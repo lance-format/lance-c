@@ -52,4 +52,3 @@ test C/C++ compilation: `cargo test --test compile_and_run_test -- --ignored`
 2. Add declaration to `include/lance.h`.
 3. Add C++ wrapper to `include/lance.hpp`.
 4. Add test in `tests/c_api_test.rs`.
-
