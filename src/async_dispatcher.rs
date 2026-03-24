@@ -8,7 +8,7 @@
 //! sequentially, avoiding reentrancy and Tokio thread blocking.
 
 use std::ffi::c_void;
-use std::sync::{mpsc, LazyLock};
+use std::sync::{LazyLock, mpsc};
 
 /// C callback function pointer type for async operations.
 /// - `ctx`: opaque pointer passed back to the caller

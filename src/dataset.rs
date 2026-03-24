@@ -9,11 +9,11 @@ use std::sync::Arc;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::Schema as ArrowSchema;
-use lance::dataset::builder::DatasetBuilder;
 use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use lance_core::Result;
 
-use crate::error::{ffi_try, set_last_error, LanceErrorCode};
+use crate::error::{LanceErrorCode, ffi_try, set_last_error};
 use crate::helpers;
 use crate::runtime::block_on;
 

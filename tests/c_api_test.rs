@@ -10,8 +10,8 @@ use std::ffi::CString;
 use std::ptr;
 use std::sync::Arc;
 
-use arrow::ffi::from_ffi;
 use arrow::ffi::FFI_ArrowSchema;
+use arrow::ffi::from_ffi;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;

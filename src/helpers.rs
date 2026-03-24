@@ -4,7 +4,7 @@
 //! C string parsing utilities.
 
 use std::collections::HashMap;
-use std::ffi::{c_char, CStr};
+use std::ffi::{CStr, c_char};
 
 use lance_core::{Error, Result};
 use snafu::location;
