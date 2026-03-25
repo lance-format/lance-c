@@ -27,6 +27,6 @@ mod scanner;
 pub use batch::*;
 pub use dataset::*;
 pub use error::{
-    lance_free_string, lance_last_error_code, lance_last_error_message, LanceErrorCode,
+    LanceErrorCode, lance_free_string, lance_last_error_code, lance_last_error_message,
 };
 pub use scanner::*;

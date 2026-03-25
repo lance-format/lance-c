@@ -12,8 +12,8 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::SchemaRef;
 use futures::{Stream, StreamExt};
-use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance::Dataset;
+use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_core::Result;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_io::stream::RecordBatchStream;
@@ -21,9 +21,9 @@ use lance_io::stream::RecordBatchStream;
 use crate::async_dispatcher::{self, LanceCallback};
 use crate::batch::LanceBatch;
 use crate::dataset::LanceDataset;
-use crate::error::{clear_last_error, ffi_try, set_lance_error, set_last_error, LanceErrorCode};
+use crate::error::{LanceErrorCode, clear_last_error, ffi_try, set_lance_error, set_last_error};
 use crate::helpers;
-use crate::runtime::{block_on, RT};
+use crate::runtime::{RT, block_on};
 
 /// Opaque scanner handle. Stores configuration until stream materialization.
 pub struct LanceScanner {
@@ -294,12 +294,12 @@ pub unsafe extern "C" fn lance_scanner_next(
     let s = unsafe { &mut *scanner };
 
     // Lazily materialize the stream on first call.
-    if s.stream.is_none() {
-        if let Err(err) = s.materialize_stream() {
-            set_lance_error(&err);
-            unsafe { *out = ptr::null_mut() };
-            return -1;
-        }
+    if s.stream.is_none()
+        && let Err(err) = s.materialize_stream()
+    {
+        set_lance_error(&err);
+        unsafe { *out = ptr::null_mut() };
+        return -1;
     }
 
     let stream = s.stream.as_mut().unwrap();
@@ -431,12 +431,12 @@ pub unsafe extern "C" fn lance_scanner_poll_next(
     let s = unsafe { &mut *scanner };
 
     // Lazily materialize the stream.
-    if s.stream.is_none() {
-        if let Err(err) = s.materialize_stream() {
-            set_lance_error(&err);
-            unsafe { *out = ptr::null_mut() };
-            return LancePollStatus::Error;
-        }
+    if s.stream.is_none()
+        && let Err(err) = s.materialize_stream()
+    {
+        set_lance_error(&err);
+        unsafe { *out = ptr::null_mut() };
+        return LancePollStatus::Error;
     }
 
     let stream = s.stream.as_mut().unwrap();

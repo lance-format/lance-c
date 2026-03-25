@@ -7,7 +7,7 @@
 //! the caller retrieves the error code and message from thread-local storage.
 
 use std::cell::RefCell;
-use std::ffi::{c_char, CString};
+use std::ffi::{CString, c_char};
 use std::ptr;
 
 /// Error codes returned by `lance_last_error_code()`.
