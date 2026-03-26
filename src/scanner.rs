@@ -34,6 +34,7 @@ pub struct LanceScanner {
     offset: Option<i64>,
     batch_size: Option<usize>,
     with_row_id: bool,
+    fragment_ids: Option<Vec<u64>>,
     // Materialized on first iteration call
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
     #[allow(dead_code)]
@@ -69,9 +70,25 @@ impl LanceScanner {
             offset: None,
             batch_size: None,
             with_row_id: false,
+            fragment_ids: None,
             stream: None,
             schema: None,
         }
+    }
+
+    /// Apply fragment selection to a scanner builder if fragment_ids is set.
+    fn apply_fragment_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
+        if let Some(ids) = &self.fragment_ids {
+            let all_fragments = self.dataset.get_fragments();
+            let id_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
+            let selected: Vec<_> = all_fragments
+                .into_iter()
+                .filter(|f| id_set.contains(&(f.id() as u64)))
+                .map(|f| f.metadata().clone())
+                .collect();
+            scanner.with_fragments(selected);
+        }
+        Ok(())
     }
 
     /// Build the underlying Scanner and open a stream.
@@ -92,6 +109,7 @@ impl LanceScanner {
         if self.with_row_id {
             scanner.with_row_id();
         }
+        self.apply_fragment_filter(&mut scanner)?;
         let stream = block_on(scanner.try_into_stream())?;
         self.schema = Some(stream.schema());
         self.stream = Some(Box::pin(stream));
@@ -116,6 +134,7 @@ impl LanceScanner {
         if self.with_row_id {
             scanner.with_row_id();
         }
+        self.apply_fragment_filter(&mut scanner)?;
         Ok(scanner)
     }
 }
@@ -215,6 +234,35 @@ pub unsafe extern "C" fn lance_scanner_with_row_id(
     }
     let s = unsafe { &mut *scanner };
     s.with_row_id = enable;
+    clear_last_error();
+    0
+}
+
+/// Restrict the scan to the given fragment IDs.
+/// Must be called before any iteration method.
+///
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fragment_ids(
+    scanner: *mut LanceScanner,
+    ids: *const u64,
+    len: usize,
+) -> i32 {
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+        return -1;
+    }
+    if ids.is_null() && len > 0 {
+        set_last_error(LanceErrorCode::InvalidArgument, "ids is NULL but len > 0");
+        return -1;
+    }
+    let s = unsafe { &mut *scanner };
+    let id_slice = if len > 0 {
+        unsafe { std::slice::from_raw_parts(ids, len) }
+    } else {
+        &[]
+    };
+    s.fragment_ids = Some(id_slice.to_vec());
     clear_last_error();
     0
 }
