@@ -1184,6 +1184,145 @@ fn test_large_dataset_schema() {
 }
 
 // ---------------------------------------------------------------------------
+// Fragment enumeration and fragment-scoped scanning
+// ---------------------------------------------------------------------------
+
+/// Helper: create a dataset with multiple fragments by writing multiple batches.
+fn create_multi_fragment_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("multi_frag_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+    lance_c::runtime::block_on(async {
+        // Write first fragment (rows 0..5)
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4]))],
+        )
+        .unwrap();
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch1)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Append second fragment (rows 5..10)
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![5, 6, 7, 8, 9]))],
+        )
+        .unwrap();
+        let mut ds = Dataset::open(&uri).await.unwrap();
+        ds.append(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch2)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    (tmp, uri)
+}
+
+#[test]
+fn test_fragment_count() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let count = unsafe { lance_dataset_fragment_count(ds) };
+    assert_eq!(count, 2, "should have 2 fragments");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fragment_ids() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let count = unsafe { lance_dataset_fragment_count(ds) };
+    assert_eq!(count, 2);
+
+    let mut ids = vec![0u64; count as usize];
+    let rc = unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) };
+    assert_eq!(rc, 0);
+    assert_eq!(ids.len(), 2);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_with_fragment_ids() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Get fragment IDs
+    let count = unsafe { lance_dataset_fragment_count(ds) };
+    let mut ids = vec![0u64; count as usize];
+    unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) };
+
+    // Scan only the first fragment
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let rc = unsafe { lance_scanner_set_fragment_ids(scanner, ids[..1].as_ptr(), 1) };
+    assert_eq!(rc, 0);
+
+    // Should get only 5 rows (first fragment)
+    let batches = scan_all_rows_from_scanner(scanner);
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 5, "scanning one fragment should yield 5 rows");
+
+    unsafe { lance_scanner_close(scanner) };
+
+    // Scan only the second fragment
+    let scanner2 = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    unsafe { lance_scanner_set_fragment_ids(scanner2, ids[1..].as_ptr(), 1) };
+
+    let batches2 = scan_all_rows_from_scanner(scanner2);
+    let total2: usize = batches2.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total2, 5, "scanning second fragment should yield 5 rows");
+
+    unsafe { lance_scanner_close(scanner2) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+/// Helper: scan all rows from a scanner using batch iteration, returning RecordBatches.
+fn scan_all_rows_from_scanner(scanner: *mut LanceScanner) -> Vec<RecordBatch> {
+    let mut batches = Vec::new();
+    loop {
+        let mut batch_ptr: *mut LanceBatch = ptr::null_mut();
+        let rc = unsafe { lance_scanner_next(scanner, &mut batch_ptr) };
+        if rc == 1 {
+            break; // end of stream
+        }
+        assert_eq!(rc, 0, "scanner_next should succeed");
+        assert!(!batch_ptr.is_null());
+        let mut ffi_array = arrow::ffi::FFI_ArrowArray::empty();
+        let mut ffi_schema = FFI_ArrowSchema::empty();
+        unsafe { lance_batch_to_arrow(batch_ptr, &mut ffi_array, &mut ffi_schema) };
+        let data = unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap();
+        let struct_array = arrow_array::StructArray::from(data);
+        batches.push(RecordBatch::from(struct_array));
+        unsafe { lance_batch_free(batch_ptr) };
+    }
+    batches
+}
+
+// ---------------------------------------------------------------------------
 // Tests with checked-in historical test datasets
 // ---------------------------------------------------------------------------
 

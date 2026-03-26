@@ -240,3 +240,49 @@ unsafe fn dataset_take_inner(
     }
     Ok(0)
 }
+
+// ---------------------------------------------------------------------------
+// Fragment enumeration
+// ---------------------------------------------------------------------------
+
+/// Return the number of fragments in the dataset.
+/// Returns 0 on error — check `lance_last_error_code()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_fragment_count(dataset: *const LanceDataset) -> u64 {
+    if dataset.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "dataset is NULL");
+        return 0;
+    }
+    let ds = unsafe { &*dataset };
+    crate::error::clear_last_error();
+    ds.inner.count_fragments() as u64
+}
+
+/// Fill `out_ids` with the fragment IDs of the dataset.
+///
+/// The caller must allocate `out_ids` with at least
+/// `lance_dataset_fragment_count()` elements.
+///
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_fragment_ids(
+    dataset: *const LanceDataset,
+    out_ids: *mut u64,
+) -> i32 {
+    if dataset.is_null() || out_ids.is_null() {
+        set_last_error(
+            LanceErrorCode::InvalidArgument,
+            "dataset and out_ids must not be NULL",
+        );
+        return -1;
+    }
+    let ds = unsafe { &*dataset };
+    let fragments = ds.inner.get_fragments();
+    for (i, frag) in fragments.iter().enumerate() {
+        unsafe {
+            *out_ids.add(i) = frag.id() as u64;
+        }
+    }
+    crate::error::clear_last_error();
+    0
+}

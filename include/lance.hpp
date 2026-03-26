@@ -163,6 +163,24 @@ public:
     /// Create a Scanner builder for this dataset.
     Scanner scan() const;
 
+    /// Number of fragments in the dataset.
+    uint64_t fragment_count() const {
+        uint64_t n = lance_dataset_fragment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return n;
+    }
+
+    /// Get all fragment IDs.
+    std::vector<uint64_t> fragment_ids() const {
+        auto count = fragment_count();
+        std::vector<uint64_t> ids(count);
+        if (count > 0) {
+            if (lance_dataset_fragment_ids(handle_.get(), ids.data()) != 0)
+                check_error();
+        }
+        return ids;
+    }
+
     /// Access the underlying C handle (does not transfer ownership).
     const LanceDataset* c_handle() const { return handle_.get(); }
 
@@ -204,6 +222,18 @@ public:
         if (lance_scanner_with_row_id(handle_.get(), enable) != 0)
             check_error();
         return *this;
+    }
+
+    /// Restrict scan to specific fragment IDs.
+    Scanner& fragment_ids(const uint64_t* ids, size_t len) {
+        if (lance_scanner_set_fragment_ids(handle_.get(), ids, len) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Restrict scan to specific fragment IDs (vector overload).
+    Scanner& fragment_ids(const std::vector<uint64_t>& ids) {
+        return fragment_ids(ids.data(), ids.size());
     }
 
     /// Materialize the scan as an ArrowArrayStream (blocking).

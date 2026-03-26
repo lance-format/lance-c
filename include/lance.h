@@ -135,6 +135,18 @@ int32_t lance_dataset_schema(
     struct ArrowSchema* out
 );
 
+/* ─── Fragment enumeration ─── */
+
+/** Return the number of fragments in the dataset. Returns 0 on error. */
+uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
+
+/**
+ * Fill out_ids with the fragment IDs of the dataset.
+ * Caller must allocate out_ids with at least lance_dataset_fragment_count() elements.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_ids);
+
 /* ─── Random access ─── */
 
 /**
@@ -172,6 +184,18 @@ int32_t lance_scanner_set_limit(LanceScanner* scanner, int64_t limit);
 int32_t lance_scanner_set_offset(LanceScanner* scanner, int64_t offset);
 int32_t lance_scanner_set_batch_size(LanceScanner* scanner, int64_t batch_size);
 int32_t lance_scanner_with_row_id(LanceScanner* scanner, bool enable);
+
+/**
+ * Restrict scan to the given fragment IDs. Must be called before iteration.
+ * @param ids  Array of fragment IDs
+ * @param len  Number of fragment IDs
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_set_fragment_ids(
+    LanceScanner* scanner,
+    const uint64_t* ids,
+    size_t len
+);
 
 /** Close and free a scanner handle. */
 void lance_scanner_close(LanceScanner* scanner);
