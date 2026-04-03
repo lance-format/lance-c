@@ -274,4 +274,40 @@ public:
 
 } // namespace lance
 
+// ─── Fragment writer (free functions) ────────────────────────────────────────
+
+namespace lance {
+
+/**
+ * Write an Arrow record batch stream to fragment files at `uri`.
+ *
+ * Returns a JSON string describing the written fragments.
+ * The Rust finalizer deserializes this to commit the fragments into a dataset.
+ *
+ * @param uri          Directory URI (file://, s3://, etc.)
+ * @param stream       ArrowArrayStream to consume. Must not be used after this call.
+ * @param storage_opts Key-value storage options, or empty for defaults.
+ * @return             JSON array string "[{...}]". Must be freed with lance_free_string().
+ * @throws lance::Error on failure.
+ */
+inline const char* write_fragments(
+    const std::string& uri,
+    ArrowArrayStream* stream,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts = {})
+{
+    std::vector<const char*> kv;
+    for (auto& [k, v] : storage_opts) {
+        kv.push_back(k.c_str());
+        kv.push_back(v.c_str());
+    }
+    kv.push_back(nullptr);
+
+    const char* const* opts_ptr = storage_opts.empty() ? nullptr : kv.data();
+    const char* json = lance_write_fragments(uri.c_str(), stream, opts_ptr);
+    if (!json) check_error();
+    return json;
+}
+
+} // namespace lance
+
 #endif /* LANCE_HPP */

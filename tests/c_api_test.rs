@@ -19,6 +19,7 @@ use arrow_array::{Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_c::*;
+use lance_table::format::Fragment;
 
 /// Helper: create a test dataset in a temp directory and return its path.
 fn create_test_dataset() -> (tempfile::TempDir, String) {
@@ -1384,4 +1385,78 @@ fn test_historical_dataset_open_specific_version() {
     assert!(!ds2.is_null());
     assert_eq!(unsafe { lance_dataset_version(ds2) }, 2);
     unsafe { lance_dataset_close(ds2) };
+}
+
+// ---------------------------------------------------------------------------
+// Fragment writer
+// ---------------------------------------------------------------------------
+
+/// Helper: build an FFI_ArrowArrayStream from a single RecordBatch.
+fn batch_to_ffi_stream(batch: RecordBatch) -> FFI_ArrowArrayStream {
+    let schema = batch.schema();
+    let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    FFI_ArrowArrayStream::new(Box::new(reader))
+}
+
+#[test]
+fn test_write_fragments_returns_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}", tmp.path().to_str().unwrap());
+    let c_uri = CString::new(uri.clone()).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Float32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0])),
+        ],
+    )
+    .unwrap();
+
+    let mut stream = batch_to_ffi_stream(batch);
+    let json_ptr =
+        unsafe { lance_write_fragments(c_uri.as_ptr(), &mut stream, ptr::null()) };
+    assert!(!json_ptr.is_null(), "lance_write_fragments returned NULL");
+
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .expect("JSON must be valid UTF-8");
+
+    // Must parse as a non-empty JSON array of Fragment objects.
+    let fragments: Vec<Fragment> =
+        serde_json::from_str(json_str).expect("must parse as Vec<Fragment>");
+    assert!(!fragments.is_empty(), "expected at least one fragment");
+
+    // Each fragment must reference at least one data file.
+    for frag in &fragments {
+        assert!(!frag.files.is_empty(), "fragment has no data files");
+    }
+
+    // Total row count across fragments must match input.
+    let total_rows: usize = fragments
+        .iter()
+        .filter_map(|f| f.physical_rows)
+        .sum();
+    assert_eq!(total_rows, 3);
+
+    unsafe { lance_free_string(json_ptr) };
+}
+
+#[test]
+fn test_write_fragments_null_uri_returns_null() {
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )
+    .unwrap();
+    let mut stream = batch_to_ffi_stream(batch);
+
+    let result = unsafe { lance_write_fragments(ptr::null(), &mut stream, ptr::null()) };
+    assert!(result.is_null());
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
 }

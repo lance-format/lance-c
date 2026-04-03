@@ -281,6 +281,29 @@ int32_t lance_batch_to_arrow(
 /** Free a batch handle. */
 void lance_batch_free(LanceBatch* batch);
 
+/* ─── Fragment writer ─── */
+
+/**
+ * Write an Arrow record batch stream to fragment files at `uri`.
+ *
+ * The data is written but NOT committed — no dataset manifest is created or
+ * updated. The returned JSON array can be forwarded to a Rust finalizer that
+ * calls CommitBuilder to publish the fragments into a dataset.
+ *
+ * @param uri          Directory URI for fragment files (file://, s3://, etc.)
+ * @param stream       Arrow C Data Interface stream; consumed by this call —
+ *                     do not use the stream after returning.
+ * @param storage_opts NULL-terminated key-value pairs ["k","v",NULL], or NULL.
+ * @return             JSON array string "[{...}, ...]", one object per fragment.
+ *                     Caller must free with lance_free_string().
+ *                     Returns NULL on error.
+ */
+const char* lance_write_fragments(
+    const char* uri,
+    struct ArrowArrayStream* stream,
+    const char* const* storage_opts
+);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
