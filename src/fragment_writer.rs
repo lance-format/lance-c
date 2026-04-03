@@ -100,9 +100,9 @@ unsafe fn write_fragments_inner(
     let mut params = WriteParams::default();
     if !opts.is_empty() {
         params.store_params = Some(ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(
-                StorageOptionsAccessor::with_static_options(opts),
-            )),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                opts,
+            ))),
             ..ObjectStoreParams::default()
         });
     }

@@ -1418,8 +1418,7 @@ fn test_write_fragments_returns_json() {
     .unwrap();
 
     let mut stream = batch_to_ffi_stream(batch);
-    let json_ptr =
-        unsafe { lance_write_fragments(c_uri.as_ptr(), &mut stream, ptr::null()) };
+    let json_ptr = unsafe { lance_write_fragments(c_uri.as_ptr(), &mut stream, ptr::null()) };
     assert!(!json_ptr.is_null(), "lance_write_fragments returned NULL");
 
     let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
@@ -1437,10 +1436,7 @@ fn test_write_fragments_returns_json() {
     }
 
     // Total row count across fragments must match input.
-    let total_rows: usize = fragments
-        .iter()
-        .filter_map(|f| f.physical_rows)
-        .sum();
+    let total_rows: usize = fragments.iter().filter_map(|f| f.physical_rows).sum();
     assert_eq!(total_rows, 3);
 
     unsafe { lance_free_string(json_ptr) };
@@ -1449,11 +1445,8 @@ fn test_write_fragments_returns_json() {
 #[test]
 fn test_write_fragments_null_uri_returns_null() {
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from(vec![1]))],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
     let mut stream = batch_to_ffi_stream(batch);
 
     let result = unsafe { lance_write_fragments(ptr::null(), &mut stream, ptr::null()) };

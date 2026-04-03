@@ -27,8 +27,8 @@ mod scanner;
 // Re-export all extern "C" symbols so they appear in the cdylib.
 pub use batch::*;
 pub use dataset::*;
-pub use fragment_writer::*;
 pub use error::{
     LanceErrorCode, lance_free_string, lance_last_error_code, lance_last_error_message,
 };
+pub use fragment_writer::*;
 pub use scanner::*;
