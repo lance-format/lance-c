@@ -3215,15 +3215,11 @@ dependencies = [
  "lance-core",
  "lance-datagen",
  "lance-io",
- "lance-table",
  "log",
- "object_store",
  "pin-project",
- "serde_json",
  "snafu",
  "tempfile",
  "tokio",
- "uuid",
 ]
 
 [[package]]

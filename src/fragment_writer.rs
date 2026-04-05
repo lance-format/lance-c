@@ -3,20 +3,25 @@
 
 //! Fragment writer C API: write Arrow data to local fragment files without committing.
 //!
-//! # Workflow
+//! Designed for embedded / robotics C++ pipelines where sensor data is ingested
+//! at high frequency on edge devices. The C++ process writes Lance fragment files
+//! locally with minimal overhead (no manifest, no coordination). A separate Rust
+//! finalizer process later reads the file footers, reconstructs fragment metadata,
+//! and commits them into a dataset on a remote data lake (S3, GCS, etc.).
 //!
-//! **Writer process (C/C++):**
+//! # Two-process workflow
+//!
+//! **1. Writer process (C/C++ on edge device):**
 //! ```c
-//! int32_t rc = lance_write_fragments("file:///staging/robot.lance", &schema, &stream, NULL);
+//! // Stream sensor batches into local fragment files.
+//! int32_t rc = lance_write_fragments(
+//!     "file:///data/staging/robot.lance", &schema, &stream, NULL);
 //! ```
 //!
-//! **Finalizer process (Rust):**
+//! **2. Finalizer process (Rust, runs periodically or on sync):**
 //! ```ignore
-//! // Read sidecar metadata written by lance_write_fragments
-//! let json = std::fs::read_to_string("staging/robot.lance/_fragments/xxx.json")?;
-//! let frags: Vec<Fragment> = serde_json::from_str(&json)?;
-//! let txn = Transaction::new(0, Operation::Append { fragments: frags }, None);
-//! CommitBuilder::new(uri).execute(txn).await?;
+//! // Scan data/*.lance files, reconstruct Fragment metadata from file footers,
+//! // then commit via CommitBuilder to publish to the data lake.
 //! ```
 
 use std::ffi::c_char;
@@ -26,23 +31,21 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::record_batch::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
-use lance::dataset::transaction::Operation;
 use lance::dataset::{InsertBuilder, WriteParams};
 use lance_core::Result;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
+use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 
 use crate::error::ffi_try;
 use crate::helpers;
 use crate::runtime::block_on;
 
-/// Directory name for fragment metadata sidecar files.
-const FRAGMENTS_META_DIR: &str = "_fragments";
-
 /// Write an Arrow record batch stream to fragment files at `uri`.
 ///
 /// The data is written but **not committed** — no dataset manifest is created
-/// or updated. Fragment metadata is written as a JSON sidecar file under
-/// `<uri>/_fragments/<uuid>.json`, which a Rust finalizer can read and commit.
+/// or updated. The written `.lance` files under `<uri>/data/` contain full
+/// metadata in their footers (schema with field IDs, row counts, format version).
+/// A Rust finalizer can reconstruct `Fragment` metadata by reading these footers
+/// and commit via `CommitBuilder`.
 ///
 /// - `uri`: Directory URI where fragment files are written (`file://`, `s3://`, etc.)
 /// - `schema`: Required Arrow schema. The stream's schema must match; the call
@@ -115,57 +118,23 @@ unsafe fn write_fragments_inner(
         });
     }
 
-    let store_params = if opts.is_empty() {
-        None
-    } else {
-        Some(ObjectStoreParams {
+    let mut params = WriteParams::default();
+    if !opts.is_empty() {
+        params.store_params = Some(ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                opts.clone(),
+                opts,
             ))),
             ..ObjectStoreParams::default()
-        })
-    };
-
-    let mut params = WriteParams::default();
-    if let Some(ref sp) = store_params {
-        params.store_params = Some(sp.clone());
+        });
     }
 
-    let transaction = block_on(
+    // Write fragment data files. The Transaction result is discarded —
+    // the finalizer reconstructs Fragment metadata from the file footers.
+    let _transaction = block_on(
         InsertBuilder::new(uri_str)
             .with_params(&params)
             .execute_uncommitted_stream(reader),
     )?;
-
-    let fragments = match transaction.operation {
-        Operation::Append { fragments } => fragments,
-        Operation::Overwrite { fragments, .. } => fragments,
-        other => {
-            return Err(lance_core::Error::Internal {
-                message: format!("unexpected operation from write_fragments: {other}"),
-                location: snafu::location!(),
-            });
-        }
-    };
-
-    // Serialize fragment metadata and write as a sidecar JSON file.
-    let json =
-        serde_json::to_string_pretty(&fragments).map_err(|e| lance_core::Error::Internal {
-            message: format!("failed to serialize fragments to JSON: {e}"),
-            location: snafu::location!(),
-        })?;
-
-    let (object_store, base_path) = block_on(ObjectStore::from_uri_and_params(
-        Arc::new(Default::default()),
-        uri_str,
-        &store_params.unwrap_or_default(),
-    ))?;
-
-    let sidecar_filename = format!("{}.json", uuid::Uuid::new_v4());
-    let sidecar_path = base_path
-        .child(FRAGMENTS_META_DIR)
-        .child(sidecar_filename.as_str());
-    block_on(object_store.put(&sidecar_path, json.as_bytes()))?;
 
     Ok(0)
 }

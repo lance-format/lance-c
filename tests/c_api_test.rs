@@ -19,7 +19,6 @@ use arrow_array::{Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_c::*;
-use lance_table::format::Fragment;
 
 /// Helper: create a test dataset in a temp directory and return its path.
 fn create_test_dataset() -> (tempfile::TempDir, String) {
@@ -1404,7 +1403,7 @@ fn schema_to_ffi(schema: &Schema) -> FFI_ArrowSchema {
 }
 
 #[test]
-fn test_write_fragments_writes_sidecar() {
+fn test_write_fragments_creates_data_files() {
     let tmp = tempfile::tempdir().unwrap();
     let uri = format!("file://{}", tmp.path().to_str().unwrap());
     let c_uri = CString::new(uri.clone()).unwrap();
@@ -1428,24 +1427,19 @@ fn test_write_fragments_writes_sidecar() {
         unsafe { lance_write_fragments(c_uri.as_ptr(), &ffi_schema, &mut stream, ptr::null()) };
     assert_eq!(rc, 0, "lance_write_fragments failed");
 
-    // A sidecar JSON file should exist under _fragments/.
-    let fragments_dir = tmp.path().join("_fragments");
-    assert!(fragments_dir.exists(), "_fragments dir must exist");
+    // Data files should exist under data/.
+    let data_dir = tmp.path().join("data");
+    assert!(data_dir.exists(), "data/ dir must exist");
 
-    let entries: Vec<_> = std::fs::read_dir(&fragments_dir)
+    let lance_files: Vec<_> = std::fs::read_dir(&data_dir)
         .unwrap()
         .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "lance"))
         .collect();
-    assert_eq!(entries.len(), 1, "expected exactly one sidecar file");
-
-    let json = std::fs::read_to_string(entries[0].path()).unwrap();
-    let fragments: Vec<Fragment> =
-        serde_json::from_str(&json).expect("must parse as Vec<Fragment>");
-    assert!(!fragments.is_empty(), "expected at least one fragment");
-
-    // Total row count across fragments must match input.
-    let total_rows: usize = fragments.iter().filter_map(|f| f.physical_rows).sum();
-    assert_eq!(total_rows, 3);
+    assert!(
+        !lance_files.is_empty(),
+        "expected at least one .lance data file"
+    );
 }
 
 #[test]

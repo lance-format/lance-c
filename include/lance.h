@@ -286,10 +286,14 @@ void lance_batch_free(LanceBatch* batch);
 /**
  * Write an Arrow record batch stream to fragment files at `uri`.
  *
+ * Designed for embedded / robotics C++ pipelines: write Lance fragment files
+ * locally with minimal overhead. A separate Rust finalizer process later
+ * reconstructs Fragment metadata from the file footers and commits them
+ * into a dataset on a remote data lake via CommitBuilder.
+ *
  * The data is written but NOT committed — no dataset manifest is created or
- * updated. Fragment metadata is written as a JSON sidecar file under
- * `<uri>/_fragments/<uuid>.json`. A Rust finalizer can read these files,
- * deserialize the fragments, and commit them via CommitBuilder.
+ * updated. The written .lance files under <uri>/data/ contain full metadata
+ * in their footers (schema with field IDs, row counts, format version).
  *
  * @param uri          Directory URI for fragment files (file://, s3://, etc.)
  * @param schema       Required Arrow schema. The stream schema must match

@@ -281,8 +281,8 @@ namespace lance {
 /**
  * Write an Arrow record batch stream to fragment files at `uri`.
  *
- * Fragment metadata is written as a JSON sidecar under `<uri>/_fragments/`.
- * A Rust finalizer reads these files and commits via CommitBuilder.
+ * Data files are written under `<uri>/data/`. A Rust finalizer reconstructs
+ * Fragment metadata from the file footers and commits via CommitBuilder.
  * No dynamic memory is returned to the caller.
  *
  * @param uri          Directory URI (file://, s3://, etc.)
