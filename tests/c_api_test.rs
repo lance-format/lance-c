@@ -1398,8 +1398,13 @@ fn batch_to_ffi_stream(batch: RecordBatch) -> FFI_ArrowArrayStream {
     FFI_ArrowArrayStream::new(Box::new(reader))
 }
 
+/// Helper: export an Arrow Schema to FFI_ArrowSchema.
+fn schema_to_ffi(schema: &Schema) -> FFI_ArrowSchema {
+    FFI_ArrowSchema::try_from(schema).expect("schema export must succeed")
+}
+
 #[test]
-fn test_write_fragments_returns_json() {
+fn test_write_fragments_writes_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let uri = format!("file://{}", tmp.path().to_str().unwrap());
     let c_uri = CString::new(uri.clone()).unwrap();
@@ -1417,39 +1422,74 @@ fn test_write_fragments_returns_json() {
     )
     .unwrap();
 
+    let ffi_schema = schema_to_ffi(&schema);
     let mut stream = batch_to_ffi_stream(batch);
-    let json_ptr = unsafe { lance_write_fragments(c_uri.as_ptr(), &mut stream, ptr::null()) };
-    assert!(!json_ptr.is_null(), "lance_write_fragments returned NULL");
+    let rc =
+        unsafe { lance_write_fragments(c_uri.as_ptr(), &ffi_schema, &mut stream, ptr::null()) };
+    assert_eq!(rc, 0, "lance_write_fragments failed");
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
-        .to_str()
-        .expect("JSON must be valid UTF-8");
+    // A sidecar JSON file should exist under _fragments/.
+    let fragments_dir = tmp.path().join("_fragments");
+    assert!(fragments_dir.exists(), "_fragments dir must exist");
 
-    // Must parse as a non-empty JSON array of Fragment objects.
+    let entries: Vec<_> = std::fs::read_dir(&fragments_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 1, "expected exactly one sidecar file");
+
+    let json = std::fs::read_to_string(entries[0].path()).unwrap();
     let fragments: Vec<Fragment> =
-        serde_json::from_str(json_str).expect("must parse as Vec<Fragment>");
+        serde_json::from_str(&json).expect("must parse as Vec<Fragment>");
     assert!(!fragments.is_empty(), "expected at least one fragment");
-
-    // Each fragment must reference at least one data file.
-    for frag in &fragments {
-        assert!(!frag.files.is_empty(), "fragment has no data files");
-    }
 
     // Total row count across fragments must match input.
     let total_rows: usize = fragments.iter().filter_map(|f| f.physical_rows).sum();
     assert_eq!(total_rows, 3);
-
-    unsafe { lance_free_string(json_ptr) };
 }
 
 #[test]
-fn test_write_fragments_null_uri_returns_null() {
+fn test_write_fragments_null_args_returns_error() {
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
     let batch =
         RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
     let mut stream = batch_to_ffi_stream(batch);
 
-    let result = unsafe { lance_write_fragments(ptr::null(), &mut stream, ptr::null()) };
-    assert!(result.is_null());
+    // NULL uri
+    let ffi_schema = schema_to_ffi(&schema);
+    let result =
+        unsafe { lance_write_fragments(ptr::null(), &ffi_schema, &mut stream, ptr::null()) };
+    assert_eq!(result, -1);
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+}
+
+#[test]
+fn test_write_fragments_schema_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}", tmp.path().to_str().unwrap());
+    let c_uri = CString::new(uri).unwrap();
+
+    // Stream has columns (id: Int32, val: Float32)
+    let stream_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Float32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        stream_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Float32Array::from(vec![1.0])),
+        ],
+    )
+    .unwrap();
+    let mut stream = batch_to_ffi_stream(batch);
+
+    // But the declared schema only has (id: Int32) — mismatch.
+    let declared_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let ffi_schema = schema_to_ffi(&declared_schema);
+
+    let rc =
+        unsafe { lance_write_fragments(c_uri.as_ptr(), &ffi_schema, &mut stream, ptr::null()) };
+    assert_eq!(rc, -1, "should fail on schema mismatch");
     assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
 }

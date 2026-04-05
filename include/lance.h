@@ -287,19 +287,21 @@ void lance_batch_free(LanceBatch* batch);
  * Write an Arrow record batch stream to fragment files at `uri`.
  *
  * The data is written but NOT committed — no dataset manifest is created or
- * updated. The returned JSON array can be forwarded to a Rust finalizer that
- * calls CommitBuilder to publish the fragments into a dataset.
+ * updated. Fragment metadata is written as a JSON sidecar file under
+ * `<uri>/_fragments/<uuid>.json`. A Rust finalizer can read these files,
+ * deserialize the fragments, and commit them via CommitBuilder.
  *
  * @param uri          Directory URI for fragment files (file://, s3://, etc.)
+ * @param schema       Required Arrow schema. The stream schema must match
+ *                     or the call fails with LANCE_ERR_INVALID_ARGUMENT.
  * @param stream       Arrow C Data Interface stream; consumed by this call —
  *                     do not use the stream after returning.
  * @param storage_opts NULL-terminated key-value pairs ["k","v",NULL], or NULL.
- * @return             JSON array string "[{...}, ...]", one object per fragment.
- *                     Caller must free with lance_free_string().
- *                     Returns NULL on error.
+ * @return 0 on success, -1 on error
  */
-const char* lance_write_fragments(
+int32_t lance_write_fragments(
     const char* uri,
+    const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
     const char* const* storage_opts
 );

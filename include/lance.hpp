@@ -281,17 +281,19 @@ namespace lance {
 /**
  * Write an Arrow record batch stream to fragment files at `uri`.
  *
- * Returns a JSON string describing the written fragments.
- * The Rust finalizer deserializes this to commit the fragments into a dataset.
+ * Fragment metadata is written as a JSON sidecar under `<uri>/_fragments/`.
+ * A Rust finalizer reads these files and commits via CommitBuilder.
+ * No dynamic memory is returned to the caller.
  *
  * @param uri          Directory URI (file://, s3://, etc.)
+ * @param schema       Required Arrow schema — stream schema must match.
  * @param stream       ArrowArrayStream to consume. Must not be used after this call.
  * @param storage_opts Key-value storage options, or empty for defaults.
- * @return             JSON array string "[{...}]". Must be freed with lance_free_string().
  * @throws lance::Error on failure.
  */
-inline const char* write_fragments(
+inline void write_fragments(
     const std::string& uri,
+    const ArrowSchema* schema,
     ArrowArrayStream* stream,
     const std::vector<std::pair<std::string, std::string>>& storage_opts = {})
 {
@@ -303,9 +305,9 @@ inline const char* write_fragments(
     kv.push_back(nullptr);
 
     const char* const* opts_ptr = storage_opts.empty() ? nullptr : kv.data();
-    const char* json = lance_write_fragments(uri.c_str(), stream, opts_ptr);
-    if (!json) check_error();
-    return json;
+    if (lance_write_fragments(uri.c_str(), schema, stream, opts_ptr) != 0) {
+        check_error();
+    }
 }
 
 } // namespace lance
