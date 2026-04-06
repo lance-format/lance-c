@@ -19,7 +19,7 @@
 //! ```
 //!
 //! **2. Finalizer process (Rust, runs periodically or on sync):**
-//! ```ignore
+//! ```text
 //! // Scan data/*.lance files, reconstruct Fragment metadata from file footers,
 //! // then commit via CommitBuilder to publish to the data lake.
 //! ```
