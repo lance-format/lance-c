@@ -281,6 +281,35 @@ int32_t lance_batch_to_arrow(
 /** Free a batch handle. */
 void lance_batch_free(LanceBatch* batch);
 
+/* ─── Fragment writer ─── */
+
+/**
+ * Write an Arrow record batch stream to fragment files at `uri`.
+ *
+ * Designed for embedded / robotics C++ pipelines: write Lance fragment files
+ * locally with minimal overhead. A separate Rust finalizer process later
+ * reconstructs Fragment metadata from the file footers and commits them
+ * into a dataset on a remote data lake via CommitBuilder.
+ *
+ * The data is written but NOT committed — no dataset manifest is created or
+ * updated. The written .lance files under <uri>/data/ contain full metadata
+ * in their footers (schema with field IDs, row counts, format version).
+ *
+ * @param uri          Directory URI for fragment files (file://, s3://, etc.)
+ * @param schema       Required Arrow schema. The stream schema must match
+ *                     or the call fails with LANCE_ERR_INVALID_ARGUMENT.
+ * @param stream       Arrow C Data Interface stream; consumed by this call —
+ *                     do not use the stream after returning.
+ * @param storage_opts NULL-terminated key-value pairs ["k","v",NULL], or NULL.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_write_fragments(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    const char* const* storage_opts
+);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

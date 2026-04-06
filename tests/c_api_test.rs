@@ -1385,3 +1385,273 @@ fn test_historical_dataset_open_specific_version() {
     assert_eq!(unsafe { lance_dataset_version(ds2) }, 2);
     unsafe { lance_dataset_close(ds2) };
 }
+
+// ---------------------------------------------------------------------------
+// Fragment writer
+// ---------------------------------------------------------------------------
+
+/// Helper: build an FFI_ArrowArrayStream from a single RecordBatch.
+fn batch_to_ffi_stream(batch: RecordBatch) -> FFI_ArrowArrayStream {
+    let schema = batch.schema();
+    let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    FFI_ArrowArrayStream::new(Box::new(reader))
+}
+
+/// Helper: export an Arrow Schema to FFI_ArrowSchema.
+fn schema_to_ffi(schema: &Schema) -> FFI_ArrowSchema {
+    FFI_ArrowSchema::try_from(schema).expect("schema export must succeed")
+}
+
+#[test]
+fn test_write_fragments_creates_data_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}", tmp.path().to_str().unwrap());
+    let c_uri = CString::new(uri.clone()).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Float32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0])),
+        ],
+    )
+    .unwrap();
+
+    let ffi_schema = schema_to_ffi(&schema);
+    let mut stream = batch_to_ffi_stream(batch);
+    let rc =
+        unsafe { lance_write_fragments(c_uri.as_ptr(), &ffi_schema, &mut stream, ptr::null()) };
+    assert_eq!(rc, 0, "lance_write_fragments failed");
+
+    // Data files should exist under data/.
+    let data_dir = tmp.path().join("data");
+    assert!(data_dir.exists(), "data/ dir must exist");
+
+    let lance_files: Vec<_> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "lance"))
+        .collect();
+    assert!(
+        !lance_files.is_empty(),
+        "expected at least one .lance data file"
+    );
+}
+
+#[test]
+fn test_write_fragments_null_args_returns_error() {
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+    let mut stream = batch_to_ffi_stream(batch);
+
+    // NULL uri
+    let ffi_schema = schema_to_ffi(&schema);
+    let result =
+        unsafe { lance_write_fragments(ptr::null(), &ffi_schema, &mut stream, ptr::null()) };
+    assert_eq!(result, -1);
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+}
+
+#[test]
+fn test_write_fragments_schema_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}", tmp.path().to_str().unwrap());
+    let c_uri = CString::new(uri).unwrap();
+
+    // Stream has columns (id: Int32, val: Float32)
+    let stream_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Float32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        stream_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Float32Array::from(vec![1.0])),
+        ],
+    )
+    .unwrap();
+    let mut stream = batch_to_ffi_stream(batch);
+
+    // But the declared schema only has (id: Int32) — mismatch.
+    let declared_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let ffi_schema = schema_to_ffi(&declared_schema);
+
+    let rc =
+        unsafe { lance_write_fragments(c_uri.as_ptr(), &ffi_schema, &mut stream, ptr::null()) };
+    assert_eq!(rc, -1, "should fail on schema mismatch");
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end robotics scenario: C++ writes fragments, Rust finalizer commits
+// ---------------------------------------------------------------------------
+
+/// Simulate the full robotics ingestion pipeline:
+///   1. C++ edge device writes sensor data via lance_write_fragments
+///   2. Separate Rust finalizer scans .lance files, reconstructs Fragment
+///      metadata from file footers, and commits into a dataset
+///   3. The committed dataset is readable and contains the original data
+#[test]
+fn test_robotics_e2e_write_then_finalize() {
+    use lance::dataset::transaction::{Operation, Transaction};
+    use lance::dataset::{CommitBuilder, WriteDestination};
+    use lance_file::reader::{CachedFileMetadata, FileReader as LanceFileReader};
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::utils::CachedFileSize;
+    use lance_table::format::{DataFile, Fragment};
+
+    // ── Step 1: "C++ edge device" writes fragment data files ──
+
+    let staging_dir = tempfile::tempdir().unwrap();
+    let staging_uri = format!("file://{}", staging_dir.path().to_str().unwrap());
+    let c_uri = CString::new(staging_uri.clone()).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sensor_id", DataType::Int32, false),
+        Field::new("temperature", DataType::Float32, true),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(Float32Array::from(vec![20.1, 21.5, 19.8, 22.0, 20.5])),
+            Arc::new(StringArray::from(vec![
+                "front", "rear", "left", "right", "top",
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let ffi_schema = schema_to_ffi(&schema);
+    let mut stream = batch_to_ffi_stream(batch);
+    let rc =
+        unsafe { lance_write_fragments(c_uri.as_ptr(), &ffi_schema, &mut stream, ptr::null()) };
+    assert_eq!(rc, 0, "lance_write_fragments failed");
+
+    // ── Step 2: "Rust finalizer" scans files and reconstructs fragments ──
+
+    let dataset_dir = tempfile::tempdir().unwrap();
+    let dataset_uri = dataset_dir
+        .path()
+        .join("robot.lance")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let fragments = lance_c::runtime::block_on(async {
+        let (object_store, _base_path) =
+            lance_io::object_store::ObjectStore::from_uri(&staging_uri)
+                .await
+                .unwrap();
+        let scan_scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+
+        // Discover .lance files in data/ directory
+        let data_dir = staging_dir.path().join("data");
+        let lance_files: Vec<_> = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "lance"))
+            .collect();
+        assert!(!lance_files.is_empty());
+
+        let mut fragments = Vec::new();
+        for (frag_idx, entry) in lance_files.iter().enumerate() {
+            let filename = entry.file_name().to_string_lossy().to_string();
+            let file_path = lance_io::object_store::ObjectStore::extract_path_from_uri(
+                Arc::new(Default::default()),
+                &format!("{}/data/{}", staging_uri, filename),
+            )
+            .unwrap();
+
+            let file_size: CachedFileSize = Default::default();
+            let file_scheduler = scan_scheduler
+                .open_file(&file_path, &file_size)
+                .await
+                .unwrap();
+            let meta: CachedFileMetadata = LanceFileReader::read_all_metadata(&file_scheduler)
+                .await
+                .unwrap();
+
+            // Reconstruct DataFile from footer metadata
+            let field_ids: Vec<i32> = meta.file_schema.field_ids();
+            let column_indices: Vec<i32> = (0..field_ids.len() as i32).collect();
+
+            let data_file = DataFile::new(
+                format!("data/{}", filename),
+                field_ids,
+                column_indices,
+                meta.major_version as u32,
+                meta.minor_version as u32,
+                None, // file_size_bytes
+                None, // base_id
+            );
+
+            let mut fragment = Fragment::new(frag_idx as u64);
+            fragment.files.push(data_file);
+            fragment.physical_rows = Some(meta.num_rows as usize);
+            fragments.push(fragment);
+        }
+        fragments
+    });
+
+    assert!(!fragments.is_empty());
+    let total_rows: usize = fragments.iter().filter_map(|f| f.physical_rows).sum();
+    assert_eq!(total_rows, 5);
+
+    // ── Step 3: Commit fragments into a new dataset ──
+
+    // Copy data files to the dataset directory first
+    let src_data = staging_dir.path().join("data");
+    let dst_data = dataset_dir.path().join("robot.lance").join("data");
+    std::fs::create_dir_all(&dst_data).unwrap();
+    for entry in std::fs::read_dir(&src_data).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), dst_data.join(entry.file_name())).unwrap();
+    }
+
+    // Build a lance schema from the arrow schema for the Overwrite operation
+    let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+
+    let transaction = Transaction::new(
+        0,
+        Operation::Overwrite {
+            fragments,
+            schema: lance_schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        },
+        None,
+    );
+
+    lance_c::runtime::block_on(async {
+        CommitBuilder::new(WriteDestination::Uri(&dataset_uri))
+            .execute(transaction)
+            .await
+            .unwrap();
+    });
+
+    // ── Step 4: Verify the committed dataset is readable ──
+
+    let c_ds_uri = CString::new(dataset_uri.clone()).unwrap();
+    let ds = unsafe { lance_dataset_open(c_ds_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "failed to open committed dataset");
+
+    let count = unsafe { lance_dataset_count_rows(ds) };
+    assert_eq!(count, 5, "committed dataset should have 5 rows");
+
+    let frag_count = unsafe { lance_dataset_fragment_count(ds) };
+    assert_eq!(frag_count, 1, "committed dataset should have 1 fragment");
+
+    unsafe { lance_dataset_close(ds) };
+}
