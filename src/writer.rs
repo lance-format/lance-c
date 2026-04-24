@@ -27,8 +27,8 @@ use crate::runtime::block_on;
 /// Write mode for `lance_dataset_write`.
 ///
 /// Discriminants are pinned for ABI stability. The FFI accepts this as
-/// `int32_t` and validates via [`LanceWriteMode::from_raw`] — storing an
-/// out-of-range tag as an enum would be UB.
+/// `int32_t` and rejects out-of-range values with `LANCE_ERR_INVALID_ARGUMENT`
+/// — storing an out-of-range tag as a `repr(C)` enum would be UB.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanceWriteMode {
