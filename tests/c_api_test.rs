@@ -1655,3 +1655,131 @@ fn test_robotics_e2e_write_then_finalize() {
 
     unsafe { lance_dataset_close(ds) };
 }
+
+// ---------------------------------------------------------------------------
+// Version history (lance_dataset_versions)
+// ---------------------------------------------------------------------------
+
+/// Helper: open an existing dataset and append a batch, creating a new version.
+fn append_batch(uri: &str, schema: Arc<Schema>, batch: RecordBatch) {
+    lance_c::runtime::block_on(async {
+        let mut ds = Dataset::open(uri).await.unwrap();
+        ds.append(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            None,
+        )
+        .await
+        .unwrap();
+    });
+}
+
+#[test]
+fn test_dataset_versions_single_version() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let vs = unsafe { lance_dataset_versions(ds) };
+    assert!(!vs.is_null());
+    assert_eq!(unsafe { lance_versions_count(vs) }, 1);
+    assert_eq!(unsafe { lance_versions_id_at(vs, 0) }, 1);
+    assert!(unsafe { lance_versions_timestamp_ms_at(vs, 0) } > 0);
+
+    unsafe { lance_versions_close(vs) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_versions_multiple_versions() {
+    let (_tmp, uri) = create_test_dataset();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![6, 7])),
+            Arc::new(StringArray::from(vec!["frank", "grace"])),
+        ],
+    )
+    .unwrap();
+    append_batch(&uri, schema, batch);
+
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let vs = unsafe { lance_dataset_versions(ds) };
+
+    let count = unsafe { lance_versions_count(vs) };
+    assert_eq!(count, 2);
+
+    let id0 = unsafe { lance_versions_id_at(vs, 0) };
+    let id1 = unsafe { lance_versions_id_at(vs, 1) };
+    assert_eq!(id0, 1);
+    assert_eq!(id1, 2);
+
+    let ts0 = unsafe { lance_versions_timestamp_ms_at(vs, 0) };
+    let ts1 = unsafe { lance_versions_timestamp_ms_at(vs, 1) };
+    assert!(ts0 > 0, "timestamps should be populated");
+    assert!(
+        ts1 >= ts0,
+        "timestamps should be monotonic by version order"
+    );
+
+    unsafe { lance_versions_close(vs) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_versions_null_dataset() {
+    let vs = unsafe { lance_dataset_versions(ptr::null()) };
+    assert!(vs.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_versions_count_null_handle() {
+    let n = unsafe { lance_versions_count(ptr::null()) };
+    assert_eq!(n, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_versions_index_out_of_range() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let vs = unsafe { lance_dataset_versions(ds) };
+
+    // Count is 1 for a freshly-created dataset. Exercise both the exact
+    // boundary (index == count) and a clearly-out-of-range index.
+    let count = unsafe { lance_versions_count(vs) };
+    for index in [count as usize, 5] {
+        let id = unsafe { lance_versions_id_at(vs, index) };
+        assert_eq!(id, 0);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+        let ts = unsafe { lance_versions_timestamp_ms_at(vs, index) };
+        assert_eq!(ts, 0);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    }
+
+    unsafe { lance_versions_close(vs) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_versions_accessors_null_handle() {
+    let id = unsafe { lance_versions_id_at(ptr::null(), 0) };
+    assert_eq!(id, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let ts = unsafe { lance_versions_timestamp_ms_at(ptr::null(), 0) };
+    assert_eq!(ts, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_versions_close_null_is_safe() {
+    unsafe { lance_versions_close(ptr::null_mut()) };
+}

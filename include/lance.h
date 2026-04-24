@@ -91,9 +91,10 @@ void lance_free_string(const char* s);
 
 /* ─── Opaque handles ─── */
 
-typedef struct LanceDataset LanceDataset;
+typedef struct LanceDataset  LanceDataset;
 typedef struct LanceScanner  LanceScanner;
 typedef struct LanceBatch    LanceBatch;
+typedef struct LanceVersions LanceVersions;
 
 /* ─── Dataset lifecycle ─── */
 
@@ -124,6 +125,35 @@ uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
 
 /** Return the latest version ID (I/O). Returns 0 on error. */
 uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
+
+/* ─── Version history ─── */
+
+/**
+ * Snapshot the dataset's version history. Caller frees the returned handle
+ * with lance_versions_close().
+ * @return handle on success, or NULL on error
+ */
+LanceVersions* lance_dataset_versions(const LanceDataset* dataset);
+
+/** Number of versions in the snapshot. Returns 0 on error. */
+uint64_t lance_versions_count(const LanceVersions* versions);
+
+/**
+ * Monotonic version id at `index` (0 <= index < count).
+ * Returns 0 on error (NULL handle or out-of-range index) — check
+ * lance_last_error_code().
+ */
+uint64_t lance_versions_id_at(const LanceVersions* versions, size_t index);
+
+/**
+ * Version timestamp at `index`, as Unix epoch milliseconds.
+ * Returns 0 on error (NULL handle or out-of-range index) — check
+ * lance_last_error_code().
+ */
+int64_t lance_versions_timestamp_ms_at(const LanceVersions* versions, size_t index);
+
+/** Close and free a versions handle. Safe to call with NULL. */
+void lance_versions_close(LanceVersions* versions);
 
 /**
  * Export the dataset schema via Arrow C Data Interface.

@@ -153,6 +153,32 @@ static void test_scan_with_limit(const char *uri) {
     printf("OK\n");
 }
 
+static void test_versions(const char *uri) {
+    printf("  test_versions... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    LanceVersions *vs = lance_dataset_versions(ds);
+    ASSERT(vs != NULL, "versions snapshot failed");
+
+    uint64_t n = lance_versions_count(vs);
+    ASSERT(n >= 1, "at least one version expected");
+    printf("count=%llu... ", (unsigned long long)n);
+
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t id = lance_versions_id_at(vs, (size_t)i);
+        int64_t ts = lance_versions_timestamp_ms_at(vs, (size_t)i);
+        CHECK_OK();
+        ASSERT(id >= 1, "version id should be >= 1");
+        ASSERT(ts > 0, "timestamp should be populated");
+    }
+
+    lance_versions_close(vs);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static void test_error_handling(void) {
     printf("  test_error_handling... ");
 
@@ -187,6 +213,7 @@ int main(int argc, char **argv) {
     test_open_and_metadata(uri);
     test_scan(uri);
     test_scan_with_limit(uri);
+    test_versions(uri);
     test_error_handling();
 
     printf("All C tests passed!\n");

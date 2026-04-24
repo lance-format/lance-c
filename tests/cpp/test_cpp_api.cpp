@@ -140,6 +140,22 @@ static void test_raii_cleanup(const std::string& uri) {
     PASS();
 }
 
+static void test_versions(const std::string& uri) {
+    TEST(test_versions);
+
+    auto ds = lance::Dataset::open(uri);
+    auto versions = ds.versions();
+
+    assert(!versions.empty());
+    for (const auto& v : versions) {
+        assert(v.id >= 1);
+        assert(v.timestamp_ms > 0);
+    }
+    printf("count=%zu... ", versions.size());
+
+    PASS();
+}
+
 static void test_error_exception(const std::string& /*uri*/) {
     TEST(test_error_exception);
 
@@ -171,6 +187,7 @@ int main(int argc, char** argv) {
     test_scanner_fluent(uri);
     test_dataset_take(uri);
     test_raii_cleanup(uri);
+    test_versions(uri);
     test_error_exception(uri);
 
     printf("All C++ tests passed!\n");
