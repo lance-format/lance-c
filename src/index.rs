@@ -302,7 +302,7 @@ pub struct LanceVectorIndexParams {
 }
 
 impl LanceMetricType {
-    fn to_distance(self) -> DistanceType {
+    pub(crate) fn to_distance(self) -> DistanceType {
         match self {
             Self::L2 => DistanceType::L2,
             Self::Cosine => DistanceType::Cosine,

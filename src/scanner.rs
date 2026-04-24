@@ -25,6 +25,17 @@ use crate::error::{LanceErrorCode, clear_last_error, ffi_try, set_lance_error, s
 use crate::helpers;
 use crate::runtime::{RT, block_on};
 
+/// Data type tag for query vectors, mirroring the C enum `LanceDataType`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceDataType {
+    Float32 = 0,
+    Float16 = 1,
+    Float64 = 2,
+    UInt8 = 3,
+    Int8 = 4,
+}
+
 /// Opaque scanner handle. Stores configuration until stream materialization.
 pub struct LanceScanner {
     dataset: Arc<Dataset>,
@@ -35,10 +46,23 @@ pub struct LanceScanner {
     batch_size: Option<usize>,
     with_row_id: bool,
     fragment_ids: Option<Vec<u64>>,
+    nearest: Option<NearestQuery>,
+    nprobes: Option<u32>,
+    refine_factor: Option<u32>,
+    ef: Option<u32>,
+    metric_override: Option<crate::index::LanceMetricType>,
+    use_index: Option<bool>,
+    prefilter: bool,
     // Materialized on first iteration call
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
     #[allow(dead_code)]
     schema: Option<SchemaRef>,
+}
+
+struct NearestQuery {
+    column: String,
+    query: arrow_array::ArrayRef,
+    k: u32,
 }
 
 /// Poll status for `lance_scanner_poll_next`.
@@ -71,6 +95,13 @@ impl LanceScanner {
             batch_size: None,
             with_row_id: false,
             fragment_ids: None,
+            nearest: None,
+            nprobes: None,
+            refine_factor: None,
+            ef: None,
+            metric_override: None,
+            use_index: None,
+            prefilter: false,
             stream: None,
             schema: None,
         }
@@ -110,6 +141,27 @@ impl LanceScanner {
             scanner.with_row_id();
         }
         self.apply_fragment_filter(&mut scanner)?;
+        if let Some(n) = &self.nearest {
+            scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
+            if let Some(np) = self.nprobes {
+                scanner.nprobes(np as usize);
+            }
+            if let Some(rf) = self.refine_factor {
+                scanner.refine(rf);
+            }
+            if let Some(ef) = self.ef {
+                scanner.ef(ef as usize);
+            }
+            if let Some(m) = self.metric_override {
+                scanner.distance_metric(m.to_distance());
+            }
+            if let Some(ui) = self.use_index {
+                scanner.use_index(ui);
+            }
+            if self.prefilter {
+                scanner.prefilter(true);
+            }
+        }
         let stream = block_on(scanner.try_into_stream())?;
         self.schema = Some(stream.schema());
         self.stream = Some(Box::pin(stream));
@@ -135,6 +187,27 @@ impl LanceScanner {
             scanner.with_row_id();
         }
         self.apply_fragment_filter(&mut scanner)?;
+        if let Some(n) = &self.nearest {
+            scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
+            if let Some(np) = self.nprobes {
+                scanner.nprobes(np as usize);
+            }
+            if let Some(rf) = self.refine_factor {
+                scanner.refine(rf);
+            }
+            if let Some(ef) = self.ef {
+                scanner.ef(ef as usize);
+            }
+            if let Some(m) = self.metric_override {
+                scanner.distance_metric(m.to_distance());
+            }
+            if let Some(ui) = self.use_index {
+                scanner.use_index(ui);
+            }
+            if self.prefilter {
+                scanner.prefilter(true);
+            }
+        }
         Ok(scanner)
     }
 }
@@ -569,4 +642,185 @@ fn make_raw_waker(waker_fn: LanceWaker, ctx: *mut c_void) -> RawWaker {
     );
 
     RawWaker::new(data, &VTABLE)
+}
+
+// ---------------------------------------------------------------------------
+// Vector search (Phase 2): setter knobs
+// ---------------------------------------------------------------------------
+
+macro_rules! scanner_set_u32 {
+    ($name:ident, $field:ident) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(scanner: *mut LanceScanner, value: u32) -> i32 {
+            if scanner.is_null() {
+                set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+                return -1;
+            }
+            unsafe {
+                (*scanner).$field = Some(value);
+            }
+            crate::error::clear_last_error();
+            0
+        }
+    };
+}
+
+scanner_set_u32!(lance_scanner_set_nprobes, nprobes);
+scanner_set_u32!(lance_scanner_set_refine_factor, refine_factor);
+scanner_set_u32!(lance_scanner_set_ef, ef);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_metric(scanner: *mut LanceScanner, metric: i32) -> i32 {
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+        return -1;
+    }
+    let m = match metric {
+        0 => crate::index::LanceMetricType::L2,
+        1 => crate::index::LanceMetricType::Cosine,
+        2 => crate::index::LanceMetricType::Dot,
+        3 => crate::index::LanceMetricType::Hamming,
+        _ => {
+            set_last_error(
+                LanceErrorCode::InvalidArgument,
+                format!("invalid metric: {}", metric),
+            );
+            return -1;
+        }
+    };
+    unsafe {
+        (*scanner).metric_override = Some(m);
+    }
+    crate::error::clear_last_error();
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_use_index(
+    scanner: *mut LanceScanner,
+    enable: bool,
+) -> i32 {
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+        return -1;
+    }
+    unsafe {
+        (*scanner).use_index = Some(enable);
+    }
+    crate::error::clear_last_error();
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_prefilter(
+    scanner: *mut LanceScanner,
+    enable: bool,
+) -> i32 {
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+        return -1;
+    }
+    unsafe {
+        (*scanner).prefilter = enable;
+    }
+    crate::error::clear_last_error();
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Vector search (Phase 2): k-NN query setter
+// ---------------------------------------------------------------------------
+
+/// Set the k-NN query on the scanner.
+///
+/// - `column`: Vector column to search.
+/// - `query_data`: Pointer to the query vector elements.
+/// - `query_len`: Number of elements (vector dimension).
+/// - `element_type`: `LanceDataType` discriminant for the element type.
+/// - `k`: Number of nearest neighbors to return (must be > 0).
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_nearest(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    query_len: usize,
+    element_type: i32,
+    k: u32,
+) -> i32 {
+    ffi_try!(
+        unsafe { scanner_nearest_inner(scanner, column, query_data, query_len, element_type, k) },
+        neg
+    )
+}
+
+unsafe fn scanner_nearest_inner(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    query_len: usize,
+    element_type: i32,
+    k: u32,
+) -> Result<i32> {
+    if scanner.is_null() || column.is_null() || query_data.is_null() {
+        return Err(lance_core::Error::InvalidInput {
+            source: "scanner, column, and query_data must not be NULL".into(),
+            location: snafu::location!(),
+        });
+    }
+    if k == 0 {
+        return Err(lance_core::Error::InvalidInput {
+            source: "k must be > 0".into(),
+            location: snafu::location!(),
+        });
+    }
+    let s = unsafe { &mut *scanner };
+    let column_str = unsafe { helpers::parse_c_string(column)? }.unwrap();
+
+    let dtype = match element_type {
+        0 => LanceDataType::Float32,
+        1 => LanceDataType::Float16,
+        2 => LanceDataType::Float64,
+        3 => LanceDataType::UInt8,
+        4 => LanceDataType::Int8,
+        _ => {
+            return Err(lance_core::Error::InvalidInput {
+                source: format!("invalid element_type: {}", element_type).into(),
+                location: snafu::location!(),
+            });
+        }
+    };
+
+    let query: arrow_array::ArrayRef = match dtype {
+        LanceDataType::Float32 => {
+            let slice = unsafe { std::slice::from_raw_parts(query_data as *const f32, query_len) };
+            std::sync::Arc::new(arrow_array::Float32Array::from(slice.to_vec()))
+        }
+        LanceDataType::Float64 => {
+            let slice = unsafe { std::slice::from_raw_parts(query_data as *const f64, query_len) };
+            std::sync::Arc::new(arrow_array::Float64Array::from(slice.to_vec()))
+        }
+        LanceDataType::UInt8 => {
+            let slice = unsafe { std::slice::from_raw_parts(query_data as *const u8, query_len) };
+            std::sync::Arc::new(arrow_array::UInt8Array::from(slice.to_vec()))
+        }
+        LanceDataType::Int8 => {
+            let slice = unsafe { std::slice::from_raw_parts(query_data as *const i8, query_len) };
+            std::sync::Arc::new(arrow_array::Int8Array::from(slice.to_vec()))
+        }
+        LanceDataType::Float16 => {
+            let raw = unsafe { std::slice::from_raw_parts(query_data as *const u16, query_len) };
+            let values: Vec<half::f16> =
+                raw.iter().map(|bits| half::f16::from_bits(*bits)).collect();
+            std::sync::Arc::new(arrow_array::Float16Array::from(values))
+        }
+    };
+
+    s.nearest = Some(NearestQuery {
+        column: column_str.to_string(),
+        query,
+        k,
+    });
+    Ok(0)
 }

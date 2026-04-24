@@ -2247,3 +2247,328 @@ fn test_create_index_replace_false_conflicts() {
     );
     unsafe { lance_dataset_close(ds) };
 }
+
+// ---------------------------------------------------------------------------
+// Vector search (k-NN) tests (Phase 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_scanner_nearest_brute_force() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let query: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
+    let column = c_str("embedding");
+    let rc = unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            query.len(),
+            LanceDataType::Float32 as i32,
+            5,
+        )
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let rc2 = unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) };
+    assert_eq!(rc2, 0);
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream as *mut _).unwrap() };
+    let schema = reader.schema();
+    let saw_distance = schema.field_with_name("_distance").is_ok();
+
+    let mut total = 0;
+    for batch in reader {
+        let b = batch.unwrap();
+        total += b.num_rows();
+    }
+    assert!(saw_distance, "_distance column missing from schema");
+    assert_eq!(total, 5, "expected k=5 results");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_nearest_with_ivf_pq_index() {
+    let (_tmp, uri) = create_vector_dataset(512, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfPq,
+        metric: LanceMetricType::L2,
+        num_partitions: 8,
+        num_sub_vectors: 4,
+        num_bits: 8,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &params, false);
+    }
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let query: Vec<f32> = vec![0.5; 16];
+    unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            16,
+            LanceDataType::Float32 as i32,
+            10,
+        );
+        lance_scanner_set_nprobes(scanner, 4);
+    }
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream as *mut _).unwrap() };
+    let mut total = 0;
+    for batch in reader {
+        total += batch.unwrap().num_rows();
+    }
+    assert_eq!(total, 10);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_nearest_dim_mismatch() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let query: Vec<f32> = vec![0.0; 4]; // wrong dim — column is 8
+    let column = c_str("embedding");
+
+    // The dim mismatch is caught either by lance_scanner_nearest itself or by
+    // build_scanner when materializing the stream. Either is acceptable.
+    let nearest_rc = unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            4,
+            LanceDataType::Float32 as i32,
+            5,
+        )
+    };
+
+    let final_failed = if nearest_rc != 0 {
+        true
+    } else {
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let rc = unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) };
+        rc != 0
+    };
+    assert!(
+        final_failed,
+        "expected dim mismatch error somewhere in the pipeline"
+    );
+    let msg = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(msg.to_lowercase().contains("dim"), "msg was: {}", msg);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_nearest_filter_postfilter() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let filter = c_str("id < 10");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), filter.as_ptr()) };
+    let query: Vec<f32> = vec![0.5; 8];
+    let column = c_str("embedding");
+    unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            8,
+            LanceDataType::Float32 as i32,
+            20,
+        );
+    }
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream as *mut _).unwrap() };
+    let mut total = 0;
+    for b in reader {
+        total += b.unwrap().num_rows();
+    }
+    // Post-filter on top-20 nearest: count is 0..20 depending on data.
+    // We just assert the call succeeds and returns at most 20 rows.
+    assert!(total <= 20);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_nearest_multi_fragment() {
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("multifrag").to_str().unwrap().to_string();
+    let dim: i32 = 8;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        ),
+    ]));
+
+    let mut batches = Vec::new();
+    for frag in 0..2i32 {
+        let mut emb = FixedSizeListBuilder::new(Float32Builder::new(), dim);
+        let ids: Vec<i32> = (0..32i32).map(|i| frag * 32 + i).collect();
+        for _ in 0..32 {
+            for _ in 0..dim {
+                emb.values().append_value(0.5);
+            }
+            emb.append(true);
+        }
+        batches.push(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(emb.finish())],
+            )
+            .unwrap(),
+        );
+    }
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(
+                vec![Ok(batches[0].clone())],
+                schema.clone(),
+            ),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let params = lance::dataset::WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            ..Default::default()
+        };
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batches[1].clone())], schema),
+            &uri,
+            Some(params),
+        )
+        .await
+        .unwrap();
+    });
+
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let column = c_str("embedding");
+    let query: Vec<f32> = vec![0.5; 8];
+    unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            8,
+            LanceDataType::Float32 as i32,
+            20,
+        );
+    }
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream as *mut _).unwrap() };
+    let mut total = 0;
+    for b in reader {
+        total += b.unwrap().num_rows();
+    }
+    assert_eq!(total, 20);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_nearest_null_safety() {
+    let column = c_str("embedding");
+    let query: Vec<f32> = vec![0.0; 8];
+    // NULL scanner
+    let rc = unsafe {
+        lance_scanner_nearest(
+            ptr::null_mut(),
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            8,
+            LanceDataType::Float32 as i32,
+            5,
+        )
+    };
+    assert_eq!(rc, -1);
+
+    // Build a valid scanner.
+    let (_tmp, uri) = create_vector_dataset(8, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+
+    // NULL column.
+    let rc2 = unsafe {
+        lance_scanner_nearest(
+            scanner,
+            ptr::null(),
+            query.as_ptr() as *const std::ffi::c_void,
+            8,
+            LanceDataType::Float32 as i32,
+            5,
+        )
+    };
+    assert_eq!(rc2, -1);
+
+    // NULL query_data.
+    let rc3 = unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            ptr::null(),
+            8,
+            LanceDataType::Float32 as i32,
+            5,
+        )
+    };
+    assert_eq!(rc3, -1);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
