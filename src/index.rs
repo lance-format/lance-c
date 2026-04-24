@@ -423,7 +423,8 @@ fn build_vector_params(p: &LanceVectorIndexParams) -> Result<LanceCoreVectorInde
 /// Create a vector index on a column.
 ///
 /// `params.index_type` selects the variant; the rest of the fields are
-/// validated against that variant by [`build_vector_params`].
+/// validated against that variant (missing required fields produce a
+/// descriptive error naming the field).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_create_vector_index(
     dataset: *mut LanceDataset,
