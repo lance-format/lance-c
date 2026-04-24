@@ -35,10 +35,24 @@ pub struct LanceScanner {
     batch_size: Option<usize>,
     with_row_id: bool,
     fragment_ids: Option<Vec<u64>>,
+    nearest: Option<NearestQuery>,
+    nprobes: Option<u32>,
+    refine_factor: Option<u32>,
+    ef: Option<u32>,
+    metric_override: Option<crate::index::LanceMetricType>,
+    use_index: Option<bool>,
+    prefilter: bool,
     // Materialized on first iteration call
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
     #[allow(dead_code)]
     schema: Option<SchemaRef>,
+}
+
+#[allow(dead_code)]
+struct NearestQuery {
+    column: String,
+    query: arrow_array::ArrayRef,
+    k: u32,
 }
 
 /// Poll status for `lance_scanner_poll_next`.
@@ -71,6 +85,13 @@ impl LanceScanner {
             batch_size: None,
             with_row_id: false,
             fragment_ids: None,
+            nearest: None,
+            nprobes: None,
+            refine_factor: None,
+            ef: None,
+            metric_override: None,
+            use_index: None,
+            prefilter: false,
             stream: None,
             schema: None,
         }
@@ -569,4 +590,87 @@ fn make_raw_waker(waker_fn: LanceWaker, ctx: *mut c_void) -> RawWaker {
     );
 
     RawWaker::new(data, &VTABLE)
+}
+
+// ---------------------------------------------------------------------------
+// Vector search (Phase 2): setter knobs
+// ---------------------------------------------------------------------------
+
+macro_rules! scanner_set_u32 {
+    ($name:ident, $field:ident) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(scanner: *mut LanceScanner, value: u32) -> i32 {
+            if scanner.is_null() {
+                set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+                return -1;
+            }
+            unsafe {
+                (*scanner).$field = Some(value);
+            }
+            crate::error::clear_last_error();
+            0
+        }
+    };
+}
+
+scanner_set_u32!(lance_scanner_set_nprobes, nprobes);
+scanner_set_u32!(lance_scanner_set_refine_factor, refine_factor);
+scanner_set_u32!(lance_scanner_set_ef, ef);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_metric(scanner: *mut LanceScanner, metric: i32) -> i32 {
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+        return -1;
+    }
+    let m = match metric {
+        0 => crate::index::LanceMetricType::L2,
+        1 => crate::index::LanceMetricType::Cosine,
+        2 => crate::index::LanceMetricType::Dot,
+        3 => crate::index::LanceMetricType::Hamming,
+        _ => {
+            set_last_error(
+                LanceErrorCode::InvalidArgument,
+                format!("invalid metric: {}", metric),
+            );
+            return -1;
+        }
+    };
+    unsafe {
+        (*scanner).metric_override = Some(m);
+    }
+    crate::error::clear_last_error();
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_use_index(
+    scanner: *mut LanceScanner,
+    enable: bool,
+) -> i32 {
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+        return -1;
+    }
+    unsafe {
+        (*scanner).use_index = Some(enable);
+    }
+    crate::error::clear_last_error();
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_prefilter(
+    scanner: *mut LanceScanner,
+    enable: bool,
+) -> i32 {
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+        return -1;
+    }
+    unsafe {
+        (*scanner).prefilter = enable;
+    }
+    crate::error::clear_last_error();
+    0
 }

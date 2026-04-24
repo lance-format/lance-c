@@ -431,6 +431,35 @@ uint64_t lance_dataset_index_count(const LanceDataset* dataset);
  */
 const char* lance_dataset_index_list_json(const LanceDataset* dataset);
 
+/* ─── Vector search (Phase 2) ─── */
+
+/**
+ * Set the k-NN query on the scanner.
+ * @param column        Vector column (FixedSizeList<element_type>).
+ * @param query_data    Pointer to a single query vector of length `query_len`.
+ * @param query_len     Number of elements in the query (= column dim).
+ * @param element_type  Element type of the query (must match column).
+ * @param k             Number of nearest neighbors to return.
+ * @return 0 on success, -1 on error.
+ *
+ * Defined in a follow-up commit; declaration only here.
+ */
+int32_t lance_scanner_nearest(
+    LanceScanner* scanner,
+    const char* column,
+    const void* query_data,
+    size_t query_len,
+    LanceDataType element_type,
+    uint32_t k
+);
+
+int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t n);
+int32_t lance_scanner_set_refine_factor(LanceScanner* scanner, uint32_t f);
+int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e);
+int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);
+int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
+int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
