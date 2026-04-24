@@ -40,7 +40,7 @@ unsafe fn versions_inner(dataset: *const LanceDataset) -> Result<*mut LanceVersi
         });
     }
     let ds = unsafe { &*dataset };
-    let versions = block_on(ds.inner.versions())?;
+    let versions = block_on(ds.snapshot().versions())?;
     let entries = versions
         .into_iter()
         .map(|v| VersionEntry {

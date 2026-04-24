@@ -1657,6 +1657,7 @@ fn test_robotics_e2e_write_then_finalize() {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Version history (lance_dataset_versions)
 // ---------------------------------------------------------------------------
 
@@ -1782,4 +1783,40 @@ fn test_versions_accessors_null_handle() {
 #[test]
 fn test_versions_close_null_is_safe() {
     unsafe { lance_versions_close(ptr::null_mut()) };
+}
+
+// ---------------------------------------------------------------------------
+// Index lifecycle tests (Phase 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_create_scalar_index_btree() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let column = c_str("id");
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(), /* default name */
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(), /* no params */
+            false,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "create_scalar_index returned {} ({:?})",
+        rc,
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+
+    let count = unsafe { lance_dataset_index_count(ds) };
+    assert_eq!(count, 1);
+
+    unsafe { lance_dataset_close(ds) };
 }
