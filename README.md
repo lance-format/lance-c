@@ -32,11 +32,11 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | Status | Component | Description |
 |--------|-----------|-------------|
 | [x] | Vector search | Nearest-neighbor via scanner with metric/k/nprobes |
-| [ ] | Full-text search | FTS queries through scanner interface |
+| [x] | Full-text search | FTS queries through scanner interface |
 | [x] | Vector index creation | IVF_PQ, IVF_FLAT, IVF_SQ, HNSW variants |
 | [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List indexes |
 | [x] | Index management | List and drop index operations |
-| [ ] | C++ wrappers | `create_vector_index()` and `create_scalar_index()` methods |
+| [x] | C++ wrappers | `create_vector_index()` and `create_scalar_index()` methods |
 
 ### Phase 3: Write Path & Mutations
 
