@@ -201,13 +201,58 @@ static void test_error_handling(void) {
     printf("OK\n");
 }
 
+/* Round-trip: scan src dataset to an ArrowArrayStream, write it into a new
+ * dataset at dst_uri, and verify row counts match. dst_uri must not pre-exist. */
+static void test_dataset_write_roundtrip(const char *src_uri, const char *dst_uri) {
+    printf("  test_dataset_write_roundtrip... ");
+
+    LanceDataset *src = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(src != NULL, "open source failed");
+    uint64_t src_rows = lance_dataset_count_rows(src);
+    CHECK_OK();
+
+    LanceScanner *scanner = lance_scanner_new(src, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    int32_t rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    rc = stream.get_schema(&stream, &schema);
+    ASSERT(rc == 0, "get_schema from stream failed");
+
+    LanceDataset *dst = NULL;
+    rc = lance_dataset_write(
+        dst_uri, &schema, &stream, LANCE_WRITE_CREATE, NULL, &dst);
+    ASSERT(rc == 0, "lance_dataset_write failed");
+    ASSERT(dst != NULL, "out_dataset should be populated");
+
+    /* stream is consumed by lance_dataset_write; schema we own. */
+    if (schema.release) schema.release(&schema);
+
+    uint64_t dst_rows = lance_dataset_count_rows(dst);
+    CHECK_OK();
+    ASSERT(dst_rows == src_rows, "row count mismatch after write");
+    printf("src=%llu, dst=%llu... ",
+           (unsigned long long)src_rows, (unsigned long long)dst_rows);
+
+    lance_dataset_close(dst);
+    lance_scanner_close(scanner);
+    lance_dataset_close(src);
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <dataset_uri>\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri>\n", argv[0]);
         return 1;
     }
 
     const char *uri = argv[1];
+    const char *write_uri = argv[2];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_open_and_metadata(uri);
@@ -215,6 +260,7 @@ int main(int argc, char **argv) {
     test_scan_with_limit(uri);
     test_versions(uri);
     test_error_handling();
+    test_dataset_write_roundtrip(uri, write_uri);
 
     printf("All C tests passed!\n");
     return 0;
