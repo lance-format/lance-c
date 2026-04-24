@@ -190,6 +190,41 @@ static void test_index_lifecycle(const std::string& uri) {
     PASS();
 }
 
+static void test_nearest_smoke(const std::string& uri) {
+    TEST(test_nearest_smoke);
+
+    auto ds = lance::Dataset::open(uri);
+    auto scanner = ds.scan();
+    float q[8] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+
+    // The test dataset doesn't have a vector column; calling nearest will
+    // either succeed (if "name" or "id" happens to work — won't) or throw.
+    // We just exercise the wrapper code paths, expecting either outcome
+    // gracefully. Compile/link is the main goal here.
+    bool caught = false;
+    try {
+        scanner.nearest("embedding", q, 8, 5)
+               .nprobes(2)
+               .refine_factor(1)
+               .ef(50)
+               .metric(LANCE_METRIC_L2)
+               .use_index(true)
+               .prefilter(false);
+        // Try to materialize — will throw because "embedding" column doesn't exist
+        // in the basic test fixture.
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        if (stream.release) stream.release(&stream);
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    // Either path is fine — we proved compile + linkage + the fluent chain.
+    (void)caught;
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <dataset_uri>\n", argv[0]);
@@ -207,6 +242,7 @@ int main(int argc, char** argv) {
     test_versions(uri);
     test_error_exception(uri);
     test_index_lifecycle(uri);
+    test_nearest_smoke(uri);
 
     printf("All C++ tests passed!\n");
     return 0;

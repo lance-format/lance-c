@@ -325,6 +325,48 @@ public:
         lance_scanner_scan_async(handle_.get(), callback, ctx);
     }
 
+    /// k-NN search (Float32 sugar).
+    Scanner& nearest(const std::string& column, const float* q, size_t dim, uint32_t k) {
+        if (lance_scanner_nearest(handle_.get(), column.c_str(),
+                                   q, dim, LANCE_DTYPE_FLOAT32, k) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// k-NN search (typed).
+    Scanner& nearest(const std::string& column, const void* q, size_t dim,
+                     LanceDataType dtype, uint32_t k) {
+        if (lance_scanner_nearest(handle_.get(), column.c_str(),
+                                   q, dim, dtype, k) != 0)
+            check_error();
+        return *this;
+    }
+
+    Scanner& nprobes(uint32_t n) {
+        if (lance_scanner_set_nprobes(handle_.get(), n) != 0) check_error();
+        return *this;
+    }
+    Scanner& refine_factor(uint32_t f) {
+        if (lance_scanner_set_refine_factor(handle_.get(), f) != 0) check_error();
+        return *this;
+    }
+    Scanner& ef(uint32_t e) {
+        if (lance_scanner_set_ef(handle_.get(), e) != 0) check_error();
+        return *this;
+    }
+    Scanner& metric(LanceMetricType m) {
+        if (lance_scanner_set_metric(handle_.get(), m) != 0) check_error();
+        return *this;
+    }
+    Scanner& use_index(bool enable) {
+        if (lance_scanner_set_use_index(handle_.get(), enable) != 0) check_error();
+        return *this;
+    }
+    Scanner& prefilter(bool enable) {
+        if (lance_scanner_set_prefilter(handle_.get(), enable) != 0) check_error();
+        return *this;
+    }
+
     /// Access the underlying C handle.
     LanceScanner* c_handle() { return handle_.get(); }
 };
