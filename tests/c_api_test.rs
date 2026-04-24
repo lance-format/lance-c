@@ -2247,3 +2247,51 @@ fn test_create_index_replace_false_conflicts() {
     );
     unsafe { lance_dataset_close(ds) };
 }
+
+// ---------------------------------------------------------------------------
+// Vector search (k-NN) tests (Phase 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_scanner_nearest_brute_force() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let query: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
+    let column = c_str("embedding");
+    let rc = unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            query.len(),
+            LanceDataType::Float32 as i32,
+            5,
+        )
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let rc2 = unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) };
+    assert_eq!(rc2, 0);
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream as *mut _).unwrap() };
+    let schema = reader.schema();
+    let saw_distance = schema.field_with_name("_distance").is_ok();
+
+    let mut total = 0;
+    for batch in reader {
+        let b = batch.unwrap();
+        total += b.num_rows();
+    }
+    assert!(saw_distance, "_distance column missing from schema");
+    assert_eq!(total, 5, "expected k=5 results");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
