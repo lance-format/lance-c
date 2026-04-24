@@ -17,6 +17,8 @@
 
 #include "lance.h"
 
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -259,6 +261,29 @@ public:
         return out;
     }
 
+    /// Number of segments that make up a logical vector index.
+    /// Throws lance::Error with code NotFound if the index does not exist.
+    uint64_t index_segment_count(const std::string& index_name) const {
+        uint64_t n = lance_dataset_index_segment_count(handle_.get(), index_name.c_str());
+        if (n == 0 && lance_last_error_code() != LANCE_OK) check_error();
+        return n;
+    }
+
+    /// UUIDs of the physical segments that make up a logical vector index.
+    /// Each UUID is a 16-byte array (RFC 4122 layout). Used by distributed
+    /// query engines to fan k-NN out across workers — see
+    /// `Scanner::index_segments`.
+    std::vector<std::array<uint8_t, 16>> index_segments(const std::string& index_name) const {
+        uint64_t count = index_segment_count(index_name);
+        std::vector<std::array<uint8_t, 16>> out(count);
+        if (count == 0) return out;
+        // out is contiguous: 16 bytes per element.
+        if (lance_dataset_index_segments(handle_.get(), index_name.c_str(),
+                                          reinterpret_cast<uint8_t*>(out.data())) != 0)
+            check_error();
+        return out;
+    }
+
     /// Access the underlying C handle (does not transfer ownership).
     const LanceDataset* c_handle() const { return handle_.get(); }
 
@@ -312,6 +337,21 @@ public:
     /// Restrict scan to specific fragment IDs (vector overload).
     Scanner& fragment_ids(const std::vector<uint64_t>& ids) {
         return fragment_ids(ids.data(), ids.size());
+    }
+
+    /// Restrict the next k-NN query to a subset of vector index segments.
+    /// Pass `len` 16-byte UUIDs concatenated as a single byte buffer
+    /// (total bytes = `len * 16`). Pass len=0 (and any pointer) to clear.
+    Scanner& index_segments(const uint8_t* uuids, size_t len) {
+        if (lance_scanner_set_index_segments(handle_.get(), uuids, len) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Restrict the next k-NN query to a subset of vector index segments
+    /// (typed vector overload).
+    Scanner& index_segments(const std::vector<std::array<uint8_t, 16>>& uuids) {
+        return index_segments(reinterpret_cast<const uint8_t*>(uuids.data()), uuids.size());
     }
 
     /// Materialize the scan as an ArrowArrayStream (blocking).
