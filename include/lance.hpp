@@ -84,6 +84,16 @@ public:
 
 class Scanner;
 
+// ─── Version history ─────────────────────────────────────────────────────────
+
+/// Metadata for a single dataset version.
+/// `id` mirrors the upstream Version::version (monotonic manifest version);
+/// `timestamp_ms` is Unix epoch milliseconds.
+struct VersionInfo {
+    uint64_t id;
+    int64_t  timestamp_ms;
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -129,6 +139,27 @@ public:
         uint64_t v = lance_dataset_latest_version(handle_.get());
         if (lance_last_error_code() != LANCE_OK) check_error();
         return v;
+    }
+
+    /// Snapshot the dataset's version history, ordered by version id.
+    /// Throws lance::Error on failure.
+    std::vector<VersionInfo> versions() const {
+        auto* raw = lance_dataset_versions(handle_.get());
+        if (!raw) check_error();
+        Handle<LanceVersions, lance_versions_close> snap(raw);
+
+        uint64_t n = lance_versions_count(snap.get());
+        std::vector<VersionInfo> out;
+        out.reserve(static_cast<size_t>(n));
+        for (uint64_t i = 0; i < n; i++) {
+            VersionInfo info;
+            info.id = lance_versions_id_at(snap.get(), static_cast<size_t>(i));
+            info.timestamp_ms =
+                lance_versions_timestamp_ms_at(snap.get(), static_cast<size_t>(i));
+            if (lance_last_error_code() != LANCE_OK) check_error();
+            out.push_back(info);
+        }
+        return out;
     }
 
     /// Export the schema as an Arrow C Data Interface struct.
