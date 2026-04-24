@@ -100,7 +100,9 @@ class Dataset {
     Handle<LanceDataset, lance_dataset_close> handle_;
 
 public:
-    /// Open a dataset at the given URI.
+    /// Open a dataset at the given URI. Pass `version` = 0 (the default) for
+    /// the latest, or a specific version id from `versions()` to check out
+    /// that version, e.g. `lance::Dataset::open("data.lance", {}, /*version=*/42)`.
     static Dataset open(
         const std::string& uri,
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {},

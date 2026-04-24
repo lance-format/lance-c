@@ -101,6 +101,11 @@ typedef struct LanceVersions LanceVersions;
 /**
  * Open a Lance dataset.
  *
+ * Pass `version` = 0 to open the latest, or a specific version id (e.g. one
+ * returned by `lance_dataset_versions`) to check out that version:
+ *
+ *     LanceDataset* ds = lance_dataset_open("data.lance", NULL, 42);
+ *
  * @param uri           Dataset path (file://, s3://, memory://, etc.)
  * @param storage_opts  NULL-terminated key-value pairs ["k1","v1",NULL], or NULL
  * @param version       Version to open (0 = latest)
