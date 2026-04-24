@@ -2178,3 +2178,72 @@ fn test_vector_index_missing_required_param() {
     assert!(msg.contains("num_sub_vectors"), "msg was: {}", msg);
     unsafe { lance_dataset_close(ds) };
 }
+
+#[test]
+fn test_create_index_replace_true() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("id");
+    let name = c_str("dup");
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            false,
+        );
+    }
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            true,
+        )
+    };
+    assert_eq!(rc, 0, "replace=true should succeed");
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_create_index_replace_false_conflicts() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("id");
+    let name = c_str("dup2");
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            false,
+        );
+    }
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    let code = lance_last_error_code();
+    assert!(
+        code == LanceErrorCode::IndexError || code == LanceErrorCode::InvalidArgument,
+        "expected IndexError or InvalidArgument, got {:?}",
+        code
+    );
+    unsafe { lance_dataset_close(ds) };
+}
