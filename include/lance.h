@@ -385,6 +385,43 @@ int32_t lance_dataset_write(
     LanceDataset** out_dataset
 );
 
+/**
+ * Tunable parameters for lance_dataset_write_with_params. Zero-valued numeric
+ * fields and NULL string fields keep upstream's defaults.
+ */
+typedef struct LanceWriteParams {
+    /* Soft cap on rows per data file. 0 = default. */
+    uint64_t    max_rows_per_file;
+    /* Soft cap on rows per row group. 0 = default. */
+    uint64_t    max_rows_per_group;
+    /* Soft cap on bytes per data file (~90 GB upstream default). 0 = default. */
+    uint64_t    max_bytes_per_file;
+    /* Lance file format version, e.g. "2.0", "2.1", "stable", "legacy".
+     * NULL = default. Invalid strings → LANCE_ERR_INVALID_ARGUMENT. */
+    const char* data_storage_version;
+    /* Opt into stable row ids (better for compaction at a small write cost). */
+    bool        enable_stable_row_ids;
+} LanceWriteParams;
+
+/**
+ * Same as lance_dataset_write but takes a LanceWriteParams for tuning the
+ * output shape. Pass `params` = NULL to use defaults (equivalent to calling
+ * lance_dataset_write directly).
+ *
+ * @return 0 on success, -1 on error. See lance_dataset_write for the error
+ *         code list; invalid `data_storage_version` also returns
+ *         LANCE_ERR_INVALID_ARGUMENT.
+ */
+int32_t lance_dataset_write_with_params(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    LanceWriteMode mode,
+    const LanceWriteParams* params,
+    const char* const* storage_opts,
+    LanceDataset** out_dataset
+);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
