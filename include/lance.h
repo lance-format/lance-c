@@ -156,6 +156,22 @@ int64_t lance_versions_timestamp_ms_at(const LanceVersions* versions, size_t ind
 void lance_versions_close(LanceVersions* versions);
 
 /**
+ * Restore the dataset to an older version by committing a new manifest that
+ * carries the fragments of `version`. If `version` is already the latest,
+ * succeeds as a no-op without writing a new manifest.
+ *
+ * @param dataset  Open dataset (not consumed). Must not be NULL.
+ * @param version  Target version id (>= 1). `0` is rejected since it is the
+ *                 "latest" sentinel used by lance_dataset_open.
+ * @return Fresh LanceDataset* positioned at the target version (caller closes
+ *         with lance_dataset_close), or NULL on error. Possible error codes
+ *         include LANCE_ERR_INVALID_ARGUMENT (NULL handle or version == 0),
+ *         LANCE_ERR_NOT_FOUND (unknown version),
+ *         LANCE_ERR_COMMIT_CONFLICT (concurrent writer).
+ */
+LanceDataset* lance_dataset_restore(const LanceDataset* dataset, uint64_t version);
+
+/**
  * Export the dataset schema via Arrow C Data Interface.
  * @param out  Pointer to caller-allocated ArrowSchema struct
  * @return 0 on success, -1 on error

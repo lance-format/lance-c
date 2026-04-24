@@ -1783,3 +1783,107 @@ fn test_versions_accessors_null_handle() {
 fn test_versions_close_null_is_safe() {
     unsafe { lance_versions_close(ptr::null_mut()) };
 }
+
+// ---------------------------------------------------------------------------
+// Restore (lance_dataset_restore)
+// ---------------------------------------------------------------------------
+
+/// Helper: set up a dataset with two versions — initial create (rows 1..=5)
+/// plus an append (rows 6..=7), returning `(tempdir, uri)`.
+fn create_two_version_dataset() -> (tempfile::TempDir, String) {
+    let (tmp, uri) = create_test_dataset();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![6, 7])),
+            Arc::new(StringArray::from(vec!["frank", "grace"])),
+        ],
+    )
+    .unwrap();
+    append_batch(&uri, schema, batch);
+    (tmp, uri)
+}
+
+#[test]
+fn test_dataset_restore_to_prior_version() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert_eq!(unsafe { lance_dataset_version(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 7);
+
+    // Restore to V1 — expect a fresh handle at a new version (3) with V1's
+    // row count (5).
+    let restored = unsafe { lance_dataset_restore(ds, 1) };
+    assert!(!restored.is_null());
+    assert_eq!(unsafe { lance_dataset_version(restored) }, 3);
+    assert_eq!(unsafe { lance_dataset_count_rows(restored) }, 5);
+
+    // Original handle is untouched.
+    assert_eq!(unsafe { lance_dataset_version(ds) }, 2);
+
+    unsafe { lance_dataset_close(restored) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_restore_to_current_latest_is_noop() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let latest = unsafe { lance_dataset_version(ds) };
+    assert_eq!(latest, 2);
+
+    let restored = unsafe { lance_dataset_restore(ds, latest) };
+    assert!(!restored.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_version(restored) },
+        latest,
+        "restore to latest must not bump the version"
+    );
+
+    // No new manifest: reopening the dataset reports the same latest.
+    unsafe { lance_dataset_close(restored) };
+    let ds2 = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert_eq!(unsafe { lance_dataset_version(ds2) }, latest);
+
+    unsafe { lance_dataset_close(ds2) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_restore_nonexistent_version() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let restored = unsafe { lance_dataset_restore(ds, 999) };
+    assert!(restored.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_restore_version_zero_rejected() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let restored = unsafe { lance_dataset_restore(ds, 0) };
+    assert!(restored.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_restore_null_dataset_rejected() {
+    let restored = unsafe { lance_dataset_restore(ptr::null(), 1) };
+    assert!(restored.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}

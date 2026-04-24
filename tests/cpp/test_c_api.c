@@ -179,6 +179,25 @@ static void test_versions(const char *uri) {
     printf("OK\n");
 }
 
+/* Restore the dataset to its own current version — expected to be a no-op
+ * (same version id, no new manifest written). This is the only restore path
+ * that's safe to run against the shared read-only test dataset. */
+static void test_restore_noop(const char *uri) {
+    printf("  test_restore_noop... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t current = lance_dataset_version(ds);
+
+    LanceDataset *after = lance_dataset_restore(ds, current);
+    ASSERT(after != NULL, "restore failed");
+    ASSERT(lance_dataset_version(after) == current, "version unexpectedly changed");
+
+    lance_dataset_close(after);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static void test_error_handling(void) {
     printf("  test_error_handling... ");
 
@@ -214,6 +233,7 @@ int main(int argc, char **argv) {
     test_scan(uri);
     test_scan_with_limit(uri);
     test_versions(uri);
+    test_restore_noop(uri);
     test_error_handling();
 
     printf("All C tests passed!\n");
