@@ -173,6 +173,23 @@ static void test_error_exception(const std::string& /*uri*/) {
     PASS();
 }
 
+static void test_index_lifecycle(const std::string& uri) {
+    TEST(test_index_lifecycle);
+
+    auto ds = lance::Dataset::open(uri);
+    ds.create_scalar_index("id", LANCE_SCALAR_BTREE, "id_idx");
+    assert(ds.index_count() == 1);
+
+    auto json = ds.list_indices_json();
+    assert(json.find("id_idx") != std::string::npos);
+    printf("listed: %s... ", json.c_str());
+
+    ds.drop_index("id_idx");
+    assert(ds.index_count() == 0);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <dataset_uri>\n", argv[0]);
@@ -189,6 +206,7 @@ int main(int argc, char** argv) {
     test_raii_cleanup(uri);
     test_versions(uri);
     test_error_exception(uri);
+    test_index_lifecycle(uri);
 
     printf("All C++ tests passed!\n");
     return 0;

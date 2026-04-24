@@ -174,7 +174,7 @@ unsafe fn scanner_new_inner(
     let col_names = unsafe { helpers::parse_c_string_array(columns)? };
     let filter_str = unsafe { helpers::parse_c_string(filter)? }.map(|s| s.to_string());
 
-    let mut scanner = LanceScanner::new(ds.inner.clone());
+    let mut scanner = LanceScanner::new(ds.snapshot());
     scanner.columns = col_names;
     scanner.filter = filter_str;
     Ok(Box::into_raw(Box::new(scanner)))

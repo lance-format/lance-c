@@ -1657,6 +1657,7 @@ fn test_robotics_e2e_write_then_finalize() {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Version history (lance_dataset_versions)
 // ---------------------------------------------------------------------------
 
@@ -1782,4 +1783,467 @@ fn test_versions_accessors_null_handle() {
 #[test]
 fn test_versions_close_null_is_safe() {
     unsafe { lance_versions_close(ptr::null_mut()) };
+}
+
+// ---------------------------------------------------------------------------
+// Index lifecycle tests (Phase 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_create_scalar_index_btree() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let column = c_str("id");
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(), /* default name */
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(), /* no params */
+            false,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "create_scalar_index returned {} ({:?})",
+        rc,
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+
+    let count = unsafe { lance_dataset_index_count(ds) };
+    assert_eq!(count, 1);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+/// Helper: create a dataset with a List<Utf8> column for LabelList index testing.
+fn create_label_list_dataset() -> (tempfile::TempDir, String) {
+    use arrow_array::ListArray;
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ll_ds").to_str().unwrap().to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+
+    let mut tag_builder = ListBuilder::new(StringBuilder::new());
+    tag_builder.values().append_value("rust");
+    tag_builder.values().append_value("ffi");
+    tag_builder.append(true);
+    tag_builder.values().append_value("cpp");
+    tag_builder.append(true);
+    let tags: ListArray = tag_builder.finish();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(tags)],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    (tmp, uri)
+}
+
+#[test]
+fn test_create_scalar_index_bitmap() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("name");
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::Bitmap as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_create_scalar_index_inverted() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("name");
+    // Inverted index requires JSON params with at least `base_tokenizer` and
+    // `language`. Pass the documented defaults.
+    let params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::Inverted as i32,
+            params.as_ptr(),
+            false,
+        )
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_create_scalar_index_label_list() {
+    let (_tmp, uri) = create_label_list_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("tags");
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::LabelList as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_index() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("id");
+    let name = c_str("my_idx");
+
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            false,
+        );
+    }
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+
+    let rc = unsafe { lance_dataset_drop_index(ds, name.as_ptr()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 0);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_missing_index() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let name = c_str("does_not_exist");
+    let rc = unsafe { lance_dataset_drop_index(ds, name.as_ptr()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_list_indices_json() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("id");
+    let name = c_str("id_btree");
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            false,
+        );
+    }
+
+    let json_ptr = unsafe { lance_dataset_index_list_json(ds) };
+    assert!(!json_ptr.is_null());
+    let json = unsafe {
+        std::ffi::CStr::from_ptr(json_ptr)
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    unsafe { lance_free_string(json_ptr) };
+
+    assert!(json.contains("\"name\":\"id_btree\""), "json was: {}", json);
+    assert!(json.contains("\"columns\":[\"id\"]"), "json was: {}", json);
+    assert!(json.contains("\"type\""), "json was: {}", json);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ---------------------------------------------------------------------------
+// Vector index lifecycle tests (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Helper: create a dataset with a FixedSizeList<Float32> column for vector index testing.
+fn create_vector_dataset(num_rows: i32, dim: i32) -> (tempfile::TempDir, String) {
+    use arrow_array::FixedSizeListArray;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("vec_ds").to_str().unwrap().to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        ),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+
+    let mut emb_builder = FixedSizeListBuilder::new(Float32Builder::new(), dim);
+    let texts: Vec<String> = (0..num_rows).map(|i| format!("doc {i}")).collect();
+    let mut rng_seed: u32 = 1;
+    for _ in 0..num_rows {
+        for _ in 0..dim {
+            // simple deterministic pseudo-random in [0,1)
+            rng_seed = rng_seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            emb_builder
+                .values()
+                .append_value((rng_seed as f32) / (u32::MAX as f32));
+        }
+        emb_builder.append(true);
+    }
+    let embeddings: FixedSizeListArray = emb_builder.finish();
+    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from((0..num_rows).collect::<Vec<_>>())),
+            Arc::new(embeddings) as Arc<dyn arrow_array::Array>,
+            Arc::new(StringArray::from(text_refs)),
+        ],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    (tmp, uri)
+}
+
+#[test]
+fn test_create_vector_index_ivf_flat() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfFlat,
+        metric: LanceMetricType::L2,
+        num_partitions: 8,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    let rc = unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &params, false)
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_create_vector_index_ivf_pq() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfPq,
+        metric: LanceMetricType::L2,
+        num_partitions: 8,
+        num_sub_vectors: 4,
+        num_bits: 8,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    let rc = unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &params, false)
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_create_vector_index_ivf_hnsw_sq() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfHnswSq,
+        metric: LanceMetricType::L2,
+        num_partitions: 8,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 0,
+        hnsw_m: 16,
+        hnsw_ef_construction: 100,
+        sample_rate: 0,
+    };
+    let rc = unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &params, false)
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_vector_index_missing_required_param() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfPq,
+        metric: LanceMetricType::L2,
+        num_partitions: 8,
+        num_sub_vectors: 0, // missing!
+        num_bits: 0,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    let rc = unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &params, false)
+    };
+    assert_eq!(rc, -1);
+    let msg = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(msg.contains("num_sub_vectors"), "msg was: {}", msg);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_create_index_replace_true() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("id");
+    let name = c_str("dup");
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            false,
+        );
+    }
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            true,
+        )
+    };
+    assert_eq!(rc, 0, "replace=true should succeed");
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_create_index_replace_false_conflicts() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("id");
+    let name = c_str("dup2");
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            false,
+        );
+    }
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    let code = lance_last_error_code();
+    assert!(
+        code == LanceErrorCode::IndexError || code == LanceErrorCode::InvalidArgument,
+        "expected IndexError or InvalidArgument, got {:?}",
+        code
+    );
+    unsafe { lance_dataset_close(ds) };
 }

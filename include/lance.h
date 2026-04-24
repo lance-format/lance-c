@@ -80,6 +80,51 @@ typedef enum {
     LANCE_ERR_COMMIT_CONFLICT = 8,
 } LanceErrorCode;
 
+/* ─── Index types (Phase 2) ─── */
+
+typedef enum {
+    LANCE_INDEX_IVF_FLAT      = 101,
+    LANCE_INDEX_IVF_SQ        = 102,
+    LANCE_INDEX_IVF_PQ        = 103,
+    LANCE_INDEX_IVF_HNSW_SQ   = 104,
+    LANCE_INDEX_IVF_HNSW_PQ   = 105,
+    LANCE_INDEX_IVF_HNSW_FLAT = 106,
+} LanceVectorIndexType;
+
+typedef enum {
+    LANCE_SCALAR_BTREE      = 1,
+    LANCE_SCALAR_BITMAP     = 2,
+    LANCE_SCALAR_LABEL_LIST = 3,
+    LANCE_SCALAR_INVERTED   = 4,
+} LanceScalarIndexType;
+
+typedef enum {
+    LANCE_METRIC_L2      = 0,
+    LANCE_METRIC_COSINE  = 1,
+    LANCE_METRIC_DOT     = 2,
+    LANCE_METRIC_HAMMING = 3,
+} LanceMetricType;
+
+typedef enum {
+    LANCE_DTYPE_FLOAT32 = 0,
+    LANCE_DTYPE_FLOAT16 = 1,
+    LANCE_DTYPE_FLOAT64 = 2,
+    LANCE_DTYPE_UINT8   = 3,
+    LANCE_DTYPE_INT8    = 4,
+} LanceDataType;
+
+typedef struct {
+    LanceVectorIndexType index_type;
+    LanceMetricType      metric;
+    uint32_t num_partitions;        /* IVF; 0 = default (lance internal) */
+    uint32_t num_sub_vectors;       /* PQ;  0 = default */
+    uint32_t num_bits;              /* PQ/RQ; 0 = 8 */
+    uint32_t max_iterations;        /* IVF kmeans; 0 = 50 */
+    uint32_t hnsw_m;                /* HNSW; 0 = default */
+    uint32_t hnsw_ef_construction;  /* HNSW; 0 = default */
+    uint32_t sample_rate;           /* IVF; 0 = 256 */
+} LanceVectorIndexParams;
+
 /** Return the error code from the last failed operation on this thread. */
 LanceErrorCode lance_last_error_code(void);
 
@@ -339,6 +384,52 @@ int32_t lance_write_fragments(
     struct ArrowArrayStream* stream,
     const char* const* storage_opts
 );
+
+/* ─── Index lifecycle (Phase 2) ─── */
+
+/**
+ * Create a vector index on a column.
+ * @param dataset    Open dataset (mutated; same handle remains valid).
+ * @param column     Column name (must be FixedSizeList<float32|float16|uint8|int8>).
+ * @param index_name Optional index name; NULL → "<column>_idx".
+ * @param params     Vector index params; index_type field selects the variant.
+ * @param replace    If true, replace any existing index of the same name.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_vector_index(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexParams* params,
+    bool replace
+);
+
+/**
+ * Create a scalar index on a column.
+ * @param params_json Optional JSON params string (e.g. inverted tokenizer config), or NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_scalar_index(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    LanceScalarIndexType index_type,
+    const char* params_json,
+    bool replace
+);
+
+/** Drop an index by name. Returns -1 (NOT_FOUND) if no such index. */
+int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name);
+
+/** Number of user indexes (excludes system indexes). Returns 0 on error. */
+uint64_t lance_dataset_index_count(const LanceDataset* dataset);
+
+/**
+ * JSON array describing all user indexes.
+ * Caller must free the returned string with lance_free_string().
+ * Returns NULL on error.
+ */
+const char* lance_dataset_index_list_json(const LanceDataset* dataset);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -212,6 +212,53 @@ public:
         return ids;
     }
 
+    /// Create a vector index on a column.
+    void create_vector_index(const std::string& column,
+                             const LanceVectorIndexParams& params,
+                             const std::string& name = "",
+                             bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        if (lance_dataset_create_vector_index(handle_.get(), column.c_str(),
+                                               name_c, &params, replace) != 0)
+            check_error();
+    }
+
+    /// Create a scalar index on a column.
+    void create_scalar_index(const std::string& column,
+                             LanceScalarIndexType index_type,
+                             const std::string& name = "",
+                             const std::string& params_json = "",
+                             bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        if (lance_dataset_create_scalar_index(handle_.get(), column.c_str(),
+                                               name_c, index_type,
+                                               json_c, replace) != 0)
+            check_error();
+    }
+
+    /// Drop an index by name.
+    void drop_index(const std::string& name) {
+        if (lance_dataset_drop_index(handle_.get(), name.c_str()) != 0)
+            check_error();
+    }
+
+    /// Number of user indexes (excludes system indexes).
+    uint64_t index_count() const {
+        uint64_t n = lance_dataset_index_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return n;
+    }
+
+    /// JSON array describing all user indexes.
+    std::string list_indices_json() const {
+        const char* json = lance_dataset_index_list_json(handle_.get());
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
+    }
+
     /// Access the underlying C handle (does not transfer ownership).
     const LanceDataset* c_handle() const { return handle_.get(); }
 
