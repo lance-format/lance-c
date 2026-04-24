@@ -1934,3 +1934,42 @@ fn test_create_scalar_index_label_list() {
     assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
     unsafe { lance_dataset_close(ds) };
 }
+
+#[test]
+fn test_drop_index() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("id");
+    let name = c_str("my_idx");
+
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            false,
+        );
+    }
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+
+    let rc = unsafe { lance_dataset_drop_index(ds, name.as_ptr()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 0);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_missing_index() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let name = c_str("does_not_exist");
+    let rc = unsafe { lance_dataset_drop_index(ds, name.as_ptr()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    unsafe { lance_dataset_close(ds) };
+}

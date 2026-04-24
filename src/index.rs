@@ -152,3 +152,26 @@ pub unsafe extern "C" fn lance_dataset_index_count(dataset: *const LanceDataset)
         }
     }
 }
+
+/// Drop an index by name.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_drop_index(
+    dataset: *mut LanceDataset,
+    name: *const c_char,
+) -> i32 {
+    ffi_try!(unsafe { drop_index_inner(dataset, name) }, neg)
+}
+
+unsafe fn drop_index_inner(dataset: *mut LanceDataset, name: *const c_char) -> Result<i32> {
+    if dataset.is_null() || name.is_null() {
+        return Err(lance_core::Error::InvalidInput {
+            source: "dataset and name must not be NULL".into(),
+            location: snafu::location!(),
+        });
+    }
+    let ds = unsafe { &*dataset };
+    let name_str = unsafe { helpers::parse_c_string(name)? }.unwrap();
+
+    ds.with_mut(|d| block_on(d.drop_index(name_str)))?;
+    Ok(0)
+}
