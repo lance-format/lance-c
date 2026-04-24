@@ -2096,3 +2096,85 @@ fn test_create_vector_index_ivf_flat() {
     assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
     unsafe { lance_dataset_close(ds) };
 }
+
+#[test]
+fn test_create_vector_index_ivf_pq() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfPq,
+        metric: LanceMetricType::L2,
+        num_partitions: 8,
+        num_sub_vectors: 4,
+        num_bits: 8,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    let rc = unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &params, false)
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_create_vector_index_ivf_hnsw_sq() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfHnswSq,
+        metric: LanceMetricType::L2,
+        num_partitions: 8,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 0,
+        hnsw_m: 16,
+        hnsw_ef_construction: 100,
+        sample_rate: 0,
+    };
+    let rc = unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &params, false)
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_vector_index_missing_required_param() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfPq,
+        metric: LanceMetricType::L2,
+        num_partitions: 8,
+        num_sub_vectors: 0, // missing!
+        num_bits: 0,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    let rc = unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &params, false)
+    };
+    assert_eq!(rc, -1);
+    let msg = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(msg.contains("num_sub_vectors"), "msg was: {}", msg);
+    unsafe { lance_dataset_close(ds) };
+}
