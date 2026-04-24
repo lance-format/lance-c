@@ -6,7 +6,7 @@
 //! Index creation mutates the dataset under an exclusive write lock; existing
 //! scanners that already cloned the inner Arc keep their snapshot view.
 
-use std::ffi::c_char;
+use std::ffi::{CString, c_char};
 
 use lance_core::Result;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
@@ -174,4 +174,71 @@ unsafe fn drop_index_inner(dataset: *mut LanceDataset, name: *const c_char) -> R
 
     ds.with_mut(|d| block_on(d.drop_index(name_str)))?;
     Ok(0)
+}
+
+/// JSON array describing all user indexes. Caller must free with lance_free_string().
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_index_list_json(
+    dataset: *const LanceDataset,
+) -> *const c_char {
+    if dataset.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "dataset is NULL");
+        return std::ptr::null();
+    }
+    let ds = unsafe { &*dataset };
+    let snap = ds.snapshot();
+
+    let result = (|| -> Result<String> {
+        let indices = block_on(snap.load_indices())?;
+        let schema = snap.schema();
+        let descriptions = block_on(snap.describe_indices(None))?;
+        // Map name -> index_type string from describe_indices (one I/O batch)
+        let type_by_name: std::collections::HashMap<String, String> = descriptions
+            .iter()
+            .map(|d| (d.name().to_string(), d.index_type().to_string()))
+            .collect();
+
+        let mut entries: Vec<String> = Vec::new();
+        for idx in indices.iter() {
+            if lance_index::is_system_index(idx) {
+                continue;
+            }
+            let columns: Vec<String> = idx
+                .fields
+                .iter()
+                .filter_map(|fid| schema.field_by_id(*fid).map(|f| f.name.clone()))
+                .collect();
+            let type_str = type_by_name
+                .get(&idx.name)
+                .cloned()
+                .unwrap_or_else(|| "Unknown".to_string());
+            let cols_json = columns
+                .iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\\\"")))
+                .collect::<Vec<_>>()
+                .join(",");
+            entries.push(format!(
+                "{{\"name\":\"{}\",\"uuid\":\"{}\",\"columns\":[{}],\"type\":\"{}\",\"dataset_version\":{}}}",
+                idx.name.replace('"', "\\\""),
+                idx.uuid,
+                cols_json,
+                type_str,
+                idx.dataset_version,
+            ));
+        }
+        Ok(format!("[{}]", entries.join(",")))
+    })();
+
+    match result {
+        Ok(json) => {
+            crate::error::clear_last_error();
+            CString::new(json)
+                .map(|s| s.into_raw() as *const c_char)
+                .unwrap_or(std::ptr::null())
+        }
+        Err(err) => {
+            crate::error::set_lance_error(&err);
+            std::ptr::null()
+        }
+    }
 }

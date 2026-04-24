@@ -1973,3 +1973,38 @@ fn test_drop_missing_index() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
     unsafe { lance_dataset_close(ds) };
 }
+
+#[test]
+fn test_list_indices_json() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("id");
+    let name = c_str("id_btree");
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            false,
+        );
+    }
+
+    let json_ptr = unsafe { lance_dataset_index_list_json(ds) };
+    assert!(!json_ptr.is_null());
+    let json = unsafe {
+        std::ffi::CStr::from_ptr(json_ptr)
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    unsafe { lance_free_string(json_ptr) };
+
+    assert!(json.contains("\"name\":\"id_btree\""), "json was: {}", json);
+    assert!(json.contains("\"columns\":[\"id\"]"), "json was: {}", json);
+    assert!(json.contains("\"type\""), "json was: {}", json);
+
+    unsafe { lance_dataset_close(ds) };
+}
