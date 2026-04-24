@@ -2618,3 +2618,129 @@ fn test_scanner_full_text_search() {
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
 }
+
+#[test]
+fn test_fts_fuzzy() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("name");
+    let inverted_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::Inverted as i32,
+            inverted_params.as_ptr(),
+            false,
+        );
+    }
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    // "alise" within edit distance 2 of "alice" (in the test fixture).
+    let q = c_str("alise");
+    let cols = [column.as_ptr(), ptr::null()];
+    let rc = unsafe { lance_scanner_full_text_search(scanner, q.as_ptr(), cols.as_ptr(), 2) };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream as *mut _).unwrap() };
+    let mut total = 0;
+    for b in reader {
+        total += b.unwrap().num_rows();
+    }
+    assert!(total >= 1, "expected fuzzy match for 'alise' → 'alice'");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_nearest_after_fts_is_rejected() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+
+    // Set FTS first (no inverted index needed for this test — error happens
+    // at the second call, before any stream materialization).
+    let q = c_str("foo");
+    unsafe {
+        lance_scanner_full_text_search(scanner, q.as_ptr(), ptr::null(), 0);
+    }
+
+    let column = c_str("embedding");
+    let query: Vec<f32> = vec![0.5; 8];
+    let rc = unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            8,
+            LanceDataType::Float32 as i32,
+            5,
+        )
+    };
+    assert_eq!(rc, -1);
+    let msg = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let lower = msg.to_lowercase();
+    assert!(
+        lower.contains("full_text")
+            || lower.contains("fts")
+            || lower.contains("mutually exclusive"),
+        "msg was: {}",
+        msg
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fts_after_nearest_is_rejected() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let column = c_str("embedding");
+    let query: Vec<f32> = vec![0.5; 8];
+    unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            8,
+            LanceDataType::Float32 as i32,
+            5,
+        );
+    }
+    let q = c_str("foo");
+    let rc = unsafe { lance_scanner_full_text_search(scanner, q.as_ptr(), ptr::null(), 0) };
+    assert_eq!(rc, -1);
+    let msg = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let lower = msg.to_lowercase();
+    assert!(
+        lower.contains("nearest")
+            || lower.contains("vector")
+            || lower.contains("mutually exclusive"),
+        "msg was: {}",
+        msg
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
