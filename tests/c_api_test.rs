@@ -2008,3 +2008,91 @@ fn test_list_indices_json() {
 
     unsafe { lance_dataset_close(ds) };
 }
+
+// ---------------------------------------------------------------------------
+// Vector index lifecycle tests (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Helper: create a dataset with a FixedSizeList<Float32> column for vector index testing.
+fn create_vector_dataset(num_rows: i32, dim: i32) -> (tempfile::TempDir, String) {
+    use arrow_array::FixedSizeListArray;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("vec_ds").to_str().unwrap().to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        ),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+
+    let mut emb_builder = FixedSizeListBuilder::new(Float32Builder::new(), dim);
+    let texts: Vec<String> = (0..num_rows).map(|i| format!("doc {i}")).collect();
+    let mut rng_seed: u32 = 1;
+    for _ in 0..num_rows {
+        for _ in 0..dim {
+            // simple deterministic pseudo-random in [0,1)
+            rng_seed = rng_seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            emb_builder
+                .values()
+                .append_value((rng_seed as f32) / (u32::MAX as f32));
+        }
+        emb_builder.append(true);
+    }
+    let embeddings: FixedSizeListArray = emb_builder.finish();
+    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from((0..num_rows).collect::<Vec<_>>())),
+            Arc::new(embeddings) as Arc<dyn arrow_array::Array>,
+            Arc::new(StringArray::from(text_refs)),
+        ],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    (tmp, uri)
+}
+
+#[test]
+fn test_create_vector_index_ivf_flat() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfFlat,
+        metric: LanceMetricType::L2,
+        num_partitions: 8,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    let rc = unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &params, false)
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}

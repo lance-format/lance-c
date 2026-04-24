@@ -22,6 +22,7 @@ lance = "3.0.1"
 lance-core = "3.0.1"
 lance-index = "3.0.1"
 lance-io = "3.0.1"
+lance-linalg = "3.0.1"
 arrow = { version = "57.0.0", features = ["prettyprint", "ffi"] }
 arrow-array = "57.0.0"
 arrow-schema = "57.0.0"
