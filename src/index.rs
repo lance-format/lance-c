@@ -8,9 +8,10 @@
 
 use std::ffi::{CString, c_char};
 
+use lance::index::DatasetIndexExt;
 use lance_core::Result;
+use lance_index::IndexType;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-use lance_index::{DatasetIndexExt, IndexType};
 
 use crate::dataset::LanceDataset;
 use crate::error::{LanceErrorCode, ffi_try, set_last_error};

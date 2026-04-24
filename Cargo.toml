@@ -18,11 +18,11 @@ rust-version = "1.91.0"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-lance = "3.0.1"
-lance-core = "3.0.1"
-lance-index = "3.0.1"
-lance-io = "3.0.1"
-lance-linalg = "3.0.1"
+lance = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
+lance-core = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
+lance-index = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
+lance-io = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
+lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
 arrow = { version = "57.0.0", features = ["prettyprint", "ffi"] }
 arrow-array = "57.0.0"
 arrow-schema = "57.0.0"
@@ -32,12 +32,13 @@ futures = "0.3"
 log = "0.4"
 pin-project = "1.0"
 snafu = "0.9"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-lance = "3.0.1"
-lance-datagen = "3.0.1"
-lance-file = "3.0.1"
-lance-table = "3.0.1"
+lance = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
+lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
+lance-table = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "57.0.0"
 arrow-schema = "57.0.0"

@@ -431,6 +431,33 @@ uint64_t lance_dataset_index_count(const LanceDataset* dataset);
  */
 const char* lance_dataset_index_list_json(const LanceDataset* dataset);
 
+/* ─── Distributed vector search: index segment enumeration ─── */
+
+/**
+ * Count the segments that make up a logical vector index.
+ *
+ * A logical index is a set of physical segments (one per distributed-build
+ * worker, or one per fragment range). Each segment has a stable UUID. Returns
+ * 0 if the index does not exist (also sets `LANCE_ERR_NOT_FOUND`) or on error.
+ */
+uint64_t lance_dataset_index_segment_count(
+    const LanceDataset* dataset,
+    const char* index_name
+);
+
+/**
+ * Fill `out_uuids` with the UUIDs of the segments that make up a logical index.
+ * Each UUID is written as 16 raw bytes (RFC 4122 layout). The caller must
+ * allocate at least `lance_dataset_index_segment_count() * 16` bytes.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_index_segments(
+    const LanceDataset* dataset,
+    const char* index_name,
+    uint8_t* out_uuids
+);
+
 /* ─── Vector search (Phase 2) ─── */
 
 /**
@@ -459,6 +486,26 @@ int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e);
 int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);
 int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
 int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
+
+/**
+ * Restrict the next k-NN query to a specific subset of vector index segments.
+ *
+ * Used by distributed query engines (e.g. Velox) to fan a single k-NN query
+ * out across workers, each handling a slice of segments. The coordinator gets
+ * the segment list via `lance_dataset_index_segments()`.
+ *
+ * @param segment_uuids Pointer to `len` 16-byte UUIDs concatenated end-to-end
+ *                      (total byte length = `len * 16`). Each UUID identifies
+ *                      one physical segment of a logical index.
+ * @param len           Number of UUIDs. Pass 0 (and segment_uuids may be NULL)
+ *                      to clear any previously-set segment restriction.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_set_index_segments(
+    LanceScanner* scanner,
+    const uint8_t* segment_uuids,
+    size_t len
+);
 
 #ifdef __cplusplus
 } /* extern "C" */
