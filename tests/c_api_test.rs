@@ -2706,6 +2706,376 @@ fn test_nearest_after_fts_is_rejected() {
     unsafe { lance_dataset_close(ds) };
 }
 
+// ---------------------------------------------------------------------------
+// Dataset writer (lance_dataset_write)
+// ---------------------------------------------------------------------------
+
+fn write_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Float32, true),
+    ]))
+}
+
+fn write_batch(ids: Vec<i32>, vals: Vec<f32>) -> RecordBatch {
+    assert_eq!(ids.len(), vals.len());
+    RecordBatch::try_new(
+        write_schema(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Float32Array::from(vals)),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_dataset_write_create() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("new_ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "lance_dataset_write create failed");
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_write_populates_out_dataset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let mut out_ds: *mut LanceDataset = ptr::null_mut();
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            &mut out_ds,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert!(!out_ds.is_null(), "out_dataset must be populated");
+    assert_eq!(unsafe { lance_dataset_count_rows(out_ds) }, 3);
+    unsafe { lance_dataset_close(out_ds) };
+}
+
+#[test]
+fn test_dataset_write_append_accumulates_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema1 = schema_to_ffi(&write_schema());
+    let mut stream1 = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema1,
+            &mut stream1,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ffi_schema2 = schema_to_ffi(&write_schema());
+    let mut stream2 = batch_to_ffi_stream(write_batch(vec![4, 5], vec![4.0, 5.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema2,
+            &mut stream2,
+            LanceWriteMode::Append as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 5);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_write_overwrite_replaces_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema1 = schema_to_ffi(&write_schema());
+    let mut stream1 = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema1,
+            &mut stream1,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ffi_schema2 = schema_to_ffi(&write_schema());
+    let mut stream2 = batch_to_ffi_stream(write_batch(vec![100, 200], vec![100.0, 200.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema2,
+            &mut stream2,
+            LanceWriteMode::Overwrite as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert_eq!(
+        unsafe { lance_dataset_count_rows(ds) },
+        2,
+        "overwrite must replace, not append"
+    );
+    let batches = scan_all_rows(ds);
+    assert!(!batches.is_empty(), "scan must return at least one batch");
+    let mut ids: Vec<i32> = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        ids.extend((0..id_col.len()).map(|i| id_col.value(i)));
+    }
+    ids.sort();
+    assert_eq!(ids, vec![100, 200]);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_write_overwrite_on_missing_path_creates_dataset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![7, 8], vec![7.0, 8.0]));
+
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Overwrite as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "OVERWRITE on missing path must succeed as create");
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_write_invalid_mode_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            99, // out of range — must be rejected, not cause UB
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_dataset_write_create_on_existing_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema1 = schema_to_ffi(&write_schema());
+    let mut stream1 = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema1,
+            &mut stream1,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ffi_schema2 = schema_to_ffi(&write_schema());
+    let mut stream2 = batch_to_ffi_stream(write_batch(vec![2], vec![2.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema2,
+            &mut stream2,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::DatasetAlreadyExists
+    );
+}
+
+#[test]
+fn test_dataset_write_append_schema_mismatch_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    // Create with the original schema.
+    let ffi_schema1 = schema_to_ffi(&write_schema());
+    let mut stream1 = batch_to_ffi_stream(write_batch(vec![1, 2], vec![1.0, 2.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema1,
+            &mut stream1,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    // Append with an extra column → must fail.
+    let mismatched_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Float32, true),
+        Field::new("extra", DataType::Utf8, true),
+    ]));
+    let batch2 = RecordBatch::try_new(
+        mismatched_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![10])),
+            Arc::new(Float32Array::from(vec![10.0])),
+            Arc::new(StringArray::from(vec!["x"])),
+        ],
+    )
+    .unwrap();
+    let ffi_schema2 = schema_to_ffi(&mismatched_schema);
+    let mut stream2 = batch_to_ffi_stream(batch2);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema2,
+            &mut stream2,
+            LanceWriteMode::Append as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+}
+
+#[test]
+fn test_dataset_write_declared_schema_mismatch_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    // Stream has 2 columns but declared schema has only 1 — fail fast.
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let declared_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let ffi_schema = schema_to_ffi(&declared_schema);
+
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_dataset_write_empty_stream_creates_empty_dataset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("empty_ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let schema = write_schema();
+    let ffi_schema = schema_to_ffi(&schema);
+
+    let empty: Vec<arrow::error::Result<RecordBatch>> = vec![];
+    let reader = arrow::record_batch::RecordBatchIterator::new(empty, schema.clone());
+    let mut stream = FFI_ArrowArrayStream::new(Box::new(reader));
+
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 0);
+    unsafe { lance_dataset_close(ds) };
+}
+
 #[test]
 fn test_fts_after_nearest_is_rejected() {
     let (_tmp, uri) = create_vector_dataset(64, 8);
@@ -2743,4 +3113,56 @@ fn test_fts_after_nearest_is_rejected() {
 
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_write_null_args_return_error() {
+    let schema = write_schema();
+    let c_uri = c_str("memory://x");
+
+    // NULL uri.
+    let ffi_schema_a = schema_to_ffi(&schema);
+    let mut stream_a = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            ptr::null(),
+            &ffi_schema_a,
+            &mut stream_a,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // NULL schema.
+    let mut stream_b = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            ptr::null(),
+            &mut stream_b,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // NULL stream.
+    let ffi_schema_c = schema_to_ffi(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema_c,
+            ptr::null_mut(),
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 }

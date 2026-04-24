@@ -25,6 +25,7 @@ mod index;
 pub mod runtime;
 mod scanner;
 mod versions;
+mod writer;
 
 // Re-export all extern "C" symbols so they appear in the cdylib.
 pub use batch::*;
@@ -36,3 +37,4 @@ pub use fragment_writer::*;
 pub use index::*;
 pub use scanner::*;
 pub use versions::*;
+pub use writer::*;

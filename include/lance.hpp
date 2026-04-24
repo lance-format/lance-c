@@ -17,6 +17,7 @@
 
 #include "lance.h"
 
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -94,6 +95,14 @@ struct VersionInfo {
     int64_t  timestamp_ms;
 };
 
+// ─── Write mode ──────────────────────────────────────────────────────────────
+
+enum class WriteMode : int32_t {
+    Create    = LANCE_WRITE_CREATE,
+    Append    = LANCE_WRITE_APPEND,
+    Overwrite = LANCE_WRITE_OVERWRITE,
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -120,6 +129,59 @@ public:
         auto* ds = lance_dataset_open(uri.c_str(), opts_ptr, version);
         if (!ds) check_error();
         return Dataset(ds);
+    }
+
+    /// Write an Arrow record batch stream to a Lance dataset and return the
+    /// open dataset at the committed version.
+    ///
+    /// The stream must be self-describing; its own schema is used. Treat the
+    /// stream as consumed once this call returns or throws — do not reuse it.
+    /// Throws lance::Error on failure (including if `stream` is null).
+    static Dataset write(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {}) {
+
+        if (stream == nullptr) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT, "stream must not be null");
+        }
+
+        // Pull the stream's schema so we can pass it to the C API.
+        ArrowSchema schema = {};
+        if (stream->get_schema(stream, &schema) != 0) {
+            const char* err = stream->get_last_error
+                ? stream->get_last_error(stream)
+                : nullptr;
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                std::string("failed to read stream schema: ") +
+                    (err ? err : "unknown"));
+        }
+        struct SchemaGuard {
+            ArrowSchema* s;
+            ~SchemaGuard() { if (s && s->release) s->release(s); }
+        } guard{&schema};
+
+        std::vector<const char*> kv;
+        for (auto& [k, v] : storage_opts) {
+            kv.push_back(k.c_str());
+            kv.push_back(v.c_str());
+        }
+        kv.push_back(nullptr);
+        const char* const* opts_ptr =
+            storage_opts.empty() ? nullptr : kv.data();
+
+        LanceDataset* out = nullptr;
+        int32_t rc = lance_dataset_write(
+            uri.c_str(),
+            &schema,
+            stream,
+            static_cast<LanceWriteMode>(mode),
+            opts_ptr,
+            &out);
+        if (rc != 0) check_error();
+        return Dataset(out);
     }
 
     /// Number of rows in the dataset.
