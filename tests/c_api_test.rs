@@ -2572,3 +2572,188 @@ fn test_scanner_nearest_null_safety() {
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
 }
+
+// ---------------------------------------------------------------------------
+// Distributed vector search via index segments
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_index_segment_count_and_list() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let name = c_str("emb_idx");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfFlat,
+        metric: LanceMetricType::L2,
+        num_partitions: 4,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), name.as_ptr(), &params, false)
+    };
+
+    // A single create_index call produces one logical index = one segment.
+    let count = unsafe { lance_dataset_index_segment_count(ds, name.as_ptr()) };
+    assert_eq!(count, 1);
+
+    let mut bytes = vec![0u8; (count as usize) * 16];
+    let rc = unsafe { lance_dataset_index_segments(ds, name.as_ptr(), bytes.as_mut_ptr()) };
+    assert_eq!(rc, 0);
+    // Sanity: not all zeros (a real UUID was written).
+    assert!(
+        bytes.iter().any(|b| *b != 0),
+        "expected non-zero UUID bytes"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_index_segment_count_unknown_index() {
+    let (_tmp, uri) = create_vector_dataset(8, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let name = c_str("does_not_exist");
+    let count = unsafe { lance_dataset_index_segment_count(ds, name.as_ptr()) };
+    assert_eq!(count, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_set_index_segments_with_listed_uuids() {
+    // End-to-end: build IVF index, list its segment UUIDs, then run nearest
+    // restricted to that single segment. Should return k results identical
+    // to an unrestricted search since there's only one segment.
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let name = c_str("idx");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfFlat,
+        metric: LanceMetricType::L2,
+        num_partitions: 4,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    unsafe {
+        lance_dataset_create_vector_index(ds, column.as_ptr(), name.as_ptr(), &params, false)
+    };
+
+    let count = unsafe { lance_dataset_index_segment_count(ds, name.as_ptr()) };
+    assert_eq!(count, 1);
+    let mut uuids = vec![0u8; (count as usize) * 16];
+    let rc = unsafe { lance_dataset_index_segments(ds, name.as_ptr(), uuids.as_mut_ptr()) };
+    assert_eq!(rc, 0);
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let query: Vec<f32> = vec![0.5; 16];
+    unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            16,
+            LanceDataType::Float32 as i32,
+            5,
+        );
+        let rc = lance_scanner_set_index_segments(scanner, uuids.as_ptr(), count as usize);
+        assert_eq!(rc, 0);
+    }
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream as *mut _).unwrap() };
+    let mut total = 0;
+    for b in reader {
+        total += b.unwrap().num_rows();
+    }
+    assert_eq!(total, 5, "expected k=5 results from the (single) segment");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_set_index_segments_unknown_uuid() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let query: Vec<f32> = vec![0.5; 8];
+    unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            8,
+            LanceDataType::Float32 as i32,
+            5,
+        )
+    };
+    // 16 bytes of all-zeros = a Uuid that does not match any real segment.
+    let bogus = [0u8; 16];
+    let rc = unsafe { lance_scanner_set_index_segments(scanner, bogus.as_ptr(), 1) };
+    assert_eq!(
+        rc, 0,
+        "setter accepts any byte sequence; lookup happens at scan time"
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let scan_rc = unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) };
+    assert_eq!(
+        scan_rc, -1,
+        "unknown segment UUID should error at materialize time"
+    );
+    let msg = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(
+        msg.to_lowercase().contains("segment"),
+        "msg should mention segment: {}",
+        msg
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_set_index_segments_null_safety() {
+    // NULL scanner.
+    let bytes = [0u8; 16];
+    let rc = unsafe { lance_scanner_set_index_segments(ptr::null_mut(), bytes.as_ptr(), 1) };
+    assert_eq!(rc, -1);
+
+    // NULL pointer with non-zero len.
+    let (_tmp, uri) = create_vector_dataset(8, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let rc2 = unsafe { lance_scanner_set_index_segments(scanner, ptr::null(), 1) };
+    assert_eq!(rc2, -1);
+
+    // NULL with len=0 clears the restriction → success.
+    let rc3 = unsafe { lance_scanner_set_index_segments(scanner, ptr::null(), 0) };
+    assert_eq!(rc3, 0);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
