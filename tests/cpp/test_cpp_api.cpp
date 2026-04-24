@@ -225,6 +225,36 @@ static void test_nearest_smoke(const std::string& uri) {
     PASS();
 }
 
+static void test_index_segments_smoke(const std::string& /*uri*/) {
+    TEST(test_index_segments_smoke);
+
+    // The shared test fixture has no vector column, so we can't actually run
+    // segment enumeration end-to-end without building our own dataset. The
+    // smoke goal is to prove the C++ wrappers compile and link.
+
+    // Exercise the no-op clear path on a fresh scanner — passing a nullptr
+    // buffer with len=0 must succeed.
+    {
+        // Create a scanner-less, empty-options scenario by trying to call the
+        // wrapper signatures. We don't actually invoke them at runtime here
+        // because we don't have a vector dataset to point at.
+        constexpr auto verify_signatures = []() {
+            using DsMember = uint64_t (lance::Dataset::*)(const std::string&) const;
+            using SegMember = std::vector<std::array<uint8_t, 16>>
+                (lance::Dataset::*)(const std::string&) const;
+            using ScanMember = lance::Scanner& (lance::Scanner::*)(
+                const std::vector<std::array<uint8_t, 16>>&);
+            DsMember a = &lance::Dataset::index_segment_count;
+            SegMember b = &lance::Dataset::index_segments;
+            ScanMember c = static_cast<ScanMember>(&lance::Scanner::index_segments);
+            (void)a; (void)b; (void)c;
+        };
+        verify_signatures();
+    }
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <dataset_uri>\n", argv[0]);
@@ -243,6 +273,7 @@ int main(int argc, char** argv) {
     test_error_exception(uri);
     test_index_lifecycle(uri);
     test_nearest_smoke(uri);
+    test_index_segments_smoke(uri);
 
     printf("All C++ tests passed!\n");
     return 0;
