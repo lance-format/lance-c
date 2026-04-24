@@ -21,6 +21,7 @@ mod dataset;
 mod error;
 mod fragment_writer;
 mod helpers;
+mod index;
 pub mod runtime;
 mod scanner;
 mod versions;
@@ -32,5 +33,6 @@ pub use error::{
     LanceErrorCode, lance_free_string, lance_last_error_code, lance_last_error_message,
 };
 pub use fragment_writer::*;
+pub use index::*;
 pub use scanner::*;
 pub use versions::*;
