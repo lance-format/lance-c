@@ -1820,3 +1820,117 @@ fn test_create_scalar_index_btree() {
 
     unsafe { lance_dataset_close(ds) };
 }
+
+/// Helper: create a dataset with a List<Utf8> column for LabelList index testing.
+fn create_label_list_dataset() -> (tempfile::TempDir, String) {
+    use arrow_array::ListArray;
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ll_ds").to_str().unwrap().to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+
+    let mut tag_builder = ListBuilder::new(StringBuilder::new());
+    tag_builder.values().append_value("rust");
+    tag_builder.values().append_value("ffi");
+    tag_builder.append(true);
+    tag_builder.values().append_value("cpp");
+    tag_builder.append(true);
+    let tags: ListArray = tag_builder.finish();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(tags)],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    (tmp, uri)
+}
+
+#[test]
+fn test_create_scalar_index_bitmap() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("name");
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::Bitmap as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_create_scalar_index_inverted() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("name");
+    // Inverted index requires JSON params with at least `base_tokenizer` and
+    // `language`. Pass the documented defaults.
+    let params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::Inverted as i32,
+            params.as_ptr(),
+            false,
+        )
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_create_scalar_index_label_list() {
+    let (_tmp, uri) = create_label_list_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("tags");
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::LabelList as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
