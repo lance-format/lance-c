@@ -31,7 +31,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 
 | Status | Component | Description |
 |--------|-----------|-------------|
-| [ ] | Vector search | Nearest-neighbor via scanner with metric/k/nprobes |
+| [x] | Vector search | Nearest-neighbor via scanner with metric/k/nprobes |
 | [ ] | Full-text search | FTS queries through scanner interface |
 | [x] | Vector index creation | IVF_PQ, IVF_FLAT, IVF_SQ, HNSW variants |
 | [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List indexes |
