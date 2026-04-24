@@ -2572,3 +2572,49 @@ fn test_scanner_nearest_null_safety() {
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
 }
+
+#[test]
+fn test_scanner_full_text_search() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("name");
+    // Build inverted index on `name` first.
+    let inverted_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::Inverted as i32,
+            inverted_params.as_ptr(),
+            false,
+        );
+    }
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let q = c_str("alice");
+    let cols = [column.as_ptr(), ptr::null()];
+    let rc = unsafe { lance_scanner_full_text_search(scanner, q.as_ptr(), cols.as_ptr(), 0) };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream as *mut _).unwrap() };
+    let schema = reader.schema();
+    assert!(
+        schema.field_with_name("_score").is_ok(),
+        "_score column missing from schema"
+    );
+    let mut total = 0;
+    for b in reader {
+        total += b.unwrap().num_rows();
+    }
+    assert!(total >= 1, "expected at least 1 hit for 'alice'");
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
