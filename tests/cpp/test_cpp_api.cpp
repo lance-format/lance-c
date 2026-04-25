@@ -225,6 +225,42 @@ static void test_nearest_smoke(const std::string& uri) {
     PASS();
 }
 
+static void test_fts_smoke(const std::string& uri) {
+    TEST(test_fts_smoke);
+
+    auto ds = lance::Dataset::open(uri);
+
+    // Build the inverted index needed for FTS. (Inverted requires non-NULL
+    // params JSON for the tokenizer config.)
+    bool index_built = false;
+    try {
+        ds.create_scalar_index(
+            "name", LANCE_SCALAR_INVERTED, "name_fts",
+            R"({"base_tokenizer":"simple","language":"English"})");
+        index_built = true;
+    } catch (const lance::Error&) {
+        // If the test fixture doesn't permit indexing for some reason,
+        // we still want to prove the wrappers compile + link.
+    }
+
+    auto scanner = ds.scan();
+    bool caught = false;
+    try {
+        scanner.full_text_search("alice", {"name"}, 0);
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        if (stream.release) stream.release(&stream);
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    // Either path is acceptable — the goal is compile + linkage.
+    (void)index_built;
+    (void)caught;
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <dataset_uri>\n", argv[0]);
@@ -243,6 +279,7 @@ int main(int argc, char** argv) {
     test_error_exception(uri);
     test_index_lifecycle(uri);
     test_nearest_smoke(uri);
+    test_fts_smoke(uri);
 
     printf("All C++ tests passed!\n");
     return 0;

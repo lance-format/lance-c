@@ -460,6 +460,27 @@ int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);
 int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
 int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
 
+/* ─── Full-text search (Phase 2) ─── */
+
+/**
+ * Set a BM25 full-text search query on the scanner.
+ *
+ * Mutually exclusive with lance_scanner_nearest: calling either after the
+ * other returns LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * @param query              Query string (terms).
+ * @param columns            NULL-terminated array of columns, or NULL for all
+ *                           FTS-indexed columns.
+ * @param max_fuzzy_distance 0 = exact match; >0 = MatchQuery::with_fuzziness.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_full_text_search(
+    LanceScanner* scanner,
+    const char* query,
+    const char* const* columns,
+    uint32_t max_fuzzy_distance
+);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

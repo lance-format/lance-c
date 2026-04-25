@@ -367,6 +367,23 @@ public:
         return *this;
     }
 
+    /// BM25 full-text search.
+    /// `columns` empty → search all FTS-indexed columns.
+    /// `max_fuzzy_distance` 0 = exact; >0 = MatchQuery::with_fuzziness.
+    Scanner& full_text_search(const std::string& query,
+                              const std::vector<std::string>& columns = {},
+                              uint32_t max_fuzzy_distance = 0) {
+        std::vector<const char*> col_ptrs;
+        for (auto& c : columns) col_ptrs.push_back(c.c_str());
+        col_ptrs.push_back(nullptr);
+        const char* const* cols_c =
+            columns.empty() ? nullptr : col_ptrs.data();
+        if (lance_scanner_full_text_search(handle_.get(), query.c_str(),
+                                            cols_c, max_fuzzy_distance) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Access the underlying C handle.
     LanceScanner* c_handle() { return handle_.get(); }
 };

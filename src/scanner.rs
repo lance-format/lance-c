@@ -15,6 +15,7 @@ use futures::{Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_core::Result;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_io::stream::RecordBatchStream;
 
@@ -53,6 +54,7 @@ pub struct LanceScanner {
     metric_override: Option<crate::index::LanceMetricType>,
     use_index: Option<bool>,
     prefilter: bool,
+    fts_query: Option<FullTextSearchQuery>,
     // Materialized on first iteration call
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
     #[allow(dead_code)]
@@ -102,6 +104,7 @@ impl LanceScanner {
             metric_override: None,
             use_index: None,
             prefilter: false,
+            fts_query: None,
             stream: None,
             schema: None,
         }
@@ -162,6 +165,9 @@ impl LanceScanner {
                 scanner.prefilter(true);
             }
         }
+        if let Some(fts) = &self.fts_query {
+            scanner.full_text_search(fts.clone())?;
+        }
         let stream = block_on(scanner.try_into_stream())?;
         self.schema = Some(stream.schema());
         self.stream = Some(Box::pin(stream));
@@ -207,6 +213,9 @@ impl LanceScanner {
             if self.prefilter {
                 scanner.prefilter(true);
             }
+        }
+        if let Some(fts) = &self.fts_query {
+            scanner.full_text_search(fts.clone())?;
         }
         Ok(scanner)
     }
@@ -776,6 +785,13 @@ unsafe fn scanner_nearest_inner(
         });
     }
     let s = unsafe { &mut *scanner };
+    if s.fts_query.is_some() {
+        return Err(lance_core::Error::InvalidInput {
+            source: "cannot call nearest after full_text_search; they are mutually exclusive"
+                .into(),
+            location: snafu::location!(),
+        });
+    }
     let column_str = unsafe { helpers::parse_c_string(column)? }.unwrap();
 
     let dtype = match element_type {
@@ -822,5 +838,77 @@ unsafe fn scanner_nearest_inner(
         query,
         k,
     });
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// Full-text search (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Set a BM25 full-text search query on the scanner.
+///
+/// - `query`: Query string (terms).
+/// - `columns`: NULL-terminated array of column names, or NULL to search all
+///   FTS-indexed columns.
+/// - `max_fuzzy_distance`: 0 = exact match; >0 = `MatchQuery::with_fuzziness`.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+///
+/// Mutually exclusive with `lance_scanner_nearest`: calling either after the
+/// other returns InvalidArgument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_full_text_search(
+    scanner: *mut LanceScanner,
+    query: *const c_char,
+    columns: *const *const c_char,
+    max_fuzzy_distance: u32,
+) -> i32 {
+    ffi_try!(
+        unsafe { fts_inner(scanner, query, columns, max_fuzzy_distance) },
+        neg
+    )
+}
+
+unsafe fn fts_inner(
+    scanner: *mut LanceScanner,
+    query: *const c_char,
+    columns: *const *const c_char,
+    max_fuzzy_distance: u32,
+) -> Result<i32> {
+    if scanner.is_null() || query.is_null() {
+        return Err(lance_core::Error::InvalidInput {
+            source: "scanner and query must not be NULL".into(),
+            location: snafu::location!(),
+        });
+    }
+    let s = unsafe { &mut *scanner };
+
+    // Mutual exclusion with vector search.
+    if s.nearest.is_some() {
+        return Err(lance_core::Error::InvalidInput {
+            source: "cannot call full_text_search after nearest; they are mutually exclusive"
+                .into(),
+            location: snafu::location!(),
+        });
+    }
+
+    let query_str = unsafe { helpers::parse_c_string(query)? }
+        .unwrap()
+        .to_string();
+    let cols = unsafe { helpers::parse_c_string_array(columns)? };
+
+    let mut fts = if max_fuzzy_distance > 0 {
+        FullTextSearchQuery::new_fuzzy(query_str, Some(max_fuzzy_distance))
+    } else {
+        FullTextSearchQuery::new(query_str)
+    };
+
+    if let Some(cols) = cols
+        && !cols.is_empty()
+    {
+        fts = fts.with_columns(&cols)?;
+    }
+
+    s.fts_query = Some(fts);
     Ok(0)
 }
