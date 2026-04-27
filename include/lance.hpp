@@ -222,6 +222,53 @@ public:
         return ids;
     }
 
+    /// Create a vector index on a column.
+    void create_vector_index(const std::string& column,
+                             const LanceVectorIndexParams& params,
+                             const std::string& name = "",
+                             bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        if (lance_dataset_create_vector_index(handle_.get(), column.c_str(),
+                                               name_c, &params, replace) != 0)
+            check_error();
+    }
+
+    /// Create a scalar index on a column.
+    void create_scalar_index(const std::string& column,
+                             LanceScalarIndexType index_type,
+                             const std::string& name = "",
+                             const std::string& params_json = "",
+                             bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        if (lance_dataset_create_scalar_index(handle_.get(), column.c_str(),
+                                               name_c, index_type,
+                                               json_c, replace) != 0)
+            check_error();
+    }
+
+    /// Drop an index by name.
+    void drop_index(const std::string& name) {
+        if (lance_dataset_drop_index(handle_.get(), name.c_str()) != 0)
+            check_error();
+    }
+
+    /// Number of user indexes (excludes system indexes).
+    uint64_t index_count() const {
+        uint64_t n = lance_dataset_index_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return n;
+    }
+
+    /// JSON array describing all user indexes.
+    std::string list_indices_json() const {
+        const char* json = lance_dataset_index_list_json(handle_.get());
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
+    }
+
     /// Access the underlying C handle (does not transfer ownership).
     const LanceDataset* c_handle() const { return handle_.get(); }
 
@@ -286,6 +333,65 @@ public:
     /// Start an async scan. Callback fires when ArrowArrayStream is ready.
     void scan_async(LanceCallback callback, void* ctx) const {
         lance_scanner_scan_async(handle_.get(), callback, ctx);
+    }
+
+    /// k-NN search (Float32 sugar).
+    Scanner& nearest(const std::string& column, const float* q, size_t dim, uint32_t k) {
+        if (lance_scanner_nearest(handle_.get(), column.c_str(),
+                                   q, dim, LANCE_DTYPE_FLOAT32, k) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// k-NN search (typed).
+    Scanner& nearest(const std::string& column, const void* q, size_t dim,
+                     LanceDataType dtype, uint32_t k) {
+        if (lance_scanner_nearest(handle_.get(), column.c_str(),
+                                   q, dim, dtype, k) != 0)
+            check_error();
+        return *this;
+    }
+
+    Scanner& nprobes(uint32_t n) {
+        if (lance_scanner_set_nprobes(handle_.get(), n) != 0) check_error();
+        return *this;
+    }
+    Scanner& refine_factor(uint32_t f) {
+        if (lance_scanner_set_refine_factor(handle_.get(), f) != 0) check_error();
+        return *this;
+    }
+    Scanner& ef(uint32_t e) {
+        if (lance_scanner_set_ef(handle_.get(), e) != 0) check_error();
+        return *this;
+    }
+    Scanner& metric(LanceMetricType m) {
+        if (lance_scanner_set_metric(handle_.get(), m) != 0) check_error();
+        return *this;
+    }
+    Scanner& use_index(bool enable) {
+        if (lance_scanner_set_use_index(handle_.get(), enable) != 0) check_error();
+        return *this;
+    }
+    Scanner& prefilter(bool enable) {
+        if (lance_scanner_set_prefilter(handle_.get(), enable) != 0) check_error();
+        return *this;
+    }
+
+    /// BM25 full-text search.
+    /// `columns` empty → search all FTS-indexed columns.
+    /// `max_fuzzy_distance` 0 = exact; >0 = MatchQuery::with_fuzziness.
+    Scanner& full_text_search(const std::string& query,
+                              const std::vector<std::string>& columns = {},
+                              uint32_t max_fuzzy_distance = 0) {
+        std::vector<const char*> col_ptrs;
+        for (auto& c : columns) col_ptrs.push_back(c.c_str());
+        col_ptrs.push_back(nullptr);
+        const char* const* cols_c =
+            columns.empty() ? nullptr : col_ptrs.data();
+        if (lance_scanner_full_text_search(handle_.get(), query.c_str(),
+                                            cols_c, max_fuzzy_distance) != 0)
+            check_error();
+        return *this;
     }
 
     /// Access the underlying C handle.

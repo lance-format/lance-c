@@ -7,7 +7,7 @@
 //! Returns a fresh `LanceDataset*` positioned at the target version; the
 //! caller's original handle is untouched and remains usable.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use lance_core::Result;
 
@@ -54,6 +54,7 @@ unsafe fn restore_inner(dataset: *const LanceDataset, version: u64) -> Result<*m
     }
 
     let ds = unsafe { &*dataset };
+    let snap = ds.snapshot();
 
     // Check out the target version, then always commit a new manifest that
     // aliases its fragments as the new latest. Skipping the commit when
@@ -61,13 +62,13 @@ unsafe fn restore_inner(dataset: *const LanceDataset, version: u64) -> Result<*m
     // could land a newer manifest between the read and the comparison, and
     // we'd silently leave their version as latest instead of the caller's.
     let restored = block_on(async {
-        let mut checked_out = ds.inner.checkout_version(version).await?;
+        let mut checked_out = snap.checkout_version(version).await?;
         checked_out.restore().await?;
         Ok::<_, lance_core::Error>(checked_out)
     })?;
 
     let handle = LanceDataset {
-        inner: Arc::new(restored),
+        inner: RwLock::new(Arc::new(restored)),
     };
     Ok(Box::into_raw(Box::new(handle)))
 }
