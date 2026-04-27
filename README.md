@@ -181,6 +181,17 @@ LanceDataset* ds = lance_dataset_open("data.lance", NULL, 42);
 auto ds = lance::Dataset::open("data.lance", {}, /*version=*/42);
 ```
 
+## Releasing
+
+Releases are automated by [release-please](https://github.com/googleapis/release-please-action):
+
+1. Land conventional-commit PRs to `main` (`feat:`, `fix:`, `chore:`, `build:`, etc.).
+2. release-please maintains a `chore(release): X.Y.Z` PR on `main` that bumps `Cargo.toml`, updates `CHANGELOG.md`, and tracks unreleased commits.
+3. **Merge that PR** to trigger the actual release: it tags `vX.Y.Z`, which fires [`release.yml`](.github/workflows/release.yml) — that builds prebuilt tarballs for `linux-{x86_64,aarch64}` and `macos-{x86_64,aarch64}` and uploads them to the GitHub Release.
+4. After the release publishes, copy the SHA snippet from the workflow log into `ports/lance-c/portfile.cmake` and `recipes/lance-c/all/conandata.yml`, then open follow-up PRs to `microsoft/vcpkg` and `conan-io/conan-center-index`.
+
+Pre-1.0 (`0.x.y`): breaking changes bump the **minor** (`0.X.0`), per `bump-minor-pre-major: true` in [`.release-please-config.json`](.release-please-config.json).
+
 ## License
 
 Apache-2.0
