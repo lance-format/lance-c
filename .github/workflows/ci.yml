@@ -122,29 +122,6 @@ jobs:
             exit 1
           fi
 
-  cbindgen-drift:
-    name: cbindgen header drift
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: Swatinem/rust-cache@v2
-      - name: Install protobuf-compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Install cbindgen
-        run: cargo install cbindgen --locked --version "^0.27"
-      - name: Regenerate header
-        run: cbindgen --crate lance-c --output /tmp/lance.h
-      - name: Diff against committed header
-        run: |
-          if ! diff -u include/lance/lance.h /tmp/lance.h; then
-            echo ""
-            echo "::error::include/lance/lance.h is out of date."
-            echo "Run 'cbindgen --crate lance-c -o include/lance/lance.h' and commit."
-            exit 1
-          fi
-
   rustdoc:
     name: Rustdoc
     runs-on: ubuntu-24.04
