@@ -183,14 +183,31 @@ auto ds = lance::Dataset::open("data.lance", {}, /*version=*/42);
 
 ## Releasing
 
-Releases are automated by [release-please](https://github.com/googleapis/release-please-action):
+Releases are tag-driven via [`release.yml`](.github/workflows/release.yml).
 
-1. Land conventional-commit PRs to `main` (`feat:`, `fix:`, `chore:`, `build:`, etc.).
-2. release-please maintains a `chore(release): X.Y.Z` PR on `main` that bumps `Cargo.toml`, updates `CHANGELOG.md`, and tracks unreleased commits.
-3. **Merge that PR** to trigger the actual release: it tags `vX.Y.Z`, which fires [`release.yml`](.github/workflows/release.yml) — that builds prebuilt tarballs for `linux-{x86_64,aarch64}` and `macos-{x86_64,aarch64}` and uploads them to the GitHub Release.
-4. After the release publishes, copy the SHA snippet from the workflow log into `ports/lance-c/portfile.cmake` and `recipes/lance-c/all/conandata.yml`, then open follow-up PRs to `microsoft/vcpkg` and `conan-io/conan-center-index`.
+1. Decide the new version (semver). Pre-1.0 (`0.x.y`): bump **minor** for breaking changes or new features, **patch** for bug fixes only.
+2. On `main`, bump `version = ...` in [`Cargo.toml`](Cargo.toml) and refresh `Cargo.lock`:
+   ```bash
+   git checkout main && git pull
+   # edit Cargo.toml: change version = "0.1.0" to "0.2.0"
+   cargo update -p lance-c
+   git checkout -b chore/release-0.2.0
+   git commit -am "chore(release): v0.2.0"
+   ```
+3. Open a PR with the bump (and any `CHANGELOG.md` edits if you maintain one), get it reviewed and merged.
+4. Tag the merge commit and push:
+   ```bash
+   git checkout main && git pull
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+5. `release.yml` fires on the tag push and builds prebuilt tarballs for `linux-{x86_64,aarch64}` and `macos-{x86_64,aarch64}`. ~20 minutes later, the [GitHub Release](https://github.com/lance-format/lance-c/releases) has all four `.tar.xz` artifacts plus a `SHA512SUMS` file.
+6. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
+   - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
+   - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
+7. Open follow-up PRs to `microsoft/vcpkg` and `conan-io/conan-center-index` mirroring the updated `ports/` and `recipes/` directories.
 
-Pre-1.0 (`0.x.y`): breaking changes bump the **minor** (`0.X.0`), per `bump-minor-pre-major: true` in [`.release-please-config.json`](.release-please-config.json).
+A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 
 ## License
 
