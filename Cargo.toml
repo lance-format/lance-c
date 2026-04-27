@@ -18,7 +18,7 @@ rust-version = "1.91.0"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-lance = "3.0.1"
+lance = { version = "3.0.1", features = ["substrait"] }
 lance-core = "3.0.1"
 lance-index = "3.0.1"
 lance-io = "3.0.1"
@@ -34,10 +34,12 @@ pin-project = "1.0"
 snafu = "0.9"
 
 [dev-dependencies]
-lance = "3.0.1"
+lance = { version = "3.0.1", features = ["substrait"] }
+lance-datafusion = { version = "3.0.1", features = ["substrait"] }
 lance-datagen = "3.0.1"
 lance-file = "3.0.1"
 lance-table = "3.0.1"
+datafusion = { version = "52.1.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "57.0.0"
 arrow-schema = "57.0.0"
