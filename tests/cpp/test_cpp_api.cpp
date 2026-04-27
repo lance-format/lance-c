@@ -7,7 +7,7 @@
  *
  * Tests the RAII wrappers, exception handling, and builder pattern.
  *
- * Usage: test_cpp_api <dataset_uri>
+ * Usage: test_cpp_api <dataset_uri> <write_uri>
  */
 
 #include "lance.hpp"
@@ -261,13 +261,40 @@ static void test_fts_smoke(const std::string& uri) {
     PASS();
 }
 
+// Round-trip: scan src dataset to an ArrowArrayStream, write it to a new
+// dataset via lance::Dataset::write, and verify row counts match.
+// dst_uri must not pre-exist.
+static void test_dataset_write_roundtrip(const std::string& src_uri,
+                                         const std::string& dst_uri) {
+    TEST(test_dataset_write_roundtrip);
+
+    auto src = lance::Dataset::open(src_uri);
+    uint64_t src_rows = src.count_rows();
+
+    auto scanner = src.scan();
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+
+    auto dst = lance::Dataset::write(
+        dst_uri, &stream, lance::WriteMode::Create);
+
+    uint64_t dst_rows = dst.count_rows();
+    assert(dst_rows == src_rows);
+    printf("src=%llu, dst=%llu... ",
+           (unsigned long long)src_rows, (unsigned long long)dst_rows);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <dataset_uri>\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri>\n", argv[0]);
         return 1;
     }
 
     std::string uri(argv[1]);
+    std::string write_uri(argv[2]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -280,6 +307,7 @@ int main(int argc, char** argv) {
     test_index_lifecycle(uri);
     test_nearest_smoke(uri);
     test_fts_smoke(uri);
+    test_dataset_write_roundtrip(uri, write_uri);
 
     printf("All C++ tests passed!\n");
     return 0;
