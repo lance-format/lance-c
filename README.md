@@ -58,7 +58,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [ ] | Compaction | Fragment consolidation operations |
 | [ ] | Statistics export | Row counts, column stats for query planning |
 | [x] | Cloud storage | S3, GCS, Azure via storage options pass-through |
-| [ ] | Package distribution | vcpkg and Conan recipe packaging |
+| [x] | Package distribution | vcpkg and Conan recipe packaging |
 
 ### Additional (not in RFC)
 
@@ -69,18 +69,72 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 
 ## Building
 
+There are four supported entry points; pick whichever matches your toolchain.
+
+### From source via cargo (Rust developers)
+
 ```bash
 cargo build --release
 ```
 
-The build produces `liblance_c.{so,dylib,dll}` and the headers in `include/`.
+Produces `target/release/liblance_c.{so,dylib,dll}` and a `liblance_c.a`.
+Headers stay in `include/lance/`.
+
+### From source via CMake (C/C++ developers)
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix /your/prefix
+```
+
+Installs headers, both linkages, a `LanceCConfig.cmake` package config, and
+a `lance-c.pc` pkg-config file. Consumers then:
+
+```cmake
+find_package(LanceC 0.1 REQUIRED)
+target_link_libraries(myapp PRIVATE LanceC::lance_c)
+```
+
+See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
+working example.
+
+### vcpkg
+
+```bash
+vcpkg install lance-c
+```
+
+Downloads a prebuilt binary for your triplet from
+[GitHub Releases](https://github.com/lance-format/lance-c/releases). For
+unsupported triples, opt into a source build with the `from-source` feature:
+
+```bash
+vcpkg install 'lance-c[from-source]'  # requires Rust toolchain
+```
+
+### Conan
+
+```bash
+conan install --requires=lance-c/0.1.0
+```
+
+Default path downloads prebuilts; `-o lance-c/*:from_source=True` builds
+from source via cargo.
+
+### Header path
+
+```c
+#include <lance/lance.h>     // C
+#include <lance/lance.hpp>   // C++
+```
 
 ## Usage
 
 ### C
 
 ```c
-#include "lance.h"
+#include <lance/lance.h>
 
 LanceDataset* ds = lance_dataset_open("data.lance", NULL, 0);
 if (!ds) {
@@ -100,7 +154,7 @@ lance_dataset_close(ds);
 ### C++
 
 ```cpp
-#include "lance.hpp"
+#include <lance/lance.hpp>
 
 auto ds = lance::Dataset::open("data.lance");
 printf("rows: %llu, version: %llu\n", ds.count_rows(), ds.version());
