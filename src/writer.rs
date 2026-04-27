@@ -161,8 +161,7 @@ unsafe fn write_dataset_inner(
     let uri_str = unsafe { helpers::parse_c_string(uri)? }
         .filter(|s| !s.is_empty())
         .ok_or_else(|| lance_core::Error::InvalidInput {
-            // NULL was rejected by the earlier `uri.is_null()` check, so the
-            // only remaining failure here is the empty string.
+            // NULL is rejected above; only the empty case reaches here.
             source: "uri must not be empty".into(),
             location: snafu::location!(),
         })?;

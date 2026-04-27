@@ -147,12 +147,10 @@ public:
             throw Error(LANCE_ERR_INVALID_ARGUMENT, "stream must not be null");
         }
 
-        // RAII guard that releases the stream unless `disarm()` is called.
-        // Until `lance_dataset_write` returns we still own the stream, and any
-        // exception (failed schema read, std::bad_alloc while building the
-        // storage-options vector, etc.) must not leak it. `lance_dataset_write`
-        // consumes the stream on every return path on the Rust side, so we
-        // disarm immediately before invoking it.
+        // RAII guard for the stream. Until `lance_dataset_write` is called,
+        // any exception (failed `get_schema`, `std::bad_alloc` while building
+        // `kv`, etc.) must release the stream. After that call Rust owns it,
+        // so we `disarm()` immediately before invoking the C API.
         struct StreamGuard {
             ArrowArrayStream* s;
             bool armed = true;
@@ -178,12 +176,10 @@ public:
                         "stream get_schema callback is null");
         }
 
-        // Zero-initialize the schema and arm its RAII guard *before* invoking
-        // `get_schema`, so a non-conforming producer that partially populates
-        // the schema and then returns an error code still has its `release`
-        // callback fired during unwind. (Zero-initialized `schema.release` is
-        // null, making the destructor a no-op on the success-of-error-without-
-        // population path.)
+        // Arm SchemaGuard before calling `get_schema` so a non-conforming
+        // producer that partially populates the schema before returning an
+        // error still has its `release` fired on unwind. The zero-init keeps
+        // the destructor a no-op on the clean-error path (release == null).
         struct SchemaGuard {
             ArrowSchema* s;
             // Explicit constructor for the same C++20 aggregate-init reason
@@ -200,11 +196,9 @@ public:
         ArrowSchema schema = {};
         SchemaGuard schema_guard{&schema};
 
-        // Pull the stream's schema so we can pass it to the C API. If this
-        // fails the StreamGuard releases the stream during unwind, and the
-        // SchemaGuard above releases any partial schema state the producer
-        // may have left behind — preserving the "consumed on return or
-        // throw" contract for both resources.
+        // On failure, StreamGuard releases the stream and SchemaGuard
+        // releases any partial schema state — preserving the "consumed on
+        // return or throw" contract for both resources.
         if (stream->get_schema(stream, &schema) != 0) {
             const char* err = stream->get_last_error
                 ? stream->get_last_error(stream)
