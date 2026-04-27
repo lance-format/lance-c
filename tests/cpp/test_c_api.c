@@ -179,6 +179,26 @@ static void test_versions(const char *uri) {
     printf("OK\n");
 }
 
+/* Restore the dataset to its own current version — always commits a new
+ * manifest (no skip-if-equal optimization) so the caller's "make `version`
+ * the new latest" intent holds even under concurrent writers. */
+static void test_restore_to_current(const char *uri) {
+    printf("  test_restore_to_current... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t current = lance_dataset_version(ds);
+
+    LanceDataset *after = lance_dataset_restore(ds, current);
+    ASSERT(after != NULL, "restore failed");
+    ASSERT(lance_dataset_version(after) == current + 1,
+           "restore must bump the version to commit a fresh manifest");
+
+    lance_dataset_close(after);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static void test_error_handling(void) {
     printf("  test_error_handling... ");
 
@@ -262,6 +282,7 @@ int main(int argc, char **argv) {
     test_scan(uri);
     test_scan_with_limit(uri);
     test_versions(uri);
+    test_restore_to_current(uri);
     test_error_handling();
     test_dataset_write_roundtrip(uri, write_uri);
 

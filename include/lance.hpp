@@ -283,6 +283,16 @@ public:
         return out;
     }
 
+    /// Commit a new manifest that aliases `version` as the latest. The
+    /// returned Dataset points at the target version; this handle is
+    /// unchanged. If `version` is already the latest, no new manifest is
+    /// written. Throws lance::Error on failure.
+    Dataset restore(uint64_t version) const {
+        auto* out = lance_dataset_restore(handle_.get(), version);
+        if (!out) check_error();
+        return Dataset(out);
+    }
+
     /// Export the schema as an Arrow C Data Interface struct.
     void schema(ArrowSchema* out) const {
         if (lance_dataset_schema(handle_.get(), out) != 0) {

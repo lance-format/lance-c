@@ -22,6 +22,7 @@ mod error;
 mod fragment_writer;
 mod helpers;
 mod index;
+mod restore;
 pub mod runtime;
 mod scanner;
 mod versions;
@@ -35,6 +36,7 @@ pub use error::{
 };
 pub use fragment_writer::*;
 pub use index::*;
+pub use restore::*;
 pub use scanner::*;
 pub use versions::*;
 pub use writer::*;
