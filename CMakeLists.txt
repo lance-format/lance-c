@@ -57,10 +57,12 @@ if(LANCE_C_USE_PREBUILT)
     set(_lance_c_shared_real "${LANCE_C_PREBUILT_DIR}/lib/liblance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
     set(_lance_c_include_dirs "${LANCE_C_PREBUILT_DIR}/include")
 else()
-    # Corrosion produces 'lance-c-static' (staticlib) and 'lance-c' (cdylib)
-    # IMPORTED targets from the crate-type declaration in Cargo.toml.
-    set(_lance_c_static_real lance-c-static)
-    set(_lance_c_shared_real lance-c)
+    # Corrosion replaces hyphens with underscores in target names (since Rust
+    # 1.79 / Corrosion ports a Cargo behavior change), so 'lance-c' becomes
+    # 'lance_c' and the generated targets are 'lance_c-static' and
+    # 'lance_c-shared'.
+    set(_lance_c_static_real lance_c-static)
+    set(_lance_c_shared_real lance_c-shared)
     set(_lance_c_include_dirs "${CMAKE_CURRENT_LIST_DIR}/include")
 endif()
 
@@ -94,3 +96,49 @@ if(LANCE_C_LINK STREQUAL "shared")
 else()
     add_library(LanceC::lance_c ALIAS LanceC::lance_c_static)
 endif()
+
+# ─── Install rules ───────────────────────────────────────────────────────────
+include(CMakePackageConfigHelpers)
+
+# Headers (preserves the lance/ subdirectory).
+install(DIRECTORY include/lance
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
+
+# Library artifacts. Corrosion 0.5.1's corrosion_install() only handles
+# EXECUTABLE targets, so use vanilla install(FILES) with TARGET_FILE generator
+# expressions that resolve to the .a / .dylib / .so paths cargo emits.
+if(NOT LANCE_C_USE_PREBUILT)
+    install(FILES $<TARGET_FILE:lance_c-static>
+        DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(FILES $<TARGET_FILE:lance_c-shared>
+        DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+
+# License.
+install(FILES LICENSE
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/lance-c)
+
+# Generate LanceCConfig.cmake from the template.
+configure_package_config_file(
+    "${CMAKE_CURRENT_LIST_DIR}/cmake/LanceCConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/LanceCConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LanceC
+    PATH_VARS CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_LIBDIR)
+
+# Generate version file. SameMinorVersion for 0.x (ABI may break across MINOR);
+# switch to SameMajorVersion when we hit 1.0.
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+    set(_compat SameMinorVersion)
+else()
+    set(_compat SameMajorVersion)
+endif()
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/LanceCConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY ${_compat})
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/LanceCConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/LanceCConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LanceC)
