@@ -1,0 +1,10 @@
+The package lance-c provides CMake targets:
+
+    find_package(LanceC CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE LanceC::lance_c)
+
+The default linkage matches the vcpkg triplet:
+    x64-linux         → static  (LanceC::lance_c → LanceC::lance_c_static)
+    x64-linux-dynamic → shared  (LanceC::lance_c → LanceC::lance_c_shared)
+
+Override per-build by setting LanceC_LINK=static|shared before find_package.
