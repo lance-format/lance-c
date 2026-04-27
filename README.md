@@ -113,6 +113,20 @@ ds.scan()
 // consume stream...
 ```
 
+### Open at a specific version
+
+`lance_dataset_open` takes a `version` argument — `0` means the latest, any
+other value checks out that specific version id (e.g. one returned by
+`lance_dataset_versions`):
+
+```c
+LanceDataset* ds = lance_dataset_open("data.lance", NULL, 42);
+```
+
+```cpp
+auto ds = lance::Dataset::open("data.lance", {}, /*version=*/42);
+```
+
 ## License
 
 Apache-2.0
