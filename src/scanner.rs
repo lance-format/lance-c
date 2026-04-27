@@ -42,6 +42,7 @@ pub struct LanceScanner {
     dataset: Arc<Dataset>,
     columns: Option<Vec<String>>,
     filter: Option<String>,
+    substrait_filter: Option<Vec<u8>>,
     limit: Option<i64>,
     offset: Option<i64>,
     batch_size: Option<usize>,
@@ -92,6 +93,7 @@ impl LanceScanner {
             dataset,
             columns: None,
             filter: None,
+            substrait_filter: None,
             limit: None,
             offset: None,
             batch_size: None,
@@ -131,7 +133,10 @@ impl LanceScanner {
         if let Some(cols) = &self.columns {
             scanner.project(cols)?;
         }
-        if let Some(filter) = &self.filter {
+        // Substrait filter takes precedence over SQL filter when both are set.
+        if let Some(bytes) = &self.substrait_filter {
+            scanner.filter_substrait(bytes)?;
+        } else if let Some(filter) = &self.filter {
             scanner.filter(filter)?;
         }
         if self.limit.is_some() || self.offset.is_some() {
@@ -180,7 +185,10 @@ impl LanceScanner {
         if let Some(cols) = &self.columns {
             scanner.project(cols)?;
         }
-        if let Some(filter) = &self.filter {
+        // Substrait filter takes precedence over SQL filter when both are set.
+        if let Some(bytes) = &self.substrait_filter {
+            scanner.filter_substrait(bytes)?;
+        } else if let Some(filter) = &self.filter {
             scanner.filter(filter)?;
         }
         if self.limit.is_some() || self.offset.is_some() {
@@ -345,6 +353,53 @@ pub unsafe extern "C" fn lance_scanner_set_fragment_ids(
         &[]
     };
     s.fragment_ids = Some(id_slice.to_vec());
+    clear_last_error();
+    0
+}
+
+/// Set a Substrait filter on the scanner.
+///
+/// `bytes` must point to a serialized Substrait
+/// [`ExtendedExpression`](https://substrait.io/expressions/extended_expression/)
+/// message containing exactly one expression of boolean type. This is the
+/// preferred filter API for query engines that already speak Substrait — it
+/// avoids the round-trip through SQL string formatting and parsing.
+///
+/// If both this and the SQL filter passed to `lance_scanner_new` are set, the
+/// Substrait filter wins. Calling this with the same scanner more than once
+/// replaces the previously-set Substrait filter.
+///
+/// - `scanner`: An open `LanceScanner*`.
+/// - `bytes`: Pointer to the serialized Substrait `ExtendedExpression` bytes.
+///   Must not be NULL and `len` must be > 0. The bytes are copied into the
+///   scanner; the caller may free them after this call returns.
+/// - `len`: Length of the byte buffer.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_substrait_filter(
+    scanner: *mut LanceScanner,
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+        return -1;
+    }
+    if bytes.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "bytes is NULL");
+        return -1;
+    }
+    if len == 0 {
+        set_last_error(
+            LanceErrorCode::InvalidArgument,
+            "Substrait filter bytes must be non-empty",
+        );
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+    let s = unsafe { &mut *scanner };
+    s.substrait_filter = Some(slice.to_vec());
     clear_last_error();
     0
 }

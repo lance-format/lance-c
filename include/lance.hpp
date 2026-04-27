@@ -447,6 +447,19 @@ public:
         return fragment_ids(ids.data(), ids.size());
     }
 
+    /// Set a Substrait filter (serialized ExtendedExpression bytes).
+    /// Wins over any SQL filter passed to the Scanner constructor.
+    Scanner& substrait_filter(const uint8_t* bytes, size_t len) {
+        if (lance_scanner_set_substrait_filter(handle_.get(), bytes, len) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Set a Substrait filter (vector overload).
+    Scanner& substrait_filter(const std::vector<uint8_t>& bytes) {
+        return substrait_filter(bytes.data(), bytes.size());
+    }
+
     /// Materialize the scan as an ArrowArrayStream (blocking).
     void to_arrow_stream(ArrowArrayStream* out) {
         if (lance_scanner_to_arrow_stream(handle_.get(), out) != 0)

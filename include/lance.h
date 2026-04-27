@@ -293,6 +293,29 @@ int32_t lance_scanner_set_fragment_ids(
     size_t len
 );
 
+/**
+ * Set a Substrait filter on the scanner.
+ *
+ * `bytes` must point to a serialized Substrait `ExtendedExpression` message
+ * containing exactly one expression of boolean type. This is the preferred
+ * filter API for query engines that already speak Substrait — it avoids the
+ * round-trip through SQL string formatting and parsing.
+ *
+ * If both this and the SQL filter passed to `lance_scanner_new` are set, the
+ * Substrait filter wins. Calling this with the same scanner more than once
+ * replaces the previously-set Substrait filter. The bytes are copied; the
+ * caller may free them after this call returns.
+ *
+ * @param bytes  Serialized Substrait `ExtendedExpression` bytes (must not be NULL)
+ * @param len    Length of the byte buffer (must be > 0)
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_set_substrait_filter(
+    LanceScanner* scanner,
+    const uint8_t* bytes,
+    size_t len
+);
+
 /** Close and free a scanner handle. */
 void lance_scanner_close(LanceScanner* scanner);
 

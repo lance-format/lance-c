@@ -3573,3 +3573,114 @@ fn test_dataset_write_leaves_out_dataset_untouched_on_error() {
         "*out_dataset must be untouched on Lance-level error"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Substrait filter tests
+// ---------------------------------------------------------------------------
+
+/// Build a serialized Substrait `ExtendedExpression` for `id > 3`
+/// against the test dataset's schema (id: Int32, name: Utf8).
+fn substrait_id_gt_3() -> Vec<u8> {
+    use datafusion::logical_expr::{col, lit};
+    use datafusion::prelude::SessionContext;
+    use lance_datafusion::substrait::encode_substrait;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let expr = col("id").gt(lit(3i32));
+    let state = SessionContext::new().state();
+    encode_substrait(expr, schema, &state).unwrap()
+}
+
+#[test]
+fn test_scanner_with_substrait_filter() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let bytes = substrait_id_gt_3();
+    assert!(!bytes.is_empty(), "encoded substrait must be non-empty");
+
+    // Create scanner with no SQL filter, then attach Substrait filter.
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), bytes.len()) };
+    assert_eq!(
+        rc,
+        0,
+        "set_substrait_filter should succeed; err: {:?}",
+        lance_last_error_code()
+    );
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) };
+    assert_eq!(rc, 0);
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let total_rows: usize = reader.map(|r| r.unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 2, "id > 3 should match 2 rows (id=4, id=5)");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_substrait_filter_overrides_sql_filter() {
+    // If both SQL and Substrait filters are set, Substrait wins (last write).
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // Start with SQL filter "id < 0" (matches 0 rows).
+    let sql = c_str("id < 0");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), sql.as_ptr()) };
+    assert!(!scanner.is_null());
+
+    // Override with Substrait filter "id > 3" (matches 2 rows).
+    let bytes = substrait_id_gt_3();
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), bytes.len()) };
+    assert_eq!(rc, 0);
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) };
+    assert_eq!(rc, 0);
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let total_rows: usize = reader.map(|r| r.unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 2, "Substrait filter should override SQL filter");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_set_substrait_filter_invalid_inputs() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let bytes = [0u8; 4];
+
+    // NULL scanner.
+    let rc =
+        unsafe { lance_scanner_set_substrait_filter(ptr::null_mut(), bytes.as_ptr(), bytes.len()) };
+    assert_eq!(rc, -1);
+
+    // NULL bytes pointer with non-zero len.
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, ptr::null(), 4) };
+    assert_eq!(rc, -1);
+
+    // Zero len (empty filter) is rejected.
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), 0) };
+    assert_eq!(rc, -1);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
