@@ -3608,11 +3608,10 @@ fn test_scanner_with_substrait_filter() {
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
     assert!(!scanner.is_null());
 
-    let rc = unsafe {
-        lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), bytes.len())
-    };
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), bytes.len()) };
     assert_eq!(
-        rc, 0,
+        rc,
+        0,
         "set_substrait_filter should succeed; err: {:?}",
         lance_last_error_code()
     );
@@ -3644,9 +3643,7 @@ fn test_scanner_substrait_filter_overrides_sql_filter() {
 
     // Override with Substrait filter "id > 3" (matches 2 rows).
     let bytes = substrait_id_gt_3();
-    let rc = unsafe {
-        lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), bytes.len())
-    };
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), bytes.len()) };
     assert_eq!(rc, 0);
 
     let mut ffi_stream = FFI_ArrowArrayStream::empty();
@@ -3672,21 +3669,16 @@ fn test_scanner_set_substrait_filter_invalid_inputs() {
     let bytes = vec![0u8; 4];
 
     // NULL scanner.
-    let rc = unsafe {
-        lance_scanner_set_substrait_filter(ptr::null_mut(), bytes.as_ptr(), bytes.len())
-    };
+    let rc =
+        unsafe { lance_scanner_set_substrait_filter(ptr::null_mut(), bytes.as_ptr(), bytes.len()) };
     assert_eq!(rc, -1);
 
     // NULL bytes pointer with non-zero len.
-    let rc = unsafe {
-        lance_scanner_set_substrait_filter(scanner, ptr::null(), 4)
-    };
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, ptr::null(), 4) };
     assert_eq!(rc, -1);
 
     // Zero len (empty filter) is rejected.
-    let rc = unsafe {
-        lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), 0)
-    };
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), 0) };
     assert_eq!(rc, -1);
 
     unsafe { lance_scanner_close(scanner) };
