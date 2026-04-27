@@ -45,3 +45,52 @@ if(NOT LANCE_C_USE_PREBUILT)
 endif()
 
 # Imported targets and install rules are added in subsequent tasks.
+
+# ─── Build-tree imported targets ─────────────────────────────────────────────
+# These are for consumers using add_subdirectory(lance-c). Install-tree
+# consumers get equivalent targets re-created in LanceCConfig.cmake.
+# IMPORTED targets cannot be threaded through install(EXPORT), so the install
+# path keeps a separate hand-written config template.
+
+if(LANCE_C_USE_PREBUILT)
+    set(_lance_c_static_real "${LANCE_C_PREBUILT_DIR}/lib/liblance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    set(_lance_c_shared_real "${LANCE_C_PREBUILT_DIR}/lib/liblance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    set(_lance_c_include_dirs "${LANCE_C_PREBUILT_DIR}/include")
+else()
+    # Corrosion produces 'lance-c-static' (staticlib) and 'lance-c' (cdylib)
+    # IMPORTED targets from the crate-type declaration in Cargo.toml.
+    set(_lance_c_static_real lance-c-static)
+    set(_lance_c_shared_real lance-c)
+    set(_lance_c_include_dirs "${CMAKE_CURRENT_LIST_DIR}/include")
+endif()
+
+# Platform link requirements declared once. INTERFACE library so we can attach
+# it to multiple consumer targets without duplication.
+add_library(LanceC_platform_deps INTERFACE)
+if(APPLE)
+    target_link_libraries(LanceC_platform_deps INTERFACE
+        "-framework CoreFoundation"
+        "-framework Security"
+        "-framework SystemConfiguration")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(LanceC_platform_deps INTERFACE pthread dl m)
+endif()
+
+# Public namespaced targets for build-tree (add_subdirectory) consumers.
+# IMPORTED INTERFACE libraries because they aggregate other libs + flags but
+# have no compile inputs of their own.
+add_library(LanceC::lance_c_static INTERFACE IMPORTED GLOBAL)
+set_target_properties(LanceC::lance_c_static PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${_lance_c_include_dirs}"
+    INTERFACE_LINK_LIBRARIES "${_lance_c_static_real};LanceC_platform_deps")
+
+add_library(LanceC::lance_c_shared INTERFACE IMPORTED GLOBAL)
+set_target_properties(LanceC::lance_c_shared PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${_lance_c_include_dirs}"
+    INTERFACE_LINK_LIBRARIES "${_lance_c_shared_real};LanceC_platform_deps")
+
+if(LANCE_C_LINK STREQUAL "shared")
+    add_library(LanceC::lance_c ALIAS LanceC::lance_c_shared)
+else()
+    add_library(LanceC::lance_c ALIAS LanceC::lance_c_static)
+endif()
