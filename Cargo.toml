@@ -47,3 +47,16 @@ tempfile = "3"
 
 [profile.release]
 panic = "abort"
+
+[package.metadata.capi.header]
+subdirectory = "lance"
+generation = false  # we ship a hand-maintained header at include/lance/lance.h
+
+[package.metadata.capi.pkg_config]
+name = "lance-c"
+filename = "lance-c"
+description = "C/C++ bindings for the Lance columnar data format"
+
+[package.metadata.capi.library]
+name = "lance_c"
+versioning = false  # 0.x ABI is unstable; revisit at 1.0
