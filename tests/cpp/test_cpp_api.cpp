@@ -156,16 +156,17 @@ static void test_versions(const std::string& uri) {
     PASS();
 }
 
-// Restore to the dataset's own current version — a no-op that returns a
-// fresh handle at the same version.
-static void test_restore_noop(const std::string& uri) {
-    TEST(test_restore_noop);
+// Restore to the dataset's own current version — always commits a new
+// manifest (no skip-if-equal optimization) to defeat TOCTOU races against
+// concurrent writers.
+static void test_restore_to_current(const std::string& uri) {
+    TEST(test_restore_to_current);
 
     auto ds = lance::Dataset::open(uri);
     uint64_t current = ds.version();
 
     auto after = ds.restore(current);
-    assert(after.version() == current);
+    assert(after.version() == current + 1);
 
     PASS();
 }
@@ -202,7 +203,7 @@ int main(int argc, char** argv) {
     test_dataset_take(uri);
     test_raii_cleanup(uri);
     test_versions(uri);
-    test_restore_noop(uri);
+    test_restore_to_current(uri);
     test_error_exception(uri);
 
     printf("All C++ tests passed!\n");

@@ -23,8 +23,9 @@ use crate::runtime::block_on;
 ///   "latest" sentinel by `lance_dataset_open` and is rejected here with
 ///   `LANCE_ERR_INVALID_ARGUMENT`.
 ///
-/// If `version` is already the dataset's latest, the call succeeds as a
-/// no-op without writing a new manifest.
+/// A new manifest is always written, even when `version` already matches the
+/// current latest — this guarantees the caller's stated intent ("make `version`
+/// the new latest") holds under concurrent writers without a TOCTOU race.
 ///
 /// Returns a fresh `LanceDataset*` positioned at the target version on success
 /// (caller closes with `lance_dataset_close`), or NULL on error. Errors include
@@ -54,15 +55,14 @@ unsafe fn restore_inner(dataset: *const LanceDataset, version: u64) -> Result<*m
 
     let ds = unsafe { &*dataset };
 
-    // Check out the target version, then commit a new manifest that aliases
-    // its fragments as the new latest. If the target is already the latest,
-    // skip the commit — the checkout alone is enough.
+    // Check out the target version, then always commit a new manifest that
+    // aliases its fragments as the new latest. Skipping the commit when
+    // `version == latest` would open a TOCTOU window: a concurrent writer
+    // could land a newer manifest between the read and the comparison, and
+    // we'd silently leave their version as latest instead of the caller's.
     let restored = block_on(async {
-        let latest = ds.inner.latest_version_id().await?;
         let mut checked_out = ds.inner.checkout_version(version).await?;
-        if version != latest {
-            checked_out.restore().await?;
-        }
+        checked_out.restore().await?;
         Ok::<_, lance_core::Error>(checked_out)
     })?;
 

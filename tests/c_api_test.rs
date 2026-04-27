@@ -1831,7 +1831,12 @@ fn test_dataset_restore_to_prior_version() {
 }
 
 #[test]
-fn test_dataset_restore_to_current_latest_is_noop() {
+fn test_dataset_restore_to_current_latest_writes_new_manifest() {
+    // Restoring to the current latest still writes a new manifest. The
+    // optimization that previously skipped the commit was racy: a concurrent
+    // writer could land a newer manifest between the staleness check and the
+    // skip, silently leaving their version as latest. We always commit so the
+    // caller's "make `version` the new latest" intent holds unconditionally.
     let (_tmp, uri) = create_two_version_dataset();
     let c_uri = c_str(&uri);
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
@@ -1842,14 +1847,15 @@ fn test_dataset_restore_to_current_latest_is_noop() {
     assert!(!restored.is_null());
     assert_eq!(
         unsafe { lance_dataset_version(restored) },
-        latest,
-        "restore to latest must not bump the version"
+        latest + 1,
+        "restore to latest must commit a new manifest to defeat TOCTOU races"
     );
+    assert_eq!(unsafe { lance_dataset_count_rows(restored) }, 7);
 
-    // No new manifest: reopening the dataset reports the same latest.
+    // Reopening the dataset reports the bumped latest.
     unsafe { lance_dataset_close(restored) };
     let ds2 = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
-    assert_eq!(unsafe { lance_dataset_version(ds2) }, latest);
+    assert_eq!(unsafe { lance_dataset_version(ds2) }, latest + 1);
 
     unsafe { lance_dataset_close(ds2) };
     unsafe { lance_dataset_close(ds) };
