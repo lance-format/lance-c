@@ -1,0 +1,130 @@
+name: Release
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without leading 'v')"
+        required: true
+
+permissions:
+  contents: write   # needed for softprops/action-gh-release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            os_label: linux
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            os_label: linux
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            os_label: macos
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            os_label: macos
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install protobuf (Linux)
+        if: matrix.os_label == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protobuf (macOS)
+        if: matrix.os_label == 'macos'
+        run: brew install protobuf
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >>"$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Configure + build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+      - name: Install to staging prefix
+        run: cmake --install build --prefix stage
+      - name: Tar
+        id: pack
+        run: |
+          VERSION=${{ steps.ver.outputs.version }}
+          TARGET=${{ matrix.target }}
+          ARCHIVE="lance-c-v${VERSION}-${TARGET}.tar.xz"
+          tar -C stage -cJf "${ARCHIVE}" .
+          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          shasum -a 512 "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          echo "archive=${ARCHIVE}" >>"$GITHUB_OUTPUT"
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.pack.outputs.archive }}
+            ${{ steps.pack.outputs.archive }}.sha256
+            ${{ steps.pack.outputs.archive }}.sha512
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Aggregate SHA512SUMS
+        run: |
+          cd dist
+          cat *.sha512 > SHA512SUMS
+          ls -lah
+      - name: Emit recipe-update snippet
+        run: |
+          cd dist
+          echo "## Suggested recipe updates" > recipe-snippets.md
+          echo '```cmake' >> recipe-snippets.md
+          echo '# ports/lance-c/portfile.cmake — paste these set() lines' >> recipe-snippets.md
+          for f in *.tar.xz; do
+            sha=$(awk '{print $1}' "${f}.sha512")
+            triple_target="${f#lance-c-v*-}"
+            triple_target="${triple_target%.tar.xz}"
+            echo "set(LANCE_C_SHA512_${triple_target}  \"${sha}\")"
+          done >> recipe-snippets.md
+          echo '```' >> recipe-snippets.md
+          cat recipe-snippets.md
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.xz
+            dist/*.sha256
+            dist/*.sha512
+            dist/SHA512SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
