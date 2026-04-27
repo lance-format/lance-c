@@ -3666,7 +3666,7 @@ fn test_scanner_set_substrait_filter_invalid_inputs() {
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
     assert!(!scanner.is_null());
 
-    let bytes = vec![0u8; 4];
+    let bytes = [0u8; 4];
 
     // NULL scanner.
     let rc =
