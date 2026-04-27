@@ -8,7 +8,7 @@
  * This file is compiled by the Rust integration test to verify that
  * lance.h is valid C and the API works end-to-end.
  *
- * Usage: test_c_api <dataset_uri>
+ * Usage: test_c_api <dataset_uri> <write_uri>
  */
 
 #include "lance.h"
@@ -227,11 +227,14 @@ static void test_dataset_write_roundtrip(const char *src_uri, const char *dst_ur
     LanceDataset *dst = NULL;
     rc = lance_dataset_write(
         dst_uri, &schema, &stream, LANCE_WRITE_CREATE, NULL, &dst);
+
+    /* The Rust side reads `schema` by shared reference and never releases it,
+     * so we must release it ourselves on every return path — including
+     * failure. Release before the ASSERTs so a failed write doesn't leak. */
+    if (schema.release) schema.release(&schema);
+
     ASSERT(rc == 0, "lance_dataset_write failed");
     ASSERT(dst != NULL, "out_dataset should be populated");
-
-    /* stream is consumed by lance_dataset_write; schema we own. */
-    if (schema.release) schema.release(&schema);
 
     uint64_t dst_rows = lance_dataset_count_rows(dst);
     CHECK_OK();

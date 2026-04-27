@@ -2818,6 +2818,7 @@ fn test_dataset_write_append_accumulates_rows() {
     assert_eq!(rc, 0);
 
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 5);
     unsafe { lance_dataset_close(ds) };
 }
@@ -2857,6 +2858,7 @@ fn test_dataset_write_overwrite_replaces_rows() {
     assert_eq!(rc, 0);
 
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
     assert_eq!(
         unsafe { lance_dataset_count_rows(ds) },
         2,
@@ -3017,7 +3019,10 @@ fn test_dataset_write_append_schema_mismatch_fails() {
         )
     };
     assert_eq!(rc, -1);
-    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+    // Upstream Lance currently surfaces append-with-mismatched-schema as
+    // `Internal` rather than `InvalidArgument`. Lock the assertion to the
+    // observed code so we notice (and can revisit the mapping) if it changes.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
 }
 
 #[test]
@@ -3165,4 +3170,296 @@ fn test_dataset_write_null_args_return_error() {
     };
     assert_eq!(rc, -1);
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+/// A `RecordBatchReader` that bumps a shared counter when it is dropped.
+/// Wrapping this in an `FFI_ArrowArrayStream` lets a test observe whether the
+/// stream's `release` callback was invoked: dropping the boxed reader (via
+/// `release` on the FFI side) fires `Drop` and increments the counter.
+struct CountingReader {
+    inner: arrow::record_batch::RecordBatchIterator<
+        std::vec::IntoIter<arrow::error::Result<RecordBatch>>,
+    >,
+    drop_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for CountingReader {
+    fn drop(&mut self) {
+        self.drop_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Iterator for CountingReader {
+    type Item = arrow::error::Result<RecordBatch>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl RecordBatchReader for CountingReader {
+    fn schema(&self) -> Arc<Schema> {
+        self.inner.schema()
+    }
+}
+
+/// Build a `(stream, drop_counter)` pair where the stream wraps a single-batch
+/// reader whose `Drop` increments the counter. After a call that consumes the
+/// stream, the counter goes from 0 → 1.
+fn make_counted_stream(
+    schema: &Arc<Schema>,
+) -> (FFI_ArrowArrayStream, Arc<std::sync::atomic::AtomicUsize>) {
+    let drop_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reader = CountingReader {
+        inner: arrow::record_batch::RecordBatchIterator::new(
+            vec![Ok(write_batch(vec![1], vec![1.0]))].into_iter(),
+            schema.clone(),
+        ),
+        drop_count: drop_count.clone(),
+    };
+    (FFI_ArrowArrayStream::new(Box::new(reader)), drop_count)
+}
+
+fn assert_stream_consumed(
+    _stream: &FFI_ArrowArrayStream,
+    drop_count: &Arc<std::sync::atomic::AtomicUsize>,
+) {
+    // The drop count is the real behavioral check — it can only reach 1 if
+    // the FFI release callback fired, which is what frees the boxed reader.
+    // (We do not also assert `stream.release.is_none()` because `from_raw`
+    // unconditionally clears that field via `ptr::replace` before any other
+    // work; the assertion would be vacuously true on every path.)
+    assert_eq!(
+        drop_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "stream's release callback must fire exactly once during the call"
+    );
+}
+
+/// FFI contract: every error path that received a non-NULL stream must also
+/// release it, so the C caller never has to. We assert this by wrapping the
+/// reader in a `Drop`-counter and checking the counter immediately after each
+/// `lance_dataset_write` call. The cases below exercise every validation
+/// branch in `write_dataset_inner` that runs *after* the stream has been
+/// consumed via `from_raw` — including NULL uri/schema, which were previously
+/// gated *before* consumption (the bug R1 fixed).
+#[test]
+fn test_dataset_write_releases_stream_on_every_error_path() {
+    let schema = write_schema();
+    let c_uri = c_str("memory://x");
+
+    // Each case that passes a non-NULL schema constructs its own
+    // `FFI_ArrowSchema` via `schema_to_ffi` so the cases stay independent: a
+    // hypothetical regression where Rust accidentally consumes the schema
+    // would surface as an immediate failure here instead of silently
+    // corrupting later cases. Case 2 deliberately passes `ptr::null()` and
+    // therefore needs no schema construction.
+
+    // Case 1: NULL uri.
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let ffi_schema = schema_to_ffi(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            ptr::null(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    // Case 2: NULL schema.
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            ptr::null(),
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    // Case 3: invalid mode.
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let ffi_schema = schema_to_ffi(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            99,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    // Case 4: empty URI.
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let ffi_schema = schema_to_ffi(&schema);
+    let empty_uri = c_str("");
+    let rc = unsafe {
+        lance_dataset_write(
+            empty_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    // Case 5: declared-schema mismatch.
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let one_col_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let ffi_schema = schema_to_ffi(&one_col_schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    // Case 6: Lance-level rejection (CREATE on an existing dataset). This is
+    // the only error path that fails inside `block_on(Dataset::write)` after
+    // the stream has been moved into the upstream writer. Verifies the stream
+    // is still released even when the failure originates upstream.
+    let tmp = tempfile::tempdir().unwrap();
+    let existing_uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_existing = c_str(&existing_uri);
+    // Seed the path with an initial dataset.
+    let mut seed_stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let seed_schema = schema_to_ffi(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_existing.as_ptr(),
+            &seed_schema,
+            &mut seed_stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // Now CREATE again — expected to fail with DatasetAlreadyExists, and the
+    // stream must still be released by the failure path.
+    let ffi_schema = schema_to_ffi(&schema);
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_existing.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::DatasetAlreadyExists
+    );
+    assert_stream_consumed(&stream, &drop_count);
+}
+
+/// On error, `*out_dataset` must be left untouched. A caller that passes
+/// `&mut some_existing_handle` (perhaps re-using the slot) must be able to
+/// trust that a failed call does not silently overwrite or close their handle.
+/// Covers both pre-`block_on` validation errors (NULL uri) and Lance-level
+/// errors (CREATE on existing) — the contract holds across the success-prep
+/// boundary.
+#[test]
+fn test_dataset_write_leaves_out_dataset_untouched_on_error() {
+    let schema = write_schema();
+
+    // Sentinel that is non-NULL but otherwise invalid. `without_provenance_mut`
+    // (stable since 1.84) creates the pointer without exposing provenance —
+    // strict-provenance-clean. We never dereference it; the test only checks
+    // value equality after the call to confirm `*out_dataset` was not written.
+    let sentinel: *mut LanceDataset = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+
+    // Case 1: pre-`block_on` validation error (NULL uri).
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let ffi_schema = schema_to_ffi(&schema);
+    let mut out_ds = sentinel;
+    let rc = unsafe {
+        lance_dataset_write(
+            ptr::null(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            &mut out_ds,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        out_ds, sentinel,
+        "*out_dataset must be untouched on pre-block_on error"
+    );
+
+    // Case 2: Lance-level error (CREATE on an existing dataset). Verifies the
+    // contract still holds when failure originates inside `block_on(write)`.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+    let mut seed_stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let seed_schema = schema_to_ffi(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &seed_schema,
+            &mut seed_stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let mut stream = batch_to_ffi_stream(write_batch(vec![2], vec![2.0]));
+    let ffi_schema = schema_to_ffi(&schema);
+    let mut out_ds = sentinel;
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            &mut out_ds,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::DatasetAlreadyExists
+    );
+    assert_eq!(
+        out_ds, sentinel,
+        "*out_dataset must be untouched on Lance-level error"
+    );
 }

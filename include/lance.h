@@ -485,8 +485,12 @@ int32_t lance_scanner_full_text_search(
 
 /**
  * Write mode for lance_dataset_write. Values are ABI-stable.
- * The Rust implementation validates the received integer and rejects any
- * out-of-range value with LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * The `mode` parameter on the FFI call is a fixed-width int32_t — not this
+ * enum type — so callers built with `-fshort-enums` or non-default enum
+ * sizing cannot mismatch the Rust ABI. The Rust implementation validates the
+ * received integer and rejects any out-of-range value with
+ * LANCE_ERR_INVALID_ARGUMENT.
  */
 typedef enum {
     LANCE_WRITE_CREATE    = 0,  /* Create new dataset; fail if path exists. */
@@ -501,7 +505,10 @@ typedef enum {
  * @param uri          Dataset URI (file://, s3://, memory://, etc.). Must not
  *                     be NULL or an empty string.
  * @param schema       Required Arrow schema. The stream schema must match or
- *                     the call fails with LANCE_ERR_INVALID_ARGUMENT.
+ *                     the call fails with LANCE_ERR_INVALID_ARGUMENT. This
+ *                     function does NOT call schema->release; the caller
+ *                     retains ownership and must release the schema after the
+ *                     call returns (success or failure).
  * @param stream       Arrow C Data Interface stream consumed by this call.
  *                     Do not use the stream after returning, regardless of
  *                     the return code.
@@ -511,6 +518,10 @@ typedef enum {
  *                     at the newly-committed version (caller must
  *                     lance_dataset_close it). Pass NULL to discard. On error
  *                     *out_dataset is left unchanged — do not read or free it.
+ *                     On entry `*out_dataset` should be NULL or a pointer
+ *                     whose previous value is no longer needed; this function
+ *                     overwrites the slot on success without releasing any
+ *                     prior handle.
  * @return 0 on success, -1 on error. Possible error codes include
  *         LANCE_ERR_DATASET_ALREADY_EXISTS (CREATE on an existing path),
  *         LANCE_ERR_INVALID_ARGUMENT (NULL/empty args, invalid mode,
@@ -521,7 +532,7 @@ int32_t lance_dataset_write(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
-    LanceWriteMode mode,
+    int32_t mode,
     const char* const* storage_opts,
     LanceDataset** out_dataset
 );

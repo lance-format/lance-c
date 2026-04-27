@@ -147,21 +147,72 @@ public:
             throw Error(LANCE_ERR_INVALID_ARGUMENT, "stream must not be null");
         }
 
-        // Pull the stream's schema so we can pass it to the C API.
+        // RAII guard that releases the stream unless `disarm()` is called.
+        // Until `lance_dataset_write` returns we still own the stream, and any
+        // exception (failed schema read, std::bad_alloc while building the
+        // storage-options vector, etc.) must not leak it. `lance_dataset_write`
+        // consumes the stream on every return path on the Rust side, so we
+        // disarm immediately before invoking it.
+        struct StreamGuard {
+            ArrowArrayStream* s;
+            bool armed = true;
+            // Explicit constructor: `= delete`d copy/move ctors disqualify
+            // this from being an aggregate under C++20, so brace-init like
+            // `StreamGuard{stream}` would otherwise fail to compile there.
+            explicit StreamGuard(ArrowArrayStream* p) noexcept : s(p) {}
+            ~StreamGuard() noexcept {
+                if (armed && s && s->release) s->release(s);
+            }
+            void disarm() noexcept { armed = false; }
+            StreamGuard(const StreamGuard&) = delete;
+            StreamGuard& operator=(const StreamGuard&) = delete;
+            StreamGuard(StreamGuard&&) = delete;
+            StreamGuard& operator=(StreamGuard&&) = delete;
+        } stream_guard{stream};
+
+        // Defensive: a non-conforming or already-released producer may have a
+        // null `get_schema`. Without this guard a bad caller would crash with
+        // a null function-pointer dereference on the next line.
+        if (stream->get_schema == nullptr) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "stream get_schema callback is null");
+        }
+
+        // Zero-initialize the schema and arm its RAII guard *before* invoking
+        // `get_schema`, so a non-conforming producer that partially populates
+        // the schema and then returns an error code still has its `release`
+        // callback fired during unwind. (Zero-initialized `schema.release` is
+        // null, making the destructor a no-op on the success-of-error-without-
+        // population path.)
+        struct SchemaGuard {
+            ArrowSchema* s;
+            // Explicit constructor for the same C++20 aggregate-init reason
+            // documented on StreamGuard above.
+            explicit SchemaGuard(ArrowSchema* p) noexcept : s(p) {}
+            ~SchemaGuard() noexcept {
+                if (s && s->release) s->release(s);
+            }
+            SchemaGuard(const SchemaGuard&) = delete;
+            SchemaGuard& operator=(const SchemaGuard&) = delete;
+            SchemaGuard(SchemaGuard&&) = delete;
+            SchemaGuard& operator=(SchemaGuard&&) = delete;
+        };
         ArrowSchema schema = {};
+        SchemaGuard schema_guard{&schema};
+
+        // Pull the stream's schema so we can pass it to the C API. If this
+        // fails the StreamGuard releases the stream during unwind, and the
+        // SchemaGuard above releases any partial schema state the producer
+        // may have left behind — preserving the "consumed on return or
+        // throw" contract for both resources.
         if (stream->get_schema(stream, &schema) != 0) {
             const char* err = stream->get_last_error
                 ? stream->get_last_error(stream)
                 : nullptr;
-            throw Error(
-                LANCE_ERR_INVALID_ARGUMENT,
-                std::string("failed to read stream schema: ") +
-                    (err ? err : "unknown"));
+            std::string msg = std::string("failed to read stream schema: ") +
+                              (err ? err : "unknown");
+            throw Error(LANCE_ERR_INVALID_ARGUMENT, msg);
         }
-        struct SchemaGuard {
-            ArrowSchema* s;
-            ~SchemaGuard() { if (s && s->release) s->release(s); }
-        } guard{&schema};
 
         std::vector<const char*> kv;
         for (auto& [k, v] : storage_opts) {
@@ -172,15 +223,29 @@ public:
         const char* const* opts_ptr =
             storage_opts.empty() ? nullptr : kv.data();
 
+        // The C API consumes the stream on every return path, so disarm the
+        // guard before calling. After this point the stream pointer is logically
+        // owned by Rust and any C++-side exception must not re-release it.
+        stream_guard.disarm();
+
         LanceDataset* out = nullptr;
         int32_t rc = lance_dataset_write(
             uri.c_str(),
             &schema,
             stream,
-            static_cast<LanceWriteMode>(mode),
+            static_cast<int32_t>(mode),
             opts_ptr,
             &out);
         if (rc != 0) check_error();
+        // Defensive null guard: a conforming Rust impl never returns rc == 0
+        // with `out == nullptr`, but constructing a Dataset around a null
+        // handle would silently crash on the first method call. Throw
+        // explicitly rather than going through `check_error()` because the
+        // thread-local code is `LANCE_OK` on this path (rc == 0).
+        if (!out) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_dataset_write returned success with null out_dataset");
+        }
         return Dataset(out);
     }
 
