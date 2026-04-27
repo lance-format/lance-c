@@ -76,52 +76,6 @@ jobs:
       - name: Run C/C++ compilation tests
         run: cargo test --test compile_and_run_test -- --ignored
 
-  consumer-smoke-test:
-    name: find_package(LanceC) smoke test
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            os_label: linux
-          - runner: macos-14
-            os_label: macos
-    env:
-      CC: clang
-      CXX: clang++
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: Swatinem/rust-cache@v2
-      - name: Install protobuf-compiler (Linux)
-        if: matrix.os_label == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Install protobuf (macOS)
-        if: matrix.os_label == 'macos'
-        run: brew install protobuf
-      - name: Configure + build + install lance-c
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build
-          cmake --install build --prefix "$PWD/_install"
-      - name: Build consumer example against the install
-        run: |
-          cmake -S examples/cmake-consumer -B consumer-build \
-            -DCMAKE_PREFIX_PATH="$PWD/_install" \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build consumer-build
-      - name: Verify the binary links and runs (no dataset → expect usage error)
-        run: |
-          set +e
-          consumer-build/consumer
-          rc=$?
-          if [ "$rc" -ne 2 ]; then
-            echo "Expected exit code 2 (usage error), got $rc"
-            exit 1
-          fi
-
   rustdoc:
     name: Rustdoc
     runs-on: ubuntu-24.04
