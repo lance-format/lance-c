@@ -1,0 +1,29 @@
+name: release-please
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# release-please watches conventional commits on main and maintains a
+# `chore(release): X.Y.Z` PR. Merging that PR creates a v* git tag, which
+# triggers .github/workflows/release.yml to build and publish prebuilt
+# tarballs.
+#
+# Pre-1.0 behavior (bump-minor-pre-major=true): breaking changes bump
+# 0.X.Y -> 0.(X+1).0 instead of 1.0.0, so we don't accidentally graduate
+# to 1.0 before the API is settled.
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json

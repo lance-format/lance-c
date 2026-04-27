@@ -11,7 +11,7 @@
  * Usage: test_c_api <dataset_uri> <write_uri>
  */
 
-#include "lance.h"
+#include "lance/lance.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

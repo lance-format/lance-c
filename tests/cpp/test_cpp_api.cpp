@@ -10,7 +10,7 @@
  * Usage: test_cpp_api <dataset_uri> <write_uri>
  */
 
-#include "lance.hpp"
+#include "lance/lance.hpp"
 #include <cassert>
 #include <cstdio>
 #include <cstring>

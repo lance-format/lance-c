@@ -15,7 +15,7 @@
 #ifndef LANCE_HPP
 #define LANCE_HPP
 
-#include "lance.h"
+#include "lance/lance.h"
 
 #include <cstdint>
 #include <memory>
