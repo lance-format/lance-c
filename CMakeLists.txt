@@ -142,3 +142,21 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/LanceCConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/LanceCConfigVersion.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LanceC)
+
+# ─── pkg-config ──────────────────────────────────────────────────────────────
+if(APPLE)
+    set(LANCE_C_PC_LIBS_PRIVATE
+        "-framework CoreFoundation -framework Security -framework SystemConfiguration")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(LANCE_C_PC_LIBS_PRIVATE "-lpthread -ldl -lm")
+else()
+    set(LANCE_C_PC_LIBS_PRIVATE "")
+endif()
+
+configure_file(
+    "${CMAKE_CURRENT_LIST_DIR}/cmake/lance-c.pc.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/lance-c.pc"
+    @ONLY)
+
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/lance-c.pc"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
