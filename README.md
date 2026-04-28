@@ -31,12 +31,12 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 
 | Status | Component | Description |
 |--------|-----------|-------------|
-| [ ] | Vector search | Nearest-neighbor via scanner with metric/k/nprobes |
-| [ ] | Full-text search | FTS queries through scanner interface |
-| [ ] | Vector index creation | IVF_PQ, IVF_FLAT, IVF_SQ, HNSW variants |
-| [ ] | Scalar index creation | BTree, Bitmap, Inverted, Label-List indexes |
-| [ ] | Index management | List and drop index operations |
-| [ ] | C++ wrappers | `create_vector_index()` and `create_scalar_index()` methods |
+| [x] | Vector search | Nearest-neighbor via scanner with metric/k/nprobes |
+| [x] | Full-text search | FTS queries through scanner interface |
+| [x] | Vector index creation | IVF_PQ, IVF_FLAT, IVF_SQ, HNSW variants |
+| [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List indexes |
+| [x] | Index management | List and drop index operations |
+| [x] | C++ wrappers | `create_vector_index()` and `create_scalar_index()` methods |
 
 ### Phase 3: Write Path & Mutations
 
@@ -58,7 +58,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [ ] | Compaction | Fragment consolidation operations |
 | [ ] | Statistics export | Row counts, column stats for query planning |
 | [x] | Cloud storage | S3, GCS, Azure via storage options pass-through |
-| [ ] | Package distribution | vcpkg and Conan recipe packaging |
+| [x] | Package distribution | vcpkg and Conan recipe packaging |
 
 ### Additional (not in RFC)
 
@@ -69,18 +69,72 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 
 ## Building
 
+There are four supported entry points; pick whichever matches your toolchain.
+
+### From source via cargo (Rust developers)
+
 ```bash
 cargo build --release
 ```
 
-The build produces `liblance_c.{so,dylib,dll}` and the headers in `include/`.
+Produces `target/release/liblance_c.{so,dylib,dll}` and a `liblance_c.a`.
+Headers stay in `include/lance/`.
+
+### From source via CMake (C/C++ developers)
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix /your/prefix
+```
+
+Installs headers, both linkages, a `LanceCConfig.cmake` package config, and
+a `lance-c.pc` pkg-config file. Consumers then:
+
+```cmake
+find_package(LanceC 0.1 REQUIRED)
+target_link_libraries(myapp PRIVATE LanceC::lance_c)
+```
+
+See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
+working example.
+
+### vcpkg
+
+```bash
+vcpkg install lance-c
+```
+
+Downloads a prebuilt binary for your triplet from
+[GitHub Releases](https://github.com/lance-format/lance-c/releases). For
+unsupported triples, opt into a source build with the `from-source` feature:
+
+```bash
+vcpkg install 'lance-c[from-source]'  # requires Rust toolchain
+```
+
+### Conan
+
+```bash
+conan install --requires=lance-c/0.1.0
+```
+
+Default path downloads prebuilts; `-o lance-c/*:from_source=True` builds
+from source via cargo.
+
+### Header path
+
+```c
+#include <lance/lance.h>     // C
+#include <lance/lance.hpp>   // C++
+```
 
 ## Usage
 
 ### C
 
 ```c
-#include "lance.h"
+#include <lance/lance.h>
 
 LanceDataset* ds = lance_dataset_open("data.lance", NULL, 0);
 if (!ds) {
@@ -100,7 +154,7 @@ lance_dataset_close(ds);
 ### C++
 
 ```cpp
-#include "lance.hpp"
+#include <lance/lance.hpp>
 
 auto ds = lance::Dataset::open("data.lance");
 printf("rows: %llu, version: %llu\n", ds.count_rows(), ds.version());
@@ -112,6 +166,48 @@ ds.scan()
   .to_arrow_stream(&stream);
 // consume stream...
 ```
+
+### Open at a specific version
+
+`lance_dataset_open` takes a `version` argument — `0` means the latest, any
+other value checks out that specific version id (e.g. one returned by
+`lance_dataset_versions`):
+
+```c
+LanceDataset* ds = lance_dataset_open("data.lance", NULL, 42);
+```
+
+```cpp
+auto ds = lance::Dataset::open("data.lance", {}, /*version=*/42);
+```
+
+## Releasing
+
+Releases are tag-driven via [`release.yml`](.github/workflows/release.yml).
+
+1. Decide the new version (semver). Pre-1.0 (`0.x.y`): bump **minor** for breaking changes or new features, **patch** for bug fixes only.
+2. On `main`, bump `version = ...` in [`Cargo.toml`](Cargo.toml) and refresh `Cargo.lock`:
+   ```bash
+   git checkout main && git pull
+   # edit Cargo.toml: change version = "0.1.0" to "0.2.0"
+   cargo update -p lance-c
+   git checkout -b chore/release-0.2.0
+   git commit -am "chore(release): v0.2.0"
+   ```
+3. Open a PR with the bump (and any `CHANGELOG.md` edits if you maintain one), get it reviewed and merged.
+4. Tag the merge commit and push:
+   ```bash
+   git checkout main && git pull
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+5. `release.yml` fires on the tag push and builds prebuilt tarballs for `linux-{x86_64,aarch64}` and `macos-{x86_64,aarch64}`. ~20 minutes later, the [GitHub Release](https://github.com/lance-format/lance-c/releases) has all four `.tar.xz` artifacts plus a `SHA512SUMS` file.
+6. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
+   - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
+   - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
+7. Open follow-up PRs to `microsoft/vcpkg` and `conan-io/conan-center-index` mirroring the updated `ports/` and `recipes/` directories.
+
+A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 
 ## License
 

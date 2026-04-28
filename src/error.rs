@@ -58,7 +58,9 @@ pub fn error_code_from_lance(err: &lance_core::Error) -> LanceErrorCode {
         Error::InvalidInput { .. } => LanceErrorCode::InvalidArgument,
         Error::DatasetAlreadyExists { .. } => LanceErrorCode::DatasetAlreadyExists,
         Error::CommitConflict { .. } => LanceErrorCode::CommitConflict,
-        Error::DatasetNotFound { .. } | Error::NotFound { .. } => LanceErrorCode::NotFound,
+        Error::DatasetNotFound { .. } | Error::NotFound { .. } | Error::IndexNotFound { .. } => {
+            LanceErrorCode::NotFound
+        }
         Error::IO { .. } => LanceErrorCode::IoError,
         Error::Index { .. } => LanceErrorCode::IndexError,
         Error::NotSupported { .. } => LanceErrorCode::NotSupported,

@@ -15,7 +15,7 @@
 #ifndef LANCE_HPP
 #define LANCE_HPP
 
-#include "lance.h"
+#include "lance/lance.h"
 
 #include <cstdint>
 #include <memory>
@@ -104,8 +104,13 @@ enum class WriteMode : int32_t {
     Overwrite = LANCE_WRITE_OVERWRITE,
 };
 
-/// Tunable parameters for Dataset::write. Empty fields (0 for numeric,
-/// nullopt for optional strings) keep upstream defaults.
+/// Tunable parameters for Dataset::write. Numeric fields default-out via 0;
+/// `data_storage_version` defaults out via `std::nullopt`.
+///
+/// `enable_stable_row_ids` has no default sentinel — whatever value the
+/// caller writes is forwarded to upstream. Today this matches upstream's
+/// default (`false`), so a default-constructed WriteParams is a no-op; if
+/// upstream ever changes its default, callers must set this field explicitly.
 struct WriteParams {
     uint64_t                   max_rows_per_file    = 0;
     uint64_t                   max_rows_per_group   = 0;
@@ -121,7 +126,9 @@ class Dataset {
     Handle<LanceDataset, lance_dataset_close> handle_;
 
 public:
-    /// Open a dataset at the given URI.
+    /// Open a dataset at the given URI. Pass `version` = 0 (the default) for
+    /// the latest, or a specific version id from `versions()` to check out
+    /// that version, e.g. `lance::Dataset::open("data.lance", {}, /*version=*/42)`.
     static Dataset open(
         const std::string& uri,
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
@@ -154,10 +161,12 @@ public:
         ArrowArrayStream* stream,
         WriteMode mode,
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {}) {
+
         return write(uri, stream, mode, WriteParams{}, storage_opts);
     }
 
-    /// Same as the three-argument `write` but tunes the output via `params`.
+    /// Same as the four-argument `write` but tunes the output via `params`.
+    /// Pass a default-constructed `WriteParams{}` to inherit upstream defaults.
     static Dataset write(
         const std::string& uri,
         ArrowArrayStream* stream,
@@ -169,21 +178,66 @@ public:
             throw Error(LANCE_ERR_INVALID_ARGUMENT, "stream must not be null");
         }
 
-        // Pull the stream's schema so we can pass it to the C API.
+        // RAII guard for the stream. Until `lance_dataset_write_with_params`
+        // is called, any exception (failed `get_schema`, `std::bad_alloc`
+        // while building `kv`, etc.) must release the stream. After that call
+        // Rust owns it, so we `disarm()` immediately before invoking the C API.
+        struct StreamGuard {
+            ArrowArrayStream* s;
+            bool armed = true;
+            // Explicit constructor: `= delete`d copy/move ctors disqualify
+            // this from being an aggregate under C++20, so brace-init like
+            // `StreamGuard{stream}` would otherwise fail to compile there.
+            explicit StreamGuard(ArrowArrayStream* p) noexcept : s(p) {}
+            ~StreamGuard() noexcept {
+                if (armed && s && s->release) s->release(s);
+            }
+            void disarm() noexcept { armed = false; }
+            StreamGuard(const StreamGuard&) = delete;
+            StreamGuard& operator=(const StreamGuard&) = delete;
+            StreamGuard(StreamGuard&&) = delete;
+            StreamGuard& operator=(StreamGuard&&) = delete;
+        } stream_guard{stream};
+
+        // Defensive: a non-conforming or already-released producer may have a
+        // null `get_schema`. Without this guard a bad caller would crash with
+        // a null function-pointer dereference on the next line.
+        if (stream->get_schema == nullptr) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "stream get_schema callback is null");
+        }
+
+        // Arm SchemaGuard before calling `get_schema` so a non-conforming
+        // producer that partially populates the schema before returning an
+        // error still has its `release` fired on unwind. The zero-init keeps
+        // the destructor a no-op on the clean-error path (release == null).
+        struct SchemaGuard {
+            ArrowSchema* s;
+            // Explicit constructor for the same C++20 aggregate-init reason
+            // documented on StreamGuard above.
+            explicit SchemaGuard(ArrowSchema* p) noexcept : s(p) {}
+            ~SchemaGuard() noexcept {
+                if (s && s->release) s->release(s);
+            }
+            SchemaGuard(const SchemaGuard&) = delete;
+            SchemaGuard& operator=(const SchemaGuard&) = delete;
+            SchemaGuard(SchemaGuard&&) = delete;
+            SchemaGuard& operator=(SchemaGuard&&) = delete;
+        };
         ArrowSchema schema = {};
+        SchemaGuard schema_guard{&schema};
+
+        // On failure, StreamGuard releases the stream and SchemaGuard
+        // releases any partial schema state — preserving the "consumed on
+        // return or throw" contract for both resources.
         if (stream->get_schema(stream, &schema) != 0) {
             const char* err = stream->get_last_error
                 ? stream->get_last_error(stream)
                 : nullptr;
-            throw Error(
-                LANCE_ERR_INVALID_ARGUMENT,
-                std::string("failed to read stream schema: ") +
-                    (err ? err : "unknown"));
+            std::string msg = std::string("failed to read stream schema: ") +
+                              (err ? err : "unknown");
+            throw Error(LANCE_ERR_INVALID_ARGUMENT, msg);
         }
-        struct SchemaGuard {
-            ArrowSchema* s;
-            ~SchemaGuard() { if (s && s->release) s->release(s); }
-        } guard{&schema};
 
         std::vector<const char*> kv;
         for (auto& [k, v] : storage_opts) {
@@ -202,16 +256,30 @@ public:
             params.data_storage_version ? params.data_storage_version->c_str() : nullptr;
         c_params.enable_stable_row_ids = params.enable_stable_row_ids;
 
+        // The C API consumes the stream on every return path, so disarm the
+        // guard before calling. After this point the stream pointer is logically
+        // owned by Rust and any C++-side exception must not re-release it.
+        stream_guard.disarm();
+
         LanceDataset* out = nullptr;
         int32_t rc = lance_dataset_write_with_params(
             uri.c_str(),
             &schema,
             stream,
-            static_cast<LanceWriteMode>(mode),
+            static_cast<int32_t>(mode),
             &c_params,
             opts_ptr,
             &out);
         if (rc != 0) check_error();
+        // Defensive null guard: a conforming Rust impl never returns rc == 0
+        // with `out == nullptr`, but constructing a Dataset around a null
+        // handle would silently crash on the first method call. Throw
+        // explicitly rather than going through `check_error()` because the
+        // thread-local code is `LANCE_OK` on this path (rc == 0).
+        if (!out) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_dataset_write_with_params returned success with null out_dataset");
+        }
         return Dataset(out);
     }
 
@@ -253,6 +321,16 @@ public:
             out.push_back(info);
         }
         return out;
+    }
+
+    /// Commit a new manifest that aliases `version` as the latest. The
+    /// returned Dataset points at the target version; this handle is
+    /// unchanged. If `version` is already the latest, no new manifest is
+    /// written. Throws lance::Error on failure.
+    Dataset restore(uint64_t version) const {
+        auto* out = lance_dataset_restore(handle_.get(), version);
+        if (!out) check_error();
+        return Dataset(out);
     }
 
     /// Export the schema as an Arrow C Data Interface struct.
@@ -303,6 +381,53 @@ public:
                 check_error();
         }
         return ids;
+    }
+
+    /// Create a vector index on a column.
+    void create_vector_index(const std::string& column,
+                             const LanceVectorIndexParams& params,
+                             const std::string& name = "",
+                             bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        if (lance_dataset_create_vector_index(handle_.get(), column.c_str(),
+                                               name_c, &params, replace) != 0)
+            check_error();
+    }
+
+    /// Create a scalar index on a column.
+    void create_scalar_index(const std::string& column,
+                             LanceScalarIndexType index_type,
+                             const std::string& name = "",
+                             const std::string& params_json = "",
+                             bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        if (lance_dataset_create_scalar_index(handle_.get(), column.c_str(),
+                                               name_c, index_type,
+                                               json_c, replace) != 0)
+            check_error();
+    }
+
+    /// Drop an index by name.
+    void drop_index(const std::string& name) {
+        if (lance_dataset_drop_index(handle_.get(), name.c_str()) != 0)
+            check_error();
+    }
+
+    /// Number of user indexes (excludes system indexes).
+    uint64_t index_count() const {
+        uint64_t n = lance_dataset_index_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return n;
+    }
+
+    /// JSON array describing all user indexes.
+    std::string list_indices_json() const {
+        const char* json = lance_dataset_index_list_json(handle_.get());
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
     }
 
     /// Access the underlying C handle (does not transfer ownership).
@@ -360,6 +485,19 @@ public:
         return fragment_ids(ids.data(), ids.size());
     }
 
+    /// Set a Substrait filter (serialized ExtendedExpression bytes).
+    /// Wins over any SQL filter passed to the Scanner constructor.
+    Scanner& substrait_filter(const uint8_t* bytes, size_t len) {
+        if (lance_scanner_set_substrait_filter(handle_.get(), bytes, len) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Set a Substrait filter (vector overload).
+    Scanner& substrait_filter(const std::vector<uint8_t>& bytes) {
+        return substrait_filter(bytes.data(), bytes.size());
+    }
+
     /// Materialize the scan as an ArrowArrayStream (blocking).
     void to_arrow_stream(ArrowArrayStream* out) {
         if (lance_scanner_to_arrow_stream(handle_.get(), out) != 0)
@@ -369,6 +507,65 @@ public:
     /// Start an async scan. Callback fires when ArrowArrayStream is ready.
     void scan_async(LanceCallback callback, void* ctx) const {
         lance_scanner_scan_async(handle_.get(), callback, ctx);
+    }
+
+    /// k-NN search (Float32 sugar).
+    Scanner& nearest(const std::string& column, const float* q, size_t dim, uint32_t k) {
+        if (lance_scanner_nearest(handle_.get(), column.c_str(),
+                                   q, dim, LANCE_DTYPE_FLOAT32, k) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// k-NN search (typed).
+    Scanner& nearest(const std::string& column, const void* q, size_t dim,
+                     LanceDataType dtype, uint32_t k) {
+        if (lance_scanner_nearest(handle_.get(), column.c_str(),
+                                   q, dim, dtype, k) != 0)
+            check_error();
+        return *this;
+    }
+
+    Scanner& nprobes(uint32_t n) {
+        if (lance_scanner_set_nprobes(handle_.get(), n) != 0) check_error();
+        return *this;
+    }
+    Scanner& refine_factor(uint32_t f) {
+        if (lance_scanner_set_refine_factor(handle_.get(), f) != 0) check_error();
+        return *this;
+    }
+    Scanner& ef(uint32_t e) {
+        if (lance_scanner_set_ef(handle_.get(), e) != 0) check_error();
+        return *this;
+    }
+    Scanner& metric(LanceMetricType m) {
+        if (lance_scanner_set_metric(handle_.get(), m) != 0) check_error();
+        return *this;
+    }
+    Scanner& use_index(bool enable) {
+        if (lance_scanner_set_use_index(handle_.get(), enable) != 0) check_error();
+        return *this;
+    }
+    Scanner& prefilter(bool enable) {
+        if (lance_scanner_set_prefilter(handle_.get(), enable) != 0) check_error();
+        return *this;
+    }
+
+    /// BM25 full-text search.
+    /// `columns` empty → search all FTS-indexed columns.
+    /// `max_fuzzy_distance` 0 = exact; >0 = MatchQuery::with_fuzziness.
+    Scanner& full_text_search(const std::string& query,
+                              const std::vector<std::string>& columns = {},
+                              uint32_t max_fuzzy_distance = 0) {
+        std::vector<const char*> col_ptrs;
+        for (auto& c : columns) col_ptrs.push_back(c.c_str());
+        col_ptrs.push_back(nullptr);
+        const char* const* cols_c =
+            columns.empty() ? nullptr : col_ptrs.data();
+        if (lance_scanner_full_text_search(handle_.get(), query.c_str(),
+                                            cols_c, max_fuzzy_distance) != 0)
+            check_error();
+        return *this;
     }
 
     /// Access the underlying C handle.

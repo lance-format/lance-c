@@ -4,7 +4,7 @@
 //! Dataset C API: open, close, metadata, schema, take.
 
 use std::ffi::c_char;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
@@ -19,7 +19,27 @@ use crate::runtime::block_on;
 
 /// Opaque handle representing an opened Lance dataset.
 pub struct LanceDataset {
-    pub(crate) inner: Arc<Dataset>,
+    pub(crate) inner: RwLock<Arc<Dataset>>,
+}
+
+impl LanceDataset {
+    /// Take a consistent snapshot of the inner dataset.
+    /// Returns a cloned Arc so the caller can hold it without keeping the lock.
+    pub(crate) fn snapshot(&self) -> Arc<Dataset> {
+        self.inner.read().expect("dataset rwlock poisoned").clone()
+    }
+
+    /// Mutate the inner dataset under an exclusive write lock.
+    /// `Arc::make_mut` performs a cheap shallow clone if other Arc refs exist
+    /// (existing scanners keep their snapshot view).
+    pub(crate) fn with_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Dataset) -> R,
+    {
+        let mut guard = self.inner.write().expect("dataset rwlock poisoned");
+        let ds = Arc::make_mut(&mut *guard);
+        f(ds)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +90,7 @@ unsafe fn open_dataset_inner(
 
     let dataset = block_on(builder.load())?;
     let handle = LanceDataset {
-        inner: Arc::new(dataset),
+        inner: RwLock::new(Arc::new(dataset)),
     };
     Ok(Box::into_raw(Box::new(handle)))
 }
@@ -98,7 +118,7 @@ pub unsafe extern "C" fn lance_dataset_version(dataset: *const LanceDataset) -> 
         return 0;
     }
     let ds = unsafe { &*dataset };
-    ds.inner.version().version
+    ds.snapshot().version().version
 }
 
 /// Return the number of rows in the dataset.
@@ -110,7 +130,7 @@ pub unsafe extern "C" fn lance_dataset_count_rows(dataset: *const LanceDataset) 
         return 0;
     }
     let ds = unsafe { &*dataset };
-    match block_on(ds.inner.count_rows(None)) {
+    match block_on(ds.snapshot().count_rows(None)) {
         Ok(n) => {
             crate::error::clear_last_error();
             n as u64
@@ -131,7 +151,7 @@ pub unsafe extern "C" fn lance_dataset_latest_version(dataset: *const LanceDatas
         return 0;
     }
     let ds = unsafe { &*dataset };
-    match block_on(ds.inner.latest_version_id()) {
+    match block_on(ds.snapshot().latest_version_id()) {
         Ok(v) => {
             crate::error::clear_last_error();
             v
@@ -170,7 +190,8 @@ unsafe fn dataset_schema_inner(
         });
     }
     let ds = unsafe { &*dataset };
-    let lance_schema = ds.inner.schema();
+    let snap = ds.snapshot();
+    let lance_schema = snap.schema();
     let arrow_schema: ArrowSchema = lance_schema.into();
     let ffi_schema = FFI_ArrowSchema::try_from(&arrow_schema)?;
     unsafe {
@@ -222,14 +243,13 @@ unsafe fn dataset_take_inner(
     let idx_slice = unsafe { std::slice::from_raw_parts(indices, num_indices) };
     let col_names = unsafe { helpers::parse_c_string_array(columns)? };
 
+    let snap = ds.snapshot();
     let projection = match &col_names {
-        Some(cols) => {
-            lance::dataset::ProjectionRequest::from_columns(cols.iter(), ds.inner.schema())
-        }
-        None => lance::dataset::ProjectionRequest::from_schema(ds.inner.schema().clone()),
+        Some(cols) => lance::dataset::ProjectionRequest::from_columns(cols.iter(), snap.schema()),
+        None => lance::dataset::ProjectionRequest::from_schema(snap.schema().clone()),
     };
 
-    let batch = block_on(ds.inner.take(idx_slice, projection))?;
+    let batch = block_on(snap.take(idx_slice, projection))?;
 
     // Wrap the single RecordBatch as a RecordBatchReader, then export as FFI stream.
     let schema = batch.schema();
@@ -255,7 +275,7 @@ pub unsafe extern "C" fn lance_dataset_fragment_count(dataset: *const LanceDatas
     }
     let ds = unsafe { &*dataset };
     crate::error::clear_last_error();
-    ds.inner.count_fragments() as u64
+    ds.snapshot().count_fragments() as u64
 }
 
 /// Fill `out_ids` with the fragment IDs of the dataset.
@@ -277,7 +297,7 @@ pub unsafe extern "C" fn lance_dataset_fragment_ids(
         return -1;
     }
     let ds = unsafe { &*dataset };
-    let fragments = ds.inner.get_fragments();
+    let fragments = ds.snapshot().get_fragments();
     for (i, frag) in fragments.iter().enumerate() {
         unsafe {
             *out_ids.add(i) = frag.id() as u64;

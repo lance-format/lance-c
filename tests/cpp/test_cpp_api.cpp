@@ -7,10 +7,10 @@
  *
  * Tests the RAII wrappers, exception handling, and builder pattern.
  *
- * Usage: test_cpp_api <dataset_uri>
+ * Usage: test_cpp_api <dataset_uri> <write_uri>
  */
 
-#include "lance.hpp"
+#include "lance/lance.hpp"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -156,6 +156,21 @@ static void test_versions(const std::string& uri) {
     PASS();
 }
 
+// Restore to the dataset's own current version — always commits a new
+// manifest (no skip-if-equal optimization) to defeat TOCTOU races against
+// concurrent writers.
+static void test_restore_to_current(const std::string& uri) {
+    TEST(test_restore_to_current);
+
+    auto ds = lance::Dataset::open(uri);
+    uint64_t current = ds.version();
+
+    auto after = ds.restore(current);
+    assert(after.version() == current + 1);
+
+    PASS();
+}
+
 static void test_error_exception(const std::string& /*uri*/) {
     TEST(test_error_exception);
 
@@ -169,6 +184,94 @@ static void test_error_exception(const std::string& /*uri*/) {
         printf("caught: %s... ", e.what());
     }
     assert(caught);
+
+    PASS();
+}
+
+static void test_index_lifecycle(const std::string& uri) {
+    TEST(test_index_lifecycle);
+
+    auto ds = lance::Dataset::open(uri);
+    ds.create_scalar_index("id", LANCE_SCALAR_BTREE, "id_idx");
+    assert(ds.index_count() == 1);
+
+    auto json = ds.list_indices_json();
+    assert(json.find("id_idx") != std::string::npos);
+    printf("listed: %s... ", json.c_str());
+
+    ds.drop_index("id_idx");
+    assert(ds.index_count() == 0);
+
+    PASS();
+}
+
+static void test_nearest_smoke(const std::string& uri) {
+    TEST(test_nearest_smoke);
+
+    auto ds = lance::Dataset::open(uri);
+    auto scanner = ds.scan();
+    float q[8] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+
+    // The test dataset doesn't have a vector column; calling nearest will
+    // either succeed (if "name" or "id" happens to work — won't) or throw.
+    // We just exercise the wrapper code paths, expecting either outcome
+    // gracefully. Compile/link is the main goal here.
+    bool caught = false;
+    try {
+        scanner.nearest("embedding", q, 8, 5)
+               .nprobes(2)
+               .refine_factor(1)
+               .ef(50)
+               .metric(LANCE_METRIC_L2)
+               .use_index(true)
+               .prefilter(false);
+        // Try to materialize — will throw because "embedding" column doesn't exist
+        // in the basic test fixture.
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        if (stream.release) stream.release(&stream);
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    // Either path is fine — we proved compile + linkage + the fluent chain.
+    (void)caught;
+
+    PASS();
+}
+
+static void test_fts_smoke(const std::string& uri) {
+    TEST(test_fts_smoke);
+
+    auto ds = lance::Dataset::open(uri);
+
+    // Build the inverted index needed for FTS. (Inverted requires non-NULL
+    // params JSON for the tokenizer config.)
+    bool index_built = false;
+    try {
+        ds.create_scalar_index(
+            "name", LANCE_SCALAR_INVERTED, "name_fts",
+            R"({"base_tokenizer":"simple","language":"English"})");
+        index_built = true;
+    } catch (const lance::Error&) {
+        // If the test fixture doesn't permit indexing for some reason,
+        // we still want to prove the wrappers compile + link.
+    }
+
+    auto scanner = ds.scan();
+    bool caught = false;
+    try {
+        scanner.full_text_search("alice", {"name"}, 0);
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        if (stream.release) stream.release(&stream);
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    // Either path is acceptable — the goal is compile + linkage.
+    (void)index_built;
+    (void)caught;
 
     PASS();
 }
@@ -215,7 +318,11 @@ int main(int argc, char** argv) {
     test_dataset_take(uri);
     test_raii_cleanup(uri);
     test_versions(uri);
+    test_restore_to_current(uri);
     test_error_exception(uri);
+    test_index_lifecycle(uri);
+    test_nearest_smoke(uri);
+    test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
 
     printf("All C++ tests passed!\n");

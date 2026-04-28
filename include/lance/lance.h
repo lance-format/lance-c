@@ -80,6 +80,51 @@ typedef enum {
     LANCE_ERR_COMMIT_CONFLICT = 8,
 } LanceErrorCode;
 
+/* ─── Index types (Phase 2) ─── */
+
+typedef enum {
+    LANCE_INDEX_IVF_FLAT      = 101,
+    LANCE_INDEX_IVF_SQ        = 102,
+    LANCE_INDEX_IVF_PQ        = 103,
+    LANCE_INDEX_IVF_HNSW_SQ   = 104,
+    LANCE_INDEX_IVF_HNSW_PQ   = 105,
+    LANCE_INDEX_IVF_HNSW_FLAT = 106,
+} LanceVectorIndexType;
+
+typedef enum {
+    LANCE_SCALAR_BTREE      = 1,
+    LANCE_SCALAR_BITMAP     = 2,
+    LANCE_SCALAR_LABEL_LIST = 3,
+    LANCE_SCALAR_INVERTED   = 4,
+} LanceScalarIndexType;
+
+typedef enum {
+    LANCE_METRIC_L2      = 0,
+    LANCE_METRIC_COSINE  = 1,
+    LANCE_METRIC_DOT     = 2,
+    LANCE_METRIC_HAMMING = 3,
+} LanceMetricType;
+
+typedef enum {
+    LANCE_DTYPE_FLOAT32 = 0,
+    LANCE_DTYPE_FLOAT16 = 1,
+    LANCE_DTYPE_FLOAT64 = 2,
+    LANCE_DTYPE_UINT8   = 3,
+    LANCE_DTYPE_INT8    = 4,
+} LanceDataType;
+
+typedef struct {
+    LanceVectorIndexType index_type;
+    LanceMetricType      metric;
+    uint32_t num_partitions;        /* IVF; 0 = default (lance internal) */
+    uint32_t num_sub_vectors;       /* PQ;  0 = default */
+    uint32_t num_bits;              /* PQ/RQ; 0 = 8 */
+    uint32_t max_iterations;        /* IVF kmeans; 0 = 50 */
+    uint32_t hnsw_m;                /* HNSW; 0 = default */
+    uint32_t hnsw_ef_construction;  /* HNSW; 0 = default */
+    uint32_t sample_rate;           /* IVF; 0 = 256 */
+} LanceVectorIndexParams;
+
 /** Return the error code from the last failed operation on this thread. */
 LanceErrorCode lance_last_error_code(void);
 
@@ -100,6 +145,11 @@ typedef struct LanceVersions LanceVersions;
 
 /**
  * Open a Lance dataset.
+ *
+ * Pass `version` = 0 to open the latest, or a specific version id (e.g. one
+ * returned by `lance_dataset_versions`) to check out that version:
+ *
+ *     LanceDataset* ds = lance_dataset_open("data.lance", NULL, 42);
  *
  * @param uri           Dataset path (file://, s3://, memory://, etc.)
  * @param storage_opts  NULL-terminated key-value pairs ["k1","v1",NULL], or NULL
@@ -154,6 +204,22 @@ int64_t lance_versions_timestamp_ms_at(const LanceVersions* versions, size_t ind
 
 /** Close and free a versions handle. Safe to call with NULL. */
 void lance_versions_close(LanceVersions* versions);
+
+/**
+ * Restore the dataset to an older version by committing a new manifest that
+ * carries the fragments of `version`. If `version` is already the latest,
+ * succeeds as a no-op without writing a new manifest.
+ *
+ * @param dataset  Open dataset (not consumed). Must not be NULL.
+ * @param version  Target version id (>= 1). `0` is rejected since it is the
+ *                 "latest" sentinel used by lance_dataset_open.
+ * @return Fresh LanceDataset* positioned at the target version (caller closes
+ *         with lance_dataset_close), or NULL on error. Possible error codes
+ *         include LANCE_ERR_INVALID_ARGUMENT (NULL handle or version == 0),
+ *         LANCE_ERR_NOT_FOUND (unknown version),
+ *         LANCE_ERR_COMMIT_CONFLICT (concurrent writer).
+ */
+LanceDataset* lance_dataset_restore(const LanceDataset* dataset, uint64_t version);
 
 /**
  * Export the dataset schema via Arrow C Data Interface.
@@ -224,6 +290,29 @@ int32_t lance_scanner_with_row_id(LanceScanner* scanner, bool enable);
 int32_t lance_scanner_set_fragment_ids(
     LanceScanner* scanner,
     const uint64_t* ids,
+    size_t len
+);
+
+/**
+ * Set a Substrait filter on the scanner.
+ *
+ * `bytes` must point to a serialized Substrait `ExtendedExpression` message
+ * containing exactly one expression of boolean type. This is the preferred
+ * filter API for query engines that already speak Substrait — it avoids the
+ * round-trip through SQL string formatting and parsing.
+ *
+ * If both this and the SQL filter passed to `lance_scanner_new` are set, the
+ * Substrait filter wins. Calling this with the same scanner more than once
+ * replaces the previously-set Substrait filter. The bytes are copied; the
+ * caller may free them after this call returns.
+ *
+ * @param bytes  Serialized Substrait `ExtendedExpression` bytes (must not be NULL)
+ * @param len    Length of the byte buffer (must be > 0)
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_set_substrait_filter(
+    LanceScanner* scanner,
+    const uint8_t* bytes,
     size_t len
 );
 
@@ -340,12 +429,112 @@ int32_t lance_write_fragments(
     const char* const* storage_opts
 );
 
+/* ─── Index lifecycle (Phase 2) ─── */
+
+/**
+ * Create a vector index on a column.
+ * @param dataset    Open dataset (mutated; same handle remains valid).
+ * @param column     Column name (must be FixedSizeList<float32|float16|uint8|int8>).
+ * @param index_name Optional index name; NULL → "<column>_idx".
+ * @param params     Vector index params; index_type field selects the variant.
+ * @param replace    If true, replace any existing index of the same name.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_vector_index(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexParams* params,
+    bool replace
+);
+
+/**
+ * Create a scalar index on a column.
+ * @param params_json Optional JSON params string (e.g. inverted tokenizer config), or NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_scalar_index(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    LanceScalarIndexType index_type,
+    const char* params_json,
+    bool replace
+);
+
+/** Drop an index by name. Returns -1 (NOT_FOUND) if no such index. */
+int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name);
+
+/** Number of user indexes (excludes system indexes). Returns 0 on error. */
+uint64_t lance_dataset_index_count(const LanceDataset* dataset);
+
+/**
+ * JSON array describing all user indexes.
+ * Caller must free the returned string with lance_free_string().
+ * Returns NULL on error.
+ */
+const char* lance_dataset_index_list_json(const LanceDataset* dataset);
+
+/* ─── Vector search (Phase 2) ─── */
+
+/**
+ * Set the k-NN query on the scanner.
+ * @param column        Vector column (FixedSizeList<element_type>).
+ * @param query_data    Pointer to a single query vector of length `query_len`.
+ * @param query_len     Number of elements in the query (= column dim).
+ * @param element_type  Element type of the query (must match column).
+ * @param k             Number of nearest neighbors to return.
+ * @return 0 on success, -1 on error.
+ *
+ * Defined in a follow-up commit; declaration only here.
+ */
+int32_t lance_scanner_nearest(
+    LanceScanner* scanner,
+    const char* column,
+    const void* query_data,
+    size_t query_len,
+    LanceDataType element_type,
+    uint32_t k
+);
+
+int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t n);
+int32_t lance_scanner_set_refine_factor(LanceScanner* scanner, uint32_t f);
+int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e);
+int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);
+int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
+int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
+
+/* ─── Full-text search (Phase 2) ─── */
+
+/**
+ * Set a BM25 full-text search query on the scanner.
+ *
+ * Mutually exclusive with lance_scanner_nearest: calling either after the
+ * other returns LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * @param query              Query string (terms).
+ * @param columns            NULL-terminated array of columns, or NULL for all
+ *                           FTS-indexed columns.
+ * @param max_fuzzy_distance 0 = exact match; >0 = MatchQuery::with_fuzziness.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_full_text_search(
+    LanceScanner* scanner,
+    const char* query,
+    const char* const* columns,
+    uint32_t max_fuzzy_distance
+);
+
 /* ─── Dataset writer ─── */
 
 /**
  * Write mode for lance_dataset_write. Values are ABI-stable.
- * The Rust implementation validates the received integer and rejects any
- * out-of-range value with LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * The `mode` parameter on the FFI call is a fixed-width int32_t — not this
+ * enum type — so callers built with `-fshort-enums` or non-default enum
+ * sizing cannot mismatch the Rust ABI. The Rust implementation validates the
+ * received integer and rejects any out-of-range value with
+ * LANCE_ERR_INVALID_ARGUMENT.
  */
 typedef enum {
     LANCE_WRITE_CREATE    = 0,  /* Create new dataset; fail if path exists. */
@@ -360,7 +549,10 @@ typedef enum {
  * @param uri          Dataset URI (file://, s3://, memory://, etc.). Must not
  *                     be NULL or an empty string.
  * @param schema       Required Arrow schema. The stream schema must match or
- *                     the call fails with LANCE_ERR_INVALID_ARGUMENT.
+ *                     the call fails with LANCE_ERR_INVALID_ARGUMENT. This
+ *                     function does NOT call schema->release; the caller
+ *                     retains ownership and must release the schema after the
+ *                     call returns (success or failure).
  * @param stream       Arrow C Data Interface stream consumed by this call.
  *                     Do not use the stream after returning, regardless of
  *                     the return code.
@@ -370,6 +562,10 @@ typedef enum {
  *                     at the newly-committed version (caller must
  *                     lance_dataset_close it). Pass NULL to discard. On error
  *                     *out_dataset is left unchanged — do not read or free it.
+ *                     On entry `*out_dataset` should be NULL or a pointer
+ *                     whose previous value is no longer needed; this function
+ *                     overwrites the slot on success without releasing any
+ *                     prior handle.
  * @return 0 on success, -1 on error. Possible error codes include
  *         LANCE_ERR_DATASET_ALREADY_EXISTS (CREATE on an existing path),
  *         LANCE_ERR_INVALID_ARGUMENT (NULL/empty args, invalid mode,
@@ -380,14 +576,18 @@ int32_t lance_dataset_write(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
-    LanceWriteMode mode,
+    int32_t mode,
     const char* const* storage_opts,
     LanceDataset** out_dataset
 );
 
 /**
- * Tunable parameters for lance_dataset_write_with_params. Zero-valued numeric
- * fields and NULL string fields keep upstream's defaults.
+ * Tunable parameters for lance_dataset_write_with_params. Numeric fields
+ * default-out via 0; `data_storage_version` defaults out via NULL.
+ *
+ * Note: `enable_stable_row_ids` is a `bool` and therefore has no default
+ * sentinel — callers that zero-initialize this struct end up explicitly
+ * setting it to false (which matches upstream's current default).
  */
 typedef struct LanceWriteParams {
     /* Soft cap on rows per data file. 0 = default. */
@@ -399,7 +599,8 @@ typedef struct LanceWriteParams {
     /* Lance file format version, e.g. "2.0", "2.1", "stable", "legacy".
      * NULL = default. Invalid strings → LANCE_ERR_INVALID_ARGUMENT. */
     const char* data_storage_version;
-    /* Opt into stable row ids (better for compaction at a small write cost). */
+    /* Opt into stable row ids (better for compaction at a small write cost).
+     * Strictly an override — see struct-level note above. */
     bool        enable_stable_row_ids;
 } LanceWriteParams;
 
@@ -416,7 +617,7 @@ int32_t lance_dataset_write_with_params(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
-    LanceWriteMode mode,
+    int32_t mode,
     const LanceWriteParams* params,
     const char* const* storage_opts,
     LanceDataset** out_dataset
