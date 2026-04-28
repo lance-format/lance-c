@@ -2,8 +2,8 @@
 
 The C/C++ binding to [Lance](https://github.com/lancedb/lance), providing native access to the Lance columnar format via a stable C ABI and header-only C++ RAII wrappers.
 
-- **C header:** [`include/lance.h`](include/lance.h)
-- **C++ wrappers:** [`include/lance.hpp`](include/lance.hpp) (header-only, RAII, exceptions)
+- **C header:** [`include/lance/lance.h`](include/lance/lance.h)
+- **C++ wrappers:** [`include/lance/lance.hpp`](include/lance/lance.hpp) (header-only, RAII, exceptions)
 - **Data exchange:** [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) for zero-copy interop
 
 ## Roadmap
@@ -42,13 +42,13 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 
 | Status | Component | Description |
 |--------|-----------|-------------|
-| [ ] | Dataset write | Create / append / overwrite from ArrowArrayStream |
+| [x] | Dataset write | Create / append / overwrite from ArrowArrayStream via `lance_dataset_write()`; tunable variant `lance_dataset_write_with_params()` for file/row-group sizing, Lance format version, and stable row IDs |
 | [x] | Fragment writer | Batch-at-a-time fragment file writing (no commit) via `lance_write_fragments()` |
 | [ ] | Delete operations | Predicate-based deletion |
 | [ ] | Update operations | Expression-based row updates |
 | [ ] | Merge-insert | Upsert functionality with builder pattern |
 | [ ] | Schema evolution | Add/drop/alter columns with expressions |
-| [ ] | Version management | Checkout, restore, list version operations |
+| [x] | Version management | List via `lance_dataset_versions()`, rollback via `lance_dataset_restore()`, checkout via `lance_dataset_open(uri, opts, version)` |
 
 ### Phase 4: Advanced Features
 
@@ -66,6 +66,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 |--------|-----------|-------------|
 | [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
 | [x] | Dataset metadata | `lance_dataset_version()`, `lance_dataset_count_rows()`, `lance_dataset_latest_version()` |
+| [x] | Substrait filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression` (preferred over SQL strings for query engines) |
 
 ## Building
 
