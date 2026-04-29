@@ -333,6 +333,21 @@ public:
         return Dataset(out);
     }
 
+    /// Delete rows matching the SQL `predicate`, committing a new manifest.
+    /// Mutates this dataset in place; the handle continues to point at the
+    /// new version. Returns the number of rows that were deleted.
+    /// Throws lance::Error on failure (empty predicate, malformed SQL,
+    /// commit conflict, ...).
+    ///
+    /// Named `delete_rows` to avoid the C++ `delete` keyword.
+    uint64_t delete_rows(const std::string& predicate) {
+        uint64_t num_deleted = 0;
+        if (lance_dataset_delete(handle_.get(), predicate.c_str(), &num_deleted) != 0) {
+            check_error();
+        }
+        return num_deleted;
+    }
+
     /// Export the schema as an Arrow C Data Interface struct.
     void schema(ArrowSchema* out) const {
         if (lance_dataset_schema(handle_.get(), out) != 0) {
