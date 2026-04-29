@@ -302,6 +302,34 @@ static void test_dataset_write_roundtrip(const std::string& src_uri,
     PASS();
 }
 
+// Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+// exercises `Dataset::delete_rows`. Must run after the write roundtrip.
+static void test_delete_rows(const std::string& dst_uri) {
+    TEST(test_delete_rows);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t before = ds.count_rows();
+    assert(before > 0 && "test fixture expected to have rows");
+
+    // Predicate that matches everything — exact deleted count == before.
+    uint64_t deleted = ds.delete_rows("true");
+    assert(deleted == before);
+    assert(ds.count_rows() == 0);
+
+    // Empty predicate must throw.
+    bool caught_empty = false;
+    try {
+        ds.delete_rows("");
+    } catch (const lance::Error& e) {
+        caught_empty = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_empty);
+
+    printf("deleted=%llu... ", (unsigned long long)deleted);
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <dataset_uri> <write_uri>\n", argv[0]);
@@ -324,6 +352,7 @@ int main(int argc, char** argv) {
     test_nearest_smoke(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_delete_rows(write_uri);
 
     printf("All C++ tests passed!\n");
     return 0;

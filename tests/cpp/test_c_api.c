@@ -268,6 +268,35 @@ static void test_dataset_write_roundtrip(const char *src_uri, const char *dst_ur
     printf("OK\n");
 }
 
+/* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+ * exercises `lance_dataset_delete`. Must run after the write roundtrip. */
+static void test_delete(const char *write_uri) {
+    printf("  test_delete... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    uint64_t before = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(before > 0, "fixture expected to have rows");
+
+    /* Match-everything predicate; deleted count must equal `before`. */
+    uint64_t deleted = 0;
+    int32_t rc = lance_dataset_delete(ds, "true", &deleted);
+    ASSERT(rc == 0, "delete failed");
+    ASSERT(deleted == before, "deleted count mismatch");
+    ASSERT(lance_dataset_count_rows(ds) == 0, "expected zero rows after delete");
+
+    /* NULL predicate must be rejected with INVALID_ARGUMENT. */
+    rc = lance_dataset_delete(ds, NULL, NULL);
+    ASSERT(rc == -1, "NULL predicate must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+    printf("deleted=%llu... OK\n", (unsigned long long)deleted);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <dataset_uri> <write_uri>\n", argv[0]);
@@ -285,6 +314,7 @@ int main(int argc, char **argv) {
     test_restore_to_current(uri);
     test_error_handling();
     test_dataset_write_roundtrip(uri, write_uri);
+    test_delete(write_uri);
 
     printf("All C tests passed!\n");
     return 0;

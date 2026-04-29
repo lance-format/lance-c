@@ -18,6 +18,7 @@
 mod async_dispatcher;
 mod batch;
 mod dataset;
+mod delete;
 mod error;
 mod fragment_writer;
 mod helpers;
@@ -31,6 +32,7 @@ mod writer;
 // Re-export all extern "C" symbols so they appear in the cdylib.
 pub use batch::*;
 pub use dataset::*;
+pub use delete::*;
 pub use error::{
     LanceErrorCode, lance_free_string, lance_last_error_code, lance_last_error_message,
 };

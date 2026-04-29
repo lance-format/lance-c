@@ -3684,3 +3684,191 @@ fn test_scanner_set_substrait_filter_invalid_inputs() {
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
 }
+
+// ===========================================================================
+// lance_dataset_delete
+// ===========================================================================
+
+#[test]
+fn test_delete_basic_predicate() {
+    let (_tmp, uri) = create_large_dataset(100);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let pred = c_str("id >= 50");
+    let mut num_deleted: u64 = 0;
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), &mut num_deleted) };
+    assert_eq!(rc, 0);
+    assert_eq!(num_deleted, 50);
+
+    // Existing handle now sees the post-delete dataset.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 50);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_all_rows() {
+    let (_tmp, uri) = create_large_dataset(20);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("true");
+    let mut num_deleted: u64 = 0;
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), &mut num_deleted) };
+    assert_eq!(rc, 0);
+    assert_eq!(num_deleted, 20);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 0);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_no_match_returns_zero() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("id > 9999");
+    let mut num_deleted: u64 = 0;
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), &mut num_deleted) };
+    assert_eq!(rc, 0);
+    assert_eq!(num_deleted, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 10);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_out_param_optional() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("id < 3");
+    // Pass NULL out_num_deleted — must succeed without writing anything.
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 7);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let pred = c_str("id = 0");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(
+        v_after > v_before,
+        "version should increase: before={v_before}, after={v_after}"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_null_dataset_rejected() {
+    let pred = c_str("id > 0");
+    let rc = unsafe { lance_dataset_delete(ptr::null_mut(), pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+// Locks in the documented contract: when the call fails, `out_num_deleted`
+// must be left unchanged. A future refactor that pre-zeroes the slot before
+// validating inputs would silently break this guarantee.
+#[test]
+fn test_delete_out_param_untouched_on_error() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let mut sentinel: u64 = 0xDEAD_BEEF;
+    // Empty predicate → INVALID_ARGUMENT before any work happens.
+    let pred = c_str("");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), &mut sentinel) };
+    assert_eq!(rc, -1);
+    assert_eq!(sentinel, 0xDEAD_BEEF, "out slot must be untouched on error");
+
+    // Same property must hold for upstream-surfaced errors (malformed SQL).
+    let pred = c_str("not a real predicate ((((");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), &mut sentinel) };
+    assert_eq!(rc, -1);
+    assert_eq!(sentinel, 0xDEAD_BEEF, "out slot must be untouched on error");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_null_predicate_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let rc = unsafe { lance_dataset_delete(ds, ptr::null(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    // Dataset is unchanged.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_empty_predicate_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_invalid_predicate_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Garbage SQL — Lance / DataFusion should reject this at parse time.
+    let pred = c_str("not a real predicate ((((");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    // Parser errors come back as Internal (this is what upstream surfaces;
+    // we don't try to re-classify them at the FFI boundary). If upstream
+    // ever tightens this to InvalidArgument, tighten this assertion too.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    // The dataset is left untouched on the error path.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_unknown_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("no_such_column = 1");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    // Same upstream classification as malformed SQL — see note above.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}

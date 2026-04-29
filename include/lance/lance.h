@@ -222,6 +222,32 @@ void lance_versions_close(LanceVersions* versions);
 LanceDataset* lance_dataset_restore(const LanceDataset* dataset, uint64_t version);
 
 /**
+ * Delete rows matching the SQL `predicate`, committing a new manifest.
+ *
+ * Mutates `dataset` in place — the same handle remains valid afterward and
+ * sees the new version. Scanners already in flight against this dataset
+ * keep their pre-delete snapshot view.
+ *
+ * @param dataset          Open dataset (not consumed). Must not be NULL.
+ * @param predicate        SQL filter, e.g. "id > 100" or "name = 'alice'".
+ *                         Must not be NULL or empty.
+ * @param out_num_deleted  Optional. If non-NULL, on success receives the
+ *                         number of rows that were deleted (0 if the
+ *                         predicate matched nothing). On error the slot is
+ *                         left unchanged — do not read it.
+ * @return 0 on success, -1 on error. Error codes:
+ *         LANCE_ERR_INVALID_ARGUMENT for NULL/empty args (validated at this
+ *         boundary), LANCE_ERR_INTERNAL for malformed SQL or unknown columns
+ *         (surfaced from the upstream parser), and LANCE_ERR_COMMIT_CONFLICT
+ *         for a concurrent writer.
+ */
+int32_t lance_dataset_delete(
+    LanceDataset* dataset,
+    const char* predicate,
+    uint64_t* out_num_deleted
+);
+
+/**
  * Export the dataset schema via Arrow C Data Interface.
  * @param out  Pointer to caller-allocated ArrowSchema struct
  * @return 0 on success, -1 on error
