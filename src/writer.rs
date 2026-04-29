@@ -8,6 +8,7 @@
 //! dataset with a committed manifest rather than uncommitted fragment files.
 
 use std::ffi::c_char;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 use arrow::ffi::FFI_ArrowSchema;
@@ -17,6 +18,7 @@ use arrow_schema::Schema as ArrowSchema;
 use lance::Dataset;
 use lance::dataset::{WriteMode as LanceWriteModeUpstream, WriteParams};
 use lance_core::Result;
+use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 
 use crate::dataset::LanceDataset;
@@ -74,6 +76,36 @@ impl From<LanceWriteMode> for LanceWriteModeUpstream {
     }
 }
 
+/// Tunable parameters for `lance_dataset_write_with_params`.
+///
+/// Numeric fields use `0` as a "keep upstream default" sentinel, and
+/// `data_storage_version` uses NULL the same way. The struct is `#[repr(C)]`
+/// and ABI-stable within a minor version.
+///
+/// `enable_stable_row_ids` is a `bool` and therefore has **no default
+/// sentinel** — whatever the caller writes is forwarded verbatim to upstream.
+/// Callers that zero-initialize this struct (the documented way to inherit
+/// other defaults) end up explicitly setting `enable_stable_row_ids = false`.
+/// This matches upstream's current default, so the behavior is identical
+/// today; if upstream ever changes that default, callers must set this field
+/// explicitly to follow.
+#[repr(C)]
+pub struct LanceWriteParams {
+    /// Soft cap on rows per data file. `0` uses upstream's default.
+    pub max_rows_per_file: u64,
+    /// Soft cap on rows per row group. `0` uses upstream's default.
+    pub max_rows_per_group: u64,
+    /// Soft cap on bytes per data file (~90 GB by default). `0` uses upstream's default.
+    pub max_bytes_per_file: u64,
+    /// Lance file format version string, e.g. `"2.0"`, `"2.1"`, `"stable"`,
+    /// `"legacy"`. NULL uses upstream's default. Invalid strings are rejected
+    /// with `LANCE_ERR_INVALID_ARGUMENT`.
+    pub data_storage_version: *const c_char,
+    /// Strictly an override (no default sentinel — see struct-level docs).
+    /// Whatever value the caller writes is forwarded to upstream.
+    pub enable_stable_row_ids: bool,
+}
+
 /// Write an Arrow record batch stream to a Lance dataset at `uri`, committing a manifest.
 ///
 /// - `uri`: Dataset URI (`file://`, `s3://`, `memory://`, ...). Must not be NULL or empty.
@@ -88,6 +120,8 @@ impl From<LanceWriteMode> for LanceWriteModeUpstream {
 ///   version on success (caller closes). Pass NULL to discard. On error
 ///   `*out_dataset` is untouched — do not read or free it.
 ///
+/// Equivalent to `lance_dataset_write_with_params(..., params = NULL, ...)`.
+///
 /// Returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_write(
@@ -98,8 +132,35 @@ pub unsafe extern "C" fn lance_dataset_write(
     storage_opts: *const *const c_char,
     out_dataset: *mut *mut LanceDataset,
 ) -> i32 {
+    unsafe {
+        lance_dataset_write_with_params(
+            uri,
+            schema,
+            stream,
+            mode,
+            std::ptr::null(),
+            storage_opts,
+            out_dataset,
+        )
+    }
+}
+
+/// Same as `lance_dataset_write` but takes a `LanceWriteParams` for tuning the
+/// output shape. Pass `params = NULL` to use upstream defaults.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_write_with_params(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    params: *const LanceWriteParams,
+    storage_opts: *const *const c_char,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
     ffi_try!(
-        unsafe { write_dataset_inner(uri, schema, stream, mode, storage_opts, out_dataset) },
+        unsafe {
+            write_dataset_inner(uri, schema, stream, mode, params, storage_opts, out_dataset)
+        },
         neg
     )
 }
@@ -109,6 +170,7 @@ unsafe fn write_dataset_inner(
     schema: *const FFI_ArrowSchema,
     stream: *mut FFI_ArrowArrayStream,
     mode: i32,
+    params: *const LanceWriteParams,
     storage_opts: *const *const c_char,
     out_dataset: *mut *mut LanceDataset,
 ) -> Result<i32> {
@@ -198,13 +260,20 @@ unsafe fn write_dataset_inner(
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(opts))),
         ..ObjectStoreParams::default()
     });
-    let params = WriteParams {
+    let mut write_params = WriteParams {
         mode: mode.into(),
         store_params,
         ..WriteParams::default()
     };
+    if !params.is_null() {
+        // SAFETY: `params` is non-NULL (checked above) and the caller
+        // guarantees it points to a properly-initialized `LanceWriteParams`
+        // valid for the duration of this call. We borrow by shared reference
+        // and only read; the borrow is consumed before any await point.
+        unsafe { apply_write_params(&mut write_params, &*params)? };
+    }
 
-    let dataset = block_on(Dataset::write(reader, uri_str, Some(params)))?;
+    let dataset = block_on(Dataset::write(reader, uri_str, Some(write_params)))?;
 
     if !out_dataset.is_null() {
         let handle = LanceDataset {
@@ -220,4 +289,54 @@ unsafe fn write_dataset_inner(
     }
 
     Ok(0)
+}
+
+/// Apply caller-provided overrides onto an `lance::WriteParams`. Zero / NULL
+/// fields are no-ops so upstream defaults flow through.
+unsafe fn apply_write_params(target: &mut WriteParams, params: &LanceWriteParams) -> Result<()> {
+    if params.max_rows_per_file > 0 {
+        target.max_rows_per_file = u64_to_usize(params.max_rows_per_file, "max_rows_per_file")?;
+    }
+    if params.max_rows_per_group > 0 {
+        target.max_rows_per_group = u64_to_usize(params.max_rows_per_group, "max_rows_per_group")?;
+    }
+    if params.max_bytes_per_file > 0 {
+        target.max_bytes_per_file = u64_to_usize(params.max_bytes_per_file, "max_bytes_per_file")?;
+    }
+    if !params.data_storage_version.is_null() {
+        // SAFETY: `data_storage_version` is non-NULL (checked above) and the
+        // `apply_write_params` caller (`unsafe fn` contract) guarantees it
+        // points to a NUL-terminated C string valid for the duration of the
+        // outer FFI call. `parse_c_string` reads by shared reference and the
+        // returned borrow is consumed before this function returns.
+        //
+        // `parse_c_string` returns `None` only for NULL input, which the
+        // outer check already ruled out. `.filter` lets an empty C string
+        // also fail presence, producing the clearer message below instead
+        // of relying on `FromStr`'s generic "unknown version" path.
+        let s = unsafe { helpers::parse_c_string(params.data_storage_version)? }
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| lance_core::Error::InvalidInput {
+                source: "data_storage_version must not be an empty string".into(),
+                location: snafu::location!(),
+            })?;
+        let version =
+            LanceFileVersion::from_str(s).map_err(|e| lance_core::Error::InvalidInput {
+                source: format!("invalid data_storage_version {s:?}: {e}").into(),
+                location: snafu::location!(),
+            })?;
+        target.data_storage_version = Some(version);
+    }
+    target.enable_stable_row_ids = params.enable_stable_row_ids;
+    Ok(())
+}
+
+/// Narrow `u64 -> usize` with an explicit error on overflow (32-bit targets).
+/// Realistic write tunings fit in `usize` on every supported target, but a
+/// silent `as` cast would wrap on a 32-bit host.
+fn u64_to_usize(v: u64, field: &'static str) -> Result<usize> {
+    usize::try_from(v).map_err(|_| lance_core::Error::InvalidInput {
+        source: format!("{field}={v} exceeds usize::MAX on this target").into(),
+        location: snafu::location!(),
+    })
 }

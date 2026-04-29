@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -103,6 +104,22 @@ enum class WriteMode : int32_t {
     Overwrite = LANCE_WRITE_OVERWRITE,
 };
 
+/// Tunable parameters for Dataset::write. Numeric fields default-out via 0;
+/// `data_storage_version` defaults out via `std::nullopt`.
+///
+/// `enable_stable_row_ids` has no default sentinel — whatever value the
+/// caller writes is forwarded to upstream. Today this matches upstream's
+/// default (`false`), so a default-constructed WriteParams is a no-op; if
+/// upstream ever changes its default, callers must set this field explicitly.
+struct WriteParams {
+    uint64_t                   max_rows_per_file    = 0;
+    uint64_t                   max_rows_per_group   = 0;
+    uint64_t                   max_bytes_per_file   = 0;
+    /// Lance file format version, e.g. "2.0", "2.1", "stable", "legacy".
+    std::optional<std::string> data_storage_version;
+    bool                       enable_stable_row_ids = false;
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -145,14 +162,26 @@ public:
         WriteMode mode,
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {}) {
 
+        return write(uri, stream, mode, WriteParams{}, storage_opts);
+    }
+
+    /// Same as the four-argument `write` but tunes the output via `params`.
+    /// Pass a default-constructed `WriteParams{}` to inherit upstream defaults.
+    static Dataset write(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteParams& params,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {}) {
+
         if (stream == nullptr) {
             throw Error(LANCE_ERR_INVALID_ARGUMENT, "stream must not be null");
         }
 
-        // RAII guard for the stream. Until `lance_dataset_write` is called,
-        // any exception (failed `get_schema`, `std::bad_alloc` while building
-        // `kv`, etc.) must release the stream. After that call Rust owns it,
-        // so we `disarm()` immediately before invoking the C API.
+        // RAII guard for the stream. Until `lance_dataset_write_with_params`
+        // is called, any exception (failed `get_schema`, `std::bad_alloc`
+        // while building `kv`, etc.) must release the stream. After that call
+        // Rust owns it, so we `disarm()` immediately before invoking the C API.
         struct StreamGuard {
             ArrowArrayStream* s;
             bool armed = true;
@@ -219,17 +248,26 @@ public:
         const char* const* opts_ptr =
             storage_opts.empty() ? nullptr : kv.data();
 
+        LanceWriteParams c_params = {};
+        c_params.max_rows_per_file    = params.max_rows_per_file;
+        c_params.max_rows_per_group   = params.max_rows_per_group;
+        c_params.max_bytes_per_file   = params.max_bytes_per_file;
+        c_params.data_storage_version =
+            params.data_storage_version ? params.data_storage_version->c_str() : nullptr;
+        c_params.enable_stable_row_ids = params.enable_stable_row_ids;
+
         // The C API consumes the stream on every return path, so disarm the
         // guard before calling. After this point the stream pointer is logically
         // owned by Rust and any C++-side exception must not re-release it.
         stream_guard.disarm();
 
         LanceDataset* out = nullptr;
-        int32_t rc = lance_dataset_write(
+        int32_t rc = lance_dataset_write_with_params(
             uri.c_str(),
             &schema,
             stream,
             static_cast<int32_t>(mode),
+            &c_params,
             opts_ptr,
             &out);
         if (rc != 0) check_error();
@@ -240,7 +278,7 @@ public:
         // thread-local code is `LANCE_OK` on this path (rc == 0).
         if (!out) {
             throw Error(LANCE_ERR_INTERNAL,
-                        "lance_dataset_write returned success with null out_dataset");
+                        "lance_dataset_write_with_params returned success with null out_dataset");
         }
         return Dataset(out);
     }

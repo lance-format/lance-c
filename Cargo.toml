@@ -20,6 +20,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 lance = { version = "4.0.1", features = ["substrait"] }
 lance-core = "4.0.1"
+lance-file = "4.0.1"
 lance-index = "4.0.1"
 lance-io = "4.0.1"
 lance-linalg = "4.0.1"

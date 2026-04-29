@@ -3686,6 +3686,263 @@ fn test_scanner_set_substrait_filter_invalid_inputs() {
 }
 
 // ===========================================================================
+// lance_dataset_write_with_params (Issue #15)
+// ===========================================================================
+
+fn default_write_params() -> LanceWriteParams {
+    LanceWriteParams {
+        max_rows_per_file: 0,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 0,
+        data_storage_version: ptr::null(),
+        enable_stable_row_ids: false,
+    }
+}
+
+/// Build a larger batch than the minimal test batch so `max_rows_per_file`
+/// has enough rows to exercise multi-file output.
+fn large_write_batch(n: i32) -> RecordBatch {
+    let ids: Vec<i32> = (0..n).collect();
+    let vals: Vec<f32> = (0..n).map(|i| i as f32).collect();
+    write_batch(ids, vals)
+}
+
+#[test]
+fn test_write_with_params_null_is_like_plain_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_write_with_params_max_rows_per_file_splits_fragments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(large_write_batch(100));
+
+    let mut params = default_write_params();
+    params.max_rows_per_file = 20;
+
+    let mut out_ds: *mut LanceDataset = ptr::null_mut();
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            &mut out_ds,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert!(!out_ds.is_null());
+
+    // 100 rows / 20 per file → at least 5 fragments.
+    let frag_count = unsafe { lance_dataset_fragment_count(out_ds) };
+    assert!(
+        frag_count >= 5,
+        "expected at least 5 fragments, got {frag_count}"
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(out_ds) }, 100);
+
+    unsafe { lance_dataset_close(out_ds) };
+}
+
+#[test]
+fn test_write_with_params_accepts_known_storage_version() {
+    for version_str in ["2.0", "2.1", "stable"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+        let c_uri = c_str(&uri);
+        let version_cstr = c_str(version_str);
+
+        let ffi_schema = schema_to_ffi(&write_schema());
+        let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+
+        let mut params = default_write_params();
+        params.data_storage_version = version_cstr.as_ptr();
+
+        let rc = unsafe {
+            lance_dataset_write_with_params(
+                c_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                &params,
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "version {version_str} should be accepted");
+    }
+}
+
+#[test]
+fn test_write_with_params_max_rows_per_group_accepted() {
+    // Row-group layout isn't easily observable from FFI; confirm the field
+    // is plumbed by writing successfully with a non-zero value.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(large_write_batch(50));
+
+    let mut params = default_write_params();
+    params.max_rows_per_group = 10;
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn test_write_with_params_max_bytes_per_file_accepted() {
+    // Small-byte-cap behaviour depends on input size crossing the cap; this
+    // test just confirms the field is plumbed (non-zero value accepted).
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let mut params = default_write_params();
+    params.max_bytes_per_file = 1024 * 1024; // 1 MiB
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn test_write_with_params_rejects_empty_storage_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+    let empty = c_str("");
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+
+    let mut params = default_write_params();
+    params.data_storage_version = empty.as_ptr();
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_write_with_params_rejects_invalid_storage_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+    let bad_version = c_str("banana");
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+
+    let mut params = default_write_params();
+    params.data_storage_version = bad_version.as_ptr();
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_write_with_params_stable_row_ids_accepted() {
+    // Toggle is accepted end-to-end; verifying the flag landed in the
+    // manifest would require upstream inspection we don't want to reach
+    // into from the FFI crate, so confirm only that the write succeeds.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let mut params = default_write_params();
+    params.enable_stable_row_ids = true;
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+}
+
+// ===========================================================================
 // lance_dataset_delete
 // ===========================================================================
 
