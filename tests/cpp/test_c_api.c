@@ -269,6 +269,38 @@ static void test_dataset_write_roundtrip(const char *src_uri, const char *dst_ur
 }
 
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+ * exercises `lance_dataset_update`. Must run before `test_delete`, which
+ * empties the dataset. */
+static void test_update(const char *write_uri) {
+    printf("  test_update... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    uint64_t before = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(before > 0, "fixture expected to have rows");
+
+    /* Set every row's `name` column to a literal (NULL predicate -> all rows). */
+    const char *cols[] = {"name"};
+    const char *vals[] = {"'frozen'"};
+    uint64_t updated = 0;
+    int32_t rc = lance_dataset_update(ds, NULL, cols, vals, 1, &updated);
+    ASSERT(rc == 0, "update failed");
+    ASSERT(updated == before, "updated count mismatch");
+    ASSERT(lance_dataset_count_rows(ds) == before, "row count must be unchanged");
+
+    /* num_updates == 0 must be rejected. */
+    rc = lance_dataset_update(ds, NULL, NULL, NULL, 0, NULL);
+    ASSERT(rc == -1, "num_updates=0 must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+    printf("updated=%llu... OK\n", (unsigned long long)updated);
+}
+
+/* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_delete`. Must run after the write roundtrip. */
 static void test_delete(const char *write_uri) {
     printf("  test_delete... ");
@@ -314,6 +346,7 @@ int main(int argc, char **argv) {
     test_restore_to_current(uri);
     test_error_handling();
     test_dataset_write_roundtrip(uri, write_uri);
+    test_update(write_uri);
     test_delete(write_uri);
 
     printf("All C tests passed!\n");

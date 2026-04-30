@@ -26,6 +26,7 @@ mod index;
 mod restore;
 pub mod runtime;
 mod scanner;
+mod update;
 mod versions;
 mod writer;
 
@@ -40,5 +41,6 @@ pub use fragment_writer::*;
 pub use index::*;
 pub use restore::*;
 pub use scanner::*;
+pub use update::*;
 pub use versions::*;
 pub use writer::*;

@@ -348,6 +348,39 @@ public:
         return num_deleted;
     }
 
+    /// Update rows matching the SQL `predicate` by applying per-column SQL
+    /// expressions. Mutates this dataset in place; the handle continues to
+    /// point at the new version. Returns the number of rows updated.
+    ///
+    /// `predicate` is empty -> updates every row (passed as NULL to the C
+    /// API). `updates` must be non-empty; each pair is `{column_name,
+    /// sql_expr}`. Throws lance::Error on failure (empty pair entry,
+    /// malformed SQL, unknown column, commit conflict, ...).
+    uint64_t update(
+        const std::string& predicate,
+        const std::vector<std::pair<std::string, std::string>>& updates) {
+        std::vector<const char*> col_ptrs;
+        std::vector<const char*> val_ptrs;
+        col_ptrs.reserve(updates.size());
+        val_ptrs.reserve(updates.size());
+        for (const auto& [col, val] : updates) {
+            col_ptrs.push_back(col.c_str());
+            val_ptrs.push_back(val.c_str());
+        }
+        uint64_t num_updated = 0;
+        const char* pred_ptr = predicate.empty() ? nullptr : predicate.c_str();
+        if (lance_dataset_update(
+                handle_.get(),
+                pred_ptr,
+                col_ptrs.data(),
+                val_ptrs.data(),
+                updates.size(),
+                &num_updated) != 0) {
+            check_error();
+        }
+        return num_updated;
+    }
+
     /// Export the schema as an Arrow C Data Interface struct.
     void schema(ArrowSchema* out) const {
         if (lance_dataset_schema(handle_.get(), out) != 0) {
