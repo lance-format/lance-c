@@ -4465,6 +4465,30 @@ fn test_update_null_columns_rejected() {
 }
 
 #[test]
+fn test_update_null_values_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let cols = [c_str("value")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            ptr::null(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_update_empty_predicate_rejected() {
     let (_tmp, uri) = create_large_dataset(3);
     let c_uri = c_str(&uri);
@@ -4598,6 +4622,36 @@ fn test_update_unknown_column_rejected() {
     };
     assert_eq!(rc, -1);
     // UpdateBuilder::set returns InvalidInput for unknown columns.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// Predicate-side unknown column goes through `UpdateBuilder::update_where`
+// (a different upstream path from `set`), so pin it separately.
+#[test]
+fn test_update_unknown_predicate_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("no_such_column = 1");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
 
