@@ -6,7 +6,7 @@
 //! These tests call the `extern "C"` functions directly from Rust,
 //! validating the C API contract without needing a C compiler.
 
-use std::ffi::CString;
+use std::ffi::{CString, c_char};
 use std::ptr;
 use std::sync::Arc;
 
@@ -4126,6 +4126,583 @@ fn test_delete_unknown_column_rejected() {
     // Same upstream classification as malformed SQL — see note above.
     assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ===========================================================================
+// lance_dataset_update
+// ===========================================================================
+
+/// Build a `[*const c_char; N]` ptr array from a slice of `&CString`.
+fn cstr_ptrs(items: &[CString]) -> Vec<*const c_char> {
+    items.iter().map(|s| s.as_ptr()).collect()
+}
+
+#[test]
+fn test_update_basic_predicate() {
+    let (_tmp, uri) = create_large_dataset(100);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let pred = c_str("id < 50");
+    let cols = [c_str("value")];
+    let vals = [c_str("99.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+
+    let mut num_updated: u64 = 0;
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            &mut num_updated,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(num_updated, 50);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 100);
+
+    // Verify the matched rows now read back as 99.0 and the rest are unchanged.
+    let batches = scan_all_rows(ds);
+    let mut updated_count = 0;
+    let mut unchanged_count = 0;
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let id = ids.value(i);
+            let v = values.value(i);
+            if id < 50 {
+                assert_eq!(v, 99.0, "id={id} should have been updated to 99.0");
+                updated_count += 1;
+            } else {
+                assert_eq!(v, id as f32 * 0.5, "id={id} should be unchanged");
+                unchanged_count += 1;
+            }
+        }
+    }
+    assert_eq!(updated_count, 50);
+    assert_eq!(unchanged_count, 50);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_null_predicate_updates_all() {
+    let (_tmp, uri) = create_large_dataset(20);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let cols = [c_str("label")];
+    let vals = [c_str("'frozen'")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+
+    // NULL predicate → update every row.
+    let mut num_updated: u64 = 0;
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            &mut num_updated,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(num_updated, 20);
+
+    let batches = scan_all_rows(ds);
+    for batch in &batches {
+        let labels = batch
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            assert_eq!(labels.value(i), "frozen");
+        }
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_multiple_columns() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("id = 7");
+    let cols = [c_str("value"), c_str("label")];
+    let vals = [c_str("value * 2"), c_str("'updated'")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+
+    let mut num_updated: u64 = 0;
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            2,
+            &mut num_updated,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(num_updated, 1);
+
+    // Row 7 originally had value = 3.5, label = "row_7".
+    // After update: value = 7.0, label = "updated". Other rows unchanged.
+    let batches = scan_all_rows(ds);
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let labels = batch
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let id = ids.value(i);
+            if id == 7 {
+                assert_eq!(values.value(i), 7.0);
+                assert_eq!(labels.value(i), "updated");
+            } else {
+                assert_eq!(values.value(i), id as f32 * 0.5);
+                assert_eq!(labels.value(i), format!("row_{id}"));
+            }
+        }
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_no_match_returns_zero() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("id > 9999");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+
+    let mut num_updated: u64 = 12345;
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            &mut num_updated,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(num_updated, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 10);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_out_param_optional() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("id < 3");
+    let cols = [c_str("value")];
+    let vals = [c_str("42.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+
+    // Pass NULL out_num_updated — must succeed without writing anything.
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let pred = c_str("id = 0");
+    let cols = [c_str("value")];
+    let vals = [c_str("123.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(
+        v_after > v_before,
+        "version should increase: before={v_before}, after={v_after}"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_null_dataset_rejected() {
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ptr::null_mut(),
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_update_zero_num_updates_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_null_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let vals = [c_str("0.0")];
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            ptr::null(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_null_values_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let cols = [c_str("value")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            ptr::null(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_empty_predicate_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_empty_column_entry_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let cols = [c_str("")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_null_entry_in_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Build an array where the first column pointer is NULL.
+    let val_a = c_str("0.0");
+    let col_ptrs: [*const c_char; 1] = [ptr::null()];
+    let val_ptrs: [*const c_char; 1] = [val_a.as_ptr()];
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_invalid_predicate_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Garbage SQL — UpdateBuilder::update_where wraps parser errors as
+    // InvalidInput, so this surfaces as InvalidArgument (different from
+    // lance_dataset_delete, which routes through a different upstream path
+    // and surfaces these as Internal).
+    let pred = c_str("not a real predicate ((((");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_unknown_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let cols = [c_str("no_such_column")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    // UpdateBuilder::set returns InvalidInput for unknown columns.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// Predicate-side unknown column goes through `UpdateBuilder::update_where`
+// (a different upstream path from `set`), so pin it separately.
+#[test]
+fn test_update_unknown_predicate_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("no_such_column = 1");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// Locks in the documented contract: when the call fails, `out_num_updated`
+// must be left unchanged. A future refactor that pre-zeroes the slot before
+// validating inputs would silently break this guarantee.
+#[test]
+fn test_update_out_param_untouched_on_error() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let mut sentinel: u64 = 0xDEAD_BEEF;
+
+    // Empty predicate → INVALID_ARGUMENT before any work happens (boundary).
+    let pred = c_str("");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            &mut sentinel,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(sentinel, 0xDEAD_BEEF, "out slot must be untouched on error");
+
+    // Same property must hold for upstream-surfaced errors (unknown column).
+    let bad_cols = [c_str("no_such_column")];
+    let bad_col_ptrs = cstr_ptrs(&bad_cols);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            bad_col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            &mut sentinel,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(sentinel, 0xDEAD_BEEF, "out slot must be untouched on error");
 
     unsafe { lance_dataset_close(ds) };
 }

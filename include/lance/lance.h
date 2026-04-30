@@ -248,6 +248,42 @@ int32_t lance_dataset_delete(
 );
 
 /**
+ * Update rows matching the SQL `predicate` by applying per-column SQL
+ * expressions, committing a new manifest.
+ *
+ * Mutates `dataset` in place — the same handle remains valid afterward and
+ * sees the new version. Scanners already in flight against this dataset
+ * keep their pre-update snapshot view.
+ *
+ * @param dataset          Open dataset (not consumed). Must not be NULL.
+ * @param predicate        SQL filter, e.g. "id > 100". Pass NULL to update
+ *                         every row. An explicit empty string is rejected.
+ * @param columns          Column names to update. Length = `num_updates`.
+ *                         Must not be NULL when `num_updates > 0`; each
+ *                         entry must be a non-NULL, non-empty C string.
+ * @param values           SQL scalar expressions, evaluated per row, one
+ *                         per `columns[i]` (e.g. `"100"`, `"price * 2"`,
+ *                         `"CASE WHEN ... END"`). Same NULL/length rules.
+ * @param num_updates      Length of `columns` and `values`. Must be >= 1.
+ * @param out_num_updated  Optional. If non-NULL, on success receives the
+ *                         number of rows that were updated (0 if the
+ *                         predicate matched nothing). On error the slot is
+ *                         left unchanged — do not read it.
+ * @return 0 on success, -1 on error. Error codes:
+ *         LANCE_ERR_INVALID_ARGUMENT for NULL/empty args, `num_updates == 0`,
+ *         malformed SQL, and unknown columns; LANCE_ERR_COMMIT_CONFLICT for
+ *         a concurrent writer.
+ */
+int32_t lance_dataset_update(
+    LanceDataset* dataset,
+    const char* predicate,
+    const char* const* columns,
+    const char* const* values,
+    size_t num_updates,
+    uint64_t* out_num_updated
+);
+
+/**
  * Export the dataset schema via Arrow C Data Interface.
  * @param out  Pointer to caller-allocated ArrowSchema struct
  * @return 0 on success, -1 on error
