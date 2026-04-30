@@ -271,9 +271,8 @@ int32_t lance_dataset_delete(
  *                         left unchanged — do not read it.
  * @return 0 on success, -1 on error. Error codes:
  *         LANCE_ERR_INVALID_ARGUMENT for NULL/empty args, `num_updates == 0`,
- *         malformed SQL, and unknown columns (the upstream UpdateBuilder
- *         wraps parser errors as invalid-input); LANCE_ERR_COMMIT_CONFLICT
- *         for a concurrent writer.
+ *         malformed SQL, and unknown columns; LANCE_ERR_COMMIT_CONFLICT for
+ *         a concurrent writer.
  */
 int32_t lance_dataset_update(
     LanceDataset* dataset,

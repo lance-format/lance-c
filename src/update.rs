@@ -37,8 +37,7 @@ use crate::runtime::block_on;
 ///
 /// Returns 0 on success, -1 on error. Error codes:
 /// `LANCE_ERR_INVALID_ARGUMENT` for NULL/empty args, `num_updates == 0`,
-/// malformed SQL, and unknown columns (the upstream `UpdateBuilder` wraps
-/// parser errors as invalid-input); `LANCE_ERR_COMMIT_CONFLICT` for a
+/// malformed SQL, and unknown columns; `LANCE_ERR_COMMIT_CONFLICT` for a
 /// concurrent writer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_update(
@@ -91,8 +90,9 @@ unsafe fn update_inner(
         });
     }
 
-    // Optional predicate. NULL means "update every row"; an explicit empty
-    // string is rejected so callers can't slip a no-op past validation.
+    // Optional predicate. NULL means "update every row"; explicit empty
+    // string is rejected so callers who mean "all rows" go through NULL
+    // rather than a parse error.
     // SAFETY: when non-NULL the caller guarantees `predicate` points to a
     // NUL-terminated C string valid for this call. `parse_c_string` reads
     // by shared reference.
@@ -137,11 +137,9 @@ unsafe fn update_inner(
     let ds = unsafe { &*dataset };
     let rows_updated = ds.with_mut(|d| {
         block_on(async {
-            // Upstream `UpdateBuilder::new` takes `Arc<Dataset>` (it works
-            // off a snapshot rather than `&mut Dataset`). Mirror what
-            // `Dataset::delete` does internally: clone the snapshot for the
-            // builder, then publish `result.new_dataset` into our handle so
-            // subsequent calls observe the new version.
+            // UpdateBuilder takes `Arc<Dataset>` (snapshot-based), so mirror
+            // what `Dataset::delete` does internally: clone for the builder,
+            // then publish `result.new_dataset` back into `*d`.
             let snapshot = Arc::new(d.clone());
             let mut builder = UpdateBuilder::new(snapshot);
             if let Some(p) = predicate_str {
