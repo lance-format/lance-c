@@ -184,7 +184,33 @@ auto ds = lance::Dataset::open("data.lance", {}, /*version=*/42);
 
 ## Releasing
 
-Releases are tag-driven via [`release.yml`](.github/workflows/release.yml).
+Releases are tag-driven: pushing a `v*.*.*` tag fires [`release.yml`](.github/workflows/release.yml), which builds prebuilt tarballs for `linux-{x86_64,aarch64}` and `macos-{x86_64,aarch64}` and attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases.
+
+### Recommended: cut a release via Actions UI
+
+[`create-release.yml`](.github/workflows/create-release.yml) is a `workflow_dispatch` entry point that bumps `Cargo.toml`, commits, tags, and pushes — replacing the manual edit/commit/tag steps below.
+
+1. Open Actions → **Create Release** → **Run workflow** on `main`.
+2. Choose:
+   - **release_type**: `patch` / `minor` / `major` (or `current` to cut another beta on the same base, e.g. `v0.2.0-beta.2` after `v0.2.0-beta.1`).
+   - **release_channel**: `preview` (tags `vX.Y.Z-beta.N`, auto-incremented) or `stable` (tags `vX.Y.Z`).
+   - **dry_run**: leave on for the first run to preview the computed tag/version without pushing anything.
+3. Re-run with **dry_run** off. The workflow:
+   - Bumps `version = ...` in `Cargo.toml` and refreshes `Cargo.lock` via `cargo set-version` (skipped for `current` if the version is already correct).
+   - Commits as `github-actions[bot]` with message `chore: bump version to <version>`.
+   - Pushes the commit to `main` and pushes the tag.
+   - Dispatches `release.yml` at the new tag's ref. (Direct tag push by `GITHUB_TOKEN` does not trigger workflows — GitHub's recursion guard — so we explicitly `gh workflow run` instead.)
+4. `release.yml` builds artifacts. ~20 minutes later the [GitHub Release](https://github.com/lance-format/lance-c/releases) has all four `.tar.xz` artifacts plus a `SHA512SUMS` file.
+5. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
+   - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
+   - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
+6. Open follow-up PRs to `microsoft/vcpkg` and `conan-io/conan-center-index` mirroring the updated `ports/` and `recipes/` directories.
+
+> **Branch protection:** if `main` is a protected branch, allow `github-actions[bot]` (or the GitHub Actions integration) to bypass push restrictions, or replace the default `GITHUB_TOKEN` in `create-release.yml` with a PAT that has `contents: write`.
+
+### Manual fallback
+
+If you need to cut a release without the workflow (e.g. local tag with extra commits):
 
 1. Decide the new version (semver). Pre-1.0 (`0.x.y`): bump **minor** for breaking changes or new features, **patch** for bug fixes only.
 2. On `main`, bump `version = ...` in [`Cargo.toml`](Cargo.toml) and refresh `Cargo.lock`:
@@ -202,11 +228,7 @@ Releases are tag-driven via [`release.yml`](.github/workflows/release.yml).
    git tag v0.2.0
    git push origin v0.2.0
    ```
-5. `release.yml` fires on the tag push and builds prebuilt tarballs for `linux-{x86_64,aarch64}` and `macos-{x86_64,aarch64}`. ~20 minutes later, the [GitHub Release](https://github.com/lance-format/lance-c/releases) has all four `.tar.xz` artifacts plus a `SHA512SUMS` file.
-6. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
-   - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
-   - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
-7. Open follow-up PRs to `microsoft/vcpkg` and `conan-io/conan-center-index` mirroring the updated `ports/` and `recipes/` directories.
+5. `release.yml` fires on the tag push and builds the four prebuilt tarballs as above.
 
 A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 
