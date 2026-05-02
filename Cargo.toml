@@ -3,7 +3,7 @@
 
 [package]
 name = "lance-c"
-version = "0.1.1-beta.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
