@@ -184,7 +184,7 @@ auto ds = lance::Dataset::open("data.lance", {}, /*version=*/42);
 
 ## Releasing
 
-Releases are tag-driven: pushing a `v*.*.*` tag fires [`release.yml`](.github/workflows/release.yml), which builds prebuilt tarballs for `linux-{x86_64,aarch64}` and `macos-{x86_64,aarch64}` and attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases.
+Releases are tag-driven: pushing a `v*.*.*` tag fires [`release.yml`](.github/workflows/release.yml), which builds prebuilt tarballs for `linux-{x86_64,aarch64}` and `macos-aarch64` and attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. (`macos-x86_64` is temporarily disabled — see the matrix comment in `release.yml`.)
 
 ### Recommended: cut a release via Actions UI
 
