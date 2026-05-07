@@ -283,6 +283,113 @@ int32_t lance_dataset_update(
     uint64_t* out_num_updated
 );
 
+/* ─── lance_dataset_merge_insert ──────────────────────────────────────────── */
+
+/**
+ * Behavior when a target row matches a source row on the join keys.
+ * Defaults are zero-valued so a zero-initialized LanceMergeInsertParams is a
+ * valid find-or-create configuration.
+ */
+typedef enum {
+    /* Keep the target row unchanged (find-or-create). Default. */
+    LANCE_MERGE_WHEN_MATCHED_DO_NOTHING  = 0,
+    /* Replace the target row with the source row (upsert). */
+    LANCE_MERGE_WHEN_MATCHED_UPDATE_ALL  = 1,
+    /* Replace only when an SQL filter evaluates true; requires
+       when_matched_expr. */
+    LANCE_MERGE_WHEN_MATCHED_UPDATE_IF   = 2,
+    /* Fail the operation on any match. */
+    LANCE_MERGE_WHEN_MATCHED_FAIL        = 3,
+    /* Drop the matching target row without inserting anything. */
+    LANCE_MERGE_WHEN_MATCHED_DELETE      = 4,
+} LanceMergeWhenMatched;
+
+/** Behavior when a source row has no matching target row. */
+typedef enum {
+    /* Insert the source row. Default. */
+    LANCE_MERGE_WHEN_NOT_MATCHED_INSERT_ALL = 0,
+    /* Discard the source row. */
+    LANCE_MERGE_WHEN_NOT_MATCHED_DO_NOTHING = 1,
+} LanceMergeWhenNotMatched;
+
+/** Behavior when a target row has no matching source row. */
+typedef enum {
+    /* Keep the target row. Default. */
+    LANCE_MERGE_WHEN_NOT_MATCHED_BY_SOURCE_KEEP      = 0,
+    /* Delete every unmatched target row. */
+    LANCE_MERGE_WHEN_NOT_MATCHED_BY_SOURCE_DELETE    = 1,
+    /* Delete unmatched target rows that satisfy an SQL filter; requires
+       when_not_matched_by_source_expr. */
+    LANCE_MERGE_WHEN_NOT_MATCHED_BY_SOURCE_DELETE_IF = 2,
+} LanceMergeWhenNotMatchedBySource;
+
+/**
+ * Tunable parameters for lance_dataset_merge_insert. Pass NULL to use the
+ * find-or-create defaults (DO_NOTHING / INSERT_ALL / KEEP).
+ *
+ * Expression strings are read only when the corresponding mode requires
+ * them; spurious non-NULL pointers on other modes are rejected so the
+ * contract is unambiguous.
+ */
+typedef struct LanceMergeInsertParams {
+    /* LanceMergeWhenMatched discriminant. */
+    int32_t     when_matched;
+    /* SQL filter for UPDATE_IF; NULL otherwise. Empty string is rejected. */
+    const char* when_matched_expr;
+    /* LanceMergeWhenNotMatched discriminant. */
+    int32_t     when_not_matched;
+    /* LanceMergeWhenNotMatchedBySource discriminant. */
+    int32_t     when_not_matched_by_source;
+    /* SQL filter for DELETE_IF; NULL otherwise. Empty string is rejected. */
+    const char* when_not_matched_by_source_expr;
+} LanceMergeInsertParams;
+
+/** Per-call merge statistics returned via the optional out parameter. */
+typedef struct LanceMergeInsertResult {
+    uint64_t num_inserted_rows;
+    uint64_t num_updated_rows;
+    uint64_t num_deleted_rows;
+} LanceMergeInsertResult;
+
+/**
+ * Merge `source` into `dataset` keyed on `on_columns`, committing a new
+ * manifest. Mirrors SQL MERGE; the default parameters yield a find-or-create
+ * (insert rows that do not match an existing key).
+ *
+ * Mutates `dataset` in place — the same handle remains valid afterward and
+ * sees the new version. Scanners already in flight against this dataset
+ * keep their pre-merge snapshot view.
+ *
+ * @param dataset         Open dataset (not consumed). Must not be NULL.
+ * @param on_columns      Join keys. Length = `num_on_columns`. Must be
+ *                        non-NULL when `num_on_columns > 0`; each entry
+ *                        must be a non-NULL, non-empty C string. Column
+ *                        names are matched case-insensitively (upstream).
+ * @param num_on_columns  Length of `on_columns`. Must be >= 1.
+ * @param source          Arrow C Data Interface stream of source rows.
+ *                        Consumed by this call. Its schema must be
+ *                        compatible with the dataset schema (full match or
+ *                        a subschema).
+ * @param params          Tunable parameters. Pass NULL for find-or-create
+ *                        defaults.
+ * @param out_result      Optional. If non-NULL, on success receives the
+ *                        per-call insert/update/delete counts. On error the
+ *                        slot is left unchanged — do not read it.
+ * @return 0 on success, -1 on error. Error codes:
+ *         LANCE_ERR_INVALID_ARGUMENT for NULL/empty args, out-of-range mode
+ *         discriminants, missing or extraneous expression strings, malformed
+ *         SQL, unknown columns, schema incompatibility, and no-op
+ *         configurations; LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
+ */
+int32_t lance_dataset_merge_insert(
+    LanceDataset* dataset,
+    const char* const* on_columns,
+    size_t num_on_columns,
+    struct ArrowArrayStream* source,
+    const LanceMergeInsertParams* params,
+    LanceMergeInsertResult* out_result
+);
+
 /**
  * Export the dataset schema via Arrow C Data Interface.
  * @param out  Pointer to caller-allocated ArrowSchema struct
