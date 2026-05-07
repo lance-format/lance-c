@@ -5355,6 +5355,33 @@ fn test_merge_insert_empty_key_entry_rejected() {
     unsafe { lance_dataset_close(ds) };
 }
 
+// Parity with `test_update_null_entry_in_columns_rejected`: a NULL pointer
+// inside `on_columns` is rejected via the same per-index path as an empty
+// string. Locks in the contract so a future refactor that special-cases
+// NULL (e.g. by pre-counting non-NULL entries) doesn't slip past validation.
+#[test]
+fn test_merge_insert_null_entry_in_on_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on_ptrs: [*const c_char; 1] = [ptr::null()];
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
 #[test]
 fn test_merge_insert_unknown_key_column_rejected() {
     let (_tmp, uri) = create_large_dataset(3);
