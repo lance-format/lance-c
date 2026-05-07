@@ -23,6 +23,7 @@ mod error;
 mod fragment_writer;
 mod helpers;
 mod index;
+mod merge_insert;
 mod restore;
 pub mod runtime;
 mod scanner;
@@ -39,6 +40,7 @@ pub use error::{
 };
 pub use fragment_writer::*;
 pub use index::*;
+pub use merge_insert::*;
 pub use restore::*;
 pub use scanner::*;
 pub use update::*;

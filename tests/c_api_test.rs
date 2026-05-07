@@ -4706,3 +4706,1013 @@ fn test_update_out_param_untouched_on_error() {
 
     unsafe { lance_dataset_close(ds) };
 }
+
+// ===========================================================================
+// lance_dataset_merge_insert
+// ===========================================================================
+
+/// Build a {id, value, label} batch matching `create_large_dataset`'s schema.
+fn make_merge_source(rows: &[(i32, f32, &str)]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Float32, true),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let ids: Vec<i32> = rows.iter().map(|r| r.0).collect();
+    let values: Vec<f32> = rows.iter().map(|r| r.1).collect();
+    let labels: Vec<&str> = rows.iter().map(|r| r.2).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Float32Array::from(values)),
+            Arc::new(StringArray::from(labels)),
+        ],
+    )
+    .unwrap()
+}
+
+/// Build a `LanceMergeInsertParams` zero-initialized except for the supplied
+/// fields. Helps keep tests readable when only a couple of knobs differ from
+/// the find-or-create defaults.
+fn merge_params(
+    when_matched: LanceMergeWhenMatched,
+    when_not_matched: LanceMergeWhenNotMatched,
+    when_not_matched_by_source: LanceMergeWhenNotMatchedBySource,
+) -> LanceMergeInsertParams {
+    LanceMergeInsertParams {
+        when_matched: when_matched as i32,
+        when_matched_expr: ptr::null(),
+        when_not_matched: when_not_matched as i32,
+        when_not_matched_by_source: when_not_matched_by_source as i32,
+        when_not_matched_by_source_expr: ptr::null(),
+    }
+}
+
+#[test]
+fn test_merge_insert_default_is_find_or_create() {
+    // Default params (`params=NULL`) should match upstream's find-or-create:
+    // existing keys are kept untouched; missing keys are inserted.
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let source = make_merge_source(&[(5, 999.0, "rewritten"), (200, 12.5, "new_row")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let mut result = LanceMergeInsertResult::default();
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            &mut result,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(result.num_inserted_rows, 1);
+    assert_eq!(result.num_updated_rows, 0);
+    assert_eq!(result.num_deleted_rows, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 11);
+
+    // id=5 must remain unchanged (DoNothing on match).
+    let batches = scan_all_rows(ds);
+    let mut row5_value = None;
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            if ids.value(i) == 5 {
+                row5_value = Some(values.value(i));
+            }
+        }
+    }
+    assert_eq!(
+        row5_value,
+        Some(2.5),
+        "id=5 should be unchanged on DoNothing"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_upsert_updates_and_inserts() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(5, 999.0, "rewritten"), (200, 12.5, "new_row")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::UpdateAll,
+        LanceMergeWhenNotMatched::InsertAll,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let mut result = LanceMergeInsertResult::default();
+    let rc = unsafe {
+        lance_dataset_merge_insert(ds, on_ptrs.as_ptr(), 1, &mut stream, &params, &mut result)
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(result.num_inserted_rows, 1);
+    assert_eq!(result.num_updated_rows, 1);
+    assert_eq!(result.num_deleted_rows, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 11);
+
+    // id=5 should now read 999.0 / "rewritten"; id=200 should appear with
+    // the source values; everything else stays as the original generator
+    // produced (`row_<id>`, value = id * 0.5).
+    let batches = scan_all_rows(ds);
+    let mut seen_5 = false;
+    let mut seen_200 = false;
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let labels = batch
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            match ids.value(i) {
+                5 => {
+                    assert_eq!(values.value(i), 999.0);
+                    assert_eq!(labels.value(i), "rewritten");
+                    seen_5 = true;
+                }
+                200 => {
+                    assert_eq!(values.value(i), 12.5);
+                    assert_eq!(labels.value(i), "new_row");
+                    seen_200 = true;
+                }
+                id => {
+                    assert_eq!(values.value(i), id as f32 * 0.5);
+                    assert_eq!(labels.value(i), format!("row_{id}"));
+                }
+            }
+        }
+    }
+    assert!(seen_5 && seen_200);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_when_matched_fail_errors_on_match() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(5, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::Fail,
+        LanceMergeWhenNotMatched::InsertAll,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    // Dataset is left unchanged on the error path.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 10);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_when_matched_delete_drops_match() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Source has matching id=5 and non-matching id=200. With Delete+DoNothing
+    // the matching row is removed, the non-matching row is dropped.
+    let source = make_merge_source(&[(5, 0.0, "x"), (200, 0.0, "y")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::Delete,
+        LanceMergeWhenNotMatched::DoNothing,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let mut result = LanceMergeInsertResult::default();
+    let rc = unsafe {
+        lance_dataset_merge_insert(ds, on_ptrs.as_ptr(), 1, &mut stream, &params, &mut result)
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(result.num_inserted_rows, 0);
+    assert_eq!(result.num_deleted_rows, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 9);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_update_if_filters_matches() {
+    // UpdateIf only updates matched rows where the filter holds. The source
+    // matches both id=2 and id=8; the filter `target.value > 3` selects only
+    // id=8 (target value 4.0) — id=2's target value 1.0 stays put.
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(2, 100.0, "x"), (8, 100.0, "y")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let expr = c_str("target.value > 3");
+    let params = LanceMergeInsertParams {
+        when_matched: LanceMergeWhenMatched::UpdateIf as i32,
+        when_matched_expr: expr.as_ptr(),
+        when_not_matched: LanceMergeWhenNotMatched::DoNothing as i32,
+        when_not_matched_by_source: LanceMergeWhenNotMatchedBySource::Keep as i32,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let batches = scan_all_rows(ds);
+    let mut row2_value = None;
+    let mut row8_value = None;
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            match ids.value(i) {
+                2 => row2_value = Some(values.value(i)),
+                8 => row8_value = Some(values.value(i)),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        row2_value,
+        Some(1.0),
+        "id=2 should be unchanged (filter false)"
+    );
+    assert_eq!(
+        row8_value,
+        Some(100.0),
+        "id=8 should be updated (filter true)"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_when_not_matched_do_nothing_skips_inserts() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(100, 0.0, "x"), (200, 0.0, "y")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::UpdateAll,
+        LanceMergeWhenNotMatched::DoNothing,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // Source rows did not match anything; with DoNothing they are discarded.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 5);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_when_not_matched_by_source_delete() {
+    // Replace-everything-not-in-source semantics: target rows whose key does
+    // not appear in the source are dropped.
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(2, 0.0, "x"), (3, 0.0, "y")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::DoNothing,
+        LanceMergeWhenNotMatched::DoNothing,
+        LanceMergeWhenNotMatchedBySource::Delete,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // 5 -> 2 rows remain (ids 2 and 3).
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_when_not_matched_by_source_delete_if() {
+    // DeleteIf("id < 3"): drop unmatched target rows that satisfy the filter
+    // (ids 0, 1) and keep the rest (ids 3, 4). id=2 is matched by source so
+    // it is preserved regardless of the filter.
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(2, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let expr = c_str("id < 3");
+    let params = LanceMergeInsertParams {
+        when_matched: LanceMergeWhenMatched::DoNothing as i32,
+        when_matched_expr: ptr::null(),
+        when_not_matched: LanceMergeWhenNotMatched::DoNothing as i32,
+        when_not_matched_by_source: LanceMergeWhenNotMatchedBySource::DeleteIf as i32,
+        when_not_matched_by_source_expr: expr.as_ptr(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // id=0 and id=1 deleted; id=2,3,4 kept.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_multi_column_keys() {
+    // Match on (id, label). The source row matches id=3 but with a different
+    // label, so no target row is matched and the source row is inserted as a
+    // brand-new row under upsert semantics.
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(3, 99.0, "different")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id"), c_str("label")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::UpdateAll,
+        LanceMergeWhenNotMatched::InsertAll,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let mut result = LanceMergeInsertResult::default();
+    let rc = unsafe {
+        lance_dataset_merge_insert(ds, on_ptrs.as_ptr(), 2, &mut stream, &params, &mut result)
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(result.num_inserted_rows, 1);
+    assert_eq!(result.num_updated_rows, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 6);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(v_after > v_before);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_out_result_optional() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    // Pass NULL out_result — must succeed without writing anything.
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// Locks in the documented contract: when the call fails, `out_result` must be
+// left unchanged. A future refactor that pre-zeroes the slot before validating
+// inputs would silently break this guarantee.
+#[test]
+fn test_merge_insert_out_result_untouched_on_error() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let sentinel = LanceMergeInsertResult {
+        num_inserted_rows: 0xDEAD,
+        num_updated_rows: 0xBEEF,
+        num_deleted_rows: 0xCAFE,
+    };
+    let mut out = sentinel;
+
+    // num_on_columns = 0 → INVALID_ARGUMENT before any work happens. The
+    // stream is still consumed (NULL stream is the only check ahead of the
+    // `from_raw` consume), but the result slot must be untouched.
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let rc = unsafe {
+        lance_dataset_merge_insert(ds, ptr::null(), 0, &mut stream, ptr::null(), &mut out)
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(out, sentinel, "out slot must be untouched on error");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_null_dataset_rejected() {
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ptr::null_mut(),
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_merge_insert_null_source_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_zero_num_on_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            ptr::null(),
+            0,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_null_on_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            ptr::null(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_empty_key_entry_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("")];
+    let on_ptrs = cstr_ptrs(&on);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_unknown_key_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("no_such_column")];
+    let on_ptrs = cstr_ptrs(&on);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    // MergeInsertBuilder::try_new returns InvalidInput for an unknown key.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_invalid_when_matched_discriminant_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = LanceMergeInsertParams {
+        when_matched: 99,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: 0,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_invalid_when_not_matched_discriminant_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = LanceMergeInsertParams {
+        when_matched: 0,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 99,
+        when_not_matched_by_source: 0,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_invalid_when_not_matched_by_source_discriminant_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = LanceMergeInsertParams {
+        when_matched: 0,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: 99,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_empty_expr_rejected() {
+    // Empty expression string is rejected at the FFI boundary so callers hit
+    // a precise error rather than an opaque parser failure later on.
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let empty = c_str("");
+    let params = LanceMergeInsertParams {
+        when_matched: LanceMergeWhenMatched::UpdateIf as i32,
+        when_matched_expr: empty.as_ptr(),
+        when_not_matched: 0,
+        when_not_matched_by_source: 0,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_update_if_missing_expr_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = LanceMergeInsertParams {
+        when_matched: LanceMergeWhenMatched::UpdateIf as i32,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: 0,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_unused_expr_for_update_all_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let expr = c_str("id > 0");
+    let params = LanceMergeInsertParams {
+        when_matched: LanceMergeWhenMatched::UpdateAll as i32,
+        when_matched_expr: expr.as_ptr(),
+        when_not_matched: 0,
+        when_not_matched_by_source: 0,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_delete_if_missing_expr_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = LanceMergeInsertParams {
+        when_matched: 0,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: LanceMergeWhenNotMatchedBySource::DeleteIf as i32,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_no_op_config_rejected() {
+    // DoNothing + DoNothing + Keep is a configuration that mutates nothing;
+    // upstream's `try_build` rejects it as InvalidInput.
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = merge_params(
+        LanceMergeWhenMatched::DoNothing,
+        LanceMergeWhenNotMatched::DoNothing,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_schema_mismatch_rejected() {
+    // Source `value` column is Float64 instead of Float32, so upstream's
+    // schema-compatibility check rejects the merge before any commit lands.
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let bad_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Float64, true),
+    ]));
+    let bad_batch = RecordBatch::try_new(
+        bad_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![100])),
+            Arc::new(arrow_array::Float64Array::from(vec![1.0])),
+        ],
+    )
+    .unwrap();
+    let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(bad_batch)], bad_schema);
+    let mut stream = FFI_ArrowArrayStream::new(Box::new(reader));
+
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = merge_params(
+        LanceMergeWhenMatched::UpdateAll,
+        LanceMergeWhenNotMatched::InsertAll,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    // The dataset should not be corrupted by the rejected merge.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_unknown_predicate_column_in_delete_if_rejected() {
+    // DeleteIf parses against the dataset schema at FFI time; an unknown
+    // column surfaces as InvalidArgument.
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(2, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let expr = c_str("no_such_column = 1");
+    let params = LanceMergeInsertParams {
+        when_matched: 0,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: LanceMergeWhenNotMatchedBySource::DeleteIf as i32,
+        when_not_matched_by_source_expr: expr.as_ptr(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}

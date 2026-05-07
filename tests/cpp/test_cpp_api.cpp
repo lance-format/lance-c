@@ -332,6 +332,42 @@ static void test_update(const std::string& dst_uri) {
 }
 
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+// exercises `Dataset::merge_insert`. Must run before `test_delete_rows`,
+// which empties the dataset.
+static void test_merge_insert(const std::string& dst_uri) {
+    TEST(test_merge_insert);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t before = ds.count_rows();
+    assert(before > 0 && "test fixture expected to have rows");
+
+    // Self-merge: scan the dataset itself and use that as the source. With
+    // find-or-create defaults every row is a self-match and DoNothing fires,
+    // so insert/update counts stay at zero and the row count is preserved.
+    auto scanner = ds.scan();
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+
+    auto result = ds.merge_insert({"id"}, &stream);
+    assert(result.num_inserted_rows == 0);
+    assert(result.num_updated_rows == 0);
+    assert(ds.count_rows() == before);
+
+    // Empty key vector must throw (num_on_columns == 0).
+    bool caught_empty = false;
+    try {
+        ds.merge_insert({}, nullptr);
+    } catch (const lance::Error& e) {
+        caught_empty = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_empty);
+
+    PASS();
+}
+
+// Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::delete_rows`. Must run after the write roundtrip.
 static void test_delete_rows(const std::string& dst_uri) {
     TEST(test_delete_rows);
@@ -382,6 +418,7 @@ int main(int argc, char** argv) {
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_update(write_uri);
+    test_merge_insert(write_uri);
     test_delete_rows(write_uri);
 
     printf("All C++ tests passed!\n");

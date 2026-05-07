@@ -381,6 +381,48 @@ public:
         return num_updated;
     }
 
+    /// Merge `source` into this dataset keyed on `on_columns`, committing a
+    /// new manifest. Defaults to find-or-create semantics (insert rows that
+    /// do not match an existing key). Returns the per-call insert / update /
+    /// delete counts.
+    ///
+    /// `on_columns` must be non-empty. `params` controls match behavior; pass
+    /// `nullptr` for find-or-create defaults. `source` is consumed.
+    /// Throws lance::Error on failure (empty key, schema mismatch, malformed
+    /// SQL, missing expression for *_IF mode, commit conflict, ...).
+    LanceMergeInsertResult merge_insert(
+        const std::vector<std::string>& on_columns,
+        ArrowArrayStream* source,
+        const LanceMergeInsertParams* params = nullptr) {
+        std::vector<const char*> col_ptrs;
+        col_ptrs.reserve(on_columns.size());
+        for (const auto& c : on_columns) {
+            col_ptrs.push_back(c.c_str());
+        }
+        LanceMergeInsertResult result{};
+        if (lance_dataset_merge_insert(
+                handle_.get(),
+                col_ptrs.data(),
+                on_columns.size(),
+                source,
+                params,
+                &result) != 0) {
+            check_error();
+        }
+        return result;
+    }
+
+    /// Convenience: classic upsert (when_matched=UpdateAll, when_not_matched=InsertAll).
+    LanceMergeInsertResult upsert(
+        const std::vector<std::string>& on_columns,
+        ArrowArrayStream* source) {
+        LanceMergeInsertParams params{};
+        params.when_matched = LANCE_MERGE_WHEN_MATCHED_UPDATE_ALL;
+        params.when_not_matched = LANCE_MERGE_WHEN_NOT_MATCHED_INSERT_ALL;
+        params.when_not_matched_by_source = LANCE_MERGE_WHEN_NOT_MATCHED_BY_SOURCE_KEEP;
+        return merge_insert(on_columns, source, &params);
+    }
+
     /// Export the schema as an Arrow C Data Interface struct.
     void schema(ArrowSchema* out) const {
         if (lance_dataset_schema(handle_.get(), out) != 0) {

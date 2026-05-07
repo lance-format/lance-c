@@ -301,6 +301,51 @@ static void test_update(const char *write_uri) {
 }
 
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+ * exercises `lance_dataset_merge_insert`. Must run before `test_delete`,
+ * which empties the dataset. The source comes from scanning the dataset
+ * itself, so under find-or-create defaults every row is a self-match
+ * (DoNothing) and nothing changes — this validates the FFI plumbing without
+ * needing to hand-build an Arrow batch in pure C. */
+static void test_merge_insert(const char *write_uri) {
+    printf("  test_merge_insert... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t before = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(before > 0, "fixture expected to have rows");
+
+    /* Build a self-source via the scanner. */
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    int32_t rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+
+    const char *on_cols[] = {"id"};
+    LanceMergeInsertResult result;
+    memset(&result, 0, sizeof(result));
+    rc = lance_dataset_merge_insert(ds, on_cols, 1, &stream, NULL, &result);
+    ASSERT(rc == 0, "merge_insert failed");
+    /* Self-match under DoNothing: nothing inserted, nothing updated. */
+    ASSERT(result.num_inserted_rows == 0, "expected 0 inserts");
+    ASSERT(result.num_updated_rows == 0, "expected 0 updates");
+    ASSERT(lance_dataset_count_rows(ds) == before, "row count must be unchanged");
+
+    /* num_on_columns == 0 must be rejected. */
+    rc = lance_dataset_merge_insert(ds, NULL, 0, NULL, NULL, NULL);
+    ASSERT(rc == -1, "num_on_columns=0 must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_scanner_close(scanner);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_delete`. Must run after the write roundtrip. */
 static void test_delete(const char *write_uri) {
     printf("  test_delete... ");
@@ -347,6 +392,7 @@ int main(int argc, char **argv) {
     test_error_handling();
     test_dataset_write_roundtrip(uri, write_uri);
     test_update(write_uri);
+    test_merge_insert(write_uri);
     test_delete(write_uri);
 
     printf("All C tests passed!\n");
