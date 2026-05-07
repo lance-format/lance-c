@@ -5599,6 +5599,41 @@ fn test_merge_insert_unused_expr_for_update_all_rejected() {
     unsafe { lance_dataset_close(ds) };
 }
 
+// Symmetric to `test_merge_insert_unused_expr_for_update_all_rejected`: pins
+// the same rejection on the `when_not_matched_by_source` side so the helper
+// covering that path is exercised independently.
+#[test]
+fn test_merge_insert_unused_expr_for_keep_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let expr = c_str("id > 0");
+    let params = LanceMergeInsertParams {
+        when_matched: 0,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: LanceMergeWhenNotMatchedBySource::Keep as i32,
+        when_not_matched_by_source_expr: expr.as_ptr(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
 #[test]
 fn test_merge_insert_delete_if_missing_expr_rejected() {
     let (_tmp, uri) = create_large_dataset(3);
