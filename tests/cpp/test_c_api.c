@@ -346,6 +346,36 @@ static void test_merge_insert(const char *write_uri) {
 }
 
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+ * exercises `lance_dataset_compact_files`. The smoke fixture is a single
+ * fragment, so the default planner has nothing to compact — we expect
+ * all-zero metrics and no version bump. Must run before `test_delete`. */
+static void test_compact_files(const char *write_uri) {
+    printf("  test_compact_files... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t v_before = lance_dataset_version(ds);
+
+    LanceCompactionMetrics metrics;
+    memset(&metrics, 0, sizeof(metrics));
+    int32_t rc = lance_dataset_compact_files(ds, NULL, &metrics);
+    ASSERT(rc == 0, "compact_files failed");
+    ASSERT(metrics.fragments_removed == 0 && metrics.fragments_added == 0,
+           "expected no-op metrics on a clean single-fragment dataset");
+    ASSERT(lance_dataset_version(ds) == v_before,
+           "no-op compaction must not bump the version");
+
+    /* NULL dataset must be rejected with INVALID_ARGUMENT. */
+    rc = lance_dataset_compact_files(NULL, NULL, NULL);
+    ASSERT(rc == -1, "NULL dataset must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_delete`. Must run after the write roundtrip. */
 static void test_delete(const char *write_uri) {
     printf("  test_delete... ");
@@ -393,6 +423,7 @@ int main(int argc, char **argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
+    test_compact_files(write_uri);
     test_delete(write_uri);
 
     printf("All C tests passed!\n");

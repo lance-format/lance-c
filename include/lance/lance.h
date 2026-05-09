@@ -390,6 +390,69 @@ int32_t lance_dataset_merge_insert(
     LanceMergeInsertResult* out_result
 );
 
+/* ─── lance_dataset_compact_files ─────────────────────────────────────────── */
+
+/**
+ * Tunable parameters for lance_dataset_compact_files. Pass NULL to use the
+ * upstream defaults. Each numeric field uses 0 as a "keep upstream default"
+ * sentinel; non-zero values are forwarded after a usize range check so the
+ * API does not silently truncate on 32-bit hosts.
+ */
+typedef struct LanceCompactionOptions {
+    /* Target row count per output fragment. Fragments below this size are
+       candidates for being merged with neighbors. 0 = default (~1Mi rows). */
+    uint64_t target_rows_per_fragment;
+    /* Soft cap on rows per row group within an output fragment. 0 = default. */
+    uint64_t max_rows_per_group;
+    /* Soft cap on bytes per output fragment file. 0 = default (writer cap). */
+    uint64_t max_bytes_per_file;
+    /* Compute parallelism for compaction tasks. 0 = default
+       (number of compute-intensive CPUs). */
+    uint32_t num_threads;
+    /* Scanner batch size for reading input fragments. 0 = default. */
+    uint64_t batch_size;
+} LanceCompactionOptions;
+
+/** Per-call compaction metrics returned via the optional out parameter. */
+typedef struct LanceCompactionMetrics {
+    /* Number of input fragments that were rewritten and dropped. */
+    uint64_t fragments_removed;
+    /* Number of new fragments produced by the rewrite. */
+    uint64_t fragments_added;
+    /* Total files removed across the operation, including deletion files. */
+    uint64_t files_removed;
+    /* Total files added across the operation; one per new fragment. */
+    uint64_t files_added;
+} LanceCompactionMetrics;
+
+/**
+ * Compact the dataset's fragments, committing a new manifest if anything
+ * changed. Each compaction task merges adjacent small fragments and
+ * materializes any deletion files in the process. A clean dataset (no
+ * fragment under the target size, no deletions worth materializing) is a
+ * no-op: the function returns success with all-zero metrics and the
+ * dataset's version is unchanged.
+ *
+ * Mutates `dataset` in place — the same handle remains valid afterward and
+ * sees the new version. Scanners already in flight against this dataset
+ * keep their pre-compaction snapshot view.
+ *
+ * @param dataset      Open dataset (not consumed). Must not be NULL.
+ * @param options      Tunable parameters. Pass NULL for upstream defaults.
+ * @param out_metrics  Optional. If non-NULL, on success receives the per-call
+ *                     compaction metrics. On error the slot is left unchanged
+ *                     — do not read it.
+ * @return 0 on success, -1 on error. Error codes:
+ *         LANCE_ERR_INVALID_ARGUMENT for NULL `dataset` or for numeric
+ *         overrides that exceed usize::MAX on the running target;
+ *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
+ */
+int32_t lance_dataset_compact_files(
+    LanceDataset* dataset,
+    const LanceCompactionOptions* options,
+    LanceCompactionMetrics* out_metrics
+);
+
 /**
  * Export the dataset schema via Arrow C Data Interface.
  * @param out  Pointer to caller-allocated ArrowSchema struct

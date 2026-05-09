@@ -423,6 +423,19 @@ public:
         return merge_insert(on_columns, source, &params);
     }
 
+    /// Compact small or deleted-heavy fragments into larger ones, committing
+    /// a new manifest. A clean dataset is a no-op — all-zero metrics and the
+    /// version is unchanged. Pass `nullptr` for upstream defaults.
+    /// Throws lance::Error on failure (commit conflict, ...).
+    LanceCompactionMetrics compact_files(
+        const LanceCompactionOptions* options = nullptr) {
+        LanceCompactionMetrics metrics{};
+        if (lance_dataset_compact_files(handle_.get(), options, &metrics) != 0) {
+            check_error();
+        }
+        return metrics;
+    }
+
     /// Export the schema as an Arrow C Data Interface struct.
     void schema(ArrowSchema* out) const {
         if (lance_dataset_schema(handle_.get(), out) != 0) {
