@@ -408,7 +408,7 @@ typedef struct LanceCompactionOptions {
     uint64_t max_bytes_per_file;
     /* Compute parallelism for compaction tasks. 0 = default
        (number of compute-intensive CPUs). */
-    uint32_t num_threads;
+    uint64_t num_threads;
     /* Scanner batch size for reading input fragments. 0 = default. */
     uint64_t batch_size;
 } LanceCompactionOptions;

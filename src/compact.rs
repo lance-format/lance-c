@@ -36,7 +36,7 @@ pub struct LanceCompactionOptions {
     pub max_bytes_per_file: u64,
     /// Compute parallelism for compaction tasks. `0` uses upstream's default
     /// (the number of compute-intensive CPUs).
-    pub num_threads: u32,
+    pub num_threads: u64,
     /// Scanner batch size for reading input fragments. `0` uses upstream's
     /// default.
     pub batch_size: u64,
@@ -151,7 +151,7 @@ unsafe fn resolve_options(options: *const LanceCompactionOptions) -> Result<Comp
             Some(u64_to_usize(opts.max_bytes_per_file, "max_bytes_per_file")?);
     }
     if opts.num_threads > 0 {
-        resolved.num_threads = Some(opts.num_threads as usize);
+        resolved.num_threads = Some(u64_to_usize(opts.num_threads, "num_threads")?);
     }
     if opts.batch_size > 0 {
         resolved.batch_size = Some(u64_to_usize(opts.batch_size, "batch_size")?);
