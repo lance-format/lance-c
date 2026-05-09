@@ -124,10 +124,9 @@ unsafe fn compact_inner(
     Ok(0)
 }
 
-/// Build a `CompactionOptions` from the caller-provided overrides (or NULL
-/// → all defaults). Each numeric field uses `0` as a "keep upstream default"
-/// sentinel; non-zero values are forwarded after a `usize` range check so
-/// the API doesn't silently truncate on 32-bit hosts.
+/// Apply caller-provided overrides onto a default `CompactionOptions`. NULL
+/// means "no overrides"; the per-field sentinel and overflow contract are
+/// documented on `LanceCompactionOptions`.
 unsafe fn resolve_options(options: *const LanceCompactionOptions) -> Result<CompactionOptions> {
     let mut resolved = CompactionOptions::default();
     if options.is_null() {
