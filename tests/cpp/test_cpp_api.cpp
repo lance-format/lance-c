@@ -368,6 +368,24 @@ static void test_merge_insert(const std::string& dst_uri) {
 }
 
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+// exercises `Dataset::compact_files`. The smoke fixture is a single fragment
+// so the default planner has nothing to compact — we expect a no-op (zero
+// metrics, no version bump). Must run before `test_delete_rows`.
+static void test_compact_files(const std::string& dst_uri) {
+    TEST(test_compact_files);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t v_before = ds.version();
+
+    auto metrics = ds.compact_files();
+    assert(metrics.fragments_removed == 0);
+    assert(metrics.fragments_added == 0);
+    assert(ds.version() == v_before);
+
+    PASS();
+}
+
+// Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::delete_rows`. Must run after the write roundtrip.
 static void test_delete_rows(const std::string& dst_uri) {
     TEST(test_delete_rows);
@@ -419,6 +437,7 @@ int main(int argc, char** argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
+    test_compact_files(write_uri);
     test_delete_rows(write_uri);
 
     printf("All C++ tests passed!\n");

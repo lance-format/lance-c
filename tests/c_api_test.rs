@@ -5771,3 +5771,297 @@ fn test_merge_insert_unknown_predicate_column_in_delete_if_rejected() {
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
     unsafe { lance_dataset_close(ds) };
 }
+
+// ===========================================================================
+// lance_dataset_compact_files
+// ===========================================================================
+
+/// Build a dataset of `num_fragments` small fragments (3 unique ids each)
+/// so the default planner sees plenty of small neighbors to merge. Unique
+/// ids keep fragments alive across partial-row deletes — upstream's `delete`
+/// drops a fragment entirely once all of its rows are gone.
+fn create_many_small_fragments(num_fragments: i32) -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("small_frags").to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+    lance_c::runtime::block_on(async {
+        for i in 0..num_fragments {
+            let base = i * 3;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![base, base + 1, base + 2]))],
+            )
+            .unwrap();
+            if i == 0 {
+                Dataset::write(
+                    arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    &uri,
+                    None,
+                )
+                .await
+                .unwrap();
+            } else {
+                let mut ds = Dataset::open(&uri).await.unwrap();
+                ds.append(
+                    arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        }
+    });
+
+    (tmp, uri)
+}
+
+#[test]
+fn test_compact_basic_merges_small_fragments() {
+    let (_tmp, uri) = create_many_small_fragments(4);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 4);
+    let v_before = unsafe { lance_dataset_version(ds) };
+
+    let mut metrics = LanceCompactionMetrics::default();
+    let rc = unsafe { lance_dataset_compact_files(ds, ptr::null(), &mut metrics) };
+    assert_eq!(rc, 0);
+
+    // All four small neighbors are below the default 1Mi target, so they
+    // collapse into a single output fragment. Row count is preserved.
+    assert_eq!(metrics.fragments_removed, 4);
+    assert_eq!(metrics.fragments_added, 1);
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 12);
+    assert!(unsafe { lance_dataset_version(ds) } > v_before);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_preserves_data() {
+    let (_tmp, uri) = create_many_small_fragments(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let rc = unsafe { lance_dataset_compact_files(ds, ptr::null(), ptr::null_mut()) };
+    assert_eq!(rc, 0);
+
+    // Three fragments × three unique ids each = 0..=8, every value once.
+    let mut seen = [false; 9];
+    for batch in &scan_all_rows(ds) {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            seen[ids.value(i) as usize] = true;
+        }
+    }
+    assert!(seen.iter().all(|&b| b));
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_no_op_on_clean_single_fragment() {
+    // A single fragment with no neighbors and no deletions has nothing to
+    // compact: upstream returns success without committing, so the version
+    // and counts are unchanged.
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let mut metrics = LanceCompactionMetrics {
+        fragments_removed: 0xDEAD,
+        fragments_added: 0xBEEF,
+        files_removed: 0xCAFE,
+        files_added: 0xF00D,
+    };
+    let rc = unsafe { lance_dataset_compact_files(ds, ptr::null(), &mut metrics) };
+    assert_eq!(rc, 0);
+    assert_eq!(metrics, LanceCompactionMetrics::default());
+    assert_eq!(unsafe { lance_dataset_version(ds) }, v_before);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_after_deletes_materializes_deletion_files() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Soft-delete one row from each fragment (id=1 from frag 0, id=4 from
+    // frag 1) so each fragment ends up with a deletion file to materialize.
+    let pred = c_str("id = 1 OR id = 4");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+
+    let mut metrics = LanceCompactionMetrics::default();
+    let rc = unsafe { lance_dataset_compact_files(ds, ptr::null(), &mut metrics) };
+    assert_eq!(rc, 0);
+    // Both small fragments are rewritten into a single one with the deleted
+    // rows physically removed and the deletion files gone.
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(metrics.fragments_added, 1);
+    assert!(
+        metrics.files_removed >= 4,
+        "expected ≥ 2 data files + 2 deletion files removed, got {}",
+        metrics.files_removed
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 4);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_target_rows_per_fragment_override_accepted() {
+    let (_tmp, uri) = create_many_small_fragments(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let opts = LanceCompactionOptions {
+        target_rows_per_fragment: 100,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 0,
+        num_threads: 0,
+        batch_size: 0,
+    };
+    let rc = unsafe { lance_dataset_compact_files(ds, &opts, ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 9);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_num_threads_override_accepted() {
+    let (_tmp, uri) = create_many_small_fragments(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let opts = LanceCompactionOptions {
+        target_rows_per_fragment: 0,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 0,
+        num_threads: 1,
+        batch_size: 0,
+    };
+    let rc = unsafe { lance_dataset_compact_files(ds, &opts, ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 9);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_max_bytes_per_file_override_accepted() {
+    // 1 MiB cap is far above what 6 rows of i32 produce, so the override
+    // just smoke-checks that the field flows through without erroring.
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let opts = LanceCompactionOptions {
+        target_rows_per_fragment: 0,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 1 << 20,
+        num_threads: 0,
+        batch_size: 0,
+    };
+    let rc = unsafe { lance_dataset_compact_files(ds, &opts, ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 6);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_batch_size_and_max_rows_per_group_overrides_accepted() {
+    // Smoke-checks that the two least-observable overrides flow through
+    // without erroring; the resulting layout isn't introspected here.
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let opts = LanceCompactionOptions {
+        target_rows_per_fragment: 0,
+        max_rows_per_group: 4,
+        max_bytes_per_file: 0,
+        num_threads: 0,
+        batch_size: 32,
+    };
+    let rc = unsafe { lance_dataset_compact_files(ds, &opts, ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 6);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_zero_options_equivalent_to_null() {
+    // A zero-initialized options struct must behave identically to NULL.
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let opts = LanceCompactionOptions {
+        target_rows_per_fragment: 0,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 0,
+        num_threads: 0,
+        batch_size: 0,
+    };
+    let mut metrics = LanceCompactionMetrics::default();
+    let rc = unsafe { lance_dataset_compact_files(ds, &opts, &mut metrics) };
+    assert_eq!(rc, 0);
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(metrics.fragments_added, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 6);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_out_metrics_optional() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    // Pass NULL out_metrics — must succeed without writing anything.
+    let rc = unsafe { lance_dataset_compact_files(ds, ptr::null(), ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_null_dataset_rejected() {
+    let rc = unsafe { lance_dataset_compact_files(ptr::null_mut(), ptr::null(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+// Locks in the documented contract: when the call fails, `out_metrics` must
+// be left unchanged. A future refactor that pre-zeroes the slot before
+// validating inputs would silently break this guarantee.
+#[test]
+fn test_compact_out_metrics_untouched_on_error() {
+    let sentinel = LanceCompactionMetrics {
+        fragments_removed: 0xDEAD,
+        fragments_added: 0xBEEF,
+        files_removed: 0xCAFE,
+        files_added: 0xF00D,
+    };
+    let mut out = sentinel;
+    let rc = unsafe { lance_dataset_compact_files(ptr::null_mut(), ptr::null(), &mut out) };
+    assert_eq!(rc, -1);
+    assert_eq!(out, sentinel, "out slot must be untouched on error");
+}

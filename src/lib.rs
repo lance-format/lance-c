@@ -17,6 +17,7 @@
 
 mod async_dispatcher;
 mod batch;
+mod compact;
 mod dataset;
 mod delete;
 mod error;
@@ -33,6 +34,7 @@ mod writer;
 
 // Re-export all extern "C" symbols so they appear in the cdylib.
 pub use batch::*;
+pub use compact::*;
 pub use dataset::*;
 pub use delete::*;
 pub use error::{
