@@ -15,6 +15,7 @@ use futures::{Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_core::Result;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_io::stream::RecordBatchStream;
 use uuid::Uuid;
@@ -42,6 +43,7 @@ pub struct LanceScanner {
     dataset: Arc<Dataset>,
     columns: Option<Vec<String>>,
     filter: Option<String>,
+    substrait_filter: Option<Vec<u8>>,
     limit: Option<i64>,
     offset: Option<i64>,
     batch_size: Option<usize>,
@@ -55,6 +57,7 @@ pub struct LanceScanner {
     metric_override: Option<crate::index::LanceMetricType>,
     use_index: Option<bool>,
     prefilter: bool,
+    fts_query: Option<FullTextSearchQuery>,
     // Materialized on first iteration call
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
     #[allow(dead_code)]
@@ -92,6 +95,7 @@ impl LanceScanner {
             dataset,
             columns: None,
             filter: None,
+            substrait_filter: None,
             limit: None,
             offset: None,
             batch_size: None,
@@ -105,6 +109,7 @@ impl LanceScanner {
             metric_override: None,
             use_index: None,
             prefilter: false,
+            fts_query: None,
             stream: None,
             schema: None,
         }
@@ -131,7 +136,10 @@ impl LanceScanner {
         if let Some(cols) = &self.columns {
             scanner.project(cols)?;
         }
-        if let Some(filter) = &self.filter {
+        // Substrait filter takes precedence over SQL filter when both are set.
+        if let Some(bytes) = &self.substrait_filter {
+            scanner.filter_substrait(bytes)?;
+        } else if let Some(filter) = &self.filter {
             scanner.filter(filter)?;
         }
         if self.limit.is_some() || self.offset.is_some() {
@@ -144,6 +152,12 @@ impl LanceScanner {
             scanner.with_row_id();
         }
         self.apply_fragment_filter(&mut scanner)?;
+        if self.index_segments.is_some() && self.nearest.is_none() {
+            return Err(lance_core::Error::InvalidInput {
+                source: "index_segments requires nearest() to be configured".into(),
+                location: snafu::location!(),
+            });
+        }
         if let Some(n) = &self.nearest {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
             if let Some(np) = self.nprobes {
@@ -167,6 +181,9 @@ impl LanceScanner {
             if let Some(segments) = &self.index_segments {
                 scanner.with_index_segments(segments.clone())?;
             }
+        }
+        if let Some(fts) = &self.fts_query {
+            scanner.full_text_search(fts.clone())?;
         }
         let stream = block_on(scanner.try_into_stream())?;
         self.schema = Some(stream.schema());
@@ -180,7 +197,10 @@ impl LanceScanner {
         if let Some(cols) = &self.columns {
             scanner.project(cols)?;
         }
-        if let Some(filter) = &self.filter {
+        // Substrait filter takes precedence over SQL filter when both are set.
+        if let Some(bytes) = &self.substrait_filter {
+            scanner.filter_substrait(bytes)?;
+        } else if let Some(filter) = &self.filter {
             scanner.filter(filter)?;
         }
         if self.limit.is_some() || self.offset.is_some() {
@@ -193,6 +213,12 @@ impl LanceScanner {
             scanner.with_row_id();
         }
         self.apply_fragment_filter(&mut scanner)?;
+        if self.index_segments.is_some() && self.nearest.is_none() {
+            return Err(lance_core::Error::InvalidInput {
+                source: "index_segments requires nearest() to be configured".into(),
+                location: snafu::location!(),
+            });
+        }
         if let Some(n) = &self.nearest {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
             if let Some(np) = self.nprobes {
@@ -216,6 +242,9 @@ impl LanceScanner {
             if let Some(segments) = &self.index_segments {
                 scanner.with_index_segments(segments.clone())?;
             }
+        }
+        if let Some(fts) = &self.fts_query {
+            scanner.full_text_search(fts.clone())?;
         }
         Ok(scanner)
     }
@@ -345,6 +374,53 @@ pub unsafe extern "C" fn lance_scanner_set_fragment_ids(
         &[]
     };
     s.fragment_ids = Some(id_slice.to_vec());
+    clear_last_error();
+    0
+}
+
+/// Set a Substrait filter on the scanner.
+///
+/// `bytes` must point to a serialized Substrait
+/// [`ExtendedExpression`](https://substrait.io/expressions/extended_expression/)
+/// message containing exactly one expression of boolean type. This is the
+/// preferred filter API for query engines that already speak Substrait — it
+/// avoids the round-trip through SQL string formatting and parsing.
+///
+/// If both this and the SQL filter passed to `lance_scanner_new` are set, the
+/// Substrait filter wins. Calling this with the same scanner more than once
+/// replaces the previously-set Substrait filter.
+///
+/// - `scanner`: An open `LanceScanner*`.
+/// - `bytes`: Pointer to the serialized Substrait `ExtendedExpression` bytes.
+///   Must not be NULL and `len` must be > 0. The bytes are copied into the
+///   scanner; the caller may free them after this call returns.
+/// - `len`: Length of the byte buffer.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_substrait_filter(
+    scanner: *mut LanceScanner,
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+        return -1;
+    }
+    if bytes.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "bytes is NULL");
+        return -1;
+    }
+    if len == 0 {
+        set_last_error(
+            LanceErrorCode::InvalidArgument,
+            "Substrait filter bytes must be non-empty",
+        );
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+    let s = unsafe { &mut *scanner };
+    s.substrait_filter = Some(slice.to_vec());
     clear_last_error();
     0
 }
@@ -831,6 +907,13 @@ unsafe fn scanner_nearest_inner(
         });
     }
     let s = unsafe { &mut *scanner };
+    if s.fts_query.is_some() {
+        return Err(lance_core::Error::InvalidInput {
+            source: "cannot call nearest after full_text_search; they are mutually exclusive"
+                .into(),
+            location: snafu::location!(),
+        });
+    }
     let column_str = unsafe { helpers::parse_c_string(column)? }.unwrap();
 
     let dtype = match element_type {
@@ -877,5 +960,77 @@ unsafe fn scanner_nearest_inner(
         query,
         k,
     });
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// Full-text search (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Set a BM25 full-text search query on the scanner.
+///
+/// - `query`: Query string (terms).
+/// - `columns`: NULL-terminated array of column names, or NULL to search all
+///   FTS-indexed columns.
+/// - `max_fuzzy_distance`: 0 = exact match; >0 = `MatchQuery::with_fuzziness`.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+///
+/// Mutually exclusive with `lance_scanner_nearest`: calling either after the
+/// other returns InvalidArgument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_full_text_search(
+    scanner: *mut LanceScanner,
+    query: *const c_char,
+    columns: *const *const c_char,
+    max_fuzzy_distance: u32,
+) -> i32 {
+    ffi_try!(
+        unsafe { fts_inner(scanner, query, columns, max_fuzzy_distance) },
+        neg
+    )
+}
+
+unsafe fn fts_inner(
+    scanner: *mut LanceScanner,
+    query: *const c_char,
+    columns: *const *const c_char,
+    max_fuzzy_distance: u32,
+) -> Result<i32> {
+    if scanner.is_null() || query.is_null() {
+        return Err(lance_core::Error::InvalidInput {
+            source: "scanner and query must not be NULL".into(),
+            location: snafu::location!(),
+        });
+    }
+    let s = unsafe { &mut *scanner };
+
+    // Mutual exclusion with vector search.
+    if s.nearest.is_some() {
+        return Err(lance_core::Error::InvalidInput {
+            source: "cannot call full_text_search after nearest; they are mutually exclusive"
+                .into(),
+            location: snafu::location!(),
+        });
+    }
+
+    let query_str = unsafe { helpers::parse_c_string(query)? }
+        .unwrap()
+        .to_string();
+    let cols = unsafe { helpers::parse_c_string_array(columns)? };
+
+    let mut fts = if max_fuzzy_distance > 0 {
+        FullTextSearchQuery::new_fuzzy(query_str, Some(max_fuzzy_distance))
+    } else {
+        FullTextSearchQuery::new(query_str)
+    };
+
+    if let Some(cols) = cols
+        && !cols.is_empty()
+    {
+        fts = fts.with_columns(&cols)?;
+    }
+
+    s.fts_query = Some(fts);
     Ok(0)
 }

@@ -3,7 +3,7 @@
 
 [package]
 name = "lance-c"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -18,14 +18,15 @@ rust-version = "1.91.0"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
-lance-core = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
-lance-index = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
-lance-io = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
-lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
-arrow = { version = "57.0.0", features = ["prettyprint", "ffi"] }
-arrow-array = "57.0.0"
-arrow-schema = "57.0.0"
+lance = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6", features = ["substrait"] }
+lance-core = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
+lance-index = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
+lance-io = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
+lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
+arrow = { version = "58.0.0", features = ["prettyprint", "ffi"] }
+arrow-array = "58.0.0"
+arrow-schema = "58.0.0"
 half = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 futures = "0.3"
@@ -35,14 +36,29 @@ snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
-lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
-lance-table = { git = "https://github.com/lance-format/lance.git", rev = "d630106d" }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6", features = ["substrait"] }
+lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6", features = ["substrait"] }
+lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
+lance-table = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
+datafusion = { version = "53.1.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-arrow-array = "57.0.0"
-arrow-schema = "57.0.0"
+arrow-array = "58.0.0"
+arrow-schema = "58.0.0"
 tempfile = "3"
 
 [profile.release]
 panic = "abort"
+
+[package.metadata.capi.header]
+subdirectory = "lance"
+generation = false  # we ship a hand-maintained header at include/lance/lance.h
+
+[package.metadata.capi.pkg_config]
+name = "lance-c"
+filename = "lance-c"
+description = "C/C++ bindings for the Lance columnar data format"
+
+[package.metadata.capi.library]
+name = "lance_c"
+versioning = false  # 0.x ABI is unstable; revisit at 1.0

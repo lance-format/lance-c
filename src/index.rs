@@ -189,7 +189,10 @@ pub unsafe extern "C" fn lance_dataset_index_segment_count(
     let snap = ds.snapshot();
     match block_on(snap.load_indices()) {
         Ok(indices) => {
-            let count = indices.iter().filter(|i| i.name == name).count();
+            let count = indices
+                .iter()
+                .filter(|i| !lance_index::is_system_index(i) && i.name == name)
+                .count();
             if count == 0 {
                 set_last_error(
                     LanceErrorCode::NotFound,
@@ -209,18 +212,25 @@ pub unsafe extern "C" fn lance_dataset_index_segment_count(
 
 /// Fill `out_uuids` with the UUIDs of the segments that make up a logical index.
 ///
-/// Each UUID is written as 16 raw bytes (RFC 4122 layout). The caller must
-/// allocate at least `lance_dataset_index_segment_count() * 16` bytes.
+/// Each UUID is written as 16 raw bytes (RFC 4122 layout).
 ///
-/// Returns 0 on success, -1 on error.
+/// - `capacity`: number of UUIDs the caller allocated space for in `out_uuids`
+///   (byte length must be at least `capacity * 16`).
+/// - `out_count`: if non-NULL, receives the number of UUIDs actually written.
+///
+/// Returns 0 on success, -1 on error. If the index has more segments than
+/// `capacity`, returns `LANCE_ERR_INVALID_ARGUMENT` without writing anything.
+/// Callers can retry with a larger buffer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_index_segments(
     dataset: *const LanceDataset,
     index_name: *const c_char,
     out_uuids: *mut u8,
+    capacity: usize,
+    out_count: *mut u64,
 ) -> i32 {
     ffi_try!(
-        unsafe { dataset_index_segments_inner(dataset, index_name, out_uuids) },
+        unsafe { dataset_index_segments_inner(dataset, index_name, out_uuids, capacity, out_count) },
         neg
     )
 }
@@ -229,6 +239,8 @@ unsafe fn dataset_index_segments_inner(
     dataset: *const LanceDataset,
     index_name: *const c_char,
     out_uuids: *mut u8,
+    capacity: usize,
+    out_count: *mut u64,
 ) -> Result<i32> {
     if dataset.is_null() || index_name.is_null() || out_uuids.is_null() {
         return Err(lance_core::Error::InvalidInput {
@@ -245,18 +257,37 @@ unsafe fn dataset_index_segments_inner(
     })?;
     let snap = ds.snapshot();
     let indices = block_on(snap.load_indices())?;
-    let segments: Vec<_> = indices.iter().filter(|i| i.name == name).collect();
+    let segments: Vec<_> = indices
+        .iter()
+        .filter(|i| !lance_index::is_system_index(i) && i.name == name)
+        .collect();
     if segments.is_empty() {
         return Err(lance_core::Error::IndexNotFound {
             identity: format!("name='{}'", name),
             location: snafu::location!(),
         });
     }
+    if segments.len() > capacity {
+        return Err(lance_core::Error::InvalidInput {
+            source: format!(
+                "out_uuids capacity ({}) too small for {} segments",
+                capacity,
+                segments.len()
+            )
+            .into(),
+            location: snafu::location!(),
+        });
+    }
+    // SAFETY: caller guarantees out_uuids has at least `capacity * 16` bytes,
+    // and we verified `segments.len() <= capacity` above.
     for (i, seg) in segments.iter().enumerate() {
         let bytes = seg.uuid.as_bytes();
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_uuids.add(i * 16), 16);
         }
+    }
+    if !out_count.is_null() {
+        unsafe { *out_count = segments.len() as u64 };
     }
     Ok(0)
 }

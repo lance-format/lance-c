@@ -8,10 +8,10 @@
  * This file is compiled by the Rust integration test to verify that
  * lance.h is valid C and the API works end-to-end.
  *
- * Usage: test_c_api <dataset_uri>
+ * Usage: test_c_api <dataset_uri> <write_uri>
  */
 
-#include "lance.h"
+#include "lance/lance.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -179,6 +179,26 @@ static void test_versions(const char *uri) {
     printf("OK\n");
 }
 
+/* Restore the dataset to its own current version — always commits a new
+ * manifest (no skip-if-equal optimization) so the caller's "make `version`
+ * the new latest" intent holds even under concurrent writers. */
+static void test_restore_to_current(const char *uri) {
+    printf("  test_restore_to_current... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t current = lance_dataset_version(ds);
+
+    LanceDataset *after = lance_dataset_restore(ds, current);
+    ASSERT(after != NULL, "restore failed");
+    ASSERT(lance_dataset_version(after) == current + 1,
+           "restore must bump the version to commit a fresh manifest");
+
+    lance_dataset_close(after);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static void test_error_handling(void) {
     printf("  test_error_handling... ");
 
@@ -201,20 +221,210 @@ static void test_error_handling(void) {
     printf("OK\n");
 }
 
+/* Round-trip: scan src dataset to an ArrowArrayStream, write it into a new
+ * dataset at dst_uri, and verify row counts match. dst_uri must not pre-exist. */
+static void test_dataset_write_roundtrip(const char *src_uri, const char *dst_uri) {
+    printf("  test_dataset_write_roundtrip... ");
+
+    LanceDataset *src = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(src != NULL, "open source failed");
+    uint64_t src_rows = lance_dataset_count_rows(src);
+    CHECK_OK();
+
+    LanceScanner *scanner = lance_scanner_new(src, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    int32_t rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    rc = stream.get_schema(&stream, &schema);
+    ASSERT(rc == 0, "get_schema from stream failed");
+
+    LanceDataset *dst = NULL;
+    rc = lance_dataset_write(
+        dst_uri, &schema, &stream, LANCE_WRITE_CREATE, NULL, &dst);
+
+    /* The Rust side reads `schema` by shared reference and never releases it,
+     * so we must release it ourselves on every return path — including
+     * failure. Release before the ASSERTs so a failed write doesn't leak. */
+    if (schema.release) schema.release(&schema);
+
+    ASSERT(rc == 0, "lance_dataset_write failed");
+    ASSERT(dst != NULL, "out_dataset should be populated");
+
+    uint64_t dst_rows = lance_dataset_count_rows(dst);
+    CHECK_OK();
+    ASSERT(dst_rows == src_rows, "row count mismatch after write");
+    printf("src=%llu, dst=%llu... ",
+           (unsigned long long)src_rows, (unsigned long long)dst_rows);
+
+    lance_dataset_close(dst);
+    lance_scanner_close(scanner);
+    lance_dataset_close(src);
+    printf("OK\n");
+}
+
+/* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+ * exercises `lance_dataset_update`. Must run before `test_delete`, which
+ * empties the dataset. */
+static void test_update(const char *write_uri) {
+    printf("  test_update... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    uint64_t before = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(before > 0, "fixture expected to have rows");
+
+    /* Set every row's `name` column to a literal (NULL predicate -> all rows). */
+    const char *cols[] = {"name"};
+    const char *vals[] = {"'frozen'"};
+    uint64_t updated = 0;
+    int32_t rc = lance_dataset_update(ds, NULL, cols, vals, 1, &updated);
+    ASSERT(rc == 0, "update failed");
+    ASSERT(updated == before, "updated count mismatch");
+    ASSERT(lance_dataset_count_rows(ds) == before, "row count must be unchanged");
+
+    /* num_updates == 0 must be rejected. */
+    rc = lance_dataset_update(ds, NULL, NULL, NULL, 0, NULL);
+    ASSERT(rc == -1, "num_updates=0 must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+    printf("updated=%llu... OK\n", (unsigned long long)updated);
+}
+
+/* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+ * exercises `lance_dataset_merge_insert`. Must run before `test_delete`,
+ * which empties the dataset. The source comes from scanning the dataset
+ * itself, so under find-or-create defaults every row is a self-match
+ * (DoNothing) and nothing changes — this validates the FFI plumbing without
+ * needing to hand-build an Arrow batch in pure C. */
+static void test_merge_insert(const char *write_uri) {
+    printf("  test_merge_insert... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t before = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(before > 0, "fixture expected to have rows");
+
+    /* Build a self-source via the scanner. */
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    int32_t rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+
+    const char *on_cols[] = {"id"};
+    LanceMergeInsertResult result;
+    memset(&result, 0, sizeof(result));
+    rc = lance_dataset_merge_insert(ds, on_cols, 1, &stream, NULL, &result);
+    ASSERT(rc == 0, "merge_insert failed");
+    /* Self-match under DoNothing: nothing inserted, nothing updated. */
+    ASSERT(result.num_inserted_rows == 0, "expected 0 inserts");
+    ASSERT(result.num_updated_rows == 0, "expected 0 updates");
+    ASSERT(lance_dataset_count_rows(ds) == before, "row count must be unchanged");
+
+    /* num_on_columns == 0 must be rejected. */
+    rc = lance_dataset_merge_insert(ds, NULL, 0, NULL, NULL, NULL);
+    ASSERT(rc == -1, "num_on_columns=0 must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_scanner_close(scanner);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+ * exercises `lance_dataset_compact_files`. The smoke fixture is a single
+ * fragment, so the default planner has nothing to compact — we expect
+ * all-zero metrics and no version bump. Must run before `test_delete`. */
+static void test_compact_files(const char *write_uri) {
+    printf("  test_compact_files... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t v_before = lance_dataset_version(ds);
+
+    LanceCompactionMetrics metrics;
+    memset(&metrics, 0, sizeof(metrics));
+    int32_t rc = lance_dataset_compact_files(ds, NULL, &metrics);
+    ASSERT(rc == 0, "compact_files failed");
+    ASSERT(metrics.fragments_removed == 0 && metrics.fragments_added == 0,
+           "expected no-op metrics on a clean single-fragment dataset");
+    ASSERT(lance_dataset_version(ds) == v_before,
+           "no-op compaction must not bump the version");
+
+    /* NULL dataset must be rejected with INVALID_ARGUMENT. */
+    rc = lance_dataset_compact_files(NULL, NULL, NULL);
+    ASSERT(rc == -1, "NULL dataset must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+ * exercises `lance_dataset_delete`. Must run after the write roundtrip. */
+static void test_delete(const char *write_uri) {
+    printf("  test_delete... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    uint64_t before = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(before > 0, "fixture expected to have rows");
+
+    /* Match-everything predicate; deleted count must equal `before`. */
+    uint64_t deleted = 0;
+    int32_t rc = lance_dataset_delete(ds, "true", &deleted);
+    ASSERT(rc == 0, "delete failed");
+    ASSERT(deleted == before, "deleted count mismatch");
+    ASSERT(lance_dataset_count_rows(ds) == 0, "expected zero rows after delete");
+
+    /* NULL predicate must be rejected with INVALID_ARGUMENT. */
+    rc = lance_dataset_delete(ds, NULL, NULL);
+    ASSERT(rc == -1, "NULL predicate must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+    printf("deleted=%llu... OK\n", (unsigned long long)deleted);
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <dataset_uri>\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri>\n", argv[0]);
         return 1;
     }
 
     const char *uri = argv[1];
+    const char *write_uri = argv[2];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_open_and_metadata(uri);
     test_scan(uri);
     test_scan_with_limit(uri);
     test_versions(uri);
+    test_restore_to_current(uri);
     test_error_handling();
+    test_dataset_write_roundtrip(uri, write_uri);
+    test_update(write_uri);
+    test_merge_insert(write_uri);
+    test_compact_files(write_uri);
+    test_delete(write_uri);
 
     printf("All C tests passed!\n");
     return 0;

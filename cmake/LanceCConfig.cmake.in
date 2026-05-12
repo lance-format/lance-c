@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+@PACKAGE_INIT@
+
+set_and_check(_LANCE_C_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+set_and_check(_LANCE_C_LIB_DIR     "@PACKAGE_CMAKE_INSTALL_LIBDIR@")
+
+set(_lance_c_static "${_LANCE_C_LIB_DIR}/liblance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
+set(_lance_c_shared "${_LANCE_C_LIB_DIR}/liblance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
+
+# Platform link requirements (must match build-tree CMakeLists.txt).
+set(_lance_c_platform_deps "")
+if(APPLE)
+    list(APPEND _lance_c_platform_deps
+        "-framework CoreFoundation"
+        "-framework Security"
+        "-framework SystemConfiguration")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND _lance_c_platform_deps pthread dl m)
+endif()
+
+if(EXISTS "${_lance_c_static}" AND NOT TARGET LanceC::lance_c_static)
+    add_library(LanceC::lance_c_static UNKNOWN IMPORTED)
+    set_target_properties(LanceC::lance_c_static PROPERTIES
+        IMPORTED_LOCATION "${_lance_c_static}"
+        INTERFACE_INCLUDE_DIRECTORIES "${_LANCE_C_INCLUDE_DIR}"
+        INTERFACE_LINK_LIBRARIES "${_lance_c_platform_deps}")
+endif()
+
+if(EXISTS "${_lance_c_shared}" AND NOT TARGET LanceC::lance_c_shared)
+    add_library(LanceC::lance_c_shared UNKNOWN IMPORTED)
+    set_target_properties(LanceC::lance_c_shared PROPERTIES
+        IMPORTED_LOCATION "${_lance_c_shared}"
+        INTERFACE_INCLUDE_DIRECTORIES "${_LANCE_C_INCLUDE_DIR}"
+        INTERFACE_LINK_LIBRARIES "${_lance_c_platform_deps}")
+endif()
+
+# Resolve LanceC::lance_c alias to whichever linkage the consumer requested.
+# Default static; overridden by setting LanceC_LINK=shared before find_package.
+if(NOT DEFINED LanceC_LINK)
+    set(LanceC_LINK "static")
+endif()
+
+if(NOT TARGET LanceC::lance_c)
+    if(LanceC_LINK STREQUAL "shared" AND TARGET LanceC::lance_c_shared)
+        add_library(LanceC::lance_c ALIAS LanceC::lance_c_shared)
+    elseif(TARGET LanceC::lance_c_static)
+        add_library(LanceC::lance_c ALIAS LanceC::lance_c_static)
+    elseif(TARGET LanceC::lance_c_shared)
+        # Fallback: only the shared lib was installed (e.g., vcpkg :dynamic triplet).
+        add_library(LanceC::lance_c ALIAS LanceC::lance_c_shared)
+    else()
+        message(FATAL_ERROR "LanceC: neither liblance_c${CMAKE_STATIC_LIBRARY_SUFFIX} "
+            "nor liblance_c${CMAKE_SHARED_LIBRARY_SUFFIX} found in ${_LANCE_C_LIB_DIR}")
+    endif()
+endif()
+
+check_required_components(LanceC)

@@ -7,10 +7,10 @@
  *
  * Tests the RAII wrappers, exception handling, and builder pattern.
  *
- * Usage: test_cpp_api <dataset_uri>
+ * Usage: test_cpp_api <dataset_uri> <write_uri>
  */
 
-#include "lance.hpp"
+#include "lance/lance.hpp"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -156,6 +156,21 @@ static void test_versions(const std::string& uri) {
     PASS();
 }
 
+// Restore to the dataset's own current version — always commits a new
+// manifest (no skip-if-equal optimization) to defeat TOCTOU races against
+// concurrent writers.
+static void test_restore_to_current(const std::string& uri) {
+    TEST(test_restore_to_current);
+
+    auto ds = lance::Dataset::open(uri);
+    uint64_t current = ds.version();
+
+    auto after = ds.restore(current);
+    assert(after.version() == current + 1);
+
+    PASS();
+}
+
 static void test_error_exception(const std::string& /*uri*/) {
     TEST(test_error_exception);
 
@@ -255,13 +270,187 @@ static void test_index_segments_smoke(const std::string& /*uri*/) {
     PASS();
 }
 
+static void test_fts_smoke(const std::string& uri) {
+    TEST(test_fts_smoke);
+
+    auto ds = lance::Dataset::open(uri);
+
+    // Build the inverted index needed for FTS. (Inverted requires non-NULL
+    // params JSON for the tokenizer config.)
+    bool index_built = false;
+    try {
+        ds.create_scalar_index(
+            "name", LANCE_SCALAR_INVERTED, "name_fts",
+            R"({"base_tokenizer":"simple","language":"English"})");
+        index_built = true;
+    } catch (const lance::Error&) {
+        // If the test fixture doesn't permit indexing for some reason,
+        // we still want to prove the wrappers compile + link.
+    }
+
+    auto scanner = ds.scan();
+    bool caught = false;
+    try {
+        scanner.full_text_search("alice", {"name"}, 0);
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        if (stream.release) stream.release(&stream);
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    // Either path is acceptable — the goal is compile + linkage.
+    (void)index_built;
+    (void)caught;
+
+    PASS();
+}
+
+// Round-trip: scan src dataset to an ArrowArrayStream, write it to a new
+// dataset via lance::Dataset::write, and verify row counts match.
+// dst_uri must not pre-exist.
+static void test_dataset_write_roundtrip(const std::string& src_uri,
+                                         const std::string& dst_uri) {
+    TEST(test_dataset_write_roundtrip);
+
+    auto src = lance::Dataset::open(src_uri);
+    uint64_t src_rows = src.count_rows();
+
+    auto scanner = src.scan();
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+
+    auto dst = lance::Dataset::write(
+        dst_uri, &stream, lance::WriteMode::Create);
+
+    uint64_t dst_rows = dst.count_rows();
+    assert(dst_rows == src_rows);
+    printf("src=%llu, dst=%llu... ",
+           (unsigned long long)src_rows, (unsigned long long)dst_rows);
+
+    PASS();
+}
+
+// Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+// exercises `Dataset::update`. Must run before `test_delete_rows`, which
+// empties the dataset.
+static void test_update(const std::string& dst_uri) {
+    TEST(test_update);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t before = ds.count_rows();
+    assert(before > 0 && "test fixture expected to have rows");
+
+    // Empty predicate -> updates every row.
+    uint64_t updated = ds.update("", {{"name", "'frozen'"}});
+    assert(updated == before);
+    assert(ds.count_rows() == before);
+
+    // Empty updates vector must throw (num_updates == 0).
+    bool caught_empty = false;
+    try {
+        ds.update("", {});
+    } catch (const lance::Error& e) {
+        caught_empty = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_empty);
+
+    printf("updated=%llu... ", (unsigned long long)updated);
+    PASS();
+}
+
+// Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+// exercises `Dataset::merge_insert`. Must run before `test_delete_rows`,
+// which empties the dataset.
+static void test_merge_insert(const std::string& dst_uri) {
+    TEST(test_merge_insert);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t before = ds.count_rows();
+    assert(before > 0 && "test fixture expected to have rows");
+
+    // Self-merge: scan the dataset itself and use that as the source. With
+    // find-or-create defaults every row is a self-match and DoNothing fires,
+    // so insert/update counts stay at zero and the row count is preserved.
+    auto scanner = ds.scan();
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+
+    auto result = ds.merge_insert({"id"}, &stream);
+    assert(result.num_inserted_rows == 0);
+    assert(result.num_updated_rows == 0);
+    assert(ds.count_rows() == before);
+
+    // Empty key vector must throw (num_on_columns == 0).
+    bool caught_empty = false;
+    try {
+        ds.merge_insert({}, nullptr);
+    } catch (const lance::Error& e) {
+        caught_empty = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_empty);
+
+    PASS();
+}
+
+// Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+// exercises `Dataset::compact_files`. The smoke fixture is a single fragment
+// so the default planner has nothing to compact — we expect a no-op (zero
+// metrics, no version bump). Must run before `test_delete_rows`.
+static void test_compact_files(const std::string& dst_uri) {
+    TEST(test_compact_files);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t v_before = ds.version();
+
+    auto metrics = ds.compact_files();
+    assert(metrics.fragments_removed == 0);
+    assert(metrics.fragments_added == 0);
+    assert(ds.version() == v_before);
+
+    PASS();
+}
+
+// Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+// exercises `Dataset::delete_rows`. Must run after the write roundtrip.
+static void test_delete_rows(const std::string& dst_uri) {
+    TEST(test_delete_rows);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t before = ds.count_rows();
+    assert(before > 0 && "test fixture expected to have rows");
+
+    // Predicate that matches everything — exact deleted count == before.
+    uint64_t deleted = ds.delete_rows("true");
+    assert(deleted == before);
+    assert(ds.count_rows() == 0);
+
+    // Empty predicate must throw.
+    bool caught_empty = false;
+    try {
+        ds.delete_rows("");
+    } catch (const lance::Error& e) {
+        caught_empty = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_empty);
+
+    printf("deleted=%llu... ", (unsigned long long)deleted);
+    PASS();
+}
+
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <dataset_uri>\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri>\n", argv[0]);
         return 1;
     }
 
     std::string uri(argv[1]);
+    std::string write_uri(argv[2]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -270,10 +459,17 @@ int main(int argc, char** argv) {
     test_dataset_take(uri);
     test_raii_cleanup(uri);
     test_versions(uri);
+    test_restore_to_current(uri);
     test_error_exception(uri);
     test_index_lifecycle(uri);
     test_nearest_smoke(uri);
     test_index_segments_smoke(uri);
+    test_fts_smoke(uri);
+    test_dataset_write_roundtrip(uri, write_uri);
+    test_update(write_uri);
+    test_merge_insert(write_uri);
+    test_compact_files(write_uri);
+    test_delete_rows(write_uri);
 
     printf("All C++ tests passed!\n");
     return 0;

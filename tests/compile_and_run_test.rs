@@ -146,10 +146,12 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
     }
 }
 
-/// Run a compiled test binary with the dataset URI.
-fn run_test_binary(binary: &Path, dataset_uri: &str) {
+/// Run a compiled test binary with the source dataset URI and a destination URI
+/// for the write test. The destination path must not pre-exist.
+fn run_test_binary(binary: &Path, dataset_uri: &str, write_uri: &str) {
     let output = Command::new(binary)
         .arg(dataset_uri)
+        .arg(write_uri)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -175,7 +177,8 @@ fn run_test_binary(binary: &Path, dataset_uri: &str) {
 #[ignore = "requires C compiler (cc); run with: cargo test -p lance-c -- --ignored test_c_compilation"]
 fn test_c_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
-    let (_tmp, dataset_uri) = create_test_dataset_on_disk();
+    let (tmp, dataset_uri) = create_test_dataset_on_disk();
+    let write_uri = tmp.path().join("c_write_ds").to_str().unwrap().to_string();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -189,14 +192,20 @@ fn test_c_compilation_and_execution() {
         return;
     }
 
-    run_test_binary(&binary, &dataset_uri);
+    run_test_binary(&binary, &dataset_uri, &write_uri);
 }
 
 #[test]
 #[ignore = "requires C++ compiler (c++); run with: cargo test -p lance-c -- --ignored test_cpp_compilation"]
 fn test_cpp_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
-    let (_tmp, dataset_uri) = create_test_dataset_on_disk();
+    let (tmp, dataset_uri) = create_test_dataset_on_disk();
+    let write_uri = tmp
+        .path()
+        .join("cpp_write_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -210,5 +219,5 @@ fn test_cpp_compilation_and_execution() {
         return;
     }
 
-    run_test_binary(&binary, &dataset_uri);
+    run_test_binary(&binary, &dataset_uri, &write_uri);
 }

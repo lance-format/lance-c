@@ -6,7 +6,7 @@
 //! These tests call the `extern "C"` functions directly from Rust,
 //! validating the C API contract without needing a C compiler.
 
-use std::ffi::CString;
+use std::ffi::{CString, c_char};
 use std::ptr;
 use std::sync::Arc;
 
@@ -1786,6 +1786,116 @@ fn test_versions_close_null_is_safe() {
 }
 
 // ---------------------------------------------------------------------------
+// Restore (lance_dataset_restore)
+// ---------------------------------------------------------------------------
+
+/// Helper: set up a dataset with two versions — initial create (rows 1..=5)
+/// plus an append (rows 6..=7), returning `(tempdir, uri)`.
+fn create_two_version_dataset() -> (tempfile::TempDir, String) {
+    let (tmp, uri) = create_test_dataset();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![6, 7])),
+            Arc::new(StringArray::from(vec!["frank", "grace"])),
+        ],
+    )
+    .unwrap();
+    append_batch(&uri, schema, batch);
+    (tmp, uri)
+}
+
+#[test]
+fn test_dataset_restore_to_prior_version() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert_eq!(unsafe { lance_dataset_version(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 7);
+
+    // Restore to V1 — expect a fresh handle at a new version (3) with V1's
+    // row count (5).
+    let restored = unsafe { lance_dataset_restore(ds, 1) };
+    assert!(!restored.is_null());
+    assert_eq!(unsafe { lance_dataset_version(restored) }, 3);
+    assert_eq!(unsafe { lance_dataset_count_rows(restored) }, 5);
+
+    // Original handle is untouched.
+    assert_eq!(unsafe { lance_dataset_version(ds) }, 2);
+
+    unsafe { lance_dataset_close(restored) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_restore_to_current_latest_writes_new_manifest() {
+    // Restoring to the current latest still writes a new manifest. The
+    // optimization that previously skipped the commit was racy: a concurrent
+    // writer could land a newer manifest between the staleness check and the
+    // skip, silently leaving their version as latest. We always commit so the
+    // caller's "make `version` the new latest" intent holds unconditionally.
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let latest = unsafe { lance_dataset_version(ds) };
+    assert_eq!(latest, 2);
+
+    let restored = unsafe { lance_dataset_restore(ds, latest) };
+    assert!(!restored.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_version(restored) },
+        latest + 1,
+        "restore to latest must commit a new manifest to defeat TOCTOU races"
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(restored) }, 7);
+
+    // Reopening the dataset reports the bumped latest.
+    unsafe { lance_dataset_close(restored) };
+    let ds2 = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert_eq!(unsafe { lance_dataset_version(ds2) }, latest + 1);
+
+    unsafe { lance_dataset_close(ds2) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_restore_nonexistent_version() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let restored = unsafe { lance_dataset_restore(ds, 999) };
+    assert!(restored.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_restore_version_zero_rejected() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let restored = unsafe { lance_dataset_restore(ds, 0) };
+    assert!(restored.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_restore_null_dataset_rejected() {
+    let restored = unsafe { lance_dataset_restore(ptr::null(), 1) };
+    assert!(restored.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+// ---------------------------------------------------------------------------
 // Index lifecycle tests (Phase 2)
 // ---------------------------------------------------------------------------
 
@@ -2573,6 +2683,3389 @@ fn test_scanner_nearest_null_safety() {
     unsafe { lance_dataset_close(ds) };
 }
 
+#[test]
+fn test_scanner_full_text_search() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("name");
+    // Build inverted index on `name` first.
+    let inverted_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::Inverted as i32,
+            inverted_params.as_ptr(),
+            false,
+        );
+    }
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let q = c_str("alice");
+    let cols = [column.as_ptr(), ptr::null()];
+    let rc = unsafe { lance_scanner_full_text_search(scanner, q.as_ptr(), cols.as_ptr(), 0) };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream as *mut _).unwrap() };
+    let schema = reader.schema();
+    assert!(
+        schema.field_with_name("_score").is_ok(),
+        "_score column missing from schema"
+    );
+    let mut total = 0;
+    for b in reader {
+        total += b.unwrap().num_rows();
+    }
+    assert!(total >= 1, "expected at least 1 hit for 'alice'");
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fts_fuzzy() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("name");
+    let inverted_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::Inverted as i32,
+            inverted_params.as_ptr(),
+            false,
+        );
+    }
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    // "alise" within edit distance 2 of "alice" (in the test fixture).
+    let q = c_str("alise");
+    let cols = [column.as_ptr(), ptr::null()];
+    let rc = unsafe { lance_scanner_full_text_search(scanner, q.as_ptr(), cols.as_ptr(), 2) };
+    assert_eq!(rc, 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream as *mut _) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream as *mut _).unwrap() };
+    let mut total = 0;
+    for b in reader {
+        total += b.unwrap().num_rows();
+    }
+    assert!(total >= 1, "expected fuzzy match for 'alise' → 'alice'");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_nearest_after_fts_is_rejected() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+
+    // Set FTS first (no inverted index needed for this test — error happens
+    // at the second call, before any stream materialization).
+    let q = c_str("foo");
+    unsafe {
+        lance_scanner_full_text_search(scanner, q.as_ptr(), ptr::null(), 0);
+    }
+
+    let column = c_str("embedding");
+    let query: Vec<f32> = vec![0.5; 8];
+    let rc = unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            8,
+            LanceDataType::Float32 as i32,
+            5,
+        )
+    };
+    assert_eq!(rc, -1);
+    let msg = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let lower = msg.to_lowercase();
+    assert!(
+        lower.contains("full_text")
+            || lower.contains("fts")
+            || lower.contains("mutually exclusive"),
+        "msg was: {}",
+        msg
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ---------------------------------------------------------------------------
+// Dataset writer (lance_dataset_write)
+// ---------------------------------------------------------------------------
+
+fn write_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Float32, true),
+    ]))
+}
+
+fn write_batch(ids: Vec<i32>, vals: Vec<f32>) -> RecordBatch {
+    assert_eq!(ids.len(), vals.len());
+    RecordBatch::try_new(
+        write_schema(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Float32Array::from(vals)),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_dataset_write_create() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("new_ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "lance_dataset_write create failed");
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_write_populates_out_dataset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let mut out_ds: *mut LanceDataset = ptr::null_mut();
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            &mut out_ds,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert!(!out_ds.is_null(), "out_dataset must be populated");
+    assert_eq!(unsafe { lance_dataset_count_rows(out_ds) }, 3);
+    unsafe { lance_dataset_close(out_ds) };
+}
+
+#[test]
+fn test_dataset_write_append_accumulates_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema1 = schema_to_ffi(&write_schema());
+    let mut stream1 = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema1,
+            &mut stream1,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ffi_schema2 = schema_to_ffi(&write_schema());
+    let mut stream2 = batch_to_ffi_stream(write_batch(vec![4, 5], vec![4.0, 5.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema2,
+            &mut stream2,
+            LanceWriteMode::Append as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 5);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_write_overwrite_replaces_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema1 = schema_to_ffi(&write_schema());
+    let mut stream1 = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema1,
+            &mut stream1,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ffi_schema2 = schema_to_ffi(&write_schema());
+    let mut stream2 = batch_to_ffi_stream(write_batch(vec![100, 200], vec![100.0, 200.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema2,
+            &mut stream2,
+            LanceWriteMode::Overwrite as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_count_rows(ds) },
+        2,
+        "overwrite must replace, not append"
+    );
+    let batches = scan_all_rows(ds);
+    assert!(!batches.is_empty(), "scan must return at least one batch");
+    let mut ids: Vec<i32> = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        ids.extend((0..id_col.len()).map(|i| id_col.value(i)));
+    }
+    ids.sort();
+    assert_eq!(ids, vec![100, 200]);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_write_overwrite_on_missing_path_creates_dataset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![7, 8], vec![7.0, 8.0]));
+
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Overwrite as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "OVERWRITE on missing path must succeed as create");
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_write_invalid_mode_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            99, // out of range — must be rejected, not cause UB
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_dataset_write_create_on_existing_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema1 = schema_to_ffi(&write_schema());
+    let mut stream1 = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema1,
+            &mut stream1,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ffi_schema2 = schema_to_ffi(&write_schema());
+    let mut stream2 = batch_to_ffi_stream(write_batch(vec![2], vec![2.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema2,
+            &mut stream2,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::DatasetAlreadyExists
+    );
+}
+
+#[test]
+fn test_dataset_write_append_schema_mismatch_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    // Create with the original schema.
+    let ffi_schema1 = schema_to_ffi(&write_schema());
+    let mut stream1 = batch_to_ffi_stream(write_batch(vec![1, 2], vec![1.0, 2.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema1,
+            &mut stream1,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    // Append with an extra column → must fail.
+    let mismatched_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Float32, true),
+        Field::new("extra", DataType::Utf8, true),
+    ]));
+    let batch2 = RecordBatch::try_new(
+        mismatched_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![10])),
+            Arc::new(Float32Array::from(vec![10.0])),
+            Arc::new(StringArray::from(vec!["x"])),
+        ],
+    )
+    .unwrap();
+    let ffi_schema2 = schema_to_ffi(&mismatched_schema);
+    let mut stream2 = batch_to_ffi_stream(batch2);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema2,
+            &mut stream2,
+            LanceWriteMode::Append as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    // Upstream Lance currently surfaces append-with-mismatched-schema as
+    // `Internal` rather than `InvalidArgument`. Lock the assertion to the
+    // observed code so we notice (and can revisit the mapping) if it changes.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+}
+
+#[test]
+fn test_dataset_write_declared_schema_mismatch_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    // Stream has 2 columns but declared schema has only 1 — fail fast.
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let declared_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let ffi_schema = schema_to_ffi(&declared_schema);
+
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_dataset_write_empty_stream_creates_empty_dataset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("empty_ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let schema = write_schema();
+    let ffi_schema = schema_to_ffi(&schema);
+
+    let empty: Vec<arrow::error::Result<RecordBatch>> = vec![];
+    let reader = arrow::record_batch::RecordBatchIterator::new(empty, schema.clone());
+    let mut stream = FFI_ArrowArrayStream::new(Box::new(reader));
+
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 0);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fts_after_nearest_is_rejected() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let column = c_str("embedding");
+    let query: Vec<f32> = vec![0.5; 8];
+    unsafe {
+        lance_scanner_nearest(
+            scanner,
+            column.as_ptr(),
+            query.as_ptr() as *const std::ffi::c_void,
+            8,
+            LanceDataType::Float32 as i32,
+            5,
+        );
+    }
+    let q = c_str("foo");
+    let rc = unsafe { lance_scanner_full_text_search(scanner, q.as_ptr(), ptr::null(), 0) };
+    assert_eq!(rc, -1);
+    let msg = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let lower = msg.to_lowercase();
+    assert!(
+        lower.contains("nearest")
+            || lower.contains("vector")
+            || lower.contains("mutually exclusive"),
+        "msg was: {}",
+        msg
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_write_null_args_return_error() {
+    let schema = write_schema();
+    let c_uri = c_str("memory://x");
+
+    // NULL uri.
+    let ffi_schema_a = schema_to_ffi(&schema);
+    let mut stream_a = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            ptr::null(),
+            &ffi_schema_a,
+            &mut stream_a,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // NULL schema.
+    let mut stream_b = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            ptr::null(),
+            &mut stream_b,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // NULL stream.
+    let ffi_schema_c = schema_to_ffi(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema_c,
+            ptr::null_mut(),
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+/// A `RecordBatchReader` that bumps a shared counter when it is dropped.
+/// Wrapping this in an `FFI_ArrowArrayStream` lets a test observe whether the
+/// stream's `release` callback was invoked: dropping the boxed reader (via
+/// `release` on the FFI side) fires `Drop` and increments the counter.
+struct CountingReader {
+    inner: arrow::record_batch::RecordBatchIterator<
+        std::vec::IntoIter<arrow::error::Result<RecordBatch>>,
+    >,
+    drop_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for CountingReader {
+    fn drop(&mut self) {
+        self.drop_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Iterator for CountingReader {
+    type Item = arrow::error::Result<RecordBatch>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl RecordBatchReader for CountingReader {
+    fn schema(&self) -> Arc<Schema> {
+        self.inner.schema()
+    }
+}
+
+/// Build a `(stream, drop_counter)` pair where the stream wraps a single-batch
+/// reader whose `Drop` increments the counter. After a call that consumes the
+/// stream, the counter goes from 0 → 1.
+fn make_counted_stream(
+    schema: &Arc<Schema>,
+) -> (FFI_ArrowArrayStream, Arc<std::sync::atomic::AtomicUsize>) {
+    let drop_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reader = CountingReader {
+        inner: arrow::record_batch::RecordBatchIterator::new(
+            vec![Ok(write_batch(vec![1], vec![1.0]))].into_iter(),
+            schema.clone(),
+        ),
+        drop_count: drop_count.clone(),
+    };
+    (FFI_ArrowArrayStream::new(Box::new(reader)), drop_count)
+}
+
+fn assert_stream_consumed(
+    _stream: &FFI_ArrowArrayStream,
+    drop_count: &Arc<std::sync::atomic::AtomicUsize>,
+) {
+    // The drop count is the real behavioral check — it can only reach 1 if
+    // the FFI release callback fired, which is what frees the boxed reader.
+    // (We do not also assert `stream.release.is_none()` because `from_raw`
+    // unconditionally clears that field via `ptr::replace` before any other
+    // work; the assertion would be vacuously true on every path.)
+    assert_eq!(
+        drop_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "stream's release callback must fire exactly once during the call"
+    );
+}
+
+/// FFI contract: every error path that received a non-NULL stream must also
+/// release it, so the C caller never has to. We assert this by wrapping the
+/// reader in a `Drop`-counter and checking the counter immediately after each
+/// `lance_dataset_write` call. The cases below exercise every validation
+/// branch in `write_dataset_inner` that runs *after* the stream has been
+/// consumed via `from_raw` — including NULL uri/schema, which were previously
+/// gated *before* consumption (the bug R1 fixed).
+#[test]
+fn test_dataset_write_releases_stream_on_every_error_path() {
+    let schema = write_schema();
+    let c_uri = c_str("memory://x");
+
+    // Each case that passes a non-NULL schema constructs its own
+    // `FFI_ArrowSchema` via `schema_to_ffi` so the cases stay independent: a
+    // hypothetical regression where Rust accidentally consumes the schema
+    // would surface as an immediate failure here instead of silently
+    // corrupting later cases. Case 2 deliberately passes `ptr::null()` and
+    // therefore needs no schema construction.
+
+    // Case 1: NULL uri.
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let ffi_schema = schema_to_ffi(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            ptr::null(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    // Case 2: NULL schema.
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            ptr::null(),
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    // Case 3: invalid mode.
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let ffi_schema = schema_to_ffi(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            99,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    // Case 4: empty URI.
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let ffi_schema = schema_to_ffi(&schema);
+    let empty_uri = c_str("");
+    let rc = unsafe {
+        lance_dataset_write(
+            empty_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    // Case 5: declared-schema mismatch.
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let one_col_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let ffi_schema = schema_to_ffi(&one_col_schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    // Case 6: Lance-level rejection (CREATE on an existing dataset). This is
+    // the only error path that fails inside `block_on(Dataset::write)` after
+    // the stream has been moved into the upstream writer. Verifies the stream
+    // is still released even when the failure originates upstream.
+    let tmp = tempfile::tempdir().unwrap();
+    let existing_uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_existing = c_str(&existing_uri);
+    // Seed the path with an initial dataset.
+    let mut seed_stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let seed_schema = schema_to_ffi(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_existing.as_ptr(),
+            &seed_schema,
+            &mut seed_stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // Now CREATE again — expected to fail with DatasetAlreadyExists, and the
+    // stream must still be released by the failure path.
+    let ffi_schema = schema_to_ffi(&schema);
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_existing.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::DatasetAlreadyExists
+    );
+    assert_stream_consumed(&stream, &drop_count);
+}
+
+/// On error, `*out_dataset` must be left untouched. A caller that passes
+/// `&mut some_existing_handle` (perhaps re-using the slot) must be able to
+/// trust that a failed call does not silently overwrite or close their handle.
+/// Covers both pre-`block_on` validation errors (NULL uri) and Lance-level
+/// errors (CREATE on existing) — the contract holds across the success-prep
+/// boundary.
+#[test]
+fn test_dataset_write_leaves_out_dataset_untouched_on_error() {
+    let schema = write_schema();
+
+    // Sentinel that is non-NULL but otherwise invalid. `without_provenance_mut`
+    // (stable since 1.84) creates the pointer without exposing provenance —
+    // strict-provenance-clean. We never dereference it; the test only checks
+    // value equality after the call to confirm `*out_dataset` was not written.
+    let sentinel: *mut LanceDataset = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+
+    // Case 1: pre-`block_on` validation error (NULL uri).
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let ffi_schema = schema_to_ffi(&schema);
+    let mut out_ds = sentinel;
+    let rc = unsafe {
+        lance_dataset_write(
+            ptr::null(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            &mut out_ds,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        out_ds, sentinel,
+        "*out_dataset must be untouched on pre-block_on error"
+    );
+
+    // Case 2: Lance-level error (CREATE on an existing dataset). Verifies the
+    // contract still holds when failure originates inside `block_on(write)`.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+    let mut seed_stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let seed_schema = schema_to_ffi(&schema);
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &seed_schema,
+            &mut seed_stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let mut stream = batch_to_ffi_stream(write_batch(vec![2], vec![2.0]));
+    let ffi_schema = schema_to_ffi(&schema);
+    let mut out_ds = sentinel;
+    let rc = unsafe {
+        lance_dataset_write(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            &mut out_ds,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::DatasetAlreadyExists
+    );
+    assert_eq!(
+        out_ds, sentinel,
+        "*out_dataset must be untouched on Lance-level error"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Substrait filter tests
+// ---------------------------------------------------------------------------
+
+/// Build a serialized Substrait `ExtendedExpression` for `id > 3`
+/// against the test dataset's schema (id: Int32, name: Utf8).
+fn substrait_id_gt_3() -> Vec<u8> {
+    use datafusion::logical_expr::{col, lit};
+    use datafusion::prelude::SessionContext;
+    use lance_datafusion::substrait::encode_substrait;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let expr = col("id").gt(lit(3i32));
+    let state = SessionContext::new().state();
+    encode_substrait(expr, schema, &state).unwrap()
+}
+
+#[test]
+fn test_scanner_with_substrait_filter() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let bytes = substrait_id_gt_3();
+    assert!(!bytes.is_empty(), "encoded substrait must be non-empty");
+
+    // Create scanner with no SQL filter, then attach Substrait filter.
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), bytes.len()) };
+    assert_eq!(
+        rc,
+        0,
+        "set_substrait_filter should succeed; err: {:?}",
+        lance_last_error_code()
+    );
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) };
+    assert_eq!(rc, 0);
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let total_rows: usize = reader.map(|r| r.unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 2, "id > 3 should match 2 rows (id=4, id=5)");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_substrait_filter_overrides_sql_filter() {
+    // If both SQL and Substrait filters are set, Substrait wins (last write).
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // Start with SQL filter "id < 0" (matches 0 rows).
+    let sql = c_str("id < 0");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), sql.as_ptr()) };
+    assert!(!scanner.is_null());
+
+    // Override with Substrait filter "id > 3" (matches 2 rows).
+    let bytes = substrait_id_gt_3();
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), bytes.len()) };
+    assert_eq!(rc, 0);
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) };
+    assert_eq!(rc, 0);
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let total_rows: usize = reader.map(|r| r.unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 2, "Substrait filter should override SQL filter");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_set_substrait_filter_invalid_inputs() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let bytes = [0u8; 4];
+
+    // NULL scanner.
+    let rc =
+        unsafe { lance_scanner_set_substrait_filter(ptr::null_mut(), bytes.as_ptr(), bytes.len()) };
+    assert_eq!(rc, -1);
+
+    // NULL bytes pointer with non-zero len.
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, ptr::null(), 4) };
+    assert_eq!(rc, -1);
+
+    // Zero len (empty filter) is rejected.
+    let rc = unsafe { lance_scanner_set_substrait_filter(scanner, bytes.as_ptr(), 0) };
+    assert_eq!(rc, -1);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ===========================================================================
+// lance_dataset_write_with_params (Issue #15)
+// ===========================================================================
+
+fn default_write_params() -> LanceWriteParams {
+    LanceWriteParams {
+        max_rows_per_file: 0,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 0,
+        data_storage_version: ptr::null(),
+        enable_stable_row_ids: false,
+    }
+}
+
+/// Build a larger batch than the minimal test batch so `max_rows_per_file`
+/// has enough rows to exercise multi-file output.
+fn large_write_batch(n: i32) -> RecordBatch {
+    let ids: Vec<i32> = (0..n).collect();
+    let vals: Vec<f32> = (0..n).map(|i| i as f32).collect();
+    write_batch(ids, vals)
+}
+
+#[test]
+fn test_write_with_params_null_is_like_plain_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_write_with_params_max_rows_per_file_splits_fragments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(large_write_batch(100));
+
+    let mut params = default_write_params();
+    params.max_rows_per_file = 20;
+
+    let mut out_ds: *mut LanceDataset = ptr::null_mut();
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            &mut out_ds,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert!(!out_ds.is_null());
+
+    // 100 rows / 20 per file → at least 5 fragments.
+    let frag_count = unsafe { lance_dataset_fragment_count(out_ds) };
+    assert!(
+        frag_count >= 5,
+        "expected at least 5 fragments, got {frag_count}"
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(out_ds) }, 100);
+
+    unsafe { lance_dataset_close(out_ds) };
+}
+
+#[test]
+fn test_write_with_params_accepts_known_storage_version() {
+    for version_str in ["2.0", "2.1", "stable"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+        let c_uri = c_str(&uri);
+        let version_cstr = c_str(version_str);
+
+        let ffi_schema = schema_to_ffi(&write_schema());
+        let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+
+        let mut params = default_write_params();
+        params.data_storage_version = version_cstr.as_ptr();
+
+        let rc = unsafe {
+            lance_dataset_write_with_params(
+                c_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                &params,
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "version {version_str} should be accepted");
+    }
+}
+
+#[test]
+fn test_write_with_params_max_rows_per_group_accepted() {
+    // Row-group layout isn't easily observable from FFI; confirm the field
+    // is plumbed by writing successfully with a non-zero value.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(large_write_batch(50));
+
+    let mut params = default_write_params();
+    params.max_rows_per_group = 10;
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn test_write_with_params_max_bytes_per_file_accepted() {
+    // Small-byte-cap behaviour depends on input size crossing the cap; this
+    // test just confirms the field is plumbed (non-zero value accepted).
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let mut params = default_write_params();
+    params.max_bytes_per_file = 1024 * 1024; // 1 MiB
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn test_write_with_params_rejects_empty_storage_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+    let empty = c_str("");
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+
+    let mut params = default_write_params();
+    params.data_storage_version = empty.as_ptr();
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_write_with_params_rejects_invalid_storage_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+    let bad_version = c_str("banana");
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+
+    let mut params = default_write_params();
+    params.data_storage_version = bad_version.as_ptr();
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_write_with_params_stable_row_ids_accepted() {
+    // Toggle is accepted end-to-end; verifying the flag landed in the
+    // manifest would require upstream inspection we don't want to reach
+    // into from the FFI crate, so confirm only that the write succeeds.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let mut params = default_write_params();
+    params.enable_stable_row_ids = true;
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+}
+
+// ===========================================================================
+// lance_dataset_delete
+// ===========================================================================
+
+#[test]
+fn test_delete_basic_predicate() {
+    let (_tmp, uri) = create_large_dataset(100);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let pred = c_str("id >= 50");
+    let mut num_deleted: u64 = 0;
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), &mut num_deleted) };
+    assert_eq!(rc, 0);
+    assert_eq!(num_deleted, 50);
+
+    // Existing handle now sees the post-delete dataset.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 50);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_all_rows() {
+    let (_tmp, uri) = create_large_dataset(20);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("true");
+    let mut num_deleted: u64 = 0;
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), &mut num_deleted) };
+    assert_eq!(rc, 0);
+    assert_eq!(num_deleted, 20);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 0);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_no_match_returns_zero() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("id > 9999");
+    let mut num_deleted: u64 = 0;
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), &mut num_deleted) };
+    assert_eq!(rc, 0);
+    assert_eq!(num_deleted, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 10);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_out_param_optional() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("id < 3");
+    // Pass NULL out_num_deleted — must succeed without writing anything.
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 7);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let pred = c_str("id = 0");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(
+        v_after > v_before,
+        "version should increase: before={v_before}, after={v_after}"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_null_dataset_rejected() {
+    let pred = c_str("id > 0");
+    let rc = unsafe { lance_dataset_delete(ptr::null_mut(), pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+// Locks in the documented contract: when the call fails, `out_num_deleted`
+// must be left unchanged. A future refactor that pre-zeroes the slot before
+// validating inputs would silently break this guarantee.
+#[test]
+fn test_delete_out_param_untouched_on_error() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let mut sentinel: u64 = 0xDEAD_BEEF;
+    // Empty predicate → INVALID_ARGUMENT before any work happens.
+    let pred = c_str("");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), &mut sentinel) };
+    assert_eq!(rc, -1);
+    assert_eq!(sentinel, 0xDEAD_BEEF, "out slot must be untouched on error");
+
+    // Same property must hold for upstream-surfaced errors (malformed SQL).
+    let pred = c_str("not a real predicate ((((");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), &mut sentinel) };
+    assert_eq!(rc, -1);
+    assert_eq!(sentinel, 0xDEAD_BEEF, "out slot must be untouched on error");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_null_predicate_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let rc = unsafe { lance_dataset_delete(ds, ptr::null(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    // Dataset is unchanged.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_empty_predicate_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_invalid_predicate_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Garbage SQL — Lance / DataFusion should reject this at parse time.
+    let pred = c_str("not a real predicate ((((");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    // Parser errors come back as Internal (this is what upstream surfaces;
+    // we don't try to re-classify them at the FFI boundary). If upstream
+    // ever tightens this to InvalidArgument, tighten this assertion too.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    // The dataset is left untouched on the error path.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_delete_unknown_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("no_such_column = 1");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    // Same upstream classification as malformed SQL — see note above.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ===========================================================================
+// lance_dataset_update
+// ===========================================================================
+
+/// Build a `[*const c_char; N]` ptr array from a slice of `&CString`.
+fn cstr_ptrs(items: &[CString]) -> Vec<*const c_char> {
+    items.iter().map(|s| s.as_ptr()).collect()
+}
+
+#[test]
+fn test_update_basic_predicate() {
+    let (_tmp, uri) = create_large_dataset(100);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let pred = c_str("id < 50");
+    let cols = [c_str("value")];
+    let vals = [c_str("99.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+
+    let mut num_updated: u64 = 0;
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            &mut num_updated,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(num_updated, 50);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 100);
+
+    // Verify the matched rows now read back as 99.0 and the rest are unchanged.
+    let batches = scan_all_rows(ds);
+    let mut updated_count = 0;
+    let mut unchanged_count = 0;
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let id = ids.value(i);
+            let v = values.value(i);
+            if id < 50 {
+                assert_eq!(v, 99.0, "id={id} should have been updated to 99.0");
+                updated_count += 1;
+            } else {
+                assert_eq!(v, id as f32 * 0.5, "id={id} should be unchanged");
+                unchanged_count += 1;
+            }
+        }
+    }
+    assert_eq!(updated_count, 50);
+    assert_eq!(unchanged_count, 50);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_null_predicate_updates_all() {
+    let (_tmp, uri) = create_large_dataset(20);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let cols = [c_str("label")];
+    let vals = [c_str("'frozen'")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+
+    // NULL predicate → update every row.
+    let mut num_updated: u64 = 0;
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            &mut num_updated,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(num_updated, 20);
+
+    let batches = scan_all_rows(ds);
+    for batch in &batches {
+        let labels = batch
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            assert_eq!(labels.value(i), "frozen");
+        }
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_multiple_columns() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("id = 7");
+    let cols = [c_str("value"), c_str("label")];
+    let vals = [c_str("value * 2"), c_str("'updated'")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+
+    let mut num_updated: u64 = 0;
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            2,
+            &mut num_updated,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(num_updated, 1);
+
+    // Row 7 originally had value = 3.5, label = "row_7".
+    // After update: value = 7.0, label = "updated". Other rows unchanged.
+    let batches = scan_all_rows(ds);
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let labels = batch
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let id = ids.value(i);
+            if id == 7 {
+                assert_eq!(values.value(i), 7.0);
+                assert_eq!(labels.value(i), "updated");
+            } else {
+                assert_eq!(values.value(i), id as f32 * 0.5);
+                assert_eq!(labels.value(i), format!("row_{id}"));
+            }
+        }
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_no_match_returns_zero() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("id > 9999");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+
+    let mut num_updated: u64 = 12345;
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            &mut num_updated,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(num_updated, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 10);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_out_param_optional() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("id < 3");
+    let cols = [c_str("value")];
+    let vals = [c_str("42.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+
+    // Pass NULL out_num_updated — must succeed without writing anything.
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let pred = c_str("id = 0");
+    let cols = [c_str("value")];
+    let vals = [c_str("123.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(
+        v_after > v_before,
+        "version should increase: before={v_before}, after={v_after}"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_null_dataset_rejected() {
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ptr::null_mut(),
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_update_zero_num_updates_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_null_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let vals = [c_str("0.0")];
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            ptr::null(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_null_values_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let cols = [c_str("value")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            ptr::null(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_empty_predicate_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_empty_column_entry_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let cols = [c_str("")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_null_entry_in_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Build an array where the first column pointer is NULL.
+    let val_a = c_str("0.0");
+    let col_ptrs: [*const c_char; 1] = [ptr::null()];
+    let val_ptrs: [*const c_char; 1] = [val_a.as_ptr()];
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_invalid_predicate_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Garbage SQL — UpdateBuilder::update_where wraps parser errors as
+    // InvalidInput, so this surfaces as InvalidArgument (different from
+    // lance_dataset_delete, which routes through a different upstream path
+    // and surfaces these as Internal).
+    let pred = c_str("not a real predicate ((((");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_update_unknown_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let cols = [c_str("no_such_column")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    // UpdateBuilder::set returns InvalidInput for unknown columns.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// Predicate-side unknown column goes through `UpdateBuilder::update_where`
+// (a different upstream path from `set`), so pin it separately.
+#[test]
+fn test_update_unknown_predicate_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let pred = c_str("no_such_column = 1");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// Locks in the documented contract: when the call fails, `out_num_updated`
+// must be left unchanged. A future refactor that pre-zeroes the slot before
+// validating inputs would silently break this guarantee.
+#[test]
+fn test_update_out_param_untouched_on_error() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let mut sentinel: u64 = 0xDEAD_BEEF;
+
+    // Empty predicate → INVALID_ARGUMENT before any work happens (boundary).
+    let pred = c_str("");
+    let cols = [c_str("value")];
+    let vals = [c_str("0.0")];
+    let col_ptrs = cstr_ptrs(&cols);
+    let val_ptrs = cstr_ptrs(&vals);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            pred.as_ptr(),
+            col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            &mut sentinel,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(sentinel, 0xDEAD_BEEF, "out slot must be untouched on error");
+
+    // Same property must hold for upstream-surfaced errors (unknown column).
+    let bad_cols = [c_str("no_such_column")];
+    let bad_col_ptrs = cstr_ptrs(&bad_cols);
+    let rc = unsafe {
+        lance_dataset_update(
+            ds,
+            ptr::null(),
+            bad_col_ptrs.as_ptr(),
+            val_ptrs.as_ptr(),
+            1,
+            &mut sentinel,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(sentinel, 0xDEAD_BEEF, "out slot must be untouched on error");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ===========================================================================
+// lance_dataset_merge_insert
+// ===========================================================================
+
+/// Build a {id, value, label} batch matching `create_large_dataset`'s schema.
+fn make_merge_source(rows: &[(i32, f32, &str)]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Float32, true),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let ids: Vec<i32> = rows.iter().map(|r| r.0).collect();
+    let values: Vec<f32> = rows.iter().map(|r| r.1).collect();
+    let labels: Vec<&str> = rows.iter().map(|r| r.2).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Float32Array::from(values)),
+            Arc::new(StringArray::from(labels)),
+        ],
+    )
+    .unwrap()
+}
+
+/// Build a `LanceMergeInsertParams` zero-initialized except for the supplied
+/// fields. Helps keep tests readable when only a couple of knobs differ from
+/// the find-or-create defaults.
+fn merge_params(
+    when_matched: LanceMergeWhenMatched,
+    when_not_matched: LanceMergeWhenNotMatched,
+    when_not_matched_by_source: LanceMergeWhenNotMatchedBySource,
+) -> LanceMergeInsertParams {
+    LanceMergeInsertParams {
+        when_matched: when_matched as i32,
+        when_matched_expr: ptr::null(),
+        when_not_matched: when_not_matched as i32,
+        when_not_matched_by_source: when_not_matched_by_source as i32,
+        when_not_matched_by_source_expr: ptr::null(),
+    }
+}
+
+#[test]
+fn test_merge_insert_default_is_find_or_create() {
+    // Default params (`params=NULL`) should match upstream's find-or-create:
+    // existing keys are kept untouched; missing keys are inserted.
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let source = make_merge_source(&[(5, 999.0, "rewritten"), (200, 12.5, "new_row")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let mut result = LanceMergeInsertResult::default();
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            &mut result,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(result.num_inserted_rows, 1);
+    assert_eq!(result.num_updated_rows, 0);
+    assert_eq!(result.num_deleted_rows, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 11);
+
+    // id=5 must remain unchanged (DoNothing on match).
+    let batches = scan_all_rows(ds);
+    let mut row5_value = None;
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            if ids.value(i) == 5 {
+                row5_value = Some(values.value(i));
+            }
+        }
+    }
+    assert_eq!(
+        row5_value,
+        Some(2.5),
+        "id=5 should be unchanged on DoNothing"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_upsert_updates_and_inserts() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(5, 999.0, "rewritten"), (200, 12.5, "new_row")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::UpdateAll,
+        LanceMergeWhenNotMatched::InsertAll,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let mut result = LanceMergeInsertResult::default();
+    let rc = unsafe {
+        lance_dataset_merge_insert(ds, on_ptrs.as_ptr(), 1, &mut stream, &params, &mut result)
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(result.num_inserted_rows, 1);
+    assert_eq!(result.num_updated_rows, 1);
+    assert_eq!(result.num_deleted_rows, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 11);
+
+    // id=5 should now read 999.0 / "rewritten"; id=200 should appear with
+    // the source values; everything else stays as the original generator
+    // produced (`row_<id>`, value = id * 0.5).
+    let batches = scan_all_rows(ds);
+    let mut seen_5 = false;
+    let mut seen_200 = false;
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let labels = batch
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            match ids.value(i) {
+                5 => {
+                    assert_eq!(values.value(i), 999.0);
+                    assert_eq!(labels.value(i), "rewritten");
+                    seen_5 = true;
+                }
+                200 => {
+                    assert_eq!(values.value(i), 12.5);
+                    assert_eq!(labels.value(i), "new_row");
+                    seen_200 = true;
+                }
+                id => {
+                    assert_eq!(values.value(i), id as f32 * 0.5);
+                    assert_eq!(labels.value(i), format!("row_{id}"));
+                }
+            }
+        }
+    }
+    assert!(seen_5 && seen_200);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_when_matched_fail_errors_on_match() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(5, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::Fail,
+        LanceMergeWhenNotMatched::InsertAll,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    // Dataset is left unchanged on the error path.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 10);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_when_matched_delete_drops_match() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Source has matching id=5 and non-matching id=200. With Delete+DoNothing
+    // the matching row is removed, the non-matching row is dropped.
+    let source = make_merge_source(&[(5, 0.0, "x"), (200, 0.0, "y")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::Delete,
+        LanceMergeWhenNotMatched::DoNothing,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let mut result = LanceMergeInsertResult::default();
+    let rc = unsafe {
+        lance_dataset_merge_insert(ds, on_ptrs.as_ptr(), 1, &mut stream, &params, &mut result)
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(result.num_inserted_rows, 0);
+    assert_eq!(result.num_deleted_rows, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 9);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_update_if_filters_matches() {
+    // UpdateIf only updates matched rows where the filter holds. The source
+    // matches both id=2 and id=8; the filter `target.value > 3` selects only
+    // id=8 (target value 4.0) — id=2's target value 1.0 stays put.
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(2, 100.0, "x"), (8, 100.0, "y")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let expr = c_str("target.value > 3");
+    let params = LanceMergeInsertParams {
+        when_matched: LanceMergeWhenMatched::UpdateIf as i32,
+        when_matched_expr: expr.as_ptr(),
+        when_not_matched: LanceMergeWhenNotMatched::DoNothing as i32,
+        when_not_matched_by_source: LanceMergeWhenNotMatchedBySource::Keep as i32,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let batches = scan_all_rows(ds);
+    let mut row2_value = None;
+    let mut row8_value = None;
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            match ids.value(i) {
+                2 => row2_value = Some(values.value(i)),
+                8 => row8_value = Some(values.value(i)),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        row2_value,
+        Some(1.0),
+        "id=2 should be unchanged (filter false)"
+    );
+    assert_eq!(
+        row8_value,
+        Some(100.0),
+        "id=8 should be updated (filter true)"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_when_not_matched_do_nothing_skips_inserts() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(100, 0.0, "x"), (200, 0.0, "y")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::UpdateAll,
+        LanceMergeWhenNotMatched::DoNothing,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // Source rows did not match anything; with DoNothing they are discarded.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 5);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_when_not_matched_by_source_delete() {
+    // Replace-everything-not-in-source semantics: target rows whose key does
+    // not appear in the source are dropped.
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(2, 0.0, "x"), (3, 0.0, "y")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::DoNothing,
+        LanceMergeWhenNotMatched::DoNothing,
+        LanceMergeWhenNotMatchedBySource::Delete,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // 5 -> 2 rows remain (ids 2 and 3).
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_when_not_matched_by_source_delete_if() {
+    // DeleteIf("id < 3"): drop unmatched target rows that satisfy the filter
+    // (ids 0, 1) and keep the rest (ids 3, 4). id=2 is matched by source so
+    // it is preserved regardless of the filter.
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(2, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let expr = c_str("id < 3");
+    let params = LanceMergeInsertParams {
+        when_matched: LanceMergeWhenMatched::DoNothing as i32,
+        when_matched_expr: ptr::null(),
+        when_not_matched: LanceMergeWhenNotMatched::DoNothing as i32,
+        when_not_matched_by_source: LanceMergeWhenNotMatchedBySource::DeleteIf as i32,
+        when_not_matched_by_source_expr: expr.as_ptr(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // id=0 and id=1 deleted; id=2,3,4 kept.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_multi_column_keys() {
+    // Match on (id, label). The source row matches id=3 but with a different
+    // label, so no target row is matched and the source row is inserted as a
+    // brand-new row under upsert semantics.
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(3, 99.0, "different")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id"), c_str("label")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let params = merge_params(
+        LanceMergeWhenMatched::UpdateAll,
+        LanceMergeWhenNotMatched::InsertAll,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let mut result = LanceMergeInsertResult::default();
+    let rc = unsafe {
+        lance_dataset_merge_insert(ds, on_ptrs.as_ptr(), 2, &mut stream, &params, &mut result)
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(result.num_inserted_rows, 1);
+    assert_eq!(result.num_updated_rows, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 6);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(v_after > v_before);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_out_result_optional() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    // Pass NULL out_result — must succeed without writing anything.
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// Locks in the documented contract: when the call fails, `out_result` must be
+// left unchanged. A future refactor that pre-zeroes the slot before validating
+// inputs would silently break this guarantee.
+#[test]
+fn test_merge_insert_out_result_untouched_on_error() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let sentinel = LanceMergeInsertResult {
+        num_inserted_rows: 0xDEAD,
+        num_updated_rows: 0xBEEF,
+        num_deleted_rows: 0xCAFE,
+    };
+    let mut out = sentinel;
+
+    // num_on_columns = 0 → INVALID_ARGUMENT before any work happens. The
+    // stream is still consumed (NULL stream is the only check ahead of the
+    // `from_raw` consume), but the result slot must be untouched.
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let rc = unsafe {
+        lance_dataset_merge_insert(ds, ptr::null(), 0, &mut stream, ptr::null(), &mut out)
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(out, sentinel, "out slot must be untouched on error");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_null_dataset_rejected() {
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ptr::null_mut(),
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_merge_insert_null_source_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_zero_num_on_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            ptr::null(),
+            0,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_null_on_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            ptr::null(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_empty_key_entry_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("")];
+    let on_ptrs = cstr_ptrs(&on);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_null_entry_in_on_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on_ptrs: [*const c_char; 1] = [ptr::null()];
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_unknown_key_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("no_such_column")];
+    let on_ptrs = cstr_ptrs(&on);
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    // MergeInsertBuilder::try_new returns InvalidInput for an unknown key.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_invalid_when_matched_discriminant_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = LanceMergeInsertParams {
+        when_matched: 99,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: 0,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_invalid_when_not_matched_discriminant_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = LanceMergeInsertParams {
+        when_matched: 0,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 99,
+        when_not_matched_by_source: 0,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_invalid_when_not_matched_by_source_discriminant_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = LanceMergeInsertParams {
+        when_matched: 0,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: 99,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_empty_expr_rejected() {
+    // Empty expression string is rejected at the FFI boundary so callers hit
+    // a precise error rather than an opaque parser failure later on.
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let empty = c_str("");
+    let params = LanceMergeInsertParams {
+        when_matched: LanceMergeWhenMatched::UpdateIf as i32,
+        when_matched_expr: empty.as_ptr(),
+        when_not_matched: 0,
+        when_not_matched_by_source: 0,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_update_if_missing_expr_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = LanceMergeInsertParams {
+        when_matched: LanceMergeWhenMatched::UpdateIf as i32,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: 0,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_unused_expr_for_update_all_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let expr = c_str("id > 0");
+    let params = LanceMergeInsertParams {
+        when_matched: LanceMergeWhenMatched::UpdateAll as i32,
+        when_matched_expr: expr.as_ptr(),
+        when_not_matched: 0,
+        when_not_matched_by_source: 0,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_unused_expr_for_keep_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let expr = c_str("id > 0");
+    let params = LanceMergeInsertParams {
+        when_matched: 0,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: LanceMergeWhenNotMatchedBySource::Keep as i32,
+        when_not_matched_by_source_expr: expr.as_ptr(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_delete_if_missing_expr_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = LanceMergeInsertParams {
+        when_matched: 0,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: LanceMergeWhenNotMatchedBySource::DeleteIf as i32,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_no_op_config_rejected() {
+    // DoNothing + DoNothing + Keep is a configuration that mutates nothing;
+    // upstream's `try_build` rejects it as InvalidInput.
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(100, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = merge_params(
+        LanceMergeWhenMatched::DoNothing,
+        LanceMergeWhenNotMatched::DoNothing,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_schema_mismatch_rejected() {
+    // Source `value` column is Float64 instead of Float32, so upstream's
+    // schema-compatibility check rejects the merge before any commit lands.
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let bad_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Float64, true),
+    ]));
+    let bad_batch = RecordBatch::try_new(
+        bad_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![100])),
+            Arc::new(arrow_array::Float64Array::from(vec![1.0])),
+        ],
+    )
+    .unwrap();
+    let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(bad_batch)], bad_schema);
+    let mut stream = FFI_ArrowArrayStream::new(Box::new(reader));
+
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = merge_params(
+        LanceMergeWhenMatched::UpdateAll,
+        LanceMergeWhenNotMatched::InsertAll,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    // The dataset should not be corrupted by the rejected merge.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_unknown_predicate_column_in_delete_if_rejected() {
+    // DeleteIf parses against the dataset schema at FFI time; an unknown
+    // column surfaces as InvalidArgument.
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let source = make_merge_source(&[(2, 0.0, "x")]);
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+
+    let expr = c_str("no_such_column = 1");
+    let params = LanceMergeInsertParams {
+        when_matched: 0,
+        when_matched_expr: ptr::null(),
+        when_not_matched: 0,
+        when_not_matched_by_source: LanceMergeWhenNotMatchedBySource::DeleteIf as i32,
+        when_not_matched_by_source_expr: expr.as_ptr(),
+    };
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ===========================================================================
+// lance_dataset_compact_files
+// ===========================================================================
+
+/// Build a dataset of `num_fragments` small fragments (3 unique ids each)
+/// so the default planner sees plenty of small neighbors to merge. Unique
+/// ids keep fragments alive across partial-row deletes — upstream's `delete`
+/// drops a fragment entirely once all of its rows are gone.
+fn create_many_small_fragments(num_fragments: i32) -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("small_frags").to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+    lance_c::runtime::block_on(async {
+        for i in 0..num_fragments {
+            let base = i * 3;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![base, base + 1, base + 2]))],
+            )
+            .unwrap();
+            if i == 0 {
+                Dataset::write(
+                    arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    &uri,
+                    None,
+                )
+                .await
+                .unwrap();
+            } else {
+                let mut ds = Dataset::open(&uri).await.unwrap();
+                ds.append(
+                    arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        }
+    });
+
+    (tmp, uri)
+}
+
+#[test]
+fn test_compact_basic_merges_small_fragments() {
+    let (_tmp, uri) = create_many_small_fragments(4);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 4);
+    let v_before = unsafe { lance_dataset_version(ds) };
+
+    let mut metrics = LanceCompactionMetrics::default();
+    let rc = unsafe { lance_dataset_compact_files(ds, ptr::null(), &mut metrics) };
+    assert_eq!(rc, 0);
+
+    // All four small neighbors are below the default 1Mi target, so they
+    // collapse into a single output fragment. Row count is preserved.
+    assert_eq!(metrics.fragments_removed, 4);
+    assert_eq!(metrics.fragments_added, 1);
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 12);
+    assert!(unsafe { lance_dataset_version(ds) } > v_before);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_preserves_data() {
+    let (_tmp, uri) = create_many_small_fragments(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let rc = unsafe { lance_dataset_compact_files(ds, ptr::null(), ptr::null_mut()) };
+    assert_eq!(rc, 0);
+
+    // Three fragments × three unique ids each = 0..=8, every value once.
+    let mut seen = [false; 9];
+    for batch in &scan_all_rows(ds) {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            seen[ids.value(i) as usize] = true;
+        }
+    }
+    assert!(seen.iter().all(|&b| b));
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_no_op_on_clean_single_fragment() {
+    // A single fragment with no neighbors and no deletions has nothing to
+    // compact: upstream returns success without committing, so the version
+    // and counts are unchanged.
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let mut metrics = LanceCompactionMetrics {
+        fragments_removed: 0xDEAD,
+        fragments_added: 0xBEEF,
+        files_removed: 0xCAFE,
+        files_added: 0xF00D,
+    };
+    let rc = unsafe { lance_dataset_compact_files(ds, ptr::null(), &mut metrics) };
+    assert_eq!(rc, 0);
+    assert_eq!(metrics, LanceCompactionMetrics::default());
+    assert_eq!(unsafe { lance_dataset_version(ds) }, v_before);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_after_deletes_materializes_deletion_files() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    // Soft-delete one row from each fragment (id=1 from frag 0, id=4 from
+    // frag 1) so each fragment ends up with a deletion file to materialize.
+    let pred = c_str("id = 1 OR id = 4");
+    let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+
+    let mut metrics = LanceCompactionMetrics::default();
+    let rc = unsafe { lance_dataset_compact_files(ds, ptr::null(), &mut metrics) };
+    assert_eq!(rc, 0);
+    // Both small fragments are rewritten into a single one with the deleted
+    // rows physically removed and the deletion files gone.
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(metrics.fragments_added, 1);
+    assert!(
+        metrics.files_removed >= 4,
+        "expected ≥ 2 data files + 2 deletion files removed, got {}",
+        metrics.files_removed
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 4);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_target_rows_per_fragment_override_accepted() {
+    let (_tmp, uri) = create_many_small_fragments(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let opts = LanceCompactionOptions {
+        target_rows_per_fragment: 100,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 0,
+        num_threads: 0,
+        batch_size: 0,
+    };
+    let rc = unsafe { lance_dataset_compact_files(ds, &opts, ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 9);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_num_threads_override_accepted() {
+    let (_tmp, uri) = create_many_small_fragments(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let opts = LanceCompactionOptions {
+        target_rows_per_fragment: 0,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 0,
+        num_threads: 1,
+        batch_size: 0,
+    };
+    let rc = unsafe { lance_dataset_compact_files(ds, &opts, ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 9);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_max_bytes_per_file_override_accepted() {
+    // 1 MiB cap is far above what 6 rows of i32 produce, so the override
+    // just smoke-checks that the field flows through without erroring.
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let opts = LanceCompactionOptions {
+        target_rows_per_fragment: 0,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 1 << 20,
+        num_threads: 0,
+        batch_size: 0,
+    };
+    let rc = unsafe { lance_dataset_compact_files(ds, &opts, ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 6);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_batch_size_and_max_rows_per_group_overrides_accepted() {
+    // Smoke-checks that the two least-observable overrides flow through
+    // without erroring; the resulting layout isn't introspected here.
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let opts = LanceCompactionOptions {
+        target_rows_per_fragment: 0,
+        max_rows_per_group: 4,
+        max_bytes_per_file: 0,
+        num_threads: 0,
+        batch_size: 32,
+    };
+    let rc = unsafe { lance_dataset_compact_files(ds, &opts, ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 6);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_zero_options_equivalent_to_null() {
+    // A zero-initialized options struct must behave identically to NULL.
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let opts = LanceCompactionOptions {
+        target_rows_per_fragment: 0,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 0,
+        num_threads: 0,
+        batch_size: 0,
+    };
+    let mut metrics = LanceCompactionMetrics::default();
+    let rc = unsafe { lance_dataset_compact_files(ds, &opts, &mut metrics) };
+    assert_eq!(rc, 0);
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(metrics.fragments_added, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 6);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_out_metrics_optional() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    // Pass NULL out_metrics — must succeed without writing anything.
+    let rc = unsafe { lance_dataset_compact_files(ds, ptr::null(), ptr::null_mut()) };
+    assert_eq!(rc, 0);
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_compact_null_dataset_rejected() {
+    let rc = unsafe { lance_dataset_compact_files(ptr::null_mut(), ptr::null(), ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+// Locks in the documented contract: when the call fails, `out_metrics` must
+// be left unchanged. A future refactor that pre-zeroes the slot before
+// validating inputs would silently break this guarantee.
+#[test]
+fn test_compact_out_metrics_untouched_on_error() {
+    let sentinel = LanceCompactionMetrics {
+        fragments_removed: 0xDEAD,
+        fragments_added: 0xBEEF,
+        files_removed: 0xCAFE,
+        files_added: 0xF00D,
+    };
+    let mut out = sentinel;
+    let rc = unsafe { lance_dataset_compact_files(ptr::null_mut(), ptr::null(), &mut out) };
+    assert_eq!(rc, -1);
+    assert_eq!(out, sentinel, "out slot must be untouched on error");
+}
+
 // ---------------------------------------------------------------------------
 // Distributed vector search via index segments
 // ---------------------------------------------------------------------------
@@ -2604,8 +6097,10 @@ fn test_index_segment_count_and_list() {
     assert_eq!(count, 1);
 
     let mut bytes = vec![0u8; (count as usize) * 16];
-    let rc = unsafe { lance_dataset_index_segments(ds, name.as_ptr(), bytes.as_mut_ptr()) };
+    let mut written: u64 = 0;
+    let rc = unsafe { lance_dataset_index_segments(ds, name.as_ptr(), bytes.as_mut_ptr(), count as usize, &mut written) };
     assert_eq!(rc, 0);
+    assert_eq!(written, count);
     // Sanity: not all zeros (a real UUID was written).
     assert!(
         bytes.iter().any(|b| *b != 0),
@@ -2655,7 +6150,7 @@ fn test_scanner_set_index_segments_with_listed_uuids() {
     let count = unsafe { lance_dataset_index_segment_count(ds, name.as_ptr()) };
     assert_eq!(count, 1);
     let mut uuids = vec![0u8; (count as usize) * 16];
-    let rc = unsafe { lance_dataset_index_segments(ds, name.as_ptr(), uuids.as_mut_ptr()) };
+    let rc = unsafe { lance_dataset_index_segments(ds, name.as_ptr(), uuids.as_mut_ptr(), count as usize, std::ptr::null_mut()) };
     assert_eq!(rc, 0);
 
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
