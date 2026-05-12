@@ -18,12 +18,12 @@ rust-version = "1.91.0"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6", features = ["substrait"] }
-lance-core = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
-lance-index = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
-lance-io = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
-lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "24d57870", features = ["substrait"] }
+lance-core = { git = "https://github.com/lance-format/lance.git", rev = "24d57870" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "24d57870" }
+lance-index = { git = "https://github.com/lance-format/lance.git", rev = "24d57870" }
+lance-io = { git = "https://github.com/lance-format/lance.git", rev = "24d57870" }
+lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "24d57870" }
 arrow = { version = "58.0.0", features = ["prettyprint", "ffi"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
@@ -36,11 +36,11 @@ snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6", features = ["substrait"] }
-lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6", features = ["substrait"] }
-lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
-lance-table = { git = "https://github.com/lance-format/lance.git", rev = "e0e977a6" }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "24d57870", features = ["substrait"] }
+lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "24d57870", features = ["substrait"] }
+lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "24d57870" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "24d57870" }
+lance-table = { git = "https://github.com/lance-format/lance.git", rev = "24d57870" }
 datafusion = { version = "53.1.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "58.0.0"
