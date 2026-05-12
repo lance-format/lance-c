@@ -18,6 +18,7 @@ use lance_core::Result;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_io::stream::RecordBatchStream;
+use uuid::Uuid;
 
 use crate::async_dispatcher::{self, LanceCallback};
 use crate::batch::LanceBatch;
@@ -48,6 +49,7 @@ pub struct LanceScanner {
     batch_size: Option<usize>,
     with_row_id: bool,
     fragment_ids: Option<Vec<u64>>,
+    index_segments: Option<Vec<Uuid>>,
     nearest: Option<NearestQuery>,
     nprobes: Option<u32>,
     refine_factor: Option<u32>,
@@ -99,6 +101,7 @@ impl LanceScanner {
             batch_size: None,
             with_row_id: false,
             fragment_ids: None,
+            index_segments: None,
             nearest: None,
             nprobes: None,
             refine_factor: None,
@@ -149,6 +152,12 @@ impl LanceScanner {
             scanner.with_row_id();
         }
         self.apply_fragment_filter(&mut scanner)?;
+        if self.index_segments.is_some() && self.nearest.is_none() {
+            return Err(lance_core::Error::InvalidInput {
+                source: "index_segments requires nearest() to be configured".into(),
+                location: snafu::location!(),
+            });
+        }
         if let Some(n) = &self.nearest {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
             if let Some(np) = self.nprobes {
@@ -168,6 +177,9 @@ impl LanceScanner {
             }
             if self.prefilter {
                 scanner.prefilter(true);
+            }
+            if let Some(segments) = &self.index_segments {
+                scanner.with_index_segments(segments.clone())?;
             }
         }
         if let Some(fts) = &self.fts_query {
@@ -201,6 +213,12 @@ impl LanceScanner {
             scanner.with_row_id();
         }
         self.apply_fragment_filter(&mut scanner)?;
+        if self.index_segments.is_some() && self.nearest.is_none() {
+            return Err(lance_core::Error::InvalidInput {
+                source: "index_segments requires nearest() to be configured".into(),
+                location: snafu::location!(),
+            });
+        }
         if let Some(n) = &self.nearest {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
             if let Some(np) = self.nprobes {
@@ -220,6 +238,9 @@ impl LanceScanner {
             }
             if self.prefilter {
                 scanner.prefilter(true);
+            }
+            if let Some(segments) = &self.index_segments {
+                scanner.with_index_segments(segments.clone())?;
             }
         }
         if let Some(fts) = &self.fts_query {
@@ -786,6 +807,52 @@ pub unsafe extern "C" fn lance_scanner_set_prefilter(
     }
     unsafe {
         (*scanner).prefilter = enable;
+    }
+    crate::error::clear_last_error();
+    0
+}
+
+/// Restrict the next `nearest()` query to a specific subset of vector index segments.
+///
+/// Each segment is a 16-byte UUID (RFC 4122 layout). Pass an array of `len`
+/// 16-byte buffers concatenated end-to-end (so the total byte length is `len * 16`).
+/// Used by distributed query engines (e.g. Velox) to fan k-NN out across workers,
+/// each handling a slice of segments. The coordinator gets the segment list via
+/// `lance_dataset_index_segments()`.
+///
+/// Calling with `len == 0` clears the segment restriction.
+///
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_index_segments(
+    scanner: *mut LanceScanner,
+    segment_uuids: *const u8,
+    len: usize,
+) -> i32 {
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
+        return -1;
+    }
+    if segment_uuids.is_null() && len > 0 {
+        set_last_error(
+            LanceErrorCode::InvalidArgument,
+            "segment_uuids is NULL but len > 0",
+        );
+        return -1;
+    }
+    let s = unsafe { &mut *scanner };
+    if len == 0 {
+        s.index_segments = None;
+    } else {
+        let mut uuids = Vec::with_capacity(len);
+        for i in 0..len {
+            let mut bytes = [0u8; 16];
+            unsafe {
+                std::ptr::copy_nonoverlapping(segment_uuids.add(i * 16), bytes.as_mut_ptr(), 16);
+            }
+            uuids.push(Uuid::from_bytes(bytes));
+        }
+        s.index_segments = Some(uuids);
     }
     crate::error::clear_last_error();
     0

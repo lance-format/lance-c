@@ -707,6 +707,41 @@ uint64_t lance_dataset_index_count(const LanceDataset* dataset);
  */
 const char* lance_dataset_index_list_json(const LanceDataset* dataset);
 
+/* ─── Distributed vector search: index segment enumeration ─── */
+
+/**
+ * Count the segments that make up a logical vector index.
+ *
+ * A logical index is a set of physical segments (one per distributed-build
+ * worker, or one per fragment range). Each segment has a stable UUID. Returns
+ * 0 if the index does not exist (also sets `LANCE_ERR_NOT_FOUND`) or on error.
+ */
+uint64_t lance_dataset_index_segment_count(
+    const LanceDataset* dataset,
+    const char* index_name
+);
+
+/**
+ * Fill `out_uuids` with the UUIDs of the segments that make up a logical index.
+ * Each UUID is written as 16 raw bytes (RFC 4122 layout).
+ *
+ * @param out_uuids  Caller-allocated buffer for the UUIDs (byte length >= capacity * 16).
+ * @param capacity   Number of UUIDs the buffer can hold.
+ * @param out_count  Optional (may be NULL). On success, receives the number of
+ *                   UUIDs actually written.
+ *
+ * Returns 0 on success, -1 on error.  If the index has more segments than
+ * `capacity`, returns LANCE_ERR_INVALID_ARGUMENT without writing anything;
+ * the caller can retry with a larger buffer.
+ */
+int32_t lance_dataset_index_segments(
+    const LanceDataset* dataset,
+    const char* index_name,
+    uint8_t* out_uuids,
+    size_t capacity,
+    uint64_t* out_count
+);
+
 /* ─── Vector search (Phase 2) ─── */
 
 /**
@@ -735,6 +770,26 @@ int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e);
 int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);
 int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
 int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
+
+/**
+ * Restrict the next k-NN query to a specific subset of vector index segments.
+ *
+ * Used by distributed query engines (e.g. Velox) to fan a single k-NN query
+ * out across workers, each handling a slice of segments. The coordinator gets
+ * the segment list via `lance_dataset_index_segments()`.
+ *
+ * @param segment_uuids Pointer to `len` 16-byte UUIDs concatenated end-to-end
+ *                      (total byte length = `len * 16`). Each UUID identifies
+ *                      one physical segment of a logical index.
+ * @param len           Number of UUIDs. Pass 0 (and segment_uuids may be NULL)
+ *                      to clear any previously-set segment restriction.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_set_index_segments(
+    LanceScanner* scanner,
+    const uint8_t* segment_uuids,
+    size_t len
+);
 
 /* ─── Full-text search (Phase 2) ─── */
 
