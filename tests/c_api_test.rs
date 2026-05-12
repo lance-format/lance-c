@@ -6098,7 +6098,15 @@ fn test_index_segment_count_and_list() {
 
     let mut bytes = vec![0u8; (count as usize) * 16];
     let mut written: u64 = 0;
-    let rc = unsafe { lance_dataset_index_segments(ds, name.as_ptr(), bytes.as_mut_ptr(), count as usize, &mut written) };
+    let rc = unsafe {
+        lance_dataset_index_segments(
+            ds,
+            name.as_ptr(),
+            bytes.as_mut_ptr(),
+            count as usize,
+            &mut written,
+        )
+    };
     assert_eq!(rc, 0);
     assert_eq!(written, count);
     // Sanity: not all zeros (a real UUID was written).
@@ -6150,7 +6158,15 @@ fn test_scanner_set_index_segments_with_listed_uuids() {
     let count = unsafe { lance_dataset_index_segment_count(ds, name.as_ptr()) };
     assert_eq!(count, 1);
     let mut uuids = vec![0u8; (count as usize) * 16];
-    let rc = unsafe { lance_dataset_index_segments(ds, name.as_ptr(), uuids.as_mut_ptr(), count as usize, std::ptr::null_mut()) };
+    let rc = unsafe {
+        lance_dataset_index_segments(
+            ds,
+            name.as_ptr(),
+            uuids.as_mut_ptr(),
+            count as usize,
+            std::ptr::null_mut(),
+        )
+    };
     assert_eq!(rc, 0);
 
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };

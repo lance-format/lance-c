@@ -230,7 +230,9 @@ pub unsafe extern "C" fn lance_dataset_index_segments(
     out_count: *mut u64,
 ) -> i32 {
     ffi_try!(
-        unsafe { dataset_index_segments_inner(dataset, index_name, out_uuids, capacity, out_count) },
+        unsafe {
+            dataset_index_segments_inner(dataset, index_name, out_uuids, capacity, out_count)
+        },
         neg
     )
 }
