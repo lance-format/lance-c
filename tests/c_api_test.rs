@@ -6268,3 +6268,271 @@ fn test_scanner_set_index_segments_null_safety() {
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
 }
+
+// ===========================================================================
+// lance_dataset_drop_columns
+// ===========================================================================
+
+/// Return the dataset's column names by exporting its schema through the
+/// Arrow C Data Interface.
+fn schema_field_names(ds: *const LanceDataset) -> Vec<String> {
+    debug_assert!(!ds.is_null(), "schema_field_names called with NULL dataset");
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    let rc = unsafe { lance_dataset_schema(ds, &mut ffi_schema) };
+    assert_eq!(rc, 0, "lance_dataset_schema failed");
+    let arrow_schema =
+        arrow_schema::Schema::try_from(&ffi_schema).expect("FFI_ArrowSchema -> Schema");
+    arrow_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect()
+}
+
+#[test]
+fn test_drop_columns_single() {
+    let (_tmp, uri) = create_large_dataset(10);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let col = c_str("value");
+    let cols = [col.as_ptr()];
+    let rc = unsafe { lance_dataset_drop_columns(ds, cols.as_ptr(), cols.len()) };
+    assert_eq!(rc, 0);
+
+    // Row count is unchanged — drop is metadata-only.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 10);
+    // Schema reflects the dropped column.
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id".to_string(), "label".to_string()]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_columns_multiple() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let c_value = c_str("value");
+    let c_label = c_str("label");
+    let cols = [c_value.as_ptr(), c_label.as_ptr()];
+    let rc = unsafe { lance_dataset_drop_columns(ds, cols.as_ptr(), cols.len()) };
+    assert_eq!(rc, 0);
+
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id".to_string()]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_columns_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let col = c_str("label");
+    let cols = [col.as_ptr()];
+    let rc = unsafe { lance_dataset_drop_columns(ds, cols.as_ptr(), cols.len()) };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(
+        v_after > v_before,
+        "version should increase: before={v_before}, after={v_after}"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_columns_preserves_remaining_data() {
+    let (_tmp, uri) = create_large_dataset(4);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let col = c_str("value");
+    let cols = [col.as_ptr()];
+    let rc = unsafe { lance_dataset_drop_columns(ds, cols.as_ptr(), cols.len()) };
+    assert_eq!(rc, 0);
+
+    // Materialize the remaining columns to confirm row data is intact.
+    let indices: [u64; 4] = [0, 1, 2, 3];
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe {
+        lance_dataset_take(
+            ds,
+            indices.as_ptr(),
+            indices.len(),
+            ptr::null(),
+            &mut stream,
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let schema = reader.schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, vec!["id", "label"]);
+
+    // Concatenate the resulting batches and assert the surviving column
+    // values are unchanged — a regression that zeroed surviving data
+    // would slip past a shape-only check.
+    let batches: Vec<_> = reader.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 4);
+
+    let mut ids: Vec<i32> = Vec::with_capacity(4);
+    let mut labels: Vec<String> = Vec::with_capacity(4);
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let label_col = batch
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            ids.push(id_col.value(i));
+            labels.push(label_col.value(i).to_string());
+        }
+    }
+    assert_eq!(ids, vec![0, 1, 2, 3]);
+    assert_eq!(labels, vec!["row_0", "row_1", "row_2", "row_3"]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_columns_unknown_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let col = c_str("no_such_column");
+    let cols = [col.as_ptr()];
+    let rc = unsafe { lance_dataset_drop_columns(ds, cols.as_ptr(), cols.len()) };
+    assert_eq!(rc, -1);
+    // Upstream surfaces this as InvalidInput → InvalidArgument at the FFI
+    // boundary. The dataset is left untouched on the error path.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id", "value", "label"]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_columns_cannot_drop_all() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let c_id = c_str("id");
+    let c_value = c_str("value");
+    let c_label = c_str("label");
+    let cols = [c_id.as_ptr(), c_value.as_ptr(), c_label.as_ptr()];
+    let rc = unsafe { lance_dataset_drop_columns(ds, cols.as_ptr(), cols.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    // Schema is unchanged.
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id", "value", "label"]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_columns_null_dataset_rejected() {
+    let col = c_str("value");
+    let cols = [col.as_ptr()];
+    let rc = unsafe { lance_dataset_drop_columns(ptr::null_mut(), cols.as_ptr(), cols.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_drop_columns_null_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let rc = unsafe { lance_dataset_drop_columns(ds, ptr::null(), 1) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_columns_zero_count_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let dummy = c_str("value");
+    let cols = [dummy.as_ptr()];
+    let rc = unsafe { lance_dataset_drop_columns(ds, cols.as_ptr(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    // No version bump on the error path — compare against the pre-call value.
+    assert_eq!(unsafe { lance_dataset_version(ds) }, v_before);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_columns_null_entry_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let c_value = c_str("value");
+    let cols: [*const c_char; 2] = [c_value.as_ptr(), ptr::null()];
+    let rc = unsafe { lance_dataset_drop_columns(ds, cols.as_ptr(), cols.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    // Dataset is unchanged.
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id", "value", "label"]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_drop_columns_empty_entry_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // Empty string is rejected by the `.filter(!empty)` guard at the FFI
+    // boundary, distinct from the NULL-entry path.
+    let empty = c_str("");
+    let cols = [empty.as_ptr()];
+    let rc = unsafe { lance_dataset_drop_columns(ds, cols.as_ptr(), cols.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id", "value", "label"]);
+
+    unsafe { lance_dataset_close(ds) };
+}
