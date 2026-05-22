@@ -72,6 +72,7 @@ add_library(LanceC_platform_deps INTERFACE)
 if(APPLE)
     target_link_libraries(LanceC_platform_deps INTERFACE
         "-framework CoreFoundation"
+        "-framework IOKit"
         "-framework Security"
         "-framework SystemConfiguration")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -146,7 +147,7 @@ install(FILES
 # ─── pkg-config ──────────────────────────────────────────────────────────────
 if(APPLE)
     set(LANCE_C_PC_LIBS_PRIVATE
-        "-framework CoreFoundation -framework Security -framework SystemConfiguration")
+        "-framework CoreFoundation -framework IOKit -framework Security -framework SystemConfiguration")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(LANCE_C_PC_LIBS_PRIVATE "-lpthread -ldl -lm")
 else()
