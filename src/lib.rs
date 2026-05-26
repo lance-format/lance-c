@@ -20,6 +20,7 @@ mod batch;
 mod compact;
 mod dataset;
 mod delete;
+mod drop_columns;
 mod error;
 mod fragment_writer;
 mod helpers;
@@ -37,6 +38,7 @@ pub use batch::*;
 pub use compact::*;
 pub use dataset::*;
 pub use delete::*;
+pub use drop_columns::*;
 pub use error::{
     LanceErrorCode, lance_free_string, lance_last_error_code, lance_last_error_message,
 };

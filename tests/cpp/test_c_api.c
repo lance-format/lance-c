@@ -346,6 +346,83 @@ static void test_merge_insert(const char *write_uri) {
 }
 
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+ * exercises `lance_dataset_drop_columns`. Drops the `name` column so the
+ * dataset is left with `id` only; subsequent tests (`compact_files`,
+ * `delete`) do not reference any dropped column. Must run after
+ * `test_update` / `test_merge_insert`, which both still need `name` / `id`. */
+static void test_drop_columns(const char *write_uri) {
+    printf("  test_drop_columns... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t before_rows = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(before_rows > 0, "fixture expected to have rows");
+    uint64_t v_before = lance_dataset_version(ds);
+
+    /* Snapshot the schema so we can confirm the field count decreased
+     * (otherwise a bug that bumped the version without modifying the
+     * schema would pass silently). The ArrowSchema struct owns its
+     * children — release it before any potentially-aborting assert so
+     * we don't leak under sanitizer runs in CI. */
+    struct ArrowSchema schema_before;
+    memset(&schema_before, 0, sizeof(schema_before));
+    int32_t rc = lance_dataset_schema(ds, &schema_before);
+    ASSERT(rc == 0, "schema export failed");
+    int64_t fields_before = schema_before.n_children;
+    if (schema_before.release) schema_before.release(&schema_before);
+
+    const char *cols[] = {"name"};
+    rc = lance_dataset_drop_columns(ds, cols, 1);
+    ASSERT(rc == 0, "drop_columns failed");
+    uint64_t after_rows = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(after_rows == before_rows,
+           "metadata-only drop must not change row count");
+    ASSERT(lance_dataset_version(ds) > v_before,
+           "drop_columns must bump the version");
+
+    /* Schema field count must have decreased by exactly 1. The C-test
+     * fixture has 2 columns (`id`, `name`) — assert `fields_after == 1`
+     * so this self-documents the post-drop expectation and trips if the
+     * fixture ever grows additional columns. Release the exported
+     * schema before any assertion so we never leak it on failure. */
+    struct ArrowSchema schema_after;
+    memset(&schema_after, 0, sizeof(schema_after));
+    rc = lance_dataset_schema(ds, &schema_after);
+    ASSERT(rc == 0, "schema export failed after drop");
+    int64_t fields_after = schema_after.n_children;
+    if (schema_after.release) schema_after.release(&schema_after);
+    ASSERT(fields_after == fields_before - 1,
+           "schema field count must decrease by 1 after drop");
+    ASSERT(fields_after == 1,
+           "C-test fixture should be left with `id` only after dropping `name`");
+
+    /* NULL `columns` and num_columns == 0 must both be rejected. */
+    rc = lance_dataset_drop_columns(ds, NULL, 1);
+    ASSERT(rc == -1, "NULL columns must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    rc = lance_dataset_drop_columns(ds, cols, 0);
+    ASSERT(rc == -1, "num_columns=0 must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    /* Dropping the sole remaining column (`id`) must fail with
+     * INVALID_ARGUMENT — upstream refuses to leave a dataset with zero
+     * fields. */
+    const char *last_col[] = {"id"};
+    rc = lance_dataset_drop_columns(ds, last_col, 1);
+    ASSERT(rc == -1, "dropping last column must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_compact_files`. The smoke fixture is a single
  * fragment, so the default planner has nothing to compact — we expect
  * all-zero metrics and no version bump. Must run before `test_delete`. */
@@ -423,6 +500,7 @@ int main(int argc, char **argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
+    test_drop_columns(write_uri);
     test_compact_files(write_uri);
     test_delete(write_uri);
 

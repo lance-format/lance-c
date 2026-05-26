@@ -398,6 +398,63 @@ static void test_merge_insert(const std::string& dst_uri) {
 }
 
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+// exercises `Dataset::drop_columns`. Drops the `name` column so the dataset
+// is left with `id` only; subsequent tests (`compact_files`, `delete_rows`)
+// do not reference any dropped column. Must run after `test_update` /
+// `test_merge_insert`.
+static void test_drop_columns(const std::string& dst_uri) {
+    TEST(test_drop_columns);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t before_rows = ds.count_rows();
+    uint64_t v_before = ds.version();
+
+    ds.drop_columns({"name"});
+    assert(ds.count_rows() == before_rows
+           && "metadata-only drop must preserve row count");
+    assert(ds.version() > v_before
+           && "drop_columns must bump the version");
+    uint64_t v_after_drop = ds.version();
+
+    // Dropping an unknown column must throw with INVALID_ARGUMENT and
+    // leave the dataset unchanged (no version bump on the error path).
+    bool caught_unknown = false;
+    try {
+        ds.drop_columns({"no_such_column"});
+    } catch (const lance::Error& e) {
+        caught_unknown = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_unknown);
+    assert(ds.version() == v_after_drop
+           && "failed drop must not bump the version");
+
+    // Empty column list must throw with INVALID_ARGUMENT.
+    bool caught_empty = false;
+    try {
+        ds.drop_columns({});
+    } catch (const lance::Error& e) {
+        caught_empty = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_empty);
+
+    // Dropping the sole remaining column (`id`) must throw with
+    // INVALID_ARGUMENT — upstream refuses to leave a dataset with zero
+    // fields.
+    bool caught_last = false;
+    try {
+        ds.drop_columns({"id"});
+    } catch (const lance::Error& e) {
+        caught_last = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_last);
+
+    PASS();
+}
+
+// Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::compact_files`. The smoke fixture is a single fragment
 // so the default planner has nothing to compact — we expect a no-op (zero
 // metrics, no version bump). Must run before `test_delete_rows`.
@@ -468,6 +525,7 @@ int main(int argc, char** argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
+    test_drop_columns(write_uri);
     test_compact_files(write_uri);
     test_delete_rows(write_uri);
 

@@ -453,6 +453,37 @@ int32_t lance_dataset_compact_files(
     LanceCompactionMetrics* out_metrics
 );
 
+/* ─── lance_dataset_drop_columns ──────────────────────────────────────────── */
+
+/**
+ * Drop one or more columns from the dataset's schema, committing a new
+ * manifest. This is a metadata-only operation: the data files on storage
+ * are not rewritten until a later `lance_dataset_compact_files` call
+ * materializes the projection (after which the previous version's files
+ * can be removed by a future cleanup operation).
+ *
+ * Mutates `dataset` in place — the same handle remains valid afterward
+ * and sees the new version. Scanners already in flight against this
+ * dataset keep their pre-drop schema view.
+ *
+ * @param dataset      Open dataset (not consumed). Mutated in place to
+ *                     see the new version. Must not be NULL.
+ * @param columns      Array of NUL-terminated UTF-8 column names to drop.
+ *                     Must not be NULL; entries must be non-NULL and
+ *                     non-empty.
+ * @param num_columns  Length of `columns`. Must be > 0.
+ * @return 0 on success, -1 on error. Error codes:
+ *         LANCE_ERR_INVALID_ARGUMENT for NULL/empty inputs, NULL or empty
+ *         entries, non-UTF-8 column names, unknown columns, or an attempt
+ *         to drop every column;
+ *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
+ */
+int32_t lance_dataset_drop_columns(
+    LanceDataset* dataset,
+    const char* const* columns,
+    size_t num_columns
+);
+
 /**
  * Export the dataset schema via Arrow C Data Interface.
  * @param out  Pointer to caller-allocated ArrowSchema struct

@@ -437,6 +437,32 @@ public:
         return metrics;
     }
 
+    /// Drop columns from the dataset's schema and commit a new manifest.
+    /// Metadata-only — data files remain until a later `compact_files()`
+    /// call rewrites them. Mutates this dataset in place; the handle
+    /// continues to point at the new version.
+    ///
+    /// `columns` must be non-empty. Throws lance::Error on failure (empty
+    /// list, unknown column, attempt to drop every column, commit
+    /// conflict, ...).
+    void drop_columns(const std::vector<std::string>& columns) {
+        std::vector<const char*> col_ptrs;
+        col_ptrs.reserve(columns.size());
+        for (const auto& c : columns) {
+            col_ptrs.push_back(c.c_str());
+        }
+        // Pass `col_ptrs.data()` unconditionally — matches the `update`
+        // and `merge_insert` siblings whose inputs are also required to
+        // be non-empty. The Rust layer rejects `num_columns == 0` before
+        // dereferencing the pointer, so an empty vector still surfaces
+        // INVALID_ARGUMENT with the precise "num_columns must be > 0"
+        // message rather than the misleading "columns must not be NULL".
+        if (lance_dataset_drop_columns(
+                handle_.get(), col_ptrs.data(), columns.size()) != 0) {
+            check_error();
+        }
+    }
+
     /// Export the schema as an Arrow C Data Interface struct.
     void schema(ArrowSchema* out) const {
         if (lance_dataset_schema(handle_.get(), out) != 0) {
