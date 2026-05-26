@@ -484,6 +484,81 @@ int32_t lance_dataset_drop_columns(
     size_t num_columns
 );
 
+/* ─── lance_dataset_alter_columns ─────────────────────────────────────────── */
+
+/**
+ * Tri-state nullability override for `LanceColumnAlteration`. The
+ * `UNCHANGED` discriminant is zero so a zero-initialised
+ * `LanceColumnAlteration` leaves nullability alone by default.
+ *
+ * Discriminants are pinned for ABI stability. Out-of-range values are
+ * rejected with `LANCE_ERR_INVALID_ARGUMENT` — that's why the field on
+ * `LanceColumnAlteration` is `int32_t`, not this enum directly.
+ */
+typedef enum {
+    /* Do not touch the column's existing nullability. */
+    LANCE_COLUMN_NULLABLE_UNCHANGED = 0,
+    /* Set the column to nullable. */
+    LANCE_COLUMN_NULLABLE_TRUE      = 1,
+    /* Set the column to non-nullable. Upstream verifies via a scan that no
+       row holds a NULL — the call fails if any do. */
+    LANCE_COLUMN_NULLABLE_FALSE     = 2,
+} LanceColumnNullableMode;
+
+/**
+ * A single alteration applied to one column. Every non-`path` field is
+ * optional via a sentinel:
+ *
+ *   - `rename = NULL` keeps the current name.
+ *   - `nullable_mode = LANCE_COLUMN_NULLABLE_UNCHANGED` keeps current nullability.
+ *   - `data_type = NULL` keeps the current data type.
+ *
+ * At least one of `rename`, `nullable_mode`, or `data_type` must request a
+ * change; an alteration that touches nothing is rejected at the FFI boundary.
+ *
+ * `data_type`, when non-NULL, borrows an Arrow C Data Interface `ArrowSchema`
+ * describing the target type. The struct is read by shared reference for the
+ * duration of the call; its `release` callback is never invoked.
+ */
+typedef struct LanceColumnAlteration {
+    /* Path to the existing column. Required, non-empty UTF-8. */
+    const char* path;
+    /* New column name, or NULL to keep the current name. */
+    const char* rename;
+    /* LanceColumnNullableMode discriminant. */
+    int32_t     nullable_mode;
+    /* New data type, or NULL to keep the current type. */
+    const struct ArrowSchema* data_type;
+} LanceColumnAlteration;
+
+/**
+ * Apply one or more column alterations and commit a new manifest. Rename and
+ * nullability-only changes are zero-copy and preserve any indices on the
+ * affected columns. A type change rewrites the column's data files and drops
+ * any indices that referenced it, mirroring upstream behaviour.
+ *
+ * Mutates `dataset` in place — the same handle remains valid afterward and
+ * sees the new version. Scanners already in flight against this dataset keep
+ * their pre-alteration view.
+ *
+ * @param dataset          Open dataset (not consumed). Mutated in place to
+ *                         see the new version. Must not be NULL.
+ * @param alterations      Array of `LanceColumnAlteration`. Must not be NULL.
+ * @param num_alterations  Length of `alterations`. Must be > 0.
+ * @return 0 on success, -1 on error. Error codes:
+ *         LANCE_ERR_INVALID_ARGUMENT for NULL/empty inputs, NULL or empty
+ *         `path`, non-UTF-8 strings, no-op alterations (all three optional
+ *         fields left at their sentinels), invalid `nullable_mode`
+ *         discriminant, unknown columns, type changes that aren't a valid
+ *         cast, or tightening nullability when existing rows hold NULLs;
+ *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
+ */
+int32_t lance_dataset_alter_columns(
+    LanceDataset* dataset,
+    const LanceColumnAlteration* alterations,
+    size_t num_alterations
+);
+
 /**
  * Export the dataset schema via Arrow C Data Interface.
  * @param out  Pointer to caller-allocated ArrowSchema struct

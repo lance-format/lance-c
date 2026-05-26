@@ -15,6 +15,7 @@
 //! - The caller is responsible for freeing returned strings with `lance_free_string()`.
 #![allow(clippy::missing_safety_doc)]
 
+mod alter_columns;
 mod async_dispatcher;
 mod batch;
 mod compact;
@@ -34,6 +35,7 @@ mod versions;
 mod writer;
 
 // Re-export all extern "C" symbols so they appear in the cdylib.
+pub use alter_columns::*;
 pub use batch::*;
 pub use compact::*;
 pub use dataset::*;

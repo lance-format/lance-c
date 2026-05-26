@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Arrow C Data Interface flag bits — mirror arrow_schema/arrow_c_data_interface.h
+ * so we don't depend on the full Arrow header just to read schema flags. */
+#define ARROW_FLAG_NULLABLE 2
+
 #define ASSERT(cond, msg)                                                      \
     do {                                                                       \
         if (!(cond)) {                                                         \
@@ -346,6 +350,76 @@ static void test_merge_insert(const char *write_uri) {
 }
 
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+ * exercises `lance_dataset_alter_columns` by relaxing the nullability of the
+ * `id` column (non-nullable in the fixture) to nullable. Must run before
+ * `test_drop_columns` removes `name`, but the alteration itself only touches
+ * `id`, so the column survives the subsequent drop. */
+static void test_alter_columns(const char *write_uri) {
+    printf("  test_alter_columns... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t v_before = lance_dataset_version(ds);
+
+    LanceColumnAlteration alt = {0};
+    alt.path          = "id";
+    alt.nullable_mode = LANCE_COLUMN_NULLABLE_TRUE;
+    int32_t rc = lance_dataset_alter_columns(ds, &alt, 1);
+    ASSERT(rc == 0, "alter_columns failed");
+    ASSERT(lance_dataset_version(ds) > v_before,
+           "alter_columns must bump the version");
+
+    /* Schema export to confirm `id` is now nullable. */
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    rc = lance_dataset_schema(ds, &schema);
+    ASSERT(rc == 0, "schema export failed");
+    ASSERT(schema.n_children > 0, "schema must have children");
+    int found_nullable_id = 0;
+    for (int64_t i = 0; i < schema.n_children; i++) {
+        struct ArrowSchema *child = schema.children[i];
+        if (!child) continue;
+        if (strcmp(child->name, "id") == 0) {
+            if ((child->flags & ARROW_FLAG_NULLABLE) != 0) found_nullable_id = 1;
+        }
+    }
+    if (schema.release) schema.release(&schema);
+    ASSERT(found_nullable_id, "id should be nullable after alter");
+
+    /* NULL alterations and num_alterations == 0 must be rejected. */
+    rc = lance_dataset_alter_columns(ds, NULL, 1);
+    ASSERT(rc == -1, "NULL alterations must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    rc = lance_dataset_alter_columns(ds, &alt, 0);
+    ASSERT(rc == -1, "num_alterations=0 must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    /* No-op alteration (all sentinels left at defaults) must be rejected. */
+    LanceColumnAlteration noop = {0};
+    noop.path = "id";
+    rc = lance_dataset_alter_columns(ds, &noop, 1);
+    ASSERT(rc == -1, "no-op alteration must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    /* Out-of-range nullable_mode discriminant must be rejected at the FFI
+     * boundary rather than transmuted into the repr(C) enum. */
+    LanceColumnAlteration bad_mode = {0};
+    bad_mode.path = "id";
+    bad_mode.nullable_mode = 99;
+    rc = lance_dataset_alter_columns(ds, &bad_mode, 1);
+    ASSERT(rc == -1, "invalid nullable_mode must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_drop_columns`. Drops the `name` column so the
  * dataset is left with `id` only; subsequent tests (`compact_files`,
  * `delete`) do not reference any dropped column. Must run after
@@ -500,6 +574,7 @@ int main(int argc, char **argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
+    test_alter_columns(write_uri);
     test_drop_columns(write_uri);
     test_compact_files(write_uri);
     test_delete(write_uri);

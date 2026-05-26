@@ -98,6 +98,32 @@ fn c_str(s: &str) -> CString {
     CString::new(s).unwrap()
 }
 
+/// Helper: build a tiny dataset whose `value` column is nullable AND contains
+/// at least one NULL. Used by tests that need to exercise upstream's
+/// nullability-tightening pre-scan failure path.
+fn create_dataset_with_nulls() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("with_nulls").to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Float32, true),
+    ]));
+    let ids = Int32Array::from(vec![1, 2, 3]);
+    let values = Float32Array::from(vec![Some(1.0), None, Some(3.0)]);
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(values)]).unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+    (tmp, uri)
+}
+
 /// Helper: scan to ArrowArrayStream and collect all rows.
 fn scan_all_rows(ds: *const LanceDataset) -> Vec<RecordBatch> {
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
@@ -6533,6 +6559,534 @@ fn test_drop_columns_empty_entry_rejected() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     let names = schema_field_names(ds);
     assert_eq!(names, vec!["id", "value", "label"]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ===========================================================================
+// lance_dataset_alter_columns
+// ===========================================================================
+
+/// Build an FFI ArrowSchema describing a single field of the given Arrow
+/// `DataType`. The returned struct owns its memory; the caller must keep it
+/// alive for the duration of any `lance_dataset_alter_columns` call that
+/// references it via `LanceColumnAlteration::data_type`. The placeholder
+/// field name is never inspected by the alter path — only the `format`
+/// string (i.e. the data type) is read out via `DataType::try_from`.
+fn ffi_schema_for(data_type: DataType) -> FFI_ArrowSchema {
+    let field = arrow_schema::Field::new("_", data_type, true);
+    FFI_ArrowSchema::try_from(&field).expect("Field -> FFI_ArrowSchema")
+}
+
+/// Convenience: build a `LanceColumnAlteration` with all-default sentinels.
+fn default_alteration(path: *const c_char) -> LanceColumnAlteration {
+    LanceColumnAlteration {
+        path,
+        rename: ptr::null(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: ptr::null(),
+    }
+}
+
+#[test]
+fn test_alter_columns_rename_only() {
+    let (_tmp, uri) = create_large_dataset(4);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let path = c_str("label");
+    let rename = c_str("tag");
+    let alt = LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: rename.as_ptr(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: ptr::null(),
+    };
+    let alts = [alt];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, 0);
+
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id", "value", "tag"]);
+    // Metadata-only rename preserves row count.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 4);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_relax_nullability() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // `id` is non-nullable in the fixture; relax it to nullable.
+    let path = c_str("id");
+    let alt = LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: ptr::null(),
+        nullable_mode: LanceColumnNullableMode::True as i32,
+        data_type: ptr::null(),
+    };
+    let alts = [alt];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, 0);
+
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    let rc = unsafe { lance_dataset_schema(ds, &mut ffi_schema) };
+    assert_eq!(rc, 0);
+    let arrow_schema = arrow_schema::Schema::try_from(&ffi_schema).unwrap();
+    let id_field = arrow_schema.field_with_name("id").unwrap();
+    assert!(id_field.is_nullable(), "id should be nullable after alter");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_tighten_nullability_no_nulls() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // `label` is nullable in the fixture but no rows hold a NULL, so
+    // tightening to non-nullable should succeed.
+    let path = c_str("label");
+    let alt = LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: ptr::null(),
+        nullable_mode: LanceColumnNullableMode::False as i32,
+        data_type: ptr::null(),
+    };
+    let alts = [alt];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, 0);
+
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    let rc = unsafe { lance_dataset_schema(ds, &mut ffi_schema) };
+    assert_eq!(rc, 0);
+    let arrow_schema = arrow_schema::Schema::try_from(&ffi_schema).unwrap();
+    let label_field = arrow_schema.field_with_name("label").unwrap();
+    assert!(
+        !label_field.is_nullable(),
+        "label should be non-nullable after tightening"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_type_change_int32_to_int64() {
+    let (_tmp, uri) = create_large_dataset(4);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // `id` is Int32 in the fixture; upcast to Int64.
+    let new_type = ffi_schema_for(DataType::Int64);
+    let path = c_str("id");
+    let alt = LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: ptr::null(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: &new_type as *const _,
+    };
+    let alts = [alt];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, 0);
+
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    let rc = unsafe { lance_dataset_schema(ds, &mut ffi_schema) };
+    assert_eq!(rc, 0);
+    let arrow_schema = arrow_schema::Schema::try_from(&ffi_schema).unwrap();
+    let id_field = arrow_schema.field_with_name("id").unwrap();
+    assert_eq!(id_field.data_type(), &DataType::Int64);
+
+    // Data is preserved (and now Int64-typed).
+    let indices: [u64; 4] = [0, 1, 2, 3];
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe {
+        lance_dataset_take(
+            ds,
+            indices.as_ptr(),
+            indices.len(),
+            ptr::null(),
+            &mut stream,
+        )
+    };
+    assert_eq!(rc, 0);
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let batches: Vec<_> = reader.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    let mut ids: Vec<i64> = Vec::new();
+    for b in &batches {
+        let col = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            ids.push(col.value(i));
+        }
+    }
+    assert_eq!(ids, vec![0i64, 1, 2, 3]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_rename_and_relax_nullable_combined() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let path = c_str("id");
+    let rename = c_str("row_id");
+    let alt = LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: rename.as_ptr(),
+        nullable_mode: LanceColumnNullableMode::True as i32,
+        data_type: ptr::null(),
+    };
+    let alts = [alt];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, 0);
+
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    let rc = unsafe { lance_dataset_schema(ds, &mut ffi_schema) };
+    assert_eq!(rc, 0);
+    let arrow_schema = arrow_schema::Schema::try_from(&ffi_schema).unwrap();
+    let renamed = arrow_schema.field_with_name("row_id").unwrap();
+    assert!(renamed.is_nullable());
+    assert!(arrow_schema.field_with_name("id").is_err());
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_multiple_per_call() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let p1 = c_str("value");
+    let r1 = c_str("val");
+    let p2 = c_str("label");
+    let r2 = c_str("tag");
+    let alts = [
+        LanceColumnAlteration {
+            path: p1.as_ptr(),
+            rename: r1.as_ptr(),
+            nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+            data_type: ptr::null(),
+        },
+        LanceColumnAlteration {
+            path: p2.as_ptr(),
+            rename: r2.as_ptr(),
+            nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+            data_type: ptr::null(),
+        },
+    ];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, 0);
+
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id", "val", "tag"]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let path = c_str("label");
+    let rename = c_str("tag");
+    let alt = LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: rename.as_ptr(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: ptr::null(),
+    };
+    let alts = [alt];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(
+        v_after > v_before,
+        "version should increase: before={v_before}, after={v_after}"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_unknown_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let path = c_str("no_such_column");
+    let rename = c_str("whatever");
+    let alt = LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: rename.as_ptr(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: ptr::null(),
+    };
+    let alts = [alt];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    // Dataset is untouched on the error path.
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id", "value", "label"]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_type_change_incompatible_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // Int32 -> Utf8 is not a valid Arrow upcast/downcast — upstream rejects.
+    let new_type = ffi_schema_for(DataType::Utf8);
+    let path = c_str("id");
+    let alt = LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: ptr::null(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: &new_type as *const _,
+    };
+    let alts = [alt];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_noop_alteration_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let path = c_str("id");
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let alts = [default_alteration(path.as_ptr())];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    // No version bump and no schema change on the error path.
+    assert_eq!(unsafe { lance_dataset_version(ds) }, v_before);
+    assert_eq!(schema_field_names(ds), vec!["id", "value", "label"]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_null_dataset_rejected() {
+    let path = c_str("id");
+    let rename = c_str("row_id");
+    let alts = [LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: rename.as_ptr(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: ptr::null(),
+    }];
+    let rc = unsafe { lance_dataset_alter_columns(ptr::null_mut(), alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_alter_columns_null_alterations_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let rc = unsafe { lance_dataset_alter_columns(ds, ptr::null(), 1) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_zero_count_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let path = c_str("id");
+    let rename = c_str("row_id");
+    let alts = [LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: rename.as_ptr(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: ptr::null(),
+    }];
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_version(ds) }, v_before);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_null_path_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let rename = c_str("whatever");
+    let alts = [LanceColumnAlteration {
+        path: ptr::null(),
+        rename: rename.as_ptr(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: ptr::null(),
+    }];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_empty_path_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let empty = c_str("");
+    let rename = c_str("whatever");
+    let alts = [LanceColumnAlteration {
+        path: empty.as_ptr(),
+        rename: rename.as_ptr(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: ptr::null(),
+    }];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_empty_rename_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // Distinct from `rename = NULL` (which means "keep current name") — an
+    // explicit empty string is a malformed request.
+    let path = c_str("id");
+    let empty = c_str("");
+    let alts = [LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: empty.as_ptr(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: ptr::null(),
+    }];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_invalid_nullable_mode_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // An out-of-range discriminant (e.g. 99) must be rejected at the FFI
+    // boundary rather than transmuted into the repr(C) enum. This locks in
+    // the discriminant-validation contract.
+    let path = c_str("id");
+    let alts = [LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: ptr::null(),
+        nullable_mode: 99,
+        data_type: ptr::null(),
+    }];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_released_schema_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // An uninitialised / already-released `FFI_ArrowSchema` has both its
+    // `release` callback and its `format` field set to NULL. Passing it as
+    // `data_type` must surface as INVALID_ARGUMENT rather than aborting the
+    // host process via the arrow-rs `assert!(!format.is_null())`.
+    let empty_schema = FFI_ArrowSchema::empty();
+    let path = c_str("id");
+    let alts = [LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: ptr::null(),
+        nullable_mode: LanceColumnNullableMode::Unchanged as i32,
+        data_type: &empty_schema as *const _,
+    }];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_alter_columns_tighten_nullability_with_nulls_rejected() {
+    // The `value` column actually carries a NULL, so upstream's pre-write
+    // scan must reject the attempt to make it non-nullable.
+    let (_tmp, uri) = create_dataset_with_nulls();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let path = c_str("value");
+    let alts = [LanceColumnAlteration {
+        path: path.as_ptr(),
+        rename: ptr::null(),
+        nullable_mode: LanceColumnNullableMode::False as i32,
+        data_type: ptr::null(),
+    }];
+    let rc = unsafe { lance_dataset_alter_columns(ds, alts.as_ptr(), alts.len()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 
     unsafe { lance_dataset_close(ds) };
 }
