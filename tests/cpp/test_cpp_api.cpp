@@ -18,6 +18,9 @@
 #include <string>
 #include <vector>
 
+// Arrow C Data Interface flag bits — see arrow_schema/arrow_c_data_interface.h.
+#define ARROW_FLAG_NULLABLE 2
+
 #define TEST(name) printf("  %s... ", #name)
 #define PASS()     printf("OK\n")
 
@@ -398,6 +401,71 @@ static void test_merge_insert(const std::string& dst_uri) {
 }
 
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
+// exercises `Dataset::alter_columns`. Relaxes the nullability of `id` (non-
+// nullable in the fixture) to nullable; the column survives the subsequent
+// drop_columns({"name"}) test untouched.
+static void test_alter_columns(const std::string& dst_uri) {
+    TEST(test_alter_columns);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t v_before = ds.version();
+
+    lance::ColumnAlteration alt;
+    alt.path          = "id";
+    alt.nullable_mode = LANCE_COLUMN_NULLABLE_TRUE;
+    ds.alter_columns({alt});
+    assert(ds.version() > v_before
+           && "alter_columns must bump the version");
+
+    // Confirm the schema reflects the relaxed nullability.
+    ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ds.schema(&schema);
+    assert(schema.n_children > 0 && "schema must have children");
+    bool id_is_nullable = false;
+    for (int64_t i = 0; i < schema.n_children; i++) {
+        ArrowSchema* child = schema.children[i];
+        if (!child) continue;
+        if (strcmp(child->name, "id") == 0) {
+            id_is_nullable = (child->flags & ARROW_FLAG_NULLABLE) != 0;
+        }
+    }
+    if (schema.release) schema.release(&schema);
+    assert(id_is_nullable && "id should be nullable after alter");
+
+    // No-op alteration (all sentinels left at defaults) must throw with
+    // INVALID_ARGUMENT.
+    bool caught_noop = false;
+    try {
+        lance::ColumnAlteration noop;
+        noop.path = "id";
+        ds.alter_columns({noop});
+    } catch (const lance::Error& e) {
+        caught_noop = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_noop);
+
+    // Out-of-range nullable_mode discriminant must throw with INVALID_ARGUMENT.
+    // Cast `99` through the enum type to verify the C++ wrapper forwards it
+    // verbatim rather than silently clamping.
+    bool caught_bad_mode = false;
+    try {
+        lance::ColumnAlteration bad_mode;
+        bad_mode.path = "id";
+        bad_mode.nullable_mode =
+            static_cast<LanceColumnNullableMode>(99);
+        ds.alter_columns({bad_mode});
+    } catch (const lance::Error& e) {
+        caught_bad_mode = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_bad_mode);
+
+    PASS();
+}
+
+// Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::drop_columns`. Drops the `name` column so the dataset
 // is left with `id` only; subsequent tests (`compact_files`, `delete_rows`)
 // do not reference any dropped column. Must run after `test_update` /
@@ -525,6 +593,7 @@ int main(int argc, char** argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
+    test_alter_columns(write_uri);
     test_drop_columns(write_uri);
     test_compact_files(write_uri);
     test_delete_rows(write_uri);

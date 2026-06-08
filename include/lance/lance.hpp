@@ -121,6 +121,21 @@ struct WriteParams {
     bool                       enable_stable_row_ids = false;
 };
 
+// ─── Column alteration ───────────────────────────────────────────────────────
+
+/// A single alteration applied to one column by `Dataset::alter_columns`.
+/// Every non-`path` field is optional; at least one must request a change.
+///
+/// `data_type`, when non-null, borrows an Arrow C Data Interface `ArrowSchema`
+/// describing the target type. The caller owns it and must keep it alive for
+/// the duration of the `alter_columns` call; the wrapper does not release it.
+struct ColumnAlteration {
+    std::string                path;
+    std::optional<std::string> rename;
+    LanceColumnNullableMode    nullable_mode = LANCE_COLUMN_NULLABLE_UNCHANGED;
+    const ArrowSchema*         data_type     = nullptr;
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -459,6 +474,39 @@ public:
         // message rather than the misleading "columns must not be NULL".
         if (lance_dataset_drop_columns(
                 handle_.get(), col_ptrs.data(), columns.size()) != 0) {
+            check_error();
+        }
+    }
+
+    /// Apply one or more column alterations (rename / nullability / type
+    /// change) and commit a new manifest. Rename and nullability-only
+    /// changes are zero-copy and preserve any indices on the affected
+    /// columns; a type change rewrites the column's data files and drops
+    /// any indices that referenced it.
+    ///
+    /// `alterations` must be non-empty and each entry must request at least
+    /// one change. Any `data_type` pointer must remain valid for the
+    /// duration of this call. Throws lance::Error on failure (empty list,
+    /// no-op alteration, unknown column, incompatible cast, tightening
+    /// nullability when NULLs exist, commit conflict, ...).
+    void alter_columns(const std::vector<ColumnAlteration>& alterations) {
+        // The C strings we install in each entry borrow from `alterations`
+        // (the caller's std::strings), which outlive this call. The entries
+        // themselves are copied by value into `raw`, so any reallocation
+        // during push_back just moves the raw bytes — pointer values are
+        // preserved. `reserve` is a performance hint, not a lifetime guard.
+        std::vector<LanceColumnAlteration> raw;
+        raw.reserve(alterations.size());
+        for (const auto& a : alterations) {
+            LanceColumnAlteration entry{};
+            entry.path          = a.path.c_str();
+            entry.rename        = a.rename ? a.rename->c_str() : nullptr;
+            entry.nullable_mode = static_cast<int32_t>(a.nullable_mode);
+            entry.data_type     = a.data_type;
+            raw.push_back(entry);
+        }
+        if (lance_dataset_alter_columns(
+                handle_.get(), raw.data(), raw.size()) != 0) {
             check_error();
         }
     }
