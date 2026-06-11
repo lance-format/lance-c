@@ -522,6 +522,97 @@ static void test_drop_columns(const std::string& dst_uri) {
     PASS();
 }
 
+// Re-opens the dataset (reduced to `id` only by `test_drop_columns`) and
+// exercises the three `Dataset::add_columns_*` wrappers. The positive path
+// uses the SQL variant (strings only); the nulls/stream variants are
+// smoke-checked through their argument rejections, since their happy paths are
+// covered by the Rust integration tests. The added `id_doubled` column is
+// harmless to the subsequent compact/delete steps. Must run after
+// `test_drop_columns`.
+static void test_add_columns(const std::string& dst_uri) {
+    TEST(test_add_columns);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t v_before = ds.version();
+
+    // Snapshot the field count before the add. (If ds.schema() threw, the
+    // zero-initialised struct's release stays null, so there is no leak; here
+    // the handle is freshly opened and valid, so the export is expected to
+    // succeed.)
+    ArrowSchema schema_before;
+    memset(&schema_before, 0, sizeof(schema_before));
+    ds.schema(&schema_before);
+    int64_t fields_before = schema_before.n_children;
+    if (schema_before.release) schema_before.release(&schema_before);
+
+    // SQL variant: derive `id_doubled = id * 2` from the surviving `id`.
+    ds.add_columns_sql({{"id_doubled", "id * 2"}});
+    assert(ds.version() > v_before
+           && "add_columns_sql must bump the version");
+
+    ArrowSchema schema_after;
+    memset(&schema_after, 0, sizeof(schema_after));
+    ds.schema(&schema_after);
+    int64_t fields_after = schema_after.n_children;
+    if (schema_after.release) schema_after.release(&schema_after);
+    assert(fields_after == fields_before + 1
+           && "schema field count must increase by 1 after add");
+
+    // Empty SQL column list must throw with INVALID_ARGUMENT.
+    bool caught_empty = false;
+    try {
+        ds.add_columns_sql({});
+    } catch (const lance::Error& e) {
+        caught_empty = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_empty);
+
+    // An empty column name must throw with INVALID_ARGUMENT.
+    bool caught_empty_name = false;
+    try {
+        ds.add_columns_sql({{"", "id * 2"}});
+    } catch (const lance::Error& e) {
+        caught_empty_name = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_empty_name);
+
+    // An empty expression must throw with INVALID_ARGUMENT. (A NULL expression
+    // is not representable here — `SqlColumn::expression` is a std::string — so
+    // the NULL-pointer case is covered by the C test instead.)
+    bool caught_empty_expr = false;
+    try {
+        ds.add_columns_sql({{"x", ""}});
+    } catch (const lance::Error& e) {
+        caught_empty_expr = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_empty_expr);
+
+    // AllNulls with a NULL schema pointer must throw with INVALID_ARGUMENT.
+    bool caught_null_schema = false;
+    try {
+        ds.add_columns_nulls(nullptr);
+    } catch (const lance::Error& e) {
+        caught_null_schema = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_null_schema);
+
+    // Stream with a NULL stream pointer must throw with INVALID_ARGUMENT.
+    bool caught_null_stream = false;
+    try {
+        ds.add_columns_stream(nullptr);
+    } catch (const lance::Error& e) {
+        caught_null_stream = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught_null_stream);
+
+    PASS();
+}
+
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::compact_files`. The smoke fixture is a single fragment
 // so the default planner has nothing to compact — we expect a no-op (zero
@@ -595,6 +686,7 @@ int main(int argc, char** argv) {
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);
     test_drop_columns(write_uri);
+    test_add_columns(write_uri);
     test_compact_files(write_uri);
     test_delete_rows(write_uri);
 

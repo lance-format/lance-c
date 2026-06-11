@@ -15,7 +15,7 @@ use arrow::ffi::from_ffi;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;
-use arrow_array::{Float32Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_c::*;
@@ -3312,31 +3312,47 @@ fn test_dataset_write_null_args_return_error() {
 /// Wrapping this in an `FFI_ArrowArrayStream` lets a test observe whether the
 /// stream's `release` callback was invoked: dropping the boxed reader (via
 /// `release` on the FFI side) fires `Drop` and increments the counter.
-struct CountingReader {
-    inner: arrow::record_batch::RecordBatchIterator<
-        std::vec::IntoIter<arrow::error::Result<RecordBatch>>,
-    >,
+struct CountingReader<R: RecordBatchReader> {
+    inner: R,
     drop_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl Drop for CountingReader {
+impl<R: RecordBatchReader> Drop for CountingReader<R> {
     fn drop(&mut self) {
         self.drop_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-impl Iterator for CountingReader {
+impl<R: RecordBatchReader> Iterator for CountingReader<R> {
     type Item = arrow::error::Result<RecordBatch>;
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
     }
 }
 
-impl RecordBatchReader for CountingReader {
+impl<R: RecordBatchReader> RecordBatchReader for CountingReader<R> {
     fn schema(&self) -> Arc<Schema> {
         self.inner.schema()
     }
+}
+
+/// Like `new_column_stream`, but the reader's `Drop` increments a counter so a
+/// test can prove the stream is consumed (released) on a given path. The single
+/// `name` column avoids colliding with the fixtures' existing columns.
+fn make_counted_column_stream(
+    name: &str,
+    values: Vec<i32>,
+) -> (FFI_ArrowArrayStream, Arc<std::sync::atomic::AtomicUsize>) {
+    let drop_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, true)]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap();
+    let reader = CountingReader {
+        inner: arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        drop_count: drop_count.clone(),
+    };
+    (FFI_ArrowArrayStream::new(Box::new(reader)), drop_count)
 }
 
 /// Build a `(stream, drop_counter)` pair where the stream wraps a single-batch
@@ -7089,4 +7105,841 @@ fn test_alter_columns_tighten_nullability_with_nulls_rejected() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 
     unsafe { lance_dataset_close(ds) };
+}
+
+// ---------------------------------------------------------------------------
+// lance_dataset_add_columns_{sql,nulls,stream} tests
+// ---------------------------------------------------------------------------
+
+/// Build a `LanceSqlColumn` from two live `CString`s. The caller must keep the
+/// `CString`s alive for as long as the returned struct is used.
+fn sql_column(name: &CString, expression: &CString) -> LanceSqlColumn {
+    LanceSqlColumn {
+        name: name.as_ptr(),
+        expression: expression.as_ptr(),
+    }
+}
+
+/// Scan the dataset and build a `key -> value` map, casting both columns to
+/// i64 so comparisons are independent of the exact arithmetic result type and
+/// robust to any fragment/row scan ordering. A NULL value maps to `None`.
+fn collect_i64_pairs(
+    ds: *const LanceDataset,
+    key: &str,
+    value: &str,
+) -> std::collections::HashMap<i64, Option<i64>> {
+    let batches = scan_all_rows(ds);
+    let mut map = std::collections::HashMap::new();
+    for batch in &batches {
+        let key_col =
+            arrow::compute::cast(batch.column_by_name(key).unwrap(), &DataType::Int64).unwrap();
+        let key_arr = key_col
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        let val_col =
+            arrow::compute::cast(batch.column_by_name(value).unwrap(), &DataType::Int64).unwrap();
+        let val_arr = val_col
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let v = if val_arr.is_null(i) {
+                None
+            } else {
+                Some(val_arr.value(i))
+            };
+            map.insert(key_arr.value(i), v);
+        }
+    }
+    map
+}
+
+// ── SQL variant ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_add_columns_sql_single() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("id_x2");
+    let expr = c_str("id * 2");
+    let cols = [sql_column(&name, &expr)];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, 0);
+
+    // New column appears; row count is unchanged.
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id", "value", "label", "id_x2"]);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 5);
+
+    // Values are computed from the existing `id` column.
+    let pairs = collect_i64_pairs(ds, "id", "id_x2");
+    for k in 0..5i64 {
+        assert_eq!(pairs.get(&k), Some(&Some(k * 2)));
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_multiple_per_call() {
+    let (_tmp, uri) = create_large_dataset(4);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let n1 = c_str("id_plus");
+    let e1 = c_str("id + 10");
+    let n2 = c_str("id_const");
+    let e2 = c_str("100");
+    let cols = [sql_column(&n1, &e1), sql_column(&n2, &e2)];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, 0);
+
+    let names = schema_field_names(ds);
+    assert!(names.contains(&"id_plus".to_string()));
+    assert!(names.contains(&"id_const".to_string()));
+
+    let plus = collect_i64_pairs(ds, "id", "id_plus");
+    let konst = collect_i64_pairs(ds, "id", "id_const");
+    for k in 0..4i64 {
+        assert_eq!(plus.get(&k), Some(&Some(k + 10)));
+        assert_eq!(konst.get(&k), Some(&Some(100)));
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let name = c_str("c");
+    let expr = c_str("id + 1");
+    let cols = [sql_column(&name, &expr)];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(v_after > v_before, "version should increase");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_honors_batch_size() {
+    // A small explicit batch size must still produce correct results across
+    // the whole dataset (the scan is chunked, the output is not).
+    let (_tmp, uri) = create_large_dataset(7);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("id_x2");
+    let expr = c_str("id * 2");
+    let cols = [sql_column(&name, &expr)];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 2) };
+    assert_eq!(rc, 0);
+
+    let pairs = collect_i64_pairs(ds, "id", "id_x2");
+    for k in 0..7i64 {
+        assert_eq!(pairs.get(&k), Some(&Some(k * 2)));
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_null_dataset_rejected() {
+    let name = c_str("c");
+    let expr = c_str("id + 1");
+    let cols = [sql_column(&name, &expr)];
+    let rc =
+        unsafe { lance_dataset_add_columns_sql(ptr::null_mut(), cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_add_columns_sql_null_columns_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, ptr::null(), 1, 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_zero_count_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("c");
+    let expr = c_str("id + 1");
+    let cols = [sql_column(&name, &expr)];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), 0, 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_null_name_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let expr = c_str("id + 1");
+    let cols = [LanceSqlColumn {
+        name: ptr::null(),
+        expression: expr.as_ptr(),
+    }];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_empty_name_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("");
+    let expr = c_str("id + 1");
+    let cols = [sql_column(&name, &expr)];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_null_expression_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("c");
+    let cols = [LanceSqlColumn {
+        name: name.as_ptr(),
+        expression: ptr::null(),
+    }];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_empty_expression_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("c");
+    let expr = c_str("");
+    let cols = [sql_column(&name, &expr)];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_non_utf8_name_rejected() {
+    // A non-UTF-8 `name` must surface as INVALID_ARGUMENT (parse_c_string maps
+    // the Utf8Error to InvalidInput), not panic. `CString` holds arbitrary
+    // non-NUL bytes, so it carries the invalid UTF-8 across the FFI boundary.
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let bad_name = CString::new([0xFFu8, 0xFE]).unwrap();
+    let expr = c_str("id * 2");
+    let cols = [LanceSqlColumn {
+        name: bad_name.as_ptr(),
+        expression: expr.as_ptr(),
+    }];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_non_utf8_expression_rejected() {
+    // Symmetric with the name case: a non-UTF-8 `expression` goes through the
+    // same `parse_required_field` path and must surface as INVALID_ARGUMENT.
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("c");
+    let bad_expr = CString::new([0xFFu8, 0xFE]).unwrap();
+    let cols = [LanceSqlColumn {
+        name: name.as_ptr(),
+        expression: bad_expr.as_ptr(),
+    }];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_malformed_expr_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("c");
+    let expr = c_str("id +* 2");
+    let cols = [sql_column(&name, &expr)];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_unknown_column_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("c");
+    let expr = c_str("does_not_exist + 1");
+    let cols = [sql_column(&name, &expr)];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, -1);
+    // A non-existent column is resolved by the lance-datafusion planner, which
+    // raises a schema error (`Error::Schema`) — the same upstream path as
+    // `lance_dataset_delete`'s unknown-column predicate. We don't re-classify
+    // it at the FFI boundary, so it surfaces as `Internal`, distinct from a
+    // *syntax* error, which the planner wraps as `InvalidInput`. If upstream
+    // ever tightens this to InvalidInput, tighten this assertion too.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_name_collision_rejected() {
+    // A new column whose name matches an existing column is rejected.
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("id");
+    let expr = c_str("id + 1");
+    let cols = [sql_column(&name, &expr)];
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_sql_batch_size_overflow_rejected() {
+    // A batch_size beyond u32::MAX must be rejected rather than silently
+    // wrapped. (Only exercisable where u64 > u32::MAX, i.e. 64-bit hosts.)
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let name = c_str("c");
+    let expr = c_str("id + 1");
+    let cols = [sql_column(&name, &expr)];
+    let too_big = u32::MAX as u64 + 1;
+    let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), too_big) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ── AllNulls variant ───────────────────────────────────────────────────────
+
+#[test]
+fn test_add_columns_nulls_single() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let new_schema = Schema::new(vec![Field::new("extra", DataType::Int64, true)]);
+    let ffi = schema_to_ffi(&new_schema);
+    let rc = unsafe { lance_dataset_add_columns_nulls(ds, &ffi as *const _) };
+    assert_eq!(rc, 0);
+
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id", "value", "label", "extra"]);
+    // Row count is unchanged — this is a metadata-only add.
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 5);
+
+    // Every row in the new column is NULL.
+    let batches = scan_all_rows(ds);
+    let total_nulls: usize = batches
+        .iter()
+        .map(|b| b.column_by_name("extra").unwrap().null_count())
+        .sum();
+    assert_eq!(total_nulls, 5);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_nulls_multiple_fields() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let new_schema = Schema::new(vec![
+        Field::new("extra_int", DataType::Int64, true),
+        Field::new("extra_str", DataType::Utf8, true),
+    ]);
+    let ffi = schema_to_ffi(&new_schema);
+    let rc = unsafe { lance_dataset_add_columns_nulls(ds, &ffi as *const _) };
+    assert_eq!(rc, 0);
+
+    let names = schema_field_names(ds);
+    assert!(names.contains(&"extra_int".to_string()));
+    assert!(names.contains(&"extra_str".to_string()));
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_nulls_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let new_schema = Schema::new(vec![Field::new("extra", DataType::Int64, true)]);
+    let ffi = schema_to_ffi(&new_schema);
+    let rc = unsafe { lance_dataset_add_columns_nulls(ds, &ffi as *const _) };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(v_after > v_before, "version should increase");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_nulls_null_dataset_rejected() {
+    let new_schema = Schema::new(vec![Field::new("extra", DataType::Int64, true)]);
+    let ffi = schema_to_ffi(&new_schema);
+    let rc = unsafe { lance_dataset_add_columns_nulls(ptr::null_mut(), &ffi as *const _) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_add_columns_nulls_null_schema_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let rc = unsafe { lance_dataset_add_columns_nulls(ds, ptr::null()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_nulls_released_schema_rejected() {
+    // An uninitialised / already-released `FFI_ArrowSchema` has both its
+    // `release` callback and `format` field NULL. It must surface as
+    // INVALID_ARGUMENT rather than aborting via the arrow-rs assert.
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let empty_schema = FFI_ArrowSchema::empty();
+    let rc = unsafe { lance_dataset_add_columns_nulls(ds, &empty_schema as *const _) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_nulls_non_utf8_format_rejected() {
+    // A non-NULL but non-UTF-8 top-level `format` must be rejected at the FFI
+    // boundary rather than aborting via arrow-rs's `format().to_str().expect()`
+    // under `panic = "abort"`.
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // Hand-build a minimal `FFI_ArrowSchema` that owns no arrow-managed memory:
+    // an empty struct with a no-op `release` we install, and `format` pointed at
+    // non-UTF-8 bytes we own. This avoids overwriting an arrow-allocated
+    // `format` pointer (whose producer release would then double-free against
+    // our `CString` and corrupt the heap).
+    unsafe extern "C" fn noop_release(_: *mut FFI_ArrowSchema) {}
+    let bad_format = CString::new([0xFFu8, 0xFE]).unwrap();
+    let mut ffi = FFI_ArrowSchema::empty();
+    ffi.format = bad_format.as_ptr();
+    ffi.release = Some(noop_release);
+    let rc = unsafe { lance_dataset_add_columns_nulls(ds, &ffi as *const _) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_nulls_non_nullable_field_rejected() {
+    // An all-null column cannot be non-nullable — upstream rejects it.
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let new_schema = Schema::new(vec![Field::new("extra", DataType::Int64, false)]);
+    let ffi = schema_to_ffi(&new_schema);
+    let rc = unsafe { lance_dataset_add_columns_nulls(ds, &ffi as *const _) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_nulls_name_collision_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // `value` already exists in the fixture.
+    let new_schema = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
+    let ffi = schema_to_ffi(&new_schema);
+    let rc = unsafe { lance_dataset_add_columns_nulls(ds, &ffi as *const _) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_nulls_legacy_dataset_not_supported() {
+    // Adding all-null columns is metadata-only on the modern format, but the
+    // legacy (0.1) file format can't represent missing columns that way, so
+    // upstream returns NotSupported → LANCE_ERR_NOT_SUPPORTED. This is the one
+    // documented error code the other tests don't reach, so write a legacy
+    // dataset explicitly to exercise it.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("legacy_ds").to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        let params = lance::dataset::WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::Legacy),
+            ..Default::default()
+        };
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(params),
+        )
+        .await
+        .unwrap();
+    });
+
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let new_schema = Schema::new(vec![Field::new("extra", DataType::Int64, true)]);
+    let ffi = schema_to_ffi(&new_schema);
+    let rc = unsafe { lance_dataset_add_columns_nulls(ds, &ffi as *const _) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ── Stream variant ─────────────────────────────────────────────────────────
+
+/// Build an `FFI_ArrowArrayStream` carrying a single Int32 column named `name`
+/// with the given values — the precomputed data for a new column.
+fn new_column_stream(name: &str, values: Vec<i32>) -> FFI_ArrowArrayStream {
+    let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, true)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap();
+    batch_to_ffi_stream(batch)
+}
+
+#[test]
+fn test_add_columns_stream_single() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // Storage order matches id order (single fragment written 0..5).
+    let mut stream = new_column_stream("extra", vec![1000, 1001, 1002, 1003, 1004]);
+    let rc = unsafe { lance_dataset_add_columns_stream(ds, &mut stream, 0) };
+    assert_eq!(rc, 0);
+
+    let names = schema_field_names(ds);
+    assert_eq!(names, vec!["id", "value", "label", "extra"]);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 5);
+
+    let pairs = collect_i64_pairs(ds, "id", "extra");
+    for k in 0..5i64 {
+        assert_eq!(pairs.get(&k), Some(&Some(1000 + k)));
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_stream_multi_fragment() {
+    // The stream is sliced across fragment boundaries (5 + 5 rows).
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let values: Vec<i32> = (0..10).map(|i| 1000 + i).collect();
+    let mut stream = new_column_stream("extra", values);
+    let rc = unsafe { lance_dataset_add_columns_stream(ds, &mut stream, 0) };
+    assert_eq!(rc, 0);
+
+    let pairs = collect_i64_pairs(ds, "id", "extra");
+    for k in 0..10i64 {
+        assert_eq!(pairs.get(&k), Some(&Some(1000 + k)));
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_stream_honors_batch_size() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let values: Vec<i32> = (0..10).map(|i| 2000 + i).collect();
+    let mut stream = new_column_stream("extra", values);
+    let rc = unsafe { lance_dataset_add_columns_stream(ds, &mut stream, 3) };
+    assert_eq!(rc, 0);
+
+    let pairs = collect_i64_pairs(ds, "id", "extra");
+    for k in 0..10i64 {
+        assert_eq!(pairs.get(&k), Some(&Some(2000 + k)));
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_stream_bumps_version() {
+    let (_tmp, uri) = create_large_dataset(3);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let v_before = unsafe { lance_dataset_version(ds) };
+    let mut stream = new_column_stream("extra", vec![7, 8, 9]);
+    let rc = unsafe { lance_dataset_add_columns_stream(ds, &mut stream, 0) };
+    assert_eq!(rc, 0);
+    let v_after = unsafe { lance_dataset_version(ds) };
+    assert!(v_after > v_before, "version should increase");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+// (The NULL-dataset path is covered by `test_add_columns_stream_null_dataset_consumes_stream`
+// below, which also proves the stream is consumed on that error path.)
+
+#[test]
+fn test_add_columns_stream_null_stream_rejected() {
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let rc = unsafe { lance_dataset_add_columns_stream(ds, ptr::null_mut(), 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_stream_row_count_mismatch_rejected() {
+    // The stream supplies fewer rows than the dataset has — upstream rejects
+    // the misaligned splice.
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // 3 stream rows vs 5 dataset rows. The error fires *inside* `add_columns`
+    // (a different drop point than the early-return paths), so use the counted
+    // stream to also prove the reader is released there.
+    let (mut stream, drop_count) = make_counted_column_stream("extra", vec![1, 2, 3]);
+    let rc = unsafe { lance_dataset_add_columns_stream(ds, &mut stream, 0) };
+    assert_eq!(rc, -1);
+    // Upstream `add_columns_from_stream` raises this via `Error::invalid_input`
+    // ("Stream ended before producing values for all rows"), so it maps to
+    // InvalidArgument — unlike the SQL unknown-column path, which is a schema
+    // error (Internal). If upstream re-classifies it, update this assertion.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_stream_name_collision_rejected() {
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // A stream column named `id` collides with the existing column.
+    let mut stream = new_column_stream("id", vec![1, 2, 3, 4, 5]);
+    let rc = unsafe { lance_dataset_add_columns_stream(ds, &mut stream, 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_stream_batch_size_overflow_rejected() {
+    // Mirrors the SQL overflow test: a batch_size beyond u32::MAX is rejected
+    // rather than silently wrapped. `from_raw` runs before the batch_size check,
+    // so the stream must still be consumed — proven via the drop counter (a bare
+    // `release.is_none()` check would be vacuous, since `from_raw` clears that
+    // slot unconditionally).
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let (mut stream, drop_count) = make_counted_stream(&write_schema());
+    let too_big = u32::MAX as u64 + 1;
+    let rc = unsafe { lance_dataset_add_columns_stream(ds, &mut stream, too_big) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_stream_missing_callback_rejected() {
+    // A stream missing a mandatory CADI callback must be rejected at the FFI
+    // boundary rather than aborting the process via an `unwrap()` deep inside
+    // arrow-rs (which only guards against a NULL `release`). Cover both the
+    // `get_schema` (construction) and `get_next` (iteration) callbacks, since
+    // they abort on different arrow-rs code paths. The drop counter proves our
+    // manual `release_fn(stream)` actually frees the reader on this path (which
+    // does not go through `from_raw`).
+    let (_tmp, uri) = create_large_dataset(5);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    for sabotage in ["get_schema", "get_next"] {
+        let (mut stream, drop_count) = make_counted_stream(&write_schema());
+        match sabotage {
+            "get_schema" => stream.get_schema = None,
+            "get_next" => stream.get_next = None,
+            other => unreachable!("unknown sabotage target: {other}"),
+        }
+        let rc = unsafe { lance_dataset_add_columns_stream(ds, &mut stream, 0) };
+        assert_eq!(rc, -1, "{sabotage}=None must be rejected");
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert_stream_consumed(&stream, &drop_count);
+        // We also null the caller's `release` slot so a non-compliant producer
+        // cannot trigger a second release.
+        assert!(
+            stream.release.is_none(),
+            "{sabotage}: release slot must be cleared"
+        );
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_stream_already_released_rejected() {
+    // A stream with `release == None` is the CADI "already released" sentinel
+    // (the first conjunct of the callback guard). It must be rejected, and our
+    // handler must NOT invoke any release callback. `FFI_ArrowArrayStream::empty()`
+    // owns no resources, so this path leaks nothing.
+    let (_tmp, uri) = create_large_dataset(2);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { lance_dataset_add_columns_stream(ds, &mut stream, 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_add_columns_stream_null_dataset_consumes_stream() {
+    // The dataset-NULL check runs *after* `from_raw`, so the stream is consumed
+    // (released) even on that error path — proven via the drop counter.
+    let (mut stream, drop_count) = make_counted_stream(&write_schema());
+    let rc = unsafe { lance_dataset_add_columns_stream(ptr::null_mut(), &mut stream, 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
 }

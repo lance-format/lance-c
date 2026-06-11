@@ -136,6 +136,16 @@ struct ColumnAlteration {
     const ArrowSchema*         data_type     = nullptr;
 };
 
+// ─── New column (SQL) ────────────────────────────────────────────────────────
+
+/// A single new column defined by a SQL expression over the dataset's existing
+/// columns, added by `Dataset::add_columns_sql`. Both fields are required and
+/// non-empty, e.g. `{ "doubled", "x * 2" }`.
+struct SqlColumn {
+    std::string name;
+    std::string expression;
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -507,6 +517,78 @@ public:
         }
         if (lance_dataset_alter_columns(
                 handle_.get(), raw.data(), raw.size()) != 0) {
+            check_error();
+        }
+    }
+
+    /// Add columns computed from SQL expressions over the dataset's existing
+    /// columns, committing a new manifest. `batch_size = 0` uses the upstream
+    /// default scan batch size.
+    ///
+    /// `columns` must be non-empty and each entry's `name` and `expression`
+    /// must be non-empty. Throws lance::Error on failure (empty list, empty
+    /// name/expression, malformed SQL syntax, name collision with an existing
+    /// column, commit conflict, ...). A reference to a non-existent column
+    /// throws with code `LANCE_ERR_INTERNAL` (an upstream schema error), not
+    /// `LANCE_ERR_INVALID_ARGUMENT` — see the C header for the rationale.
+    void add_columns_sql(const std::vector<SqlColumn>& columns,
+                         uint64_t batch_size = 0) {
+        // The C strings we install in each entry borrow from `columns` (the
+        // caller's std::strings), which outlive this call. The entries are
+        // copied by value into `raw`, so any reallocation during push_back
+        // just moves the raw bytes — pointer values are preserved.
+        std::vector<LanceSqlColumn> raw;
+        raw.reserve(columns.size());
+        for (const auto& c : columns) {
+            LanceSqlColumn entry{};
+            entry.name       = c.name.c_str();
+            entry.expression = c.expression.c_str();
+            raw.push_back(entry);
+        }
+        // Pass `raw.data()` unconditionally — matches the `alter_columns` and
+        // `drop_columns` siblings whose inputs are also required to be
+        // non-empty. An empty `columns` yields `num_columns == 0`, which the
+        // Rust layer rejects before it indexes the pointer.
+        if (lance_dataset_add_columns_sql(
+                handle_.get(), raw.data(), raw.size(), batch_size) != 0) {
+            check_error();
+        }
+    }
+
+    /// Add all-null columns described by an Arrow schema, committing a new
+    /// manifest. Metadata-only on non-legacy datasets. Every field in `schema`
+    /// must be nullable. The caller owns `schema` and must keep it alive for
+    /// the duration of the call; the wrapper does not release it.
+    ///
+    /// Throws lance::Error on failure (invalid schema, non-nullable field, name
+    /// collision with an existing column, commit conflict, ...). A legacy-format
+    /// dataset throws with code `LANCE_ERR_NOT_SUPPORTED` (all-null columns are
+    /// metadata-only and the legacy format cannot represent them that way).
+    void add_columns_nulls(const ArrowSchema* schema) {
+        if (lance_dataset_add_columns_nulls(handle_.get(), schema) != 0) {
+            check_error();
+        }
+    }
+
+    /// Add columns by splicing precomputed data from an Arrow C stream into the
+    /// dataset, committing a new manifest. `batch_size = 0` uses the upstream
+    /// default. When non-null, `stream` is consumed (released) on every return
+    /// path — including a null-dataset error and when this method throws — so do
+    /// not use it again afterward. Only a null `stream` is rejected without
+    /// consuming anything.
+    ///
+    /// The stream's total row count must match the dataset exactly. Throws
+    /// lance::Error on failure (row-count mismatch, name collision with an
+    /// existing column, commit conflict, ...).
+    void add_columns_stream(ArrowArrayStream* stream, uint64_t batch_size = 0) {
+        // Forward `stream` straight to the C API, which owns the stream and
+        // releases it on every path. No RAII guard is needed here (unlike
+        // `write`, which builds vectors before its C call): nothing between this
+        // method's entry and the call below can throw, so the stream can never
+        // be stranded by an exception. WARNING: do not add any throwing code
+        // before the C call without first arming a stream-release guard.
+        if (lance_dataset_add_columns_stream(
+                handle_.get(), stream, batch_size) != 0) {
             check_error();
         }
     }

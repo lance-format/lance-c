@@ -559,6 +559,114 @@ int32_t lance_dataset_alter_columns(
     size_t num_alterations
 );
 
+/* ─── lance_dataset_add_columns ───────────────────────────────────────────── */
+
+/**
+ * A single new column defined by a SQL expression over the dataset's existing
+ * columns, e.g. { .name = "doubled", .expression = "x * 2" }. Both fields are
+ * required, non-empty UTF-8, and are read by shared reference for the duration
+ * of the call.
+ */
+typedef struct LanceSqlColumn {
+    /* Name of the new column. Required, non-empty UTF-8. */
+    const char* name;
+    /* SQL expression evaluated against existing columns. Required, non-empty. */
+    const char* expression;
+} LanceSqlColumn;
+
+/**
+ * Add one or more columns computed from SQL expressions over the dataset's
+ * existing columns, committing a new manifest. Each fragment is scanned, the
+ * expressions are evaluated, and the results are written as new column files.
+ *
+ * Mutates `dataset` in place — the same handle remains valid afterward and
+ * sees the new version. Scanners already in flight keep their pre-add view.
+ *
+ * @param dataset      Open dataset (not consumed). Mutated in place. Must not
+ *                     be NULL.
+ * @param columns      Array of `LanceSqlColumn`. Must not be NULL; each entry's
+ *                     `name` and `expression` must be non-NULL and non-empty.
+ * @param num_columns  Length of `columns`. Must be > 0.
+ * @param batch_size   Rows per scan batch while evaluating expressions.
+ *                     0 = upstream default.
+ * @return 0 on success, -1 on error. Error codes:
+ *         LANCE_ERR_INVALID_ARGUMENT for NULL/empty inputs, NULL or empty
+ *         `name` / `expression`, non-UTF-8 strings, malformed SQL *syntax*, a
+ *         new column name that collides with an existing column, or a
+ *         `batch_size` beyond UINT32_MAX. An expression that references a
+ *         *non-existent column* surfaces as LANCE_ERR_INTERNAL (an upstream
+ *         schema error, the same path as lance_dataset_delete), not
+ *         LANCE_ERR_INVALID_ARGUMENT. LANCE_ERR_COMMIT_CONFLICT for a
+ *         concurrent writer.
+ */
+int32_t lance_dataset_add_columns_sql(
+    LanceDataset* dataset,
+    const LanceSqlColumn* columns,
+    size_t num_columns,
+    uint64_t batch_size
+);
+
+/**
+ * Add one or more all-null columns described by an Arrow C Data Interface
+ * schema, committing a new manifest. On non-legacy datasets this is a
+ * metadata-only operation — no data files are rewritten. Every field in the
+ * schema must be nullable.
+ *
+ * Mutates `dataset` in place — the same handle remains valid afterward and
+ * sees the new version. Scanners already in flight keep their pre-add view.
+ *
+ * @param dataset  Open dataset (not consumed). Mutated in place. Must not be
+ *                 NULL.
+ * @param schema   Arrow C `ArrowSchema` describing the new columns. Read by
+ *                 shared reference; its `release` callback is never invoked.
+ *                 Must not be NULL. Only the top-level schema is validated
+ *                 before it is handed to arrow-rs; the caller is responsible for
+ *                 providing fully-initialised child fields.
+ * @return 0 on success, -1 on error. Error codes:
+ *         LANCE_ERR_INVALID_ARGUMENT for a NULL dataset/schema, an
+ *         uninitialised or already-released schema, an invalid Arrow schema, a
+ *         non-nullable field, or a name that collides with an existing column.
+ *         LANCE_ERR_NOT_SUPPORTED for a legacy-format dataset (which cannot take
+ *         all-null columns as a metadata-only change).
+ *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
+ */
+int32_t lance_dataset_add_columns_nulls(
+    LanceDataset* dataset,
+    const struct ArrowSchema* schema
+);
+
+/**
+ * Add columns by splicing precomputed data from an Arrow C Data Interface
+ * stream into the dataset, committing a new manifest. The stream's batches are
+ * consumed in order and aligned positionally to the dataset's existing rows;
+ * the total row count must match the dataset exactly.
+ *
+ * Mutates `dataset` in place — the same handle remains valid afterward and
+ * sees the new version. Scanners already in flight keep their pre-add view.
+ *
+ * @param dataset     Open dataset (not consumed). Mutated in place. Must not
+ *                    be NULL.
+ * @param stream      Arrow C stream of new column data. When non-NULL it is
+ *                    consumed (released) on every return path, including error
+ *                    returns — the caller must not use it again. (A NULL stream
+ *                    is rejected before anything is consumed.) Its schema
+ *                    defines the new columns and must not collide with existing
+ *                    column names.
+ * @param batch_size  Rows per write batch while aligning the stream to
+ *                    fragments. 0 = upstream default.
+ * @return 0 on success, -1 on error. Error codes:
+ *         LANCE_ERR_INVALID_ARGUMENT for a NULL dataset/stream, a stream missing
+ *         a mandatory get_schema/get_next/release callback, a stream whose total
+ *         row count does not match the dataset, a new column name that collides
+ *         with an existing column, or a `batch_size` beyond UINT32_MAX.
+ *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
+ */
+int32_t lance_dataset_add_columns_stream(
+    LanceDataset* dataset,
+    struct ArrowArrayStream* stream,
+    uint64_t batch_size
+);
+
 /**
  * Export the dataset schema via Arrow C Data Interface.
  * @param out  Pointer to caller-allocated ArrowSchema struct

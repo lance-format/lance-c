@@ -496,6 +496,124 @@ static void test_drop_columns(const char *write_uri) {
     printf("OK\n");
 }
 
+/* Re-opens the dataset (reduced to `id` only by `test_drop_columns`) and
+ * exercises the three `lance_dataset_add_columns_*` entry points. The positive
+ * path uses the SQL variant — strings only, no hand-built Arrow C structures;
+ * the nulls/stream variants are smoke-checked through their NULL-argument
+ * rejections, since their happy paths are covered by the Rust integration
+ * tests. The added `id_doubled` column is harmless to the subsequent
+ * compact/delete steps. Must run after `test_drop_columns`. */
+static void test_add_columns(const char *write_uri) {
+    printf("  test_add_columns... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t v_before = lance_dataset_version(ds);
+
+    /* Snapshot field count before the add so we can confirm it grew by one. */
+    struct ArrowSchema schema_before;
+    memset(&schema_before, 0, sizeof(schema_before));
+    int32_t rc = lance_dataset_schema(ds, &schema_before);
+    ASSERT(rc == 0, "schema export failed");
+    int64_t fields_before = schema_before.n_children;
+    if (schema_before.release) schema_before.release(&schema_before);
+
+    /* SQL variant: derive `id_doubled = id * 2` from the surviving `id`. */
+    LanceSqlColumn col = {0};
+    col.name = "id_doubled";
+    col.expression = "id * 2";
+    rc = lance_dataset_add_columns_sql(ds, &col, 1, 0);
+    ASSERT(rc == 0, "add_columns_sql failed");
+    ASSERT(lance_dataset_version(ds) > v_before,
+           "add_columns_sql must bump the version");
+
+    struct ArrowSchema schema_after;
+    memset(&schema_after, 0, sizeof(schema_after));
+    rc = lance_dataset_schema(ds, &schema_after);
+    ASSERT(rc == 0, "schema export failed after add");
+    int64_t fields_after = schema_after.n_children;
+    if (schema_after.release) schema_after.release(&schema_after);
+    ASSERT(fields_after == fields_before + 1,
+           "schema field count must increase by 1 after add");
+
+    /* SQL rejections: NULL dataset, NULL columns, zero count, NULL name. */
+    rc = lance_dataset_add_columns_sql(NULL, &col, 1, 0);
+    ASSERT(rc == -1, "NULL dataset must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    rc = lance_dataset_add_columns_sql(ds, NULL, 1, 0);
+    ASSERT(rc == -1, "NULL columns must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    rc = lance_dataset_add_columns_sql(ds, &col, 0, 0);
+    ASSERT(rc == -1, "num_columns=0 must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    LanceSqlColumn bad_name = {0};
+    bad_name.name = NULL;
+    bad_name.expression = "id * 2";
+    rc = lance_dataset_add_columns_sql(ds, &bad_name, 1, 0);
+    ASSERT(rc == -1, "NULL name must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    LanceSqlColumn empty_name = {0};
+    empty_name.name = "";
+    empty_name.expression = "id * 2";
+    rc = lance_dataset_add_columns_sql(ds, &empty_name, 1, 0);
+    ASSERT(rc == -1, "empty name must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    LanceSqlColumn null_expr = {0};
+    null_expr.name = "x";
+    null_expr.expression = NULL;
+    rc = lance_dataset_add_columns_sql(ds, &null_expr, 1, 0);
+    ASSERT(rc == -1, "NULL expression must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    LanceSqlColumn empty_expr = {0};
+    empty_expr.name = "x";
+    empty_expr.expression = "";
+    rc = lance_dataset_add_columns_sql(ds, &empty_expr, 1, 0);
+    ASSERT(rc == -1, "empty expression must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    /* AllNulls variant rejections: NULL dataset, NULL schema. */
+    rc = lance_dataset_add_columns_nulls(NULL, NULL);
+    ASSERT(rc == -1, "NULL dataset must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    rc = lance_dataset_add_columns_nulls(ds, NULL);
+    ASSERT(rc == -1, "NULL schema must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    /* Stream variant rejections. The stream-NULL check fires first, so passing
+     * NULL for both arguments also surfaces INVALID_ARGUMENT. (The
+     * valid-stream + NULL-dataset path runs after the stream is consumed and
+     * cannot be smoke-tested in pure C without a live stream struct; it is
+     * covered by the Rust integration tests.) */
+    rc = lance_dataset_add_columns_stream(NULL, NULL, 0);
+    ASSERT(rc == -1, "NULL dataset and NULL stream must fail (stream check first)");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    rc = lance_dataset_add_columns_stream(ds, NULL, 0);
+    ASSERT(rc == -1, "NULL stream must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_compact_files`. The smoke fixture is a single
  * fragment, so the default planner has nothing to compact — we expect
@@ -576,6 +694,7 @@ int main(int argc, char **argv) {
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);
     test_drop_columns(write_uri);
+    test_add_columns(write_uri);
     test_compact_files(write_uri);
     test_delete(write_uri);
 
