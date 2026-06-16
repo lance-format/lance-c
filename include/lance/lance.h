@@ -137,9 +137,9 @@ void lance_free_string(const char* s);
 /* ─── Opaque handles ─── */
 
 typedef struct LanceDataset  LanceDataset;
-typedef struct LanceScanner        LanceScanner;
-typedef struct LanceBatch          LanceBatch;
-typedef struct LanceVersions       LanceVersions;
+typedef struct LanceScanner  LanceScanner;
+typedef struct LanceBatch    LanceBatch;
+typedef struct LanceVersions LanceVersions;
 typedef struct LanceDataStatistics LanceDataStatistics;
 
 /* ─── Dataset lifecycle ─── */

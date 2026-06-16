@@ -68,9 +68,8 @@ unsafe fn calculate_inner(dataset: *const LanceDataset) -> Result<*mut LanceData
 ///
 /// Clears the thread-local error on success. Returns 0 and sets
 /// `InvalidArgument` on a NULL handle. A dataset with an empty schema also
-/// yields 0, with no error set, so callers should check
-/// `lance_last_error_code()` to distinguish the error case from a genuinely
-/// empty result.
+/// yields 0 with no error set, so check `lance_last_error_code()` to
+/// distinguish the error case from an empty result.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_data_statistics_count(stats: *const LanceDataStatistics) -> u64 {
     if stats.is_null() {
@@ -89,9 +88,9 @@ pub unsafe extern "C" fn lance_data_statistics_count(stats: *const LanceDataStat
 /// Return the schema field id at `index` (0 <= index < count).
 ///
 /// Returns 0 and sets the thread-local error on NULL or out-of-range input.
-/// Note that 0 is also a valid field id, so callers that pass an untrusted
-/// index must check `lance_last_error_code()` to disambiguate; iterating
-/// `0..count` never triggers the error path.
+/// Because 0 is itself a valid field id, check `lance_last_error_code()` when
+/// passing an untrusted index; iterating `0..count` never triggers the error
+/// path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_data_statistics_field_id_at(
     stats: *const LanceDataStatistics,
