@@ -44,9 +44,9 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 |--------|-----------|-------------|
 | [x] | Dataset write | Create / append / overwrite from ArrowArrayStream via `lance_dataset_write()`; tunable variant `lance_dataset_write_with_params()` for file/row-group sizing, Lance format version, and stable row IDs |
 | [x] | Fragment writer | Batch-at-a-time fragment file writing (no commit) via `lance_write_fragments()` |
-| [ ] | Delete operations | Predicate-based deletion |
-| [ ] | Update operations | Expression-based row updates |
-| [ ] | Merge-insert | Upsert functionality with builder pattern |
+| [x] | Delete operations | Predicate-based deletion via `lance_dataset_delete()` |
+| [x] | Update operations | Expression-based row updates via `lance_dataset_update()` |
+| [x] | Merge-insert | Upsert via configurable when-matched / when-not-matched policies with `lance_dataset_merge_insert()` |
 | [x] | Schema evolution | Add columns via SQL / all-null / `ArrowArrayStream` with `lance_dataset_add_columns_*()`, drop via `lance_dataset_drop_columns()`, rename / retype / set nullability via `lance_dataset_alter_columns()` |
 | [x] | Version management | List via `lance_dataset_versions()`, rollback via `lance_dataset_restore()`, checkout via `lance_dataset_open(uri, opts, version)` |
 
@@ -55,8 +55,8 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | Status | Component | Description |
 |--------|-----------|-------------|
 | [x] | Fragment-level access | Fragment enumeration, ID listing, scanner fragment filtering |
-| [ ] | Compaction | Fragment consolidation operations |
-| [ ] | Statistics export | Row counts, column stats for query planning |
+| [x] | Compaction | Fragment consolidation via `lance_dataset_compact_files()` |
+| [x] | Statistics export | Per-field compressed on-disk size for query planning via `lance_dataset_calculate_data_stats()` |
 | [x] | Cloud storage | S3, GCS, Azure via storage options pass-through |
 | [x] | Package distribution | vcpkg and Conan recipe packaging |
 
