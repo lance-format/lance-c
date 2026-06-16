@@ -137,9 +137,10 @@ void lance_free_string(const char* s);
 /* ─── Opaque handles ─── */
 
 typedef struct LanceDataset  LanceDataset;
-typedef struct LanceScanner  LanceScanner;
-typedef struct LanceBatch    LanceBatch;
-typedef struct LanceVersions LanceVersions;
+typedef struct LanceScanner        LanceScanner;
+typedef struct LanceBatch          LanceBatch;
+typedef struct LanceVersions       LanceVersions;
+typedef struct LanceDataStatistics LanceDataStatistics;
 
 /* ─── Dataset lifecycle ─── */
 
@@ -204,6 +205,48 @@ int64_t lance_versions_timestamp_ms_at(const LanceVersions* versions, size_t ind
 
 /** Close and free a versions handle. Safe to call with NULL. */
 void lance_versions_close(LanceVersions* versions);
+
+/* ─── Data statistics ─── */
+
+/**
+ * Compute per-field data statistics (compressed on-disk byte size) for query
+ * planning. Walks every fragment, so this performs I/O. Caller frees the
+ * returned handle with lance_data_statistics_close().
+ *
+ * Entries are ordered by schema field id, one per field (including nested
+ * struct/list children).
+ * @return handle on success, or NULL on error
+ */
+LanceDataStatistics* lance_dataset_calculate_data_stats(const LanceDataset* dataset);
+
+/**
+ * Number of fields in the statistics snapshot. Clears the thread-local error
+ * on success. Returns 0 and sets LANCE_ERR_INVALID_ARGUMENT on a NULL handle;
+ * a dataset with an empty schema also yields 0 with no error set, so check
+ * lance_last_error_code() to distinguish the error case from an empty result.
+ */
+uint64_t lance_data_statistics_count(const LanceDataStatistics* stats);
+
+/**
+ * Schema field id at `index` (0 <= index < count).
+ * Returns 0 on error (NULL handle or out-of-range index), setting
+ * LANCE_ERR_INVALID_ARGUMENT. Because 0 is itself a valid field id, check
+ * lance_last_error_code() when passing an untrusted index; iterating
+ * `0..count` never errors.
+ */
+uint32_t lance_data_statistics_field_id_at(const LanceDataStatistics* stats, size_t index);
+
+/**
+ * Compressed on-disk byte size of the field at `index`.
+ * Returns 0 on error (NULL handle or out-of-range index), setting
+ * LANCE_ERR_INVALID_ARGUMENT. A field written with the legacy (v1) storage
+ * format also reports 0 but sets no error, so check lance_last_error_code() to
+ * distinguish a genuine 0 from the error sentinel.
+ */
+uint64_t lance_data_statistics_bytes_on_disk_at(const LanceDataStatistics* stats, size_t index);
+
+/** Close and free a data statistics handle. Safe to call with NULL. */
+void lance_data_statistics_close(LanceDataStatistics* stats);
 
 /**
  * Restore the dataset to an older version by committing a new manifest that

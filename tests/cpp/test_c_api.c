@@ -272,6 +272,64 @@ static void test_dataset_write_roundtrip(const char *src_uri, const char *dst_ur
     printf("OK\n");
 }
 
+/* Exercises `lance_dataset_calculate_data_stats` on the freshly-written
+ * (modern, v2+) dataset, where per-field on-disk sizes are populated. Runs
+ * before the mutation tests reshape or empty the dataset. */
+static void test_data_statistics(const char *write_uri) {
+    printf("  test_data_statistics... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    LanceDataStatistics *stats = lance_dataset_calculate_data_stats(ds);
+    ASSERT(stats != NULL, "data stats failed");
+
+    uint64_t n = lance_data_statistics_count(stats);
+    CHECK_OK();
+    ASSERT(n >= 1, "at least one field expected");
+
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t id = lance_data_statistics_field_id_at(stats, (size_t)i);
+        uint64_t bytes = lance_data_statistics_bytes_on_disk_at(stats, (size_t)i);
+        CHECK_OK();
+        (void)id;
+        total += bytes;
+    }
+    ASSERT(total > 0, "modern storage should report non-zero on-disk size");
+
+    /* Out-of-range index is rejected with INVALID_ARGUMENT on both accessors. */
+    (void)lance_data_statistics_field_id_at(stats, (size_t)n);
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "out-of-range field_id must fail");
+    (void)lance_data_statistics_bytes_on_disk_at(stats, (size_t)n);
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "out-of-range bytes_on_disk must fail");
+
+    lance_data_statistics_close(stats);
+    lance_dataset_close(ds);
+
+    /* NULL dataset is rejected before anything is allocated. */
+    ASSERT(lance_dataset_calculate_data_stats(NULL) == NULL,
+           "NULL dataset must yield NULL handle");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    /* NULL handle is rejected by every accessor. */
+    ASSERT(lance_data_statistics_count(NULL) == 0, "NULL handle count must be 0");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL handle count must set INVALID_ARGUMENT");
+    (void)lance_data_statistics_field_id_at(NULL, 0);
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL handle field_id must fail");
+    (void)lance_data_statistics_bytes_on_disk_at(NULL, 0);
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL handle bytes_on_disk must fail");
+    lance_data_statistics_close(NULL); /* must be a safe no-op */
+
+    printf("fields=%llu... OK\n", (unsigned long long)n);
+}
+
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_update`. Must run before `test_delete`, which
  * empties the dataset. */
@@ -690,6 +748,7 @@ int main(int argc, char **argv) {
     test_restore_to_current(uri);
     test_error_handling();
     test_dataset_write_roundtrip(uri, write_uri);
+    test_data_statistics(write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);
