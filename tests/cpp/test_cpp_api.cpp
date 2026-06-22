@@ -335,6 +335,26 @@ static void test_dataset_write_roundtrip(const std::string& src_uri,
     PASS();
 }
 
+// Exercises `Dataset::calculate_data_stats` on the freshly-written (modern,
+// v2+) dataset, where per-field on-disk sizes are populated. Runs before the
+// mutation tests reshape or empty the dataset.
+static void test_data_statistics(const std::string& dst_uri) {
+    TEST(test_data_statistics);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    auto stats = ds.calculate_data_stats();
+
+    assert(!stats.empty() && "at least one field expected");
+    uint64_t total = 0;
+    for (const auto& f : stats) {
+        total += f.bytes_on_disk;
+    }
+    assert(total > 0 && "modern storage should report non-zero on-disk size");
+    printf("fields=%zu... ", stats.size());
+
+    PASS();
+}
+
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::update`. Must run before `test_delete_rows`, which
 // empties the dataset.
@@ -682,6 +702,7 @@ int main(int argc, char** argv) {
     test_index_segments_smoke(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_data_statistics(write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);

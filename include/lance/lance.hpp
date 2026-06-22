@@ -97,6 +97,14 @@ struct VersionInfo {
     int64_t  timestamp_ms;
 };
 
+/// Per-field storage statistics for query planning.
+/// `id` is the schema field id; `bytes_on_disk` is the compressed on-disk size
+/// (0 for datasets written with the legacy v1 storage format).
+struct FieldStatistics {
+    uint32_t id;
+    uint64_t bytes_on_disk;
+};
+
 // ─── Write mode ──────────────────────────────────────────────────────────────
 
 enum class WriteMode : int32_t {
@@ -345,6 +353,28 @@ public:
                 lance_versions_timestamp_ms_at(snap.get(), static_cast<size_t>(i));
             if (lance_last_error_code() != LANCE_OK) check_error();
             out.push_back(info);
+        }
+        return out;
+    }
+
+    /// Compute per-field data statistics (compressed on-disk byte size) for
+    /// query planning, ordered by schema field id. Performs I/O over every
+    /// fragment. Throws lance::Error on failure.
+    std::vector<FieldStatistics> calculate_data_stats() const {
+        auto* raw = lance_dataset_calculate_data_stats(handle_.get());
+        if (!raw) check_error();
+        Handle<LanceDataStatistics, lance_data_statistics_close> snap(raw);
+
+        uint64_t n = lance_data_statistics_count(snap.get());
+        std::vector<FieldStatistics> out;
+        out.reserve(static_cast<size_t>(n));
+        for (uint64_t i = 0; i < n; i++) {
+            FieldStatistics fs;
+            fs.id = lance_data_statistics_field_id_at(snap.get(), static_cast<size_t>(i));
+            fs.bytes_on_disk =
+                lance_data_statistics_bytes_on_disk_at(snap.get(), static_cast<size_t>(i));
+            if (lance_last_error_code() != LANCE_OK) check_error();
+            out.push_back(fs);
         }
         return out;
     }

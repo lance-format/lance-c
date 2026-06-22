@@ -1812,6 +1812,295 @@ fn test_versions_close_null_is_safe() {
 }
 
 // ---------------------------------------------------------------------------
+// Data statistics (lance_dataset_calculate_data_stats)
+// ---------------------------------------------------------------------------
+
+/// Sum `bytes_on_disk` across every field in a statistics handle.
+fn total_bytes_on_disk(stats: *const LanceDataStatistics) -> u64 {
+    let count = unsafe { lance_data_statistics_count(stats) };
+    (0..count)
+        .map(|i| unsafe { lance_data_statistics_bytes_on_disk_at(stats, i as usize) })
+        .sum()
+}
+
+/// Collect the field ids of a statistics handle in index order.
+fn field_ids(stats: *const LanceDataStatistics) -> Vec<u32> {
+    let count = unsafe { lance_data_statistics_count(stats) };
+    (0..count)
+        .map(|i| unsafe { lance_data_statistics_field_id_at(stats, i as usize) })
+        .collect()
+}
+
+#[test]
+fn test_data_statistics_single_fragment() {
+    // create_test_dataset has two top-level fields (id=0, name=1) written with
+    // the default (modern, v2+) storage format, so bytes_on_disk is populated.
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let stats = unsafe { lance_dataset_calculate_data_stats(ds) };
+    assert!(!stats.is_null());
+    assert_eq!(unsafe { lance_data_statistics_count(stats) }, 2);
+    assert_eq!(field_ids(stats), vec![0, 1]);
+    // Field id 0 is a legitimate value that collides with the error sentinel;
+    // reading it on the success path must leave the error state clear so callers
+    // can disambiguate a real 0 from an error via lance_last_error_code().
+    assert_eq!(unsafe { lance_data_statistics_field_id_at(stats, 0) }, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    assert!(
+        total_bytes_on_disk(stats) > 0,
+        "modern storage should report non-zero on-disk size"
+    );
+
+    unsafe { lance_data_statistics_close(stats) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_data_statistics_field_count_matches_schema() {
+    // create_large_dataset has three fields (id, value, label).
+    let (_tmp, uri) = create_large_dataset(50);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let stats = unsafe { lance_dataset_calculate_data_stats(ds) };
+    assert!(!stats.is_null());
+    assert_eq!(unsafe { lance_data_statistics_count(stats) }, 3);
+    assert_eq!(field_ids(stats), vec![0, 1, 2]);
+    // Every field carries data, so each reports a non-zero size.
+    for i in 0..3 {
+        assert!(
+            unsafe { lance_data_statistics_bytes_on_disk_at(stats, i) } > 0,
+            "field {i} should report non-zero on-disk size"
+        );
+    }
+
+    unsafe { lance_data_statistics_close(stats) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+/// Write a single-fragment dataset with one Int32 `id` field holding `ids` and
+/// return the on-disk byte size of that field.
+fn single_fragment_id_field_bytes(ids: Vec<i32>) -> u64 {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("one_frag_stats_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    lance_c::runtime::block_on(async {
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(ids))]).unwrap();
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let stats = unsafe { lance_dataset_calculate_data_stats(ds) };
+    let bytes = unsafe { lance_data_statistics_bytes_on_disk_at(stats, 0) };
+    unsafe { lance_data_statistics_close(stats) };
+    unsafe { lance_dataset_close(ds) };
+    bytes
+}
+
+#[test]
+fn test_data_statistics_multi_fragment_sums_across_fragments() {
+    // The two-fragment dataset's first fragment (ids 0..5) is identical to a
+    // standalone single-fragment dataset of the same rows. If calculate_data_stats
+    // counted only one fragment, the two byte totals would match; genuine
+    // aggregation makes the two-fragment total strictly larger.
+    let one_fragment_bytes = single_fragment_id_field_bytes(vec![0, 1, 2, 3, 4]);
+    assert!(
+        one_fragment_bytes > 0,
+        "single fragment should report non-zero size"
+    );
+
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+
+    let stats = unsafe { lance_dataset_calculate_data_stats(ds) };
+    assert!(!stats.is_null());
+    assert_eq!(unsafe { lance_data_statistics_count(stats) }, 1);
+    assert_eq!(field_ids(stats), vec![0]);
+
+    let two_fragment_bytes = unsafe { lance_data_statistics_bytes_on_disk_at(stats, 0) };
+    assert!(
+        two_fragment_bytes > one_fragment_bytes,
+        "two-fragment on-disk size ({two_fragment_bytes}) must exceed single-fragment \
+         size ({one_fragment_bytes}); calculate_data_stats must sum across fragments"
+    );
+
+    unsafe { lance_data_statistics_close(stats) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_data_statistics_legacy_storage_reports_zero_bytes() {
+    // The legacy (v1) file format does not track per-field on-disk sizes, so
+    // upstream reports every field with bytes_on_disk == 0. The field list
+    // itself is still fully populated.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("legacy_stats_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        let params = lance::dataset::WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::Legacy),
+            ..Default::default()
+        };
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(params),
+        )
+        .await
+        .unwrap();
+    });
+
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let stats = unsafe { lance_dataset_calculate_data_stats(ds) };
+    assert!(!stats.is_null());
+
+    assert_eq!(unsafe { lance_data_statistics_count(stats) }, 2);
+    assert_eq!(field_ids(stats), vec![0, 1]);
+    assert_eq!(
+        total_bytes_on_disk(stats),
+        0,
+        "legacy storage does not track per-field on-disk size"
+    );
+    // The zeros above are genuine (legacy storage), not error sentinels: reading
+    // an in-range field leaves the error clear, which is the documented way to
+    // tell a real 0 from the out-of-range/NULL error sentinel.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+
+    unsafe { lance_data_statistics_close(stats) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_data_statistics_empty_schema_yields_zero_count_no_error() {
+    // Lance permits a zero-field dataset. calculate_data_stats then returns a
+    // valid (non-NULL) but empty snapshot: count 0 with NO error set. This is
+    // exactly how a caller distinguishes it from the NULL-handle error, which
+    // returns count 0 *with* InvalidArgument — the contract the count doc states.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("empty_schema_stats_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(Vec::<Field>::new()));
+    lance_c::runtime::block_on(async {
+        let batch = RecordBatch::new_empty(schema.clone());
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let stats = unsafe { lance_dataset_calculate_data_stats(ds) };
+
+    assert!(
+        !stats.is_null(),
+        "empty-schema dataset still yields a snapshot"
+    );
+    assert_eq!(unsafe { lance_data_statistics_count(stats) }, 0);
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "an empty snapshot must leave the error clear, unlike the NULL-handle case"
+    );
+    assert!(field_ids(stats).is_empty());
+
+    unsafe { lance_data_statistics_close(stats) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_data_statistics_null_dataset() {
+    let stats = unsafe { lance_dataset_calculate_data_stats(ptr::null()) };
+    assert!(stats.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_data_statistics_count_null_handle() {
+    let n = unsafe { lance_data_statistics_count(ptr::null()) };
+    assert_eq!(n, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_data_statistics_index_out_of_range() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let stats = unsafe { lance_dataset_calculate_data_stats(ds) };
+
+    let count = unsafe { lance_data_statistics_count(stats) } as usize;
+    // Exercise the exact boundary (index == count) and a clearly-past-end index.
+    for index in [count, 99] {
+        let id = unsafe { lance_data_statistics_field_id_at(stats, index) };
+        assert_eq!(id, 0);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+        let bytes = unsafe { lance_data_statistics_bytes_on_disk_at(stats, index) };
+        assert_eq!(bytes, 0);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    }
+
+    unsafe { lance_data_statistics_close(stats) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_data_statistics_accessors_null_handle() {
+    let id = unsafe { lance_data_statistics_field_id_at(ptr::null(), 0) };
+    assert_eq!(id, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let bytes = unsafe { lance_data_statistics_bytes_on_disk_at(ptr::null(), 0) };
+    assert_eq!(bytes, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_data_statistics_close_null_is_safe() {
+    unsafe { lance_data_statistics_close(ptr::null_mut()) };
+}
+
+// ---------------------------------------------------------------------------
 // Restore (lance_dataset_restore)
 // ---------------------------------------------------------------------------
 
