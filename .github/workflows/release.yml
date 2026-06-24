@@ -30,9 +30,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             os_label: linux
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-            os_label: macos
+          # x86_64-apple-darwin temporarily disabled: GitHub is deprecating
+          # macos-13 runners and jobs queue 24h+ before timing out. Restore
+          # this row once a macos-* Intel runner is reliably available again.
           - target: aarch64-apple-darwin
             runner: macos-14
             os_label: macos
@@ -51,6 +51,11 @@ jobs:
       - name: Install protobuf (Linux)
         if: matrix.os_label == 'linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Setup Zig Toolchain (Linux Only)
+        if: matrix.os_label == 'linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
       - name: Install protobuf (macOS)
         if: matrix.os_label == 'macos'
         run: brew install protobuf
@@ -62,10 +67,54 @@ jobs:
           else
             echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
           fi
-      - name: Configure + build
+      - name: Configure CMake
+        shell: bash
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          CMAKE_FLAGS=(
+            "-DCMAKE_BUILD_TYPE=Release"
+          )
+
+          if [ "${{ matrix.os_label }}" = "linux" ]; then
+            case "${{ matrix.target }}" in
+              x86_64-unknown-linux-gnu)
+                ZIG_TARGET="x86_64-linux-gnu.2.28"
+                ;;
+              aarch64-unknown-linux-gnu)
+                ZIG_TARGET="aarch64-linux-gnu.2.28"
+                ;;
+              *)
+                echo "::error::Unsupported Linux target: ${{ matrix.target }}"
+                exit 1
+                ;;
+            esac
+            CMAKE_FLAGS+=(
+              "-DCMAKE_C_COMPILER=zig;cc;-target;${ZIG_TARGET}"
+              "-DCMAKE_CXX_COMPILER=zig;c++;-target;${ZIG_TARGET}"
+            )
+          fi
+
+          mkdir build
+          cmake -S . -B build "${CMAKE_FLAGS[@]}"
+      - name: build
+        run: |
           cmake --build build --parallel
+      - name: Verify GLIBC Baseline
+        if: matrix.os_label == 'linux'
+        run: |
+          TARGET_SO=$(find build -name "*.so" | head -n 1)
+          if [ -z "$TARGET_SO" ]; then
+            echo "::error::No shared library (.so) found to verify!"
+            exit 1
+          fi
+          
+          echo "Verifying file: $TARGET_SO"
+          objdump -p "$TARGET_SO" | grep -A 10 "Version References:"
+          
+          # Fails the pipeline if any leaking symbols match GLIBC 2.29 through 2.39+
+          if objdump -p "$TARGET_SO" | grep -E "GLIBC_2\.(2[9]|3[0-9]|[4-9][0-9])" -q; then
+            echo "::error::GLIBC Leak Detected! The binary contains symbols newer than GLIBC 2.28."
+            exit 1
+          fi
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
       - name: Tar
@@ -93,6 +142,7 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
