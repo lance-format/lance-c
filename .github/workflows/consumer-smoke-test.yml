@@ -49,12 +49,44 @@ jobs:
       - name: Install protobuf-compiler (Linux)
         if: matrix.os_label == 'linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Setup Zig Toolchain (Linux Only)
+        if: matrix.os_label == 'linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
       - name: Install protobuf (macOS)
         if: matrix.os_label == 'macos'
         run: brew install protobuf
-      - name: Configure + build + install lance-c
+      - name: Configure CMake
+        shell: bash
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          CMAKE_FLAGS=(
+            "-DCMAKE_BUILD_TYPE=Release"
+          )
+
+          if [ "${{ matrix.os_label }}" = "linux" ]; then
+            case "${{ matrix.target }}" in
+              x86_64-unknown-linux-gnu)
+                ZIG_TARGET="x86_64-linux-gnu.2.28"
+                ;;
+              aarch64-unknown-linux-gnu)
+                ZIG_TARGET="aarch64-linux-gnu.2.28"
+                ;;
+              *)
+                echo "::error::Unsupported Linux target: ${{ matrix.target }}"
+                exit 1
+                ;;
+            esac
+            CMAKE_FLAGS+=(
+              "-DCMAKE_C_COMPILER=zig;cc;-target;${ZIG_TARGET}"
+              "-DCMAKE_CXX_COMPILER=zig;c++;-target;${ZIG_TARGET}"
+            )
+          fi
+
+          mkdir build
+          cmake -S . -B build "${CMAKE_FLAGS[@]}"
+      - name: build + install lance-c
+        run: |
           cmake --build build
           cmake --install build --prefix "$PWD/_install"
       - name: Build consumer example against the install
