@@ -30,15 +30,16 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             os_label: linux
-          # x86_64-apple-darwin temporarily disabled: GitHub is deprecating
-          # macos-13 runners and jobs queue 24h+ before timing out. Restore
-          # this row once a macos-* Intel runner is reliably available again.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            os_label: macos
           - target: aarch64-apple-darwin
             runner: macos-14
             os_label: macos
     env:
       CC: clang
       CXX: clang++
+      MACOSX_DEPLOYMENT_TARGET: "11"
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1

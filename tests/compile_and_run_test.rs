@@ -124,7 +124,7 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
 
     let status = Command::new("c++")
         .args([
-            "-std=c++17",
+            "-std=c++20",
             "-Wall",
             "-Wextra",
             "-o",
