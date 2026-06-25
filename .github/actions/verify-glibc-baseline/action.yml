@@ -1,0 +1,42 @@
+name: Verify GLIBC baseline
+description: Check a built Linux shared library for symbols newer than the configured baseline
+inputs:
+  search_root:
+    description: Directory to search for the shared library
+    required: false
+    default: stage
+  library_name:
+    description: Shared library filename to verify
+    required: false
+    default: liblance_c.so
+runs:
+  using: composite
+  steps:
+    - name: Verify GLIBC baseline
+      shell: bash
+      run: |
+        search_root="${{ inputs.search_root }}"
+        library_name="${{ inputs.library_name }}"
+        baseline="${GLIBC_BASELINE:?Baseline env not loaded}"
+
+        target_so=$(find "$search_root" -type f -name "$library_name" -print -quit)
+        if [ -z "$target_so" ]; then
+          echo "::error::No shared library (${library_name}) found under ${search_root}!"
+          exit 1
+        fi
+
+        echo "Verifying file: $target_so"
+
+        objdump_output=$(objdump -p "$target_so")
+        printf '%s\n' "$objdump_output" | grep -A 10 "Version References:" || true
+
+        version_gt() {
+          [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | tail -n1)" = "$1" ] && [ "$1" != "$2" ]
+        }
+
+        while IFS= read -r version; do
+          if version_gt "$version" "$baseline"; then
+            echo "::error::GLIBC Leak Detected! The binary contains symbols newer than GLIBC ${baseline}."
+            exit 1
+          fi
+        done < <(printf '%s\n' "$objdump_output" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -Vu)

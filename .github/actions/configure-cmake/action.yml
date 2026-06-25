@@ -1,0 +1,62 @@
+name: Configure CMake
+description: Configure LanceC with the appropriate compiler setup for the current target
+inputs:
+  target:
+    description: architecture
+    required: true
+  os_label:
+    description: Operating-system label
+    required: true
+  build_dir:
+    description: CMake build directory
+    required: false
+    default: build
+  build_type:
+    description: CMake build type
+    required: false
+    default: Release
+runs:
+  using: composite
+  steps:
+    - name: Configure CMake
+      shell: bash
+      run: |
+        build_dir="${{ inputs.build_dir }}"
+        CMAKE_FLAGS=(
+          "-DCMAKE_BUILD_TYPE=${{ inputs.build_type }}"
+        )
+
+        if [ "${{ inputs.os_label }}" = "linux" ]; then
+          baseline="${GLIBC_BASELINE:?Baseline env not loaded}"
+          case "${{ inputs.target }}" in
+            x86_64-unknown-linux-gnu)
+              zig_target="x86_64-linux-gnu.${baseline}"
+              ;;
+            aarch64-unknown-linux-gnu)
+              zig_target="aarch64-linux-gnu.${baseline}"
+              ;;
+            *)
+              echo "::error::Unsupported Linux target: ${{ inputs.target }}"
+              exit 1
+              ;;
+          esac
+
+          wrapper_dir="${RUNNER_TEMP}/zig-linkers/${{ inputs.target }}"
+          mkdir -p "$wrapper_dir"
+
+          printf '%s\n' '#!/usr/bin/env bash' \
+            "exec zig cc -target \"$zig_target\" \"\$@\"" >"$wrapper_dir/cc"
+          printf '%s\n' '#!/usr/bin/env bash' \
+            "exec zig c++ -target \"$zig_target\" \"\$@\"" >"$wrapper_dir/cxx"
+          chmod +x "$wrapper_dir/cc" "$wrapper_dir/cxx"
+
+          echo "Resolved linker wrapper: $wrapper_dir/cc"
+          echo "Resolved C++ wrapper: $wrapper_dir/cxx"
+
+          CMAKE_FLAGS+=(
+            "-DCMAKE_C_COMPILER=$wrapper_dir/cc"
+            "-DCMAKE_CXX_COMPILER=$wrapper_dir/cxx"
+          )
+        fi
+
+        cmake -S . -B "$build_dir" "${CMAKE_FLAGS[@]}"

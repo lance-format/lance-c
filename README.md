@@ -12,9 +12,9 @@ The C/C++ binding to [Lance](https://github.com/lancedb/lance), providing native
 |-----------|------------------|
 | CMake | 3.22+ |
 | C++ | C++20 |
-| GLIBC | 2.28 |
+| GLIBC baseline | `.github/baseline.env` (`GLIBC_BASELINE`) |
 | Clang | Clang 18; Apple Clang 15 |
-| macOS | 11.0 |
+| macOS | `.github/baseline.env` (`MACOSX_DEPLOYMENT_TARGET`) |
 
 ## Building
 
@@ -47,6 +47,8 @@ target_link_libraries(myapp PRIVATE LanceC::lance_c)
 
 See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
 working example.
+
+Baseline values are defined once in [`.github/baseline.env`](.github/baseline.env) and loaded by CI, release workflows, and CMake.
 
 ### vcpkg
 

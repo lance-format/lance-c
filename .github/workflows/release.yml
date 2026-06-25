@@ -39,9 +39,18 @@ jobs:
     env:
       CC: clang
       CXX: clang++
-      MACOSX_DEPLOYMENT_TARGET: "11"
     steps:
       - uses: actions/checkout@v4
+      - name: Load baseline floors
+        shell: bash
+        run: |
+          set -a
+          source .github/baseline.env
+          set +a
+          {
+            echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+            echo "GLIBC_BASELINE=$GLIBC_BASELINE"
+          } >>"$GITHUB_ENV"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
@@ -68,55 +77,20 @@ jobs:
             echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
           fi
       - name: Configure CMake
-        shell: bash
-        run: |
-          CMAKE_FLAGS=(
-            "-DCMAKE_BUILD_TYPE=Release"
-          )
-
-          if [ "${{ matrix.os_label }}" = "linux" ]; then
-            case "${{ matrix.target }}" in
-              x86_64-unknown-linux-gnu)
-                ZIG_TARGET="x86_64-linux-gnu.2.28"
-                ;;
-              aarch64-unknown-linux-gnu)
-                ZIG_TARGET="aarch64-linux-gnu.2.28"
-                ;;
-              *)
-                echo "::error::Unsupported Linux target: ${{ matrix.target }}"
-                exit 1
-                ;;
-            esac
-            CMAKE_FLAGS+=(
-              "-DCMAKE_C_COMPILER=zig;cc;-target;${ZIG_TARGET}"
-              "-DCMAKE_CXX_COMPILER=zig;c++;-target;${ZIG_TARGET}"
-            )
-          fi
-
-          mkdir build
-          cmake -S . -B build "${CMAKE_FLAGS[@]}"
+        uses: ./.github/actions/configure-cmake
+        with:
+          target: ${{ matrix.target }}
+          os_label: ${{ matrix.os_label }}
       - name: build
         run: |
           cmake --build build --parallel
-      - name: Verify GLIBC Baseline
-        if: matrix.os_label == 'linux'
-        run: |
-          TARGET_SO=$(find build -name "*.so" | head -n 1)
-          if [ -z "$TARGET_SO" ]; then
-            echo "::error::No shared library (.so) found to verify!"
-            exit 1
-          fi
-          
-          echo "Verifying file: $TARGET_SO"
-          objdump -p "$TARGET_SO" | grep -A 10 "Version References:"
-          
-          # Fails the pipeline if any leaking symbols match GLIBC 2.29 through 2.39+
-          if objdump -p "$TARGET_SO" | grep -E "GLIBC_2\.(2[9]|3[0-9]|[4-9][0-9])" -q; then
-            echo "::error::GLIBC Leak Detected! The binary contains symbols newer than GLIBC 2.28."
-            exit 1
-          fi
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
+      - name: Verify GLIBC Baseline
+        if: matrix.os_label == 'linux'
+        uses: ./.github/actions/verify-glibc-baseline
+        with:
+          search_root: ${{ github.workspace }}/stage
       - name: Tar
         id: pack
         run: |

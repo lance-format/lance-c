@@ -5,10 +5,13 @@ cmake_minimum_required(VERSION 3.22)
 
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include(cargo-version)
+include(baseline)
 read_cargo_version("${CMAKE_CURRENT_LIST_DIR}/Cargo.toml" LANCE_C_VERSION)
 
+lance_c_load_baseline_env("${CMAKE_CURRENT_LIST_DIR}/.github/baseline.env")
+
 if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "11" CACHE STRING "Minimum macOS deployment target")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "${MACOSX_DEPLOYMENT_TARGET}" CACHE STRING "Minimum macOS deployment target")
 endif()
 
 project(LanceC
@@ -55,6 +58,9 @@ if(NOT LANCE_C_USE_PREBUILT)
         CRATE_TYPES staticlib cdylib
         PROFILE release
     )
+    if(APPLE)
+        corrosion_set_env_vars(lance-c "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    endif()
 endif()
 
 # Imported targets and install rules are added in subsequent tasks.
