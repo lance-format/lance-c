@@ -8,6 +8,10 @@ on:
       version:
         description: "Version to build (without leading 'v')"
         required: true
+      skip_glibc_check:
+        description: "Emergency override: skip GLIBC baseline check (set to 'true' only if intentional)"
+        required: false
+        default: 'false'
 
 permissions:
   contents: write   # needed for softprops/action-gh-release
@@ -87,10 +91,17 @@ jobs:
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
       - name: Verify GLIBC Baseline
-        if: matrix.os_label == 'linux'
+        if: matrix.os_label == 'linux' && inputs.skip_glibc_check != 'true'
         uses: ./.github/actions/verify-glibc-baseline
         with:
           search_root: ${{ github.workspace }}/stage
+          workflow_type: release
+      - name: Annotate skipped GLIBC check
+        if: matrix.os_label == 'linux' && inputs.skip_glibc_check == 'true'
+        run: |
+          echo "::warning title=GLIBC check skipped::skip_glibc_check=true was set — this release may exceed the GLIBC_BASELINE (${{ env.GLIBC_BASELINE }}) floor. Audit the artifact before distributing."
+          echo "## ⚠️ GLIBC baseline check was skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "skip_glibc_check=true was set on this run. The artifact may link symbols above **${{ env.GLIBC_BASELINE }}**." >> "$GITHUB_STEP_SUMMARY"
       - name: Tar
         id: pack
         run: |
