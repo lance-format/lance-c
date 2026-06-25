@@ -59,7 +59,7 @@ if(NOT LANCE_C_USE_PREBUILT)
         PROFILE release
     )
     if(APPLE)
-        corrosion_set_env_vars(lance-c "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+        corrosion_set_env_vars(lance_c "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
     endif()
 endif()
 
