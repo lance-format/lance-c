@@ -13,7 +13,7 @@ The C/C++ binding to [Lance](https://github.com/lancedb/lance), providing native
 | CMake | 3.22+ |
 | C++ | C++20 |
 | GLIBC baseline | 2.28 |
-| Clang | Clang 18; Apple Clang 15 |
+| Clang | Clang 20; Apple Clang 15 |
 | macOS | `.github/baseline.env` (`MACOSX_DEPLOYMENT_TARGET`) |
 
 ## Building
