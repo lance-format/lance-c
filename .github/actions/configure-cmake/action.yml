@@ -20,15 +20,21 @@ runs:
   steps:
     - name: Configure CMake
       shell: bash
+      env:
+        LANCE_TARGET: ${{ inputs.target }}
+        LANCE_OS_LABEL: ${{ inputs.os_label }}
+        LANCE_BUILD_DIR: ${{ inputs.build_dir }}
+        LANCE_BUILD_TYPE: ${{ inputs.build_type }}
       run: |
-        build_dir="${{ inputs.build_dir }}"
+        set -euo pipefail
+        build_dir="$LANCE_BUILD_DIR"
         CMAKE_FLAGS=(
-          "-DCMAKE_BUILD_TYPE=${{ inputs.build_type }}"
+          "-DCMAKE_BUILD_TYPE=$LANCE_BUILD_TYPE"
         )
 
-        if [ "${{ inputs.os_label }}" = "linux" ]; then
+        if [ "$LANCE_OS_LABEL" = "linux" ]; then
           baseline="${GLIBC_BASELINE:?Baseline env not loaded}"
-          case "${{ inputs.target }}" in
+          case "$LANCE_TARGET" in
             x86_64-unknown-linux-gnu)
               zig_target="x86_64-linux-gnu.${baseline}"
               ;;
@@ -36,12 +42,12 @@ runs:
               zig_target="aarch64-linux-gnu.${baseline}"
               ;;
             *)
-              echo "::error::Unsupported Linux target: ${{ inputs.target }}"
+              echo "::error::Unsupported Linux target: $LANCE_TARGET"
               exit 1
               ;;
           esac
 
-          wrapper_dir="${RUNNER_TEMP}/zig-linkers/${{ inputs.target }}"
+          wrapper_dir="${RUNNER_TEMP}/zig-linkers/$LANCE_TARGET"
           mkdir -p "$wrapper_dir"
 
           # Single wrapper: used by rustc as linker only (via CARGO_TARGET_*_RUSTFLAGS).
@@ -52,7 +58,7 @@ runs:
           printf '#!/usr/bin/env bash\nexec zig cc -target "%s" "$@"\n' "$zig_target" > "$wrapper_dir/cc"
           chmod +x "$wrapper_dir/cc"
 
-          triple_upper=$(echo "${{ inputs.target }}" | tr '[:lower:]-' '[:upper:]_')
+          triple_upper=$(echo "$LANCE_TARGET" | tr '[:lower:]-' '[:upper:]_')
 
           {
             # Tell rustc to use zig cc as linker only (not as CC for build scripts).
