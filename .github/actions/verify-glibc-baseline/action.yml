@@ -31,8 +31,7 @@ runs:
 
         echo "Verifying file: $target_so"
 
-        objdump_output=$(objdump -p "$target_so")
-        printf '%s\n' "$objdump_output" | grep -A 10 "Version References: (truncated to first 10)" || true
+        objdump_output=$(objdump -T "$target_so")
 
         version_gt() {
           [ "$1" = "$2" ] && return 1
@@ -43,7 +42,7 @@ runs:
           if version_gt "$version" "$baseline"; then
             {
               echo "## GLIBC baseline violation"
-              echo "One or more symbols in \`$SEARCH_ROOT\` exceed the **$GLIBC_BASELINE** floor."
+              echo "One or more symbols in \`$search_root\` exceed the **$GLIBC_BASELINE** floor."
               echo "Run \`objdump -T <binary> | grep GLIBC_\` to identify the offending symbols."
               
               if [ "${{ inputs.workflow_type }}" = "release" ]; then
