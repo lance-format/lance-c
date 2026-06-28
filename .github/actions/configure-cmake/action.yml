@@ -44,19 +44,24 @@ runs:
           wrapper_dir="${RUNNER_TEMP}/zig-linkers/${{ inputs.target }}"
           mkdir -p "$wrapper_dir"
 
-          printf '%s\n' '#!/usr/bin/env bash' \
-            "exec zig cc -target \"$zig_target\" \"\$@\"" >"$wrapper_dir/cc"
-          printf '%s\n' '#!/usr/bin/env bash' \
-            "exec zig c++ -target \"$zig_target\" \"\$@\"" >"$wrapper_dir/cxx"
-          chmod +x "$wrapper_dir/cc" "$wrapper_dir/cxx"
+          # Single wrapper: used by rustc as linker only (via CARGO_TARGET_*_RUSTFLAGS).
+          # We do NOT set it as CMAKE_C_COMPILER — Corrosion propagates CMAKE_C_COMPILER
+          # as CC_<target> to all cargo C build scripts (aws-lc-sys, sha2-asm, etc.),
+          # and zig cc cannot handle LLVM-style flags those scripts pass (e.g.
+          # --target=x86_64-unknown-linux-gnu, -march=armv8-a+crypto).
+          printf '#!/usr/bin/env bash\nexec zig cc -target "%s" "$@"\n' "$zig_target" > "$wrapper_dir/cc"
+          chmod +x "$wrapper_dir/cc"
 
-          echo "Resolved linker wrapper: $wrapper_dir/cc"
-          echo "Resolved C++ wrapper: $wrapper_dir/cxx"
+          triple_upper=$(echo "${{ inputs.target }}" | tr '[:lower:]-' '[:upper:]_')
 
-          CMAKE_FLAGS+=(
-            "-DCMAKE_C_COMPILER=$wrapper_dir/cc"
-            "-DCMAKE_CXX_COMPILER=$wrapper_dir/cxx"
-          )
+          {
+            # Tell rustc to use zig cc as linker only (not as CC for build scripts).
+            # Cargo C build deps (aws-lc-sys, sha2-asm, etc.) will use the system
+            # clang via CC/CXX set at the job level, avoiding zig's CPU/flag
+            # parsing issues (e.g. -march=armv8-a+crypto, --target= LLVM triples).
+            # linker-flavor=gcc means rustc will NOT pass --target to the linker.
+            echo "CARGO_TARGET_${triple_upper}_RUSTFLAGS=-C linker=$wrapper_dir/cc -C linker-flavor=gcc"
+          } >> "$GITHUB_ENV"
         fi
 
         cmake -S . -B "$build_dir" "${CMAKE_FLAGS[@]}"
