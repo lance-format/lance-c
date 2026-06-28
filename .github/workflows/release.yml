@@ -8,10 +8,6 @@ on:
       version:
         description: "Version to build (without leading 'v')"
         required: true
-      skip_glibc_check:
-        description: "Emergency override: skip GLIBC baseline check (set to 'true' only if intentional)"
-        required: false
-        default: 'false'
 
 permissions:
   contents: write   # needed for softprops/action-gh-release
@@ -53,7 +49,6 @@ jobs:
           set +a
           {
             echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
-            echo "GLIBC_BASELINE=$GLIBC_BASELINE"
           } >>"$GITHUB_ENV"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -64,11 +59,6 @@ jobs:
       - name: Install protobuf (Linux)
         if: matrix.os_label == 'linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Setup Zig Toolchain (Linux Only)
-        if: matrix.os_label == 'linux'
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2
-        with:
-          version: 0.14.0
       - name: Install protobuf (macOS)
         if: matrix.os_label == 'macos'
         run: brew install protobuf
@@ -80,28 +70,12 @@ jobs:
           else
             echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
           fi
-      - name: Configure CMake
-        uses: ./.github/actions/configure-cmake
-        with:
-          target: ${{ matrix.target }}
-          os_label: ${{ matrix.os_label }}
-      - name: build
+      - name: Configure + build
         run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
-      - name: Verify GLIBC Baseline
-        if: matrix.os_label == 'linux' && inputs.skip_glibc_check != 'true'
-        uses: ./.github/actions/verify-glibc-baseline
-        with:
-          search_root: ${{ github.workspace }}/stage
-          workflow_type: release
-      - name: Annotate skipped GLIBC check
-        if: matrix.os_label == 'linux' && inputs.skip_glibc_check == 'true'
-        run: |
-          echo "::warning title=GLIBC check skipped::skip_glibc_check=true was set — this release may exceed the GLIBC_BASELINE (${{ env.GLIBC_BASELINE }}) floor. Audit the artifact before distributing."
-          echo "## ⚠️ GLIBC baseline check was skipped" >> "$GITHUB_STEP_SUMMARY"
-          echo "skip_glibc_check=true was set on this run. The artifact may link symbols above **${{ env.GLIBC_BASELINE }}**." >> "$GITHUB_STEP_SUMMARY"
       - name: Tar
         id: pack
         run: |

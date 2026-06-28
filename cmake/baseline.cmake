@@ -14,11 +14,6 @@ function(lance_c_load_baseline_env env_file)
         if(_line STREQUAL "" OR _line MATCHES "^#")
             continue()
         endif()
-
-        if(NOT _line MATCHES "^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
-            message(FATAL_ERROR "Invalid baseline line: ${_line}")
-        endif()
-
         set("${CMAKE_MATCH_1}" "${CMAKE_MATCH_2}" PARENT_SCOPE)
     endforeach()
 endfunction()

@@ -64,7 +64,6 @@ if(NOT LANCE_C_USE_PREBUILT)
         CRATES lance-c
         CRATE_TYPES staticlib cdylib
         PROFILE release
-        NO_LINKER_OVERRIDE  # linker is set via CARGO_TARGET_*_RUSTFLAGS in the CI action
     )
     if(APPLE)
         corrosion_set_env_vars(lance_c "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")

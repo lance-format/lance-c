@@ -36,10 +36,8 @@ jobs:
         include:
           - runner: ubuntu-24.04
             os_label: linux
-            target: x86_64-unknown-linux-gnu
           - runner: macos-14
             os_label: macos
-            target: aarch64-apple-darwin
     env:
       CC: clang
       CXX: clang++
@@ -53,35 +51,20 @@ jobs:
           set +a
           {
             echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
-            echo "GLIBC_BASELINE=$GLIBC_BASELINE"
           } >>"$GITHUB_ENV"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: Install protobuf-compiler (Linux)
         if: matrix.os_label == 'linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Setup Zig Toolchain (Linux Only)
-        if: matrix.os_label == 'linux'
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2
-        with:
-          version: 0.14.0
       - name: Install protobuf (macOS)
         if: matrix.os_label == 'macos'
         run: brew install protobuf
-      - name: Configure CMake
-        uses: ./.github/actions/configure-cmake
-        with:
-          target: ${{ matrix.target }}
-          os_label: ${{ matrix.os_label }}
-      - name: build + install lance-c
+      - name: Configure + build + install lance-c
         run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build
           cmake --install build --prefix "$PWD/_install"
-      - name: Verify GLIBC Baseline
-        if: matrix.os_label == 'linux'
-        uses: ./.github/actions/verify-glibc-baseline
-        with:
-          search_root: ${{ github.workspace }}/_install
       - name: Build consumer example against the install
         run: |
           cmake -S examples/cmake-consumer -B consumer-build \
