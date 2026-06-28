@@ -28,28 +28,45 @@ env:
 jobs:
   consumer-smoke-test:
     name: find_package(LanceC) smoke test
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
-            os_label: linux
-          - runner: macos-14
-            os_label: macos
+          - os: ubuntu-24.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+          - os: macos-14
     env:
       CC: clang
       CXX: clang++
     steps:
       - uses: actions/checkout@v4
+      - name: Load baseline floors
+        shell: bash
+        run: |
+          set -a
+          source .github/baseline.env
+          set +a
+          {
+            echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+          } >>"$GITHUB_ENV"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: Install protobuf-compiler (Linux)
-        if: matrix.os_label == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        if: runner.os == 'Linux'
+        run: |
+          ARCH=$(uname -m)
+          case "${ARCH}" in x86_64) PA="linux-x86_64" ;; aarch64) PA="linux-aarch_64" ;; esac
+          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-${PA}.zip" -o /tmp/protoc.zip
+          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' && rm /tmp/protoc.zip
+      - name: Install Clang 20 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+            manylinux-install-clang -v 20.1.8.0
       - name: Install protobuf (macOS)
-        if: matrix.os_label == 'macos'
+        if: runner.os == 'macOS'
         run: brew install protobuf
       - name: Configure + build + install lance-c
         run: |

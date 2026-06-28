@@ -6,67 +6,15 @@ The C/C++ binding to [Lance](https://github.com/lancedb/lance), providing native
 - **C++ wrappers:** [`include/lance/lance.hpp`](include/lance/lance.hpp) (header-only, RAII, exceptions)
 - **Data exchange:** [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) for zero-copy interop
 
-## Roadmap
+## Supported build targets
 
-Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/6035).
-
-### Phase 1: Core Read Path + C++ Wrappers (MVP)
-
-| Status | Component | Description |
-|--------|-----------|-------------|
-| [x] | Infrastructure | `lance-c` crate with Cargo.toml, Tokio runtime initialization |
-| [x] | Error handling | Thread-local error codes/messages for cross-FFI safety |
-| [x] | C header | `lance.h` with Arrow C Data Interface structs |
-| [x] | Dataset operations | Open/close with URI + storage options + version support |
-| [x] | Schema export | Arrow C Data Interface for zero-copy schema exchange |
-| [x] | Scanner builder | Column projection, SQL filters, limit/offset, batch size, row ID, fragment filtering |
-| [x] | ArrowArrayStream export | `lance_scanner_to_arrow_stream()` blocking API |
-| [x] | Batch iteration | `lance_scanner_next()` blocking function |
-| [x] | Poll + waker iteration | `lance_scanner_poll_next()` for async engines (Velox, Presto) |
-| [x] | Random access | Index-based row retrieval via `lance_dataset_take()` |
-| [x] | C++ wrappers | Header-only RAII library (`lance::Dataset`, `lance::Scanner`, `lance::Batch`) |
-| [x] | Builder pattern | Fluent Scanner API (`.limit().offset().batch_size().with_row_id()`) |
-
-### Phase 2: Vector Search & Indexing
-
-| Status | Component | Description |
-|--------|-----------|-------------|
-| [x] | Vector search | Nearest-neighbor via scanner with metric/k/nprobes |
-| [x] | Full-text search | FTS queries through scanner interface |
-| [x] | Vector index creation | IVF_PQ, IVF_FLAT, IVF_SQ, HNSW variants |
-| [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List indexes |
-| [x] | Index management | List and drop index operations |
-| [x] | C++ wrappers | `create_vector_index()` and `create_scalar_index()` methods |
-
-### Phase 3: Write Path & Mutations
-
-| Status | Component | Description |
-|--------|-----------|-------------|
-| [x] | Dataset write | Create / append / overwrite from ArrowArrayStream via `lance_dataset_write()`; tunable variant `lance_dataset_write_with_params()` for file/row-group sizing, Lance format version, and stable row IDs |
-| [x] | Fragment writer | Batch-at-a-time fragment file writing (no commit) via `lance_write_fragments()` |
-| [x] | Delete operations | Predicate-based deletion via `lance_dataset_delete()` |
-| [x] | Update operations | Expression-based row updates via `lance_dataset_update()` |
-| [x] | Merge-insert | Upsert via configurable when-matched / when-not-matched policies with `lance_dataset_merge_insert()` |
-| [x] | Schema evolution | Add columns via SQL / all-null / `ArrowArrayStream` with `lance_dataset_add_columns_*()`, drop via `lance_dataset_drop_columns()`, rename / retype / set nullability via `lance_dataset_alter_columns()` |
-| [x] | Version management | List via `lance_dataset_versions()`, rollback via `lance_dataset_restore()`, checkout via `lance_dataset_open(uri, opts, version)` |
-
-### Phase 4: Advanced Features
-
-| Status | Component | Description |
-|--------|-----------|-------------|
-| [x] | Fragment-level access | Fragment enumeration, ID listing, scanner fragment filtering |
-| [x] | Compaction | Fragment consolidation via `lance_dataset_compact_files()` |
-| [x] | Statistics export | Per-field compressed on-disk size for query planning via `lance_dataset_calculate_data_stats()` |
-| [x] | Cloud storage | S3, GCS, Azure via storage options pass-through |
-| [x] | Package distribution | vcpkg and Conan recipe packaging |
-
-### Additional (not in RFC)
-
-| Status | Component | Description |
-|--------|-----------|-------------|
-| [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
-| [x] | Dataset metadata | `lance_dataset_version()`, `lance_dataset_count_rows()`, `lance_dataset_latest_version()` |
-| [x] | Substrait filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression` (preferred over SQL strings for query engines) |
+| Component | Target / minimum |
+|-----------|------------------|
+| CMake | 3.22+ |
+| C++ | C++20 |
+| GLIBC baseline | 2.28 |
+| Clang | Clang 20; Apple Clang 15 |
+| macOS | `.github/baseline.env` (`MACOSX_DEPLOYMENT_TARGET`) |
 
 ## Building
 
@@ -81,11 +29,11 @@ cargo build --release
 Produces `target/release/liblance_c.{so,dylib,dll}` and a `liblance_c.a`.
 Headers stay in `include/lance/`.
 
-### From source via CMake (C/C++ developers)
+### From source via CMake (C/C++ developers and packagers)
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake --build build --parallel
 cmake --install build --prefix /your/prefix
 ```
 
@@ -99,6 +47,8 @@ target_link_libraries(myapp PRIVATE LanceC::lance_c)
 
 See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
 working example.
+
+Baseline values are defined once in [`.github/baseline.env`](.github/baseline.env) and loaded by CI, release workflows, and CMake.
 
 ### vcpkg
 
