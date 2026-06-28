@@ -38,18 +38,26 @@ runs:
           [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
         }
 
-        while IFS= read -r version; do
-          if version_gt "$version" "$baseline"; then
-            {
-              echo "## GLIBC baseline violation"
-              echo "One or more symbols in \`$search_root\` exceed the **$GLIBC_BASELINE** floor."
-              echo "Run \`objdump -T <binary> | grep GLIBC_\` to identify the offending symbols."
-              
-              if [ "${{ inputs.workflow_type }}" = "release" ]; then
-                echo "To override in an emergency, re-dispatch with \`skip_glibc_check=true\`."
-              fi
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error title=GLIBC baseline violated::See job summary for details."
-            exit 1
-          fi
-        done < <(printf '%s\n' "$objdump_output" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -Vu)
+        violating_symbols=$(printf '%s\n' "$objdump_output" | grep -E 'GLIBC_[0-9]' | \
+          awk '{for(i=1;i<=NF;i++) if($i~/GLIBC_[0-9]/) print $i, $(NF)}' | \
+          while read -r ver sym; do
+            v=$(echo "$ver" | grep -oE '[0-9]+(\.[0-9]+)+')
+            if version_gt "$v" "$baseline"; then echo "$sym $ver"; fi
+          done | sort -u)
+
+        if [ -n "$violating_symbols" ]; then
+          {
+            echo "## GLIBC baseline violation"
+            echo "One or more symbols in \`$target_so\` exceed the **$GLIBC_BASELINE** floor."
+            echo ""
+            echo "### Offending symbols"
+            echo "\`\`\`"
+            echo "$violating_symbols"
+            echo "\`\`\`"
+            if [ "${{ inputs.workflow_type }}" = "release" ]; then
+              echo "To override in an emergency, re-dispatch with \`skip_glibc_check=true\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=GLIBC baseline violated::See job summary for details."
+          exit 1
+        fi
