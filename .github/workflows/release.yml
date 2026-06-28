@@ -66,7 +66,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Setup Zig Toolchain (Linux Only)
         if: matrix.os_label == 'linux'
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2
         with:
           version: 0.13.0
       - name: Install protobuf (macOS)
