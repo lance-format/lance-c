@@ -17,8 +17,13 @@ env:
 
 jobs:
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.target }}${{ matrix.artifact_suffix }})
     runs-on: ${{ matrix.runner }}
+    container:
+      # An expression evaluating to empty means "no container" — the job runs
+      # directly on the runner. A literal `image: ''` fails schema validation,
+      # but an expression does not, which is what makes this pattern work.
+      image: ${{ matrix.container }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -27,28 +32,73 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             os_label: linux
+            container: ""
+            artifact_suffix: ""
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             os_label: linux
+            container: ""
+            artifact_suffix: ""
+          # Debian 12 (bookworm) ships glibc 2.36. Building inside the image
+          # pins the ABI floor by construction, independent of whatever glibc
+          # the host runner image happens to carry, so these archives keep
+          # working on bookworm-based deployments.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            os_label: linux
+            container: "debian:12"
+            artifact_suffix: "-debian12"
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            os_label: linux
+            container: "debian:12"
+            artifact_suffix: "-debian12"
           # x86_64-apple-darwin temporarily disabled: GitHub is deprecating
           # macos-13 runners and jobs queue 24h+ before timing out. Restore
           # this row once a macos-* Intel runner is reliably available again.
           - target: aarch64-apple-darwin
             runner: macos-14
             os_label: macos
+            container: ""
+            artifact_suffix: ""
     env:
       CC: clang
       CXX: clang++
     steps:
+      # Runs before checkout so git is present for the clone and for the
+      # Corrosion FetchContent. The image has no sudo and runs as root.
+      # xz-utils backs `tar -cJf` and perl provides `shasum`; neither is in
+      # the base image.
+      - name: Install build dependencies (container)
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            cmake \
+            curl \
+            git \
+            libssl-dev \
+            perl \
+            pkg-config \
+            protobuf-compiler \
+            xz-utils
       - uses: actions/checkout@v4
+      - name: Mark workspace safe for git (container)
+        if: matrix.container != ''
+        run: git config --global --add safe.directory '*'
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          # Suffix keeps the container and host builds of the same triple from
+          # sharing a cache — they link against different glibc versions.
+          key: ${{ matrix.target }}${{ matrix.artifact_suffix }}
       - name: Install protobuf (Linux)
-        if: matrix.os_label == 'linux'
+        if: matrix.os_label == 'linux' && matrix.container == ''
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Install protobuf (macOS)
         if: matrix.os_label == 'macos'
@@ -72,7 +122,8 @@ jobs:
         run: |
           VERSION=${{ steps.ver.outputs.version }}
           TARGET=${{ matrix.target }}
-          ARCHIVE="lance-c-v${VERSION}-${TARGET}.tar.xz"
+          SUFFIX=${{ matrix.artifact_suffix }}
+          ARCHIVE="lance-c-v${VERSION}-${TARGET}${SUFFIX}.tar.xz"
           tar -C stage -cJf "${ARCHIVE}" .
           shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
           shasum -a 512 "${ARCHIVE}" > "${ARCHIVE}.sha512"
@@ -80,7 +131,7 @@ jobs:
       - name: Upload as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: ${{ matrix.target }}${{ matrix.artifact_suffix }}
           path: |
             ${{ steps.pack.outputs.archive }}
             ${{ steps.pack.outputs.archive }}.sha256
