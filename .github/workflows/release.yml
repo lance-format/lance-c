@@ -68,7 +68,11 @@ jobs:
       # Runs before checkout so git is present for the clone and for the
       # Corrosion FetchContent. The image has no sudo and runs as root.
       # xz-utils backs `tar -cJf` and perl provides `shasum`; neither is in
-      # the base image.
+      # the base image. libprotobuf-dev supplies the well-known .proto files
+      # under /usr/include/google/protobuf/, which lance-encoding's build
+      # script imports; protobuf-compiler only Recommends it, so
+      # --no-install-recommends drops it and protoc fails to resolve
+      # google/protobuf/empty.proto.
       - name: Install build dependencies (container)
         if: matrix.container != ''
         run: |
@@ -80,6 +84,7 @@ jobs:
             cmake \
             curl \
             git \
+            libprotobuf-dev \
             libssl-dev \
             perl \
             pkg-config \
