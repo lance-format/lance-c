@@ -60,12 +60,9 @@ pub struct LanceSqlColumn {
 /// Returns 0 on success, -1 on error. Error codes:
 /// `LANCE_ERR_INVALID_ARGUMENT` for NULL/empty args, NULL or empty `name` /
 /// `expression`, non-UTF-8 strings, malformed SQL *syntax*, a new column whose
-/// name collides with an existing column, or a `batch_size` that exceeds
-/// `u32::MAX`. An expression that references a *non-existent column*
-/// is resolved by the upstream planner and surfaces as `LANCE_ERR_INTERNAL`
-/// (an upstream schema error, the same path as `lance_dataset_delete`); we do
-/// not re-classify it at the FFI boundary. `LANCE_ERR_COMMIT_CONFLICT` for a
-/// concurrent writer.
+/// name collides with an existing column, a `batch_size` that exceeds
+/// `u32::MAX`, or an expression that references a non-existent column.
+/// `LANCE_ERR_COMMIT_CONFLICT` for a concurrent writer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_add_columns_sql(
     dataset: *mut LanceDataset,

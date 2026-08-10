@@ -279,10 +279,9 @@ LanceDataset* lance_dataset_restore(const LanceDataset* dataset, uint64_t versio
  *                         predicate matched nothing). On error the slot is
  *                         left unchanged — do not read it.
  * @return 0 on success, -1 on error. Error codes:
- *         LANCE_ERR_INVALID_ARGUMENT for NULL/empty args (validated at this
- *         boundary), LANCE_ERR_INTERNAL for malformed SQL or unknown columns
- *         (surfaced from the upstream parser), and LANCE_ERR_COMMIT_CONFLICT
- *         for a concurrent writer.
+ *         LANCE_ERR_INVALID_ARGUMENT for NULL/empty args, malformed SQL, or
+ *         unknown columns, and LANCE_ERR_COMMIT_CONFLICT for a concurrent
+ *         writer.
  */
 int32_t lance_dataset_delete(
     LanceDataset* dataset,
@@ -636,11 +635,9 @@ typedef struct LanceSqlColumn {
  *         LANCE_ERR_INVALID_ARGUMENT for NULL/empty inputs, NULL or empty
  *         `name` / `expression`, non-UTF-8 strings, malformed SQL *syntax*, a
  *         new column name that collides with an existing column, or a
- *         `batch_size` beyond UINT32_MAX. An expression that references a
- *         *non-existent column* surfaces as LANCE_ERR_INTERNAL (an upstream
- *         schema error, the same path as lance_dataset_delete), not
- *         LANCE_ERR_INVALID_ARGUMENT. LANCE_ERR_COMMIT_CONFLICT for a
- *         concurrent writer.
+ *         `batch_size` beyond UINT32_MAX, or an expression that references a
+ *         non-existent column. LANCE_ERR_COMMIT_CONFLICT for a concurrent
+ *         writer.
  */
 int32_t lance_dataset_add_columns_sql(
     LanceDataset* dataset,

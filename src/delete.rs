@@ -26,10 +26,8 @@ use crate::runtime::block_on;
 ///   slot is untouched.
 ///
 /// Returns 0 on success, -1 on error. Error codes:
-/// `LANCE_ERR_INVALID_ARGUMENT` for NULL/empty args (validated at this
-/// boundary), `LANCE_ERR_INTERNAL` for malformed SQL or unknown columns
-/// (surfaced from the upstream parser), and `LANCE_ERR_COMMIT_CONFLICT`
-/// for a concurrent writer.
+/// `LANCE_ERR_INVALID_ARGUMENT` for NULL/empty args, malformed SQL, or unknown
+/// columns, and `LANCE_ERR_COMMIT_CONFLICT` for a concurrent writer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_delete(
     dataset: *mut LanceDataset,

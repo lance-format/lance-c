@@ -4435,10 +4435,8 @@ fn test_delete_invalid_predicate_rejected() {
     let pred = c_str("not a real predicate ((((");
     let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
     assert_eq!(rc, -1);
-    // Parser errors come back as Internal (this is what upstream surfaces;
-    // we don't try to re-classify them at the FFI boundary). If upstream
-    // ever tightens this to InvalidArgument, tighten this assertion too.
-    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    // The upstream parser classifies malformed predicates as invalid input.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     // The dataset is left untouched on the error path.
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
 
@@ -4454,8 +4452,8 @@ fn test_delete_unknown_column_rejected() {
     let pred = c_str("no_such_column = 1");
     let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
     assert_eq!(rc, -1);
-    // Same upstream classification as malformed SQL — see note above.
-    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    // The upstream planner classifies unknown columns as invalid input.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
 
     unsafe { lance_dataset_close(ds) };
@@ -7732,13 +7730,8 @@ fn test_add_columns_sql_unknown_column_rejected() {
     let cols = [sql_column(&name, &expr)];
     let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
     assert_eq!(rc, -1);
-    // A non-existent column is resolved by the lance-datafusion planner, which
-    // raises a schema error (`Error::Schema`) — the same upstream path as
-    // `lance_dataset_delete`'s unknown-column predicate. We don't re-classify
-    // it at the FFI boundary, so it surfaces as `Internal`, distinct from a
-    // *syntax* error, which the planner wraps as `InvalidInput`. If upstream
-    // ever tightens this to InvalidInput, tighten this assertion too.
-    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    // The upstream planner classifies unknown columns as invalid input.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 
     unsafe { lance_dataset_close(ds) };
 }
