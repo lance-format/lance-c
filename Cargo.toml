@@ -18,12 +18,12 @@ rust-version = "1.91.0"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6", features = ["substrait"] }
-lance-core = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6" }
-lance-index = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6" }
-lance-io = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6" }
-lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6" }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df", features = ["substrait"] }
+lance-core = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df" }
+lance-index = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df" }
+lance-io = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df" }
+lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df" }
 arrow = { version = "58.0.0", features = ["prettyprint", "ffi"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
@@ -36,12 +36,12 @@ snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6", features = ["substrait"] }
-lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6", features = ["substrait"] }
-lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6" }
-lance-table = { git = "https://github.com/lance-format/lance.git", rev = "9644d163c6e1ed309eea9ec2960c000a17663ed6" }
-datafusion = { version = "53.1.0", default-features = false }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df", features = ["substrait"] }
+lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df", features = ["substrait"] }
+lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df" }
+lance-table = { git = "https://github.com/lance-format/lance.git", rev = "95f2f36b22043c3face00afe088c34e0742d01df" }
+datafusion = { version = "54.1.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"

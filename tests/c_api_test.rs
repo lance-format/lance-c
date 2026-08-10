@@ -1528,6 +1528,7 @@ fn test_robotics_e2e_write_then_finalize() {
     use lance::dataset::transaction::{Operation, Transaction};
     use lance::dataset::{CommitBuilder, WriteDestination};
     use lance_file::reader::{CachedFileMetadata, FileReader as LanceFileReader};
+    use lance_file::version::ConcreteFileVersion;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
     use lance_io::utils::CachedFileSize;
     use lance_table::format::{DataFile, Fragment};
@@ -1617,8 +1618,11 @@ fn test_robotics_e2e_write_then_finalize() {
                 format!("data/{}", filename),
                 field_ids,
                 column_indices,
-                meta.major_version as u32,
-                meta.minor_version as u32,
+                ConcreteFileVersion::from_data_file_numbers(
+                    meta.major_version as u32,
+                    meta.minor_version as u32,
+                )
+                .unwrap(),
                 None, // file_size_bytes
                 None, // base_id
             );

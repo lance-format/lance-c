@@ -75,18 +75,21 @@ unsafe fn update_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if num_updates == 0 {
         return Err(lance_core::Error::InvalidInput {
             source: "num_updates must be >= 1".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if columns.is_null() || values.is_null() {
         return Err(lance_core::Error::InvalidInput {
             source: "columns and values must not be NULL when num_updates > 0".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -103,6 +106,7 @@ unsafe fn update_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "predicate must not be empty (pass NULL to update all rows)".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -122,12 +126,14 @@ unsafe fn update_inner(
             .ok_or_else(|| lance_core::Error::InvalidInput {
                 source: format!("columns[{i}] must not be NULL or empty").into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             })?;
         let val = unsafe { helpers::parse_c_string(val_ptr)? }
             .filter(|s| !s.is_empty())
             .ok_or_else(|| lance_core::Error::InvalidInput {
                 source: format!("values[{i}] must not be NULL or empty").into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             })?;
         update_pairs.push((col.to_string(), val.to_string()));
     }

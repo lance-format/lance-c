@@ -18,6 +18,7 @@ pub unsafe fn parse_c_string<'a>(ptr: *const c_char) -> Result<Option<&'a str>> 
     let s = cstr.to_str().map_err(|e| Error::InvalidInput {
         source: Box::new(e),
         location: location!(),
+        backtrace: snafu::GenerateImplicitData::generate(),
     })?;
     Ok(Some(s))
 }
@@ -65,6 +66,7 @@ pub unsafe fn parse_storage_options(ptr: *const *const c_char) -> Result<HashMap
             return Err(Error::InvalidInput {
                 source: "storage options must be key-value pairs; odd number of entries".into(),
                 location: location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             });
         }
         let key = unsafe { parse_c_string(key_ptr)? }.unwrap().to_string();

@@ -49,6 +49,7 @@ unsafe fn delete_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset and predicate must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -61,6 +62,7 @@ unsafe fn delete_inner(
             // NULL is rejected above; only the empty case reaches here.
             source: "predicate must not be empty".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         })?;
 
     // SAFETY: `dataset` is non-NULL (checked above) and the caller guarantees

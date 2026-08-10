@@ -41,6 +41,7 @@ unsafe fn batch_to_arrow_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "batch, out_array, and out_schema must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let b = unsafe { &*batch };

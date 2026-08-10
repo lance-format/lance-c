@@ -54,6 +54,7 @@ impl LanceMergeWhenMatched {
                 )
                 .into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             }),
         }
     }
@@ -80,6 +81,7 @@ impl LanceMergeWhenNotMatched {
                 )
                 .into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             }),
         }
     }
@@ -110,6 +112,7 @@ impl LanceMergeWhenNotMatchedBySource {
                 )
                 .into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             }),
         }
     }
@@ -241,6 +244,7 @@ unsafe fn merge_insert_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "source stream must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -253,6 +257,7 @@ unsafe fn merge_insert_inner(
         lance_core::Error::InvalidInput {
             source: e.to_string().into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
 
@@ -260,18 +265,21 @@ unsafe fn merge_insert_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if num_on_columns == 0 {
         return Err(lance_core::Error::InvalidInput {
             source: "num_on_columns must be >= 1".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if on_columns.is_null() {
         return Err(lance_core::Error::InvalidInput {
             source: "on_columns must not be NULL when num_on_columns > 0".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -289,6 +297,7 @@ unsafe fn merge_insert_inner(
             .ok_or_else(|| lance_core::Error::InvalidInput {
                 source: format!("on_columns[{i}] must not be NULL or empty").into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             })?;
         keys.push(key.to_string());
     }
@@ -387,6 +396,7 @@ unsafe fn resolve_params(params: *const LanceMergeInsertParams) -> Result<Resolv
             let expr = when_matched_expr.ok_or_else(|| lance_core::Error::InvalidInput {
                 source: "when_matched=UpdateIf requires when_matched_expr".into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             })?;
             // Upstream `WhenMatched::update_if` defers parsing until execute
             // time; we only forward the string here.
@@ -431,6 +441,7 @@ unsafe fn resolve_params(params: *const LanceMergeInsertParams) -> Result<Resolv
                         "when_not_matched_by_source=DeleteIf requires when_not_matched_by_source_expr"
                             .into(),
                     location: snafu::location!(),
+                    backtrace: snafu::GenerateImplicitData::generate(),
                 }
             })?;
             ResolvedWhenNotMatchedBySource::DeleteIf(expr)
@@ -456,6 +467,7 @@ unsafe fn read_optional_expr(ptr: *const c_char, field: &str) -> Result<Option<S
         return Err(lance_core::Error::InvalidInput {
             source: format!("{field} must not be empty").into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     Ok(Some(s.to_string()))
@@ -466,6 +478,7 @@ fn reject_unused_expr(field: &str, mode: &str, expr: &Option<String>) -> Result<
         return Err(lance_core::Error::InvalidInput {
             source: format!("{field}_expr must be NULL when {field}={mode}").into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     Ok(())

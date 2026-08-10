@@ -37,6 +37,7 @@ unsafe fn versions_inner(dataset: *const LanceDataset) -> Result<*mut LanceVersi
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let ds = unsafe { &*dataset };

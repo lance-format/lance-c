@@ -156,6 +156,7 @@ impl LanceScanner {
             return Err(lance_core::Error::InvalidInput {
                 source: "index_segments requires nearest() to be configured".into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             });
         }
         if let Some(n) = &self.nearest {
@@ -217,6 +218,7 @@ impl LanceScanner {
             return Err(lance_core::Error::InvalidInput {
                 source: "index_segments requires nearest() to be configured".into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             });
         }
         if let Some(n) = &self.nearest {
@@ -279,6 +281,7 @@ unsafe fn scanner_new_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let ds = unsafe { &*dataset };
@@ -461,6 +464,7 @@ unsafe fn scanner_to_arrow_stream_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "scanner and out must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let s = unsafe { &*scanner };
@@ -898,12 +902,14 @@ unsafe fn scanner_nearest_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "scanner, column, and query_data must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if k == 0 {
         return Err(lance_core::Error::InvalidInput {
             source: "k must be > 0".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let s = unsafe { &mut *scanner };
@@ -912,6 +918,7 @@ unsafe fn scanner_nearest_inner(
             source: "cannot call nearest after full_text_search; they are mutually exclusive"
                 .into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let column_str = unsafe { helpers::parse_c_string(column)? }.unwrap();
@@ -926,6 +933,7 @@ unsafe fn scanner_nearest_inner(
             return Err(lance_core::Error::InvalidInput {
                 source: format!("invalid element_type: {}", element_type).into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             });
         }
     };
@@ -1001,6 +1009,7 @@ unsafe fn fts_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "scanner and query must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let s = unsafe { &mut *scanner };
@@ -1011,6 +1020,7 @@ unsafe fn fts_inner(
             source: "cannot call full_text_search after nearest; they are mutually exclusive"
                 .into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 

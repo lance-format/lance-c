@@ -44,12 +44,14 @@ unsafe fn restore_inner(dataset: *const LanceDataset, version: u64) -> Result<*m
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if version == 0 {
         return Err(lance_core::Error::InvalidInput {
             source: "version must be >= 1; 0 is reserved as the \"latest\" sentinel".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 

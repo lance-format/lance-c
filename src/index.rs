@@ -38,6 +38,7 @@ impl LanceScalarIndexType {
             _ => Err(lance_core::Error::InvalidInput {
                 source: format!("invalid scalar index type: {}", v).into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             }),
         }
     }
@@ -98,6 +99,7 @@ unsafe fn create_scalar_index_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset and column must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let ds = unsafe { &*dataset };
@@ -105,6 +107,7 @@ unsafe fn create_scalar_index_inner(
         lance_core::Error::InvalidInput {
             source: "column must not be empty".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
     let name = unsafe { helpers::parse_c_string(index_name)? }.map(|s| s.to_string());
@@ -248,6 +251,7 @@ unsafe fn dataset_index_segments_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset, index_name, and out_uuids must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let ds = unsafe { &*dataset };
@@ -255,6 +259,7 @@ unsafe fn dataset_index_segments_inner(
         lance_core::Error::InvalidInput {
             source: "index_name must not be empty".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
     let snap = ds.snapshot();
@@ -267,6 +272,7 @@ unsafe fn dataset_index_segments_inner(
         return Err(lance_core::Error::IndexNotFound {
             identity: format!("name='{}'", name),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if segments.len() > capacity {
@@ -278,6 +284,7 @@ unsafe fn dataset_index_segments_inner(
             )
             .into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     // SAFETY: caller guarantees out_uuids has at least `capacity * 16` bytes,
@@ -308,6 +315,7 @@ unsafe fn drop_index_inner(dataset: *mut LanceDataset, name: *const c_char) -> R
         return Err(lance_core::Error::InvalidInput {
             source: "dataset and name must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let ds = unsafe { &*dataset };
@@ -461,6 +469,7 @@ fn require_field(name: &str, value: u32) -> Result<u32> {
         Err(lance_core::Error::InvalidInput {
             source: format!("{} is required for this index type and must be > 0", name).into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         })
     } else {
         Ok(value)
@@ -591,6 +600,7 @@ unsafe fn create_vector_index_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset, column, and params must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let ds = unsafe { &*dataset };
@@ -598,6 +608,7 @@ unsafe fn create_vector_index_inner(
         lance_core::Error::InvalidInput {
             source: "column must not be empty".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
     let name = unsafe { helpers::parse_c_string(index_name)? }.map(|s| s.to_string());

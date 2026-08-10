@@ -78,6 +78,7 @@ unsafe fn write_fragments_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "uri, schema, and stream must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -85,6 +86,7 @@ unsafe fn write_fragments_inner(
         lance_core::Error::InvalidInput {
             source: "uri must not be empty".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
 
@@ -93,6 +95,7 @@ unsafe fn write_fragments_inner(
         lance_core::Error::InvalidInput {
             source: format!("invalid schema: {e}").into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
 
@@ -103,6 +106,7 @@ unsafe fn write_fragments_inner(
         lance_core::Error::InvalidInput {
             source: e.to_string().into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
 
@@ -115,6 +119,7 @@ unsafe fn write_fragments_inner(
             )
             .into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 

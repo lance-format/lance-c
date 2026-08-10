@@ -75,6 +75,7 @@ unsafe fn open_dataset_inner(
         lance_core::Error::InvalidInput {
             source: "uri must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
 
@@ -187,6 +188,7 @@ unsafe fn dataset_schema_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset and out must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let ds = unsafe { &*dataset };
@@ -237,6 +239,7 @@ unsafe fn dataset_take_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset, indices, and out must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let ds = unsafe { &*dataset };

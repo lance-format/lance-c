@@ -86,18 +86,21 @@ unsafe fn add_columns_sql_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if columns.is_null() {
         return Err(lance_core::Error::InvalidInput {
             source: "columns must not be NULL".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if num_columns == 0 {
         return Err(lance_core::Error::InvalidInput {
             source: "num_columns must be > 0".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -164,12 +167,14 @@ unsafe fn add_columns_nulls_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if schema.is_null() {
         return Err(lance_core::Error::InvalidInput {
             source: "schema must not be NULL".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -188,6 +193,7 @@ unsafe fn add_columns_nulls_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "schema is uninitialised or already released".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     // arrow-rs's `FFI_ArrowSchema::format()` does `to_str().expect(..)` on the
@@ -206,12 +212,14 @@ unsafe fn add_columns_nulls_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "schema format string is not valid UTF-8".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     let arrow_schema =
         ArrowSchema::try_from(ffi_schema).map_err(|e| lance_core::Error::InvalidInput {
             source: format!("schema is not a valid Arrow schema: {e}").into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         })?;
 
     let transform = NewColumnTransform::AllNulls(Arc::new(arrow_schema));
@@ -273,6 +281,7 @@ unsafe fn add_columns_stream_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "stream must not be NULL".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -322,6 +331,7 @@ unsafe fn add_columns_stream_inner(
                      required get_schema/get_next/release callback"
                 .into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -337,6 +347,7 @@ unsafe fn add_columns_stream_inner(
         lance_core::Error::InvalidInput {
             source: e.to_string().into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
 
@@ -344,6 +355,7 @@ unsafe fn add_columns_stream_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -369,6 +381,7 @@ unsafe fn parse_required_field(ptr: *const c_char, index: usize, field: &str) ->
         .ok_or_else(|| lance_core::Error::InvalidInput {
             source: format!("columns[{index}].{field} must not be NULL or empty").into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         })?;
     Ok(value.to_string())
 }
@@ -383,6 +396,7 @@ fn resolve_batch_size(batch_size: u64) -> Result<Option<u32>> {
     let narrowed = u32::try_from(batch_size).map_err(|_| lance_core::Error::InvalidInput {
         source: format!("batch_size={batch_size} exceeds u32::MAX").into(),
         location: location!(),
+        backtrace: snafu::GenerateImplicitData::generate(),
     })?;
     Ok(Some(narrowed))
 }

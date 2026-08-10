@@ -56,18 +56,21 @@ unsafe fn drop_columns_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if columns.is_null() {
         return Err(lance_core::Error::InvalidInput {
             source: "columns must not be NULL".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if num_columns == 0 {
         return Err(lance_core::Error::InvalidInput {
             source: "num_columns must be > 0".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -86,6 +89,7 @@ unsafe fn drop_columns_inner(
             .ok_or_else(|| lance_core::Error::InvalidInput {
                 source: format!("columns[{i}] must not be NULL or empty").into(),
                 location: location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             })?;
         names.push(name.to_string());
     }

@@ -45,6 +45,7 @@ unsafe fn calculate_inner(dataset: *const LanceDataset) -> Result<*mut LanceData
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     // SAFETY: `dataset` is non-null (checked above) and points at a live

@@ -94,6 +94,7 @@ unsafe fn compact_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -165,5 +166,6 @@ fn u64_to_usize(v: u64, field: &'static str) -> Result<usize> {
     usize::try_from(v).map_err(|_| lance_core::Error::InvalidInput {
         source: format!("{field}={v} exceeds usize::MAX on this target").into(),
         location: snafu::location!(),
+        backtrace: snafu::GenerateImplicitData::generate(),
     })
 }

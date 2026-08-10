@@ -54,6 +54,7 @@ impl LanceColumnNullableMode {
                 )
                 .into(),
                 location: location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             }),
         }
     }
@@ -127,18 +128,21 @@ unsafe fn alter_columns_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "dataset must not be NULL".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if alterations.is_null() {
         return Err(lance_core::Error::InvalidInput {
             source: "alterations must not be NULL".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if num_alterations == 0 {
         return Err(lance_core::Error::InvalidInput {
             source: "num_alterations must be > 0".into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -180,6 +184,7 @@ unsafe fn parse_alteration(
         .ok_or_else(|| lance_core::Error::InvalidInput {
             source: format!("alterations[{index}].path must not be NULL or empty").into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         })?
         .to_string();
 
@@ -191,6 +196,7 @@ unsafe fn parse_alteration(
                 Err(lance_core::Error::InvalidInput {
                     source: format!("alterations[{index}].rename must not be empty").into(),
                     location: location!(),
+                    backtrace: snafu::GenerateImplicitData::generate(),
                 })
             } else {
                 Ok(s.to_string())
@@ -225,11 +231,13 @@ unsafe fn parse_alteration(
                 )
                 .into(),
                 location: location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             });
         }
         let dt = DataType::try_from(ffi_schema).map_err(|e| lance_core::Error::InvalidInput {
             source: format!("alterations[{index}].data_type is not a valid Arrow type: {e}").into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         })?;
         Some(dt)
     };
@@ -242,6 +250,7 @@ unsafe fn parse_alteration(
             )
             .into(),
             location: location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 

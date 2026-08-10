@@ -61,6 +61,7 @@ impl LanceWriteMode {
                 )
                 .into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             }),
         }
     }
@@ -183,6 +184,7 @@ unsafe fn write_dataset_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "stream must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -195,6 +197,7 @@ unsafe fn write_dataset_inner(
         lance_core::Error::InvalidInput {
             source: e.to_string().into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
 
@@ -202,12 +205,14 @@ unsafe fn write_dataset_inner(
         return Err(lance_core::Error::InvalidInput {
             source: "uri must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
     if schema.is_null() {
         return Err(lance_core::Error::InvalidInput {
             source: "schema must not be NULL".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -226,6 +231,7 @@ unsafe fn write_dataset_inner(
             // NULL is rejected above; only the empty case reaches here.
             source: "uri must not be empty".into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         })?;
 
     // SAFETY: `schema` is non-NULL (checked above) and the caller guarantees
@@ -236,6 +242,7 @@ unsafe fn write_dataset_inner(
         lance_core::Error::InvalidInput {
             source: format!("invalid schema: {e}").into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         }
     })?;
 
@@ -253,6 +260,7 @@ unsafe fn write_dataset_inner(
             )
             .into(),
             location: snafu::location!(),
+            backtrace: snafu::GenerateImplicitData::generate(),
         });
     }
 
@@ -319,11 +327,13 @@ unsafe fn apply_write_params(target: &mut WriteParams, params: &LanceWriteParams
             .ok_or_else(|| lance_core::Error::InvalidInput {
                 source: "data_storage_version must not be an empty string".into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             })?;
         let version =
             LanceFileVersion::from_str(s).map_err(|e| lance_core::Error::InvalidInput {
                 source: format!("invalid data_storage_version {s:?}: {e}").into(),
                 location: snafu::location!(),
+                backtrace: snafu::GenerateImplicitData::generate(),
             })?;
         target.data_storage_version = Some(version);
     }
@@ -338,5 +348,6 @@ fn u64_to_usize(v: u64, field: &'static str) -> Result<usize> {
     usize::try_from(v).map_err(|_| lance_core::Error::InvalidInput {
         source: format!("{field}={v} exceeds usize::MAX on this target").into(),
         location: snafu::location!(),
+        backtrace: snafu::GenerateImplicitData::generate(),
     })
 }
