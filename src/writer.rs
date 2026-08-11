@@ -55,13 +55,12 @@ impl LanceWriteMode {
             0 => Ok(Self::Create),
             1 => Ok(Self::Append),
             2 => Ok(Self::Overwrite),
-            other => Err(lance_core::Error::InvalidInput {
-                source: format!(
+            other => Err(lance_core::Error::invalid_input_source(
+                format!(
                     "invalid write mode {other}; expected 0 (create), 1 (append), or 2 (overwrite)"
                 )
                 .into(),
-                location: snafu::location!(),
-            }),
+            )),
         }
     }
 }
@@ -180,10 +179,9 @@ unsafe fn write_dataset_inner(
     // uri/schema NULL checks ahead of `from_raw` would leak the stream on
     // those paths and break the documented "consumed on every return" contract.
     if stream.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "stream must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "stream must not be NULL".into(),
+        ));
     }
 
     // SAFETY: `stream` is non-NULL (checked above) and the caller guarantees
@@ -191,24 +189,18 @@ unsafe fn write_dataset_inner(
     // owned by them. `from_raw` performs a `ptr::replace` that transfers
     // ownership into the returned reader, zeroing the caller's release
     // callback so it cannot be released twice.
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream) }.map_err(|e| {
-        lance_core::Error::InvalidInput {
-            source: e.to_string().into(),
-            location: snafu::location!(),
-        }
-    })?;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream) }
+        .map_err(|e| lance_core::Error::invalid_input_source(e.to_string().into()))?;
 
     if uri.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "uri must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "uri must not be NULL".into(),
+        ));
     }
     if schema.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "schema must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "schema must not be NULL".into(),
+        ));
     }
 
     // Validate the mode at the boundary — storing an out-of-range tag as a
@@ -222,21 +214,15 @@ unsafe fn write_dataset_inner(
     // which `block_on` enforces by completing before this function returns.
     let uri_str = unsafe { helpers::parse_c_string(uri)? }
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| lance_core::Error::InvalidInput {
-            // NULL is rejected above; only the empty case reaches here.
-            source: "uri must not be empty".into(),
-            location: snafu::location!(),
-        })?;
+        // NULL is rejected above; only the empty case reaches here.
+        .ok_or_else(|| lance_core::Error::invalid_input("uri must not be empty"))?;
 
     // SAFETY: `schema` is non-NULL (checked above) and the caller guarantees
     // it points to a properly-initialized `FFI_ArrowSchema` valid for the
     // duration of this call. `try_from(&FFI_ArrowSchema)` reads by shared
     // reference and does not move out of or release the schema.
     let expected_schema = ArrowSchema::try_from(unsafe { &*schema }).map_err(|e| {
-        lance_core::Error::InvalidInput {
-            source: format!("invalid schema: {e}").into(),
-            location: snafu::location!(),
-        }
+        lance_core::Error::invalid_input_source(format!("invalid schema: {e}").into())
     })?;
 
     // SAFETY: `storage_opts` is either NULL or a NULL-terminated array of
@@ -247,13 +233,10 @@ unsafe fn write_dataset_inner(
     // Fail fast: compare the stream schema against the caller-provided schema.
     let stream_schema = reader.schema();
     if stream_schema.fields() != expected_schema.fields() {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!(
+        return Err(lance_core::Error::invalid_input_source(format!(
                 "stream schema does not match the provided schema.\n  expected: {expected_schema}\n  got:      {stream_schema}"
             )
-            .into(),
-            location: snafu::location!(),
-        });
+            .into()));
     }
 
     let store_params = (!opts.is_empty()).then(|| ObjectStoreParams {
@@ -316,15 +299,16 @@ unsafe fn apply_write_params(target: &mut WriteParams, params: &LanceWriteParams
         // of relying on `FromStr`'s generic "unknown version" path.
         let s = unsafe { helpers::parse_c_string(params.data_storage_version)? }
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| lance_core::Error::InvalidInput {
-                source: "data_storage_version must not be an empty string".into(),
-                location: snafu::location!(),
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    "data_storage_version must not be an empty string".into(),
+                )
             })?;
-        let version =
-            LanceFileVersion::from_str(s).map_err(|e| lance_core::Error::InvalidInput {
-                source: format!("invalid data_storage_version {s:?}: {e}").into(),
-                location: snafu::location!(),
-            })?;
+        let version = LanceFileVersion::from_str(s).map_err(|e| {
+            lance_core::Error::invalid_input_source(
+                format!("invalid data_storage_version {s:?}: {e}").into(),
+            )
+        })?;
         target.data_storage_version = Some(version);
     }
     target.enable_stable_row_ids = params.enable_stable_row_ids;
@@ -335,8 +319,9 @@ unsafe fn apply_write_params(target: &mut WriteParams, params: &LanceWriteParams
 /// Realistic write tunings fit in `usize` on every supported target, but a
 /// silent `as` cast would wrap on a 32-bit host.
 fn u64_to_usize(v: u64, field: &'static str) -> Result<usize> {
-    usize::try_from(v).map_err(|_| lance_core::Error::InvalidInput {
-        source: format!("{field}={v} exceeds usize::MAX on this target").into(),
-        location: snafu::location!(),
+    usize::try_from(v).map_err(|_| {
+        lance_core::Error::invalid_input_source(
+            format!("{field}={v} exceeds usize::MAX on this target").into(),
+        )
     })
 }

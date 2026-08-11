@@ -41,16 +41,14 @@ pub unsafe extern "C" fn lance_dataset_restore(
 
 unsafe fn restore_inner(dataset: *const LanceDataset, version: u64) -> Result<*mut LanceDataset> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     if version == 0 {
-        return Err(lance_core::Error::InvalidInput {
-            source: "version must be >= 1; 0 is reserved as the \"latest\" sentinel".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "version must be >= 1; 0 is reserved as the \"latest\" sentinel".into(),
+        ));
     }
 
     let ds = unsafe { &*dataset };

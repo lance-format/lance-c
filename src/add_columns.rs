@@ -26,7 +26,6 @@ use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::NewColumnTransform;
 use lance_core::Result;
-use snafu::location;
 
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
@@ -86,22 +85,19 @@ unsafe fn add_columns_sql_inner(
     batch_size: u64,
 ) -> Result<i32> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     if columns.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "columns must not be NULL".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "columns must not be NULL".into(),
+        ));
     }
     if num_columns == 0 {
-        return Err(lance_core::Error::InvalidInput {
-            source: "num_columns must be > 0".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "num_columns must be > 0".into(),
+        ));
     }
 
     let batch_size = resolve_batch_size(batch_size)?;
@@ -164,16 +160,14 @@ unsafe fn add_columns_nulls_inner(
     schema: *const FFI_ArrowSchema,
 ) -> Result<i32> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     if schema.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "schema must not be NULL".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "schema must not be NULL".into(),
+        ));
     }
 
     // SAFETY: `schema` is non-NULL (checked above) and the caller guarantees it
@@ -188,10 +182,9 @@ unsafe fn add_columns_nulls_inner(
     // zero-initialised or half-built struct that would slip past the release
     // check.
     if ffi_schema.release.is_none() || ffi_schema.format.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "schema is uninitialised or already released".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "schema is uninitialised or already released".into(),
+        ));
     }
     // arrow-rs's `FFI_ArrowSchema::format()` does `to_str().expect(..)` on the
     // format pointer; a non-NULL but non-UTF-8 top-level format would abort the
@@ -206,16 +199,15 @@ unsafe fn add_columns_nulls_inner(
         .to_str()
         .is_err()
     {
-        return Err(lance_core::Error::InvalidInput {
-            source: "schema format string is not valid UTF-8".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "schema format string is not valid UTF-8".into(),
+        ));
     }
-    let arrow_schema =
-        ArrowSchema::try_from(ffi_schema).map_err(|e| lance_core::Error::InvalidInput {
-            source: format!("schema is not a valid Arrow schema: {e}").into(),
-            location: location!(),
-        })?;
+    let arrow_schema = ArrowSchema::try_from(ffi_schema).map_err(|e| {
+        lance_core::Error::invalid_input_source(
+            format!("schema is not a valid Arrow schema: {e}").into(),
+        )
+    })?;
 
     let transform = NewColumnTransform::AllNulls(Arc::new(arrow_schema));
 
@@ -273,10 +265,9 @@ unsafe fn add_columns_stream_inner(
     // contract. (This NULL-before-`from_raw` ordering matches `merge_insert.rs`;
     // the callback pre-flight guard below is specific to this function.)
     if stream.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "stream must not be NULL".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "stream must not be NULL".into(),
+        ));
     }
 
     // Reject a stream missing a mandatory C Data Interface callback *before*
@@ -320,12 +311,11 @@ unsafe fn add_columns_stream_inner(
                 release_fn(stream);
             }
         }
-        return Err(lance_core::Error::InvalidInput {
-            source: "stream is uninitialised, already released, or missing a \
+        return Err(lance_core::Error::invalid_input_source(
+            "stream is uninitialised, already released, or missing a \
                      required get_schema/get_next/release callback"
                 .into(),
-            location: location!(),
-        });
+        ));
     }
 
     // SAFETY: `stream` is non-NULL (checked above) and the caller guarantees it
@@ -336,18 +326,13 @@ unsafe fn add_columns_stream_inner(
     // `release == NULL` error, but `from_raw` still fails (a live `map_err` path)
     // if the stream's `get_schema` callback returns an error code or yields a
     // schema arrow-rs cannot convert; that surfaces as `LANCE_ERR_INVALID_ARGUMENT`.
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream) }.map_err(|e| {
-        lance_core::Error::InvalidInput {
-            source: e.to_string().into(),
-            location: location!(),
-        }
-    })?;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream) }
+        .map_err(|e| lance_core::Error::invalid_input_source(e.to_string().into()))?;
 
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
 
     let batch_size = resolve_batch_size(batch_size)?;
@@ -369,9 +354,10 @@ unsafe fn parse_required_field(ptr: *const c_char, index: usize, field: &str) ->
     // string the caller keeps alive for this call.
     let value = unsafe { helpers::parse_c_string(ptr)? }
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| lance_core::Error::InvalidInput {
-            source: format!("columns[{index}].{field} must not be NULL or empty").into(),
-            location: location!(),
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source(
+                format!("columns[{index}].{field} must not be NULL or empty").into(),
+            )
         })?;
     Ok(value.to_string())
 }
@@ -383,9 +369,10 @@ fn resolve_batch_size(batch_size: u64) -> Result<Option<u32>> {
     if batch_size == 0 {
         return Ok(None);
     }
-    let narrowed = u32::try_from(batch_size).map_err(|_| lance_core::Error::InvalidInput {
-        source: format!("batch_size={batch_size} exceeds u32::MAX").into(),
-        location: location!(),
+    let narrowed = u32::try_from(batch_size).map_err(|_| {
+        lance_core::Error::invalid_input_source(
+            format!("batch_size={batch_size} exceeds u32::MAX").into(),
+        )
     })?;
     Ok(Some(narrowed))
 }

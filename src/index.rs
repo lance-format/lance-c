@@ -35,10 +35,9 @@ impl LanceScalarIndexType {
             2 => Ok(Self::Bitmap),
             3 => Ok(Self::LabelList),
             4 => Ok(Self::Inverted),
-            _ => Err(lance_core::Error::InvalidInput {
-                source: format!("invalid scalar index type: {}", v).into(),
-                location: snafu::location!(),
-            }),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!("invalid scalar index type: {}", v).into(),
+            )),
         }
     }
 
@@ -95,17 +94,13 @@ unsafe fn create_scalar_index_inner(
     replace: bool,
 ) -> Result<i32> {
     if dataset.is_null() || column.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset and column must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset and column must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let column_str = unsafe { helpers::parse_c_string(column)? }.ok_or_else(|| {
-        lance_core::Error::InvalidInput {
-            source: "column must not be empty".into(),
-            location: snafu::location!(),
-        }
+        lance_core::Error::invalid_input_source("column must not be empty".into())
     })?;
     let name = unsafe { helpers::parse_c_string(index_name)? }.map(|s| s.to_string());
     let params_str = unsafe { helpers::parse_c_string(params_json)? };
@@ -245,17 +240,13 @@ unsafe fn dataset_index_segments_inner(
     out_count: *mut u64,
 ) -> Result<i32> {
     if dataset.is_null() || index_name.is_null() || out_uuids.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset, index_name, and out_uuids must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset, index_name, and out_uuids must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let name = unsafe { helpers::parse_c_string(index_name)? }.ok_or_else(|| {
-        lance_core::Error::InvalidInput {
-            source: "index_name must not be empty".into(),
-            location: snafu::location!(),
-        }
+        lance_core::Error::invalid_input_source("index_name must not be empty".into())
     })?;
     let snap = ds.snapshot();
     let indices = block_on(snap.load_indices())?;
@@ -264,21 +255,20 @@ unsafe fn dataset_index_segments_inner(
         .filter(|i| !lance_index::is_system_index(i) && i.name == name)
         .collect();
     if segments.is_empty() {
-        return Err(lance_core::Error::IndexNotFound {
-            identity: format!("name='{}'", name),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::index_not_found(format!(
+            "name='{}'",
+            name
+        )));
     }
     if segments.len() > capacity {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!(
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
                 "out_uuids capacity ({}) too small for {} segments",
                 capacity,
                 segments.len()
             )
             .into(),
-            location: snafu::location!(),
-        });
+        ));
     }
     // SAFETY: caller guarantees out_uuids has at least `capacity * 16` bytes,
     // and we verified `segments.len() <= capacity` above.
@@ -305,10 +295,9 @@ pub unsafe extern "C" fn lance_dataset_drop_index(
 
 unsafe fn drop_index_inner(dataset: *mut LanceDataset, name: *const c_char) -> Result<i32> {
     if dataset.is_null() || name.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset and name must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset and name must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let name_str = unsafe { helpers::parse_c_string(name)? }.unwrap();
@@ -458,10 +447,9 @@ impl LanceMetricType {
 /// invalid value at the API boundary.
 fn require_field(name: &str, value: u32) -> Result<u32> {
     if value == 0 {
-        Err(lance_core::Error::InvalidInput {
-            source: format!("{} is required for this index type and must be > 0", name).into(),
-            location: snafu::location!(),
-        })
+        Err(lance_core::Error::invalid_input_source(
+            format!("{} is required for this index type and must be > 0", name).into(),
+        ))
     } else {
         Ok(value)
     }
@@ -588,17 +576,13 @@ unsafe fn create_vector_index_inner(
     replace: bool,
 ) -> Result<i32> {
     if dataset.is_null() || column.is_null() || params.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset, column, and params must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset, column, and params must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let column_str = unsafe { helpers::parse_c_string(column)? }.ok_or_else(|| {
-        lance_core::Error::InvalidInput {
-            source: "column must not be empty".into(),
-            location: snafu::location!(),
-        }
+        lance_core::Error::invalid_input_source("column must not be empty".into())
     })?;
     let name = unsafe { helpers::parse_c_string(index_name)? }.map(|s| s.to_string());
     let p = unsafe { &*params };

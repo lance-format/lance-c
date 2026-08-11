@@ -34,10 +34,9 @@ pub unsafe extern "C" fn lance_dataset_versions(
 
 unsafe fn versions_inner(dataset: *const LanceDataset) -> Result<*mut LanceVersions> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let versions = block_on(ds.snapshot().versions())?;

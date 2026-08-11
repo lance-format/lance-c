@@ -48,13 +48,10 @@ impl LanceMergeWhenMatched {
             2 => Ok(Self::UpdateIf),
             3 => Ok(Self::Fail),
             4 => Ok(Self::Delete),
-            other => Err(lance_core::Error::InvalidInput {
-                source: format!(
-                    "invalid when_matched {other}; expected 0..=4 (see LanceMergeWhenMatched)"
-                )
-                .into(),
-                location: snafu::location!(),
-            }),
+            other => Err(lance_core::Error::invalid_input_source(
+                format!("invalid when_matched {other}; expected 0..=4 (see LanceMergeWhenMatched)")
+                    .into(),
+            )),
         }
     }
 }
@@ -74,13 +71,10 @@ impl LanceMergeWhenNotMatched {
         match raw {
             0 => Ok(Self::InsertAll),
             1 => Ok(Self::DoNothing),
-            other => Err(lance_core::Error::InvalidInput {
-                source: format!(
+            other => Err(lance_core::Error::invalid_input_source(format!(
                     "invalid when_not_matched {other}; expected 0 or 1 (see LanceMergeWhenNotMatched)"
                 )
-                .into(),
-                location: snafu::location!(),
-            }),
+                .into())),
         }
     }
 }
@@ -104,13 +98,10 @@ impl LanceMergeWhenNotMatchedBySource {
             0 => Ok(Self::Keep),
             1 => Ok(Self::Delete),
             2 => Ok(Self::DeleteIf),
-            other => Err(lance_core::Error::InvalidInput {
-                source: format!(
+            other => Err(lance_core::Error::invalid_input_source(format!(
                     "invalid when_not_matched_by_source {other}; expected 0..=2 (see LanceMergeWhenNotMatchedBySource)"
                 )
-                .into(),
-                location: snafu::location!(),
-            }),
+                .into())),
         }
     }
 }
@@ -238,10 +229,9 @@ unsafe fn merge_insert_inner(
     // those paths and break the documented "consumed on every return"
     // contract (mirrors `lance_dataset_write`).
     if source.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "source stream must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "source stream must not be NULL".into(),
+        ));
     }
 
     // SAFETY: `source` is non-NULL (checked above) and the caller guarantees
@@ -249,30 +239,23 @@ unsafe fn merge_insert_inner(
     // owned by them. `from_raw` performs a `ptr::replace` that transfers
     // ownership into the returned reader, zeroing the caller's release
     // callback so it cannot be released twice.
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(source) }.map_err(|e| {
-        lance_core::Error::InvalidInput {
-            source: e.to_string().into(),
-            location: snafu::location!(),
-        }
-    })?;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(source) }
+        .map_err(|e| lance_core::Error::invalid_input_source(e.to_string().into()))?;
 
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     if num_on_columns == 0 {
-        return Err(lance_core::Error::InvalidInput {
-            source: "num_on_columns must be >= 1".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "num_on_columns must be >= 1".into(),
+        ));
     }
     if on_columns.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "on_columns must not be NULL when num_on_columns > 0".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "on_columns must not be NULL when num_on_columns > 0".into(),
+        ));
     }
 
     // Materialize key columns up front so a precise per-index error fires
@@ -286,9 +269,10 @@ unsafe fn merge_insert_inner(
         // NUL-terminated C string the caller keeps alive for this call.
         let key = unsafe { helpers::parse_c_string(entry_ptr)? }
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| lance_core::Error::InvalidInput {
-                source: format!("on_columns[{i}] must not be NULL or empty").into(),
-                location: snafu::location!(),
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!("on_columns[{i}] must not be NULL or empty").into(),
+                )
             })?;
         keys.push(key.to_string());
     }
@@ -384,9 +368,10 @@ unsafe fn resolve_params(params: *const LanceMergeInsertParams) -> Result<Resolv
             WhenMatched::UpdateAll
         }
         LanceMergeWhenMatched::UpdateIf => {
-            let expr = when_matched_expr.ok_or_else(|| lance_core::Error::InvalidInput {
-                source: "when_matched=UpdateIf requires when_matched_expr".into(),
-                location: snafu::location!(),
+            let expr = when_matched_expr.ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    "when_matched=UpdateIf requires when_matched_expr".into(),
+                )
             })?;
             // Upstream `WhenMatched::update_if` defers parsing until execute
             // time; we only forward the string here.
@@ -426,12 +411,10 @@ unsafe fn resolve_params(params: *const LanceMergeInsertParams) -> Result<Resolv
         }
         LanceMergeWhenNotMatchedBySource::DeleteIf => {
             let expr = when_not_matched_by_source_expr.ok_or_else(|| {
-                lance_core::Error::InvalidInput {
-                    source:
-                        "when_not_matched_by_source=DeleteIf requires when_not_matched_by_source_expr"
-                            .into(),
-                    location: snafu::location!(),
-                }
+                lance_core::Error::invalid_input_source(
+                    "when_not_matched_by_source=DeleteIf requires when_not_matched_by_source_expr"
+                        .into(),
+                )
             })?;
             ResolvedWhenNotMatchedBySource::DeleteIf(expr)
         }
@@ -453,20 +436,18 @@ unsafe fn read_optional_expr(ptr: *const c_char, field: &str) -> Result<Option<S
         return Ok(None);
     };
     if s.is_empty() {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!("{field} must not be empty").into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{field} must not be empty").into(),
+        ));
     }
     Ok(Some(s.to_string()))
 }
 
 fn reject_unused_expr(field: &str, mode: &str, expr: &Option<String>) -> Result<()> {
     if expr.is_some() {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!("{field}_expr must be NULL when {field}={mode}").into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{field}_expr must be NULL when {field}={mode}").into(),
+        ));
     }
     Ok(())
 }

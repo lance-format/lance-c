@@ -38,10 +38,9 @@ unsafe fn batch_to_arrow_inner(
     out_schema: *mut FFI_ArrowSchema,
 ) -> Result<i32> {
     if batch.is_null() || out_array.is_null() || out_schema.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "batch, out_array, and out_schema must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "batch, out_array, and out_schema must not be NULL".into(),
+        ));
     }
     let b = unsafe { &*batch };
     let struct_array: arrow_array::StructArray = b.inner.clone().into();

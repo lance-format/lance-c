@@ -153,10 +153,9 @@ impl LanceScanner {
         }
         self.apply_fragment_filter(&mut scanner)?;
         if self.index_segments.is_some() && self.nearest.is_none() {
-            return Err(lance_core::Error::InvalidInput {
-                source: "index_segments requires nearest() to be configured".into(),
-                location: snafu::location!(),
-            });
+            return Err(lance_core::Error::invalid_input_source(
+                "index_segments requires nearest() to be configured".into(),
+            ));
         }
         if let Some(n) = &self.nearest {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
@@ -214,10 +213,9 @@ impl LanceScanner {
         }
         self.apply_fragment_filter(&mut scanner)?;
         if self.index_segments.is_some() && self.nearest.is_none() {
-            return Err(lance_core::Error::InvalidInput {
-                source: "index_segments requires nearest() to be configured".into(),
-                location: snafu::location!(),
-            });
+            return Err(lance_core::Error::invalid_input_source(
+                "index_segments requires nearest() to be configured".into(),
+            ));
         }
         if let Some(n) = &self.nearest {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
@@ -276,10 +274,9 @@ unsafe fn scanner_new_inner(
     filter: *const c_char,
 ) -> Result<*mut LanceScanner> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let col_names = unsafe { helpers::parse_c_string_array(columns)? };
@@ -458,10 +455,9 @@ unsafe fn scanner_to_arrow_stream_inner(
     out: *mut FFI_ArrowArrayStream,
 ) -> Result<i32> {
     if scanner.is_null() || out.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "scanner and out must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner and out must not be NULL".into(),
+        ));
     }
     let s = unsafe { &*scanner };
     let built_scanner = s.build_scanner()?;
@@ -895,24 +891,20 @@ unsafe fn scanner_nearest_inner(
     k: u32,
 ) -> Result<i32> {
     if scanner.is_null() || column.is_null() || query_data.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "scanner, column, and query_data must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner, column, and query_data must not be NULL".into(),
+        ));
     }
     if k == 0 {
-        return Err(lance_core::Error::InvalidInput {
-            source: "k must be > 0".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "k must be > 0".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     if s.fts_query.is_some() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "cannot call nearest after full_text_search; they are mutually exclusive"
-                .into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot call nearest after full_text_search; they are mutually exclusive".into(),
+        ));
     }
     let column_str = unsafe { helpers::parse_c_string(column)? }.unwrap();
 
@@ -923,10 +915,9 @@ unsafe fn scanner_nearest_inner(
         3 => LanceDataType::UInt8,
         4 => LanceDataType::Int8,
         _ => {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!("invalid element_type: {}", element_type).into(),
-                location: snafu::location!(),
-            });
+            return Err(lance_core::Error::invalid_input_source(
+                format!("invalid element_type: {}", element_type).into(),
+            ));
         }
     };
 
@@ -998,20 +989,17 @@ unsafe fn fts_inner(
     max_fuzzy_distance: u32,
 ) -> Result<i32> {
     if scanner.is_null() || query.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "scanner and query must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner and query must not be NULL".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
 
     // Mutual exclusion with vector search.
     if s.nearest.is_some() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "cannot call full_text_search after nearest; they are mutually exclusive"
-                .into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot call full_text_search after nearest; they are mutually exclusive".into(),
+        ));
     }
 
     let query_str = unsafe { helpers::parse_c_string(query)? }

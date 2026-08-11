@@ -75,47 +75,32 @@ unsafe fn write_fragments_inner(
     storage_opts: *const *const c_char,
 ) -> Result<i32> {
     if uri.is_null() || schema.is_null() || stream.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "uri, schema, and stream must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "uri, schema, and stream must not be NULL".into(),
+        ));
     }
 
-    let uri_str = unsafe { helpers::parse_c_string(uri)? }.ok_or_else(|| {
-        lance_core::Error::InvalidInput {
-            source: "uri must not be empty".into(),
-            location: snafu::location!(),
-        }
-    })?;
+    let uri_str = unsafe { helpers::parse_c_string(uri)? }
+        .ok_or_else(|| lance_core::Error::invalid_input_source("uri must not be empty".into()))?;
 
     // Import the caller-provided schema from the Arrow C Data Interface.
     let expected_schema = ArrowSchema::try_from(unsafe { &*schema }).map_err(|e| {
-        lance_core::Error::InvalidInput {
-            source: format!("invalid schema: {e}").into(),
-            location: snafu::location!(),
-        }
+        lance_core::Error::invalid_input_source(format!("invalid schema: {e}").into())
     })?;
 
     let opts = unsafe { helpers::parse_storage_options(storage_opts)? };
 
     // Consume the C stream into an Arrow RecordBatch reader.
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream) }.map_err(|e| {
-        lance_core::Error::InvalidInput {
-            source: e.to_string().into(),
-            location: snafu::location!(),
-        }
-    })?;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream) }
+        .map_err(|e| lance_core::Error::invalid_input_source(e.to_string().into()))?;
 
     // Fail fast: compare the stream schema against the caller-provided schema.
     let stream_schema = reader.schema();
     if stream_schema.fields() != expected_schema.fields() {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!(
+        return Err(lance_core::Error::invalid_input_source(format!(
                 "stream schema does not match the provided schema.\n  expected: {expected_schema}\n  got:      {stream_schema}"
             )
-            .into(),
-            location: snafu::location!(),
-        });
+            .into()));
     }
 
     let mut params = WriteParams::default();

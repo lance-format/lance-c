@@ -72,22 +72,19 @@ unsafe fn update_inner(
     out_num_updated: *mut u64,
 ) -> Result<i32> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     if num_updates == 0 {
-        return Err(lance_core::Error::InvalidInput {
-            source: "num_updates must be >= 1".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "num_updates must be >= 1".into(),
+        ));
     }
     if columns.is_null() || values.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "columns and values must not be NULL when num_updates > 0".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "columns and values must not be NULL when num_updates > 0".into(),
+        ));
     }
 
     // Optional predicate. NULL means "update every row"; explicit empty
@@ -100,10 +97,9 @@ unsafe fn update_inner(
     if let Some(p) = predicate_str.as_ref()
         && p.is_empty()
     {
-        return Err(lance_core::Error::InvalidInput {
-            source: "predicate must not be empty (pass NULL to update all rows)".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "predicate must not be empty (pass NULL to update all rows)".into(),
+        ));
     }
 
     // Collect (column, value) pairs into owned strings up front so we can
@@ -119,15 +115,17 @@ unsafe fn update_inner(
         // to each entry pointer within the arrays.
         let col = unsafe { helpers::parse_c_string(col_ptr)? }
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| lance_core::Error::InvalidInput {
-                source: format!("columns[{i}] must not be NULL or empty").into(),
-                location: snafu::location!(),
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!("columns[{i}] must not be NULL or empty").into(),
+                )
             })?;
         let val = unsafe { helpers::parse_c_string(val_ptr)? }
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| lance_core::Error::InvalidInput {
-                source: format!("values[{i}] must not be NULL or empty").into(),
-                location: snafu::location!(),
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!("values[{i}] must not be NULL or empty").into(),
+                )
             })?;
         update_pairs.push((col.to_string(), val.to_string()));
     }

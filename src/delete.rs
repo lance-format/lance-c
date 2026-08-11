@@ -48,10 +48,9 @@ unsafe fn delete_inner(
     out_num_deleted: *mut u64,
 ) -> Result<i32> {
     if dataset.is_null() || predicate.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset and predicate must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset and predicate must not be NULL".into(),
+        ));
     }
 
     // SAFETY: `predicate` is non-NULL (checked above) and the caller
@@ -59,11 +58,8 @@ unsafe fn delete_inner(
     // duration of this call. `parse_c_string` reads by shared reference.
     let predicate_str = unsafe { helpers::parse_c_string(predicate)? }
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| lance_core::Error::InvalidInput {
-            // NULL is rejected above; only the empty case reaches here.
-            source: "predicate must not be empty".into(),
-            location: snafu::location!(),
-        })?;
+        // NULL is rejected above; only the empty case reaches here.
+        .ok_or_else(|| lance_core::Error::invalid_input("predicate must not be empty"))?;
 
     // SAFETY: `dataset` is non-NULL (checked above) and the caller guarantees
     // it points to a live `LanceDataset` not aliased mutably elsewhere.

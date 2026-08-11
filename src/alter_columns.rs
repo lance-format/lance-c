@@ -15,7 +15,6 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::DataType;
 use lance::dataset::ColumnAlteration;
 use lance_core::Result;
-use snafu::location;
 
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
@@ -48,13 +47,12 @@ impl LanceColumnNullableMode {
             0 => Ok(Self::Unchanged),
             1 => Ok(Self::True),
             2 => Ok(Self::False),
-            other => Err(lance_core::Error::InvalidInput {
-                source: format!(
+            other => Err(lance_core::Error::invalid_input_source(
+                format!(
                     "invalid nullable_mode {other}; expected 0..=2 (see LanceColumnNullableMode)"
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 }
@@ -124,22 +122,19 @@ unsafe fn alter_columns_inner(
     num_alterations: usize,
 ) -> Result<i32> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     if alterations.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "alterations must not be NULL".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "alterations must not be NULL".into(),
+        ));
     }
     if num_alterations == 0 {
-        return Err(lance_core::Error::InvalidInput {
-            source: "num_alterations must be > 0".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "num_alterations must be > 0".into(),
+        ));
     }
 
     // Materialize alterations up front so any per-index validation error
@@ -177,9 +172,10 @@ unsafe fn parse_alteration(
     // C string the caller keeps alive for this call.
     let path = unsafe { helpers::parse_c_string(entry.path)? }
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| lance_core::Error::InvalidInput {
-            source: format!("alterations[{index}].path must not be NULL or empty").into(),
-            location: location!(),
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source(
+                format!("alterations[{index}].path must not be NULL or empty").into(),
+            )
         })?
         .to_string();
 
@@ -188,10 +184,9 @@ unsafe fn parse_alteration(
     let rename = unsafe { helpers::parse_c_string(entry.rename)? }
         .map(|s| {
             if s.is_empty() {
-                Err(lance_core::Error::InvalidInput {
-                    source: format!("alterations[{index}].rename must not be empty").into(),
-                    location: location!(),
-                })
+                Err(lance_core::Error::invalid_input_source(
+                    format!("alterations[{index}].rename must not be empty").into(),
+                ))
             } else {
                 Ok(s.to_string())
             }
@@ -219,30 +214,27 @@ unsafe fn parse_alteration(
         //   - `format == NULL`: catches a zero-initialised or otherwise
         //     half-built struct that would slip past the release check.
         if ffi_schema.release.is_none() || ffi_schema.format.is_null() {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!(
-                    "alterations[{index}].data_type is uninitialised or already released"
-                )
-                .into(),
-                location: location!(),
-            });
+            return Err(lance_core::Error::invalid_input_source(
+                format!("alterations[{index}].data_type is uninitialised or already released")
+                    .into(),
+            ));
         }
-        let dt = DataType::try_from(ffi_schema).map_err(|e| lance_core::Error::InvalidInput {
-            source: format!("alterations[{index}].data_type is not a valid Arrow type: {e}").into(),
-            location: location!(),
+        let dt = DataType::try_from(ffi_schema).map_err(|e| {
+            lance_core::Error::invalid_input_source(
+                format!("alterations[{index}].data_type is not a valid Arrow type: {e}").into(),
+            )
         })?;
         Some(dt)
     };
 
     if rename.is_none() && nullable.is_none() && data_type.is_none() {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!(
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
                 "alterations[{index}] is a no-op: \
                  set rename, nullable_mode, or data_type to request a change"
             )
             .into(),
-            location: location!(),
-        });
+        ));
     }
 
     Ok(ColumnAlteration {

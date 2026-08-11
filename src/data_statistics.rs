@@ -42,10 +42,9 @@ pub unsafe extern "C" fn lance_dataset_calculate_data_stats(
 
 unsafe fn calculate_inner(dataset: *const LanceDataset) -> Result<*mut LanceDataStatistics> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     // SAFETY: `dataset` is non-null (checked above) and points at a live
     // `LanceDataset` created by `lance_dataset_open`; we take only a shared

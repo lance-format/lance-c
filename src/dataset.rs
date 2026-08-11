@@ -71,12 +71,8 @@ unsafe fn open_dataset_inner(
     storage_options: *const *const c_char,
     version: u64,
 ) -> Result<*mut LanceDataset> {
-    let uri_str = unsafe { helpers::parse_c_string(uri)? }.ok_or_else(|| {
-        lance_core::Error::InvalidInput {
-            source: "uri must not be NULL".into(),
-            location: snafu::location!(),
-        }
-    })?;
+    let uri_str = unsafe { helpers::parse_c_string(uri)? }
+        .ok_or_else(|| lance_core::Error::invalid_input_source("uri must not be NULL".into()))?;
 
     let opts = unsafe { helpers::parse_storage_options(storage_options)? };
 
@@ -184,10 +180,9 @@ unsafe fn dataset_schema_inner(
     out: *mut FFI_ArrowSchema,
 ) -> Result<i32> {
     if dataset.is_null() || out.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset and out must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset and out must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let snap = ds.snapshot();
@@ -234,10 +229,9 @@ unsafe fn dataset_take_inner(
     out: *mut FFI_ArrowArrayStream,
 ) -> Result<i32> {
     if dataset.is_null() || indices.is_null() || out.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset, indices, and out must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset, indices, and out must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let idx_slice = unsafe { std::slice::from_raw_parts(indices, num_indices) };

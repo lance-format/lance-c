@@ -91,10 +91,9 @@ unsafe fn compact_inner(
     out_metrics: *mut LanceCompactionMetrics,
 ) -> Result<i32> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
 
     // SAFETY: `options` is either NULL (use defaults) or points to a valid
@@ -162,8 +161,9 @@ unsafe fn resolve_options(options: *const LanceCompactionOptions) -> Result<Comp
 /// Realistic compaction tunings fit in `usize` on every supported target,
 /// but a silent `as` cast would wrap on a 32-bit host.
 fn u64_to_usize(v: u64, field: &'static str) -> Result<usize> {
-    usize::try_from(v).map_err(|_| lance_core::Error::InvalidInput {
-        source: format!("{field}={v} exceeds usize::MAX on this target").into(),
-        location: snafu::location!(),
+    usize::try_from(v).map_err(|_| {
+        lance_core::Error::invalid_input_source(
+            format!("{field}={v} exceeds usize::MAX on this target").into(),
+        )
     })
 }

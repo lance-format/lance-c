@@ -6,8 +6,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
 
-use lance_core::{Error, Result};
-use snafu::location;
+use lance_core::Result;
 
 /// Parse a nullable C string pointer into an `Option<&str>`.
 pub unsafe fn parse_c_string<'a>(ptr: *const c_char) -> Result<Option<&'a str>> {
@@ -15,10 +14,9 @@ pub unsafe fn parse_c_string<'a>(ptr: *const c_char) -> Result<Option<&'a str>> 
         return Ok(None);
     }
     let cstr = unsafe { CStr::from_ptr(ptr) };
-    let s = cstr.to_str().map_err(|e| Error::InvalidInput {
-        source: Box::new(e),
-        location: location!(),
-    })?;
+    let s = cstr
+        .to_str()
+        .map_err(|e| lance_core::Error::invalid_input_source(Box::new(e)))?;
     Ok(Some(s))
 }
 
@@ -62,10 +60,9 @@ pub unsafe fn parse_storage_options(ptr: *const *const c_char) -> Result<HashMap
         }
         let val_ptr = unsafe { *ptr.add(i + 1) };
         if val_ptr.is_null() {
-            return Err(Error::InvalidInput {
-                source: "storage options must be key-value pairs; odd number of entries".into(),
-                location: location!(),
-            });
+            return Err(lance_core::Error::invalid_input_source(
+                "storage options must be key-value pairs; odd number of entries".into(),
+            ));
         }
         let key = unsafe { parse_c_string(key_ptr)? }.unwrap().to_string();
         let val = unsafe { parse_c_string(val_ptr)? }.unwrap().to_string();
