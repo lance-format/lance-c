@@ -557,10 +557,8 @@ public:
     ///
     /// `columns` must be non-empty and each entry's `name` and `expression`
     /// must be non-empty. Throws lance::Error on failure (empty list, empty
-    /// name/expression, malformed SQL syntax, name collision with an existing
-    /// column, commit conflict, ...). A reference to a non-existent column
-    /// throws with code `LANCE_ERR_INTERNAL` (an upstream schema error), not
-    /// `LANCE_ERR_INVALID_ARGUMENT` — see the C header for the rationale.
+    /// name/expression, malformed SQL syntax, a reference to a non-existent
+    /// column, name collision with an existing column, commit conflict, ...).
     void add_columns_sql(const std::vector<SqlColumn>& columns,
                          uint64_t batch_size = 0) {
         // The C strings we install in each entry borrow from `columns` (the
