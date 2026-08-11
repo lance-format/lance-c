@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch, StringArray};
+use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 
@@ -61,23 +61,59 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("name", DataType::Utf8, true),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 8),
+            false,
+        ),
     ]));
 
-    let batch = RecordBatch::try_new(
-        schema.clone(),
+    let make_batch = |start: i32, names: Vec<&str>| {
+        let ids: Vec<i32> = (start..start + names.len() as i32).collect();
+        let values = Float32Array::from_iter_values(
+            ids.iter()
+                .flat_map(|id| (0..8).map(move |component| *id as f32 * 0.1 + component as f32)),
+        );
+        let vectors = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            8,
+            Arc::new(values),
+            None,
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap()
+    };
+    let first = make_batch(
+        1,
         vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])),
-            Arc::new(StringArray::from(vec![
-                "alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi", "ivan", "judy",
-            ])),
+            "alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi", "ivan", "judy",
         ],
-    )
-    .unwrap();
+    );
+    let second = make_batch(
+        11,
+        vec![
+            "kate", "leo", "maya", "nick", "olga", "paul", "quinn", "ruth", "sam", "tina",
+        ],
+    );
 
     lance_c::runtime::block_on(async {
         Dataset::write(
-            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
             &uri,
+            None,
+        )
+        .await
+        .unwrap()
+        .append(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
             None,
         )
         .await
@@ -108,13 +144,9 @@ fn compile_c_test(source: &Path, output: &Path, include_dir: &Path, lib_path: &P
         ])
         .status();
 
-    match status {
-        Ok(s) => s.success(),
-        Err(e) => {
-            eprintln!("C compiler not available: {e}");
-            false
-        }
-    }
+    status
+        .expect("C compiler is required for this ignored test")
+        .success()
 }
 
 /// Compile a C++ source file, linking against lance-c.
@@ -137,13 +169,9 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
         ])
         .status();
 
-    match status {
-        Ok(s) => s.success(),
-        Err(e) => {
-            eprintln!("C++ compiler not available: {e}");
-            false
-        }
-    }
+    status
+        .expect("C++ compiler is required for this ignored test")
+        .success()
 }
 
 /// Run a compiled test binary with the source dataset URI and a destination URI
@@ -187,10 +215,10 @@ fn test_c_compilation_and_execution() {
         .join("test_c_api.c");
     let binary = build_dir.path().join("test_c_api");
 
-    if !compile_c_test(&source, &binary, &include_dir, &lib_path) {
-        eprintln!("Skipping C test: compilation failed (C compiler may not be available)");
-        return;
-    }
+    assert!(
+        compile_c_test(&source, &binary, &include_dir, &lib_path),
+        "C test compilation failed"
+    );
 
     run_test_binary(&binary, &dataset_uri, &write_uri);
 }
@@ -214,10 +242,10 @@ fn test_cpp_compilation_and_execution() {
         .join("test_cpp_api.cpp");
     let binary = build_dir.path().join("test_cpp_api");
 
-    if !compile_cpp_test(&source, &binary, &include_dir, &lib_path) {
-        eprintln!("Skipping C++ test: compilation failed (C++ compiler may not be available)");
-        return;
-    }
+    assert!(
+        compile_cpp_test(&source, &binary, &include_dir, &lib_path),
+        "C++ test compilation failed"
+    );
 
     run_test_binary(&binary, &dataset_uri, &write_uri);
 }

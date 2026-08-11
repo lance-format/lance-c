@@ -16,6 +16,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 // Arrow C Data Interface flag bits — see arrow_schema/arrow_c_data_interface.h.
@@ -302,6 +303,90 @@ static void test_index_segments_smoke(const std::string& /*uri*/) {
     PASS();
 }
 
+static void test_index_segment_builder(const std::string& uri) {
+    TEST(test_index_segment_builder);
+
+    static_assert(!std::is_copy_constructible_v<lance::IndexSegmentBuilder>);
+    static_assert(!std::is_copy_assignable_v<lance::IndexSegmentBuilder>);
+    static_assert(std::is_move_constructible_v<lance::IndexSegmentBuilder>);
+    static_assert(!std::is_copy_constructible_v<lance::IndexSegmentMetadata>);
+    static_assert(std::is_move_constructible_v<lance::IndexSegmentMetadata>);
+    static_assert(!std::is_copy_constructible_v<lance::IndexModel>);
+    static_assert(std::is_move_constructible_v<lance::IndexModel>);
+
+    auto ds = lance::Dataset::open(uri);
+    auto fragment_ids = ds.fragment_ids();
+    assert(!fragment_ids.empty());
+    uint32_t selected_fragment_id = static_cast<uint32_t>(fragment_ids.front());
+    std::array<uint8_t, 16> expected_uuid = {
+        0x21, 0x43, 0x65, 0x87, 0xa9, 0xcb, 0x4e, 0xfd,
+        0x81, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    };
+
+    LanceIndexSegmentBuildOptions options = {};
+    options.fragment_ids = &selected_fragment_id;
+    options.fragment_count = 1;
+    options.index_uuid = expected_uuid.data();
+    options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+
+    uint64_t version_before = ds.version();
+    auto builder = ds.new_scalar_index_segment_builder(
+        "id", LANCE_SCALAR_BITMAP, "cpp_id_segment", "", &options);
+    auto bytes = builder.execute_uncommitted();
+    assert(!bytes.empty());
+    assert(ds.version() == version_before);
+
+    auto metadata = lance::IndexSegmentMetadata::parse(bytes);
+    assert(metadata.uuid() == expected_uuid);
+    assert(metadata.name() == "cpp_id_segment");
+    assert(metadata.dataset_version() == version_before);
+    assert(metadata.index_version() == 0);
+    assert(metadata.index_type() == LANCE_SCALAR_BITMAP);
+    assert(metadata.index_details_type_url().find("BitmapIndexDetails") !=
+           std::string::npos);
+    assert(metadata.field_ids() == std::vector<int32_t>{0});
+    assert(metadata.fragment_ids() ==
+           std::vector<uint32_t>{selected_fragment_id});
+
+    PASS();
+}
+
+static void test_vector_models_and_reusable_segments(const std::string& uri) {
+    TEST(test_vector_models_and_reusable_segments);
+    auto ds = lance::Dataset::open(uri);
+    auto all_ids = ds.fragment_ids();
+    assert(all_ids.size() >= 2);
+    assert(all_ids[0] <= UINT32_MAX && all_ids[1] <= UINT32_MAX);
+
+    auto centroids =
+        ds.train_ivf_model("embedding", 2, LANCE_METRIC_L2);
+    auto codebook =
+        ds.train_pq_model("embedding", 2, 4, LANCE_METRIC_L2, centroids);
+    LanceVectorIndexParams params = {
+        LANCE_INDEX_IVF_PQ, LANCE_METRIC_L2, 2, 2, 4, 2, 0, 0, 16,
+    };
+    for (size_t i = 0; i < 2; ++i) {
+        uint32_t fragment_id = static_cast<uint32_t>(all_ids[i]);
+        LanceIndexSegmentBuildOptions options = {};
+        options.fragment_ids = &fragment_id;
+        options.fragment_count = 1;
+        options.ivf_centroids = centroids.array();
+        options.ivf_centroids_schema = centroids.schema();
+        options.pq_codebook = codebook.array();
+        options.pq_codebook_schema = codebook.schema();
+        options.mode = LANCE_INDEX_SEGMENT_BUILD_PRECOMPUTED;
+        auto builder = ds.new_vector_index_segment_builder(
+            "embedding", params, "", &options);
+        auto bytes = builder.execute_uncommitted();
+        auto metadata = lance::IndexSegmentMetadata::parse(bytes);
+        assert(metadata.index_type() == LANCE_INDEX_IVF_PQ);
+        assert(metadata.fragment_ids() == std::vector<uint32_t>{fragment_id});
+        assert(centroids.array()->release != nullptr);
+        assert(codebook.array()->release != nullptr);
+    }
+    PASS();
+}
+
 static void test_fts_smoke(const std::string& uri) {
     TEST(test_fts_smoke);
 
@@ -515,8 +600,8 @@ static void test_alter_columns(const std::string& dst_uri) {
 }
 
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
-// exercises `Dataset::drop_columns`. Drops the `name` column so the dataset
-// is left with `id` only; subsequent tests (`compact_files`, `delete_rows`)
+// exercises `Dataset::drop_columns`. Drops `name` and `embedding` so the
+// dataset is left with `id` only; subsequent tests (`compact_files`, `delete_rows`)
 // do not reference any dropped column. Must run after `test_update` /
 // `test_merge_insert`.
 static void test_drop_columns(const std::string& dst_uri) {
@@ -526,7 +611,7 @@ static void test_drop_columns(const std::string& dst_uri) {
     uint64_t before_rows = ds.count_rows();
     uint64_t v_before = ds.version();
 
-    ds.drop_columns({"name"});
+    ds.drop_columns({"name", "embedding"});
     assert(ds.count_rows() == before_rows
            && "metadata-only drop must preserve row count");
     assert(ds.version() > v_before
@@ -730,6 +815,8 @@ int main(int argc, char** argv) {
     test_index_lifecycle(uri);
     test_nearest_smoke(uri);
     test_index_segments_smoke(uri);
+    test_index_segment_builder(uri);
+    test_vector_models_and_reusable_segments(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_data_statistics(write_uri);
