@@ -4066,6 +4066,45 @@ fn test_write_with_params_null_is_like_plain_write() {
 }
 
 #[test]
+fn test_write_preserves_auto_cleanup_default() {
+    // Lance 9.1 disabled auto-cleanup by default (auto_cleanup: None).
+    // lance-c exposes neither cleanup configuration nor an explicit cleanup
+    // operation, so the wrapper preserves the pre-9.1 default; datasets
+    // created through the C writer must keep their reclamation path.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let dataset = lance_c::runtime::block_on(lance::Dataset::open(&uri)).unwrap();
+    let config = &dataset.manifest.config;
+    assert_eq!(
+        config.get("lance.auto_cleanup.interval").map(String::as_str),
+        Some("20"),
+        "auto-cleanup interval must be recorded in the manifest config"
+    );
+    assert!(
+        config.contains_key("lance.auto_cleanup.older_than"),
+        "auto-cleanup older_than must be recorded in the manifest config"
+    );
+}
+
+#[test]
 fn test_write_with_params_max_rows_per_file_splits_fragments() {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().join("ds").to_str().unwrap().to_string();
