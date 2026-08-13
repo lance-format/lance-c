@@ -2495,6 +2495,74 @@ fn create_vector_dataset(num_rows: i32, dim: i32) -> (tempfile::TempDir, String)
     (tmp, uri)
 }
 
+/// Create two vector fragments with deterministic vectors. Every component of
+/// row `id` is `id as f32`, making nearest-neighbor expectations unambiguous.
+fn create_multi_fragment_vector_dataset(
+    rows_per_fragment: i32,
+    dim: i32,
+) -> (tempfile::TempDir, String) {
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("multi_fragment_vec_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        ),
+    ]));
+
+    let make_batch = |first_id: i32| {
+        let ids: Vec<i32> = (first_id..first_id + rows_per_fragment).collect();
+        let mut embeddings = FixedSizeListBuilder::new(Float32Builder::new(), dim);
+        for id in &ids {
+            for _ in 0..dim {
+                embeddings.values().append_value(*id as f32);
+            }
+            embeddings.append(true);
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(embeddings.finish()),
+            ],
+        )
+        .unwrap()
+    };
+
+    let first = make_batch(0);
+    let second = make_batch(rows_per_fragment);
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
+            &uri,
+            Some(lance::dataset::WriteParams {
+                mode: lance::dataset::WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    (tmp, uri)
+}
+
 #[test]
 fn test_create_vector_index_ivf_flat() {
     let (_tmp, uri) = create_vector_dataset(256, 16);
@@ -2848,6 +2916,138 @@ fn test_scanner_nearest_filter_postfilter() {
     // Post-filter on top-20 nearest: count is 0..20 depending on data.
     // We just assert the call succeeds and returns at most 20 rows.
     assert!(total <= 20);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_nearest_prefilter_with_fragment_ids_next() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(32, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut fragment_ids = vec![0; unsafe { lance_dataset_fragment_count(ds) } as usize];
+    assert_eq!(fragment_ids.len(), 2);
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, fragment_ids.as_mut_ptr()) },
+        0
+    );
+
+    let filter = c_str("id >= 40");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), filter.as_ptr()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, fragment_ids[1..].as_ptr(), 1) },
+        0
+    );
+
+    // Match the Doris call order: nearest is configured before prefilter.
+    let column = c_str("embedding");
+    let query = [40.0_f32; 8];
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr().cast(),
+                query.len(),
+                LanceDataType::Float32 as i32,
+                5,
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, true) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_use_index(scanner, false) }, 0);
+
+    let batches = scan_all_rows_from_scanner(scanner);
+    let mut ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![40, 41, 42, 43, 44]);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_nearest_prefilter_with_fragment_ids_arrow_stream() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(32, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut fragment_ids = vec![0; unsafe { lance_dataset_fragment_count(ds) } as usize];
+    assert_eq!(fragment_ids.len(), 2);
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, fragment_ids.as_mut_ptr()) },
+        0
+    );
+
+    let filter = c_str("id >= 60");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), filter.as_ptr()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, fragment_ids[1..].as_ptr(), 1) },
+        0
+    );
+
+    let column = c_str("embedding");
+    let query = [60.0_f32; 8];
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr().cast(),
+                query.len(),
+                LanceDataType::Float32 as i32,
+                10,
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, true) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_use_index(scanner, false) }, 0);
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()) }.to_string_lossy()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let mut ids = reader
+        .flat_map(|batch| {
+            let batch = batch.unwrap();
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![60, 61, 62, 63]);
 
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
