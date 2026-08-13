@@ -15,6 +15,7 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::record_batch::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
+use chrono::TimeDelta;
 use lance::Dataset;
 use lance::dataset::{AutoCleanupParams, WriteMode as LanceWriteModeUpstream, WriteParams};
 use lance_core::Result;
@@ -250,9 +251,14 @@ unsafe fn write_dataset_inner(
         // lance-c exposes neither cleanup configuration nor an explicit
         // cleanup operation, so losing the reclamation path would silently
         // accumulate versions for datasets created through the C writer.
-        // Preserve the pre-9.1 default (every 20 versions, older than 14
-        // days) to keep C-visible behavior unchanged across the upgrade.
-        auto_cleanup: Some(AutoCleanupParams::default()),
+        // Pin the pre-9.1 policy (every 20 versions, older than 14 days)
+        // explicitly rather than via `AutoCleanupParams::default()`, so a
+        // future upstream default change cannot silently shift C-visible
+        // behavior.
+        auto_cleanup: Some(AutoCleanupParams {
+            interval: 20,
+            older_than: TimeDelta::days(14),
+        }),
         ..WriteParams::default()
     };
     if !params.is_null() {

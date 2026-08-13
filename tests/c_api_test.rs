@@ -4094,12 +4094,17 @@ fn test_write_preserves_auto_cleanup_default() {
     let dataset = lance_c::runtime::block_on(lance::Dataset::open(&uri)).unwrap();
     let config = &dataset.manifest.config;
     assert_eq!(
-        config.get("lance.auto_cleanup.interval").map(String::as_str),
+        config
+            .get("lance.auto_cleanup.interval")
+            .map(String::as_str),
         Some("20"),
         "auto-cleanup interval must be recorded in the manifest config"
     );
-    assert!(
-        config.contains_key("lance.auto_cleanup.older_than"),
+    assert_eq!(
+        config
+            .get("lance.auto_cleanup.older_than")
+            .map(String::as_str),
+        Some("14days"),
         "auto-cleanup older_than must be recorded in the manifest config"
     );
 }
@@ -4942,9 +4947,9 @@ fn test_update_invalid_predicate_rejected() {
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
 
     // Garbage SQL — UpdateBuilder::update_where wraps parser errors as
-    // InvalidInput, so this surfaces as InvalidArgument (different from
-    // lance_dataset_delete, which routes through a different upstream path
-    // and surfaces these as Internal).
+    // InvalidInput, so this surfaces as InvalidArgument (lance_dataset_delete
+    // classifies parser failures the same way under Lance 9.1; see
+    // test_delete_invalid_predicate_rejected).
     let pred = c_str("not a real predicate ((((");
     let cols = [c_str("value")];
     let vals = [c_str("0.0")];

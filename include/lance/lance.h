@@ -1089,6 +1089,12 @@ typedef enum {
  * Write an Arrow record batch stream to a Lance dataset at `uri`, committing
  * a manifest.
  *
+ * A dataset created through this call records an auto-cleanup policy in its
+ * manifest: every 20 committed versions, versions older than 14 days are
+ * reclaimed automatically. Callers relying on lance_dataset_versions /
+ * lance_dataset_restore for time travel should be aware that versions past
+ * that horizon may no longer exist.
+ *
  * @param uri          Dataset URI (file://, s3://, memory://, etc.). Must not
  *                     be NULL or an empty string.
  * @param schema       Required Arrow schema. The stream schema must match or
