@@ -748,6 +748,7 @@ public:
         const std::vector<uint32_t>& fragment_ids = {}) const;
 
     /// Train a shared PQ codebook as an Arrow C Data Interface array/schema.
+    /// L2 and cosine use IVF residuals; DOT trains on raw vectors.
     IndexModel train_pq_model(
         const std::string& column,
         uint32_t num_sub_vectors,

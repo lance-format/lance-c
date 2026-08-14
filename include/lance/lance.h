@@ -1096,9 +1096,11 @@ int32_t lance_index_train_ivf_model(
  * Train a PQ codebook, exporting
  * FixedSizeList<Float32>[dimension / num_sub_vectors] with
  * num_sub_vectors * 2^num_bits rows. `num_bits` must be 4 or 8. The IVF
- * centroids must be the shared centroids that will be injected with this
- * residual PQ codebook. The trainer borrows them synchronously: it may replace
- * the ArrowArray struct, but leaves a live caller-owned equivalent in place.
+ * centroids must be the shared centroids that will be injected with this PQ
+ * codebook. L2 and cosine training use them to compute residuals; DOT training
+ * keeps them for model identity but trains on raw vectors. The trainer borrows
+ * them synchronously: it may replace the ArrowArray struct, but leaves a live
+ * caller-owned equivalent in place.
  */
 int32_t lance_index_train_pq_model(
     const LanceDataset* dataset,

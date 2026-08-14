@@ -230,7 +230,8 @@ unsafe fn train_ivf_model_inner(
 
 /// Train a PQ codebook and export it as
 /// `FixedSizeList<Float32>[dimension / num_sub_vectors]` with
-/// `num_sub_vectors * 2^num_bits` rows.
+/// `num_sub_vectors * 2^num_bits` rows. L2 and cosine train on IVF residuals;
+/// DOT trains on raw vectors.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_index_train_pq_model(
     dataset: *const LanceDataset,
@@ -327,13 +328,17 @@ unsafe fn train_pq_model_inner(
     }
     let ivf = IvfModel::new(centroids, None);
     let params = PQBuildParams::new(num_sub_vectors, num_bits as usize);
+    let ivf_residual = match metric {
+        LanceMetricType::L2 | LanceMetricType::Cosine => Some(&ivf),
+        LanceMetricType::Dot | LanceMetricType::Hamming => None,
+    };
     let model = block_on(build_pq_model_in_fragments(
         &dataset,
         &column,
         dim,
         metric.to_distance(),
         &params,
-        Some(&ivf),
+        ivf_residual,
         fragments.as_deref(),
     ))?;
     let subvector_dim = dim / num_sub_vectors;
