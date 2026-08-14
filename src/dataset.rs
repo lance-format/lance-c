@@ -290,22 +290,15 @@ unsafe fn dataset_take_rows_inner(
     out: *mut FFI_ArrowArrayStream,
 ) -> Result<i32> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input("dataset must not be NULL"));
     }
     if out.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "out must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input("out must not be NULL"));
     }
     if num_row_ids > 0 && row_ids.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!("row_ids must not be NULL when num_row_ids = {num_row_ids}").into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input(format!(
+            "row_ids must not be NULL when num_row_ids = {num_row_ids}"
+        )));
     }
 
     let ds = unsafe { &*dataset };
