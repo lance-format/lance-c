@@ -749,6 +749,31 @@ int32_t lance_dataset_take(
     struct ArrowArrayStream* out
 );
 
+/**
+ * Take rows by dataset row IDs.
+ *
+ * Row IDs are values from the `_rowid` scanner column, not zero-based row
+ * offsets. They must belong to the same dataset snapshot used for this read.
+ * Missing or deleted row IDs may be omitted from the result. For found rows,
+ * input order and duplicates are preserved.
+ *
+ * @param dataset      Open dataset snapshot.
+ * @param row_ids      Array of dataset row IDs. May be NULL only when
+ *                     `num_row_ids` is zero.
+ * @param num_row_ids  Length of `row_ids`.
+ * @param columns      NULL-terminated column names, or NULL for all. The
+ *                     system column `_rowid` may be requested explicitly.
+ * @param out          Pointer to caller-allocated ArrowArrayStream.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_take_rows(
+    const LanceDataset* dataset,
+    const uint64_t* row_ids,
+    size_t num_row_ids,
+    const char* const* columns,
+    struct ArrowArrayStream* out
+);
+
 /* ─── Scanner builder ─── */
 
 /**

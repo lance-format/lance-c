@@ -650,6 +650,30 @@ public:
         }
     }
 
+    /// Take rows by dataset row IDs. Results exported as ArrowArrayStream.
+    void take_rows(const uint64_t* row_ids, size_t num_row_ids,
+                   const std::vector<std::string>& columns,
+                   ArrowArrayStream* out) const {
+        std::vector<const char*> col_ptrs;
+        for (auto& c : columns) col_ptrs.push_back(c.c_str());
+        col_ptrs.push_back(nullptr);
+        const char* const* cols_ptr = columns.empty() ? nullptr : col_ptrs.data();
+
+        if (lance_dataset_take_rows(
+                handle_.get(), row_ids, num_row_ids, cols_ptr, out) != 0) {
+            check_error();
+        }
+    }
+
+    /// Take all columns by dataset row IDs.
+    void take_rows(const uint64_t* row_ids, size_t num_row_ids,
+                   ArrowArrayStream* out) const {
+        if (lance_dataset_take_rows(
+                handle_.get(), row_ids, num_row_ids, nullptr, out) != 0) {
+            check_error();
+        }
+    }
+
     /// Create a Scanner builder for this dataset.
     Scanner scan() const;
 

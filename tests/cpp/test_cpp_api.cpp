@@ -122,6 +122,35 @@ static void test_dataset_take(const std::string& uri) {
     PASS();
 }
 
+static void test_dataset_take_rows(const std::string& uri) {
+    TEST(test_dataset_take_rows);
+
+    auto ds = lance::Dataset::open(uri);
+
+    // The smoke fixture has one fragment, so its first row IDs are 0, 1, 2.
+    uint64_t row_ids[] = {0, 1, 2};
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ds.take_rows(row_ids, 3, &stream);
+
+    uint64_t total = 0;
+    while (true) {
+        ArrowArray arr;
+        memset(&arr, 0, sizeof(arr));
+        int rc = stream.get_next(&stream, &arr);
+        assert(rc == 0);
+        if (!arr.release) break;
+        total += (uint64_t)arr.length;
+        arr.release(&arr);
+    }
+
+    assert(total == 3);
+    printf("rows=%llu... ", (unsigned long long)total);
+
+    if (stream.release) stream.release(&stream);
+    PASS();
+}
+
 static void test_raii_cleanup(const std::string& uri) {
     TEST(test_raii_cleanup);
 
@@ -693,6 +722,7 @@ int main(int argc, char** argv) {
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
     test_dataset_take(uri);
+    test_dataset_take_rows(uri);
     test_raii_cleanup(uri);
     test_versions(uri);
     test_restore_to_current(uri);

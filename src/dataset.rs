@@ -255,6 +255,85 @@ unsafe fn dataset_take_inner(
     Ok(0)
 }
 
+/// Take rows by dataset row IDs, returning results as an ArrowArrayStream.
+///
+/// - `row_ids`: array of dataset row IDs, such as values returned in the
+///   `_rowid` scanner column
+/// - `num_row_ids`: length of the row ID array
+/// - `columns`: NULL-terminated column name array, or NULL for all columns
+/// - `out`: pointer to a stack-allocated `ArrowArrayStream`
+///
+/// `row_ids` may be NULL only when `num_row_ids` is zero. Row IDs must belong
+/// to the same dataset snapshot used for this read. Missing or deleted row IDs
+/// may be omitted from the result by the upstream Lance implementation.
+///
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_take_rows(
+    dataset: *const LanceDataset,
+    row_ids: *const u64,
+    num_row_ids: usize,
+    columns: *const *const c_char,
+    out: *mut FFI_ArrowArrayStream,
+) -> i32 {
+    ffi_try!(
+        unsafe { dataset_take_rows_inner(dataset, row_ids, num_row_ids, columns, out) },
+        neg
+    )
+}
+
+unsafe fn dataset_take_rows_inner(
+    dataset: *const LanceDataset,
+    row_ids: *const u64,
+    num_row_ids: usize,
+    columns: *const *const c_char,
+    out: *mut FFI_ArrowArrayStream,
+) -> Result<i32> {
+    if dataset.is_null() {
+        return Err(lance_core::Error::InvalidInput {
+            source: "dataset must not be NULL".into(),
+            location: snafu::location!(),
+        });
+    }
+    if out.is_null() {
+        return Err(lance_core::Error::InvalidInput {
+            source: "out must not be NULL".into(),
+            location: snafu::location!(),
+        });
+    }
+    if num_row_ids > 0 && row_ids.is_null() {
+        return Err(lance_core::Error::InvalidInput {
+            source: format!("row_ids must not be NULL when num_row_ids = {num_row_ids}").into(),
+            location: snafu::location!(),
+        });
+    }
+
+    let ds = unsafe { &*dataset };
+    let row_id_slice = if num_row_ids == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(row_ids, num_row_ids) }
+    };
+    let col_names = unsafe { helpers::parse_c_string_array(columns)? };
+
+    let snap = ds.snapshot();
+    let projection = match &col_names {
+        Some(cols) => lance::dataset::ProjectionRequest::from_columns(cols.iter(), snap.schema()),
+        None => lance::dataset::ProjectionRequest::from_schema(snap.schema().clone()),
+    };
+
+    let batch = block_on(snap.take_rows(row_id_slice, projection))?;
+
+    // Match lance_dataset_take: export the single RecordBatch as an Arrow stream.
+    let schema = batch.schema();
+    let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
+    unsafe {
+        std::ptr::write_unaligned(out, ffi_stream);
+    }
+    Ok(0)
+}
+
 // ---------------------------------------------------------------------------
 // Fragment enumeration
 // ---------------------------------------------------------------------------

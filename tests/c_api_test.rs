@@ -15,7 +15,7 @@ use arrow::ffi::from_ffi;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;
-use arrow_array::{Array, Float32Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, Float32Array, Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_c::*;
@@ -387,6 +387,50 @@ fn test_dataset_take() {
         .downcast_ref::<Int32Array>()
         .unwrap();
     assert_eq!(id_col.values(), &[1, 3, 5]);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_take_rows_empty_and_null_validation() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut empty_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_dataset_take_rows(ds, ptr::null(), 0, ptr::null(), &mut empty_stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut empty_stream) }.unwrap();
+    assert_eq!(
+        reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
+        0
+    );
+
+    let mut invalid_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_dataset_take_rows(ds, ptr::null(), 1, ptr::null(), &mut invalid_stream) },
+        -1
+    );
+    let message = unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()) }.to_string_lossy();
+    assert!(
+        message.contains("row_ids must not be NULL when num_row_ids = 1"),
+        "unexpected error: {message}"
+    );
+
+    let row_id = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_rows(ptr::null(), &row_id, 1, ptr::null(), &mut invalid_stream)
+        },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_dataset_take_rows(ds, &row_id, 1, ptr::null(), ptr::null_mut()) },
+        -1
+    );
 
     unsafe { lance_dataset_close(ds) };
 }
@@ -2500,6 +2544,7 @@ fn create_vector_dataset(num_rows: i32, dim: i32) -> (tempfile::TempDir, String)
 fn create_multi_fragment_vector_dataset(
     rows_per_fragment: i32,
     dim: i32,
+    enable_stable_row_ids: bool,
 ) -> (tempfile::TempDir, String) {
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
 
@@ -2544,7 +2589,10 @@ fn create_multi_fragment_vector_dataset(
         Dataset::write(
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
             &uri,
-            None,
+            Some(lance::dataset::WriteParams {
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
@@ -2553,6 +2601,7 @@ fn create_multi_fragment_vector_dataset(
             &uri,
             Some(lance::dataset::WriteParams {
                 mode: lance::dataset::WriteMode::Append,
+                enable_stable_row_ids,
                 ..Default::default()
             }),
         )
@@ -2789,6 +2838,105 @@ fn test_scanner_nearest_brute_force() {
     unsafe { lance_dataset_close(ds) };
 }
 
+fn assert_dataset_take_rows_from_multi_fragment_ann_result(enable_stable_row_ids: bool) {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(32, 8, enable_stable_row_ids);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // A non-NULL array whose first element is NULL is an explicit empty
+    // projection. The ANN result should therefore contain only _distance and
+    // the explicitly requested _rowid system column.
+    let no_columns: [*const c_char; 1] = [ptr::null()];
+    let scanner = unsafe { lance_scanner_new(ds, no_columns.as_ptr(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(unsafe { lance_scanner_with_row_id(scanner, true) }, 0);
+
+    let column = c_str("embedding");
+    let query = [40.0_f32; 8];
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr().cast(),
+                query.len(),
+                LanceDataType::Float32 as i32,
+                1,
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_use_index(scanner, false) }, 0);
+
+    let mut ann_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ann_stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ann_stream) }.unwrap();
+    let ann_batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+    assert_eq!(
+        ann_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        1
+    );
+    assert_eq!(ann_batches[0].num_columns(), 2);
+
+    let distance = ann_batches[0]
+        .column_by_name("_distance")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(distance, 0.0);
+    let row_id = ann_batches[0]
+        .column_by_name("_rowid")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    if !enable_stable_row_ids {
+        assert_ne!(
+            row_id >> 32,
+            0,
+            "expected an address-style row ID from the second fragment"
+        );
+    }
+
+    let id_column = c_str("id");
+    let columns = [id_column.as_ptr(), ptr::null()];
+    let mut take_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_dataset_take_rows(ds, &row_id, 1, columns.as_ptr(), &mut take_stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut take_stream) }.unwrap();
+    let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+    assert_eq!(batches.len(), 1);
+    let ids = batches[0]
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.values(), &[40]);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_take_rows_from_multi_fragment_ann_result() {
+    assert_dataset_take_rows_from_multi_fragment_ann_result(false);
+}
+
+#[test]
+fn test_dataset_take_rows_from_multi_fragment_ann_result_with_stable_row_ids() {
+    assert_dataset_take_rows_from_multi_fragment_ann_result(true);
+}
+
 #[test]
 fn test_scanner_nearest_with_ivf_pq_index() {
     let (_tmp, uri) = create_vector_dataset(512, 16);
@@ -2923,7 +3071,7 @@ fn test_scanner_nearest_filter_postfilter() {
 
 #[test]
 fn test_scanner_nearest_prefilter_with_fragment_ids_next() {
-    let (_tmp, uri) = create_multi_fragment_vector_dataset(32, 8);
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(32, 8, false);
     let uri_c = c_str(&uri);
     let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!ds.is_null());
@@ -2986,7 +3134,7 @@ fn test_scanner_nearest_prefilter_with_fragment_ids_next() {
 
 #[test]
 fn test_scanner_nearest_prefilter_with_fragment_ids_arrow_stream() {
-    let (_tmp, uri) = create_multi_fragment_vector_dataset(32, 8);
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(32, 8, false);
     let uri_c = c_str(&uri);
     let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!ds.is_null());
