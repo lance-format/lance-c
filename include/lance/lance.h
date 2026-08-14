@@ -118,7 +118,7 @@ typedef struct {
     LanceMetricType      metric;
     uint32_t num_partitions;        /* IVF; required, must be > 0 */
     uint32_t num_sub_vectors;       /* PQ; required, must be > 0 */
-    uint32_t num_bits;              /* PQ/SQ; 0 = 8, otherwise 4 or 8 */
+    uint32_t num_bits;              /* PQ: 0 (default 8), 4, or 8; SQ: 0 or 8 */
     uint32_t max_iterations;        /* IVF kmeans; 0 = 50 */
     uint32_t hnsw_m;                /* HNSW; required, must be > 0 */
     uint32_t hnsw_ef_construction;  /* HNSW; 0 = default */
@@ -998,10 +998,13 @@ int32_t lance_dataset_create_scalar_index(
  * error. Models produced by the trainer functions carry provenance metadata;
  * vector builders reject mismatched metric/dimension or PQ/IVF model identity.
  *
- * `mode` is zero-defaulted: AUTO trains missing models locally and uses any
- * supplied models. LOCAL_TRAIN rejects supplied models; PRECOMPUTED requires
- * the models needed by the selected vector index. Scalar builders accept AUTO
- * and LOCAL_TRAIN. Passing NULL for the entire options pointer uses AUTO.
+ * `mode` is zero-defaulted: AUTO uses a supplied model set, or trains locally
+ * when no model set is supplied. For IVF-PQ and IVF-HNSW-PQ, IVF centroids and
+ * the PQ codebook are one model set: callers must supply both or neither;
+ * partial model training is not supported. LOCAL_TRAIN rejects supplied
+ * models; PRECOMPUTED requires the complete model set needed by the selected
+ * vector index. Scalar builders accept AUTO and LOCAL_TRAIN. Passing NULL for
+ * the entire options pointer uses AUTO.
  */
 typedef enum LanceIndexSegmentBuildMode {
     LANCE_INDEX_SEGMENT_BUILD_AUTO = 0,
@@ -1024,7 +1027,7 @@ typedef struct LanceIndexSegmentBuildOptions {
  * Vector parameters with fixed-width, boundary-validated discriminants.
  * num_partitions is required for every variant; num_sub_vectors is required
  * for PQ variants; hnsw_m is required for HNSW variants. num_bits is 0 for
- * the Lance default (8), otherwise it must be 4 or 8 for PQ/SQ variants.
+ * the Lance default (8). PQ accepts 4 or 8; SQ accepts only 8.
  */
 typedef struct LanceVectorIndexSegmentParams {
     int32_t  index_type;
@@ -1062,7 +1065,8 @@ LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar(
 /**
  * Create a single-use vector index segment builder. Model arrays and schemas
  * are borrowed synchronously; arrays may be replaced but remain live and
- * caller-owned. NULL model pairs train locally in AUTO mode.
+ * caller-owned. When no model set is supplied, AUTO trains locally. PQ
+ * variants require both the IVF centroids and PQ codebook, or neither.
  */
 LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector(
     const LanceDataset* dataset,

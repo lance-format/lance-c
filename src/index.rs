@@ -430,7 +430,7 @@ pub enum LanceMetricType {
 /// Field semantics (zero = "use Lance default" unless otherwise noted):
 /// * `num_partitions`  — IVF; **required (must be > 0)**.
 /// * `num_sub_vectors` — PQ; **required for any PQ variant** (must be > 0).
-/// * `num_bits`        — PQ/SQ; 0 → 8.
+/// * `num_bits`        — PQ: 0 → 8, otherwise 4 or 8; SQ: 0 or 8.
 /// * `max_iterations`  — IVF/PQ kmeans; 0 → 50.
 /// * `hnsw_m`          — HNSW; **required for any HNSW variant** (must be > 0).
 /// * `hnsw_ef_construction` — HNSW; 0 → 150.
@@ -541,10 +541,10 @@ fn build_pq(p: &LanceVectorIndexParams, codebook: Option<ArrayRef>) -> Result<PQ
 fn build_sq(p: &LanceVectorIndexParams) -> Result<SQBuildParams> {
     let mut sq = SQBuildParams::default();
     if p.num_bits != 0 {
-        if !matches!(p.num_bits, 4 | 8) {
+        if p.num_bits != 8 {
             return Err(lance_core::Error::invalid_input_source(
                 format!(
-                    "num_bits must be 4 or 8 for Lance SQ indexes, got {}",
+                    "num_bits must be 0 or 8 for Lance SQ indexes, got {}",
                     p.num_bits
                 )
                 .into(),

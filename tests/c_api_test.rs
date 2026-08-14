@@ -3904,6 +3904,89 @@ fn test_create_vector_index_ivf_hnsw_sq() {
 }
 
 #[test]
+fn test_vector_index_num_bits_validation_for_sq_and_pq() {
+    let (_tmp, uri) = create_vector_dataset(16, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+
+    let sq_params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfSq,
+        metric: LanceMetricType::L2,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 4,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &sq_params, false)
+        },
+        -1
+    );
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(message.contains("num_bits must be 0 or 8"), "{message}");
+
+    let segment_sq_params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfHnswSq as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 4,
+        max_iterations: 0,
+        hnsw_m: 16,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                ds,
+                column.as_ptr(),
+                ptr::null(),
+                &segment_sq_params,
+                ptr::null(),
+            )
+        }
+        .is_null()
+    );
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(message.contains("num_bits must be 0 or 8"), "{message}");
+
+    let segment_pq_params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        num_sub_vectors: 2,
+        ..segment_sq_params
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            &segment_pq_params,
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "PQ must continue to accept num_bits=4");
+
+    unsafe {
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
 fn test_vector_index_missing_required_param() {
     let (_tmp, uri) = create_vector_dataset(256, 16);
     let uri_c = c_str(&uri);
