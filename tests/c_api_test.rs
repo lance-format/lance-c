@@ -7,6 +7,7 @@
 //! validating the C API contract without needing a C compiler.
 
 use std::ffi::{CString, c_char};
+use std::process::Command;
 use std::ptr;
 use std::sync::Arc;
 
@@ -433,6 +434,56 @@ fn test_dataset_take_rows_empty_and_null_validation() {
     );
 
     unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_take_rows_invalid_column() {
+    const CHILD_ENV: &str = "LANCE_C_TEST_TAKE_ROWS_INVALID_COLUMN_CHILD";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let (_tmp, uri) = create_test_dataset();
+        let c_uri = c_str(&uri);
+        let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+        assert!(!ds.is_null());
+
+        let row_id = 0_u64;
+        let invalid_column = c_str("unknown_column");
+        let columns = [invalid_column.as_ptr(), ptr::null()];
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(
+            unsafe { lance_dataset_take_rows(ds, &row_id, 1, columns.as_ptr(), &mut stream) },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+        let message_ptr = lance_last_error_message();
+        assert!(!message_ptr.is_null());
+        let message = unsafe { std::ffi::CStr::from_ptr(message_ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { lance_free_string(message_ptr) };
+        assert!(
+            message.contains("unknown_column"),
+            "unexpected error: {message}"
+        );
+
+        unsafe { lance_dataset_close(ds) };
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("test_dataset_take_rows_invalid_column")
+        .arg("--nocapture")
+        .env(CHILD_ENV, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "invalid-column subprocess failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------

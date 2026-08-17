@@ -42,6 +42,26 @@ impl LanceDataset {
     }
 }
 
+fn projection_from_columns(
+    dataset: &Dataset,
+    columns: Option<&[String]>,
+) -> Result<lance::dataset::ProjectionRequest> {
+    match columns {
+        Some(columns) => {
+            let schema = dataset
+                .schema()
+                .project_preserve_system_columns(columns)
+                .map_err(|err| {
+                    lance_core::Error::invalid_input(format!("invalid columns {columns:?}: {err}"))
+                })?;
+            Ok(lance::dataset::ProjectionRequest::from_schema(schema))
+        }
+        None => Ok(lance::dataset::ProjectionRequest::from_schema(
+            dataset.schema().clone(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dataset lifecycle
 // ---------------------------------------------------------------------------
@@ -238,10 +258,7 @@ unsafe fn dataset_take_inner(
     let col_names = unsafe { helpers::parse_c_string_array(columns)? };
 
     let snap = ds.snapshot();
-    let projection = match &col_names {
-        Some(cols) => lance::dataset::ProjectionRequest::from_columns(cols.iter(), snap.schema()),
-        None => lance::dataset::ProjectionRequest::from_schema(snap.schema().clone()),
-    };
+    let projection = projection_from_columns(&snap, col_names.as_deref())?;
 
     let batch = block_on(snap.take(idx_slice, projection))?;
 
@@ -310,10 +327,7 @@ unsafe fn dataset_take_rows_inner(
     let col_names = unsafe { helpers::parse_c_string_array(columns)? };
 
     let snap = ds.snapshot();
-    let projection = match &col_names {
-        Some(cols) => lance::dataset::ProjectionRequest::from_columns(cols.iter(), snap.schema()),
-        None => lance::dataset::ProjectionRequest::from_schema(snap.schema().clone()),
-    };
+    let projection = projection_from_columns(&snap, col_names.as_deref())?;
 
     let batch = block_on(snap.take_rows(row_id_slice, projection))?;
 
