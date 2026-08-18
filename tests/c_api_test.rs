@@ -3012,6 +3012,318 @@ fn create_multi_fragment_vector_dataset(
     (tmp, uri)
 }
 
+fn train_segment_pq_models(
+    dataset: *const LanceDataset,
+    column: &CString,
+    metric: LanceMetricType,
+) -> (
+    FFI_ArrowArray,
+    FFI_ArrowSchema,
+    FFI_ArrowArray,
+    FFI_ArrowSchema,
+) {
+    let mut centroids = FFI_ArrowArray::empty();
+    let mut centroids_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_index_train_ivf_model(
+                dataset,
+                column.as_ptr(),
+                2,
+                metric as i32,
+                ptr::null(),
+                0,
+                &mut centroids,
+                &mut centroids_schema,
+            )
+        },
+        0
+    );
+
+    let mut codebook = FFI_ArrowArray::empty();
+    let mut codebook_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_index_train_pq_model(
+                dataset,
+                column.as_ptr(),
+                2,
+                4,
+                metric as i32,
+                ptr::null(),
+                0,
+                &mut centroids,
+                &centroids_schema,
+                &mut codebook,
+                &mut codebook_schema,
+            )
+        },
+        0
+    );
+
+    (centroids, centroids_schema, codebook, codebook_schema)
+}
+
+fn take_last_error_message() -> String {
+    let error = lance_last_error_message();
+    assert!(!error.is_null());
+    let message = unsafe { std::ffi::CStr::from_ptr(error) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { lance_free_string(error) };
+    message
+}
+
+#[test]
+fn test_vector_index_segment_rejects_unsafe_full_dataset_dot_pq() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let column = c_str("embedding");
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let selected_fragments = fragment_ids.map(|fragment_id| fragment_id as u32);
+    let (mut centroids, centroids_schema, mut codebook, codebook_schema) =
+        train_segment_pq_models(dataset, &column, LanceMetricType::Dot);
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        metric: LanceMetricType::Dot as i32,
+        num_partitions: 2,
+        num_sub_vectors: 2,
+        num_bits: 4,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let mut options = LanceIndexSegmentBuildOptions {
+        fragment_ids: ptr::null(),
+        fragment_count: 0,
+        index_uuid: ptr::null(),
+        ivf_centroids: &mut centroids,
+        ivf_centroids_schema: &centroids_schema,
+        pq_codebook: &mut codebook,
+        pq_codebook_schema: &codebook_schema,
+        mode: LanceIndexSegmentBuildMode::Precomputed as i32,
+    };
+
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    assert!(
+        builder.is_null(),
+        "precomputed DOT PQ must not be accepted for an implicit full-dataset selection"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("metric=DOT"), "{message}");
+    assert!(message.contains("full dataset"), "{message}");
+    assert!(message.contains("e934cc2c"), "{message}");
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+
+    options.fragment_ids = selected_fragments.as_ptr();
+    options.fragment_count = selected_fragments.len();
+    options.mode = LanceIndexSegmentBuildMode::Auto as i32;
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    assert!(
+        builder.is_null(),
+        "AUTO with a DOT PQ codebook must not be accepted when every fragment is explicit"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("2 of 2 fragments"), "{message}");
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+
+    let hnsw_params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfHnswPq as i32,
+        hnsw_m: 4,
+        hnsw_ef_construction: 16,
+        ..params
+    };
+    options.fragment_ids = ptr::null();
+    options.fragment_count = 0;
+    options.mode = LanceIndexSegmentBuildMode::Precomputed as i32;
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &hnsw_params,
+            &options,
+        )
+    };
+    assert!(
+        builder.is_null(),
+        "precomputed DOT IVF_HNSW_PQ must not be accepted for the full dataset"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("metric=DOT"), "{message}");
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+
+    let (_single_tmp, single_uri) = create_multi_fragment_vector_dataset(1, 64, 8, false);
+    let single_uri_c = c_str(&single_uri);
+    let single_dataset = unsafe { lance_dataset_open(single_uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!single_dataset.is_null());
+    let mut single_fragment_id = [0_u64; 1];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(single_dataset, single_fragment_id.as_mut_ptr()) },
+        0
+    );
+    let single_fragment_id = single_fragment_id[0] as u32;
+    options.fragment_ids = &single_fragment_id;
+    options.fragment_count = 1;
+    options.mode = LanceIndexSegmentBuildMode::Auto as i32;
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            single_dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    assert!(
+        builder.is_null(),
+        "the only explicit fragment is still a full-dataset DOT PQ selection"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("1 of 1 fragments"), "{message}");
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+    unsafe { lance_dataset_close(single_dataset) };
+
+    let selected_fragment = selected_fragments[0];
+    options.fragment_ids = &selected_fragment;
+    options.fragment_count = 1;
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    if builder.is_null() {
+        panic!(
+            "strict DOT PQ fragment subset should remain supported: {}",
+            take_last_error_message()
+        );
+    }
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    let rc =
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) };
+    if rc != 0 {
+        panic!(
+            "strict DOT PQ fragment subset should execute: {}",
+            take_last_error_message()
+        );
+    }
+    assert!(!bytes.is_null());
+    assert!(len > 0);
+
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        if let Some(release) = centroids.release {
+            release(&mut centroids);
+        }
+        if let Some(release) = codebook.release {
+            release(&mut codebook);
+        }
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_vector_index_segment_allows_full_dataset_precomputed_pq_for_non_dot_metrics() {
+    for metric in [LanceMetricType::L2, LanceMetricType::Cosine] {
+        let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+        let uri_c = c_str(&uri);
+        let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+        assert!(!dataset.is_null());
+        let column = c_str("embedding");
+        let (mut centroids, centroids_schema, mut codebook, codebook_schema) =
+            train_segment_pq_models(dataset, &column, metric);
+        let params = LanceVectorIndexSegmentParams {
+            index_type: LanceVectorIndexType::IvfPq as i32,
+            metric: metric as i32,
+            num_partitions: 2,
+            num_sub_vectors: 2,
+            num_bits: 4,
+            max_iterations: 2,
+            hnsw_m: 0,
+            hnsw_ef_construction: 0,
+            sample_rate: 16,
+        };
+        let options = LanceIndexSegmentBuildOptions {
+            fragment_ids: ptr::null(),
+            fragment_count: 0,
+            index_uuid: ptr::null(),
+            ivf_centroids: &mut centroids,
+            ivf_centroids_schema: &centroids_schema,
+            pq_codebook: &mut codebook,
+            pq_codebook_schema: &codebook_schema,
+            mode: LanceIndexSegmentBuildMode::Precomputed as i32,
+        };
+
+        let builder = unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        };
+        if builder.is_null() {
+            panic!(
+                "full-dataset {metric:?} PQ should remain supported: {}",
+                take_last_error_message()
+            );
+        }
+        assert!(!centroids.is_released());
+        assert!(!codebook.is_released());
+
+        unsafe {
+            lance_index_segment_builder_free(builder);
+            if let Some(release) = centroids.release {
+                release(&mut centroids);
+            }
+            if let Some(release) = codebook.release {
+                release(&mut codebook);
+            }
+            lance_dataset_close(dataset);
+        }
+    }
+}
+
 #[test]
 fn test_vector_index_segment_trains_locally_for_fragment_subset() {
     let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);

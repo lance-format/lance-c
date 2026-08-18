@@ -25,7 +25,7 @@ use crate::dataset::LanceDataset;
 use crate::error::{LanceErrorCode, clear_last_error, ffi_try, set_last_error};
 use crate::helpers;
 use crate::index::{
-    LanceScalarIndexType, LanceVectorIndexParams, LanceVectorIndexType,
+    LanceMetricType, LanceScalarIndexType, LanceVectorIndexParams, LanceVectorIndexType,
     build_vector_params_with_models,
 };
 use crate::runtime::block_on;
@@ -881,9 +881,33 @@ unsafe fn new_vector_builder_inner(
     } else {
         None
     };
+
     let centroids = centroids.map(Arc::new);
     // Construct now so all parameter/model mismatches fail at the FFI boundary.
     let _ = build_vector_params_with_models(&params, centroids.clone(), codebook.clone())?;
+
+    // TODO(upstream-lance): Remove this fail-fast once Lance's ordinary
+    // full-dataset vector-index path constructs a supplied PQ codebook with a
+    // DOT ProductQuantizer, matching its distributed fragment-subset path.
+    // Pinned Lance revision e934cc2c currently constructs that quantizer with
+    // L2 and would silently encode PQ codes incompatible with metric=DOT.
+    let dataset_fragment_count = dataset.get_fragments().len();
+    let selected_fragment_count = parsed
+        .fragment_ids
+        .as_ref()
+        .map_or(dataset_fragment_count, Vec::len);
+    if matches!(
+        params.index_type,
+        LanceVectorIndexType::IvfPq | LanceVectorIndexType::IvfHnswPq
+    ) && params.metric == LanceMetricType::Dot
+        && codebook.is_some()
+        && selected_fragment_count == dataset_fragment_count
+    {
+        return Err(invalid_input(format!(
+            "pq_codebook is supplied for metric=DOT, index_type={:?}, mode={:?}, and a fragment selection covering the full dataset ({selected_fragment_count} of {dataset_fragment_count} fragments): pinned Lance revision e934cc2c constructs the full-dataset ProductQuantizer with metric=L2, which would silently encode incompatible PQ codes; select a strict fragment subset or wait for upstream Lance DOT support",
+            params.index_type, parsed.mode
+        )));
+    }
 
     Ok(Box::into_raw(Box::new(LanceIndexSegmentBuilder {
         dataset,
