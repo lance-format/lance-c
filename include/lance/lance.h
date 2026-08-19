@@ -1006,12 +1006,12 @@ int32_t lance_dataset_create_scalar_index(
  * vector index. Scalar builders accept AUTO and LOCAL_TRAIN. Passing NULL for
  * the entire options pointer uses AUTO.
  *
- * Temporary limitation: IVF-PQ and IVF-HNSW-PQ reject a supplied model set
- * with the DOT metric when the fragment selection covers the whole dataset
- * (including an explicit list of every fragment), in both AUTO and PRECOMPUTED
- * modes. Use a strict fragment subset until the upstream Lance full-dataset
- * builder supports supplied codebooks with a DOT ProductQuantizer. L2 and
- * Cosine model sets are unaffected.
+ * Temporary limitation: with the DOT metric, IVF-PQ and IVF-HNSW-PQ reject a
+ * supplied model set when the fragment selection is an effective strict
+ * subset of the dataset, in both AUTO and PRECOMPUTED modes. Cover every
+ * fragment in one segment (or pass NULL fragment_ids) until the upstream
+ * Lance distributed builder reconstructs supplied codebooks with an L2
+ * ProductQuantizer. L2 and Cosine model sets are unaffected.
  */
 typedef enum LanceIndexSegmentBuildMode {
     LANCE_INDEX_SEGMENT_BUILD_AUTO = 0,

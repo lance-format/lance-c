@@ -886,27 +886,37 @@ unsafe fn new_vector_builder_inner(
     // Construct now so all parameter/model mismatches fail at the FFI boundary.
     let _ = build_vector_params_with_models(&params, centroids.clone(), codebook.clone())?;
 
-    // TODO(upstream-lance): Remove this fail-fast once Lance's ordinary
-    // full-dataset vector-index path constructs a supplied PQ codebook with a
-    // DOT ProductQuantizer, matching its distributed fragment-subset path.
-    // Pinned Lance revision e934cc2c currently constructs that quantizer with
-    // L2 and would silently encode PQ codes incompatible with metric=DOT.
-    let dataset_fragment_count = dataset.get_fragments().len();
-    let selected_fragment_count = parsed
-        .fragment_ids
-        .as_ref()
-        .map_or(dataset_fragment_count, Vec::len);
+    // TODO(upstream-lance): Remove this fail-fast once Lance's distributed
+    // vector-index path reconstructs a supplied PQ codebook with an L2
+    // ProductQuantizer, matching the ordinary full-dataset path. Pinned Lance
+    // revision e934cc2c rewraps supplied codebooks with DistanceType::Dot in
+    // `make_global_pq`, which silently switches PQ code assignment away from
+    // the L2 contract shared by full-dataset builds and index readers.
     if matches!(
         params.index_type,
         LanceVectorIndexType::IvfPq | LanceVectorIndexType::IvfHnswPq
     ) && params.metric == LanceMetricType::Dot
         && codebook.is_some()
-        && selected_fragment_count == dataset_fragment_count
+        && let Some(fragment_ids) = parsed.fragment_ids.as_ref()
     {
-        return Err(invalid_input(format!(
-            "pq_codebook is supplied for metric=DOT, index_type={:?}, mode={:?}, and a fragment selection covering the full dataset ({selected_fragment_count} of {dataset_fragment_count} fragments): pinned Lance revision e934cc2c constructs the full-dataset ProductQuantizer with metric=L2, which would silently encode incompatible PQ codes; select a strict fragment subset or wait for upstream Lance DOT support",
-            params.index_type, parsed.mode
-        )));
+        // `fragment_ids` are unique and known to exist (checked in
+        // `parse_options`), so set inequality here is exactly an effective
+        // strict subset, mirroring core `effective_vector_fragments`.
+        let all_fragment_ids: HashSet<u32> = dataset
+            .get_fragments()
+            .iter()
+            .filter_map(|fragment| u32::try_from(fragment.id()).ok())
+            .collect();
+        let selected_fragment_ids: HashSet<u32> = fragment_ids.iter().copied().collect();
+        if selected_fragment_ids != all_fragment_ids {
+            return Err(invalid_input(format!(
+                "pq_codebook is supplied for metric=DOT, index_type={:?}, mode={:?}, and an effective strict fragment subset ({} of {} fragments): pinned Lance revision e934cc2c reconstructs the supplied codebook with a DOT ProductQuantizer in the distributed build path (make_global_pq), silently breaking the L2 PQ-assignment contract; cover the full dataset in one segment (pass NULL fragment_ids or list every fragment) or wait for upstream Lance DOT support",
+                params.index_type,
+                parsed.mode,
+                selected_fragment_ids.len(),
+                all_fragment_ids.len()
+            )));
+        }
     }
 
     Ok(Box::into_raw(Box::new(LanceIndexSegmentBuilder {
