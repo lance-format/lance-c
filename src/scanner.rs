@@ -18,7 +18,7 @@ use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_core::Result;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_io::ffi::to_ffi_arrow_array_stream;
-use lance_io::stream::RecordBatchStream;
+use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use uuid::Uuid;
 
 use crate::async_dispatcher::{self, LanceCallback};
@@ -30,6 +30,7 @@ use crate::error::{
 };
 use crate::helpers;
 use crate::runtime::{RT, block_on};
+use crate::stream_guard::GuardedStream;
 
 /// Data type tag for query vectors, mirroring the C enum `LanceDataType`.
 #[repr(i32)]
@@ -548,29 +549,70 @@ pub unsafe extern "C" fn lance_scanner_close(scanner: *mut LanceScanner) {
 /// This is the preferred API for simple integrations — blocks the calling thread.
 /// The scanner is consumed by this call and should not be used afterward (close it).
 ///
+/// The exported stream is panic-guarded (issue #61): a panic during export
+/// poisons the scanner — this call returns -1 with `LANCE_ERR_PANIC`, and
+/// every later call on the handle fails the same way — while a panic during
+/// later consumer-driven `get_next` calls surfaces as a stream error
+/// (nonzero `get_next` + `get_last_error`, then end-of-stream) instead of
+/// unwinding out of the Arrow C callbacks and aborting the host process.
+///
 /// Returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_to_arrow_stream(
     scanner: *mut LanceScanner,
     out: *mut FFI_ArrowArrayStream,
 ) -> i32 {
+    if scanner.is_null() || out.is_null() {
+        set_last_error(
+            LanceErrorCode::InvalidArgument,
+            "scanner and out must not be NULL",
+        );
+        return -1;
+    }
     scanner_poison_check!(scanner, -1);
-    ffi_try!(unsafe { scanner_to_arrow_stream_inner(scanner, out) }, neg)
+    let s = unsafe { &*scanner };
+    let poisoned = s.poison_flag();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        scanner_to_arrow_stream_inner(s, out)
+    })) {
+        Ok(Ok(rc)) => {
+            clear_last_error();
+            rc
+        }
+        Ok(Err(err)) => {
+            set_lance_error(&err);
+            -1
+        }
+        Err(payload) => {
+            poisoned.store(true, Ordering::SeqCst);
+            set_last_error(
+                LanceErrorCode::Panic,
+                format!("panic in FFI call: {}", panic_payload_message(&*payload)),
+            );
+            -1
+        }
+    }
 }
 
+/// Export logic, split out so `lance_scanner_to_arrow_stream` can wrap the
+/// whole thing in `catch_unwind` and poison the handle on panic. The stream
+/// is additionally wrapped in a [`GuardedStream`] before export so panics
+/// during the consumer's later `get_next` calls convert to a terminal stream
+/// error (and poison the handle) instead of unwinding across the Arrow C
+/// callbacks.
+///
+/// # Safety
+/// `out` must be a valid, writable pointer (checked by the caller).
 unsafe fn scanner_to_arrow_stream_inner(
-    scanner: *mut LanceScanner,
+    s: &LanceScanner,
     out: *mut FFI_ArrowArrayStream,
 ) -> Result<i32> {
-    if scanner.is_null() || out.is_null() {
-        return Err(lance_core::Error::invalid_input_source(
-            "scanner and out must not be NULL".into(),
-        ));
-    }
-    let s = unsafe { &*scanner };
     let built_scanner = s.build_scanner()?;
     let stream = block_on(built_scanner.try_into_stream())?;
-    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone())?;
+    let schema = stream.schema();
+    let guarded = GuardedStream::new(stream, s.poison_flag());
+    let adapted = RecordBatchStreamAdapter::new(schema, guarded);
+    let ffi_stream = to_ffi_arrow_array_stream(adapted, RT.handle().clone())?;
     unsafe {
         ptr::write_unaligned(out, ffi_stream);
     }
@@ -728,19 +770,31 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
         ctx: callback_ctx,
     };
 
+    // Shared poison flag moved into the task: the GuardedStream below flips
+    // it if a panic is caught during the consumer's later `get_next` calls.
+    let poisoned = s.poison_flag();
+
     RT.spawn(async move {
         let result = built_scanner.try_into_stream().await;
         match result {
-            Ok(stream) => match to_ffi_arrow_array_stream(stream, handle) {
-                Ok(ffi_stream) => {
-                    let ptr = Box::into_raw(Box::new(ffi_stream));
-                    send_cb.dispatch(0, ptr as *mut c_void);
+            Ok(stream) => {
+                // Guard the exported stream (issue #61): a mid-iteration panic
+                // becomes one terminal error item per the Arrow C stream error
+                // contract instead of unwinding out of arrow-rs's `get_next`.
+                let schema = stream.schema();
+                let guarded = GuardedStream::new(stream, poisoned);
+                let adapted = RecordBatchStreamAdapter::new(schema, guarded);
+                match to_ffi_arrow_array_stream(adapted, handle) {
+                    Ok(ffi_stream) => {
+                        let ptr = Box::into_raw(Box::new(ffi_stream));
+                        send_cb.dispatch(0, ptr as *mut c_void);
+                    }
+                    Err(err) => {
+                        set_lance_error(&err);
+                        send_cb.dispatch(-1, std::ptr::null_mut());
+                    }
                 }
-                Err(err) => {
-                    set_lance_error(&err);
-                    send_cb.dispatch(-1, std::ptr::null_mut());
-                }
-            },
+            }
             Err(err) => {
                 set_lance_error(&err);
                 send_cb.dispatch(-1, std::ptr::null_mut());

@@ -32,6 +32,7 @@ mod merge_insert;
 mod restore;
 pub mod runtime;
 mod scanner;
+pub mod stream_guard;
 mod update;
 mod versions;
 mod writer;
