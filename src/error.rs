@@ -5,6 +5,19 @@
 //!
 //! After any C function returns an error indicator (NULL pointer or negative int),
 //! the caller retrieves the error code and message from thread-local storage.
+//!
+//! Panic handling (issue #61): every entry point runs its body under
+//! `catch_unwind` (via `ffi_try!` or a hand-rolled guard), so a panic in
+//! Lance/Arrow code is reported as `LanceErrorCode::Panic` instead of
+//! unwinding across the FFI boundary. Scanner handles are poisoned after a
+//! panic and reject later calls; dataset handles stay usable because commits
+//! are atomic manifest swaps and failed mutations roll back in memory. Void
+//! close/free entry points have no error channel, so `swallow_unwind` catches
+//! a panicking `Drop`, logs it, and leaks the remainder by design. The limits
+//! are honest: double panics, panics in `Drop` during unwind, stack overflow,
+//! and allocation failure still abort the process, and post-panic state is
+//! best-effort — hosts should fail the query rather than retry a poisoned
+//! handle.
 
 use std::cell::RefCell;
 use std::ffi::{CString, c_char};
@@ -102,9 +115,6 @@ pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> Str
 /// process under Rust 1.81+ semantics), so it is logged and dropped instead.
 /// Thread-local error state is deliberately left untouched — a void return
 /// gives the caller no channel to observe an error through anyway.
-// No non-test callers yet: the close/free entry points that need this get
-// their guards in the follow-up step of issue #61.
-#[allow(dead_code)]
 pub(crate) fn swallow_unwind(context: &str, f: impl FnOnce()) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         log::error!(
@@ -142,12 +152,16 @@ pub extern "C" fn lance_last_error_message() -> *const c_char {
 }
 
 /// Free a string returned by `lance_last_error_message()`.
+///
+/// Best-effort (issue #61): a panic raised while dropping the string is
+/// caught and logged rather than unwinding into the caller, and the
+/// allocation may leak.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_free_string(s: *const c_char) {
     if !s.is_null() {
-        unsafe {
+        swallow_unwind("lance_free_string", || unsafe {
             let _ = CString::from_raw(s as *mut c_char);
-        }
+        });
     }
 }
 

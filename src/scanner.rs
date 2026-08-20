@@ -26,7 +26,7 @@ use crate::batch::LanceBatch;
 use crate::dataset::LanceDataset;
 use crate::error::{
     LanceErrorCode, clear_last_error, error_code_from_lance, ffi_try, panic_payload_message,
-    set_lance_error, set_last_error,
+    set_lance_error, set_last_error, swallow_unwind,
 };
 use crate::helpers;
 use crate::runtime::{RT, block_on};
@@ -531,12 +531,18 @@ unsafe fn scanner_set_substrait_filter_inner(
 }
 
 /// Close and free a scanner handle.
+///
+/// Best-effort (issue #61): this drops a possibly-live
+/// `DatasetRecordBatchStream`, the highest-risk `Drop` in this crate. A
+/// panic raised while dropping the handle is caught and logged rather than
+/// unwinding into the caller, and the remainder of the value may leak.
+/// Deliberately no poison check — a poisoned scanner must still be freeable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_close(scanner: *mut LanceScanner) {
     if !scanner.is_null() {
-        unsafe {
+        swallow_unwind("lance_scanner_close", || unsafe {
             let _ = Box::from_raw(scanner);
-        }
+        });
     }
 }
 

@@ -9,7 +9,7 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::RecordBatch;
 use lance_core::Result;
 
-use crate::error::ffi_try;
+use crate::error::{ffi_try, swallow_unwind};
 
 /// Opaque handle wrapping an Arrow RecordBatch.
 pub struct LanceBatch {
@@ -53,11 +53,15 @@ unsafe fn batch_to_arrow_inner(
 }
 
 /// Free a `LanceBatch` handle.
+///
+/// Best-effort (issue #61): a panic raised while dropping the batch is
+/// caught and logged rather than unwinding into the caller, and the
+/// remainder of the value may leak.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_batch_free(batch: *mut LanceBatch) {
     if !batch.is_null() {
-        unsafe {
+        swallow_unwind("lance_batch_free", || unsafe {
             let _ = Box::from_raw(batch);
-        }
+        });
     }
 }

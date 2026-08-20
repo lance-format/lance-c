@@ -14,7 +14,7 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance_core::Result;
 
-use crate::error::ffi_try;
+use crate::error::{ffi_try, swallow_unwind};
 use crate::helpers;
 use crate::runtime::block_on;
 
@@ -152,12 +152,17 @@ unsafe fn open_dataset_inner(
 
 /// Close and free a dataset handle.
 /// Safe to call with NULL. Safe to call multiple times (subsequent calls are no-ops).
+///
+/// Best-effort (issue #61): a panic raised while dropping the handle is
+/// caught and logged rather than unwinding into the caller, and the
+/// remainder of the value may leak. Deliberately no poison check — a
+/// poisoned handle must still be freeable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_close(dataset: *mut LanceDataset) {
     if !dataset.is_null() {
-        unsafe {
+        swallow_unwind("lance_dataset_close", || unsafe {
             let _ = Box::from_raw(dataset);
-        }
+        });
     }
 }
 

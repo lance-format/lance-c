@@ -9,7 +9,7 @@
 use lance_core::Result;
 
 use crate::dataset::LanceDataset;
-use crate::error::ffi_try;
+use crate::error::{ffi_try, swallow_unwind};
 use crate::runtime::block_on;
 
 /// Opaque snapshot of a dataset's version history.
@@ -92,12 +92,16 @@ unsafe fn timestamp_ms_at_inner(versions: *const LanceVersions, index: usize) ->
 }
 
 /// Close and free a versions handle. Safe to call with NULL.
+///
+/// Best-effort (issue #61): a panic raised while dropping the handle is
+/// caught and logged rather than unwinding into the caller, and the
+/// remainder of the value may leak.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_versions_close(versions: *mut LanceVersions) {
     if !versions.is_null() {
-        unsafe {
+        swallow_unwind("lance_versions_close", || unsafe {
             let _ = Box::from_raw(versions);
-        }
+        });
     }
 }
 

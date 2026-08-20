@@ -12,7 +12,7 @@ use lance::dataset::statistics::DatasetStatisticsExt;
 use lance_core::Result;
 
 use crate::dataset::LanceDataset;
-use crate::error::ffi_try;
+use crate::error::{ffi_try, swallow_unwind};
 use crate::runtime::block_on;
 
 /// Opaque snapshot of a dataset's per-field data statistics.
@@ -123,12 +123,16 @@ unsafe fn bytes_on_disk_at_inner(stats: *const LanceDataStatistics, index: usize
 }
 
 /// Close and free a data statistics handle. Safe to call with NULL.
+///
+/// Best-effort (issue #61): a panic raised while dropping the handle is
+/// caught and logged rather than unwinding into the caller, and the
+/// remainder of the value may leak.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_data_statistics_close(stats: *mut LanceDataStatistics) {
     if !stats.is_null() {
-        unsafe {
+        swallow_unwind("lance_data_statistics_close", || unsafe {
             let _ = Box::from_raw(stats);
-        }
+        });
     }
 }
 
