@@ -53,9 +53,6 @@ tempfile = "3"
 # already in the graph transitively via tokio/lance.
 libc = "0.2"
 
-[profile.release]
-panic = "abort"
-
 [package.metadata.capi.header]
 subdirectory = "lance"
 generation = false  # we ship a hand-maintained header at include/lance/lance.h

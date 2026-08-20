@@ -78,6 +78,8 @@ typedef enum {
     LANCE_ERR_INTERNAL = 6,
     LANCE_ERR_NOT_SUPPORTED = 7,
     LANCE_ERR_COMMIT_CONFLICT = 8,
+    /* An unexpected panic was caught at the FFI boundary. */
+    LANCE_ERR_PANIC = 9,
 } LanceErrorCode;
 
 /* ─── Index types (Phase 2) ─── */
