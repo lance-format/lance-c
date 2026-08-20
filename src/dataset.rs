@@ -4,6 +4,7 @@
 //! Dataset C API: open, close, metadata, schema, take.
 
 use std::ffi::c_char;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, RwLock};
 
 use arrow::ffi::FFI_ArrowSchema;
@@ -25,20 +26,58 @@ pub struct LanceDataset {
 impl LanceDataset {
     /// Take a consistent snapshot of the inner dataset.
     /// Returns a cloned Arc so the caller can hold it without keeping the lock.
+    ///
+    /// Lock access is deliberately poison-tolerant. The lock is only ever
+    /// poisoned by a panic unwinding out of `with_mut`, and `with_mut` catches
+    /// that panic before swapping (see below), so the guarded value is always
+    /// a single consistent `Arc<Dataset>` pointer: it is never observed
+    /// half-mutated, and the swap itself is one atomic pointer store that
+    /// cannot tear. A poisoned lock therefore still protects consistent data,
+    /// and dataset handles stay usable after a caught panic.
     pub(crate) fn snapshot(&self) -> Arc<Dataset> {
-        self.inner.read().expect("dataset rwlock poisoned").clone()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Mutate the inner dataset under an exclusive write lock.
-    /// `Arc::make_mut` performs a cheap shallow clone if other Arc refs exist
-    /// (existing scanners keep their snapshot view).
+    /// Mutate the inner dataset under an exclusive write lock, using
+    /// clone-execute-swap so a panicking mutation cannot corrupt the handle:
+    ///
+    /// 1. `Dataset::clone` (a cheap shallow clone — every heap field of
+    ///    `Dataset` is an `Arc` or small value) copies the current dataset
+    ///    out of the lock.
+    /// 2. `f` runs on that clone, still under the write lock, so concurrent
+    ///    mutations stay serialized exactly as before. The call is wrapped in
+    ///    `catch_unwind`.
+    /// 3. On success the mutated clone replaces the stored `Arc` in one
+    ///    pointer swap and `f`'s return value is handed back.
+    /// 4. If `f` panics, the guard still holds the pristine old `Arc`, so the
+    ///    in-memory state is rolled back simply by never swapping. The panic
+    ///    is re-thrown via `resume_unwind` with its original payload so the
+    ///    entry-point `ffi_try!` guard maps it to `LANCE_ERR_PANIC` with the
+    ///    real message.
+    ///
+    /// Note this is deliberately *not* `Arc::make_mut` + restore-on-panic:
+    /// when the handle is the unique owner, `make_mut` mutates the shared
+    /// allocation in place, and "restoring" the old `Arc` would then restore
+    /// the same already-half-mutated dataset. Cloning first is the only form
+    /// that makes rollback real.
+    ///
+    /// The resumed unwind poisons the `RwLock`; the poison-tolerant accessors
+    /// are why the handle keeps working afterwards (per the issue consensus:
+    /// on-disk state cannot tear either, because Lance commits are atomic
+    /// manifest swaps).
     pub(crate) fn with_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Dataset) -> R,
     {
-        let mut guard = self.inner.write().expect("dataset rwlock poisoned");
-        let ds = Arc::make_mut(&mut *guard);
-        f(ds)
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let mut working = Dataset::clone(&**guard);
+        match catch_unwind(AssertUnwindSafe(|| f(&mut working))) {
+            Ok(ret) => {
+                *guard = Arc::new(working);
+                ret
+            }
+            Err(payload) => resume_unwind(payload),
+        }
     }
 }
 
@@ -391,4 +430,89 @@ unsafe fn dataset_fragment_ids_inner(
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    /// Build a real 3-row dataset in a tempdir and wrap it in a handle.
+    /// (The default panic hook prints to stderr during the panic test; that
+    /// is expected noise.)
+    fn create_test_handle() -> (tempfile::TempDir, LanceDataset) {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().join("with_mut_ds").to_str().unwrap().to_string();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let dataset = block_on(Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        ))
+        .unwrap();
+        let handle = LanceDataset {
+            inner: RwLock::new(Arc::new(dataset)),
+        };
+        (tmp, handle)
+    }
+
+    #[test]
+    fn with_mut_mutation_is_visible_via_snapshot() {
+        let (_tmp, handle) = create_test_handle();
+        assert_eq!(handle.snapshot().version().version, 1);
+
+        let result = handle.with_mut(|ds| block_on(ds.delete("id = 1")).unwrap());
+        assert_eq!(result.num_deleted_rows, 1);
+
+        let snap = handle.snapshot();
+        assert_eq!(snap.version().version, 2);
+        assert_eq!(block_on(snap.count_rows(None)).unwrap(), 2);
+    }
+
+    #[test]
+    fn with_mut_panic_rolls_back_and_handle_stays_usable() {
+        let (_tmp, handle) = create_test_handle();
+        let uri_before = handle.snapshot().uri().to_string();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            handle.with_mut(|_ds| panic!("simulated bug in mutation"))
+        }));
+        let payload = result.expect_err("panic must escape with_mut unchanged");
+        let msg = crate::error::panic_payload_message(&*payload);
+        assert!(
+            msg.contains("simulated bug in mutation"),
+            "original payload must be preserved, got: {msg}"
+        );
+
+        // The unwind poisoned the RwLock; poison-tolerant reads must still
+        // return the pre-panic dataset (the swap never happened, so the
+        // in-memory state was rolled back).
+        let snap = handle.snapshot();
+        assert_eq!(snap.version().version, 1);
+        assert_eq!(snap.uri(), uri_before);
+        assert_eq!(block_on(snap.count_rows(None)).unwrap(), 3);
+
+        // A later mutation on the same handle still works (poison-tolerant
+        // write path) and is again visible via snapshot.
+        let result = handle.with_mut(|ds| block_on(ds.delete("id = 1")).unwrap());
+        assert_eq!(result.num_deleted_rows, 1);
+        let snap = handle.snapshot();
+        assert_eq!(snap.version().version, 2);
+        assert_eq!(block_on(snap.count_rows(None)).unwrap(), 2);
+    }
 }
