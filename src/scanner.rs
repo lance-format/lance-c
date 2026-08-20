@@ -12,7 +12,7 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::SchemaRef;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_core::Result;
@@ -25,8 +25,8 @@ use crate::async_dispatcher::{self, LanceCallback};
 use crate::batch::LanceBatch;
 use crate::dataset::LanceDataset;
 use crate::error::{
-    LanceErrorCode, clear_last_error, ffi_try, panic_payload_message, set_lance_error,
-    set_last_error,
+    LanceErrorCode, clear_last_error, error_code_from_lance, ffi_try, panic_payload_message,
+    set_lance_error, set_last_error,
 };
 use crate::helpers;
 use crate::runtime::{RT, block_on};
@@ -711,20 +711,36 @@ unsafe fn scanner_next_inner(s: &mut LanceScanner, out: *mut *mut LanceBatch) ->
 /// when the ArrowArrayStream is ready.
 ///
 /// - `callback`: Called with `(ctx, 0, *mut ArrowArrayStream)` on success,
-///   or `(ctx, -1, NULL)` on error (check `lance_last_error_*`).
+///   or `(ctx, -1, NULL)` on error. On error, the dispatcher installs the
+///   error on the callback thread's TLS first, so `lance_last_error_*`
+///   called from inside the callback observes the failure.
 /// - `callback_ctx`: Opaque pointer passed back to the callback.
 ///
 /// The scanner configuration is captured at call time. The scanner handle
 /// can be closed immediately after this call.
+///
+/// A panic inside the spawned task poisons the scanner and is still reported
+/// through the callback: `(ctx, -1, NULL)` with `LANCE_ERR_PANIC` on the
+/// callback thread's TLS — the caller never hangs waiting for a completion
+/// that would otherwise die as an unobserved task `JoinError`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_scan_async(
     scanner: *const LanceScanner,
     callback: LanceCallback,
     callback_ctx: *mut c_void,
 ) {
+    // Validation-time failures happen before scan_async returns, so they keep
+    // setting the caller thread's TLS AND carry the error inside the dispatch
+    // message for the callback thread to observe (issue #61).
     if scanner.is_null() {
         set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        async_dispatcher::dispatch_callback(callback, callback_ctx, -1, ptr::null_mut());
+        async_dispatcher::dispatch_callback(
+            callback,
+            callback_ctx,
+            -1,
+            ptr::null_mut(),
+            Some((LanceErrorCode::InvalidArgument, "scanner is NULL".into())),
+        );
         return;
     }
 
@@ -736,7 +752,16 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
             LanceErrorCode::Panic,
             "scanner is poisoned by an earlier panic",
         );
-        async_dispatcher::dispatch_callback(callback, callback_ctx, -1, ptr::null_mut());
+        async_dispatcher::dispatch_callback(
+            callback,
+            callback_ctx,
+            -1,
+            ptr::null_mut(),
+            Some((
+                LanceErrorCode::Panic,
+                "scanner is poisoned by an earlier panic".into(),
+            )),
+        );
         return;
     }
 
@@ -744,7 +769,13 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
         Ok(sc) => sc,
         Err(err) => {
             set_lance_error(&err);
-            async_dispatcher::dispatch_callback(callback, callback_ctx, -1, ptr::null_mut());
+            async_dispatcher::dispatch_callback(
+                callback,
+                callback_ctx,
+                -1,
+                ptr::null_mut(),
+                Some((error_code_from_lance(&err), err.to_string())),
+            );
             return;
         }
     };
@@ -753,6 +784,7 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
 
     // Wrap non-Send raw pointers for the async task.
     // Safety: The C caller guarantees callback_ctx remains valid until callback fires.
+    #[derive(Clone, Copy)]
     struct SendCallback {
         callback: LanceCallback,
         ctx: *mut c_void,
@@ -760,8 +792,13 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
     unsafe impl Send for SendCallback {}
 
     impl SendCallback {
-        fn dispatch(&self, status: i32, result: *mut c_void) {
-            async_dispatcher::dispatch_callback(self.callback, self.ctx, status, result);
+        fn dispatch(
+            &self,
+            status: i32,
+            result: *mut c_void,
+            error: Option<(LanceErrorCode, String)>,
+        ) {
+            async_dispatcher::dispatch_callback(self.callback, self.ctx, status, result, error);
         }
     }
 
@@ -775,30 +812,64 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
     let poisoned = s.poison_flag();
 
     RT.spawn(async move {
-        let result = built_scanner.try_into_stream().await;
-        match result {
-            Ok(stream) => {
-                // Guard the exported stream (issue #61): a mid-iteration panic
-                // becomes one terminal error item per the Arrow C stream error
-                // contract instead of unwinding out of arrow-rs's `get_next`.
-                let schema = stream.schema();
-                let guarded = GuardedStream::new(stream, poisoned);
-                let adapted = RecordBatchStreamAdapter::new(schema, guarded);
-                match to_ffi_arrow_array_stream(adapted, handle) {
-                    Ok(ffi_stream) => {
-                        let ptr = Box::into_raw(Box::new(ffi_stream));
-                        send_cb.dispatch(0, ptr as *mut c_void);
-                    }
-                    Err(err) => {
-                        set_lance_error(&err);
-                        send_cb.dispatch(-1, std::ptr::null_mut());
+        // Copies kept outside the inner future (which consumes the originals)
+        // so the panic arm below can still poison the handle and report.
+        let poisoned_on_panic = Arc::clone(&poisoned);
+        let send_cb_on_panic = send_cb;
+        // The whole task body runs under catch_unwind (issue #61): a panic
+        // here would otherwise die as an unobserved JoinError — the callback
+        // would never fire and the C caller would hang forever waiting for a
+        // completion that never arrives.
+        let outcome = std::panic::AssertUnwindSafe(async move {
+            let result = built_scanner.try_into_stream().await;
+            match result {
+                Ok(stream) => {
+                    // Guard the exported stream (issue #61): a mid-iteration panic
+                    // becomes one terminal error item per the Arrow C stream error
+                    // contract instead of unwinding out of arrow-rs's `get_next`.
+                    let schema = stream.schema();
+                    let guarded = GuardedStream::new(stream, poisoned);
+                    let adapted = RecordBatchStreamAdapter::new(schema, guarded);
+                    match to_ffi_arrow_array_stream(adapted, handle) {
+                        Ok(ffi_stream) => {
+                            let ptr = Box::into_raw(Box::new(ffi_stream));
+                            send_cb.dispatch(0, ptr as *mut c_void, None);
+                        }
+                        Err(err) => {
+                            // Runs on a Tokio worker AFTER scan_async returned:
+                            // setting this thread's TLS would be invisible to
+                            // everyone, so the error rides inside the dispatch
+                            // message and the dispatcher installs it on the
+                            // callback thread instead (issue #61).
+                            send_cb.dispatch(
+                                -1,
+                                std::ptr::null_mut(),
+                                Some((error_code_from_lance(&err), err.to_string())),
+                            );
+                        }
                     }
                 }
+                Err(err) => {
+                    send_cb.dispatch(
+                        -1,
+                        std::ptr::null_mut(),
+                        Some((error_code_from_lance(&err), err.to_string())),
+                    );
+                }
             }
-            Err(err) => {
-                set_lance_error(&err);
-                send_cb.dispatch(-1, std::ptr::null_mut());
-            }
+        })
+        .catch_unwind()
+        .await;
+        if let Err(payload) = outcome {
+            poisoned_on_panic.store(true, Ordering::SeqCst);
+            send_cb_on_panic.dispatch(
+                -1,
+                std::ptr::null_mut(),
+                Some((
+                    LanceErrorCode::Panic,
+                    format!("panic in FFI call: {}", panic_payload_message(&*payload)),
+                )),
+            );
         }
     });
 }
@@ -1433,10 +1504,29 @@ mod tests {
 
     static CALLBACK_STATUS: AtomicI32 = AtomicI32::new(i32::MIN);
     static CALLBACK_RESULT_WAS_NULL: AtomicBool = AtomicBool::new(false);
+    static CALLBACK_ERROR_CODE: AtomicI32 = AtomicI32::new(i32::MIN);
+    static CALLBACK_ERROR_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
     unsafe extern "C" fn record_status(_ctx: *mut c_void, status: i32, result: *mut c_void) {
-        CALLBACK_STATUS.store(status, Ordering::SeqCst);
         CALLBACK_RESULT_WAS_NULL.store(result.is_null(), Ordering::SeqCst);
+        // The dispatcher installs the error on this (callback) thread's TLS
+        // before invoking us; record it exactly as a C consumer reads it:
+        // code first, then the (consuming) message read.
+        CALLBACK_ERROR_CODE.store(lance_last_error_code() as i32, Ordering::SeqCst);
+        let msg_ptr = lance_last_error_message();
+        let message = if msg_ptr.is_null() {
+            None
+        } else {
+            let msg = unsafe { CStr::from_ptr(msg_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { crate::error::lance_free_string(msg_ptr) };
+            Some(msg)
+        };
+        *CALLBACK_ERROR_MESSAGE.lock().unwrap() = message;
+        // Published last: a reader that observes `status` also observes the
+        // error fields written above (SeqCst total order).
+        CALLBACK_STATUS.store(status, Ordering::SeqCst);
     }
 
     #[test]
@@ -1458,6 +1548,23 @@ mod tests {
         }
         assert_eq!(CALLBACK_STATUS.load(Ordering::SeqCst), -1);
         assert!(CALLBACK_RESULT_WAS_NULL.load(Ordering::SeqCst));
+        // The callback thread's TLS must carry the poison error too (issue
+        // #61): validation-time failures set the caller thread's TLS AND ride
+        // inside the dispatch message, which the dispatcher installs before
+        // invoking the callback.
+        assert_eq!(
+            CALLBACK_ERROR_CODE.load(Ordering::SeqCst),
+            LanceErrorCode::Panic as i32
+        );
+        let callback_msg = CALLBACK_ERROR_MESSAGE
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("callback-thread TLS must carry the poison message");
+        assert!(
+            callback_msg.contains("poisoned by an earlier panic"),
+            "unexpected callback-thread message: {callback_msg}"
+        );
 
         unsafe {
             lance_scanner_close(scanner);
