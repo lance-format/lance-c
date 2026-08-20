@@ -36,6 +36,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Vector index creation | IVF_PQ, IVF_FLAT, IVF_SQ, HNSW variants |
 | [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List indexes |
 | [x] | Index management | List and drop index operations |
+| [x] | Distributed index build | Train shared IVF/PQ models, build uncommitted fragment-scoped segments, and exchange protobuf metadata |
 | [x] | C++ wrappers | `create_vector_index()` and `create_scalar_index()` methods |
 
 ### Phase 3: Write Path & Mutations

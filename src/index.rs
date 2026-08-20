@@ -7,7 +7,9 @@
 //! scanners that already cloned the inner Arc keep their snapshot view.
 
 use std::ffi::{CString, c_char};
+use std::sync::Arc;
 
+use arrow_array::{Array, ArrayRef, FixedSizeListArray};
 use lance::index::DatasetIndexExt;
 use lance_core::Result;
 use lance_index::IndexType;
@@ -29,7 +31,7 @@ pub enum LanceScalarIndexType {
 }
 
 impl LanceScalarIndexType {
-    fn from_c(v: i32) -> Result<Self> {
+    pub(crate) fn from_c(v: i32) -> Result<Self> {
         match v {
             1 => Ok(Self::BTree),
             2 => Ok(Self::Bitmap),
@@ -41,7 +43,7 @@ impl LanceScalarIndexType {
         }
     }
 
-    fn to_builtin(self) -> BuiltinIndexType {
+    pub(crate) fn to_builtin(self) -> BuiltinIndexType {
         match self {
             Self::BTree => BuiltinIndexType::BTree,
             Self::Bitmap => BuiltinIndexType::Bitmap,
@@ -50,7 +52,7 @@ impl LanceScalarIndexType {
         }
     }
 
-    fn to_index_type(self) -> IndexType {
+    pub(crate) fn to_index_type(self) -> IndexType {
         match self {
             Self::BTree => IndexType::BTree,
             Self::Bitmap => IndexType::Bitmap,
@@ -396,6 +398,22 @@ pub enum LanceVectorIndexType {
     IvfHnswFlat = 106,
 }
 
+impl LanceVectorIndexType {
+    pub(crate) fn from_c(value: i32) -> Result<Self> {
+        match value {
+            101 => Ok(Self::IvfFlat),
+            102 => Ok(Self::IvfSq),
+            103 => Ok(Self::IvfPq),
+            104 => Ok(Self::IvfHnswSq),
+            105 => Ok(Self::IvfHnswPq),
+            106 => Ok(Self::IvfHnswFlat),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!("invalid vector index type: {value}").into(),
+            )),
+        }
+    }
+}
+
 /// Distance metric, mirroring the C enum `LanceMetricType`.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,7 +430,7 @@ pub enum LanceMetricType {
 /// Field semantics (zero = "use Lance default" unless otherwise noted):
 /// * `num_partitions`  — IVF; **required (must be > 0)**.
 /// * `num_sub_vectors` — PQ; **required for any PQ variant** (must be > 0).
-/// * `num_bits`        — PQ/SQ; 0 → 8.
+/// * `num_bits`        — PQ: 0 → 8, otherwise 4 or 8; SQ: 0 or 8.
 /// * `max_iterations`  — IVF/PQ kmeans; 0 → 50.
 /// * `hnsw_m`          — HNSW; **required for any HNSW variant** (must be > 0).
 /// * `hnsw_ef_construction` — HNSW; 0 → 150.
@@ -432,6 +450,21 @@ pub struct LanceVectorIndexParams {
 }
 
 impl LanceMetricType {
+    pub(crate) fn from_c(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::L2),
+            1 => Ok(Self::Cosine),
+            2 => Ok(Self::Dot),
+            3 => Ok(Self::Hamming),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "metric must be one of 0 (L2), 1 (Cosine), 2 (Dot), or 3 (Hamming); got {value}"
+                )
+                .into(),
+            )),
+        }
+    }
+
     pub(crate) fn to_distance(self) -> DistanceType {
         match self {
             Self::L2 => DistanceType::L2,
@@ -455,9 +488,21 @@ fn require_field(name: &str, value: u32) -> Result<u32> {
     }
 }
 
-fn build_ivf(p: &LanceVectorIndexParams) -> Result<IvfBuildParams> {
+fn build_ivf(
+    p: &LanceVectorIndexParams,
+    centroids: Option<Arc<FixedSizeListArray>>,
+) -> Result<IvfBuildParams> {
     let num_partitions = require_field("num_partitions", p.num_partitions)? as usize;
     let mut ivf = IvfBuildParams::new(num_partitions);
+    if let Some(centroids) = centroids {
+        if centroids.len() != num_partitions {
+            return Err(lance_core::Error::invalid_input(format!(
+                "ivf_centroids length {} does not match num_partitions {num_partitions}",
+                centroids.len()
+            )));
+        }
+        ivf.centroids = Some(centroids);
+    }
     if p.max_iterations != 0 {
         ivf.max_iters = p.max_iterations as usize;
     }
@@ -467,13 +512,18 @@ fn build_ivf(p: &LanceVectorIndexParams) -> Result<IvfBuildParams> {
     Ok(ivf)
 }
 
-fn build_pq(p: &LanceVectorIndexParams) -> Result<PQBuildParams> {
+fn build_pq(p: &LanceVectorIndexParams, codebook: Option<ArrayRef>) -> Result<PQBuildParams> {
     let num_sub_vectors = require_field("num_sub_vectors", p.num_sub_vectors)? as usize;
     let num_bits = if p.num_bits == 0 {
         8
     } else {
         p.num_bits as usize
     };
+    if !matches!(num_bits, 4 | 8) {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("num_bits must be 4 or 8 for Lance PQ indexes, got {num_bits}").into(),
+        ));
+    }
     let max_iters = if p.max_iterations == 0 {
         50
     } else {
@@ -483,19 +533,29 @@ fn build_pq(p: &LanceVectorIndexParams) -> Result<PQBuildParams> {
         num_sub_vectors,
         num_bits,
         max_iters,
+        codebook,
         ..Default::default()
     })
 }
 
-fn build_sq(p: &LanceVectorIndexParams) -> SQBuildParams {
+fn build_sq(p: &LanceVectorIndexParams) -> Result<SQBuildParams> {
     let mut sq = SQBuildParams::default();
     if p.num_bits != 0 {
+        if p.num_bits != 8 {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "num_bits must be 0 or 8 for Lance SQ indexes, got {}",
+                    p.num_bits
+                )
+                .into(),
+            ));
+        }
         sq.num_bits = p.num_bits as u16;
     }
     if p.sample_rate != 0 {
         sq.sample_rate = p.sample_rate as usize;
     }
-    sq
+    Ok(sq)
 }
 
 fn build_hnsw(p: &LanceVectorIndexParams) -> Result<HnswBuildParams> {
@@ -511,38 +571,46 @@ fn build_hnsw(p: &LanceVectorIndexParams) -> Result<HnswBuildParams> {
 }
 
 fn build_vector_params(p: &LanceVectorIndexParams) -> Result<LanceCoreVectorIndexParams> {
+    build_vector_params_with_models(p, None, None)
+}
+
+pub(crate) fn build_vector_params_with_models(
+    p: &LanceVectorIndexParams,
+    centroids: Option<Arc<FixedSizeListArray>>,
+    codebook: Option<ArrayRef>,
+) -> Result<LanceCoreVectorIndexParams> {
     let metric = p.metric.to_distance();
     use LanceVectorIndexType::*;
     let core = match p.index_type {
         IvfFlat => {
-            let ivf = build_ivf(p)?;
+            let ivf = build_ivf(p, centroids)?;
             LanceCoreVectorIndexParams::with_ivf_flat_params(metric, ivf)
         }
         IvfPq => {
-            let ivf = build_ivf(p)?;
-            let pq = build_pq(p)?;
+            let ivf = build_ivf(p, centroids)?;
+            let pq = build_pq(p, codebook)?;
             LanceCoreVectorIndexParams::with_ivf_pq_params(metric, ivf, pq)
         }
         IvfSq => {
-            let ivf = build_ivf(p)?;
-            let sq = build_sq(p);
+            let ivf = build_ivf(p, centroids)?;
+            let sq = build_sq(p)?;
             LanceCoreVectorIndexParams::with_ivf_sq_params(metric, ivf, sq)
         }
         IvfHnswFlat => {
-            let ivf = build_ivf(p)?;
+            let ivf = build_ivf(p, centroids)?;
             let hnsw = build_hnsw(p)?;
             LanceCoreVectorIndexParams::ivf_hnsw(metric, ivf, hnsw)
         }
         IvfHnswPq => {
-            let ivf = build_ivf(p)?;
+            let ivf = build_ivf(p, centroids)?;
             let hnsw = build_hnsw(p)?;
-            let pq = build_pq(p)?;
+            let pq = build_pq(p, codebook)?;
             LanceCoreVectorIndexParams::with_ivf_hnsw_pq_params(metric, ivf, hnsw, pq)
         }
         IvfHnswSq => {
-            let ivf = build_ivf(p)?;
+            let ivf = build_ivf(p, centroids)?;
             let hnsw = build_hnsw(p)?;
-            let sq = build_sq(p);
+            let sq = build_sq(p)?;
             LanceCoreVectorIndexParams::with_ivf_hnsw_sq_params(metric, ivf, hnsw, sq)
         }
     };

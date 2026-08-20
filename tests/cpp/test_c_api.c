@@ -504,8 +504,8 @@ static void test_drop_columns(const char *write_uri) {
     int64_t fields_before = schema_before.n_children;
     if (schema_before.release) schema_before.release(&schema_before);
 
-    const char *cols[] = {"name"};
-    rc = lance_dataset_drop_columns(ds, cols, 1);
+    const char *cols[] = {"name", "embedding"};
+    rc = lance_dataset_drop_columns(ds, cols, 2);
     ASSERT(rc == 0, "drop_columns failed");
     uint64_t after_rows = lance_dataset_count_rows(ds);
     CHECK_OK();
@@ -514,8 +514,8 @@ static void test_drop_columns(const char *write_uri) {
     ASSERT(lance_dataset_version(ds) > v_before,
            "drop_columns must bump the version");
 
-    /* Schema field count must have decreased by exactly 1. The C-test
-     * fixture has 2 columns (`id`, `name`) — assert `fields_after == 1`
+    /* Schema field count must have decreased by exactly 2. The C-test
+     * fixture has 3 columns (`id`, `name`, `embedding`) — assert `fields_after == 1`
      * so this self-documents the post-drop expectation and trips if the
      * fixture ever grows additional columns. Release the exported
      * schema before any assertion so we never leak it on failure. */
@@ -525,10 +525,10 @@ static void test_drop_columns(const char *write_uri) {
     ASSERT(rc == 0, "schema export failed after drop");
     int64_t fields_after = schema_after.n_children;
     if (schema_after.release) schema_after.release(&schema_after);
-    ASSERT(fields_after == fields_before - 1,
-           "schema field count must decrease by 1 after drop");
+    ASSERT(fields_after == fields_before - 2,
+           "schema field count must decrease by 2 after drop");
     ASSERT(fields_after == 1,
-           "C-test fixture should be left with `id` only after dropping `name`");
+           "C-test fixture should be left with `id` only after dropping columns");
 
     /* NULL `columns` and num_columns == 0 must both be rejected. */
     rc = lance_dataset_drop_columns(ds, NULL, 1);
@@ -672,6 +672,175 @@ static void test_add_columns(const char *write_uri) {
     printf("OK\n");
 }
 
+/* Builds one uncommitted scalar index segment and exercises the byte-buffer
+ * and parsed-metadata ownership APIs from a real C caller. */
+static void test_index_segment_builder(const char *uri) {
+    printf("  test_index_segment_builder... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    uint64_t fragment_count = lance_dataset_fragment_count(ds);
+    CHECK_OK();
+    ASSERT(fragment_count > 0, "fixture must contain at least one fragment");
+    uint64_t *all_fragment_ids =
+        (uint64_t *)calloc((size_t)fragment_count, sizeof(uint64_t));
+    ASSERT(all_fragment_ids != NULL, "fragment-id allocation failed");
+    ASSERT(lance_dataset_fragment_ids(ds, all_fragment_ids) == 0,
+           "fragment enumeration failed");
+    uint32_t selected_fragment_id = (uint32_t)all_fragment_ids[0];
+    free(all_fragment_ids);
+
+    const uint8_t expected_uuid[16] = {
+        0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x4d, 0xef,
+        0x80, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde,
+    };
+    LanceIndexSegmentBuildOptions options;
+    memset(&options, 0, sizeof(options));
+    options.fragment_ids = &selected_fragment_id;
+    options.fragment_count = 1;
+    options.index_uuid = expected_uuid;
+    options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+
+    uint64_t version_before = lance_dataset_version(ds);
+    LanceIndexSegmentBuilder *builder =
+        lance_index_segment_builder_new_scalar(
+            ds, "id", "c_id_segment", LANCE_SCALAR_BITMAP, NULL, &options);
+    ASSERT(builder != NULL, "scalar segment builder creation failed");
+
+    uint8_t *metadata_bytes = NULL;
+    size_t metadata_len = 0;
+    int32_t rc = lance_index_segment_builder_execute_uncommitted(
+        builder, &metadata_bytes, &metadata_len);
+    ASSERT(rc == 0, "uncommitted scalar segment build failed");
+    ASSERT(metadata_bytes != NULL && metadata_len > 0,
+           "segment build returned empty metadata");
+    ASSERT(lance_dataset_version(ds) == version_before,
+           "uncommitted build must not change the dataset version");
+
+    LanceIndexSegmentMetadata *metadata = NULL;
+    rc = lance_index_segment_metadata_parse(
+        metadata_bytes, metadata_len, &metadata);
+    ASSERT(rc == 0 && metadata != NULL, "metadata parse failed");
+
+    uint8_t actual_uuid[16] = {0};
+    ASSERT(lance_index_segment_metadata_uuid(metadata, actual_uuid) == 0,
+           "metadata UUID read failed");
+    ASSERT(memcmp(actual_uuid, expected_uuid, sizeof(actual_uuid)) == 0,
+           "metadata UUID mismatch");
+    ASSERT(strcmp(lance_index_segment_metadata_name(metadata),
+                  "c_id_segment") == 0,
+           "metadata name mismatch");
+    ASSERT(lance_index_segment_metadata_dataset_version(metadata) ==
+               version_before,
+           "metadata dataset version mismatch");
+    ASSERT(lance_index_segment_metadata_index_version(metadata) == 0,
+           "metadata index version mismatch");
+    ASSERT(lance_index_segment_metadata_index_type(metadata) ==
+               LANCE_SCALAR_BITMAP,
+           "metadata index type mismatch");
+    const char *type_url =
+        lance_index_segment_metadata_index_details_type_url(metadata);
+    ASSERT(type_url != NULL && strstr(type_url, "BitmapIndexDetails") != NULL,
+           "metadata type URL mismatch");
+    ASSERT(lance_index_segment_metadata_field_count(metadata) == 1,
+           "metadata field count mismatch");
+    int32_t field_id = -1;
+    size_t field_count = 0;
+    ASSERT(lance_index_segment_metadata_field_ids(
+               metadata, &field_id, 1, &field_count) == 0,
+           "metadata field IDs read failed");
+    ASSERT(field_count == 1 && field_id == 0,
+           "metadata field ID mismatch");
+    ASSERT(lance_index_segment_metadata_fragment_count(metadata) == 1,
+           "metadata fragment count mismatch");
+
+    uint32_t actual_fragment_id = 0;
+    size_t written = 0;
+    ASSERT(lance_index_segment_metadata_fragment_ids(
+               metadata, &actual_fragment_id, 1, &written) == 0,
+           "metadata fragment IDs read failed");
+    ASSERT(written == 1 && actual_fragment_id == selected_fragment_id,
+           "metadata fragment ID mismatch");
+
+    lance_index_segment_metadata_free(metadata);
+    lance_free_bytes(metadata_bytes);
+    lance_index_segment_builder_free(builder);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+static void test_vector_models_and_reusable_segments(const char *uri) {
+    printf("  test_vector_models_and_reusable_segments... ");
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t fragment_count = lance_dataset_fragment_count(ds);
+    ASSERT(fragment_count >= 2, "vector fixture must have two fragments");
+    uint64_t all_ids[2] = {0, 0};
+    ASSERT(lance_dataset_fragment_ids(ds, all_ids) == 0,
+           "fragment enumeration failed");
+    ASSERT(all_ids[0] <= UINT32_MAX && all_ids[1] <= UINT32_MAX,
+           "fragment id does not fit segment ABI");
+    uint32_t fragment_ids[2] = {(uint32_t)all_ids[0], (uint32_t)all_ids[1]};
+
+    struct ArrowArray centroids = {0};
+    struct ArrowSchema centroids_schema = {0};
+    ASSERT(lance_index_train_ivf_model(
+               ds, "embedding", 2, LANCE_METRIC_L2, NULL, 0,
+               &centroids, &centroids_schema) == 0,
+           "IVF training failed");
+    struct ArrowArray codebook = {0};
+    struct ArrowSchema codebook_schema = {0};
+    ASSERT(lance_index_train_pq_model(
+               ds, "embedding", 2, 4, LANCE_METRIC_L2, NULL, 0,
+               &centroids, &centroids_schema, &codebook, &codebook_schema) == 0,
+           "residual PQ training failed");
+
+    LanceVectorIndexSegmentParams params = {
+        LANCE_INDEX_IVF_PQ, LANCE_METRIC_L2, 2, 2, 4, 2, 0, 0, 16,
+    };
+    for (size_t i = 0; i < 2; i++) {
+        LanceIndexSegmentBuildOptions options = {0};
+        options.fragment_ids = &fragment_ids[i];
+        options.fragment_count = 1;
+        options.ivf_centroids = &centroids;
+        options.ivf_centroids_schema = &centroids_schema;
+        options.pq_codebook = &codebook;
+        options.pq_codebook_schema = &codebook_schema;
+        options.mode = LANCE_INDEX_SEGMENT_BUILD_PRECOMPUTED;
+        LanceIndexSegmentBuilder *builder =
+            lance_index_segment_builder_new_vector(
+                ds, "embedding", NULL, &params, &options);
+        ASSERT(builder != NULL, "vector segment builder failed");
+        ASSERT(centroids.release != NULL && codebook.release != NULL,
+               "models must remain reusable");
+        uint8_t *bytes = NULL;
+        size_t len = 0;
+        ASSERT(lance_index_segment_builder_execute_uncommitted(
+                   builder, &bytes, &len) == 0,
+               "vector segment execution failed");
+        LanceIndexSegmentMetadata *metadata = NULL;
+        ASSERT(lance_index_segment_metadata_parse(bytes, len, &metadata) == 0,
+               "vector metadata parse failed");
+        uint32_t actual = UINT32_MAX;
+        size_t written = 0;
+        ASSERT(lance_index_segment_metadata_fragment_ids(
+                   metadata, &actual, 1, &written) == 0,
+               "vector metadata fragment read failed");
+        ASSERT(written == 1 && actual == fragment_ids[i],
+               "vector metadata fragment mismatch");
+        lance_index_segment_metadata_free(metadata);
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+    }
+    if (centroids.release) centroids.release(&centroids);
+    if (centroids_schema.release) centroids_schema.release(&centroids_schema);
+    if (codebook.release) codebook.release(&codebook);
+    if (codebook_schema.release) codebook_schema.release(&codebook_schema);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_compact_files`. The smoke fixture is a single
  * fragment, so the default planner has nothing to compact — we expect
@@ -747,6 +916,8 @@ int main(int argc, char **argv) {
     test_versions(uri);
     test_restore_to_current(uri);
     test_error_handling();
+    test_index_segment_builder(uri);
+    test_vector_models_and_reusable_segments(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_data_statistics(write_uri);
     test_update(write_uri);

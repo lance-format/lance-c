@@ -28,6 +28,8 @@ mod error;
 mod fragment_writer;
 mod helpers;
 mod index;
+mod index_model;
+mod index_segment;
 mod merge_insert;
 mod restore;
 pub mod runtime;
@@ -50,6 +52,8 @@ pub use error::{
 };
 pub use fragment_writer::*;
 pub use index::*;
+pub use index_model::*;
+pub use index_segment::*;
 pub use merge_insert::*;
 pub use restore::*;
 pub use scanner::*;

@@ -116,11 +116,11 @@ typedef enum {
 typedef struct {
     LanceVectorIndexType index_type;
     LanceMetricType      metric;
-    uint32_t num_partitions;        /* IVF; 0 = default (lance internal) */
-    uint32_t num_sub_vectors;       /* PQ;  0 = default */
-    uint32_t num_bits;              /* PQ/RQ; 0 = 8 */
+    uint32_t num_partitions;        /* IVF; required, must be > 0 */
+    uint32_t num_sub_vectors;       /* PQ; required, must be > 0 */
+    uint32_t num_bits;              /* PQ: 0 (default 8), 4, or 8; SQ: 0 or 8 */
     uint32_t max_iterations;        /* IVF kmeans; 0 = 50 */
-    uint32_t hnsw_m;                /* HNSW; 0 = default */
+    uint32_t hnsw_m;                /* HNSW; required, must be > 0 */
     uint32_t hnsw_ef_construction;  /* HNSW; 0 = default */
     uint32_t sample_rate;           /* IVF; 0 = 256 */
 } LanceVectorIndexParams;
@@ -141,6 +141,8 @@ typedef struct LanceScanner  LanceScanner;
 typedef struct LanceBatch    LanceBatch;
 typedef struct LanceVersions LanceVersions;
 typedef struct LanceDataStatistics LanceDataStatistics;
+typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
+typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 
 /* ─── Dataset lifecycle ─── */
 
@@ -974,6 +976,260 @@ int32_t lance_dataset_create_scalar_index(
     const char* params_json,
     bool replace
 );
+
+/* ─── Uncommitted index segment build ─── */
+
+/**
+ * Options for an uncommitted index segment build.
+ *
+ * `fragment_ids == NULL && fragment_count == 0` selects the whole dataset.
+ * Any non-empty fragment list is copied when the builder is created.
+ * `index_uuid`, when non-NULL, points to exactly 16 RFC 4122 bytes and is also
+ * copied during builder creation. Lance does not support an assigned UUID for
+ * fragment-scoped BTree builds; leave it NULL for that combination.
+ *
+ * The Arrow array/schema pairs provide vector model injection. Both pointers
+ * in a pair must be NULL or both must be non-NULL. Vector builder creation
+ * borrows model pairs synchronously. It may replace each ArrowArray struct but
+ * leaves a live caller-owned equivalent in place, so one trained model can be
+ * reused by multiple segment builders. Schemas remain caller-owned. Scalar
+ * builders reject non-NULL model pairs. Inputs must be valid Arrow C Data
+ * Interface trees; malformed arrays may be moved/released while reporting an
+ * error. Models produced by the trainer functions carry provenance metadata;
+ * vector builders reject mismatched metric/dimension or PQ/IVF model identity.
+ *
+ * `mode` is zero-defaulted: AUTO uses a supplied model set, or trains locally
+ * when no model set is supplied. For IVF-PQ and IVF-HNSW-PQ, IVF centroids and
+ * the PQ codebook are one model set: callers must supply both or neither;
+ * partial model training is not supported. LOCAL_TRAIN rejects supplied
+ * models; PRECOMPUTED requires the complete model set needed by the selected
+ * vector index. Scalar builders accept AUTO and LOCAL_TRAIN. Passing NULL for
+ * the entire options pointer uses AUTO.
+ *
+ * Temporary limitation: with the DOT metric, IVF-PQ and IVF-HNSW-PQ reject a
+ * supplied model set when the fragment selection is an effective strict
+ * subset of the dataset, in both AUTO and PRECOMPUTED modes. Cover every
+ * fragment in one segment (or pass NULL fragment_ids) until the upstream
+ * Lance distributed builder reconstructs supplied codebooks with an L2
+ * ProductQuantizer. L2 and Cosine model sets are unaffected.
+ */
+typedef enum LanceIndexSegmentBuildMode {
+    LANCE_INDEX_SEGMENT_BUILD_AUTO = 0,
+    LANCE_INDEX_SEGMENT_BUILD_LOCAL_TRAIN = 1,
+    LANCE_INDEX_SEGMENT_BUILD_PRECOMPUTED = 2
+} LanceIndexSegmentBuildMode;
+
+typedef struct LanceIndexSegmentBuildOptions {
+    const uint32_t*          fragment_ids;
+    size_t                   fragment_count;
+    const uint8_t*           index_uuid;
+    struct ArrowArray*       ivf_centroids;
+    const struct ArrowSchema* ivf_centroids_schema;
+    struct ArrowArray*       pq_codebook;
+    const struct ArrowSchema* pq_codebook_schema;
+    int32_t                  mode;
+} LanceIndexSegmentBuildOptions;
+
+/**
+ * Vector parameters with fixed-width, boundary-validated discriminants.
+ * num_partitions is required for every variant; num_sub_vectors is required
+ * for PQ variants; hnsw_m is required for HNSW variants. num_bits is 0 for
+ * the Lance default (8). PQ accepts 4 or 8; SQ accepts only 8.
+ */
+typedef struct LanceVectorIndexSegmentParams {
+    int32_t  index_type;
+    int32_t  metric;
+    uint32_t num_partitions;
+    uint32_t num_sub_vectors;
+    uint32_t num_bits;
+    uint32_t max_iterations;
+    uint32_t hnsw_m;
+    uint32_t hnsw_ef_construction;
+    uint32_t sample_rate;
+} LanceVectorIndexSegmentParams;
+
+/**
+ * Create a single-use scalar index segment builder bound to the dataset's
+ * current snapshot. The dataset handle is not consumed and need not outlive
+ * the returned builder.
+ *
+ * @param index_name Optional index name; NULL selects the Lance default.
+ * @param index_type LanceScalarIndexType discriminant, passed as int32_t so
+ *                   out-of-range values can be rejected safely.
+ * @param params_json Optional scalar-index JSON parameters, or NULL.
+ * @param options Optional build options, or NULL for defaults.
+ * @return Builder handle on success, or NULL on error.
+ */
+LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar(
+    const LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    int32_t index_type,
+    const char* params_json,
+    const LanceIndexSegmentBuildOptions* options
+);
+
+/**
+ * Create a single-use vector index segment builder. Model arrays and schemas
+ * are borrowed synchronously; arrays may be replaced but remain live and
+ * caller-owned. When no model set is supplied, AUTO trains locally. PQ
+ * variants require both the IVF centroids and PQ codebook, or neither.
+ */
+LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector(
+    const LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexSegmentParams* params,
+    const LanceIndexSegmentBuildOptions* options
+);
+
+/**
+ * Train IVF centroids, exporting FixedSizeList<Float32>[vector_dimension].
+ * The output structs must be zero-initialized; the caller owns and releases
+ * both Arrow C Data Interface outputs after success.
+ */
+int32_t lance_index_train_ivf_model(
+    const LanceDataset* dataset,
+    const char* column,
+    uint32_t num_partitions,
+    int32_t metric,
+    const uint32_t* fragment_ids,
+    size_t fragment_count,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Train a PQ codebook, exporting
+ * FixedSizeList<Float32>[dimension / num_sub_vectors] with
+ * num_sub_vectors * 2^num_bits rows. `num_bits` must be 4 or 8. The IVF
+ * centroids must be the shared centroids that will be injected with this PQ
+ * codebook. L2 and cosine training use them to compute residuals; DOT training
+ * keeps them for model identity but trains on raw vectors. The trainer borrows
+ * them synchronously: it may replace the ArrowArray struct, but leaves a live
+ * caller-owned equivalent in place.
+ */
+int32_t lance_index_train_pq_model(
+    const LanceDataset* dataset,
+    const char* column,
+    uint32_t num_sub_vectors,
+    uint32_t num_bits,
+    int32_t metric,
+    const uint32_t* fragment_ids,
+    size_t fragment_count,
+    struct ArrowArray* ivf_centroids,
+    const struct ArrowSchema* ivf_centroids_schema,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Build segment artifacts without committing them to the dataset manifest.
+ * The builder is single-use, including when execution fails.
+ *
+ * On success, `*out_bytes` receives protobuf-encoded IndexMetadata and
+ * `*out_len` receives its byte length. Free the buffer with
+ * lance_free_bytes(). On error, the output slots are left unchanged.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_index_segment_builder_execute_uncommitted(
+    LanceIndexSegmentBuilder* builder,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/** Free metadata bytes returned by an uncommitted segment build. NULL-safe. */
+void lance_free_bytes(uint8_t* bytes);
+
+/** Free an index segment builder. NULL-safe. */
+void lance_index_segment_builder_free(LanceIndexSegmentBuilder* builder);
+
+/**
+ * Parse protobuf-encoded IndexMetadata into an opaque metadata handle.
+ * `bytes` is borrowed only for this call. On error, `*out_metadata` is left
+ * unchanged.
+ */
+int32_t lance_index_segment_metadata_parse(
+    const uint8_t* bytes,
+    size_t len,
+    LanceIndexSegmentMetadata** out_metadata
+);
+
+/** Copy the segment UUID into a caller-provided 16-byte buffer. */
+int32_t lance_index_segment_metadata_uuid(
+    const LanceIndexSegmentMetadata* metadata,
+    uint8_t* out_uuid
+);
+
+/**
+ * Return the segment name. The string is borrowed from `metadata` and remains
+ * valid until lance_index_segment_metadata_free(); do not free it separately.
+ */
+const char* lance_index_segment_metadata_name(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/** Return the dataset version against which the segment was built. */
+uint64_t lance_index_segment_metadata_dataset_version(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/** Return the physical index version, or -1 on error. */
+int32_t lance_index_segment_metadata_index_version(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/**
+ * Return the LanceScalarIndexType/LanceVectorIndexType discriminant, or -1 on
+ * error. Both enum domains use the stable, non-overlapping values above.
+ */
+int32_t lance_index_segment_metadata_index_type(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/**
+ * Return the protobuf Any type URL, borrowed until metadata is freed.
+ * Returns NULL if metadata has no index_details.
+ */
+const char* lance_index_segment_metadata_index_details_type_url(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/** Return the number of indexed field IDs. */
+size_t lance_index_segment_metadata_field_count(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/** Copy indexed field IDs in metadata order. */
+int32_t lance_index_segment_metadata_field_ids(
+    const LanceIndexSegmentMetadata* metadata,
+    int32_t* out_field_ids,
+    size_t capacity,
+    size_t* out_count
+);
+
+/** Return the number of fragment IDs covered by the segment. */
+size_t lance_index_segment_metadata_fragment_count(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/**
+ * Copy covered fragment IDs in ascending order.
+ *
+ * `capacity` is measured in uint32_t elements. `out_count` is required and
+ * receives the number written. `out_fragment_ids` may be NULL only when the
+ * metadata covers zero fragments.
+ */
+int32_t lance_index_segment_metadata_fragment_ids(
+    const LanceIndexSegmentMetadata* metadata,
+    uint32_t* out_fragment_ids,
+    size_t capacity,
+    size_t* out_count
+);
+
+/** Free parsed segment metadata. NULL-safe. */
+void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
 
 /** Drop an index by name. Returns -1 (NOT_FOUND) if no such index. */
 int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name);

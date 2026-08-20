@@ -11,8 +11,8 @@ use std::process::Command;
 use std::ptr;
 use std::sync::Arc;
 
-use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi::from_ffi;
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;
@@ -2341,6 +2341,360 @@ fn test_create_scalar_index_btree() {
     unsafe { lance_dataset_close(ds) };
 }
 
+#[test]
+fn test_scalar_index_segment_build_is_fragment_scoped_and_uncommitted() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let selected_fragment = fragment_ids[1] as u32;
+    let expected_uuid = [
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0x4c, 0xde, 0x8f, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+        0xcd,
+    ];
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &selected_fragment,
+        fragment_count: 1,
+        index_uuid: expected_uuid.as_ptr(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let column = c_str("id");
+    let index_name = c_str("id_segment");
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            index_name.as_ptr(),
+            LanceScalarIndexType::Bitmap as i32,
+            ptr::null(),
+            &options,
+        )
+    };
+    assert!(!builder.is_null());
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let mut metadata_bytes = ptr::null_mut();
+    let mut metadata_len = 0_usize;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_execute_uncommitted(
+                builder,
+                &mut metadata_bytes,
+                &mut metadata_len,
+            )
+        },
+        0
+    );
+    assert!(!metadata_bytes.is_null());
+    assert!(metadata_len > 0);
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(metadata_bytes, metadata_len, &mut metadata) },
+        0
+    );
+    assert!(!metadata.is_null());
+
+    let mut actual_uuid = [0_u8; 16];
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_uuid(metadata, actual_uuid.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(actual_uuid, expected_uuid);
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_dataset_version(metadata) },
+        version_before
+    );
+    let actual_name = unsafe {
+        std::ffi::CStr::from_ptr(lance_index_segment_metadata_name(metadata))
+            .to_str()
+            .unwrap()
+    };
+    assert_eq!(actual_name, "id_segment");
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_index_version(metadata) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_index_type(metadata) },
+        LanceScalarIndexType::Bitmap as i32
+    );
+    let type_url = unsafe {
+        std::ffi::CStr::from_ptr(lance_index_segment_metadata_index_details_type_url(
+            metadata,
+        ))
+        .to_str()
+        .unwrap()
+    };
+    assert!(type_url.ends_with("BitmapIndexDetails"), "{type_url}");
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_field_count(metadata) },
+        1
+    );
+    let mut field_id = -1_i32;
+    let mut field_count = 0_usize;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_field_ids(metadata, &mut field_id, 1, &mut field_count)
+        },
+        0
+    );
+    assert_eq!(field_count, 1);
+    assert_eq!(field_id, 0);
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_fragment_count(metadata) },
+        1
+    );
+    let mut actual_fragment = 0_u32;
+    let mut written = 0_usize;
+    let mut untouched_fragment = u32::MAX;
+    let mut untouched_count = usize::MAX;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_fragment_ids(
+                metadata,
+                &mut untouched_fragment,
+                0,
+                &mut untouched_count,
+            )
+        },
+        -1
+    );
+    assert_eq!(untouched_fragment, u32::MAX);
+    assert_eq!(untouched_count, usize::MAX);
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_fragment_ids(
+                metadata,
+                &mut actual_fragment,
+                1,
+                &mut written,
+            )
+        },
+        0
+    );
+    assert_eq!(written, 1);
+    assert_eq!(actual_fragment, selected_fragment);
+
+    unsafe {
+        lance_index_segment_metadata_free(metadata);
+        lance_free_bytes(metadata_bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_index_segment_builder_owns_snapshot_and_is_single_use() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("id");
+    let name = c_str("whole_snapshot");
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::Bitmap as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null());
+    let invalid_output_builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::Bitmap as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!invalid_output_builder.is_null());
+    unsafe { lance_dataset_close(dataset) };
+
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_execute_uncommitted(
+                invalid_output_builder,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    let mut invalid_bytes = ptr::null_mut();
+    let mut invalid_len = 0;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_execute_uncommitted(
+                invalid_output_builder,
+                &mut invalid_bytes,
+                &mut invalid_len,
+            )
+        },
+        -1
+    );
+    assert!(invalid_bytes.is_null());
+    assert_eq!(invalid_len, 0);
+
+    let mut bytes = ptr::null_mut();
+    let mut len = 0_usize;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0
+    );
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_fragment_count(metadata) },
+        2
+    );
+
+    let mut second_bytes = ptr::null_mut();
+    let mut second_len = usize::MAX;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_execute_uncommitted(
+                builder,
+                &mut second_bytes,
+                &mut second_len,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(second_bytes.is_null());
+    assert_eq!(second_len, usize::MAX);
+
+    unsafe {
+        lance_index_segment_metadata_free(metadata);
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_index_segment_builder_free(invalid_output_builder);
+        lance_index_segment_builder_free(ptr::null_mut());
+        lance_index_segment_metadata_free(ptr::null_mut());
+    }
+}
+
+#[test]
+fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
+    use prost::Message;
+
+    let sentinel = std::ptr::dangling_mut::<LanceIndexSegmentMetadata>();
+    let mut metadata = sentinel;
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(ptr::null(), 0, &mut metadata) },
+        -1
+    );
+    assert_eq!(metadata, sentinel);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let malformed = [0xff_u8, 0xff, 0xff];
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_parse(malformed.as_ptr(), malformed.len(), &mut metadata)
+        },
+        -1
+    );
+    assert_eq!(metadata, sentinel);
+
+    let dangerous = lance_table::format::pb::IndexMetadata {
+        uuid: Some(lance_table::format::pb::Uuid {
+            uuid: vec![0_u8; 16],
+        }),
+        fields: vec![0],
+        name: "dangerous_timestamp".to_string(),
+        dataset_version: 1,
+        fragment_bitmap: Vec::new(),
+        index_details: None,
+        index_version: Some(0),
+        created_at: Some(u64::MAX),
+        base_id: None,
+        files: Vec::new(),
+    }
+    .encode_to_vec();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_parse(dangerous.as_ptr(), dangerous.len(), &mut metadata)
+        },
+        -1
+    );
+    assert_eq!(metadata, sentinel);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let negative_version = lance_table::format::pb::IndexMetadata {
+        uuid: Some(lance_table::format::pb::Uuid {
+            uuid: vec![0_u8; 16],
+        }),
+        fields: vec![0],
+        name: "negative_version".to_string(),
+        dataset_version: 1,
+        fragment_bitmap: Vec::new(),
+        index_details: None,
+        index_version: Some(-1),
+        created_at: None,
+        base_id: None,
+        files: Vec::new(),
+    }
+    .encode_to_vec();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_parse(
+                negative_version.as_ptr(),
+                negative_version.len(),
+                &mut metadata,
+            )
+        },
+        -1
+    );
+    assert_eq!(metadata, sentinel);
+
+    let negative_field = lance_table::format::pb::IndexMetadata {
+        uuid: Some(lance_table::format::pb::Uuid {
+            uuid: vec![0_u8; 16],
+        }),
+        fields: vec![-1],
+        name: "negative_field".to_string(),
+        dataset_version: 1,
+        fragment_bitmap: Vec::new(),
+        index_details: None,
+        index_version: Some(0),
+        created_at: None,
+        base_id: None,
+        files: Vec::new(),
+    }
+    .encode_to_vec();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_parse(
+                negative_field.as_ptr(),
+                negative_field.len(),
+                &mut metadata,
+            )
+        },
+        -1
+    );
+    assert_eq!(metadata, sentinel);
+}
+
 /// Helper: create a dataset with a List<Utf8> column for LabelList index testing.
 fn create_label_list_dataset() -> (tempfile::TempDir, String) {
     use arrow_array::ListArray;
@@ -2590,9 +2944,11 @@ fn create_vector_dataset(num_rows: i32, dim: i32) -> (tempfile::TempDir, String)
     (tmp, uri)
 }
 
-/// Create two vector fragments with deterministic vectors. Every component of
-/// row `id` is `id as f32`, making nearest-neighbor expectations unambiguous.
+/// Create `num_fragments` vector fragments with deterministic vectors.
+/// Component `i` of global row `id` is `id as f32 + i as f32 / dim as f32`,
+/// keeping nearest-neighbor orderings unambiguous.
 fn create_multi_fragment_vector_dataset(
+    num_fragments: i32,
     rows_per_fragment: i32,
     dim: i32,
     enable_stable_row_ids: bool,
@@ -2602,7 +2958,7 @@ fn create_multi_fragment_vector_dataset(
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp
         .path()
-        .join("multi_fragment_vec_ds")
+        .join("multi_vec_ds")
         .to_str()
         .unwrap()
         .to_string();
@@ -2615,52 +2971,1221 @@ fn create_multi_fragment_vector_dataset(
         ),
     ]));
 
-    let make_batch = |first_id: i32| {
-        let ids: Vec<i32> = (first_id..first_id + rows_per_fragment).collect();
-        let mut embeddings = FixedSizeListBuilder::new(Float32Builder::new(), dim);
-        for id in &ids {
-            for _ in 0..dim {
-                embeddings.values().append_value(*id as f32);
-            }
-            embeddings.append(true);
-        }
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(ids)),
-                Arc::new(embeddings.finish()),
-            ],
-        )
-        .unwrap()
-    };
-
-    let first = make_batch(0);
-    let second = make_batch(rows_per_fragment);
     lance_c::runtime::block_on(async {
-        Dataset::write(
-            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
-            &uri,
-            Some(lance::dataset::WriteParams {
+        for fragment in 0..num_fragments {
+            let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), dim);
+            for row in 0..rows_per_fragment {
+                for component in 0..dim {
+                    vectors.values().append_value(
+                        (fragment * rows_per_fragment + row) as f32 + component as f32 / dim as f32,
+                    );
+                }
+                vectors.append(true);
+            }
+            let ids = (0..rows_per_fragment)
+                .map(|row| fragment * rows_per_fragment + row)
+                .collect::<Vec<_>>();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(vectors.finish())],
+            )
+            .unwrap();
+            let params = lance::dataset::WriteParams {
+                mode: if fragment > 0 {
+                    lance::dataset::WriteMode::Append
+                } else {
+                    lance::dataset::WriteMode::Create
+                },
                 enable_stable_row_ids,
                 ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        Dataset::write(
-            arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
-            &uri,
-            Some(lance::dataset::WriteParams {
-                mode: lance::dataset::WriteMode::Append,
-                enable_stable_row_ids,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+            };
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                &uri,
+                Some(params),
+            )
+            .await
+            .unwrap();
+        }
     });
 
     (tmp, uri)
+}
+
+fn train_segment_pq_models(
+    dataset: *const LanceDataset,
+    column: &CString,
+    metric: LanceMetricType,
+) -> (
+    FFI_ArrowArray,
+    FFI_ArrowSchema,
+    FFI_ArrowArray,
+    FFI_ArrowSchema,
+) {
+    let mut centroids = FFI_ArrowArray::empty();
+    let mut centroids_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_index_train_ivf_model(
+                dataset,
+                column.as_ptr(),
+                2,
+                metric as i32,
+                ptr::null(),
+                0,
+                &mut centroids,
+                &mut centroids_schema,
+            )
+        },
+        0
+    );
+
+    let mut codebook = FFI_ArrowArray::empty();
+    let mut codebook_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_index_train_pq_model(
+                dataset,
+                column.as_ptr(),
+                2,
+                4,
+                metric as i32,
+                ptr::null(),
+                0,
+                &mut centroids,
+                &centroids_schema,
+                &mut codebook,
+                &mut codebook_schema,
+            )
+        },
+        0
+    );
+
+    (centroids, centroids_schema, codebook, codebook_schema)
+}
+
+fn take_last_error_message() -> String {
+    let error = lance_last_error_message();
+    assert!(!error.is_null());
+    let message = unsafe { std::ffi::CStr::from_ptr(error) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { lance_free_string(error) };
+    message
+}
+
+#[test]
+fn test_vector_index_segment_rejects_strict_subset_dot_pq() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let column = c_str("embedding");
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let selected_fragments = fragment_ids.map(|fragment_id| fragment_id as u32);
+    let (mut centroids, centroids_schema, mut codebook, codebook_schema) =
+        train_segment_pq_models(dataset, &column, LanceMetricType::Dot);
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        metric: LanceMetricType::Dot as i32,
+        num_partitions: 2,
+        num_sub_vectors: 2,
+        num_bits: 4,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let mut options = LanceIndexSegmentBuildOptions {
+        fragment_ids: ptr::null(),
+        fragment_count: 0,
+        index_uuid: ptr::null(),
+        ivf_centroids: &mut centroids,
+        ivf_centroids_schema: &centroids_schema,
+        pq_codebook: &mut codebook,
+        pq_codebook_schema: &codebook_schema,
+        mode: LanceIndexSegmentBuildMode::Precomputed as i32,
+    };
+
+    // Full coverage takes Lance's ordinary build path, which assigns PQ codes
+    // with an L2 quantizer and records L2 in the index metadata, so supplied
+    // DOT PQ models are safe there and must remain supported.
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    if builder.is_null() {
+        panic!(
+            "precomputed DOT PQ must remain supported for an implicit full-dataset selection: {}",
+            take_last_error_message()
+        );
+    }
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    let rc =
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) };
+    if rc != 0 {
+        panic!(
+            "implicit full-dataset DOT PQ selection should execute: {}",
+            take_last_error_message()
+        );
+    }
+    assert!(!bytes.is_null());
+    assert!(len > 0);
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+    }
+
+    options.fragment_ids = selected_fragments.as_ptr();
+    options.fragment_count = selected_fragments.len();
+    options.mode = LanceIndexSegmentBuildMode::Auto as i32;
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    if builder.is_null() {
+        panic!(
+            "AUTO with a DOT PQ codebook must remain supported when every fragment is explicit: {}",
+            take_last_error_message()
+        );
+    }
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+    unsafe { lance_index_segment_builder_free(builder) };
+
+    let hnsw_params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfHnswPq as i32,
+        hnsw_m: 4,
+        hnsw_ef_construction: 16,
+        ..params
+    };
+    options.fragment_ids = ptr::null();
+    options.fragment_count = 0;
+    options.mode = LanceIndexSegmentBuildMode::Precomputed as i32;
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &hnsw_params,
+            &options,
+        )
+    };
+    if builder.is_null() {
+        panic!(
+            "precomputed DOT IVF_HNSW_PQ must remain supported for the full dataset: {}",
+            take_last_error_message()
+        );
+    }
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+    unsafe { lance_index_segment_builder_free(builder) };
+
+    let (_single_tmp, single_uri) = create_multi_fragment_vector_dataset(1, 64, 8, false);
+    let single_uri_c = c_str(&single_uri);
+    let single_dataset = unsafe { lance_dataset_open(single_uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!single_dataset.is_null());
+    let mut single_fragment_id = [0_u64; 1];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(single_dataset, single_fragment_id.as_mut_ptr()) },
+        0
+    );
+    let single_fragment_id = single_fragment_id[0] as u32;
+    options.fragment_ids = &single_fragment_id;
+    options.fragment_count = 1;
+    options.mode = LanceIndexSegmentBuildMode::Auto as i32;
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            single_dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    if builder.is_null() {
+        panic!(
+            "the only explicit fragment is still full coverage and must remain supported: {}",
+            take_last_error_message()
+        );
+    }
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+    unsafe {
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(single_dataset);
+    }
+
+    // A strict subset takes Lance's distributed build path, which rewraps the
+    // supplied codebook with a DOT ProductQuantizer (make_global_pq) and
+    // silently breaks the L2 PQ-assignment contract; reject it in both modes.
+    let selected_fragment = selected_fragments[0];
+    options.fragment_ids = &selected_fragment;
+    options.fragment_count = 1;
+    options.mode = LanceIndexSegmentBuildMode::Precomputed as i32;
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    assert!(
+        builder.is_null(),
+        "strict-subset DOT PQ must not be accepted in PRECOMPUTED"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("metric=DOT"), "{message}");
+    assert!(message.contains("strict fragment subset"), "{message}");
+    assert!(message.contains("e934cc2c"), "{message}");
+    assert!(message.contains("1 of 2 fragments"), "{message}");
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+
+    options.mode = LanceIndexSegmentBuildMode::Auto as i32;
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    assert!(
+        builder.is_null(),
+        "strict-subset DOT PQ must not be accepted in AUTO"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("1 of 2 fragments"), "{message}");
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+
+    options.mode = LanceIndexSegmentBuildMode::Precomputed as i32;
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &hnsw_params,
+            &options,
+        )
+    };
+    assert!(
+        builder.is_null(),
+        "strict-subset DOT IVF_HNSW_PQ must not be accepted"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("metric=DOT"), "{message}");
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+
+    unsafe {
+        if let Some(release) = centroids.release {
+            release(&mut centroids);
+        }
+        if let Some(release) = codebook.release {
+            release(&mut codebook);
+        }
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_vector_index_segment_allows_full_dataset_precomputed_pq_for_non_dot_metrics() {
+    for metric in [LanceMetricType::L2, LanceMetricType::Cosine] {
+        let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+        let uri_c = c_str(&uri);
+        let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+        assert!(!dataset.is_null());
+        let column = c_str("embedding");
+        let (mut centroids, centroids_schema, mut codebook, codebook_schema) =
+            train_segment_pq_models(dataset, &column, metric);
+        let params = LanceVectorIndexSegmentParams {
+            index_type: LanceVectorIndexType::IvfPq as i32,
+            metric: metric as i32,
+            num_partitions: 2,
+            num_sub_vectors: 2,
+            num_bits: 4,
+            max_iterations: 2,
+            hnsw_m: 0,
+            hnsw_ef_construction: 0,
+            sample_rate: 16,
+        };
+        let options = LanceIndexSegmentBuildOptions {
+            fragment_ids: ptr::null(),
+            fragment_count: 0,
+            index_uuid: ptr::null(),
+            ivf_centroids: &mut centroids,
+            ivf_centroids_schema: &centroids_schema,
+            pq_codebook: &mut codebook,
+            pq_codebook_schema: &codebook_schema,
+            mode: LanceIndexSegmentBuildMode::Precomputed as i32,
+        };
+
+        let builder = unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        };
+        if builder.is_null() {
+            panic!(
+                "full-dataset {metric:?} PQ should remain supported: {}",
+                take_last_error_message()
+            );
+        }
+        assert!(!centroids.is_released());
+        assert!(!codebook.is_released());
+
+        unsafe {
+            lance_index_segment_builder_free(builder);
+            if let Some(release) = centroids.release {
+                release(&mut centroids);
+            }
+            if let Some(release) = codebook.release {
+                release(&mut codebook);
+            }
+            lance_dataset_close(dataset);
+        }
+    }
+}
+
+#[test]
+fn test_vector_index_segment_trains_locally_for_fragment_subset() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let selected_fragment = fragment_ids[0] as u32;
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &selected_fragment,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let column = c_str("embedding");
+    let name = c_str("embedding_segment");
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            name.as_ptr(),
+            &params,
+            &options,
+        )
+    };
+    assert!(!builder.is_null());
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_index_type(metadata) },
+        LanceVectorIndexType::IvfFlat as i32
+    );
+    let mut actual_fragment = u32::MAX;
+    let mut count = 0;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_fragment_ids(metadata, &mut actual_fragment, 1, &mut count)
+        },
+        0
+    );
+    assert_eq!((count, actual_fragment), (1, selected_fragment));
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_index_segment_metadata_free(metadata);
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_index_segment_options_reject_invalid_fragment_and_train_combinations() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 16, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 8,
+    };
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let fragment_id = fragment_ids[0] as u32;
+    let mut options = LanceIndexSegmentBuildOptions {
+        fragment_ids: ptr::null(),
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    options.fragment_ids = &fragment_id;
+    options.fragment_count = 0;
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+
+    let duplicate = [fragment_id, fragment_id];
+    options.fragment_ids = duplicate.as_ptr();
+    options.fragment_count = duplicate.len();
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+
+    let unknown = u32::MAX;
+    options.fragment_ids = &unknown;
+    options.fragment_count = 1;
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+
+    options.fragment_ids = &fragment_id;
+    options.mode = LanceIndexSegmentBuildMode::Precomputed as i32;
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(message.contains("PRECOMPUTED"), "{message}");
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let centroids = arrow_array::FixedSizeListArray::try_new(
+        item,
+        8,
+        Arc::new(Float32Array::from(vec![0.0_f32; 16])),
+        None,
+    )
+    .unwrap();
+    let (mut centroid_array, centroid_schema) = arrow::ffi::to_ffi(&centroids.into_data()).unwrap();
+    options.fragment_ids = &unknown;
+    options.mode = LanceIndexSegmentBuildMode::Precomputed as i32;
+    options.ivf_centroids = &mut centroid_array;
+    options.ivf_centroids_schema = &centroid_schema;
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+    assert!(
+        !centroid_array.is_released(),
+        "model arrays remain caller-owned on validation errors"
+    );
+
+    options.ivf_centroids = ptr::null_mut();
+    options.ivf_centroids_schema = ptr::null();
+    options.fragment_ids = &fragment_id;
+    options.fragment_count = 1;
+    options.mode = 99;
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+
+    options.mode = LanceIndexSegmentBuildMode::Auto as i32;
+    let invalid_type = LanceVectorIndexSegmentParams {
+        index_type: 999,
+        ..params
+    };
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &invalid_type,
+                &options,
+            )
+        }
+        .is_null()
+    );
+
+    let invalid_bits = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        num_sub_vectors: 2,
+        num_bits: 63,
+        ..params
+    };
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &invalid_bits,
+                &options,
+            )
+        }
+        .is_null()
+    );
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_vector_model_rejects_malformed_arrow_inputs_without_panicking() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let mut centroids = FFI_ArrowArray::empty();
+    let mut centroids_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_index_train_ivf_model(
+                dataset,
+                column.as_ptr(),
+                2,
+                LanceMetricType::L2 as i32,
+                ptr::null(),
+                0,
+                &mut centroids,
+                &mut centroids_schema,
+            )
+        },
+        0
+    );
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 8,
+    };
+    let fragment = 0_u32;
+    let mut options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &fragment,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: &mut centroids,
+        ivf_centroids_schema: &centroids_schema,
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Precomputed as i32,
+    };
+
+    let empty_schema = FFI_ArrowSchema::empty();
+    options.ivf_centroids_schema = &empty_schema;
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+    assert!(!centroids.is_released());
+
+    let invalid_utf8 = CString::new([0xff_u8]).unwrap();
+    let original_name = centroids_schema.name;
+    centroids_schema.name = invalid_utf8.as_ptr().cast_mut();
+    options.ivf_centroids_schema = &centroids_schema;
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+    centroids_schema.name = original_name;
+    assert!(!centroids.is_released());
+
+    let child_schema = unsafe { *centroids_schema.children };
+    assert!(!child_schema.is_null());
+    let original_child_name = unsafe { (*child_schema).name };
+    unsafe { (*child_schema).name = invalid_utf8.as_ptr().cast_mut() };
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+    unsafe { (*child_schema).name = original_child_name };
+    assert!(!centroids.is_released());
+
+    let original_children = centroids.n_children;
+    centroids.n_children = 0;
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &options,
+            )
+        }
+        .is_null()
+    );
+    centroids.n_children = original_children;
+    assert!(!centroids.is_released());
+
+    unsafe {
+        if let Some(release) = centroids.release {
+            release(&mut centroids);
+        }
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_vector_model_canonicalizes_slices_and_rejects_null_values() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let mut centroids = FFI_ArrowArray::empty();
+    let mut centroids_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_index_train_ivf_model(
+                dataset,
+                column.as_ptr(),
+                4,
+                LanceMetricType::L2 as i32,
+                ptr::null(),
+                0,
+                &mut centroids,
+                &mut centroids_schema,
+            )
+        },
+        0
+    );
+    centroids.offset = 1;
+    centroids.length = 2;
+    assert!(
+        centroids.offset > 0,
+        "test requires a non-zero parent offset"
+    );
+
+    let fragment = 0_u32;
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &fragment,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: &mut centroids,
+        ivf_centroids_schema: &centroids_schema,
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Precomputed as i32,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    assert!(!builder.is_null(), "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0
+    );
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let mut values = vec![Some(0.0_f32); 16];
+    values[3] = None;
+    let null_model = arrow_array::FixedSizeListArray::try_new(
+        item,
+        8,
+        Arc::new(Float32Array::from(values)),
+        None,
+    )
+    .unwrap();
+    let (mut null_array, null_schema) = arrow::ffi::to_ffi(&null_model.into_data()).unwrap();
+    drop(null_schema);
+    let null_options = LanceIndexSegmentBuildOptions {
+        ivf_centroids: &mut null_array,
+        ..options
+    };
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &params,
+                &null_options,
+            )
+        }
+        .is_null()
+    );
+    assert!(!null_array.is_released());
+
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        if let Some(release) = centroids.release {
+            release(&mut centroids);
+        }
+        if let Some(release) = null_array.release {
+            release(&mut null_array);
+        }
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_vector_index_segment_borrows_shared_ivf_model() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let selected_fragment = fragment_ids[1] as u32;
+
+    let mut centroids = FFI_ArrowArray::empty();
+    let mut centroids_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_index_train_ivf_model(
+                dataset,
+                column.as_ptr(),
+                2,
+                LanceMetricType::L2 as i32,
+                ptr::null(),
+                0,
+                &mut centroids,
+                &mut centroids_schema,
+            )
+        },
+        0
+    );
+    assert!(!centroids.is_released());
+
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &selected_fragment,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: &mut centroids,
+        ivf_centroids_schema: &centroids_schema,
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        // Core's train=false means empty index; the FFI contract instead uses
+        // model presence to select the precomputed path.
+        mode: LanceIndexSegmentBuildMode::Precomputed as i32,
+    };
+    let name = c_str("shared_ivf_segment");
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            name.as_ptr(),
+            &params,
+            &options,
+        )
+    };
+    assert!(!builder.is_null(), "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert!(
+        !centroids.is_released(),
+        "builder must leave centroids reusable"
+    );
+
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_index_type(metadata) },
+        LanceVectorIndexType::IvfFlat as i32
+    );
+    let mut actual_fragment = u32::MAX;
+    let mut count = 0;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_fragment_ids(metadata, &mut actual_fragment, 1, &mut count)
+        },
+        0
+    );
+    assert_eq!((count, actual_fragment), (1, selected_fragment));
+
+    let other_fragment = fragment_ids[0] as u32;
+    let options2 = LanceIndexSegmentBuildOptions {
+        fragment_ids: &other_fragment,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: &mut centroids,
+        ivf_centroids_schema: &centroids_schema,
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Precomputed as i32,
+    };
+    let name2 = c_str("shared_ivf_segment_2");
+    let builder2 = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            name2.as_ptr(),
+            &params,
+            &options2,
+        )
+    };
+    assert!(!builder2.is_null(), "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert!(!centroids.is_released());
+    let mut bytes2 = ptr::null_mut();
+    let mut len2 = 0;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_execute_uncommitted(builder2, &mut bytes2, &mut len2)
+        },
+        0
+    );
+    let mut metadata2 = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(bytes2, len2, &mut metadata2) },
+        0
+    );
+    let mut actual_fragment2 = u32::MAX;
+    let mut count2 = 0;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_fragment_ids(
+                metadata2,
+                &mut actual_fragment2,
+                1,
+                &mut count2,
+            )
+        },
+        0
+    );
+    assert_eq!((count2, actual_fragment2), (1, other_fragment));
+
+    unsafe {
+        lance_index_segment_metadata_free(metadata);
+        lance_index_segment_metadata_free(metadata2);
+        lance_free_bytes(bytes);
+        lance_free_bytes(bytes2);
+        lance_index_segment_builder_free(builder);
+        lance_index_segment_builder_free(builder2);
+        if let Some(release) = centroids.release {
+            release(&mut centroids);
+        }
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_vector_index_segment_borrows_shared_ivf_and_pq_models() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let selected_fragment = fragment_ids[0] as u32;
+
+    let mut centroids = FFI_ArrowArray::empty();
+    let mut centroids_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_index_train_ivf_model(
+                dataset,
+                column.as_ptr(),
+                2,
+                LanceMetricType::L2 as i32,
+                ptr::null(),
+                0,
+                &mut centroids,
+                &mut centroids_schema,
+            )
+        },
+        0
+    );
+    let mut codebook = FFI_ArrowArray::empty();
+    let mut codebook_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_index_train_pq_model(
+                dataset,
+                column.as_ptr(),
+                2,
+                4,
+                LanceMetricType::L2 as i32,
+                ptr::null(),
+                0,
+                &mut centroids,
+                &centroids_schema,
+                &mut codebook,
+                &mut codebook_schema,
+            )
+        },
+        0
+    );
+
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 2,
+        num_bits: 4,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &selected_fragment,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: &mut centroids,
+        ivf_centroids_schema: &centroids_schema,
+        pq_codebook: &mut codebook,
+        pq_codebook_schema: &codebook_schema,
+        mode: LanceIndexSegmentBuildMode::Precomputed as i32,
+    };
+    let name = c_str("shared_pq_segment");
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            name.as_ptr(),
+            &params,
+            &options,
+        )
+    };
+    assert!(!builder.is_null(), "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert!(!centroids.is_released());
+    assert!(!codebook.is_released());
+
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_index_type(metadata) },
+        LanceVectorIndexType::IvfPq as i32
+    );
+
+    unsafe {
+        lance_index_segment_metadata_free(metadata);
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        if let Some(release) = centroids.release {
+            release(&mut centroids);
+        }
+        if let Some(release) = codebook.release {
+            release(&mut codebook);
+        }
+        lance_dataset_close(dataset);
+    }
 }
 
 #[test]
@@ -2740,6 +4265,89 @@ fn test_create_vector_index_ivf_hnsw_sq() {
         std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
     });
     unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_vector_index_num_bits_validation_for_sq_and_pq() {
+    let (_tmp, uri) = create_vector_dataset(16, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+
+    let sq_params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfSq,
+        metric: LanceMetricType::L2,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 4,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &sq_params, false)
+        },
+        -1
+    );
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(message.contains("num_bits must be 0 or 8"), "{message}");
+
+    let segment_sq_params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfHnswSq as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 4,
+        max_iterations: 0,
+        hnsw_m: 16,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    assert!(
+        unsafe {
+            lance_index_segment_builder_new_vector(
+                ds,
+                column.as_ptr(),
+                ptr::null(),
+                &segment_sq_params,
+                ptr::null(),
+            )
+        }
+        .is_null()
+    );
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(message.contains("num_bits must be 0 or 8"), "{message}");
+
+    let segment_pq_params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        num_sub_vectors: 2,
+        ..segment_sq_params
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            ds,
+            column.as_ptr(),
+            ptr::null(),
+            &segment_pq_params,
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "PQ must continue to accept num_bits=4");
+
+    unsafe {
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(ds);
+    }
 }
 
 #[test]
@@ -2890,7 +4498,7 @@ fn test_scanner_nearest_brute_force() {
 }
 
 fn assert_dataset_take_rows_from_multi_fragment_ann_result(enable_stable_row_ids: bool) {
-    let (_tmp, uri) = create_multi_fragment_vector_dataset(32, 8, enable_stable_row_ids);
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, enable_stable_row_ids);
     let uri_c = c_str(&uri);
     let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!ds.is_null());
@@ -2904,7 +4512,9 @@ fn assert_dataset_take_rows_from_multi_fragment_ann_result(enable_stable_row_ids
     assert_eq!(unsafe { lance_scanner_with_row_id(scanner, true) }, 0);
 
     let column = c_str("embedding");
-    let query = [40.0_f32; 8];
+    // Exact vector of row 40 as generated by create_multi_fragment_vector_dataset
+    // (global id + component / dim), so the nearest neighbor has distance 0.
+    let query: [f32; 8] = std::array::from_fn(|component| 40.0 + component as f32 / 8.0);
     assert_eq!(
         unsafe {
             lance_scanner_nearest(
@@ -3122,7 +4732,7 @@ fn test_scanner_nearest_filter_postfilter() {
 
 #[test]
 fn test_scanner_nearest_prefilter_with_fragment_ids_next() {
-    let (_tmp, uri) = create_multi_fragment_vector_dataset(32, 8, false);
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
     let uri_c = c_str(&uri);
     let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!ds.is_null());
@@ -3185,7 +4795,7 @@ fn test_scanner_nearest_prefilter_with_fragment_ids_next() {
 
 #[test]
 fn test_scanner_nearest_prefilter_with_fragment_ids_arrow_stream() {
-    let (_tmp, uri) = create_multi_fragment_vector_dataset(32, 8, false);
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
     let uri_c = c_str(&uri);
     let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!ds.is_null());

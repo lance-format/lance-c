@@ -86,6 +86,9 @@ public:
 // ─── Forward Declarations ────────────────────────────────────────────────────
 
 class Scanner;
+class IndexModel;
+class IndexSegmentBuilder;
+class IndexSegmentMetadata;
 
 // ─── Version history ─────────────────────────────────────────────────────────
 
@@ -720,6 +723,40 @@ public:
             check_error();
     }
 
+    /// Create a single-use builder for an uncommitted scalar index segment.
+    /// The builder owns a snapshot, so it remains valid independently of this
+    /// Dataset object's lifetime.
+    IndexSegmentBuilder new_scalar_index_segment_builder(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        const std::string& index_name = "",
+        const std::string& params_json = "",
+        const LanceIndexSegmentBuildOptions* options = nullptr) const;
+
+    /// Create a single-use builder for an uncommitted vector index segment.
+    IndexSegmentBuilder new_vector_index_segment_builder(
+        const std::string& column,
+        const LanceVectorIndexParams& params,
+        const std::string& index_name = "",
+        const LanceIndexSegmentBuildOptions* options = nullptr) const;
+
+    /// Train shared IVF centroids as an Arrow C Data Interface array/schema.
+    IndexModel train_ivf_model(
+        const std::string& column,
+        uint32_t num_partitions,
+        LanceMetricType metric,
+        const std::vector<uint32_t>& fragment_ids = {}) const;
+
+    /// Train a shared PQ codebook as an Arrow C Data Interface array/schema.
+    /// L2 and cosine use IVF residuals; DOT trains on raw vectors.
+    IndexModel train_pq_model(
+        const std::string& column,
+        uint32_t num_sub_vectors,
+        uint32_t num_bits,
+        LanceMetricType metric,
+        IndexModel& ivf_centroids,
+        const std::vector<uint32_t>& fragment_ids = {}) const;
+
     /// Drop an index by name.
     void drop_index(const std::string& name) {
         if (lance_dataset_drop_index(handle_.get(), name.c_str()) != 0)
@@ -773,6 +810,261 @@ public:
 private:
     explicit Dataset(LanceDataset* ptr) : handle_(ptr) {}
 };
+
+// ─── Uncommitted index segments ──────────────────────────────────────────────
+
+/// Move-only owner of an Arrow C Data Interface model array and schema.
+class IndexModel {
+    ArrowArray array_ = {};
+    ArrowSchema schema_ = {};
+
+    void reset() noexcept {
+        if (array_.release) array_.release(&array_);
+        if (schema_.release) schema_.release(&schema_);
+    }
+
+    friend class Dataset;
+
+    IndexModel(ArrowArray array, ArrowSchema schema) noexcept
+        : array_(array), schema_(schema) {}
+
+public:
+    ~IndexModel() { reset(); }
+
+    IndexModel(IndexModel&& other) noexcept
+        : array_(other.array_), schema_(other.schema_) {
+        other.array_ = {};
+        other.schema_ = {};
+    }
+    IndexModel& operator=(IndexModel&& other) noexcept {
+        if (this != &other) {
+            reset();
+            array_ = other.array_;
+            schema_ = other.schema_;
+            other.array_ = {};
+            other.schema_ = {};
+        }
+        return *this;
+    }
+    IndexModel(const IndexModel&) = delete;
+    IndexModel& operator=(const IndexModel&) = delete;
+
+    ArrowArray* array() noexcept { return &array_; }
+    const ArrowSchema* schema() const noexcept { return &schema_; }
+};
+
+/// Parsed metadata for one physical index segment.
+class IndexSegmentMetadata {
+    Handle<LanceIndexSegmentMetadata, lance_index_segment_metadata_free> handle_;
+
+public:
+    explicit IndexSegmentMetadata(LanceIndexSegmentMetadata* metadata)
+        : handle_(metadata) {}
+
+    IndexSegmentMetadata(IndexSegmentMetadata&&) noexcept = default;
+    IndexSegmentMetadata& operator=(IndexSegmentMetadata&&) noexcept = default;
+    IndexSegmentMetadata(const IndexSegmentMetadata&) = delete;
+    IndexSegmentMetadata& operator=(const IndexSegmentMetadata&) = delete;
+
+    /// Parse protobuf-encoded IndexMetadata bytes.
+    static IndexSegmentMetadata parse(const uint8_t* bytes, size_t len) {
+        LanceIndexSegmentMetadata* metadata = nullptr;
+        if (lance_index_segment_metadata_parse(bytes, len, &metadata) != 0)
+            check_error();
+        if (!metadata) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_index_segment_metadata_parse returned success with null metadata");
+        }
+        return IndexSegmentMetadata(metadata);
+    }
+
+    /// Vector overload for protobuf-encoded IndexMetadata bytes.
+    static IndexSegmentMetadata parse(const std::vector<uint8_t>& bytes) {
+        return parse(bytes.data(), bytes.size());
+    }
+
+    std::array<uint8_t, 16> uuid() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_index_segment_metadata_uuid(handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    std::string name() const {
+        const char* value = lance_index_segment_metadata_name(handle_.get());
+        if (!value) check_error();
+        return std::string(value);
+    }
+
+    uint64_t dataset_version() const {
+        uint64_t version =
+            lance_index_segment_metadata_dataset_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return version;
+    }
+
+    int32_t index_version() const {
+        int32_t version =
+            lance_index_segment_metadata_index_version(handle_.get());
+        if (version < 0) check_error();
+        return version;
+    }
+
+    int32_t index_type() const {
+        int32_t type = lance_index_segment_metadata_index_type(handle_.get());
+        if (type < 0) check_error();
+        return type;
+    }
+
+    std::string index_details_type_url() const {
+        const char* value =
+            lance_index_segment_metadata_index_details_type_url(handle_.get());
+        if (!value) check_error();
+        return std::string(value);
+    }
+
+    std::vector<int32_t> field_ids() const {
+        size_t count = lance_index_segment_metadata_field_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+
+        std::vector<int32_t> out(count);
+        size_t written = 0;
+        if (lance_index_segment_metadata_field_ids(
+                handle_.get(), out.data(), out.size(), &written) != 0)
+            check_error();
+        out.resize(written);
+        return out;
+    }
+
+    std::vector<uint32_t> fragment_ids() const {
+        size_t count =
+            lance_index_segment_metadata_fragment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+
+        std::vector<uint32_t> out(count);
+        size_t written = 0;
+        if (lance_index_segment_metadata_fragment_ids(
+                handle_.get(), out.data(), out.size(), &written) != 0)
+            check_error();
+        out.resize(written);
+        return out;
+    }
+
+    const LanceIndexSegmentMetadata* c_handle() const { return handle_.get(); }
+};
+
+/// Move-only builder for one uncommitted physical index segment.
+class IndexSegmentBuilder {
+    Handle<LanceIndexSegmentBuilder, lance_index_segment_builder_free> handle_;
+
+public:
+    explicit IndexSegmentBuilder(LanceIndexSegmentBuilder* builder)
+        : handle_(builder) {}
+
+    IndexSegmentBuilder(IndexSegmentBuilder&&) noexcept = default;
+    IndexSegmentBuilder& operator=(IndexSegmentBuilder&&) noexcept = default;
+    IndexSegmentBuilder(const IndexSegmentBuilder&) = delete;
+    IndexSegmentBuilder& operator=(const IndexSegmentBuilder&) = delete;
+
+    /// Execute the single-use builder without committing a dataset manifest.
+    /// Native bytes are released even if error handling or vector allocation
+    /// throws an exception.
+    std::vector<uint8_t> execute_uncommitted() {
+        struct BytesGuard {
+            uint8_t* bytes = nullptr;
+            ~BytesGuard() noexcept { lance_free_bytes(bytes); }
+
+            BytesGuard() = default;
+            BytesGuard(const BytesGuard&) = delete;
+            BytesGuard& operator=(const BytesGuard&) = delete;
+        } guard;
+
+        size_t len = 0;
+        if (lance_index_segment_builder_execute_uncommitted(
+                handle_.get(), &guard.bytes, &len) != 0)
+            check_error();
+        if (!guard.bytes || len == 0) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_index_segment_builder_execute_uncommitted returned empty metadata");
+        }
+        return std::vector<uint8_t>(guard.bytes, guard.bytes + len);
+    }
+
+    LanceIndexSegmentBuilder* c_handle() { return handle_.get(); }
+};
+
+inline IndexSegmentBuilder Dataset::new_scalar_index_segment_builder(
+    const std::string& column,
+    LanceScalarIndexType index_type,
+    const std::string& index_name,
+    const std::string& params_json,
+    const LanceIndexSegmentBuildOptions* options) const {
+    const char* index_name_c = index_name.empty() ? nullptr : index_name.c_str();
+    const char* params_json_c = params_json.empty() ? nullptr : params_json.c_str();
+    auto* builder = lance_index_segment_builder_new_scalar(
+        handle_.get(), column.c_str(), index_name_c,
+        static_cast<int32_t>(index_type), params_json_c, options);
+    if (!builder) check_error();
+    return IndexSegmentBuilder(builder);
+}
+
+inline IndexSegmentBuilder Dataset::new_vector_index_segment_builder(
+    const std::string& column,
+    const LanceVectorIndexParams& params,
+    const std::string& index_name,
+    const LanceIndexSegmentBuildOptions* options) const {
+    const char* index_name_c = index_name.empty() ? nullptr : index_name.c_str();
+    LanceVectorIndexSegmentParams segment_params = {
+        static_cast<int32_t>(params.index_type),
+        static_cast<int32_t>(params.metric),
+        params.num_partitions,
+        params.num_sub_vectors,
+        params.num_bits,
+        params.max_iterations,
+        params.hnsw_m,
+        params.hnsw_ef_construction,
+        params.sample_rate,
+    };
+    auto* builder = lance_index_segment_builder_new_vector(
+        handle_.get(), column.c_str(), index_name_c, &segment_params, options);
+    if (!builder) check_error();
+    return IndexSegmentBuilder(builder);
+}
+
+inline IndexModel Dataset::train_ivf_model(
+    const std::string& column,
+    uint32_t num_partitions,
+    LanceMetricType metric,
+    const std::vector<uint32_t>& fragment_ids) const {
+    ArrowArray array = {};
+    ArrowSchema schema = {};
+    const uint32_t* ids = fragment_ids.empty() ? nullptr : fragment_ids.data();
+    if (lance_index_train_ivf_model(
+            handle_.get(), column.c_str(), num_partitions,
+            static_cast<int32_t>(metric), ids,
+            fragment_ids.size(), &array, &schema) != 0)
+        check_error();
+    return IndexModel(array, schema);
+}
+
+inline IndexModel Dataset::train_pq_model(
+    const std::string& column,
+    uint32_t num_sub_vectors,
+    uint32_t num_bits,
+    LanceMetricType metric,
+    IndexModel& ivf_centroids,
+    const std::vector<uint32_t>& fragment_ids) const {
+    ArrowArray array = {};
+    ArrowSchema schema = {};
+    const uint32_t* ids = fragment_ids.empty() ? nullptr : fragment_ids.data();
+    if (lance_index_train_pq_model(
+            handle_.get(), column.c_str(), num_sub_vectors, num_bits,
+            static_cast<int32_t>(metric), ids, fragment_ids.size(),
+            ivf_centroids.array(), ivf_centroids.schema(), &array, &schema) != 0)
+        check_error();
+    return IndexModel(array, schema);
+}
 
 // ─── Scanner ─────────────────────────────────────────────────────────────────
 

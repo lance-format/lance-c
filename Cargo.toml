@@ -24,17 +24,21 @@ lance-file = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2
 lance-index = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
 lance-io = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
 lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
+lance-table = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
 arrow = { version = "58.0.0", features = ["prettyprint", "ffi"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
-# Direct only to name `chrono::TimeDelta`, the field type of lance's public
-# `AutoCleanupParams`; already in the graph transitively via lance.
+# Direct to name `chrono::TimeDelta` (the field type of lance's public
+# `AutoCleanupParams`) and `chrono::DateTime`/`Utc` (index metadata
+# timestamps); already in the graph transitively via lance.
 chrono = { version = "0.4", default-features = false }
 half = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 futures = "0.3"
 log = "0.4"
+libc = "0.2"
 pin-project = "1.0"
+prost = "0.14"
 snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
@@ -43,7 +47,6 @@ lance = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c", f
 lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c", features = ["substrait"] }
 lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
 lance-file = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
-lance-table = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
 datafusion = { version = "54.0.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "58.0.0"
