@@ -161,7 +161,11 @@ pub unsafe extern "C" fn lance_free_string(s: *const c_char) {
 /// set a `LanceErrorCode::Panic` error carrying the panic message and return
 /// the shape's error value. Shapes: `null` (returns `*mut T`), `neg`
 /// (returns a signed integer, `-1` on error), `void` (returns `()`, error
-/// observable only via thread-local storage).
+/// observable only via thread-local storage), or a generic `$errval`
+/// expression returned verbatim on either failure path (for 0-sentinel
+/// integer returns and any other shape the literal arms do not cover).
+/// The literal-token arms are listed first so `null`/`neg`/`void` are never
+/// captured by the `$errval:expr` catch-all.
 macro_rules! ffi_try {
     ($body:expr, null) => {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
@@ -223,6 +227,28 @@ macro_rules! ffi_try {
                         $crate::error::panic_payload_message(&*payload)
                     ),
                 );
+            }
+        }
+    };
+    ($body:expr, $errval:expr) => {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(Ok(val)) => {
+                $crate::error::clear_last_error();
+                val
+            }
+            Ok(Err(err)) => {
+                $crate::error::set_lance_error(&err);
+                $errval
+            }
+            Err(payload) => {
+                $crate::error::set_last_error(
+                    $crate::error::LanceErrorCode::Panic,
+                    format!(
+                        "panic in FFI call: {}",
+                        $crate::error::panic_payload_message(&*payload)
+                    ),
+                );
+                $errval
             }
         }
     };
@@ -339,6 +365,43 @@ mod tests {
         // A succeeding call clears the error.
         ffi_try!(lance_core::Result::<()>::Ok(()), void);
         assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    }
+
+    #[test]
+    fn ffi_try_errval_ok_clears_and_returns_value() {
+        set_last_error(LanceErrorCode::Internal, "stale error");
+        let v: u64 = ffi_try!(Ok(42u64), 0);
+        assert_eq!(v, 42);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+        assert!(take_last_error_message().is_none());
+    }
+
+    #[test]
+    fn ffi_try_errval_maps_lance_error_to_errval_and_code() {
+        let v: u64 = ffi_try!(
+            Err(lance_core::Error::invalid_input_source("bad arg".into())),
+            0
+        );
+        assert_eq!(v, 0);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let msg = take_last_error_message().expect("error must set a message");
+        assert!(msg.contains("bad arg"), "got: {msg}");
+    }
+
+    #[test]
+    fn ffi_try_errval_maps_panic_to_errval_and_panic_code() {
+        // A non-zero sentinel proves the arm returns `$errval` verbatim.
+        let v: i64 = ffi_try!(panicking(), 7);
+        assert_eq!(v, 7);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+        let msg = take_last_error_message().expect("panic must set a message");
+        assert!(msg.contains("simulated bug in FFI body"), "got: {msg}");
+
+        // The zero sentinel used by the 0-sentinel integer entry points.
+        let v: u32 = ffi_try!(panicking(), 0);
+        assert_eq!(v, 0);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+        take_last_error_message();
     }
 
     #[test]

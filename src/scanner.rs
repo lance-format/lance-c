@@ -296,27 +296,35 @@ unsafe fn scanner_new_inner(
 /// Set the row limit on the scanner. Returns 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_limit(scanner: *mut LanceScanner, limit: i64) -> i32 {
+    ffi_try!(unsafe { scanner_set_limit_inner(scanner, limit) }, neg)
+}
+
+unsafe fn scanner_set_limit_inner(scanner: *mut LanceScanner, limit: i64) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     s.limit = Some(limit);
-    clear_last_error();
-    0
+    Ok(0)
 }
 
 /// Set the row offset on the scanner. Returns 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_offset(scanner: *mut LanceScanner, offset: i64) -> i32 {
+    ffi_try!(unsafe { scanner_set_offset_inner(scanner, offset) }, neg)
+}
+
+unsafe fn scanner_set_offset_inner(scanner: *mut LanceScanner, offset: i64) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     s.offset = Some(offset);
-    clear_last_error();
-    0
+    Ok(0)
 }
 
 /// Set the batch size on the scanner. Returns 0.
@@ -325,14 +333,21 @@ pub unsafe extern "C" fn lance_scanner_set_batch_size(
     scanner: *mut LanceScanner,
     batch_size: i64,
 ) -> i32 {
+    ffi_try!(
+        unsafe { scanner_set_batch_size_inner(scanner, batch_size) },
+        neg
+    )
+}
+
+unsafe fn scanner_set_batch_size_inner(scanner: *mut LanceScanner, batch_size: i64) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     s.batch_size = Some(batch_size as usize);
-    clear_last_error();
-    0
+    Ok(0)
 }
 
 /// Enable or disable row ID in scan output. Returns 0.
@@ -341,14 +356,18 @@ pub unsafe extern "C" fn lance_scanner_with_row_id(
     scanner: *mut LanceScanner,
     enable: bool,
 ) -> i32 {
+    ffi_try!(unsafe { scanner_with_row_id_inner(scanner, enable) }, neg)
+}
+
+unsafe fn scanner_with_row_id_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     s.with_row_id = enable;
-    clear_last_error();
-    0
+    Ok(0)
 }
 
 /// Restrict the scan to the given fragment IDs.
@@ -361,13 +380,26 @@ pub unsafe extern "C" fn lance_scanner_set_fragment_ids(
     ids: *const u64,
     len: usize,
 ) -> i32 {
+    ffi_try!(
+        unsafe { scanner_set_fragment_ids_inner(scanner, ids, len) },
+        neg
+    )
+}
+
+unsafe fn scanner_set_fragment_ids_inner(
+    scanner: *mut LanceScanner,
+    ids: *const u64,
+    len: usize,
+) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     if ids.is_null() && len > 0 {
-        set_last_error(LanceErrorCode::InvalidArgument, "ids is NULL but len > 0");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "ids is NULL but len > 0".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     let id_slice = if len > 0 {
@@ -376,8 +408,7 @@ pub unsafe extern "C" fn lance_scanner_set_fragment_ids(
         &[]
     };
     s.fragment_ids = Some(id_slice.to_vec());
-    clear_last_error();
-    0
+    Ok(0)
 }
 
 /// Set a Substrait filter on the scanner.
@@ -405,26 +436,36 @@ pub unsafe extern "C" fn lance_scanner_set_substrait_filter(
     bytes: *const u8,
     len: usize,
 ) -> i32 {
+    ffi_try!(
+        unsafe { scanner_set_substrait_filter_inner(scanner, bytes, len) },
+        neg
+    )
+}
+
+unsafe fn scanner_set_substrait_filter_inner(
+    scanner: *mut LanceScanner,
+    bytes: *const u8,
+    len: usize,
+) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     if bytes.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "bytes is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "bytes is NULL".into(),
+        ));
     }
     if len == 0 {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "Substrait filter bytes must be non-empty",
-        );
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "Substrait filter bytes must be non-empty".into(),
+        ));
     }
     let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
     let s = unsafe { &mut *scanner };
     s.substrait_filter = Some(slice.to_vec());
-    clear_last_error();
-    0
+    Ok(0)
 }
 
 /// Close and free a scanner handle.
@@ -738,15 +779,20 @@ macro_rules! scanner_set_u32 {
     ($name:ident, $field:ident) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(scanner: *mut LanceScanner, value: u32) -> i32 {
-            if scanner.is_null() {
-                set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-                return -1;
-            }
-            unsafe {
-                (*scanner).$field = Some(value);
-            }
-            crate::error::clear_last_error();
-            0
+            ffi_try!(
+                (|| -> Result<i32> {
+                    if scanner.is_null() {
+                        return Err(lance_core::Error::invalid_input_source(
+                            "scanner is NULL".into(),
+                        ));
+                    }
+                    unsafe {
+                        (*scanner).$field = Some(value);
+                    }
+                    Ok(0)
+                })(),
+                neg
+            )
         }
     };
 }
@@ -757,9 +803,14 @@ scanner_set_u32!(lance_scanner_set_ef, ef);
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_metric(scanner: *mut LanceScanner, metric: i32) -> i32 {
+    ffi_try!(unsafe { scanner_set_metric_inner(scanner, metric) }, neg)
+}
+
+unsafe fn scanner_set_metric_inner(scanner: *mut LanceScanner, metric: i32) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     let m = match metric {
         0 => crate::index::LanceMetricType::L2,
@@ -767,18 +818,15 @@ pub unsafe extern "C" fn lance_scanner_set_metric(scanner: *mut LanceScanner, me
         2 => crate::index::LanceMetricType::Dot,
         3 => crate::index::LanceMetricType::Hamming,
         _ => {
-            set_last_error(
-                LanceErrorCode::InvalidArgument,
-                format!("invalid metric: {}", metric),
-            );
-            return -1;
+            return Err(lance_core::Error::invalid_input_source(
+                format!("invalid metric: {}", metric).into(),
+            ));
         }
     };
     unsafe {
         (*scanner).metric_override = Some(m);
     }
-    crate::error::clear_last_error();
-    0
+    Ok(0)
 }
 
 #[unsafe(no_mangle)]
@@ -786,15 +834,19 @@ pub unsafe extern "C" fn lance_scanner_set_use_index(
     scanner: *mut LanceScanner,
     enable: bool,
 ) -> i32 {
+    ffi_try!(unsafe { scanner_set_use_index_inner(scanner, enable) }, neg)
+}
+
+unsafe fn scanner_set_use_index_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     unsafe {
         (*scanner).use_index = Some(enable);
     }
-    crate::error::clear_last_error();
-    0
+    Ok(0)
 }
 
 #[unsafe(no_mangle)]
@@ -802,15 +854,19 @@ pub unsafe extern "C" fn lance_scanner_set_prefilter(
     scanner: *mut LanceScanner,
     enable: bool,
 ) -> i32 {
+    ffi_try!(unsafe { scanner_set_prefilter_inner(scanner, enable) }, neg)
+}
+
+unsafe fn scanner_set_prefilter_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     unsafe {
         (*scanner).prefilter = enable;
     }
-    crate::error::clear_last_error();
-    0
+    Ok(0)
 }
 
 /// Restrict the next `nearest()` query to a specific subset of vector index segments.
@@ -830,16 +886,26 @@ pub unsafe extern "C" fn lance_scanner_set_index_segments(
     segment_uuids: *const u8,
     len: usize,
 ) -> i32 {
+    ffi_try!(
+        unsafe { scanner_set_index_segments_inner(scanner, segment_uuids, len) },
+        neg
+    )
+}
+
+unsafe fn scanner_set_index_segments_inner(
+    scanner: *mut LanceScanner,
+    segment_uuids: *const u8,
+    len: usize,
+) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     if segment_uuids.is_null() && len > 0 {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "segment_uuids is NULL but len > 0",
-        );
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "segment_uuids is NULL but len > 0".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     if len == 0 {
@@ -855,8 +921,7 @@ pub unsafe extern "C" fn lance_scanner_set_index_segments(
         }
         s.index_segments = Some(uuids);
     }
-    crate::error::clear_last_error();
-    0
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

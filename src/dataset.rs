@@ -13,7 +13,7 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance_core::Result;
 
-use crate::error::{LanceErrorCode, ffi_try, set_last_error};
+use crate::error::ffi_try;
 use crate::helpers;
 use crate::runtime::block_on;
 
@@ -127,56 +127,54 @@ pub unsafe extern "C" fn lance_dataset_close(dataset: *mut LanceDataset) {
 // ---------------------------------------------------------------------------
 
 /// Return the version number of this dataset snapshot.
+/// Returns 0 on error — check `lance_last_error_code()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_version(dataset: *const LanceDataset) -> u64 {
+    ffi_try!(unsafe { dataset_version_inner(dataset) }, 0)
+}
+
+unsafe fn dataset_version_inner(dataset: *const LanceDataset) -> Result<u64> {
     if dataset.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "dataset is NULL");
-        return 0;
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
-    ds.snapshot().version().version
+    Ok(ds.snapshot().version().version)
 }
 
 /// Return the number of rows in the dataset.
 /// Returns 0 on error — check `lance_last_error_code()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_count_rows(dataset: *const LanceDataset) -> u64 {
+    ffi_try!(unsafe { dataset_count_rows_inner(dataset) }, 0)
+}
+
+unsafe fn dataset_count_rows_inner(dataset: *const LanceDataset) -> Result<u64> {
     if dataset.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "dataset is NULL");
-        return 0;
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
-    match block_on(ds.snapshot().count_rows(None)) {
-        Ok(n) => {
-            crate::error::clear_last_error();
-            n as u64
-        }
-        Err(err) => {
-            crate::error::set_lance_error(&err);
-            0
-        }
-    }
+    Ok(block_on(ds.snapshot().count_rows(None))? as u64)
 }
 
 /// Return the latest version ID of the dataset.
 /// Returns 0 on error — check `lance_last_error_code()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_latest_version(dataset: *const LanceDataset) -> u64 {
+    ffi_try!(unsafe { dataset_latest_version_inner(dataset) }, 0)
+}
+
+unsafe fn dataset_latest_version_inner(dataset: *const LanceDataset) -> Result<u64> {
     if dataset.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "dataset is NULL");
-        return 0;
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
-    match block_on(ds.snapshot().latest_version_id()) {
-        Ok(v) => {
-            crate::error::clear_last_error();
-            v
-        }
-        Err(err) => {
-            crate::error::set_lance_error(&err);
-            0
-        }
-    }
+    block_on(ds.snapshot().latest_version_id())
 }
 
 // ---------------------------------------------------------------------------
@@ -349,13 +347,17 @@ unsafe fn dataset_take_rows_inner(
 /// Returns 0 on error — check `lance_last_error_code()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_fragment_count(dataset: *const LanceDataset) -> u64 {
+    ffi_try!(unsafe { dataset_fragment_count_inner(dataset) }, 0)
+}
+
+unsafe fn dataset_fragment_count_inner(dataset: *const LanceDataset) -> Result<u64> {
     if dataset.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "dataset is NULL");
-        return 0;
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
-    crate::error::clear_last_error();
-    ds.snapshot().count_fragments() as u64
+    Ok(ds.snapshot().count_fragments() as u64)
 }
 
 /// Fill `out_ids` with the fragment IDs of the dataset.
@@ -369,12 +371,17 @@ pub unsafe extern "C" fn lance_dataset_fragment_ids(
     dataset: *const LanceDataset,
     out_ids: *mut u64,
 ) -> i32 {
+    ffi_try!(unsafe { dataset_fragment_ids_inner(dataset, out_ids) }, neg)
+}
+
+unsafe fn dataset_fragment_ids_inner(
+    dataset: *const LanceDataset,
+    out_ids: *mut u64,
+) -> Result<i32> {
     if dataset.is_null() || out_ids.is_null() {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "dataset and out_ids must not be NULL",
-        );
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset and out_ids must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let fragments = ds.snapshot().get_fragments();
@@ -383,6 +390,5 @@ pub unsafe extern "C" fn lance_dataset_fragment_ids(
             *out_ids.add(i) = frag.id() as u64;
         }
     }
-    crate::error::clear_last_error();
-    0
+    Ok(0)
 }

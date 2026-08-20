@@ -14,7 +14,7 @@ use lance_index::IndexType;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
 use crate::dataset::LanceDataset;
-use crate::error::{LanceErrorCode, ffi_try, set_last_error};
+use crate::error::ffi_try;
 use crate::helpers;
 use crate::runtime::block_on;
 
@@ -126,27 +126,25 @@ unsafe fn create_scalar_index_inner(
 }
 
 /// Number of user indexes (excludes system indexes).
+/// Returns 0 on error — check `lance_last_error_code()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_index_count(dataset: *const LanceDataset) -> u64 {
+    ffi_try!(unsafe { index_count_inner(dataset) }, 0)
+}
+
+unsafe fn index_count_inner(dataset: *const LanceDataset) -> Result<u64> {
     if dataset.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "dataset is NULL");
-        return 0;
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let snap = ds.snapshot();
-    match block_on(snap.load_indices()) {
-        Ok(indices) => {
-            crate::error::clear_last_error();
-            indices
-                .iter()
-                .filter(|i| !lance_index::is_system_index(i))
-                .count() as u64
-        }
-        Err(err) => {
-            crate::error::set_lance_error(&err);
-            0
-        }
-    }
+    let indices = block_on(snap.load_indices())?;
+    Ok(indices
+        .iter()
+        .filter(|i| !lance_index::is_system_index(i))
+        .count() as u64)
 }
 
 /// Count the segments that make up a logical index.
@@ -159,50 +157,35 @@ pub unsafe extern "C" fn lance_dataset_index_segment_count(
     dataset: *const LanceDataset,
     index_name: *const c_char,
 ) -> u64 {
+    ffi_try!(unsafe { index_segment_count_inner(dataset, index_name) }, 0)
+}
+
+unsafe fn index_segment_count_inner(
+    dataset: *const LanceDataset,
+    index_name: *const c_char,
+) -> Result<u64> {
     if dataset.is_null() || index_name.is_null() {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "dataset and index_name must not be NULL",
-        );
-        return 0;
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset and index_name must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
-    let name = match unsafe { helpers::parse_c_string(index_name) } {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            set_last_error(
-                LanceErrorCode::InvalidArgument,
-                "index_name must not be empty",
-            );
-            return 0;
-        }
-        Err(err) => {
-            crate::error::set_lance_error(&err);
-            return 0;
-        }
-    };
+    let name = unsafe { helpers::parse_c_string(index_name)? }.ok_or_else(|| {
+        lance_core::Error::invalid_input_source("index_name must not be empty".into())
+    })?;
     let snap = ds.snapshot();
-    match block_on(snap.load_indices()) {
-        Ok(indices) => {
-            let count = indices
-                .iter()
-                .filter(|i| !lance_index::is_system_index(i) && i.name == name)
-                .count();
-            if count == 0 {
-                set_last_error(
-                    LanceErrorCode::NotFound,
-                    format!("index '{}' not found", name),
-                );
-                return 0;
-            }
-            crate::error::clear_last_error();
-            count as u64
-        }
-        Err(err) => {
-            crate::error::set_lance_error(&err);
-            0
-        }
+    let indices = block_on(snap.load_indices())?;
+    let count = indices
+        .iter()
+        .filter(|i| !lance_index::is_system_index(i) && i.name == name)
+        .count();
+    if count == 0 {
+        return Err(lance_core::Error::index_not_found(format!(
+            "name='{}'",
+            name
+        )));
     }
+    Ok(count as u64)
 }
 
 /// Fill `out_uuids` with the UUIDs of the segments that make up a logical index.
@@ -311,66 +294,62 @@ unsafe fn drop_index_inner(dataset: *mut LanceDataset, name: *const c_char) -> R
 pub unsafe extern "C" fn lance_dataset_index_list_json(
     dataset: *const LanceDataset,
 ) -> *const c_char {
+    ffi_try!(unsafe { index_list_json_inner(dataset) }, null)
+}
+
+unsafe fn index_list_json_inner(dataset: *const LanceDataset) -> Result<*const c_char> {
     if dataset.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "dataset is NULL");
-        return std::ptr::null();
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let snap = ds.snapshot();
 
-    let result = (|| -> Result<String> {
-        let indices = block_on(snap.load_indices())?;
-        let schema = snap.schema();
-        let descriptions = block_on(snap.describe_indices(None))?;
-        // Map name -> index_type string from describe_indices (one I/O batch)
-        let type_by_name: std::collections::HashMap<String, String> = descriptions
+    let indices = block_on(snap.load_indices())?;
+    let schema = snap.schema();
+    let descriptions = block_on(snap.describe_indices(None))?;
+    // Map name -> index_type string from describe_indices (one I/O batch)
+    let type_by_name: std::collections::HashMap<String, String> = descriptions
+        .iter()
+        .map(|d| (d.name().to_string(), d.index_type().to_string()))
+        .collect();
+
+    let mut entries: Vec<String> = Vec::new();
+    for idx in indices.iter() {
+        if lance_index::is_system_index(idx) {
+            continue;
+        }
+        let columns: Vec<String> = idx
+            .fields
             .iter()
-            .map(|d| (d.name().to_string(), d.index_type().to_string()))
+            .filter_map(|fid| schema.field_by_id(*fid).map(|f| f.name.clone()))
             .collect();
-
-        let mut entries: Vec<String> = Vec::new();
-        for idx in indices.iter() {
-            if lance_index::is_system_index(idx) {
-                continue;
-            }
-            let columns: Vec<String> = idx
-                .fields
-                .iter()
-                .filter_map(|fid| schema.field_by_id(*fid).map(|f| f.name.clone()))
-                .collect();
-            let type_str = type_by_name
-                .get(&idx.name)
-                .cloned()
-                .unwrap_or_else(|| "Unknown".to_string());
-            let cols_json = columns
-                .iter()
-                .map(|c| format!("\"{}\"", c.replace('"', "\\\"")))
-                .collect::<Vec<_>>()
-                .join(",");
-            entries.push(format!(
-                "{{\"name\":\"{}\",\"uuid\":\"{}\",\"columns\":[{}],\"type\":\"{}\",\"dataset_version\":{}}}",
-                idx.name.replace('"', "\\\""),
-                idx.uuid,
-                cols_json,
-                type_str,
-                idx.dataset_version,
-            ));
-        }
-        Ok(format!("[{}]", entries.join(",")))
-    })();
-
-    match result {
-        Ok(json) => {
-            crate::error::clear_last_error();
-            CString::new(json)
-                .map(|s| s.into_raw() as *const c_char)
-                .unwrap_or(std::ptr::null())
-        }
-        Err(err) => {
-            crate::error::set_lance_error(&err);
-            std::ptr::null()
-        }
+        let type_str = type_by_name
+            .get(&idx.name)
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string());
+        let cols_json = columns
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        entries.push(format!(
+            "{{\"name\":\"{}\",\"uuid\":\"{}\",\"columns\":[{}],\"type\":\"{}\",\"dataset_version\":{}}}",
+            idx.name.replace('"', "\\\""),
+            idx.uuid,
+            cols_json,
+            type_str,
+            idx.dataset_version,
+        ));
     }
+    let json = format!("[{}]", entries.join(","));
+
+    // A JSON payload with an interior NUL cannot cross the C boundary as a
+    // `char*`; return NULL without an error message, as before.
+    Ok(CString::new(json)
+        .map(|s| s.into_raw() as *const c_char)
+        .unwrap_or(std::ptr::null()))
 }
 
 // ---------------------------------------------------------------------------

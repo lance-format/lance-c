@@ -132,17 +132,25 @@ pub unsafe extern "C" fn lance_dataset_write(
     storage_opts: *const *const c_char,
     out_dataset: *mut *mut LanceDataset,
 ) -> i32 {
-    unsafe {
-        lance_dataset_write_with_params(
-            uri,
-            schema,
-            stream,
-            mode,
-            std::ptr::null(),
-            storage_opts,
-            out_dataset,
-        )
-    }
+    // Wrap the shared inner fn directly rather than forwarding to the
+    // `lance_dataset_write_with_params` extern: both extern "C" frames must
+    // carry their own panic guard, and a guard around the forwarding call
+    // would clear the thread-local error the inner guard just set (its
+    // `-1` return looks like `Ok(-1)` to an outer guard).
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                std::ptr::null(),
+                storage_opts,
+                out_dataset,
+            )
+        },
+        neg
+    )
 }
 
 /// Same as `lance_dataset_write` but takes a `LanceWriteParams` for tuning the
