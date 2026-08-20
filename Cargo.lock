@@ -3716,6 +3716,7 @@ dependencies = [
  "lance-io",
  "lance-linalg",
  "lance-table",
+ "libc",
  "log",
  "pin-project",
  "snafu",
