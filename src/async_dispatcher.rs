@@ -59,18 +59,22 @@ impl Dispatcher {
                         Some((code, message)) => set_last_error(*code, message),
                         None => clear_last_error(),
                     }
-                    // Invoke the C callback under catch_unwind (issue #61): a
-                    // panicking callback — Rust host code in practice — must
-                    // not unwind this thread away. If it did, the channel
-                    // would disconnect and every later async completion would
-                    // be silently lost, hanging every future C caller waiting
-                    // for a callback that never fires. Log and keep dispatching.
+                    // Invoke the C callback under catch_unwind, best-effort
+                    // only (issue #61). The declared callback ABI is
+                    // `extern "C"` and therefore NON-unwinding — `lance.h`
+                    // requires callbacks not to panic, and a panic in such a
+                    // callback aborts at its own boundary before this catch
+                    // could ever run. The catch exists solely for Rust hosts
+                    // that pass an `extern "C-unwind"` callback: for them it
+                    // keeps the dispatcher thread (and with it every later
+                    // async completion) alive. It is not part of the panic
+                    // contract and must never be relied on as one.
                     let outcome = catch_unwind(AssertUnwindSafe(|| unsafe {
                         (msg.callback)(msg.callback_ctx, msg.status, msg.result);
                     }));
                     if let Err(payload) = outcome {
                         log::error!(
-                            "lance-c dispatcher: C callback panicked and was contained: {}",
+                            "lance-c dispatcher: unwinding (C-unwind) host callback panicked; contained best-effort: {}",
                             panic_payload_message(&*payload)
                         );
                     }
@@ -227,47 +231,6 @@ mod tests {
             "stale error must be cleared before a successful callback"
         );
         assert_eq!(second.message, None);
-
-        unsafe { reclaim(ctx) };
-    }
-
-    /// A callback that unwinds out of its frame. Declared `extern "C-unwind"`
-    /// because a panic in a plain `extern "C"` callback aborts at its own
-    /// boundary (Rust 1.81+) before any caller-side guard could run — the
-    /// dispatcher guard exists for Rust host callbacks like this one. The
-    /// cast to `LanceCallback` below is sound: "C" and "C-unwind" share the
-    /// same calling convention; only unwind permission differs.
-    unsafe extern "C-unwind" fn panicking_callback(
-        _ctx: *mut c_void,
-        _status: i32,
-        _result: *mut c_void,
-    ) {
-        panic!("simulated C callback panic")
-    }
-
-    #[test]
-    fn callback_panic_is_contained_and_dispatcher_survives() {
-        let (rx, ctx) = probe();
-        // Re-type the unwinding callback as the `extern "C"` LanceCallback.
-        // Sound: "C" and "C-unwind" share the same calling convention; only
-        // unwind permission differs, and the dispatcher is what catches it.
-        let unwinding_cb: LanceCallback = unsafe {
-            std::mem::transmute::<
-                unsafe extern "C-unwind" fn(*mut c_void, i32, *mut c_void),
-                LanceCallback,
-            >(panicking_callback)
-        };
-        // The panicking callback runs first; the normal one must still fire.
-        // (The panic hook prints to stderr during this test; expected noise.)
-        dispatch_callback(unwinding_cb, ptr::null_mut(), 0, ptr::null_mut(), None);
-        dispatch_callback(observe, ctx, 42, ptr::null_mut(), None);
-
-        let obs = recv(&rx);
-        assert_eq!(
-            obs.status, 42,
-            "a panicking callback must not kill the dispatcher thread"
-        );
-        assert_eq!(obs.code, LanceErrorCode::Ok);
 
         unsafe { reclaim(ctx) };
     }

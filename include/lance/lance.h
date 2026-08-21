@@ -100,10 +100,16 @@ typedef enum {
  * Honest limits: a double panic, a panic in a destructor while unwinding, a
  * stack overflow, or an allocation failure still aborts the process. A
  * panic caught inside a close/free call (lance_*_close, lance_batch_free,
- * lance_free_string) is logged and the remainder of the value may leak —
+ * lance_free_string, or the release callback of an exported
+ * ArrowArrayStream) is logged and the remainder of the value may leak —
  * close is best-effort by design. Post-panic process state is best-effort:
  * hosts should fail the in-flight query rather than retry a poisoned
  * handle.
+ *
+ * Callbacks passed INTO the library (LanceCallback, LanceWaker) are the
+ * reverse direction and are NOT covered by this contract: their ABI is
+ * non-unwinding, so a panicking callback aborts the host process before
+ * the library can contain it. Callbacks must not panic.
  */
 
 /* ─── Index types (Phase 2) ─── */
@@ -895,7 +901,11 @@ int32_t lance_scanner_next(
  * The callback runs on the dispatcher thread; on failure the error code and
  * message are installed in that thread's thread-local storage immediately
  * before the callback runs, so lance_last_error_* called from inside the
- * callback observes this completion's failure. Callbacks must not panic.
+ * callback observes this completion's failure.
+ *
+ * Callbacks must not panic: the callback ABI is non-unwinding, so a
+ * panicking callback aborts the host process before the dispatcher can
+ * contain it.
  *
  * @param ctx     Opaque pointer passed back from the caller
  * @param status  0 = success, -1 = error
