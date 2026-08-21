@@ -30,7 +30,7 @@
 //!   best-effort close/free policy in `lance.h`. A cleanup panic is logged,
 //!   not poisoned — the handle's own state was never touched.
 //!
-//! The panic message is sanitized by [`panic_payload_message`] (NUL bytes
+//! The panic message is sanitized by `panic_payload_message` (NUL bytes
 //! replaced) before it is baked into the error string: arrow-rs's `get_next`
 //! runs `CString::new` on this string, and an embedded NUL would panic right
 //! through the guard.
