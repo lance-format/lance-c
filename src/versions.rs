@@ -9,7 +9,7 @@
 use lance_core::Result;
 
 use crate::dataset::LanceDataset;
-use crate::error::{LanceErrorCode, clear_last_error, ffi_try, set_last_error};
+use crate::error::{ffi_try, swallow_unwind};
 use crate::runtime::block_on;
 
 /// Opaque snapshot of a dataset's version history.
@@ -53,22 +53,28 @@ unsafe fn versions_inner(dataset: *const LanceDataset) -> Result<*mut LanceVersi
 /// Return the number of versions. Returns 0 on error (NULL handle).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_versions_count(versions: *const LanceVersions) -> u64 {
+    ffi_try!(unsafe { count_inner(versions) }, 0)
+}
+
+unsafe fn count_inner(versions: *const LanceVersions) -> Result<u64> {
     if versions.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "versions is NULL");
-        return 0;
+        return Err(lance_core::Error::invalid_input_source(
+            "versions is NULL".into(),
+        ));
     }
     let v = unsafe { &*versions };
-    clear_last_error();
-    v.entries.len() as u64
+    Ok(v.entries.len() as u64)
 }
 
 /// Return the monotonic version id at `index` (0 <= index < count).
 /// Returns 0 and sets the thread-local error on NULL or out-of-range input.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_versions_id_at(versions: *const LanceVersions, index: usize) -> u64 {
-    unsafe { entry_at(versions, index) }
-        .map(|e| e.id)
-        .unwrap_or(0)
+    ffi_try!(unsafe { id_at_inner(versions, index) }, 0)
+}
+
+unsafe fn id_at_inner(versions: *const LanceVersions, index: usize) -> Result<u64> {
+    Ok(unsafe { entry_at(versions, index) }?.id)
 }
 
 /// Return the Unix epoch millisecond timestamp at `index`.
@@ -78,18 +84,24 @@ pub unsafe extern "C" fn lance_versions_timestamp_ms_at(
     versions: *const LanceVersions,
     index: usize,
 ) -> i64 {
-    unsafe { entry_at(versions, index) }
-        .map(|e| e.timestamp_ms)
-        .unwrap_or(0)
+    ffi_try!(unsafe { timestamp_ms_at_inner(versions, index) }, 0)
+}
+
+unsafe fn timestamp_ms_at_inner(versions: *const LanceVersions, index: usize) -> Result<i64> {
+    Ok(unsafe { entry_at(versions, index) }?.timestamp_ms)
 }
 
 /// Close and free a versions handle. Safe to call with NULL.
+///
+/// Best-effort (issue #61): a panic raised while dropping the handle is
+/// caught and logged rather than unwinding into the caller, and the
+/// remainder of the value may leak.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_versions_close(versions: *mut LanceVersions) {
     if !versions.is_null() {
-        unsafe {
+        swallow_unwind("lance_versions_close", || unsafe {
             let _ = Box::from_raw(versions);
-        }
+        });
     }
 }
 
@@ -97,29 +109,23 @@ pub unsafe extern "C" fn lance_versions_close(versions: *mut LanceVersions) {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Copy the entry at `index` out of the versions handle. Sets the thread-local
-/// error and returns `None` on NULL handle or out-of-range index.
-unsafe fn entry_at(versions: *const LanceVersions, index: usize) -> Option<VersionEntry> {
+/// Copy the entry at `index` out of the versions handle. Returns an
+/// `InvalidArgument` error on NULL handle or out-of-range index.
+unsafe fn entry_at(versions: *const LanceVersions, index: usize) -> Result<VersionEntry> {
     if versions.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "versions is NULL");
-        return None;
+        return Err(lance_core::Error::invalid_input_source(
+            "versions is NULL".into(),
+        ));
     }
     let v = unsafe { &*versions };
-    match v.entries.get(index).copied() {
-        Some(e) => {
-            clear_last_error();
-            Some(e)
-        }
-        None => {
-            set_last_error(
-                LanceErrorCode::InvalidArgument,
-                format!(
-                    "version index {} out of range; count = {}",
-                    index,
-                    v.entries.len()
-                ),
-            );
-            None
-        }
-    }
+    v.entries.get(index).copied().ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "version index {} out of range; count = {}",
+                index,
+                v.entries.len()
+            )
+            .into(),
+        )
+    })
 }

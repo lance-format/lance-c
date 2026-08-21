@@ -78,7 +78,39 @@ typedef enum {
     LANCE_ERR_INTERNAL = 6,
     LANCE_ERR_NOT_SUPPORTED = 7,
     LANCE_ERR_COMMIT_CONFLICT = 8,
+    /* An unexpected panic was caught at the FFI boundary. */
+    LANCE_ERR_PANIC = 9,
 } LanceErrorCode;
+
+/**
+ * Panic handling (issue lance-format/lance-c#61).
+ *
+ * A panic raised inside Lance/Arrow code is caught at the FFI boundary and
+ * reported as LANCE_ERR_PANIC through the usual thread-local error channel
+ * (lance_last_error_code / lance_last_error_message) instead of unwinding
+ * into the host. After a panic:
+ *
+ *  - A LanceScanner handle is poisoned: every later call on it fails with
+ *    LANCE_ERR_PANIC ("scanner is poisoned by an earlier panic"). Close it
+ *    and build a fresh scanner; do not retry the poisoned handle.
+ *  - A LanceDataset handle remains usable: commits are atomic manifest
+ *    swaps, and a mutation that panics before commit rolls back in memory,
+ *    leaving the last committed snapshot intact.
+ *
+ * Honest limits: a double panic, a panic in a destructor while unwinding, a
+ * stack overflow, or an allocation failure still aborts the process. A
+ * panic caught inside a close/free call (lance_*_close, lance_batch_free,
+ * lance_free_string, or the release callback of an exported
+ * ArrowArrayStream) is logged and the remainder of the value may leak —
+ * close is best-effort by design. Post-panic process state is best-effort:
+ * hosts should fail the in-flight query rather than retry a poisoned
+ * handle.
+ *
+ * Callbacks passed INTO the library (LanceCallback, LanceWaker) are the
+ * reverse direction and are NOT covered by this contract: their ABI is
+ * non-unwinding, so a panicking callback aborts the host process before
+ * the library can contain it. Callbacks must not panic.
+ */
 
 /* ─── Index types (Phase 2) ─── */
 
@@ -836,6 +868,12 @@ void lance_scanner_close(LanceScanner* scanner);
 
 /**
  * Materialize the scan as an ArrowArrayStream (blocking).
+ *
+ * Reading the exported stream may surface a mid-iteration panic as one
+ * error through the Arrow C stream contract (nonzero get_next plus
+ * get_last_error), followed by end-of-stream; the scanner handle is
+ * poisoned afterwards.
+ *
  * @return 0 on success, -1 on error
  */
 int32_t lance_scanner_to_arrow_stream(
@@ -859,6 +897,16 @@ int32_t lance_scanner_next(
 
 /**
  * Callback type for async operations.
+ *
+ * The callback runs on the dispatcher thread; on failure the error code and
+ * message are installed in that thread's thread-local storage immediately
+ * before the callback runs, so lance_last_error_* called from inside the
+ * callback observes this completion's failure.
+ *
+ * Callbacks must not panic: the callback ABI is non-unwinding, so a
+ * panicking callback aborts the host process before the dispatcher can
+ * contain it.
+ *
  * @param ctx     Opaque pointer passed back from the caller
  * @param status  0 = success, -1 = error
  * @param result  Operation-specific result (e.g., ArrowArrayStream*)
@@ -868,6 +916,12 @@ typedef void (*LanceCallback)(void* ctx, int32_t status, void* result);
 /**
  * Start an async scan. The callback fires on a dedicated dispatcher thread
  * when the ArrowArrayStream is ready.
+ *
+ * On failure the callback receives status -1 with result NULL, and the
+ * error code/message are installed in the dispatcher thread's thread-local
+ * storage immediately before the callback runs (per completion). A panic in
+ * the scan task also yields status -1 with LANCE_ERR_PANIC and poisons the
+ * scanner handle.
  */
 void lance_scanner_scan_async(
     const LanceScanner* scanner,

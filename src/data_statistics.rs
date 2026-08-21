@@ -12,7 +12,7 @@ use lance::dataset::statistics::DatasetStatisticsExt;
 use lance_core::Result;
 
 use crate::dataset::LanceDataset;
-use crate::error::{LanceErrorCode, clear_last_error, ffi_try, set_last_error};
+use crate::error::{ffi_try, swallow_unwind};
 use crate::runtime::block_on;
 
 /// Opaque snapshot of a dataset's per-field data statistics.
@@ -71,17 +71,20 @@ unsafe fn calculate_inner(dataset: *const LanceDataset) -> Result<*mut LanceData
 /// distinguish the error case from an empty result.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_data_statistics_count(stats: *const LanceDataStatistics) -> u64 {
+    ffi_try!(unsafe { count_inner(stats) }, 0)
+}
+
+unsafe fn count_inner(stats: *const LanceDataStatistics) -> Result<u64> {
     if stats.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "stats is NULL");
-        return 0;
+        return Err(lance_core::Error::invalid_input_source(
+            "stats is NULL".into(),
+        ));
     }
     // SAFETY: `stats` is non-null (checked above) and was produced by
     // `lance_dataset_calculate_data_stats` via `Box::into_raw`; the accessors
     // only ever take shared borrows, so no mutable alias exists.
     let s = unsafe { &*stats };
-    let count = s.fields.len() as u64;
-    clear_last_error();
-    count
+    Ok(s.fields.len() as u64)
 }
 
 /// Return the schema field id at `index` (0 <= index < count).
@@ -95,7 +98,11 @@ pub unsafe extern "C" fn lance_data_statistics_field_id_at(
     stats: *const LanceDataStatistics,
     index: usize,
 ) -> u32 {
-    unsafe { entry_at(stats, index) }.map(|f| f.id).unwrap_or(0)
+    ffi_try!(unsafe { field_id_at_inner(stats, index) }, 0)
+}
+
+unsafe fn field_id_at_inner(stats: *const LanceDataStatistics, index: usize) -> Result<u32> {
+    Ok(unsafe { entry_at(stats, index) }?.id)
 }
 
 /// Return the compressed on-disk byte size of the field at `index`.
@@ -108,18 +115,24 @@ pub unsafe extern "C" fn lance_data_statistics_bytes_on_disk_at(
     stats: *const LanceDataStatistics,
     index: usize,
 ) -> u64 {
-    unsafe { entry_at(stats, index) }
-        .map(|f| f.bytes_on_disk)
-        .unwrap_or(0)
+    ffi_try!(unsafe { bytes_on_disk_at_inner(stats, index) }, 0)
+}
+
+unsafe fn bytes_on_disk_at_inner(stats: *const LanceDataStatistics, index: usize) -> Result<u64> {
+    Ok(unsafe { entry_at(stats, index) }?.bytes_on_disk)
 }
 
 /// Close and free a data statistics handle. Safe to call with NULL.
+///
+/// Best-effort (issue #61): a panic raised while dropping the handle is
+/// caught and logged rather than unwinding into the caller, and the
+/// remainder of the value may leak.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_data_statistics_close(stats: *mut LanceDataStatistics) {
     if !stats.is_null() {
-        unsafe {
+        swallow_unwind("lance_data_statistics_close", || unsafe {
             let _ = Box::from_raw(stats);
-        }
+        });
     }
 }
 
@@ -127,32 +140,26 @@ pub unsafe extern "C" fn lance_data_statistics_close(stats: *mut LanceDataStatis
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Copy the field stat at `index` out of the handle. Sets the thread-local
-/// error and returns `None` on NULL handle or out-of-range index.
-unsafe fn entry_at(stats: *const LanceDataStatistics, index: usize) -> Option<FieldStat> {
+/// Copy the field stat at `index` out of the handle. Returns an
+/// `InvalidArgument` error on NULL handle or out-of-range index.
+unsafe fn entry_at(stats: *const LanceDataStatistics, index: usize) -> Result<FieldStat> {
     if stats.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "stats is NULL");
-        return None;
+        return Err(lance_core::Error::invalid_input_source(
+            "stats is NULL".into(),
+        ));
     }
     // SAFETY: `stats` is non-null (checked above) and was produced by
     // `lance_dataset_calculate_data_stats` via `Box::into_raw`; we take only a
     // shared borrow.
     let s = unsafe { &*stats };
-    match s.fields.get(index).copied() {
-        Some(f) => {
-            clear_last_error();
-            Some(f)
-        }
-        None => {
-            set_last_error(
-                LanceErrorCode::InvalidArgument,
-                format!(
-                    "field statistics index {} out of range; count = {}",
-                    index,
-                    s.fields.len()
-                ),
-            );
-            None
-        }
-    }
+    s.fields.get(index).copied().ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "field statistics index {} out of range; count = {}",
+                index,
+                s.fields.len()
+            )
+            .into(),
+        )
+    })
 }
