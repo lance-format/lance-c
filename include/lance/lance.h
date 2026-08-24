@@ -863,6 +863,79 @@ int32_t lance_scanner_set_substrait_filter(
     size_t len
 );
 
+/** Type of a dynamically named scan metric. */
+typedef enum {
+    LANCE_SCAN_METRIC_COUNT = 0,
+    LANCE_SCAN_METRIC_TIME_NANOSECONDS = 1,
+} LanceScanMetricKind;
+
+/**
+ * Borrowed view of one dynamically named scan metric.
+ *
+ * `name` is not NUL-terminated. `name` and this structure are valid only for
+ * the duration of the LanceScanStatisticsCallback invocation.
+ */
+typedef struct {
+    const char* name;
+    size_t name_len;
+    LanceScanMetricKind kind;
+    uint64_t value;
+} LanceScanMetric;
+
+/**
+ * Borrowed view of the execution statistics for one finalized scan.
+ *
+ * The fixed fields are stable summary metrics. `metrics` contains additional
+ * implementation-specific counters and timings. Those names are not a stable
+ * API and are intended for diagnostics and profiles. Dynamic metrics are
+ * best-effort and may be omitted if they cannot be materialized. `metrics` is
+ * NULL when `metrics_len` is zero.
+ */
+typedef struct {
+    uint64_t iops;
+    uint64_t requests;
+    uint64_t bytes_read;
+    uint64_t indices_loaded;
+    uint64_t index_partitions_loaded;
+    uint64_t index_comparisons;
+    const LanceScanMetric* metrics;
+    size_t metrics_len;
+} LanceScanStatistics;
+
+/**
+ * Receives scan statistics when a stream reaches EOF, fails, or is released.
+ *
+ * The statistics and all nested pointers are borrowed and valid only for the
+ * duration of this call. The callback may run on the thread that consumes or
+ * releases the scan stream and must therefore be thread-safe. It must return
+ * normally without throwing an exception or unwinding, and must not call any
+ * `lance_scanner_*` function with the originating scanner.
+ *
+ * Scan statistics are diagnostic and best-effort. The callback must handle its
+ * own errors and must not use them to abort or throw across this FFI boundary.
+ */
+typedef void (*LanceScanStatisticsCallback)(
+    void* callback_ctx,
+    const LanceScanStatistics* statistics
+);
+
+/**
+ * Register the execution-statistics callback for this scanner.
+ *
+ * Must be called before starting the scan; registering after the scan starts
+ * returns an error. `callback` must not be NULL. `callback_ctx` may be NULL. A
+ * non-NULL `callback_ctx` must remain valid, and `callback` must remain valid,
+ * until the stream reaches EOF, fails, or is released. Replaces a previously
+ * registered callback.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_set_statistics_callback(
+    LanceScanner* scanner,
+    LanceScanStatisticsCallback callback,
+    void* callback_ctx
+);
+
 /** Close and free a scanner handle. */
 void lance_scanner_close(LanceScanner* scanner);
 

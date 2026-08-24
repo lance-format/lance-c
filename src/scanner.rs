@@ -14,7 +14,9 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::SchemaRef;
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
-use lance::dataset::scanner::DatasetRecordBatchStream;
+use lance::dataset::scanner::{
+    DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
+};
 use lance_core::Result;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_io::stream::RecordBatchStream;
@@ -69,6 +71,8 @@ pub struct LanceScanner {
     // the spawned async task can poison the handle from outside this call
     // frame via `poison_flag()`.
     poisoned: Arc<AtomicBool>,
+    scan_statistics_callback: Option<ExecutionStatsCallback>,
+    scan_started: AtomicBool,
     // Materialized on first iteration call
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
     #[allow(dead_code)]
@@ -122,6 +126,8 @@ impl LanceScanner {
             prefilter: false,
             fts_query: None,
             poisoned: Arc::new(AtomicBool::new(false)),
+            scan_statistics_callback: None,
+            scan_started: AtomicBool::new(false),
             stream: None,
             schema: None,
         }
@@ -157,6 +163,7 @@ impl LanceScanner {
 
     /// Build the underlying Scanner and open a stream.
     fn materialize_stream(&mut self) -> Result<()> {
+        self.scan_started.store(true, Ordering::Release);
         let mut scanner = self.dataset.scan();
         if let Some(cols) = &self.columns {
             scanner.project(cols)?;
@@ -212,6 +219,9 @@ impl LanceScanner {
         if let Some(fts) = &self.fts_query {
             scanner.full_text_search(fts.clone())?;
         }
+        if let Some(callback) = &self.scan_statistics_callback {
+            scanner.scan_stats_callback(callback.clone());
+        }
         let stream = block_on(scanner.try_into_stream())?;
         self.schema = Some(stream.schema());
         self.stream = Some(Box::pin(stream));
@@ -220,6 +230,7 @@ impl LanceScanner {
 
     /// Build a Scanner (without materializing) and return it.
     fn build_scanner(&self) -> Result<lance::dataset::scanner::Scanner> {
+        self.scan_started.store(true, Ordering::Release);
         let mut scanner = self.dataset.scan();
         if let Some(cols) = &self.columns {
             scanner.project(cols)?;
@@ -274,7 +285,119 @@ impl LanceScanner {
         if let Some(fts) = &self.fts_query {
             scanner.full_text_search(fts.clone())?;
         }
+        if let Some(callback) = &self.scan_statistics_callback {
+            scanner.scan_stats_callback(callback.clone());
+        }
         Ok(scanner)
+    }
+}
+
+/// Type of a dynamically named scan metric.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceScanMetricKind {
+    /// Monotonically accumulated counter.
+    Count = 0,
+    /// Accumulated duration in nanoseconds.
+    TimeNanoseconds = 1,
+}
+
+/// Borrowed view of one dynamically named scan metric.
+///
+/// `name` is not NUL-terminated. Both `name` and this structure are valid only
+/// for the duration of the scan statistics callback.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceScanMetric {
+    pub name: *const c_char,
+    pub name_len: usize,
+    pub kind: LanceScanMetricKind,
+    pub value: u64,
+}
+
+/// Borrowed view of the execution statistics for one completed scan.
+///
+/// The fixed fields are stable summary metrics. `metrics` contains additional
+/// implementation-specific counters and timings and is valid only for the
+/// duration of the callback.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceScanStatistics {
+    pub iops: u64,
+    pub requests: u64,
+    pub bytes_read: u64,
+    pub indices_loaded: u64,
+    pub index_partitions_loaded: u64,
+    pub index_comparisons: u64,
+    pub metrics: *const LanceScanMetric,
+    pub metrics_len: usize,
+}
+
+/// Callback invoked when a scan stream reaches EOF, fails, or is released.
+///
+/// The callback is an FFI boundary and must return normally without unwinding
+/// or throwing an exception. It must not call back into `lance_scanner_*` with
+/// the originating scanner.
+pub type LanceScanStatisticsCallback =
+    Option<unsafe extern "C" fn(ctx: *mut c_void, statistics: *const LanceScanStatistics)>;
+
+struct SendScanStatisticsCallback {
+    callback: unsafe extern "C" fn(*mut c_void, *const LanceScanStatistics),
+    ctx: *mut c_void,
+}
+
+// SAFETY: The C API requires the callback and its context to remain valid and
+// safe to invoke from the thread that consumes or releases the scan stream.
+unsafe impl Send for SendScanStatisticsCallback {}
+unsafe impl Sync for SendScanStatisticsCallback {}
+
+impl SendScanStatisticsCallback {
+    fn invoke(&self, counts: &ExecutionSummaryCounts) {
+        // Dynamic profile metrics are best-effort. Use fallible reservation so
+        // allocation failure omits them instead of aborting the embedding process.
+        let mut metrics = Vec::new();
+        if let Some(metrics_len) = counts.all_counts.len().checked_add(counts.all_times.len())
+            && metrics.try_reserve_exact(metrics_len).is_ok()
+        {
+            metrics.extend(
+                counts
+                    .all_counts
+                    .iter()
+                    .map(|(name, value)| LanceScanMetric {
+                        name: name.as_ptr().cast(),
+                        name_len: name.len(),
+                        kind: LanceScanMetricKind::Count,
+                        value: *value as u64,
+                    }),
+            );
+            metrics.extend(
+                counts
+                    .all_times
+                    .iter()
+                    .map(|(name, value)| LanceScanMetric {
+                        name: name.as_ptr().cast(),
+                        name_len: name.len(),
+                        kind: LanceScanMetricKind::TimeNanoseconds,
+                        value: *value as u64,
+                    }),
+            );
+        }
+
+        let statistics = LanceScanStatistics {
+            iops: counts.iops as u64,
+            requests: counts.requests as u64,
+            bytes_read: counts.bytes_read as u64,
+            indices_loaded: counts.indices_loaded as u64,
+            index_partitions_loaded: counts.parts_loaded as u64,
+            index_comparisons: counts.index_comparisons as u64,
+            metrics: if metrics.is_empty() {
+                ptr::null()
+            } else {
+                metrics.as_ptr()
+            },
+            metrics_len: metrics.len(),
+        };
+        unsafe { (self.callback)(self.ctx, &statistics) };
     }
 }
 
@@ -526,6 +649,60 @@ unsafe fn scanner_set_substrait_filter_inner(
     let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
     let s = unsafe { &mut *scanner };
     s.substrait_filter = Some(slice.to_vec());
+    Ok(0)
+}
+
+/// Register a callback that receives execution statistics when the scan stream
+/// reaches EOF, fails, or is released.
+///
+/// The callback and `callback_ctx` must remain valid until the scan stream is
+/// finalized. Metric names and arrays passed to the callback are borrowed and
+/// must be copied if the caller needs to retain them. The callback must be
+/// thread-safe, must return normally without unwinding or throwing an
+/// exception, and must not call `lance_scanner_*` with the originating scanner.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_statistics_callback(
+    scanner: *mut LanceScanner,
+    callback: LanceScanStatisticsCallback,
+    callback_ctx: *mut c_void,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    ffi_try!(
+        unsafe { scanner_set_statistics_callback_inner(scanner, callback, callback_ctx) },
+        neg
+    )
+}
+
+unsafe fn scanner_set_statistics_callback_inner(
+    scanner: *mut LanceScanner,
+    callback: LanceScanStatisticsCallback,
+    callback_ctx: *mut c_void,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let Some(callback) = callback else {
+        return Err(lance_core::Error::invalid_input_source(
+            "statistics callback is NULL".into(),
+        ));
+    };
+
+    let s = unsafe { &mut *scanner };
+    if s.scan_started.load(Ordering::Acquire) {
+        return Err(lance_core::Error::invalid_input_source(
+            "statistics callback must be registered before the scan starts".into(),
+        ));
+    }
+
+    let callback = SendScanStatisticsCallback {
+        callback,
+        ctx: callback_ctx,
+    };
+    s.scan_statistics_callback = Some(Arc::new(move |counts: &ExecutionSummaryCounts| {
+        callback.invoke(counts);
+    }));
     Ok(0)
 }
 

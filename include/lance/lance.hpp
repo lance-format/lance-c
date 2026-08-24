@@ -1127,6 +1127,16 @@ public:
         return substrait_filter(bytes.data(), bytes.size());
     }
 
+    /// Register a callback for scan execution statistics before starting the scan.
+    /// The callback may run on the thread that consumes or releases the stream. It
+    /// must be thread-safe, must not throw, and must not re-enter the originating
+    /// scanner. A non-null callback context must outlive the exported stream.
+    Scanner& statistics_callback(LanceScanStatisticsCallback callback, void* callback_ctx) {
+        if (lance_scanner_set_statistics_callback(handle_.get(), callback, callback_ctx) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Restrict the next k-NN query to a subset of vector index segments.
     /// Pass `len` 16-byte UUIDs concatenated as a single byte buffer
     /// (total bytes = `len * 16`). Pass len=0 (and any pointer) to clear.
