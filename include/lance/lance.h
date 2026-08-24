@@ -883,7 +883,7 @@ typedef struct {
 } LanceScanMetric;
 
 /**
- * Borrowed view of the execution statistics for one finalized scan.
+ * Borrowed view of the execution statistics for one fully consumed scan.
  *
  * The fixed fields are stable summary metrics. `metrics` contains additional
  * implementation-specific counters and timings. Those names are not a stable
@@ -903,13 +903,13 @@ typedef struct {
 } LanceScanStatistics;
 
 /**
- * Receives scan statistics when a stream reaches EOF, fails, or is released.
+ * Receives scan statistics after a stream is fully consumed to EOF.
  *
  * The statistics and all nested pointers are borrowed and valid only for the
- * duration of this call. The callback may run on the thread that consumes or
- * releases the scan stream and must therefore be thread-safe. It must return
- * normally without throwing an exception or unwinding, and must not call any
- * `lance_scanner_*` function with the originating scanner.
+ * duration of this call. The callback may run on the thread that observes EOF
+ * and must therefore be thread-safe. It must return normally without throwing
+ * an exception or unwinding, and must not call any `lance_scanner_*` function
+ * with the originating scanner.
  *
  * Scan statistics are diagnostic and best-effort. The callback must handle its
  * own errors and must not use them to abort or throw across this FFI boundary.
@@ -925,8 +925,15 @@ typedef void (*LanceScanStatisticsCallback)(
  * Must be called before starting the scan; registering after the scan starts
  * returns an error. `callback` must not be NULL. `callback_ctx` may be NULL. A
  * non-NULL `callback_ctx` must remain valid, and `callback` must remain valid,
- * until the stream reaches EOF, fails, or is released. Replaces a previously
- * registered callback.
+ * until the callback returns or, if the callback has not run, until the owning
+ * scan stream is released. For `lance_scanner_next` and
+ * `lance_scanner_poll_next`, the scanner owns the stream. For an exported
+ * ArrowArrayStream, the Arrow stream owns it independently of the scanner.
+ *
+ * The callback is invoked exactly once when the stream is fully consumed to
+ * EOF. It is not guaranteed to run if execution fails, the scan is cancelled,
+ * or the scanner / ArrowArrayStream is released before EOF. Replaces a
+ * previously registered callback.
  *
  * @return 0 on success, -1 on error
  */

@@ -315,7 +315,7 @@ pub struct LanceScanMetric {
     pub value: u64,
 }
 
-/// Borrowed view of the execution statistics for one completed scan.
+/// Borrowed view of the execution statistics for one fully consumed scan.
 ///
 /// The fixed fields are stable summary metrics. `metrics` contains additional
 /// implementation-specific counters and timings and is valid only for the
@@ -333,7 +333,7 @@ pub struct LanceScanStatistics {
     pub metrics_len: usize,
 }
 
-/// Callback invoked when a scan stream reaches EOF, fails, or is released.
+/// Callback invoked after a scan stream is fully consumed to EOF.
 ///
 /// The callback is an FFI boundary and must return normally without unwinding
 /// or throwing an exception. It must not call back into `lance_scanner_*` with
@@ -347,7 +347,7 @@ struct SendScanStatisticsCallback {
 }
 
 // SAFETY: The C API requires the callback and its context to remain valid and
-// safe to invoke from the thread that consumes or releases the scan stream.
+// safe to invoke from the thread that observes the scan stream's EOF.
 unsafe impl Send for SendScanStatisticsCallback {}
 unsafe impl Sync for SendScanStatisticsCallback {}
 
@@ -652,14 +652,17 @@ unsafe fn scanner_set_substrait_filter_inner(
     Ok(0)
 }
 
-/// Register a callback that receives execution statistics when the scan stream
-/// reaches EOF, fails, or is released.
+/// Register a callback that receives execution statistics after the scan stream
+/// is fully consumed to EOF.
 ///
-/// The callback and `callback_ctx` must remain valid until the scan stream is
-/// finalized. Metric names and arrays passed to the callback are borrowed and
-/// must be copied if the caller needs to retain them. The callback must be
-/// thread-safe, must return normally without unwinding or throwing an
-/// exception, and must not call `lance_scanner_*` with the originating scanner.
+/// The callback is not guaranteed to run if execution fails, the scan is
+/// cancelled, or the scanner / exported Arrow stream is released before EOF.
+/// The callback and `callback_ctx` must remain valid until the callback returns
+/// or, if it has not run, until the owning scan stream is released. Metric names
+/// and arrays passed to the callback are borrowed and must be copied if the
+/// caller needs to retain them. The callback must be thread-safe, must return
+/// normally without unwinding or throwing an exception, and must not call
+/// `lance_scanner_*` with the originating scanner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_statistics_callback(
     scanner: *mut LanceScanner,

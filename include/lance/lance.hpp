@@ -1127,10 +1127,11 @@ public:
         return substrait_filter(bytes.data(), bytes.size());
     }
 
-    /// Register a callback for scan execution statistics before starting the scan.
-    /// The callback may run on the thread that consumes or releases the stream. It
-    /// must be thread-safe, must not throw, and must not re-enter the originating
-    /// scanner. A non-null callback context must outlive the exported stream.
+    /// Register a callback for scan statistics after successful full exhaustion.
+    /// The callback is not guaranteed on error, cancellation, or early release. It
+    /// may run on the thread that observes EOF, must be thread-safe, must not throw,
+    /// and must not re-enter the originating scanner. The callback and a non-null
+    /// context must remain valid until the callback returns or the stream is released.
     Scanner& statistics_callback(LanceScanStatisticsCallback callback, void* callback_ctx) {
         if (lance_scanner_set_statistics_callback(handle_.get(), callback, callback_ctx) != 0)
             check_error();
