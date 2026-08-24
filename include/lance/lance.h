@@ -873,7 +873,8 @@ typedef enum {
  * Borrowed view of one dynamically named scan metric.
  *
  * `name` is not NUL-terminated. `name` and this structure are valid only for
- * the duration of the LanceScanStatisticsCallback invocation.
+ * the duration of the LanceScanStatisticsCallback invocation. Metric order is
+ * unspecified.
  */
 typedef struct {
     const char* name;
@@ -905,11 +906,22 @@ typedef struct {
 /**
  * Receives scan statistics after a stream is fully consumed to EOF.
  *
- * The statistics and all nested pointers are borrowed and valid only for the
- * duration of this call. The callback may run on the thread that observes EOF
- * and must therefore be thread-safe. It must return normally without throwing
- * an exception or unwinding, and must not call any `lance_scanner_*` function
- * with the originating scanner.
+ * `statistics` is non-NULL. It and all nested pointers are borrowed and valid
+ * only for the duration of this call. The callback may run on the thread that
+ * observes EOF and must therefore be thread-safe. It must return normally
+ * without throwing an exception or unwinding, and must not call any
+ * `lance_scanner_*` function with the originating scanner.
+ *
+ * From callback entry until the enclosing operation that observes EOF has
+ * returned to its caller, the callback must not directly or indirectly cause
+ * `get_schema`, `get_next`, `get_last_error`, or `release` to be called on any
+ * ArrowArrayStream derived from the originating scanner, nor cause such a
+ * stream to be moved, destroyed, or otherwise accessed. This includes signaling
+ * or scheduling another thread to act based only on callback completion: the
+ * callback returns before the enclosing stream operation does. Such interaction
+ * is reentrant and has undefined behavior. Normal access may resume only after
+ * the enclosing ArrowArrayStream `get_next`, `lance_scanner_next`, or
+ * `lance_scanner_poll_next` call returns to its caller.
  *
  * Scan statistics are diagnostic and best-effort. The callback must handle its
  * own errors and must not use them to abort or throw across this FFI boundary.
@@ -925,15 +937,27 @@ typedef void (*LanceScanStatisticsCallback)(
  * Must be called before starting the scan; registering after the scan starts
  * returns an error. `callback` must not be NULL. `callback_ctx` may be NULL. A
  * non-NULL `callback_ctx` must remain valid, and `callback` must remain valid,
- * until the callback returns or, if the callback has not run, until the owning
- * scan stream is released. For `lance_scanner_next` and
- * `lance_scanner_poll_next`, the scanner owns the stream. For an exported
- * ArrowArrayStream, the Arrow stream owns it independently of the scanner.
+ * until all of the following are true: the scanner is closed, every in-flight
+ * `lance_scanner_scan_async` call has delivered its completion callback, and
+ * every ArrowArrayStream derived from the scanner has been released. The
+ * registration remains installed after a callback returns and applies to
+ * streams created later from the same scanner. For `lance_scanner_next` and
+ * `lance_scanner_poll_next`, the scanner owns the stream. Exported and
+ * asynchronous ArrowArrayStreams own their registrations independently of the
+ * scanner and may invoke the callback after the scanner is closed. Concurrent
+ * streams may invoke the callback concurrently.
  *
- * The callback is invoked exactly once when the stream is fully consumed to
- * EOF. It is not guaranteed to run if execution fails, the scan is cancelled,
- * or the scanner / ArrowArrayStream is released before EOF. Replaces a
- * previously registered callback.
+ * The callback is invoked exactly once for each derived stream that is fully
+ * consumed to EOF. It is not guaranteed to run for a stream if execution fails,
+ * the scan is cancelled, or the scanner / ArrowArrayStream is released before
+ * EOF. Before scanning starts, a new registration replaces the previous one;
+ * after a successful replacement, the previous callback and context are no
+ * longer retained and may be retired.
+ *
+ * From callback entry until the enclosing EOF-observing operation returns, the
+ * callback must not directly or indirectly cause interaction with any
+ * ArrowArrayStream derived from this scanner; see LanceScanStatisticsCallback
+ * for the complete reentrancy restriction.
  *
  * @return 0 on success, -1 on error
  */
@@ -950,6 +974,7 @@ void lance_scanner_close(LanceScanner* scanner);
 
 /**
  * Materialize the scan as an ArrowArrayStream (blocking).
+ * The scanner remains valid, and each call creates an independent stream.
  *
  * Reading the exported stream may surface a mid-iteration panic as one
  * error through the Arrow C stream contract (nonzero get_next plus

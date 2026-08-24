@@ -39,6 +39,36 @@
         }                                                                      \
     } while (0)
 
+typedef struct {
+    uint64_t calls;
+    uint64_t bytes_read;
+    int invalid;
+} ScanStatisticsCapture;
+
+static void capture_scan_statistics(
+    void *callback_ctx,
+    const LanceScanStatistics *statistics
+) {
+    if (callback_ctx == NULL) return;
+    ScanStatisticsCapture *captured = (ScanStatisticsCapture *)callback_ctx;
+    if (statistics == NULL ||
+        (statistics->metrics_len > 0 && statistics->metrics == NULL)) {
+        captured->invalid = 1;
+        return;
+    }
+    for (size_t i = 0; i < statistics->metrics_len; ++i) {
+        const LanceScanMetric *metric = &statistics->metrics[i];
+        if ((metric->name_len > 0 && metric->name == NULL) ||
+            (metric->kind != LANCE_SCAN_METRIC_COUNT &&
+             metric->kind != LANCE_SCAN_METRIC_TIME_NANOSECONDS)) {
+            captured->invalid = 1;
+            return;
+        }
+    }
+    captured->calls += 1;
+    captured->bytes_read = statistics->bytes_read;
+}
+
 static void test_open_and_metadata(const char *uri) {
     printf("  test_open_and_metadata... ");
 
@@ -84,10 +114,14 @@ static void test_scan(const char *uri) {
     /* Full scan via ArrowArrayStream */
     LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
     ASSERT(scanner != NULL, "scanner creation failed");
+    ScanStatisticsCapture captured = {0};
+    int32_t rc = lance_scanner_set_statistics_callback(
+        scanner, capture_scan_statistics, &captured);
+    ASSERT(rc == 0, "statistics callback registration failed");
 
     struct ArrowArrayStream stream;
     memset(&stream, 0, sizeof(stream));
-    int32_t rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    rc = lance_scanner_to_arrow_stream(scanner, &stream);
     ASSERT(rc == 0, "to_arrow_stream failed");
 
     /* Read schema from stream */
@@ -113,6 +147,9 @@ static void test_scan(const char *uri) {
     }
 
     ASSERT(total_rows == expected_rows, "row count mismatch");
+    ASSERT(captured.calls == 1, "statistics callback count mismatch");
+    ASSERT(captured.bytes_read > 0, "statistics should report bytes read");
+    ASSERT(captured.invalid == 0, "statistics callback received invalid data");
     printf("rows=%llu... ", (unsigned long long)total_rows);
 
     if (stream.release) stream.release(&stream);

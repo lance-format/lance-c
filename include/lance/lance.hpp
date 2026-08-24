@@ -1128,10 +1128,22 @@ public:
     }
 
     /// Register a callback for scan statistics after successful full exhaustion.
-    /// The callback is not guaranteed on error, cancellation, or early release. It
-    /// may run on the thread that observes EOF, must be thread-safe, must not throw,
-    /// and must not re-enter the originating scanner. The callback and a non-null
-    /// context must remain valid until the callback returns or the stream is released.
+    /// The registration applies to every stream derived from this scanner, including
+    /// concurrent streams and streams created after an earlier callback returns. The
+    /// callback is not guaranteed on error, cancellation, or early release. It may
+    /// run on the thread that observes EOF, must be thread-safe, must not throw, and
+    /// must not re-enter the originating scanner. The callback and a non-null context
+    /// must remain valid until the scanner is closed, all async scan requests have
+    /// delivered their completion callbacks, and all derived streams are released.
+    /// From callback entry until the enclosing operation that observes EOF has
+    /// returned to its caller, the callback must not directly or indirectly cause
+    /// any ArrowArrayStream derived from this Scanner to be accessed, called,
+    /// released, moved, or destroyed. This includes signaling or scheduling another
+    /// thread to act based only on callback completion: the callback returns before
+    /// the enclosing stream operation does. Such interaction is reentrant and has
+    /// undefined behavior. Normal access may resume only after the enclosing
+    /// ArrowArrayStream `get_next`, `lance_scanner_next`, or
+    /// `lance_scanner_poll_next` call returns.
     Scanner& statistics_callback(LanceScanStatisticsCallback callback, void* callback_ctx) {
         if (lance_scanner_set_statistics_callback(handle_.get(), callback, callback_ctx) != 0)
             check_error();
@@ -1153,7 +1165,7 @@ public:
         return index_segments(reinterpret_cast<const uint8_t*>(uuids.data()), uuids.size());
     }
 
-    /// Materialize the scan as an ArrowArrayStream (blocking).
+    /// Materialize an independent ArrowArrayStream (blocking). The scanner remains valid.
     void to_arrow_stream(ArrowArrayStream* out) {
         if (lance_scanner_to_arrow_stream(handle_.get(), out) != 0)
             check_error();

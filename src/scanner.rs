@@ -305,7 +305,7 @@ pub enum LanceScanMetricKind {
 /// Borrowed view of one dynamically named scan metric.
 ///
 /// `name` is not NUL-terminated. Both `name` and this structure are valid only
-/// for the duration of the scan statistics callback.
+/// for the duration of the scan statistics callback. Metric order is unspecified.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LanceScanMetric {
@@ -318,8 +318,10 @@ pub struct LanceScanMetric {
 /// Borrowed view of the execution statistics for one fully consumed scan.
 ///
 /// The fixed fields are stable summary metrics. `metrics` contains additional
-/// implementation-specific counters and timings and is valid only for the
-/// duration of the callback.
+/// implementation-specific counters and timings whose names are not a stable API
+/// and are intended only for diagnostics and profiles. Dynamic metrics are
+/// best-effort and may be omitted if they cannot be materialized. `metrics` is
+/// null when `metrics_len` is zero and is valid only for the callback duration.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LanceScanStatistics {
@@ -333,13 +335,20 @@ pub struct LanceScanStatistics {
     pub metrics_len: usize,
 }
 
-/// Callback invoked after a scan stream is fully consumed to EOF.
+/// Callback invoked once for each derived scan stream that is fully consumed to EOF.
 ///
 /// The callback is an FFI boundary and must return normally without unwinding
 /// or throwing an exception. It must not call back into `lance_scanner_*` with
-/// the originating scanner.
+/// the originating scanner. From callback entry until the enclosing operation
+/// that observes EOF has returned to its caller, the callback must not directly
+/// or indirectly cause any Arrow C stream derived from the originating scanner to
+/// be called, released, moved, destroyed, or otherwise accessed. This includes
+/// signaling or scheduling another thread to act based only on callback completion:
+/// the callback returns before the enclosing stream operation does. Such interaction
+/// is reentrant and has undefined behavior. Normal access may resume only after the
+/// enclosing `get_next`, `lance_scanner_next`, or `lance_scanner_poll_next` returns.
 pub type LanceScanStatisticsCallback =
-    Option<unsafe extern "C" fn(ctx: *mut c_void, statistics: *const LanceScanStatistics)>;
+    Option<unsafe extern "C" fn(callback_ctx: *mut c_void, statistics: *const LanceScanStatistics)>;
 
 struct SendScanStatisticsCallback {
     callback: unsafe extern "C" fn(*mut c_void, *const LanceScanStatistics),
@@ -347,7 +356,9 @@ struct SendScanStatisticsCallback {
 }
 
 // SAFETY: The C API requires the callback and its context to remain valid and
-// safe to invoke from the thread that observes the scan stream's EOF.
+// safe to invoke until the scanner is closed, every in-flight asynchronous scan
+// has delivered its completion callback, and every derived stream has been
+// released. Concurrent derived streams may invoke the callback concurrently.
 unsafe impl Send for SendScanStatisticsCallback {}
 unsafe impl Sync for SendScanStatisticsCallback {}
 
@@ -657,12 +668,24 @@ unsafe fn scanner_set_substrait_filter_inner(
 ///
 /// The callback is not guaranteed to run if execution fails, the scan is
 /// cancelled, or the scanner / exported Arrow stream is released before EOF.
-/// The callback and `callback_ctx` must remain valid until the callback returns
-/// or, if it has not run, until the owning scan stream is released. Metric names
-/// and arrays passed to the callback are borrowed and must be copied if the
-/// caller needs to retain them. The callback must be thread-safe, must return
-/// normally without unwinding or throwing an exception, and must not call
-/// `lance_scanner_*` with the originating scanner.
+/// The registration applies to every stream derived from this scanner, including
+/// streams created after an earlier callback has returned. The callback and
+/// `callback_ctx` must remain valid until the scanner is closed, every in-flight
+/// asynchronous scan has delivered its completion callback, and every derived
+/// stream has been released.
+/// Metric names and arrays passed to the callback are borrowed and must be copied
+/// if the caller needs to retain them. The callback must be thread-safe, must
+/// return normally without unwinding or throwing an exception, and must not call
+/// `lance_scanner_*` with the originating scanner. From callback entry until the
+/// enclosing operation that observes EOF has returned to its caller, the callback
+/// must not directly or indirectly cause any Arrow C stream derived from that
+/// scanner to be called, released, moved, destroyed, or otherwise accessed. This
+/// includes signaling or scheduling another thread to act based only on callback
+/// completion: the callback returns before the enclosing stream operation does.
+/// Such interaction is reentrant and has undefined behavior. Normal access may
+/// resume only after the enclosing `get_next`, `lance_scanner_next`, or
+/// `lance_scanner_poll_next` returns. Replacing the registration before scanning
+/// starts immediately releases the previous registration.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_statistics_callback(
     scanner: *mut LanceScanner,
@@ -732,7 +755,7 @@ pub unsafe extern "C" fn lance_scanner_close(scanner: *mut LanceScanner) {
 /// Materialize the scan as an Arrow C Data Interface `ArrowArrayStream`.
 ///
 /// This is the preferred API for simple integrations — blocks the calling thread.
-/// The scanner is consumed by this call and should not be used afterward (close it).
+/// The scanner remains valid and may be used to create additional streams.
 ///
 /// The exported stream is panic-guarded (issue #61): a panic during export
 /// poisons the scanner — this call returns -1 with `LANCE_ERR_PANIC`, and

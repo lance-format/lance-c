@@ -25,6 +25,25 @@
 #define TEST(name) printf("  %s... ", #name)
 #define PASS()     printf("OK\n")
 
+struct ScanStatisticsCapture {
+    uint64_t calls = 0;
+    uint64_t bytes_read = 0;
+    bool invalid = false;
+};
+
+static void capture_scan_statistics(
+    void* callback_ctx,
+    const LanceScanStatistics* statistics) noexcept {
+    if (!callback_ctx) return;
+    auto* captured = static_cast<ScanStatisticsCapture*>(callback_ctx);
+    if (!statistics || (statistics->metrics_len > 0 && !statistics->metrics)) {
+        captured->invalid = true;
+        return;
+    }
+    captured->calls += 1;
+    captured->bytes_read = statistics->bytes_read;
+}
+
 static void test_dataset_open(const std::string& uri) {
     TEST(test_dataset_open);
 
@@ -70,7 +89,11 @@ static void test_scanner_fluent(const std::string& uri) {
 
     // Fluent builder pattern.
     auto scanner = ds.scan();
-    scanner.limit(5).offset(0).batch_size(2);
+    ScanStatisticsCapture captured;
+    scanner.limit(5)
+           .offset(0)
+           .batch_size(2)
+           .statistics_callback(capture_scan_statistics, &captured);
 
     ArrowArrayStream stream;
     memset(&stream, 0, sizeof(stream));
@@ -89,6 +112,9 @@ static void test_scanner_fluent(const std::string& uri) {
     }
 
     assert(total == 5);
+    assert(captured.calls == 1);
+    assert(captured.bytes_read > 0);
+    assert(!captured.invalid);
     printf("rows=%llu... ", (unsigned long long)total);
 
     if (stream.release) stream.release(&stream);
