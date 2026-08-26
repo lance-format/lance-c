@@ -6,8 +6,8 @@
 use std::ffi::{c_char, c_void};
 use std::pin::Pin;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use arrow::ffi_stream::FFI_ArrowArrayStream;
@@ -71,6 +71,11 @@ pub struct LanceScanner {
     // the spawned async task can poison the handle from outside this call
     // frame via `poison_flag()`.
     poisoned: Arc<AtomicBool>,
+    // Every RawWaker handed to the poll stream registers here. Close retires
+    // the registry before dropping the stream: pending callbacks are
+    // cancelled and callbacks already in progress are allowed to quiesce
+    // before the caller may destroy callback_ctx.
+    poll_wakers: PollWakerRegistry,
     scan_statistics_callback: Option<ExecutionStatsCallback>,
     scan_started: AtomicBool,
     // Materialized on first iteration call
@@ -126,6 +131,7 @@ impl LanceScanner {
             prefilter: false,
             fts_query: None,
             poisoned: Arc::new(AtomicBool::new(false)),
+            poll_wakers: PollWakerRegistry::default(),
             scan_statistics_callback: None,
             scan_started: AtomicBool::new(false),
             stream: None,
@@ -754,6 +760,12 @@ unsafe fn scanner_set_statistics_callback_inner(
 
 /// Close and free a scanner handle.
 ///
+/// Pending poll wakers are cancelled before the stream is dropped. If a poll
+/// waker callback is already running on another thread, close waits for that
+/// callback to return, making this function the retirement boundary for its
+/// callback context. A waker callback must therefore never close or otherwise
+/// re-enter its originating scanner.
+///
 /// Best-effort (issue #61): this drops a possibly-live
 /// `DatasetRecordBatchStream`, the highest-risk `Drop` in this crate. A
 /// panic raised while dropping the handle is caught and logged rather than
@@ -763,7 +775,9 @@ unsafe fn scanner_set_statistics_callback_inner(
 pub unsafe extern "C" fn lance_scanner_close(scanner: *mut LanceScanner) {
     if !scanner.is_null() {
         swallow_unwind("lance_scanner_close", || unsafe {
-            let _ = Box::from_raw(scanner);
+            let scanner = Box::from_raw(scanner);
+            scanner.poll_wakers.retire_and_wait();
+            drop(scanner);
         });
     }
 }
@@ -1212,7 +1226,9 @@ pub unsafe extern "C" fn lance_scanner_async_stream_free(stream: *mut FFI_ArrowA
 ///   waker callback.
 ///   The caller should yield the thread and re-poll after the waker fires.
 /// - The waker is single-use: it fires at most once per poll call that returns PENDING.
-///   Its context must remain valid until it fires or the scanner is closed.
+///   Its context must remain valid until the callback returns or
+///   `lance_scanner_close` returns. Close cancels callbacks that have not
+///   entered and waits for callbacks already in progress.
 ///
 /// The stream is lazily materialized on the first poll call (which will typically
 /// return PENDING while the stream opens).
@@ -1283,12 +1299,12 @@ unsafe fn scanner_poll_next_inner(
         return LancePollStatus::Error;
     }
 
-    let stream = s.stream.as_mut().unwrap();
-
     // Construct a std::task::Waker from the C function pointer.
-    let raw_waker = make_raw_waker(waker, waker_ctx);
+    let raw_waker = make_raw_waker(&s.poll_wakers, waker, waker_ctx);
     let waker_obj = unsafe { Waker::from_raw(raw_waker) };
     let mut cx = Context::from_waker(&waker_obj);
+
+    let stream = s.stream.as_mut().unwrap();
 
     // Enter the Tokio runtime context so internal I/O futures can access
     // the reactor. Without this, polling from a non-Tokio thread panics.
@@ -1327,19 +1343,45 @@ unsafe fn scanner_poll_next_inner(
 struct CWakerContext {
     waker_fn: LanceWaker,
     ctx: *mut c_void,
-    fired: AtomicBool,
+    state: Mutex<CWakerState>,
+    quiesced: Condvar,
+}
+
+#[derive(Default)]
+struct CWakerState {
+    fired: bool,
+    cancelled: bool,
+    active: bool,
+}
+
+#[derive(Default)]
+struct PollWakerRegistry {
+    state: Mutex<PollWakerRegistryState>,
+}
+
+#[derive(Default)]
+struct PollWakerRegistryState {
+    retired: bool,
+    registrations: Vec<Weak<CWakerContext>>,
 }
 
 // C function pointers + void* are Send by convention for FFI.
 unsafe impl Send for CWakerContext {}
 unsafe impl Sync for CWakerContext {}
 
-fn make_raw_waker(waker_fn: LanceWaker, ctx: *mut c_void) -> RawWaker {
-    let data = Arc::into_raw(Arc::new(CWakerContext {
+fn make_raw_waker(
+    registry: &PollWakerRegistry,
+    waker_fn: LanceWaker,
+    ctx: *mut c_void,
+) -> RawWaker {
+    let context = Arc::new(CWakerContext {
         waker_fn,
         ctx,
-        fired: AtomicBool::new(false),
-    })) as *const ();
+        state: Mutex::new(CWakerState::default()),
+        quiesced: Condvar::new(),
+    });
+    registry.register(&context);
+    let data = Arc::into_raw(context) as *const ();
 
     const VTABLE: RawWakerVTable = RawWakerVTable::new(
         // clone
@@ -1370,8 +1412,93 @@ fn make_raw_waker(waker_fn: LanceWaker, ctx: *mut c_void) -> RawWaker {
 
 impl CWakerContext {
     fn wake_once(&self) {
-        if !self.fired.swap(true, Ordering::AcqRel) {
-            unsafe { (self.waker_fn)(self.ctx) };
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.cancelled || state.fired {
+                return;
+            }
+            state.fired = true;
+            state.active = true;
+        }
+
+        unsafe { (self.waker_fn)(self.ctx) };
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active = false;
+        self.quiesced.notify_all();
+    }
+
+    fn cancel(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancelled = true;
+    }
+
+    fn wait_until_quiescent(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.active {
+            state = self
+                .quiesced
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+impl PollWakerRegistry {
+    fn register(&self, registration: &Arc<CWakerContext>) {
+        let retired = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .registrations
+                .retain(|candidate| candidate.strong_count() > 0);
+            if state.retired {
+                true
+            } else {
+                state.registrations.push(Arc::downgrade(registration));
+                false
+            }
+        };
+        if retired {
+            registration.cancel();
+        }
+    }
+
+    fn retire_and_wait(&self) {
+        let registrations = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.retired = true;
+            state
+                .registrations
+                .drain(..)
+                .filter_map(|registration| registration.upgrade())
+                .collect::<Vec<_>>()
+        };
+
+        // Cancel every registration before waiting for any one callback, so
+        // no later registration can enter while close is quiescing an earlier
+        // one.
+        for registration in &registrations {
+            registration.cancel();
+        }
+        for registration in registrations {
+            registration.wait_until_quiescent();
         }
     }
 }
@@ -1715,6 +1842,8 @@ mod tests {
     use crate::error::{lance_last_error_code, lance_last_error_message};
     use std::ffi::{CStr, CString};
     use std::sync::atomic::{AtomicI32, AtomicUsize};
+    use std::sync::{Barrier, mpsc};
+    use std::time::Duration;
 
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -1827,13 +1956,109 @@ mod tests {
         }
 
         WAKES.store(0, Ordering::SeqCst);
-        let waker = unsafe { Waker::from_raw(make_raw_waker(count_wake, ptr::null_mut())) };
+        let registry = PollWakerRegistry::default();
+        let waker =
+            unsafe { Waker::from_raw(make_raw_waker(&registry, count_wake, ptr::null_mut())) };
         let cloned = waker.clone();
         waker.wake_by_ref();
         cloned.wake_by_ref();
         drop(cloned);
         drop(waker);
         assert_eq!(WAKES.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn scanner_close_cancels_a_retained_poll_waker() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let calls = Box::into_raw(Box::new(AtomicUsize::new(0)));
+
+        unsafe extern "C" fn count_wake(ctx: *mut c_void) {
+            let calls = unsafe { &*(ctx.cast::<AtomicUsize>()) };
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        // Model a future retaining the RawWaker clone returned from a PENDING
+        // poll. Closing the scanner is the documented retirement boundary, so
+        // waking that retained clone afterwards must not touch callback_ctx.
+        let waker = unsafe {
+            Waker::from_raw(make_raw_waker(
+                &(*scanner).poll_wakers,
+                count_wake,
+                calls.cast(),
+            ))
+        };
+        unsafe { lance_scanner_close(scanner) };
+        waker.wake();
+
+        let calls = unsafe { Box::from_raw(calls) };
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a retained RawWaker invoked callback_ctx after scanner close"
+        );
+        unsafe { lance_dataset_close(dataset) };
+    }
+
+    struct BlockingWakeProbe {
+        calls: AtomicUsize,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    unsafe extern "C" fn blocking_waker(ctx: *mut c_void) {
+        let probe = unsafe { &*(ctx.cast::<BlockingWakeProbe>()) };
+        probe.calls.fetch_add(1, Ordering::SeqCst);
+        probe.entered.wait();
+        probe.release.wait();
+    }
+
+    #[test]
+    fn scanner_close_waits_for_an_active_poll_waker() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let probe = Box::into_raw(Box::new(BlockingWakeProbe {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        let waker = unsafe {
+            Waker::from_raw(make_raw_waker(
+                &(*scanner).poll_wakers,
+                blocking_waker,
+                probe.cast(),
+            ))
+        };
+
+        let wake_thread = std::thread::spawn(move || waker.wake());
+        entered.wait();
+
+        let close_started = Arc::new(Barrier::new(2));
+        let close_started_in_thread = Arc::clone(&close_started);
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let scanner_address = scanner as usize;
+        let close_thread = std::thread::spawn(move || {
+            close_started_in_thread.wait();
+            unsafe { lance_scanner_close(scanner_address as *mut LanceScanner) };
+            closed_tx.send(()).unwrap();
+        });
+        close_started.wait();
+
+        let closed_while_callback_was_active =
+            closed_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        release.wait();
+        wake_thread.join().unwrap();
+        close_thread.join().unwrap();
+
+        let probe = unsafe { Box::from_raw(probe) };
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !closed_while_callback_was_active,
+            "scanner close returned before an active poll waker callback completed"
+        );
+        unsafe { lance_dataset_close(dataset) };
     }
 
     fn panicking_setter_body() -> Result<i32> {

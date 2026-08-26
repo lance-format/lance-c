@@ -1009,7 +1009,16 @@ int32_t lance_scanner_set_statistics_callback(
     void* callback_ctx
 );
 
-/** Close and free a scanner handle. */
+/**
+ * Close and free a scanner handle. Safe to call with NULL; a non-NULL handle
+ * must be closed exactly once.
+ *
+ * This is the retirement boundary for poll wakers registered by
+ * lance_scanner_poll_next(): it cancels callbacks that have not entered and
+ * waits for any callback already in progress to return before freeing the
+ * scanner. Do not call this function from one of the scanner's own waker
+ * callbacks, because close must wait for that callback to return.
+ */
 void lance_scanner_close(LanceScanner* scanner);
 
 /* ─── Sync scan: ArrowArrayStream ─── */
@@ -1126,8 +1135,14 @@ typedef enum {
  * Waker callback: called from a Tokio thread when data is ready. A waker
  * passed to lance_scanner_poll_next() must not be NULL. For one poll call
  * that returns LANCE_POLL_PENDING, all internal RawWaker clones share a
- * one-shot gate, so the callback fires at most once. `ctx` must remain valid
- * until that callback fires or the scanner is closed.
+ * one-shot gate, so the callback fires at most once.
+ *
+ * The callback and `ctx` must be thread-safe and must remain valid until the
+ * callback returns or lance_scanner_close() returns. Close cancels a pending
+ * callback and waits for an active callback before returning, so the caller
+ * may destroy `ctx` afterwards. The callback must return normally and must
+ * not call lance_scanner_close() or otherwise re-enter its originating
+ * scanner.
  */
 typedef void (*LanceWaker)(void* ctx);
 
