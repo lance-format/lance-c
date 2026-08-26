@@ -42,7 +42,7 @@ struct Dispatcher {
 }
 
 impl Dispatcher {
-    fn new() -> Self {
+    fn new() -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel::<DispatcherMessage>();
 
         std::thread::Builder::new()
@@ -50,48 +50,62 @@ impl Dispatcher {
             .spawn(move || {
                 log::debug!("Lance C dispatcher thread started");
                 while let Ok(msg) = rx.recv() {
-                    // Install the carried error on THIS thread's TLS so the
-                    // callback's `lance_last_error_*` calls observe it. TLS
-                    // persists across callbacks on this thread, so a success
-                    // must explicitly clear: a stale error from an earlier
-                    // failed callback must never leak into a later one.
-                    match &msg.error {
-                        Some((code, message)) => set_last_error(*code, message),
-                        None => clear_last_error(),
-                    }
-                    // Invoke the C callback under catch_unwind, best-effort
-                    // only (issue #61). The declared callback ABI is
-                    // `extern "C"` and therefore NON-unwinding — `lance.h`
-                    // requires callbacks not to panic, and a panic in such a
-                    // callback aborts at its own boundary before this catch
-                    // could ever run. The catch exists solely for Rust hosts
-                    // that pass an `extern "C-unwind"` callback: for them it
-                    // keeps the dispatcher thread (and with it every later
-                    // async completion) alive. It is not part of the panic
-                    // contract and must never be relied on as one.
-                    let outcome = catch_unwind(AssertUnwindSafe(|| unsafe {
-                        (msg.callback)(msg.callback_ctx, msg.status, msg.result);
-                    }));
-                    if let Err(payload) = outcome {
-                        log::error!(
-                            "lance-c dispatcher: unwinding (C-unwind) host callback panicked; contained best-effort: {}",
-                            panic_payload_message(&*payload)
-                        );
-                    }
+                    deliver_message(msg);
                 }
                 log::debug!("Lance C dispatcher thread shutting down");
-            })
-            .expect("Failed to spawn lance-c dispatcher thread");
+            })?;
 
-        Self { tx }
+        Ok(Self { tx })
     }
 
-    fn send(&self, msg: DispatcherMessage) {
-        let _ = self.tx.send(msg);
+    fn send(&self, msg: DispatcherMessage) -> Result<(), DispatcherMessage> {
+        self.tx.send(msg).map_err(|err| err.0)
     }
 }
 
-static DISPATCHER: LazyLock<Dispatcher> = LazyLock::new(Dispatcher::new);
+/// Install one completion's TLS state and invoke its callback on the current
+/// thread. Normally that thread is the dispatcher; this is also the fallback
+/// when dispatcher creation or channel delivery fails, preserving the
+/// exactly-once completion contract instead of silently dropping the message.
+fn deliver_message(msg: DispatcherMessage) {
+    match &msg.error {
+        Some((code, message)) => set_last_error(*code, message),
+        None => clear_last_error(),
+    }
+
+    // Best-effort only (issue #61). A real `extern "C"` callback cannot
+    // unwind; a panic aborts at its own boundary before this catch runs. The
+    // catch only helps Rust hosts that deliberately supply a C-unwind shim.
+    let outcome = catch_unwind(AssertUnwindSafe(|| unsafe {
+        (msg.callback)(msg.callback_ctx, msg.status, msg.result);
+    }));
+    if let Err(payload) = outcome {
+        log::error!(
+            "lance-c dispatcher: unwinding host callback panicked; contained best-effort: {}",
+            panic_payload_message(&*payload)
+        );
+    }
+}
+
+fn dispatch_message(dispatcher: Option<&Dispatcher>, msg: DispatcherMessage) {
+    let undelivered = match dispatcher {
+        Some(dispatcher) => match dispatcher.send(msg) {
+            Ok(()) => return,
+            Err(msg) => msg,
+        },
+        None => msg,
+    };
+    log::error!("lance-c dispatcher unavailable; invoking async completion on the current thread");
+    deliver_message(undelivered);
+}
+
+static DISPATCHER: LazyLock<Option<Dispatcher>> = LazyLock::new(|| match Dispatcher::new() {
+    Ok(dispatcher) => Some(dispatcher),
+    Err(err) => {
+        log::error!("failed to start lance-c dispatcher thread: {err}");
+        None
+    }
+});
 
 /// Send a completion message to the dispatcher thread. Before invoking the
 /// callback, the dispatcher installs `error` on its own thread-local error
@@ -105,13 +119,16 @@ pub(crate) fn dispatch_callback(
     result: *mut c_void,
     error: Option<(LanceErrorCode, String)>,
 ) {
-    DISPATCHER.send(DispatcherMessage {
-        callback,
-        callback_ctx,
-        status,
-        result,
-        error,
-    });
+    dispatch_message(
+        DISPATCHER.as_ref(),
+        DispatcherMessage {
+            callback,
+            callback_ctx,
+            status,
+            result,
+            error,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -232,6 +249,55 @@ mod tests {
         );
         assert_eq!(second.message, None);
 
+        unsafe { reclaim(ctx) };
+    }
+
+    #[test]
+    fn unavailable_dispatcher_falls_back_without_dropping_completion() {
+        let (rx, ctx) = probe();
+        dispatch_message(
+            None,
+            DispatcherMessage {
+                callback: observe,
+                callback_ctx: ctx,
+                status: -1,
+                result: ptr::null_mut(),
+                error: Some((
+                    LanceErrorCode::Internal,
+                    "dispatcher unavailable".to_string(),
+                )),
+            },
+        );
+
+        let obs = recv(&rx);
+        assert_eq!(obs.status, -1);
+        assert_eq!(obs.code, LanceErrorCode::Internal);
+        assert_eq!(obs.message.as_deref(), Some("dispatcher unavailable"));
+        unsafe { reclaim(ctx) };
+    }
+
+    #[test]
+    fn closed_dispatch_channel_falls_back_without_dropping_completion() {
+        let (tx, dead_rx) = mpsc::channel();
+        drop(dead_rx);
+        let dispatcher = Dispatcher { tx };
+        let (rx, ctx) = probe();
+
+        dispatch_message(
+            Some(&dispatcher),
+            DispatcherMessage {
+                callback: observe,
+                callback_ctx: ctx,
+                status: 0,
+                result: ptr::dangling_mut::<c_void>(),
+                error: None,
+            },
+        );
+
+        let obs = recv(&rx);
+        assert_eq!(obs.status, 0);
+        assert!(!obs.result_was_null);
+        assert_eq!(obs.code, LanceErrorCode::Ok);
         unsafe { reclaim(ctx) };
     }
 }

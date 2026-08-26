@@ -208,8 +208,8 @@ unsafe fn parse_alteration(
         let ffi_schema = unsafe { &*entry.data_type };
         // Reject an already-released or never-initialised schema before
         // handing it to arrow-rs, which would otherwise `assert!` on the
-        // NULL `format` field and abort the host process under our
-        // `panic = "abort"` profile. Both checks are intentional:
+        // NULL `format` field and turn predictable invalid input into
+        // LANCE_ERR_PANIC. Both checks are intentional:
         //   - `release == NULL`: the canonical Arrow CADI "released" sentinel.
         //   - `format == NULL`: catches a zero-initialised or otherwise
         //     half-built struct that would slip past the release check.

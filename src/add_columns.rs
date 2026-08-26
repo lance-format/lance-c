@@ -176,7 +176,7 @@ unsafe fn add_columns_nulls_inner(
     let ffi_schema = unsafe { &*schema };
     // Reject an already-released or never-initialised schema before handing it
     // to arrow-rs, which would otherwise `assert!` on the NULL `format` field
-    // and abort the host process under our `panic = "abort"` profile. Both
+    // and turn predictable invalid input into LANCE_ERR_PANIC. Both
     // checks are intentional — `release == NULL` is the canonical Arrow C Data
     // Interface "released" sentinel, while `format == NULL` catches a
     // zero-initialised or half-built struct that would slip past the release
@@ -187,8 +187,8 @@ unsafe fn add_columns_nulls_inner(
         ));
     }
     // arrow-rs's `FFI_ArrowSchema::format()` does `to_str().expect(..)` on the
-    // format pointer; a non-NULL but non-UTF-8 top-level format would abort the
-    // process under `panic = "abort"`. Validate it here so a malformed format
+    // format pointer; a non-NULL but non-UTF-8 top-level format would panic in
+    // the guarded FFI boundary. Validate it here so a malformed format
     // surfaces as INVALID_ARGUMENT instead. (Child fields are still the caller's
     // responsibility — see the doc comment — as walking them would duplicate
     // arrow-rs's recursive descent.)
@@ -273,8 +273,8 @@ unsafe fn add_columns_stream_inner(
     // Reject a stream missing a mandatory C Data Interface callback *before*
     // handing it to arrow-rs. `ArrowArrayStreamReader` only guards against a
     // NULL `release`; a NULL `get_schema` or `get_next` would otherwise reach an
-    // `unwrap()` deep inside arrow-rs and abort the host process under our
-    // `panic = "abort"` profile. We do not require `get_last_error` (the spec
+    // `unwrap()` deep inside arrow-rs and turn predictable invalid input into
+    // LANCE_ERR_PANIC. We do not require `get_last_error` (the spec
     // marks it optional): requiring it would not close the abort anyway, since a
     // present callback that *returns* NULL at error time hits the same
     // `last_error.unwrap()` on arrow-rs's `get_next` error path — a residual

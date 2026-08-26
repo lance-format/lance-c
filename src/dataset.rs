@@ -17,6 +17,7 @@ use lance_core::Result;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::helpers;
 use crate::runtime::block_on;
+use crate::stream_guard::guarded_ffi_stream_from_reader;
 
 /// Opaque handle representing an opened Lance dataset.
 pub struct LanceDataset {
@@ -151,7 +152,8 @@ unsafe fn open_dataset_inner(
 }
 
 /// Close and free a dataset handle.
-/// Safe to call with NULL. Safe to call multiple times (subsequent calls are no-ops).
+/// Safe to call with NULL. A non-NULL handle must be closed exactly once and
+/// must not be used again afterwards.
 ///
 /// Best-effort (issue #61): a panic raised while dropping the handle is
 /// caught and logged rather than unwinding into the caller, and the
@@ -268,6 +270,10 @@ unsafe fn dataset_schema_inner(
 /// - `columns`: NULL-terminated column name array, or NULL for all columns
 /// - `out`: pointer to a stack-allocated `ArrowArrayStream`
 ///
+/// The already-materialized batch is exported through a guarded reader:
+/// schema conversion is validated before callbacks are exposed, and later
+/// `get_next` / `release` panics are contained at the Arrow C boundary.
+///
 /// Returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_take(
@@ -307,7 +313,7 @@ unsafe fn dataset_take_inner(
     // Wrap the single RecordBatch as a RecordBatchReader, then export as FFI stream.
     let schema = batch.schema();
     let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
-    let ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
+    let ffi_stream = guarded_ffi_stream_from_reader(reader)?;
     unsafe {
         std::ptr::write_unaligned(out, ffi_stream);
     }
@@ -325,6 +331,10 @@ unsafe fn dataset_take_inner(
 /// `row_ids` may be NULL only when `num_row_ids` is zero. Row IDs must belong
 /// to the same dataset snapshot used for this read. Missing or deleted row IDs
 /// may be omitted from the result by the upstream Lance implementation.
+///
+/// The already-materialized batch is exported through the same guarded reader
+/// as [`lance_dataset_take`], including schema preflight and deferred callback
+/// panic containment.
 ///
 /// Returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
@@ -376,7 +386,7 @@ unsafe fn dataset_take_rows_inner(
     // Match lance_dataset_take: export the single RecordBatch as an Arrow stream.
     let schema = batch.schema();
     let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
-    let ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
+    let ffi_stream = guarded_ffi_stream_from_reader(reader)?;
     unsafe {
         std::ptr::write_unaligned(out, ffi_stream);
     }
@@ -492,10 +502,19 @@ mod tests {
     #[test]
     fn with_mut_panic_rolls_back_and_handle_stays_usable() {
         let (_tmp, handle) = create_test_handle();
+        let (_replacement_tmp, replacement_handle) = create_test_handle();
+        let replacement = Dataset::clone(&*replacement_handle.snapshot());
         let uri_before = handle.snapshot().uri().to_string();
+        assert_ne!(replacement.uri(), uri_before);
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            handle.with_mut(|_ds| panic!("simulated bug in mutation"))
+            handle.with_mut(|ds| {
+                // Make a visible in-memory mutation before panicking. This
+                // distinguishes clone-execute-swap from mutating the handle's
+                // stored Dataset in place and merely skipping the final swap.
+                *ds = replacement;
+                panic!("simulated bug in mutation")
+            })
         }));
         let payload = result.expect_err("panic must escape with_mut unchanged");
         let msg = crate::error::panic_payload_message(&*payload);

@@ -7,10 +7,15 @@
  *
  * All data crosses this boundary via the Arrow C Data Interface
  * (ArrowSchema, ArrowArray, ArrowArrayStream).
+ * For Arrow structures written to caller-provided output storage, the caller
+ * retains ownership of the outer structure and must invoke its non-NULL
+ * `release` callback exactly once to release the contents. APIs that allocate
+ * the outer structure as well document a separate matching free function.
  *
- * Error handling uses thread-local storage: after any function returns
- * NULL (pointer) or -1 (int), call lance_last_error_code() and
- * lance_last_error_message() to get details.
+ * Error handling uses thread-local storage: after any function returns its
+ * documented error sentinel (for example NULL, -1, or 0 for selected scalar
+ * accessors), call lance_last_error_code() and lance_last_error_message() to
+ * get details.
  */
 
 #ifndef LANCE_H
@@ -100,16 +105,21 @@ typedef enum {
  * Honest limits: a double panic, a panic in a destructor while unwinding, a
  * stack overflow, or an allocation failure still aborts the process. A
  * panic caught inside a close/free call (lance_*_close, lance_batch_free,
- * lance_free_string, or the release callback of an exported
- * ArrowArrayStream) is logged and the remainder of the value may leak —
- * close is best-effort by design. Post-panic process state is best-effort:
- * hosts should fail the in-flight query rather than retry a poisoned
- * handle.
+ * lance_free_string, lance_scanner_async_stream_free, or the release callback
+ * of an exported ArrowArrayStream) is logged and the remainder of the value
+ * may leak — close is best-effort by design. Post-panic process state is
+ * best-effort: hosts should fail the in-flight query rather than retry a
+ * poisoned handle.
  *
- * Callbacks passed INTO the library (LanceCallback, LanceWaker) are the
- * reverse direction and are NOT covered by this contract: their ABI is
- * non-unwinding, so a panicking callback aborts the host process before
- * the library can contain it. Callbacks must not panic.
+ * Callbacks passed INTO the library (LanceCallback, LanceWaker, and
+ * LanceScanStatisticsCallback) are the reverse direction and are NOT covered
+ * by this contract: their ABI is non-unwinding, so a callback that throws or
+ * unwinds can abort the host process before the library can contain it.
+ * Callbacks must return normally.
+ *
+ * This contract requires Rust's `panic = "unwind"` strategy. The crate
+ * rejects `panic = "abort"` builds at compile time because catch_unwind
+ * cannot provide this API contract in such a build.
  */
 
 /* ─── Index types (Phase 2) ─── */
@@ -202,13 +212,22 @@ void lance_dataset_close(LanceDataset* dataset);
 
 /* ─── Dataset metadata (sync, in-memory) ─── */
 
-/** Return the version number of this dataset snapshot. */
+/**
+ * Return the version number of this dataset snapshot.
+ * @return version on success, or 0 on error (check lance_last_error_code())
+ */
 uint64_t lance_dataset_version(const LanceDataset* dataset);
 
-/** Return the number of rows. Returns 0 on error. */
+/**
+ * Return the number of rows. Returns 0 on error; an empty dataset also returns
+ * 0, so check lance_last_error_code().
+ */
 uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
 
-/** Return the latest version ID (I/O). Returns 0 on error. */
+/**
+ * Return the latest version ID (I/O), or 0 on error (check
+ * lance_last_error_code()).
+ */
 uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
 
 /* ─── Version history ─── */
@@ -220,7 +239,10 @@ uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
  */
 LanceVersions* lance_dataset_versions(const LanceDataset* dataset);
 
-/** Number of versions in the snapshot. Returns 0 on error. */
+/**
+ * Number of versions in the snapshot, or 0 on error (check
+ * lance_last_error_code()).
+ */
 uint64_t lance_versions_count(const LanceVersions* versions);
 
 /**
@@ -755,7 +777,10 @@ int32_t lance_dataset_schema(
 
 /* ─── Fragment enumeration ─── */
 
-/** Return the number of fragments in the dataset. Returns 0 on error. */
+/**
+ * Return the number of fragments in the dataset. Returns 0 on error; a
+ * dataset with no fragments also returns 0, so check lance_last_error_code().
+ */
 uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
 
 /**
@@ -769,6 +794,15 @@ int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_id
 
 /**
  * Take rows by indices.
+ *
+ * On success, `out` is initialized in caller-owned storage; the caller must
+ * eventually invoke its non-NULL `release` callback exactly once. The schema
+ * is validated before the stream callbacks are exposed. A deferred iteration
+ * failure, including a caught panic in `get_next`, is reported through the
+ * Arrow C stream contract (nonzero `get_next` plus `get_last_error`). A panic
+ * during `release` cleanup is contained and logged; cleanup remains
+ * best-effort.
+ *
  * @param indices      Array of 0-based row offsets
  * @param num_indices  Length of indices array
  * @param columns      NULL-terminated column names, or NULL for all
@@ -790,6 +824,14 @@ int32_t lance_dataset_take(
  * offsets. They must belong to the same dataset snapshot used for this read.
  * Missing or deleted row IDs may be omitted from the result. For found rows,
  * input order and duplicates are preserved.
+ *
+ * On success, `out` is initialized in caller-owned storage; the caller must
+ * eventually invoke its non-NULL `release` callback exactly once. The schema
+ * is validated before the stream callbacks are exposed. A deferred iteration
+ * failure, including a caught panic in `get_next`, is reported through the
+ * Arrow C stream contract (nonzero `get_next` plus `get_last_error`). A panic
+ * during `release` cleanup is contained and logged; cleanup remains
+ * best-effort.
  *
  * @param dataset      Open dataset snapshot.
  * @param row_ids      Array of dataset row IDs. May be NULL only when
@@ -975,6 +1017,10 @@ void lance_scanner_close(LanceScanner* scanner);
 /**
  * Materialize the scan as an ArrowArrayStream (blocking).
  * The scanner remains valid, and each call creates an independent stream.
+ * `out` points to caller-owned storage. On success, the caller must eventually
+ * invoke `out->release(out)` exactly once when `release` is non-NULL; that
+ * releases the stream contents but not the caller-owned outer structure. Do
+ * not pass this caller-allocated stream to lance_scanner_async_stream_free().
  *
  * Reading the exported stream may surface a mid-iteration panic as one
  * error through the Arrow C stream contract (nonzero get_next plus
@@ -1005,14 +1051,18 @@ int32_t lance_scanner_next(
 /**
  * Callback type for async operations.
  *
- * The callback runs on the dispatcher thread; on failure the error code and
- * message are installed in that thread's thread-local storage immediately
- * before the callback runs, so lance_last_error_* called from inside the
- * callback observes this completion's failure.
+ * The callback normally runs on the dedicated dispatcher thread. During a
+ * rare dispatcher startup or delivery failure, completion falls back to the
+ * thread that detects the failure (for example the calling or producing
+ * thread), so the callback must be thread-safe. On failure the error code and
+ * message are installed on the actual callback thread immediately before the
+ * callback runs, so lance_last_error_* called from inside the callback
+ * observes this completion's failure.
  *
- * Callbacks must not panic: the callback ABI is non-unwinding, so a
- * panicking callback aborts the host process before the dispatcher can
- * contain it.
+ * Callbacks must return normally: the callback ABI is non-unwinding, so a
+ * callback that throws or unwinds can abort the host process before the
+ * dispatcher can contain it.
+ * A callback passed to lance_scanner_scan_async() must not be NULL.
  *
  * @param ctx     Opaque pointer passed back from the caller
  * @param status  0 = success, -1 = error
@@ -1021,20 +1071,47 @@ int32_t lance_scanner_next(
 typedef void (*LanceCallback)(void* ctx, int32_t status, void* result);
 
 /**
- * Start an async scan. The callback fires on a dedicated dispatcher thread
- * when the ArrowArrayStream is ready.
+ * Start an async scan. The callback normally fires on a dedicated dispatcher
+ * thread when the ArrowArrayStream is ready. During a rare dispatcher
+ * infrastructure failure it may instead run on the calling or producing
+ * thread, so it must be thread-safe.
+ *
+ * For a non-NULL callback, exactly one completion is delivered, including for
+ * validation, setup, task, and dispatcher failures. The fallback path may
+ * invoke it before lance_scanner_scan_async() returns. `callback` and a
+ * non-NULL `callback_ctx` must remain valid until that invocation returns.
+ *
+ * `callback` must not be NULL; `callback_ctx` may be NULL. On success, result
+ * is a library-allocated ArrowArrayStream owned by the caller. The caller must
+ * eventually pass it exactly once to lance_scanner_async_stream_free(), even
+ * if it has already invoked the stream's release callback directly. Do not
+ * free the returned outer structure with free(), delete, or a platform
+ * allocator.
  *
  * On failure the callback receives status -1 with result NULL, and the
- * error code/message are installed in the dispatcher thread's thread-local
- * storage immediately before the callback runs (per completion). A panic in
- * the scan task also yields status -1 with LANCE_ERR_PANIC and poisons the
- * scanner handle.
+ * error code/message are installed in the actual callback thread's
+ * thread-local storage immediately before the callback runs (per completion).
+ * A panic in the scan task also yields status -1 with LANCE_ERR_PANIC and
+ * poisons the scanner handle.
  */
 void lance_scanner_scan_async(
     const LanceScanner* scanner,
     LanceCallback callback,
     void* callback_ctx
 );
+
+/**
+ * Release and free an ArrowArrayStream returned by a successful
+ * lance_scanner_scan_async() callback.
+ *
+ * If `stream->release` is non-NULL, this function invokes it before freeing
+ * the library-allocated outer structure. It is therefore valid both before
+ * and after a consumer has directly released the stream contents. `stream`
+ * may be NULL. A non-NULL pointer must be passed exactly once and must be the
+ * pointer delivered by lance_scanner_scan_async(); using this function for a
+ * caller-allocated ArrowArrayStream is invalid.
+ */
+void lance_scanner_async_stream_free(struct ArrowArrayStream* stream);
 
 /* ─── Poll-based scan (for cooperative async runtimes) ─── */
 
@@ -1045,12 +1122,20 @@ typedef enum {
     LANCE_POLL_ERROR    = -1,
 } LancePollStatus;
 
-/** Waker callback: called from a Tokio thread when data is ready. */
+/**
+ * Waker callback: called from a Tokio thread when data is ready. A waker
+ * passed to lance_scanner_poll_next() must not be NULL. For one poll call
+ * that returns LANCE_POLL_PENDING, all internal RawWaker clones share a
+ * one-shot gate, so the callback fires at most once. `ctx` must remain valid
+ * until that callback fires or the scanner is closed.
+ */
 typedef void (*LanceWaker)(void* ctx);
 
 /**
  * Poll for the next batch without blocking.
- * See RFC for usage pattern.
+ * `waker` must not be NULL; `waker_ctx` may be NULL. `out` is set to a
+ * LanceBatch only for LANCE_POLL_READY and is set to NULL for
+ * LANCE_POLL_PENDING, LANCE_POLL_FINISHED, and LANCE_POLL_ERROR.
  */
 LancePollStatus lance_scanner_poll_next(
     LanceScanner* scanner,
@@ -1329,7 +1414,10 @@ const char* lance_index_segment_metadata_name(
     const LanceIndexSegmentMetadata* metadata
 );
 
-/** Return the dataset version against which the segment was built. */
+/**
+ * Return the dataset version against which the segment was built, or 0 on
+ * error (check lance_last_error_code()).
+ */
 uint64_t lance_index_segment_metadata_dataset_version(
     const LanceIndexSegmentMetadata* metadata
 );
@@ -1355,7 +1443,10 @@ const char* lance_index_segment_metadata_index_details_type_url(
     const LanceIndexSegmentMetadata* metadata
 );
 
-/** Return the number of indexed field IDs. */
+/**
+ * Return the number of indexed field IDs. Returns 0 on error; zero may also be
+ * a valid count, so check lance_last_error_code().
+ */
 size_t lance_index_segment_metadata_field_count(
     const LanceIndexSegmentMetadata* metadata
 );
@@ -1368,7 +1459,10 @@ int32_t lance_index_segment_metadata_field_ids(
     size_t* out_count
 );
 
-/** Return the number of fragment IDs covered by the segment. */
+/**
+ * Return the number of fragment IDs covered by the segment. Returns 0 on
+ * error; zero may also be a valid count, so check lance_last_error_code().
+ */
 size_t lance_index_segment_metadata_fragment_count(
     const LanceIndexSegmentMetadata* metadata
 );
@@ -1393,7 +1487,11 @@ void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
 /** Drop an index by name. Returns -1 (NOT_FOUND) if no such index. */
 int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name);
 
-/** Number of user indexes (excludes system indexes). Returns 0 on error. */
+/**
+ * Number of user indexes (excludes system indexes). Returns 0 on error; a
+ * dataset with no user indexes also returns 0, so check
+ * lance_last_error_code().
+ */
 uint64_t lance_dataset_index_count(const LanceDataset* dataset);
 
 /**

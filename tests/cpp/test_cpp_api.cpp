@@ -12,8 +12,11 @@
 
 #include "lance/lance.hpp"
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -42,6 +45,29 @@ static void capture_scan_statistics(
     }
     captured->calls += 1;
     captured->bytes_read = statistics->bytes_read;
+}
+
+struct AsyncScanCapture {
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool completed = false;
+    int32_t status = -1;
+    ArrowArrayStream* stream = nullptr;
+};
+
+static void capture_async_scan(
+    void* callback_ctx,
+    int32_t status,
+    void* result) noexcept {
+    if (!callback_ctx) return;
+    auto* captured = static_cast<AsyncScanCapture*>(callback_ctx);
+    {
+        std::lock_guard<std::mutex> lock(captured->mutex);
+        captured->status = status;
+        captured->stream = static_cast<ArrowArrayStream*>(result);
+        captured->completed = true;
+    }
+    captured->ready.notify_one();
 }
 
 static void test_dataset_open(const std::string& uri) {
@@ -121,6 +147,47 @@ static void test_scanner_fluent(const std::string& uri) {
     PASS();
 }
 
+static void test_scanner_async_stream_ownership(const std::string& uri) {
+    TEST(test_scanner_async_stream_ownership);
+
+    auto ds = lance::Dataset::open(uri);
+    auto scanner = ds.scan();
+    AsyncScanCapture captured;
+    scanner.scan_async(capture_async_scan, &captured);
+
+    ArrowArrayStream* stream = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(captured.mutex);
+        bool completed = captured.ready.wait_for(
+            lock, std::chrono::seconds(30), [&captured] {
+                return captured.completed;
+            });
+        assert(completed && "async scan callback timed out");
+        assert(captured.status == 0);
+        assert(captured.stream != nullptr);
+        stream = captured.stream;
+    }
+
+    uint64_t total = 0;
+    while (true) {
+        ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        int rc = stream->get_next(stream, &array);
+        assert(rc == 0);
+        if (!array.release) break;
+        total += static_cast<uint64_t>(array.length);
+        array.release(&array);
+    }
+    assert(total > 0);
+
+    // This releases the stream contents (if still live) and the separate
+    // library-allocated outer structure. It is also explicitly NULL-safe.
+    lance::scanner_async_stream_free(stream);
+    lance::scanner_async_stream_free(nullptr);
+
+    PASS();
+}
+
 static void test_dataset_take(const std::string& uri) {
     TEST(test_dataset_take);
 
@@ -194,6 +261,15 @@ static void test_raii_cleanup(const std::string& uri) {
         auto ds1 = lance::Dataset::open(uri);
         auto ds2 = std::move(ds1);
         assert(ds2.count_rows() > 0);
+
+        bool moved_from_version_threw = false;
+        try {
+            (void)ds1.version();
+        } catch (const lance::Error& e) {
+            moved_from_version_threw = true;
+            assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+        }
+        assert(moved_from_version_threw);
     }
 
     PASS();
@@ -832,6 +908,7 @@ int main(int argc, char** argv) {
     test_dataset_open(uri);
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
+    test_scanner_async_stream_ownership(uri);
     test_dataset_take(uri);
     test_dataset_take_rows(uri);
     test_raii_cleanup(uri);

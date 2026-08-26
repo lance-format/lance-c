@@ -15,6 +15,11 @@
 //! - The caller is responsible for freeing returned strings with `lance_free_string()`.
 #![allow(clippy::missing_safety_doc)]
 
+#[cfg(not(panic = "unwind"))]
+compile_error!(
+    "lance-c requires panic=\"unwind\" so its C ABI panic firewall can honor LANCE_ERR_PANIC"
+);
+
 mod add_columns;
 mod alter_columns;
 mod async_dispatcher;

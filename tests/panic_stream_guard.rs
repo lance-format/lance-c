@@ -40,8 +40,16 @@
 //!    host. The guard's `Drop` detaches the inner stream and contains
 //!    cleanup. Runs in a child process, asserting a clean exit AND that
 //!    the destructor panic really fired (caught).
+//!
+//! 5. Regular errors containing NUL are sanitized before arrow-rs formats
+//!    them inside `get_next`.
+//! 6. A panic from an external error's `Display` is caught, reported as one
+//!    terminal stream error, and poisons the scanner.
+//! 7. An unexportable schema is rejected while still inside the Rust guard,
+//!    before arrow-rs's non-unwinding `get_schema` callback is exposed.
 
 use std::ffi::CStr;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,7 +57,7 @@ use std::task::{Context, Poll};
 
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::ffi::FFI_ArrowArray;
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use futures::Stream;
 use lance_c::stream_guard::GuardedReader;
@@ -91,6 +99,17 @@ impl Stream for PanicOnSecondPoll {
 /// destructor reached from the Arrow C `release` callback.
 struct PanicOnDrop;
 
+#[derive(Debug)]
+struct PanickingDisplay;
+
+impl std::fmt::Display for PanickingDisplay {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        panic!("simulated panic while formatting a stream error")
+    }
+}
+
+impl std::error::Error for PanickingDisplay {}
+
 impl Stream for PanicOnDrop {
     type Item = lance_core::Result<RecordBatch>;
 
@@ -110,6 +129,11 @@ impl Drop for PanicOnDrop {
 unsafe fn c_get_next(stream: *mut FFI_ArrowArrayStream, array: *mut FFI_ArrowArray) -> i32 {
     let get_next = unsafe { (*stream).get_next }.expect("get_next callback is NULL");
     unsafe { get_next(stream, array) }
+}
+
+unsafe fn c_get_schema(stream: *mut FFI_ArrowArrayStream, schema: *mut FFI_ArrowSchema) -> i32 {
+    let get_schema = unsafe { (*stream).get_schema }.expect("get_schema callback is NULL");
+    unsafe { get_schema(stream, schema) }
 }
 
 unsafe fn c_get_last_error(stream: *mut FFI_ArrowArrayStream) -> Option<String> {
@@ -238,6 +262,120 @@ fn guarded_stream_maps_panic_to_c_stream_error() {
     assert!(
         array2.release.is_none(),
         "end-of-stream must yield a released array"
+    );
+}
+
+#[test]
+fn guarded_stream_sanitizes_nul_in_regular_error() {
+    if std::env::var("POC_CHILD_NUL_ERROR").is_err() {
+        let output = run_child(
+            "guarded_stream_sanitizes_nul_in_regular_error",
+            "POC_CHILD_NUL_ERROR",
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "guarded child must exit cleanly, got status {:?}\nstderr:\n{stderr}",
+            output.status
+        );
+        return;
+    }
+
+    let scanner_poison = Arc::new(AtomicBool::new(false));
+    let stream = futures::stream::iter(vec![Err(lance_core::Error::invalid_input_source(
+        "ordinary error with a NUL: bo\0om".into(),
+    ))]);
+    let (_rt, mut ffi) = guarded_export(stream, Arc::clone(&scanner_poison));
+    let mut array = FFI_ArrowArray::empty();
+
+    let rc = unsafe { c_get_next(&mut ffi, &mut array) };
+    assert_ne!(rc, 0, "the ordinary stream error must reach Arrow C");
+    let msg = unsafe { c_get_last_error(&mut ffi) }.expect("get_last_error returned NULL");
+    assert!(msg.contains("bo\\0om"), "NUL must be escaped, got: {msg:?}");
+    assert!(
+        !scanner_poison.load(Ordering::SeqCst),
+        "an ordinary stream error must not poison the scanner"
+    );
+}
+
+#[test]
+fn guarded_stream_catches_panicking_error_display() {
+    if std::env::var("POC_CHILD_DISPLAY_ERROR").is_err() {
+        let output = run_child(
+            "guarded_stream_catches_panicking_error_display",
+            "POC_CHILD_DISPLAY_ERROR",
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "guarded child must exit cleanly, got status {:?}\nstderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            stderr.contains("simulated panic while formatting a stream error"),
+            "the formatting panic must have fired and been caught\nstderr:\n{stderr}"
+        );
+        return;
+    }
+
+    let scanner_poison = Arc::new(AtomicBool::new(false));
+    let stream = futures::stream::iter(vec![Err(lance_core::Error::invalid_input_source(
+        Box::new(PanickingDisplay),
+    ))]);
+    let (_rt, mut ffi) = guarded_export(stream, Arc::clone(&scanner_poison));
+    let mut array = FFI_ArrowArray::empty();
+
+    let rc = unsafe { c_get_next(&mut ffi, &mut array) };
+    assert_ne!(rc, 0, "the caught panic must reach Arrow C as an error");
+    let msg = unsafe { c_get_last_error(&mut ffi) }.expect("get_last_error returned NULL");
+    assert!(
+        msg.contains("simulated panic while formatting a stream error"),
+        "panic message should propagate to get_last_error, got: {msg}"
+    );
+    assert!(
+        scanner_poison.load(Ordering::SeqCst),
+        "a formatting panic must poison the owning scanner"
+    );
+}
+
+#[test]
+fn guarded_stream_rejects_nul_schema_before_arrow_callback() {
+    if std::env::var("POC_CHILD_NUL_SCHEMA").is_err() {
+        let output = run_child(
+            "guarded_stream_rejects_nul_schema_before_arrow_callback",
+            "POC_CHILD_NUL_SCHEMA",
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "schema validation must fail before Arrow's callback can abort, got status {:?}\nstderr:\n{stderr}",
+            output.status
+        );
+        return;
+    }
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "field\0name",
+        DataType::Int32,
+        false,
+    )]));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let scanner_poison = Arc::new(AtomicBool::new(false));
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let reader = GuardedReader::new(
+            futures::stream::empty::<lance_core::Result<RecordBatch>>(),
+            schema,
+            rt.handle().clone(),
+            scanner_poison,
+        );
+        let mut ffi = FFI_ArrowArrayStream::new(Box::new(reader));
+        let mut ffi_schema = FFI_ArrowSchema::empty();
+        let rc = unsafe { c_get_schema(&mut ffi, &mut ffi_schema) };
+        panic!("invalid schema reached Arrow callback and returned rc={rc}");
+    }));
+    assert!(
+        outcome.is_err(),
+        "invalid schema must be rejected while the Rust FFI guard can still catch it"
     );
 }
 

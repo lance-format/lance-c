@@ -22,7 +22,7 @@ use prost::Message;
 use uuid::Uuid;
 
 use crate::dataset::LanceDataset;
-use crate::error::{LanceErrorCode, clear_last_error, ffi_try, set_last_error};
+use crate::error::{ffi_try, swallow_unwind};
 use crate::helpers;
 use crate::index::{
     LanceMetricType, LanceScalarIndexType, LanceVectorIndexParams, LanceVectorIndexType,
@@ -1042,7 +1042,9 @@ pub unsafe extern "C" fn lance_free_bytes(bytes: *mut u8) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_index_segment_builder_free(builder: *mut LanceIndexSegmentBuilder) {
     if !builder.is_null() {
-        unsafe { drop(Box::from_raw(builder)) };
+        swallow_unwind("lance_index_segment_builder_free", || unsafe {
+            drop(Box::from_raw(builder));
+        });
     }
 }
 
@@ -1155,12 +1157,15 @@ unsafe fn metadata_uuid_inner(
 pub unsafe extern "C" fn lance_index_segment_metadata_name(
     metadata: *const LanceIndexSegmentMetadata,
 ) -> *const c_char {
-    if metadata.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "metadata is NULL");
-        return ptr::null();
-    }
-    clear_last_error();
-    unsafe { (*metadata).name.as_ptr() }
+    ffi_try!(
+        (|| -> Result<*const c_char> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            Ok(unsafe { (*metadata).name.as_ptr() })
+        })(),
+        ptr::null()
+    )
 }
 
 /// Return the dataset version recorded in the metadata.
@@ -1168,12 +1173,15 @@ pub unsafe extern "C" fn lance_index_segment_metadata_name(
 pub unsafe extern "C" fn lance_index_segment_metadata_dataset_version(
     metadata: *const LanceIndexSegmentMetadata,
 ) -> u64 {
-    if metadata.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "metadata is NULL");
-        return 0;
-    }
-    clear_last_error();
-    unsafe { (*metadata).metadata.dataset_version }
+    ffi_try!(
+        (|| -> Result<u64> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            Ok(unsafe { (*metadata).metadata.dataset_version })
+        })(),
+        0
+    )
 }
 
 /// Return the physical index version recorded in the metadata.
@@ -1181,12 +1189,15 @@ pub unsafe extern "C" fn lance_index_segment_metadata_dataset_version(
 pub unsafe extern "C" fn lance_index_segment_metadata_index_version(
     metadata: *const LanceIndexSegmentMetadata,
 ) -> i32 {
-    if metadata.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "metadata is NULL");
-        return -1;
-    }
-    clear_last_error();
-    unsafe { (*metadata).metadata.index_version }
+    ffi_try!(
+        (|| -> Result<i32> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            Ok(unsafe { (*metadata).metadata.index_version })
+        })(),
+        neg
+    )
 }
 
 /// Return the concrete scalar/vector index enum value, or -1 on error.
@@ -1194,16 +1205,7 @@ pub unsafe extern "C" fn lance_index_segment_metadata_index_version(
 pub unsafe extern "C" fn lance_index_segment_metadata_index_type(
     metadata: *const LanceIndexSegmentMetadata,
 ) -> i32 {
-    match unsafe { metadata_index_type_inner(metadata) } {
-        Ok(index_type) => {
-            clear_last_error();
-            index_type
-        }
-        Err(error) => {
-            crate::error::set_lance_error(&error);
-            -1
-        }
-    }
+    ffi_try!(unsafe { metadata_index_type_inner(metadata) }, neg)
 }
 
 unsafe fn metadata_index_type_inner(metadata: *const LanceIndexSegmentMetadata) -> Result<i32> {
@@ -1258,19 +1260,20 @@ unsafe fn metadata_index_type_inner(metadata: *const LanceIndexSegmentMetadata) 
 pub unsafe extern "C" fn lance_index_segment_metadata_index_details_type_url(
     metadata: *const LanceIndexSegmentMetadata,
 ) -> *const c_char {
-    if metadata.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "metadata is NULL");
-        return ptr::null();
-    }
-    let Some(type_url) = (unsafe { &(*metadata).index_details_type_url }) else {
-        set_last_error(
-            LanceErrorCode::NotFound,
-            "index metadata does not contain index_details",
-        );
-        return ptr::null();
-    };
-    clear_last_error();
-    type_url.as_ptr()
+    ffi_try!(
+        (|| -> Result<*const c_char> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let type_url = unsafe { &(*metadata).index_details_type_url }
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::index_not_found("index metadata does not contain index_details")
+                })?;
+            Ok(type_url.as_ptr())
+        })(),
+        ptr::null()
+    )
 }
 
 /// Return the number of indexed field IDs.
@@ -1278,12 +1281,15 @@ pub unsafe extern "C" fn lance_index_segment_metadata_index_details_type_url(
 pub unsafe extern "C" fn lance_index_segment_metadata_field_count(
     metadata: *const LanceIndexSegmentMetadata,
 ) -> usize {
-    if metadata.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "metadata is NULL");
-        return 0;
-    }
-    clear_last_error();
-    unsafe { (*metadata).metadata.fields.len() }
+    ffi_try!(
+        (|| -> Result<usize> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            Ok(unsafe { (*metadata).metadata.fields.len() })
+        })(),
+        0
+    )
 }
 
 /// Copy indexed field IDs in metadata order.
@@ -1334,12 +1340,15 @@ unsafe fn metadata_field_ids_inner(
 pub unsafe extern "C" fn lance_index_segment_metadata_fragment_count(
     metadata: *const LanceIndexSegmentMetadata,
 ) -> usize {
-    if metadata.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "metadata is NULL");
-        return 0;
-    }
-    clear_last_error();
-    unsafe { (*metadata).fragment_ids.len() }
+    ffi_try!(
+        (|| -> Result<usize> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            Ok(unsafe { (*metadata).fragment_ids.len() })
+        })(),
+        0
+    )
 }
 
 /// Copy covered fragment IDs in ascending order.
@@ -1393,6 +1402,8 @@ pub unsafe extern "C" fn lance_index_segment_metadata_free(
     metadata: *mut LanceIndexSegmentMetadata,
 ) {
     if !metadata.is_null() {
-        unsafe { drop(Box::from_raw(metadata)) };
+        swallow_unwind("lance_index_segment_metadata_free", || unsafe {
+            drop(Box::from_raw(metadata));
+        });
     }
 }

@@ -993,7 +993,7 @@ fn test_scanner_scan_async() {
     unsafe {
         lance_scanner_scan_async(
             scanner,
-            on_complete,
+            Some(on_complete),
             Arc::as_ptr(&pair_clone) as *mut std::ffi::c_void,
         );
         lance_scanner_close(scanner);
@@ -1015,8 +1015,23 @@ fn test_scanner_scan_async() {
     assert_eq!(total_rows, 5);
     assert_eq!(captured.calls.load(AtomicOrdering::SeqCst), 1);
     assert!(!captured.invalid_statistics.load(AtomicOrdering::SeqCst));
+    unsafe {
+        lance_scanner_async_stream_free(result.stream_ptr.cast::<FFI_ArrowArrayStream>());
+    }
 
     unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_async_stream_free_releases_stream_and_accepts_null() {
+    let (stream, drop_count) = make_counted_column_stream("value", vec![1]);
+    let stream = Box::into_raw(Box::new(stream));
+
+    unsafe { lance_scanner_async_stream_free(stream) };
+    assert_eq!(drop_count.load(AtomicOrdering::SeqCst), 1);
+
+    // Match the other close/free APIs: NULL is a no-op.
+    unsafe { lance_scanner_async_stream_free(ptr::null_mut()) };
 }
 
 // ===========================================================================
@@ -1594,7 +1609,7 @@ fn test_async_scan_with_filter() {
     unsafe {
         lance_scanner_scan_async(
             scanner,
-            on_complete,
+            Some(on_complete),
             Arc::as_ptr(&pair_clone) as *mut std::ffi::c_void,
         );
     }
@@ -1609,6 +1624,9 @@ fn test_async_scan_with_filter() {
     let ffi_stream = unsafe { &mut *(result.stream_ptr as *mut FFI_ArrowArrayStream) };
     let reader = unsafe { ArrowArrayStreamReader::from_raw(ffi_stream) }.unwrap();
     assert_eq!(reader.map(|r| r.unwrap().num_rows()).sum::<usize>(), 2);
+    unsafe {
+        lance_scanner_async_stream_free(result.stream_ptr.cast::<FFI_ArrowArrayStream>());
+    }
 
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
@@ -1641,7 +1659,7 @@ fn test_poll_next_basic() {
         loop {
             let mut batch: *mut LanceBatch = ptr::null_mut();
             let status = unsafe {
-                lance_scanner_poll_next(scanner, test_waker, ptr::null_mut(), &mut batch)
+                lance_scanner_poll_next(scanner, Some(test_waker), ptr::null_mut(), &mut batch)
             };
             match status {
                 LancePollStatus::Ready => {
@@ -3040,6 +3058,45 @@ fn test_index_segment_builder_owns_snapshot_and_is_single_use() {
         lance_index_segment_builder_free(ptr::null_mut());
         lance_index_segment_metadata_free(ptr::null_mut());
     }
+}
+
+#[test]
+fn test_index_segment_metadata_accessors_reject_null_handles() {
+    assert!(unsafe { lance_index_segment_metadata_name(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_dataset_version(ptr::null()) },
+        0
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_index_version(ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_index_type(ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    assert!(unsafe { lance_index_segment_metadata_index_details_type_url(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_field_count(ptr::null()) },
+        0
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_fragment_count(ptr::null()) },
+        0
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 }
 
 #[test]
@@ -10388,8 +10445,8 @@ fn test_add_columns_nulls_released_schema_rejected() {
 #[test]
 fn test_add_columns_nulls_non_utf8_format_rejected() {
     // A non-NULL but non-UTF-8 top-level `format` must be rejected at the FFI
-    // boundary rather than aborting via arrow-rs's `format().to_str().expect()`
-    // under `panic = "abort"`.
+    // boundary rather than reaching arrow-rs's `format().to_str().expect()`
+    // and being downgraded from a precise InvalidArgument to Panic.
     let (_tmp, uri) = create_large_dataset(2);
     let c_uri = c_str(&uri);
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };

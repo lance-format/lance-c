@@ -88,6 +88,64 @@ pub fn set_lance_error(err: &lance_core::Error) {
     set_last_error(error_code_from_lance(err), err.to_string());
 }
 
+/// Why an [`ffi_guard_with`] invocation failed.
+pub(crate) enum FfiFailure {
+    /// The guarded body returned a regular `lance_core::Error`.
+    Lance,
+    /// Something panicked while executing the body or mapping its result.
+    Panic,
+}
+
+/// Finish a caught FFI panic without leaving panic reporting unguarded.
+///
+/// A failure while recording the panic or constructing the caller's error
+/// value is itself caught. There is no type-safe value we can manufacture if
+/// that recovery also panics, so the second payload is resumed; this is the
+/// documented double-panic limit of the FFI firewall.
+fn recover_from_ffi_panic<T>(
+    payload: Box<dyn std::any::Any + Send>,
+    recover: impl FnOnce() -> T,
+) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        set_last_error(
+            LanceErrorCode::Panic,
+            format!("panic in FFI call: {}", panic_payload_message(&*payload)),
+        );
+        recover()
+    })) {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Run a complete fallible FFI operation under the panic firewall and map any
+/// failure to the ABI-specific return value.
+///
+/// The guard deliberately includes result mapping, not just `body()`: a
+/// wrapped external error may itself panic from `Display` while
+/// [`set_lance_error`] formats it. Keeping formatting, TLS mutation, and the
+/// error sentinel inside the unwind boundary prevents those secondary panics
+/// from escaping an `extern "C"` entry point. If the sentinel itself panics,
+/// the recovery path records `LanceErrorCode::Panic` and asks for it once more.
+pub(crate) fn ffi_guard_with<T>(
+    body: impl FnOnce() -> lance_core::Result<T>,
+    mut on_failure: impl FnMut(FfiFailure) -> T,
+) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match body() {
+        Ok(value) => {
+            clear_last_error();
+            value
+        }
+        Err(err) => {
+            set_lance_error(&err);
+            on_failure(FfiFailure::Lance)
+        }
+    })) {
+        Ok(value) => value,
+        Err(payload) => recover_from_ffi_panic(payload, || on_failure(FfiFailure::Panic)),
+    }
+}
+
 /// Extract a human-readable message from a `catch_unwind` panic payload.
 ///
 /// `panic!` only ever produces `&str` or `String` payloads; anything else
@@ -182,89 +240,16 @@ pub unsafe extern "C" fn lance_free_string(s: *const c_char) {
 /// captured by the `$errval:expr` catch-all.
 macro_rules! ffi_try {
     ($body:expr, null) => {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
-            Ok(Ok(val)) => {
-                $crate::error::clear_last_error();
-                val
-            }
-            Ok(Err(err)) => {
-                $crate::error::set_lance_error(&err);
-                std::ptr::null_mut()
-            }
-            Err(payload) => {
-                $crate::error::set_last_error(
-                    $crate::error::LanceErrorCode::Panic,
-                    format!(
-                        "panic in FFI call: {}",
-                        $crate::error::panic_payload_message(&*payload)
-                    ),
-                );
-                std::ptr::null_mut()
-            }
-        }
+        $crate::error::ffi_guard_with(|| $body, |_| std::ptr::null_mut())
     };
     ($body:expr, neg) => {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
-            Ok(Ok(val)) => {
-                $crate::error::clear_last_error();
-                val
-            }
-            Ok(Err(err)) => {
-                $crate::error::set_lance_error(&err);
-                -1
-            }
-            Err(payload) => {
-                $crate::error::set_last_error(
-                    $crate::error::LanceErrorCode::Panic,
-                    format!(
-                        "panic in FFI call: {}",
-                        $crate::error::panic_payload_message(&*payload)
-                    ),
-                );
-                -1
-            }
-        }
+        $crate::error::ffi_guard_with(|| $body, |_| -1)
     };
     ($body:expr, void) => {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
-            Ok(Ok(_)) => {
-                $crate::error::clear_last_error();
-            }
-            Ok(Err(err)) => {
-                $crate::error::set_lance_error(&err);
-            }
-            Err(payload) => {
-                $crate::error::set_last_error(
-                    $crate::error::LanceErrorCode::Panic,
-                    format!(
-                        "panic in FFI call: {}",
-                        $crate::error::panic_payload_message(&*payload)
-                    ),
-                );
-            }
-        }
+        $crate::error::ffi_guard_with(|| $body, |_| ())
     };
     ($body:expr, $errval:expr) => {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
-            Ok(Ok(val)) => {
-                $crate::error::clear_last_error();
-                val
-            }
-            Ok(Err(err)) => {
-                $crate::error::set_lance_error(&err);
-                $errval
-            }
-            Err(payload) => {
-                $crate::error::set_last_error(
-                    $crate::error::LanceErrorCode::Panic,
-                    format!(
-                        "panic in FFI call: {}",
-                        $crate::error::panic_payload_message(&*payload)
-                    ),
-                );
-                $errval
-            }
-        }
+        $crate::error::ffi_guard_with(|| $body, |_| $errval)
     };
 }
 
@@ -274,6 +259,17 @@ pub(crate) use ffi_try;
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    #[derive(Debug)]
+    struct PanickingDisplay;
+
+    impl std::fmt::Display for PanickingDisplay {
+        fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("simulated panic while formatting an FFI error")
+        }
+    }
+
+    impl std::error::Error for PanickingDisplay {}
 
     /// Yields a `lance_core::Result<T>` by panicking — the panic is what the
     /// `ffi_try!` shapes under test must catch. (The panic hook prints to
@@ -400,6 +396,48 @@ mod tests {
         assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
         let msg = take_last_error_message().expect("error must set a message");
         assert!(msg.contains("bad arg"), "got: {msg}");
+    }
+
+    #[test]
+    fn ffi_try_catches_panic_while_formatting_lance_error() {
+        let v: u64 = ffi_try!(
+            Err(lance_core::Error::invalid_input_source(Box::new(
+                PanickingDisplay,
+            ))),
+            0
+        );
+        assert_eq!(v, 0);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+        let msg = take_last_error_message().expect("panic must set a message");
+        assert!(
+            msg.contains("simulated panic while formatting an FFI error"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ffi_try_catches_panic_while_building_error_sentinel() {
+        let attempts = std::cell::Cell::new(0);
+        let v: i64 = ffi_try!(
+            Err(lance_core::Error::invalid_input_source("bad arg".into())),
+            {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt == 0 {
+                    panic!("simulated panic while building an FFI error sentinel");
+                }
+                7
+            }
+        );
+
+        assert_eq!(v, 7);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+        let msg = take_last_error_message().expect("panic must set a message");
+        assert!(
+            msg.contains("simulated panic while building an FFI error sentinel"),
+            "got: {msg}"
+        );
     }
 
     #[test]

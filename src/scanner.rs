@@ -26,8 +26,8 @@ use crate::async_dispatcher::{self, LanceCallback};
 use crate::batch::LanceBatch;
 use crate::dataset::LanceDataset;
 use crate::error::{
-    LanceErrorCode, clear_last_error, error_code_from_lance, ffi_try, panic_payload_message,
-    set_lance_error, set_last_error, swallow_unwind,
+    FfiFailure, LanceErrorCode, clear_last_error, error_code_from_lance, ffi_guard_with, ffi_try,
+    panic_payload_message, set_lance_error, set_last_error, swallow_unwind,
 };
 use crate::helpers;
 use crate::runtime::{RT, block_on};
@@ -64,7 +64,7 @@ pub struct LanceScanner {
     use_index: Option<bool>,
     prefilter: bool,
     fts_query: Option<FullTextSearchQuery>,
-    // Set when a panic is caught in a stateful stream operation (issue #61):
+    // Set when a panic is caught in any operation on this scanner (issue #61):
     // once poisoned, every later `lance_scanner_*` call on this handle (except
     // `lance_scanner_close`, which must always free memory) fails with
     // `LANCE_ERR_PANIC`. Behind an `Arc` so the exported-stream wrapper and
@@ -442,6 +442,26 @@ macro_rules! scanner_poison_check {
     };
 }
 
+/// Run a scanner configuration call through the common FFI guard and poison
+/// the handle if that call catches a panic. Regular Lance errors remain
+/// recoverable and do not poison the builder.
+macro_rules! scanner_ffi_try {
+    ($scanner:expr, $body:expr $(,)?) => {{
+        let scanner_ptr = $scanner;
+        ffi_guard_with(
+            || $body,
+            |failure| {
+                if matches!(failure, FfiFailure::Panic) && !scanner_ptr.is_null() {
+                    unsafe { &*scanner_ptr }
+                        .poison_flag()
+                        .store(true, Ordering::SeqCst);
+                }
+                -1
+            },
+        )
+    }};
+}
+
 // ---------------------------------------------------------------------------
 // Scanner lifecycle + builder
 // ---------------------------------------------------------------------------
@@ -486,7 +506,7 @@ unsafe fn scanner_new_inner(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_limit(scanner: *mut LanceScanner, limit: i64) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(unsafe { scanner_set_limit_inner(scanner, limit) }, neg)
+    scanner_ffi_try!(scanner, unsafe { scanner_set_limit_inner(scanner, limit) })
 }
 
 unsafe fn scanner_set_limit_inner(scanner: *mut LanceScanner, limit: i64) -> Result<i32> {
@@ -504,7 +524,9 @@ unsafe fn scanner_set_limit_inner(scanner: *mut LanceScanner, limit: i64) -> Res
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_offset(scanner: *mut LanceScanner, offset: i64) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(unsafe { scanner_set_offset_inner(scanner, offset) }, neg)
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_offset_inner(scanner, offset)
+    })
 }
 
 unsafe fn scanner_set_offset_inner(scanner: *mut LanceScanner, offset: i64) -> Result<i32> {
@@ -525,10 +547,9 @@ pub unsafe extern "C" fn lance_scanner_set_batch_size(
     batch_size: i64,
 ) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(
-        unsafe { scanner_set_batch_size_inner(scanner, batch_size) },
-        neg
-    )
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_batch_size_inner(scanner, batch_size)
+    })
 }
 
 unsafe fn scanner_set_batch_size_inner(scanner: *mut LanceScanner, batch_size: i64) -> Result<i32> {
@@ -549,7 +570,9 @@ pub unsafe extern "C" fn lance_scanner_with_row_id(
     enable: bool,
 ) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(unsafe { scanner_with_row_id_inner(scanner, enable) }, neg)
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_with_row_id_inner(scanner, enable)
+    })
 }
 
 unsafe fn scanner_with_row_id_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
@@ -574,10 +597,9 @@ pub unsafe extern "C" fn lance_scanner_set_fragment_ids(
     len: usize,
 ) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(
-        unsafe { scanner_set_fragment_ids_inner(scanner, ids, len) },
-        neg
-    )
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fragment_ids_inner(scanner, ids, len)
+    })
 }
 
 unsafe fn scanner_set_fragment_ids_inner(
@@ -631,10 +653,9 @@ pub unsafe extern "C" fn lance_scanner_set_substrait_filter(
     len: usize,
 ) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(
-        unsafe { scanner_set_substrait_filter_inner(scanner, bytes, len) },
-        neg
-    )
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_substrait_filter_inner(scanner, bytes, len)
+    })
 }
 
 unsafe fn scanner_set_substrait_filter_inner(
@@ -693,10 +714,9 @@ pub unsafe extern "C" fn lance_scanner_set_statistics_callback(
     callback_ctx: *mut c_void,
 ) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(
-        unsafe { scanner_set_statistics_callback_inner(scanner, callback, callback_ctx) },
-        neg
-    )
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_statistics_callback_inner(scanner, callback, callback_ctx)
+    })
 }
 
 unsafe fn scanner_set_statistics_callback_inner(
@@ -770,27 +790,30 @@ pub unsafe extern "C" fn lance_scanner_to_arrow_stream(
     scanner: *mut LanceScanner,
     out: *mut FFI_ArrowArrayStream,
 ) -> i32 {
-    if scanner.is_null() || out.is_null() {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "scanner and out must not be NULL",
-        );
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner must not be NULL");
         return -1;
     }
     scanner_poison_check!(scanner, -1);
+    if out.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "out must not be NULL");
+        return -1;
+    }
     let s = unsafe { &*scanner };
     let poisoned = s.poison_flag();
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        scanner_to_arrow_stream_inner(s, out)
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match unsafe { scanner_to_arrow_stream_inner(s, out) } {
+            Ok(rc) => {
+                clear_last_error();
+                rc
+            }
+            Err(err) => {
+                set_lance_error(&err);
+                -1
+            }
+        }
     })) {
-        Ok(Ok(rc)) => {
-            clear_last_error();
-            rc
-        }
-        Ok(Err(err)) => {
-            set_lance_error(&err);
-            -1
-        }
+        Ok(rc) => rc,
         Err(payload) => {
             poisoned.store(true, Ordering::SeqCst);
             set_last_error(
@@ -848,14 +871,18 @@ pub unsafe extern "C" fn lance_scanner_next(
     scanner: *mut LanceScanner,
     out: *mut *mut LanceBatch,
 ) -> i32 {
-    if scanner.is_null() || out.is_null() {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "scanner and out must not be NULL",
-        );
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut() };
+    }
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner must not be NULL");
         return -1;
     }
     scanner_poison_check!(scanner, -1);
+    if out.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "out must not be NULL");
+        return -1;
+    }
     let s = unsafe { &mut *scanner };
     let poisoned = s.poison_flag();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -919,16 +946,22 @@ unsafe fn scanner_next_inner(s: &mut LanceScanner, out: *mut *mut LanceBatch) ->
 /// Start an async scan. The callback is invoked on a dedicated dispatcher thread
 /// when the ArrowArrayStream is ready.
 ///
-/// - `callback`: Called with `(ctx, 0, *mut ArrowArrayStream)` on success,
-///   or `(ctx, -1, NULL)` on error. On error, the dispatcher installs the
-///   error on the callback thread's TLS first, so `lance_last_error_*`
-///   called from inside the callback observes the failure.
+/// - `callback`: Must not be NULL. Called with
+///   `(ctx, 0, *mut ArrowArrayStream)` on success or `(ctx, -1, NULL)` on
+///   error. The successful result is a Rust-allocated outer stream container
+///   and must eventually be passed to [`lance_scanner_async_stream_free`]. On
+///   error, the dispatcher installs the error on the callback thread's TLS
+///   first, so `lance_last_error_*` called from inside the callback observes
+///   the failure.
 /// - `callback_ctx`: Opaque pointer passed back to the callback.
 ///
 /// The scanner configuration is captured at call time. The scanner handle
 /// can be closed immediately after this call.
 ///
-/// The promised contract is exactly one callback completion, even on panic.
+/// With a non-NULL callback, the promised contract is exactly one completion,
+/// even on panic. Completions normally run on the dispatcher thread; if that
+/// thread cannot be created or its channel has failed, delivery falls back to
+/// the thread producing the completion rather than dropping it.
 /// A panic anywhere in call-time setup (validation, scanner building,
 /// runtime access, task spawn) is caught by the entry guard below and still
 /// reported through the callback: `(ctx, -1, NULL)` with `LANCE_ERR_PANIC`,
@@ -939,9 +972,13 @@ unsafe fn scanner_next_inner(s: &mut LanceScanner, out: *mut *mut LanceBatch) ->
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_scan_async(
     scanner: *const LanceScanner,
-    callback: LanceCallback,
+    callback: Option<LanceCallback>,
     callback_ctx: *mut c_void,
 ) {
+    let Some(callback) = callback else {
+        set_last_error(LanceErrorCode::InvalidArgument, "callback must not be NULL");
+        return;
+    };
     unsafe {
         scan_async_guarded(scanner, callback, callback_ctx, |s, cb, ctx| {
             scan_async_setup(s, cb, ctx)
@@ -1148,6 +1185,22 @@ unsafe fn scan_async_setup(
     });
 }
 
+/// Release the heap-allocated Arrow stream container returned through a
+/// successful [`lance_scanner_scan_async`] callback.
+///
+/// The Arrow stream's own `release` callback is invoked first when it is still
+/// present, then the outer Rust allocation is freed. Passing NULL is a no-op.
+/// This function must not be used for stack-allocated streams returned by
+/// [`lance_scanner_to_arrow_stream`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_async_stream_free(stream: *mut FFI_ArrowArrayStream) {
+    if !stream.is_null() {
+        swallow_unwind("lance_scanner_async_stream_free", || unsafe {
+            drop(Box::from_raw(stream));
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Poll-based iteration (for cooperative async runtimes)
 // ---------------------------------------------------------------------------
@@ -1155,9 +1208,11 @@ unsafe fn scan_async_setup(
 /// Poll for the next batch without blocking.
 ///
 /// - If data is already buffered, returns `LANCE_POLL_READY` immediately.
-/// - If I/O is needed, returns `LANCE_POLL_PENDING` and schedules the waker callback.
+/// - If I/O is needed, returns `LANCE_POLL_PENDING` and schedules the non-NULL
+///   waker callback.
 ///   The caller should yield the thread and re-poll after the waker fires.
 /// - The waker is single-use: it fires at most once per poll call that returns PENDING.
+///   Its context must remain valid until it fires or the scanner is closed.
 ///
 /// The stream is lazily materialized on the first poll call (which will typically
 /// return PENDING while the stream opens).
@@ -1168,18 +1223,26 @@ unsafe fn scan_async_setup(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_poll_next(
     scanner: *mut LanceScanner,
-    waker: LanceWaker,
+    waker: Option<LanceWaker>,
     waker_ctx: *mut c_void,
     out: *mut *mut LanceBatch,
 ) -> LancePollStatus {
-    if scanner.is_null() || out.is_null() {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "scanner and out must not be NULL",
-        );
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut() };
+    }
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner must not be NULL");
         return LancePollStatus::Error;
     }
     scanner_poison_check!(scanner, LancePollStatus::Error);
+    if out.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "out must not be NULL");
+        return LancePollStatus::Error;
+    }
+    let Some(waker) = waker else {
+        set_last_error(LanceErrorCode::InvalidArgument, "waker must not be NULL");
+        return LancePollStatus::Error;
+    };
     let s = unsafe { &mut *scanner };
     let poisoned = s.poison_flag();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -1264,6 +1327,7 @@ unsafe fn scanner_poll_next_inner(
 struct CWakerContext {
     waker_fn: LanceWaker,
     ctx: *mut c_void,
+    fired: AtomicBool,
 }
 
 // C function pointers + void* are Send by convention for FFI.
@@ -1271,37 +1335,45 @@ unsafe impl Send for CWakerContext {}
 unsafe impl Sync for CWakerContext {}
 
 fn make_raw_waker(waker_fn: LanceWaker, ctx: *mut c_void) -> RawWaker {
-    let data = Box::into_raw(Box::new(CWakerContext { waker_fn, ctx })) as *const ();
+    let data = Arc::into_raw(Arc::new(CWakerContext {
+        waker_fn,
+        ctx,
+        fired: AtomicBool::new(false),
+    })) as *const ();
 
     const VTABLE: RawWakerVTable = RawWakerVTable::new(
         // clone
         |data| {
-            let orig = unsafe { &*(data as *const CWakerContext) };
-            let cloned = Box::new(CWakerContext {
-                waker_fn: orig.waker_fn,
-                ctx: orig.ctx,
-            });
-            RawWaker::new(Box::into_raw(cloned) as *const (), &VTABLE)
+            unsafe { Arc::<CWakerContext>::increment_strong_count(data.cast()) };
+            RawWaker::new(data, &VTABLE)
         },
         // wake (consumes)
         |data| {
-            let ctx = unsafe { Box::from_raw(data as *mut CWakerContext) };
-            unsafe { (ctx.waker_fn)(ctx.ctx) };
+            let ctx = unsafe { Arc::from_raw(data as *const CWakerContext) };
+            ctx.wake_once();
         },
         // wake_by_ref
         |data| {
             let ctx = unsafe { &*(data as *const CWakerContext) };
-            unsafe { (ctx.waker_fn)(ctx.ctx) };
+            ctx.wake_once();
         },
         // drop
         |data| {
             unsafe {
-                let _ = Box::from_raw(data as *mut CWakerContext);
+                drop(Arc::from_raw(data as *const CWakerContext));
             };
         },
     );
 
     RawWaker::new(data, &VTABLE)
+}
+
+impl CWakerContext {
+    fn wake_once(&self) {
+        if !self.fired.swap(true, Ordering::AcqRel) {
+            unsafe { (self.waker_fn)(self.ctx) };
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1313,7 +1385,8 @@ macro_rules! scanner_set_u32 {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(scanner: *mut LanceScanner, value: u32) -> i32 {
             scanner_poison_check!(scanner, -1);
-            ffi_try!(
+            scanner_ffi_try!(
+                scanner,
                 (|| -> Result<i32> {
                     if scanner.is_null() {
                         return Err(lance_core::Error::invalid_input_source(
@@ -1324,8 +1397,7 @@ macro_rules! scanner_set_u32 {
                         (*scanner).$field = Some(value);
                     }
                     Ok(0)
-                })(),
-                neg
+                })()
             )
         }
     };
@@ -1338,7 +1410,9 @@ scanner_set_u32!(lance_scanner_set_ef, ef);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_metric(scanner: *mut LanceScanner, metric: i32) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(unsafe { scanner_set_metric_inner(scanner, metric) }, neg)
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_metric_inner(scanner, metric)
+    })
 }
 
 unsafe fn scanner_set_metric_inner(scanner: *mut LanceScanner, metric: i32) -> Result<i32> {
@@ -1370,7 +1444,9 @@ pub unsafe extern "C" fn lance_scanner_set_use_index(
     enable: bool,
 ) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(unsafe { scanner_set_use_index_inner(scanner, enable) }, neg)
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_use_index_inner(scanner, enable)
+    })
 }
 
 unsafe fn scanner_set_use_index_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
@@ -1391,7 +1467,9 @@ pub unsafe extern "C" fn lance_scanner_set_prefilter(
     enable: bool,
 ) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(unsafe { scanner_set_prefilter_inner(scanner, enable) }, neg)
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_prefilter_inner(scanner, enable)
+    })
 }
 
 unsafe fn scanner_set_prefilter_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
@@ -1424,10 +1502,9 @@ pub unsafe extern "C" fn lance_scanner_set_index_segments(
     len: usize,
 ) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(
-        unsafe { scanner_set_index_segments_inner(scanner, segment_uuids, len) },
-        neg
-    )
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_index_segments_inner(scanner, segment_uuids, len)
+    })
 }
 
 unsafe fn scanner_set_index_segments_inner(
@@ -1485,10 +1562,9 @@ pub unsafe extern "C" fn lance_scanner_nearest(
     k: u32,
 ) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(
-        unsafe { scanner_nearest_inner(scanner, column, query_data, query_len, element_type, k) },
-        neg
-    )
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_nearest_inner(scanner, column, query_data, query_len, element_type, k)
+    },)
 }
 
 unsafe fn scanner_nearest_inner(
@@ -1586,10 +1662,9 @@ pub unsafe extern "C" fn lance_scanner_full_text_search(
     max_fuzzy_distance: u32,
 ) -> i32 {
     scanner_poison_check!(scanner, -1);
-    ffi_try!(
-        unsafe { fts_inner(scanner, query, columns, max_fuzzy_distance) },
-        neg
-    )
+    scanner_ffi_try!(scanner, unsafe {
+        fts_inner(scanner, query, columns, max_fuzzy_distance)
+    },)
 }
 
 unsafe fn fts_inner(
@@ -1639,7 +1714,7 @@ mod tests {
     use crate::dataset::{lance_dataset_close, lance_dataset_open};
     use crate::error::{lance_last_error_code, lance_last_error_message};
     use std::ffi::{CStr, CString};
-    use std::sync::atomic::AtomicI32;
+    use std::sync::atomic::{AtomicI32, AtomicUsize};
 
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -1707,6 +1782,102 @@ mod tests {
     unsafe extern "C" fn noop_waker(_ctx: *mut c_void) {}
 
     #[test]
+    fn null_async_callback_is_rejected_without_poisoning_scanner() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+
+        unsafe { lance_scanner_scan_async(scanner, None, ptr::null_mut()) };
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let msg_ptr = lance_last_error_message();
+        assert!(!msg_ptr.is_null());
+        let msg = unsafe { CStr::from_ptr(msg_ptr) }.to_string_lossy();
+        assert!(msg.contains("callback must not be NULL"), "got: {msg}");
+        unsafe { crate::error::lance_free_string(msg_ptr) };
+        assert!(!unsafe { &*scanner }.is_poisoned());
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn null_poll_waker_is_rejected_and_clears_out() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let mut batch = std::ptr::NonNull::<LanceBatch>::dangling().as_ptr();
+
+        let status = unsafe { lance_scanner_poll_next(scanner, None, ptr::null_mut(), &mut batch) };
+        assert_eq!(status, LancePollStatus::Error);
+        assert!(batch.is_null());
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert!(!unsafe { &*scanner }.is_poisoned());
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn raw_waker_clones_share_one_shot_gate() {
+        static WAKES: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn count_wake(_ctx: *mut c_void) {
+            WAKES.fetch_add(1, Ordering::SeqCst);
+        }
+
+        WAKES.store(0, Ordering::SeqCst);
+        let waker = unsafe { Waker::from_raw(make_raw_waker(count_wake, ptr::null_mut())) };
+        let cloned = waker.clone();
+        waker.wake_by_ref();
+        cloned.wake_by_ref();
+        drop(cloned);
+        drop(waker);
+        assert_eq!(WAKES.load(Ordering::SeqCst), 1);
+    }
+
+    fn panicking_setter_body() -> Result<i32> {
+        panic!("simulated panic in scanner setter")
+    }
+
+    unsafe fn panicking_scanner_setter(scanner: *mut LanceScanner) -> i32 {
+        scanner_poison_check!(scanner, -1);
+        scanner_ffi_try!(scanner, panicking_setter_body())
+    }
+
+    #[test]
+    fn scanner_setter_panic_poisons_handle() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+
+        let rc = unsafe { panicking_scanner_setter(scanner) };
+        assert_eq!(rc, -1);
+        assert!(unsafe { &*scanner }.is_poisoned());
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+        let msg_ptr = lance_last_error_message();
+        assert!(!msg_ptr.is_null());
+        let msg = unsafe { CStr::from_ptr(msg_ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::error::lance_free_string(msg_ptr) };
+        assert!(
+            msg.contains("simulated panic in scanner setter"),
+            "got: {msg}"
+        );
+
+        // The original panic message is reported once; later calls use the
+        // stable poison error and never touch scanner state again.
+        let rc = unsafe { lance_scanner_set_limit(scanner, 10) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
     fn poisoned_scanner_rejects_setters_with_panic_code() {
         let (_tmp, uri) = create_test_dataset();
         let (dataset, scanner) = open_dataset_and_scanner(&uri);
@@ -1745,10 +1916,15 @@ mod tests {
         let (dataset, scanner) = open_dataset_and_scanner(&uri);
         poison(scanner);
 
-        let mut batch: *mut LanceBatch = ptr::null_mut();
+        let mut batch = std::ptr::NonNull::<LanceBatch>::dangling().as_ptr();
         let rc = unsafe { lance_scanner_next(scanner, &mut batch) };
         assert_eq!(rc, -1);
         assert!(batch.is_null(), "error path must leave *out NULL");
+        assert_poison_error_pending();
+
+        // Poison has precedence over validation of secondary arguments.
+        let rc = unsafe { lance_scanner_next(scanner, ptr::null_mut()) };
+        assert_eq!(rc, -1);
         assert_poison_error_pending();
 
         unsafe {
@@ -1763,11 +1939,18 @@ mod tests {
         let (dataset, scanner) = open_dataset_and_scanner(&uri);
         poison(scanner);
 
-        let mut batch: *mut LanceBatch = ptr::null_mut();
-        let status =
-            unsafe { lance_scanner_poll_next(scanner, noop_waker, ptr::null_mut(), &mut batch) };
+        let mut batch = std::ptr::NonNull::<LanceBatch>::dangling().as_ptr();
+        let status = unsafe {
+            lance_scanner_poll_next(scanner, Some(noop_waker), ptr::null_mut(), &mut batch)
+        };
         assert_eq!(status, LancePollStatus::Error);
         assert!(batch.is_null(), "error path must leave *out NULL");
+        assert_poison_error_pending();
+
+        let status = unsafe {
+            lance_scanner_poll_next(scanner, Some(noop_waker), ptr::null_mut(), ptr::null_mut())
+        };
+        assert_eq!(status, LancePollStatus::Error);
         assert_poison_error_pending();
 
         unsafe {
@@ -1809,7 +1992,7 @@ mod tests {
         let (dataset, scanner) = open_dataset_and_scanner(&uri);
         poison(scanner);
 
-        unsafe { lance_scanner_scan_async(scanner, record_status, ptr::null_mut()) };
+        unsafe { lance_scanner_scan_async(scanner, Some(record_status), ptr::null_mut()) };
         // The poison error is also visible on the calling thread.
         assert_poison_error_pending();
 

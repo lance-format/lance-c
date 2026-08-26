@@ -49,6 +49,12 @@ inline void check_error() {
     }
 }
 
+/// Release and free a library-allocated ArrowArrayStream returned by
+/// Scanner::scan_async. NULL-safe; do not use for caller-allocated streams.
+inline void scanner_async_stream_free(ArrowArrayStream* stream) noexcept {
+    lance_scanner_async_stream_free(stream);
+}
+
 // ─── RAII Handle Template ────────────────────────────────────────────────────
 
 template <typename T, void (*Deleter)(T*)>
@@ -329,7 +335,9 @@ public:
 
     /// Version of this dataset snapshot.
     uint64_t version() const {
-        return lance_dataset_version(handle_.get());
+        uint64_t v = lance_dataset_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return v;
     }
 
     /// Latest version ID (queries object store).
@@ -347,11 +355,13 @@ public:
         Handle<LanceVersions, lance_versions_close> snap(raw);
 
         uint64_t n = lance_versions_count(snap.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
         std::vector<VersionInfo> out;
         out.reserve(static_cast<size_t>(n));
         for (uint64_t i = 0; i < n; i++) {
             VersionInfo info;
             info.id = lance_versions_id_at(snap.get(), static_cast<size_t>(i));
+            if (lance_last_error_code() != LANCE_OK) check_error();
             info.timestamp_ms =
                 lance_versions_timestamp_ms_at(snap.get(), static_cast<size_t>(i));
             if (lance_last_error_code() != LANCE_OK) check_error();
@@ -369,11 +379,13 @@ public:
         Handle<LanceDataStatistics, lance_data_statistics_close> snap(raw);
 
         uint64_t n = lance_data_statistics_count(snap.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
         std::vector<FieldStatistics> out;
         out.reserve(static_cast<size_t>(n));
         for (uint64_t i = 0; i < n; i++) {
             FieldStatistics fs;
             fs.id = lance_data_statistics_field_id_at(snap.get(), static_cast<size_t>(i));
+            if (lance_last_error_code() != LANCE_OK) check_error();
             fs.bytes_on_disk =
                 lance_data_statistics_bytes_on_disk_at(snap.get(), static_cast<size_t>(i));
             if (lance_last_error_code() != LANCE_OK) check_error();
@@ -631,7 +643,9 @@ public:
         }
     }
 
-    /// Take rows by indices. Results exported as ArrowArrayStream.
+    /// Take rows by indices. `out` is caller-owned and its non-null `release`
+    /// must be called exactly once. Deferred iteration/cleanup panics are
+    /// contained by the exported stream guard.
     void take(const uint64_t* indices, size_t num_indices,
               const std::vector<std::string>& columns,
               ArrowArrayStream* out) const {
@@ -645,7 +659,7 @@ public:
         }
     }
 
-    /// Take all columns.
+    /// Take all columns with the same stream ownership as the overload above.
     void take(const uint64_t* indices, size_t num_indices,
               ArrowArrayStream* out) const {
         if (lance_dataset_take(handle_.get(), indices, num_indices, nullptr, out) != 0) {
@@ -653,7 +667,9 @@ public:
         }
     }
 
-    /// Take rows by dataset row IDs. Results exported as ArrowArrayStream.
+    /// Take rows by dataset row IDs. `out` is caller-owned and its non-null
+    /// `release` must be called exactly once. Deferred iteration/cleanup panics
+    /// are contained by the exported stream guard.
     void take_rows(const uint64_t* row_ids, size_t num_row_ids,
                    const std::vector<std::string>& columns,
                    ArrowArrayStream* out) const {
@@ -668,7 +684,8 @@ public:
         }
     }
 
-    /// Take all columns by dataset row IDs.
+    /// Take all columns by dataset row IDs with the same stream ownership as
+    /// the overload above.
     void take_rows(const uint64_t* row_ids, size_t num_row_ids,
                    ArrowArrayStream* out) const {
         if (lance_dataset_take_rows(
@@ -783,7 +800,7 @@ public:
     /// Throws lance::Error with code NotFound if the index does not exist.
     uint64_t index_segment_count(const std::string& index_name) const {
         uint64_t n = lance_dataset_index_segment_count(handle_.get(), index_name.c_str());
-        if (n == 0 && lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) check_error();
         return n;
     }
 
@@ -1127,7 +1144,7 @@ public:
         return substrait_filter(bytes.data(), bytes.size());
     }
 
-    /// Register a callback for scan statistics after successful full exhaustion.
+    /// Register a non-null callback for scan statistics after successful full exhaustion.
     /// The registration applies to every stream derived from this scanner, including
     /// concurrent streams and streams created after an earlier callback returns. The
     /// callback is not guaranteed on error, cancellation, or early release. It may
@@ -1166,12 +1183,20 @@ public:
     }
 
     /// Materialize an independent ArrowArrayStream (blocking). The scanner remains valid.
+    /// `out` is caller-owned; call its non-null `release` callback exactly once.
     void to_arrow_stream(ArrowArrayStream* out) {
         if (lance_scanner_to_arrow_stream(handle_.get(), out) != 0)
             check_error();
     }
 
-    /// Start an async scan. Callback fires when ArrowArrayStream is ready.
+    /// Start an async scan with a non-null callback. On success, the callback's
+    /// ArrowArrayStream result is library-allocated and must be passed exactly
+    /// once to `lance::scanner_async_stream_free`, which also invokes `release`
+    /// when necessary. The callback normally runs on the dispatcher thread,
+    /// but a rare infrastructure fallback may invoke it on the calling or
+    /// producing thread, possibly before this method returns, so it must be
+    /// thread-safe. Exactly one completion is delivered; callback and non-null
+    /// context storage must remain valid until it returns.
     void scan_async(LanceCallback callback, void* ctx) const {
         lance_scanner_scan_async(handle_.get(), callback, ctx);
     }
