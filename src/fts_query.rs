@@ -50,11 +50,25 @@ impl TryFrom<i32> for LanceFtsCoverageMode {
 
 /// Rust-owned immutable state behind [`LanceFtsQueryContext`].
 pub(crate) struct FtsQueryContextInner {
-    pub(crate) dataset_uri: String,
-    pub(crate) dataset_version: u64,
+    pub(crate) dataset: Arc<lance::Dataset>,
     pub(crate) query: FullTextSearchQuery,
     pub(crate) segments: Vec<IndexMetadata>,
     pub(crate) scorer: Arc<MemBM25Scorer>,
+}
+
+impl FtsQueryContextInner {
+    pub(crate) fn validate_dataset_identity(&self, dataset: &Arc<lance::Dataset>) -> Result<()> {
+        if !Arc::ptr_eq(&self.dataset, dataset) {
+            return Err(invalid_input(format!(
+                "FTS query context and scanner must originate from the same process-local dataset snapshot; context has uri '{}' version {}, scanner has uri '{}' version {}",
+                self.dataset.uri(),
+                self.dataset.version_id(),
+                dataset.uri(),
+                dataset.version_id()
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Opaque process-local FTS query context.
@@ -74,7 +88,6 @@ async fn prepare_fts_query_context(
     dataset: Arc<lance::Dataset>,
     column: String,
     query_text: String,
-    max_fuzzy_distance: u32,
     coverage_mode: LanceFtsCoverageMode,
 ) -> Result<FtsQueryContextInner> {
     let logical_index = dataset
@@ -180,12 +193,7 @@ async fn prepare_fts_query_context(
         )));
     }
 
-    let query = if max_fuzzy_distance == 0 {
-        FullTextSearchQuery::new(query_text).with_column(column.clone())?
-    } else {
-        FullTextSearchQuery::new_fuzzy(query_text, Some(max_fuzzy_distance))
-            .with_column(column.clone())?
-    };
+    let query = FullTextSearchQuery::new(query_text).with_column(column.clone())?;
     let match_query = match &query.query {
         FtsQuery::Match(query) => query,
         _ => {
@@ -204,8 +212,7 @@ async fn prepare_fts_query_context(
     let scorer = Arc::new(build_global_bm25_scorer(&indices, &query_tokens, &params).await?);
 
     Ok(FtsQueryContextInner {
-        dataset_uri: dataset.uri().to_string(),
-        dataset_version: dataset.version_id(),
+        dataset,
         query,
         segments,
         scorer,
@@ -249,12 +256,16 @@ unsafe fn prepare_fts_query_inner(
         .ok_or_else(|| invalid_input("query must not be empty"))?
         .to_string();
     let coverage_mode = LanceFtsCoverageMode::try_from(coverage_mode)?;
+    if max_fuzzy_distance != 0 {
+        return Err(invalid_input(format!(
+            "max_fuzzy_distance must be 0 for prepared FTS query contexts, got {max_fuzzy_distance}; fuzzy queries require a canonical prepared BM25 vocabulary"
+        )));
+    }
     let snapshot = unsafe { &*dataset }.snapshot();
     let inner = block_on(prepare_fts_query_context(
         snapshot,
         column,
         query,
-        max_fuzzy_distance,
         coverage_mode,
     ))?;
     Ok(Box::into_raw(Box::new(LanceFtsQueryContext {

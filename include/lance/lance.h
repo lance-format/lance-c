@@ -1621,12 +1621,21 @@ typedef enum {
  * committed FTS segments for `column`, checks fragment coverage, opens those
  * segments, and computes one query-specific global BM25 scorer across their
  * indexed documents. The context can then be shared by any number of scanners
- * in this process; it has no serialization or cross-process transport format.
+ * created from the exact same process-local dataset snapshot. It has no
+ * serialization or cross-process transport format. Reopening the same URI and
+ * manifest version creates a different identity and cannot reuse the context,
+ * because storage options and object-store endpoints may differ.
  *
  * In LANCE_FTS_COVERAGE_INDEX_ONLY mode, unindexed fragments are allowed and
  * excluded from both the scorer corpus and query results. In STRICT mode any
  * unindexed fragment makes this call fail.
  *
+ * Prepared contexts currently support exact Match queries only.
+ * `max_fuzzy_distance` must be zero because fuzzy execution requires its
+ * canonical expanded vocabulary to be prepared together with the scorer.
+ * This restriction does not apply to lance_scanner_full_text_search().
+ *
+ * @param max_fuzzy_distance Must be zero for prepared query contexts.
  * @param coverage_mode Fixed-width LanceFtsCoverageMode discriminant.
  * @return Context handle on success, or NULL on error.
  */
@@ -1664,10 +1673,12 @@ int32_t lance_scanner_full_text_search(
 );
 
 /**
- * Attach a prepared process-local FTS query context. The scanner retains
- * shared ownership, so the caller may close `context` after success. This is
- * mutually exclusive with nearest and lance_scanner_full_text_search because
- * the context already owns the FTS query.
+ * Attach a prepared process-local FTS query context. The scanner must have
+ * been created from the exact LanceDataset snapshot used to prepare the
+ * context; URI and manifest version equality is not sufficient. The scanner
+ * retains shared ownership, so the caller may close `context` after success.
+ * This is mutually exclusive with nearest and lance_scanner_full_text_search
+ * because the context already owns the FTS query.
  */
 int32_t lance_scanner_set_fts_query_context(
     LanceScanner* scanner,

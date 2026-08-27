@@ -722,8 +722,10 @@ public:
     Scanner scan() const;
 
     /// Prepare a query-specific global BM25 scorer over the committed FTS
-    /// segments of this pinned snapshot. IndexOnly permits and reports
-    /// unindexed fragments; Strict rejects them.
+    /// segments of this pinned snapshot. IndexOnly permits unindexed fragments;
+    /// Strict rejects them. Prepared contexts currently require
+    /// `max_fuzzy_distance == 0`. The context can only be attached to scanners
+    /// created from this exact process-local dataset snapshot.
     FtsQueryContext prepare_fts_query(
         const std::string& column,
         const std::string& query,

@@ -254,20 +254,7 @@ impl LanceScanner {
             scanner.full_text_search(fts.clone())?;
         }
         let distributed_fts = if let Some(context) = &self.fts_context {
-            if context.dataset_uri != self.dataset.uri()
-                || context.dataset_version != self.dataset.version_id()
-            {
-                return Err(lance_core::Error::invalid_input_source(
-                    format!(
-                        "FTS query context belongs to dataset uri '{}' version {}, but scanner belongs to uri '{}' version {}",
-                        context.dataset_uri,
-                        context.dataset_version,
-                        self.dataset.uri(),
-                        self.dataset.version_id()
-                    )
-                    .into(),
-                ));
-            }
+            context.validate_dataset_identity(&self.dataset)?;
             let segments = select_fts_segments(context, self.fts_index_segments.as_deref())?;
             scanner.full_text_search(context.query.clone())?;
             // Both STRICT and INDEX_ONLY context scans must use only the
@@ -350,7 +337,7 @@ fn select_fts_segments(
                 lance_core::Error::invalid_input_source(
                     format!(
                         "FTS segment UUID {uuid} is not present in the attached query context for dataset version {}",
-                        context.dataset_version
+                        context.dataset.version_id()
                     )
                     .into(),
                 )
@@ -1981,20 +1968,7 @@ unsafe fn scanner_set_fts_query_context_inner(
                 .into(),
         ));
     }
-    if context.dataset_uri != scanner.dataset.uri()
-        || context.dataset_version != scanner.dataset.version_id()
-    {
-        return Err(lance_core::Error::invalid_input_source(
-            format!(
-                "FTS query context belongs to dataset uri '{}' version {}, but scanner belongs to uri '{}' version {}",
-                context.dataset_uri,
-                context.dataset_version,
-                scanner.dataset.uri(),
-                scanner.dataset.version_id()
-            )
-            .into(),
-        ));
-    }
+    context.validate_dataset_identity(&scanner.dataset)?;
     scanner.fts_context = Some(context);
     Ok(0)
 }

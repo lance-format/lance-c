@@ -5907,6 +5907,32 @@ fn test_prepared_fts_global_scorer_is_shared_across_segment_splits() {
     );
     unsafe { lance_scanner_close(unknown_segment_scanner) };
 
+    let independently_reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!independently_reopened.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_version(independently_reopened) },
+        unsafe { lance_dataset_version(dataset) },
+        "the identity check must reject equal URI/version locator metadata"
+    );
+    let reopened_scanner =
+        unsafe { lance_scanner_new(independently_reopened, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query_context(reopened_scanner, context) },
+        -1,
+        "an independently opened dataset must not reuse the prepared context"
+    );
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(
+        message.contains("same process-local dataset snapshot"),
+        "{message}"
+    );
+    unsafe { lance_scanner_close(reopened_scanner) };
+    unsafe { lance_dataset_close(independently_reopened) };
+
     let old_snapshot = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 2) };
     assert!(!old_snapshot.is_null());
     let old_snapshot_scanner = unsafe { lance_scanner_new(old_snapshot, ptr::null(), ptr::null()) };
@@ -5923,7 +5949,7 @@ fn test_prepared_fts_global_scorer_is_shared_across_segment_splits() {
 }
 
 #[test]
-fn test_prepare_fts_query_rejects_null_empty_and_invalid_mode() {
+fn test_prepare_fts_query_rejects_null_empty_invalid_mode_and_fuzzy() {
     let (_tmp, uri) = create_test_dataset();
     let uri_c = c_str(&uri);
     let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
@@ -5962,6 +5988,28 @@ fn test_prepare_fts_query_rejects_null_empty_and_invalid_mode() {
     assert!(
         unsafe { lance_dataset_prepare_fts_query(dataset, column.as_ptr(), query.as_ptr(), 0, 99) }
             .is_null()
+    );
+    assert!(
+        unsafe {
+            lance_dataset_prepare_fts_query(
+                dataset,
+                column.as_ptr(),
+                query.as_ptr(),
+                1,
+                LanceFtsCoverageMode::Strict as i32,
+            )
+        }
+        .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(
+        message.contains("max_fuzzy_distance must be 0"),
+        "{message}"
     );
     let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
     assert_eq!(
