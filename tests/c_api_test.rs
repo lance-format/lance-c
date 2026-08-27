@@ -5600,6 +5600,383 @@ fn test_fts_fuzzy() {
     unsafe { lance_dataset_close(ds) };
 }
 
+fn collect_context_fts_scores(
+    dataset: *const LanceDataset,
+    context: *const LanceFtsQueryContext,
+    segment_uuids: Option<&[[u8; 16]]>,
+) -> std::collections::HashMap<i32, f32> {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    if let Some(segment_uuids) = segment_uuids {
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_fts_index_segments(
+                    scanner,
+                    segment_uuids.as_ptr().cast::<u8>(),
+                    segment_uuids.len(),
+                )
+            },
+            0
+        );
+    }
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream).unwrap() };
+    let mut scores = std::collections::HashMap::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let batch_scores = batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            assert!(
+                scores
+                    .insert(ids.value(row), batch_scores.value(row))
+                    .is_none()
+            );
+        }
+    }
+    unsafe { lance_scanner_close(scanner) };
+    scores
+}
+
+fn load_fts_segment_uuids(uri: &str, column: &str) -> Vec<[u8; 16]> {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexCriteria;
+
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let logical_index = dataset
+            .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
+            .await
+            .unwrap()
+            .unwrap();
+        dataset
+            .load_indices_by_name(&logical_index.name)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|segment| *segment.uuid.as_bytes())
+            .collect()
+    })
+}
+
+#[test]
+fn test_prepare_fts_query_index_only_allows_unindexed_fragment() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let column = c_str("name");
+    let query = c_str("alice");
+    let inverted_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+
+    let indexed_snapshot = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                indexed_snapshot,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::Inverted as i32,
+                inverted_params.as_ptr(),
+                false,
+            )
+        },
+        0
+    );
+    unsafe { lance_dataset_close(indexed_snapshot) };
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![6, 7])),
+            Arc::new(StringArray::from(vec!["alice", "alice alice"])),
+        ],
+    )
+    .unwrap();
+    append_batch(&uri, schema, batch);
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let strict = unsafe {
+        lance_dataset_prepare_fts_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(strict.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(message.contains("unindexed fragments"), "{message}");
+
+    let context = unsafe {
+        lance_dataset_prepare_fts_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            0,
+            LanceFtsCoverageMode::IndexOnly as i32,
+        )
+    };
+    assert!(!context.is_null());
+    let segment_uuids = load_fts_segment_uuids(&uri, "name");
+    assert_eq!(segment_uuids.len(), 1);
+
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+        0
+    );
+    // Scanner retains an Arc; closing the public handle does not invalidate it.
+    unsafe { lance_fts_query_context_close(context) };
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_fts_index_segments(
+                scanner,
+                segment_uuids.as_ptr().cast::<u8>(),
+                segment_uuids.len(),
+            )
+        },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream).unwrap() };
+    let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+    assert_eq!(
+        total_rows, 1,
+        "INDEX_ONLY must exclude both matching rows in the unindexed fragment"
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_prepared_fts_global_scorer_is_shared_across_segment_splits() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let column = c_str("name");
+    let query = c_str("alice");
+    let inverted_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::Inverted as i32,
+                inverted_params.as_ptr(),
+                false,
+            )
+        },
+        0
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    append_batch(
+        &uri,
+        schema.clone(),
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![6, 7])),
+                Arc::new(StringArray::from(vec!["alice", "alice alice"])),
+            ],
+        )
+        .unwrap(),
+    );
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+    });
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let context = unsafe {
+        lance_dataset_prepare_fts_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!context.is_null(), "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    let segment_uuids = load_fts_segment_uuids(&uri, "name");
+    assert_eq!(segment_uuids.len(), 2);
+
+    let full_scores = collect_context_fts_scores(dataset, context, None);
+    assert_eq!(full_scores.len(), 3);
+    let mut split_scores = std::collections::HashMap::new();
+    for segment_uuid in &segment_uuids {
+        for (id, score) in
+            collect_context_fts_scores(dataset, context, Some(std::slice::from_ref(segment_uuid)))
+        {
+            assert!(split_scores.insert(id, score).is_none());
+        }
+    }
+    assert_eq!(split_scores.len(), full_scores.len());
+    for (id, expected_score) in full_scores {
+        let actual_score = split_scores.get(&id).unwrap();
+        assert!(
+            (actual_score - expected_score).abs() < 1e-6,
+            "id={id}, full={expected_score}, split={actual_score}"
+        );
+    }
+
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    let duplicate_segments = [segment_uuids[0], segment_uuids[0]];
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_fts_index_segments(
+                scanner,
+                duplicate_segments.as_ptr().cast::<u8>(),
+                duplicate_segments.len(),
+            )
+        },
+        -1
+    );
+    assert!(unsafe { lance_scanner_set_fts_query_context(scanner, ptr::null()) } < 0);
+
+    unsafe { lance_scanner_close(scanner) };
+
+    let unknown_segment_scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query_context(unknown_segment_scanner, context) },
+        0
+    );
+    let unknown_uuid = [0_u8; 16];
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_fts_index_segments(unknown_segment_scanner, unknown_uuid.as_ptr(), 1)
+        },
+        0,
+        "membership is validated against the attached context at scan time"
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(unknown_segment_scanner, &mut stream) },
+        -1
+    );
+    unsafe { lance_scanner_close(unknown_segment_scanner) };
+
+    let old_snapshot = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 2) };
+    assert!(!old_snapshot.is_null());
+    let old_snapshot_scanner = unsafe { lance_scanner_new(old_snapshot, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query_context(old_snapshot_scanner, context) },
+        -1,
+        "a context must not be attached to a different dataset version"
+    );
+    unsafe { lance_scanner_close(old_snapshot_scanner) };
+    unsafe { lance_dataset_close(old_snapshot) };
+
+    unsafe { lance_fts_query_context_close(context) };
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_prepare_fts_query_rejects_null_empty_and_invalid_mode() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("name");
+    let query = c_str("alice");
+    let empty = c_str("");
+
+    assert!(
+        unsafe {
+            lance_dataset_prepare_fts_query(
+                ptr::null(),
+                column.as_ptr(),
+                query.as_ptr(),
+                0,
+                LanceFtsCoverageMode::Strict as i32,
+            )
+        }
+        .is_null()
+    );
+    assert!(
+        unsafe {
+            lance_dataset_prepare_fts_query(
+                dataset,
+                empty.as_ptr(),
+                query.as_ptr(),
+                0,
+                LanceFtsCoverageMode::Strict as i32,
+            )
+        }
+        .is_null()
+    );
+    assert!(
+        unsafe { lance_dataset_prepare_fts_query(dataset, column.as_ptr(), empty.as_ptr(), 0, 0) }
+            .is_null()
+    );
+    assert!(
+        unsafe { lance_dataset_prepare_fts_query(dataset, column.as_ptr(), query.as_ptr(), 0, 99) }
+            .is_null()
+    );
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_index_segments(scanner, ptr::null(), 1) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_index_segments(scanner, ptr::null(), 0) },
+        0
+    );
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_fts_query_context_close(ptr::null_mut()) };
+    unsafe { lance_dataset_close(dataset) };
+}
+
 #[test]
 fn test_nearest_after_fts_is_rejected() {
     let (_tmp, uri) = create_vector_dataset(64, 8);

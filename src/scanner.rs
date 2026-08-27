@@ -12,14 +12,17 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::SchemaRef;
+use datafusion::physical_plan::ExecutionPlan;
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::scanner::{
     DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
 };
+use lance::io::exec::fts::MatchQueryExec;
 use lance_core::Result;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_io::stream::RecordBatchStream;
+use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 use crate::async_dispatcher::{self, LanceCallback};
@@ -28,6 +31,9 @@ use crate::dataset::LanceDataset;
 use crate::error::{
     FfiFailure, LanceErrorCode, clear_last_error, error_code_from_lance, ffi_guard_with, ffi_try,
     panic_payload_message, set_lance_error, set_last_error, swallow_unwind,
+};
+use crate::fts_query::{
+    FtsQueryContextInner, LanceFtsQueryContext, clone_context, parse_segment_uuids,
 };
 use crate::helpers;
 use crate::runtime::{RT, block_on};
@@ -64,6 +70,8 @@ pub struct LanceScanner {
     use_index: Option<bool>,
     prefilter: bool,
     fts_query: Option<FullTextSearchQuery>,
+    fts_context: Option<Arc<FtsQueryContextInner>>,
+    fts_index_segments: Option<Vec<Uuid>>,
     // Set when a panic is caught in any operation on this scanner (issue #61):
     // once poisoned, every later `lance_scanner_*` call on this handle (except
     // `lance_scanner_close`, which must always free memory) fails with
@@ -130,6 +138,8 @@ impl LanceScanner {
             use_index: None,
             prefilter: false,
             fts_query: None,
+            fts_context: None,
+            fts_index_segments: None,
             poisoned: Arc::new(AtomicBool::new(false)),
             poll_wakers: PollWakerRegistry::default(),
             scan_statistics_callback: None,
@@ -169,6 +179,15 @@ impl LanceScanner {
 
     /// Build the underlying Scanner and open a stream.
     fn materialize_stream(&mut self) -> Result<()> {
+        let prepared_scanner = self.build_scanner()?;
+        let stream = block_on(prepared_scanner.try_into_stream())?;
+        self.schema = Some(stream.schema());
+        self.stream = Some(Box::pin(stream));
+        Ok(())
+    }
+
+    /// Build a Scanner (without materializing) and return it.
+    fn build_scanner(&self) -> Result<PreparedScanner> {
         self.scan_started.store(true, Ordering::Release);
         let mut scanner = self.dataset.scan();
         if let Some(cols) = &self.columns {
@@ -195,71 +214,14 @@ impl LanceScanner {
                 "index_segments requires nearest() to be configured".into(),
             ));
         }
-        // Lance validates fragment-scoped nearest searches when nearest() is
-        // configured. Such searches are supported when the fragment scan is
-        // the input to a prefilter, so this flag must be set first.
-        if self.prefilter {
-            scanner.prefilter(true);
-        }
-        if let Some(n) = &self.nearest {
-            scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
-            if let Some(np) = self.nprobes {
-                scanner.nprobes(np as usize);
-            }
-            if let Some(rf) = self.refine_factor {
-                scanner.refine(rf);
-            }
-            if let Some(ef) = self.ef {
-                scanner.ef(ef as usize);
-            }
-            if let Some(m) = self.metric_override {
-                scanner.distance_metric(m.to_distance());
-            }
-            if let Some(ui) = self.use_index {
-                scanner.use_index(ui);
-            }
-            if let Some(segments) = &self.index_segments {
-                scanner.with_index_segments(segments.clone())?;
-            }
-        }
-        if let Some(fts) = &self.fts_query {
-            scanner.full_text_search(fts.clone())?;
-        }
-        if let Some(callback) = &self.scan_statistics_callback {
-            scanner.scan_stats_callback(callback.clone());
-        }
-        let stream = block_on(scanner.try_into_stream())?;
-        self.schema = Some(stream.schema());
-        self.stream = Some(Box::pin(stream));
-        Ok(())
-    }
-
-    /// Build a Scanner (without materializing) and return it.
-    fn build_scanner(&self) -> Result<lance::dataset::scanner::Scanner> {
-        self.scan_started.store(true, Ordering::Release);
-        let mut scanner = self.dataset.scan();
-        if let Some(cols) = &self.columns {
-            scanner.project(cols)?;
-        }
-        // Substrait filter takes precedence over SQL filter when both are set.
-        if let Some(bytes) = &self.substrait_filter {
-            scanner.filter_substrait(bytes)?;
-        } else if let Some(filter) = &self.filter {
-            scanner.filter(filter)?;
-        }
-        if self.limit.is_some() || self.offset.is_some() {
-            scanner.limit(self.limit, self.offset)?;
-        }
-        if let Some(bs) = self.batch_size {
-            scanner.batch_size(bs);
-        }
-        if self.with_row_id {
-            scanner.with_row_id();
-        }
-        self.apply_fragment_filter(&mut scanner)?;
-        if self.index_segments.is_some() && self.nearest.is_none() {
+        if self.fts_index_segments.is_some() && self.fts_context.is_none() {
             return Err(lance_core::Error::invalid_input_source(
-                "index_segments requires nearest() to be configured".into(),
+                "fts_index_segments requires an FTS query context".into(),
+            ));
+        }
+        if self.fts_context.is_some() && self.fragment_ids.is_some() {
+            return Err(lance_core::Error::invalid_input_source(
+                "fragment_ids cannot be combined with an FTS query context; split the query by FTS index segment UUID instead".into(),
             ));
         }
         // nearest() checks the current prefilter setting before accepting a
@@ -291,11 +253,154 @@ impl LanceScanner {
         if let Some(fts) = &self.fts_query {
             scanner.full_text_search(fts.clone())?;
         }
+        let distributed_fts = if let Some(context) = &self.fts_context {
+            if context.dataset_uri != self.dataset.uri()
+                || context.dataset_version != self.dataset.version_id()
+            {
+                return Err(lance_core::Error::invalid_input_source(
+                    format!(
+                        "FTS query context belongs to dataset uri '{}' version {}, but scanner belongs to uri '{}' version {}",
+                        context.dataset_uri,
+                        context.dataset_version,
+                        self.dataset.uri(),
+                        self.dataset.version_id()
+                    )
+                    .into(),
+                ));
+            }
+            let segments = select_fts_segments(context, self.fts_index_segments.as_deref())?;
+            scanner.full_text_search(context.query.clone())?;
+            // Both STRICT and INDEX_ONLY context scans must use only the
+            // committed segments pinned in the context. In STRICT mode all
+            // current fragments were already proven covered during prepare.
+            scanner.fast_search();
+            Some(PreparedFtsExecution {
+                context: Arc::clone(context),
+                segments,
+                batch_size: self.batch_size,
+                scan_statistics_callback: self.scan_statistics_callback.clone(),
+            })
+        } else {
+            None
+        };
         if let Some(callback) = &self.scan_statistics_callback {
             scanner.scan_stats_callback(callback.clone());
         }
-        Ok(scanner)
+        Ok(PreparedScanner {
+            scanner,
+            distributed_fts,
+        })
     }
+}
+
+struct PreparedFtsExecution {
+    context: Arc<FtsQueryContextInner>,
+    segments: Vec<IndexMetadata>,
+    batch_size: Option<usize>,
+    scan_statistics_callback: Option<ExecutionStatsCallback>,
+}
+
+struct PreparedScanner {
+    scanner: lance::dataset::scanner::Scanner,
+    distributed_fts: Option<PreparedFtsExecution>,
+}
+
+impl PreparedScanner {
+    async fn try_into_stream(self) -> Result<DatasetRecordBatchStream> {
+        let Some(distributed_fts) = self.distributed_fts else {
+            return self.scanner.try_into_stream().await;
+        };
+        let plan = self.scanner.create_plan().await?;
+        let (plan, replaced) = replace_match_query_exec(
+            plan,
+            &distributed_fts.segments,
+            &distributed_fts.context.scorer,
+        )?;
+        if replaced != 1 {
+            return Err(lance_core::Error::internal(format!(
+                "expected exactly one MatchQueryExec in prepared FTS plan, replaced {replaced}"
+            )));
+        }
+        let stream = lance_datafusion::exec::execute_plan(
+            plan,
+            lance_datafusion::exec::LanceExecutionOptions {
+                batch_size: distributed_fts.batch_size,
+                execution_stats_callback: distributed_fts.scan_statistics_callback,
+                ..Default::default()
+            },
+        )?;
+        Ok(DatasetRecordBatchStream::new(stream))
+    }
+}
+
+fn select_fts_segments(
+    context: &FtsQueryContextInner,
+    selected_uuids: Option<&[Uuid]>,
+) -> Result<Vec<IndexMetadata>> {
+    let Some(selected_uuids) = selected_uuids else {
+        return Ok(context.segments.clone());
+    };
+    let mut selected = Vec::with_capacity(selected_uuids.len());
+    for uuid in selected_uuids {
+        let segment = context
+            .segments
+            .iter()
+            .find(|segment| segment.uuid == *uuid)
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "FTS segment UUID {uuid} is not present in the attached query context for dataset version {}",
+                        context.dataset_version
+                    )
+                    .into(),
+                )
+            })?;
+        selected.push(segment.clone());
+    }
+    if selected.is_empty() {
+        return Err(lance_core::Error::invalid_input_source(
+            "FTS segment subset must contain at least one UUID".into(),
+        ));
+    }
+    Ok(selected)
+}
+
+fn replace_match_query_exec(
+    plan: Arc<dyn ExecutionPlan>,
+    segments: &[IndexMetadata],
+    scorer: &Arc<lance_index::scalar::inverted::MemBM25Scorer>,
+) -> Result<(Arc<dyn ExecutionPlan>, usize)> {
+    let children = plan.children();
+    let mut replaced = 0;
+    let rebuilt = if children.is_empty() {
+        plan
+    } else {
+        let mut new_children = Vec::with_capacity(children.len());
+        for child in children {
+            let (new_child, child_replaced) =
+                replace_match_query_exec(Arc::clone(child), segments, scorer)?;
+            new_children.push(new_child);
+            replaced += child_replaced;
+        }
+        plan.with_new_children(new_children).map_err(|error| {
+            lance_core::Error::internal(format!(
+                "failed to rebuild FTS execution plan children: {error}"
+            ))
+        })?
+    };
+
+    if let Some(exec) = rebuilt.downcast_ref::<MatchQueryExec>() {
+        let replacement = MatchQueryExec::new_with_segments(
+            Arc::clone(exec.dataset()),
+            exec.query().clone(),
+            exec.params().clone(),
+            exec.prefilter_source().clone(),
+            segments.to_vec(),
+        )
+        .with_base_scorer(Arc::clone(scorer));
+        return Ok((Arc::new(replacement), replaced + 1));
+    }
+    Ok((rebuilt, replaced))
 }
 
 /// Type of a dynamically named scan metric.
@@ -1713,9 +1818,9 @@ unsafe fn scanner_nearest_inner(
         ));
     }
     let s = unsafe { &mut *scanner };
-    if s.fts_query.is_some() {
+    if s.fts_query.is_some() || s.fts_context.is_some() {
         return Err(lance_core::Error::invalid_input_source(
-            "cannot call nearest after full_text_search; they are mutually exclusive".into(),
+            "cannot call nearest after full_text_search or attaching an FTS query context; they are mutually exclusive".into(),
         ));
     }
     let column_str = unsafe { helpers::parse_c_string(column)? }.unwrap();
@@ -1813,6 +1918,11 @@ unsafe fn fts_inner(
             "cannot call full_text_search after nearest; they are mutually exclusive".into(),
         ));
     }
+    if s.fts_context.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot call full_text_search after attaching an FTS query context; the context already owns the query".into(),
+        ));
+    }
 
     let query_str = unsafe { helpers::parse_c_string(query)? }
         .unwrap()
@@ -1832,6 +1942,93 @@ unsafe fn fts_inner(
     }
 
     s.fts_query = Some(fts);
+    Ok(0)
+}
+
+/// Attach an immutable, process-local FTS query context to this scanner.
+/// The scanner clones the context's shared ownership; the caller may close
+/// the public context handle after this function returns successfully.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fts_query_context(
+    scanner: *mut LanceScanner,
+    context: *const LanceFtsQueryContext,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fts_query_context_inner(scanner, context)
+    })
+}
+
+unsafe fn scanner_set_fts_query_context_inner(
+    scanner: *mut LanceScanner,
+    context: *const LanceFtsQueryContext,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner must not be NULL".into(),
+        ));
+    }
+    let context = unsafe { clone_context(context)? };
+    let scanner = unsafe { &mut *scanner };
+    if scanner.nearest.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot attach an FTS query context after nearest; they are mutually exclusive".into(),
+        ));
+    }
+    if scanner.fts_query.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot attach an FTS query context after full_text_search; the context already owns the query"
+                .into(),
+        ));
+    }
+    if context.dataset_uri != scanner.dataset.uri()
+        || context.dataset_version != scanner.dataset.version_id()
+    {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "FTS query context belongs to dataset uri '{}' version {}, but scanner belongs to uri '{}' version {}",
+                context.dataset_uri,
+                context.dataset_version,
+                scanner.dataset.uri(),
+                scanner.dataset.version_id()
+            )
+            .into(),
+        ));
+    }
+    scanner.fts_context = Some(context);
+    Ok(0)
+}
+
+/// Restrict a context-backed FTS scan to a subset of segment UUIDs.
+/// Passing `len == 0` clears the restriction so all context segments are used.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fts_index_segments(
+    scanner: *mut LanceScanner,
+    segment_uuids: *const u8,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fts_index_segments_inner(scanner, segment_uuids, len)
+    })
+}
+
+unsafe fn scanner_set_fts_index_segments_inner(
+    scanner: *mut LanceScanner,
+    segment_uuids: *const u8,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner must not be NULL".into(),
+        ));
+    }
+    let segments = if len == 0 {
+        None
+    } else {
+        Some(parse_segment_uuids(segment_uuids, len)?)
+    };
+    unsafe { &mut *scanner }.fts_index_segments = segments;
     Ok(0)
 }
 

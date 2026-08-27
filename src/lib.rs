@@ -31,6 +31,7 @@ mod delete;
 mod drop_columns;
 mod error;
 mod fragment_writer;
+mod fts_query;
 mod helpers;
 mod index;
 mod index_model;
@@ -57,6 +58,7 @@ pub use error::{
     LanceErrorCode, lance_free_string, lance_last_error_code, lance_last_error_message,
 };
 pub use fragment_writer::*;
+pub use fts_query::*;
 pub use index::*;
 pub use index_model::*;
 pub use index_segment::*;

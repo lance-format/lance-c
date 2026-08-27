@@ -95,6 +95,7 @@ class Scanner;
 class IndexModel;
 class IndexSegmentBuilder;
 class IndexSegmentMetadata;
+class FtsQueryContext;
 
 // ─── Version history ─────────────────────────────────────────────────────────
 
@@ -120,6 +121,11 @@ enum class WriteMode : int32_t {
     Create    = LANCE_WRITE_CREATE,
     Append    = LANCE_WRITE_APPEND,
     Overwrite = LANCE_WRITE_OVERWRITE,
+};
+
+enum class FtsCoverageMode : int32_t {
+    Strict    = LANCE_FTS_COVERAGE_STRICT,
+    IndexOnly = LANCE_FTS_COVERAGE_INDEX_ONLY,
 };
 
 /// Tunable parameters for Dataset::write. Numeric fields default-out via 0;
@@ -161,6 +167,24 @@ struct ColumnAlteration {
 struct SqlColumn {
     std::string name;
     std::string expression;
+};
+
+// ─── Process-local FTS query context ────────────────────────────────────────
+
+/// Immutable, query-specific global BM25 scorer plus pinned FTS segment list.
+/// This handle is process-local and intentionally has no serialization API.
+class FtsQueryContext {
+    Handle<LanceFtsQueryContext, lance_fts_query_context_close> handle_;
+
+public:
+    explicit FtsQueryContext(LanceFtsQueryContext* context) : handle_(context) {}
+
+    FtsQueryContext(FtsQueryContext&&) noexcept = default;
+    FtsQueryContext& operator=(FtsQueryContext&&) noexcept = default;
+    FtsQueryContext(const FtsQueryContext&) = delete;
+    FtsQueryContext& operator=(const FtsQueryContext&) = delete;
+
+    const LanceFtsQueryContext* c_handle() const { return handle_.get(); }
 };
 
 // ─── Dataset ─────────────────────────────────────────────────────────────────
@@ -696,6 +720,21 @@ public:
 
     /// Create a Scanner builder for this dataset.
     Scanner scan() const;
+
+    /// Prepare a query-specific global BM25 scorer over the committed FTS
+    /// segments of this pinned snapshot. IndexOnly permits and reports
+    /// unindexed fragments; Strict rejects them.
+    FtsQueryContext prepare_fts_query(
+        const std::string& column,
+        const std::string& query,
+        uint32_t max_fuzzy_distance = 0,
+        FtsCoverageMode coverage_mode = FtsCoverageMode::Strict) const {
+        auto* context = lance_dataset_prepare_fts_query(
+            handle_.get(), column.c_str(), query.c_str(), max_fuzzy_distance,
+            static_cast<int32_t>(coverage_mode));
+        if (!context) check_error();
+        return FtsQueryContext(context);
+    }
 
     /// Number of fragments in the dataset.
     uint64_t fragment_count() const {
@@ -1258,6 +1297,29 @@ public:
                                             cols_c, max_fuzzy_distance) != 0)
             check_error();
         return *this;
+    }
+
+    /// Attach a process-local prepared FTS query context. The scanner retains
+    /// shared ownership, so the context object may be destroyed after success.
+    Scanner& fts_query_context(const FtsQueryContext& context) {
+        if (lance_scanner_set_fts_query_context(handle_.get(), context.c_handle()) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Restrict a context-backed FTS query to a segment UUID subset.
+    Scanner& fts_index_segments(const uint8_t* segment_uuids, size_t segment_count) {
+        if (lance_scanner_set_fts_index_segments(
+                handle_.get(), segment_uuids, segment_count) != 0)
+            check_error();
+        return *this;
+    }
+
+    Scanner& fts_index_segments(
+        const std::vector<std::array<uint8_t, 16>>& segment_uuids) {
+        return fts_index_segments(
+            reinterpret_cast<const uint8_t*>(segment_uuids.data()),
+            segment_uuids.size());
     }
 
     /// Access the underlying C handle.
