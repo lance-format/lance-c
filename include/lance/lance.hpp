@@ -1185,6 +1185,13 @@ public:
         return substrait_filter(bytes.data(), bytes.size());
     }
 
+    /// Add an SQL filter that is combined with the selected primary filter using AND.
+    Scanner& additional_sql_filter(const std::string& filter) {
+        if (lance_scanner_additional_sql_filter(handle_.get(), filter.c_str()) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Register a non-null callback for scan statistics after successful full exhaustion.
     /// The registration applies to every stream derived from this scanner, including
     /// concurrent streams and streams created after an earlier callback returns. The
