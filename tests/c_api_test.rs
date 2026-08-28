@@ -6964,6 +6964,135 @@ fn test_scanner_additional_sql_filters_are_anded_with_substrait() {
 }
 
 #[test]
+fn test_scanner_additional_sql_filter_preserves_metadata_primary_filter() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let primary = c_str(
+        "_rowid IS NOT NULL AND _rowaddr IS NOT NULL \
+         AND _row_created_at_version IS NOT NULL \
+         AND _row_last_updated_at_version IS NOT NULL",
+    );
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), primary.as_ptr()) };
+    assert!(!scanner.is_null());
+
+    let additional = c_str("id > 3");
+    assert_eq!(
+        unsafe { lance_scanner_additional_sql_filter(scanner, additional.as_ptr()) },
+        0
+    );
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 2, "metadata predicate AND id > 3");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_additional_sql_filter_preserves_distance_primary_filter() {
+    let (_tmp, uri) = create_vector_dataset(16, 8);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let primary = c_str("_distance IS NOT NULL");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), primary.as_ptr()) };
+    assert!(!scanner.is_null());
+    let query = [0.0_f32; 8];
+    let column = c_str("embedding");
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr().cast(),
+                query.len(),
+                LanceDataType::Float32 as i32,
+                16,
+            )
+        },
+        0
+    );
+    let additional = c_str("id < 3");
+    assert_eq!(
+        unsafe { lance_scanner_additional_sql_filter(scanner, additional.as_ptr()) },
+        0
+    );
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 3, "_distance predicate AND id < 3");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_additional_sql_filter_preserves_score_primary_filter() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let column = c_str("name");
+    let inverted_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::Inverted as i32,
+                inverted_params.as_ptr(),
+                false,
+            )
+        },
+        0
+    );
+
+    let primary = c_str("_score IS NOT NULL");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), primary.as_ptr()) };
+    assert!(!scanner.is_null());
+    let query = c_str("alice");
+    let columns = [column.as_ptr(), ptr::null()];
+    assert_eq!(
+        unsafe { lance_scanner_full_text_search(scanner, query.as_ptr(), columns.as_ptr(), 0) },
+        0
+    );
+    let additional = c_str("id >= 1");
+    assert_eq!(
+        unsafe { lance_scanner_additional_sql_filter(scanner, additional.as_ptr()) },
+        0
+    );
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 1, "_score predicate AND id >= 1");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_scanner_additional_sql_filter_rejects_invalid_inputs() {
     let (_tmp, uri) = create_test_dataset();
     let c_uri = c_str(&uri);

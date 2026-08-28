@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use arrow::ffi_stream::FFI_ArrowArrayStream;
-use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use arrow_schema::SchemaRef;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
@@ -20,9 +20,6 @@ use lance::dataset::scanner::{
 };
 use lance::io::exec::fts::MatchQueryExec;
 use lance_core::Result;
-use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
-use lance_datafusion::planner::Planner;
-use lance_datafusion::substrait::parse_substrait;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_io::stream::RecordBatchStream;
 use lance_table::format::IndexMetadata;
@@ -183,37 +180,32 @@ impl LanceScanner {
     }
 
     fn apply_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
+        if let Some(substrait) = &self.substrait_filter {
+            scanner.filter_substrait(substrait)?;
+        } else if let Some(sql) = &self.filter {
+            scanner.filter(sql)?;
+        }
+
         if self.additional_sql_filters.is_empty() {
-            if let Some(substrait) = &self.substrait_filter {
-                scanner.filter_substrait(substrait)?;
-            } else if let Some(sql) = &self.filter {
-                scanner.filter(sql)?;
-            }
             return Ok(());
         }
 
-        let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
-        let planner = Planner::new(Arc::clone(&schema));
-        let mut combined = if let Some(substrait) = &self.substrait_filter {
-            let context = get_session_context(&LanceExecutionOptions::default());
-            Some(
-                parse_substrait(substrait, schema, &context.state())
-                    .now_or_never()
-                    .expect("Substrait filter parsing must complete synchronously")?,
-            )
-        } else if let Some(sql) = &self.filter {
-            Some(planner.parse_filter(sql)?)
-        } else {
-            None
-        };
+        // Let Lance resolve every SQL expression against the scanner's full
+        // filterable schema. Besides stored columns, this includes metadata
+        // columns and query-generated columns such as _distance and _score.
+        let mut combined = scanner.get_expr_filter()?;
         for sql in &self.additional_sql_filters {
-            let sql = planner.parse_filter(sql)?;
+            let mut additional_scanner = scanner.clone();
+            additional_scanner.filter(sql)?;
+            let additional = additional_scanner
+                .get_expr_filter()?
+                .expect("additional SQL filter exists");
             combined = Some(match combined {
-                Some(existing) => existing.and(sql),
-                None => sql,
+                Some(existing) => existing.and(additional),
+                None => additional,
             });
         }
-        scanner.filter_expr(planner.optimize_expr(combined.expect("additional filter exists"))?);
+        scanner.filter_expr(combined.expect("additional SQL filter exists"));
         Ok(())
     }
 
@@ -233,7 +225,6 @@ impl LanceScanner {
         if let Some(cols) = &self.columns {
             scanner.project(cols)?;
         }
-        self.apply_filter(&mut scanner)?;
         if self.limit.is_some() || self.offset.is_some() {
             scanner.limit(self.limit, self.offset)?;
         }
@@ -305,6 +296,7 @@ impl LanceScanner {
         } else {
             None
         };
+        self.apply_filter(&mut scanner)?;
         if let Some(callback) = &self.scan_statistics_callback {
             scanner.scan_stats_callback(callback.clone());
         }
