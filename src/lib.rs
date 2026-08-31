@@ -22,6 +22,7 @@ compile_error!(
 
 mod add_columns;
 mod alter_columns;
+mod async_bridge;
 mod async_dispatcher;
 mod batch;
 mod compact;

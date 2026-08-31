@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::{collections::BTreeSet, mem};
 
 use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -174,6 +175,26 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
         .success()
 }
 
+/// Compile a standalone C source file that only inspects the public header.
+fn compile_c_header_test(source: &Path, output: &Path, include_dir: &Path) -> bool {
+    let status = Command::new("clang")
+        .args([
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o",
+            output.to_str().unwrap(),
+            source.to_str().unwrap(),
+            &format!("-I{}", include_dir.display()),
+        ])
+        .status();
+
+    status
+        .expect("C compiler is required for this ignored test")
+        .success()
+}
+
 /// Run a compiled test binary with the source dataset URI and a destination URI
 /// for the write test. The destination path must not pre-exist.
 fn run_test_binary(binary: &Path, dataset_uri: &str, write_uri: &str) {
@@ -248,4 +269,200 @@ fn test_cpp_compilation_and_execution() {
     );
 
     run_test_binary(&binary, &dataset_uri, &write_uri);
+}
+
+#[test]
+#[ignore = "requires C compiler (clang); run with: cargo test --test compile_and_run_test -- --ignored"]
+fn test_c_and_rust_abi_layouts_match() {
+    macro_rules! record_type {
+        ($records:ident, $type:ty) => {
+            $records.insert(format!(
+                "T|{}|{}|{}",
+                stringify!($type).rsplit("::").next().unwrap(),
+                mem::size_of::<$type>(),
+                mem::align_of::<$type>()
+            ));
+        };
+    }
+
+    macro_rules! record_field {
+        ($records:ident, $type:ty, $field:ident) => {
+            $records.insert(format!(
+                "F|{}.{}|{}",
+                stringify!($type).rsplit("::").next().unwrap(),
+                stringify!($field),
+                mem::offset_of!($type, $field)
+            ));
+        };
+    }
+
+    macro_rules! record_struct {
+        ($records:ident, $type:ty, [$($field:ident),+ $(,)?]) => {
+            record_type!($records, $type);
+            $(record_field!($records, $type, $field);)+
+        };
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let include_dir = manifest_dir.join("include");
+    let source = manifest_dir.join("tests").join("cpp").join("abi_layout.c");
+    let build_dir = tempfile::tempdir().unwrap();
+    let binary = build_dir.path().join("abi_layout");
+    assert!(
+        compile_c_header_test(&source, &binary, &include_dir),
+        "C ABI layout test compilation failed"
+    );
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("failed to run C ABI layout test");
+    assert!(
+        output.status.success(),
+        "C ABI layout test failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let c_records = String::from_utf8(output.stdout)
+        .expect("C ABI layout output must be UTF-8")
+        .lines()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    let mut rust_records = BTreeSet::new();
+    record_type!(rust_records, lance_c::LanceErrorCode);
+    record_type!(rust_records, lance_c::LanceVectorIndexType);
+    record_type!(rust_records, lance_c::LanceScalarIndexType);
+    record_type!(rust_records, lance_c::LanceMetricType);
+    record_type!(rust_records, lance_c::LanceDataType);
+    record_type!(rust_records, lance_c::LanceMergeWhenMatched);
+    record_type!(rust_records, lance_c::LanceMergeWhenNotMatched);
+    record_type!(rust_records, lance_c::LanceMergeWhenNotMatchedBySource);
+    record_type!(rust_records, lance_c::LanceColumnNullableMode);
+    record_type!(rust_records, lance_c::LanceScanMetricKind);
+    record_type!(rust_records, lance_c::LancePollStatus);
+    record_type!(rust_records, lance_c::LanceIndexSegmentBuildMode);
+    record_type!(rust_records, lance_c::LanceFtsCoverageMode);
+    record_type!(rust_records, lance_c::LanceWriteMode);
+
+    record_struct!(
+        rust_records,
+        lance_c::LanceVectorIndexParams,
+        [
+            index_type,
+            metric,
+            num_partitions,
+            num_sub_vectors,
+            num_bits,
+            max_iterations,
+            hnsw_m,
+            hnsw_ef_construction,
+            sample_rate,
+        ]
+    );
+    record_struct!(
+        rust_records,
+        lance_c::LanceMergeInsertParams,
+        [
+            when_matched,
+            when_matched_expr,
+            when_not_matched,
+            when_not_matched_by_source,
+            when_not_matched_by_source_expr,
+        ]
+    );
+    record_struct!(
+        rust_records,
+        lance_c::LanceMergeInsertResult,
+        [num_inserted_rows, num_updated_rows, num_deleted_rows]
+    );
+    record_struct!(
+        rust_records,
+        lance_c::LanceCompactionOptions,
+        [
+            target_rows_per_fragment,
+            max_rows_per_group,
+            max_bytes_per_file,
+            num_threads,
+            batch_size,
+        ]
+    );
+    record_struct!(
+        rust_records,
+        lance_c::LanceCompactionMetrics,
+        [
+            fragments_removed,
+            fragments_added,
+            files_removed,
+            files_added,
+        ]
+    );
+    record_struct!(
+        rust_records,
+        lance_c::LanceColumnAlteration,
+        [path, rename, nullable_mode, data_type]
+    );
+    record_struct!(rust_records, lance_c::LanceSqlColumn, [name, expression]);
+    record_struct!(
+        rust_records,
+        lance_c::LanceScanMetric,
+        [name, name_len, kind, value]
+    );
+    record_struct!(
+        rust_records,
+        lance_c::LanceScanStatistics,
+        [
+            iops,
+            requests,
+            bytes_read,
+            indices_loaded,
+            index_partitions_loaded,
+            index_comparisons,
+            metrics,
+            metrics_len,
+        ]
+    );
+    record_struct!(
+        rust_records,
+        lance_c::LanceIndexSegmentBuildOptions,
+        [
+            fragment_ids,
+            fragment_count,
+            index_uuid,
+            ivf_centroids,
+            ivf_centroids_schema,
+            pq_codebook,
+            pq_codebook_schema,
+            mode,
+        ]
+    );
+    record_struct!(
+        rust_records,
+        lance_c::LanceVectorIndexSegmentParams,
+        [
+            index_type,
+            metric,
+            num_partitions,
+            num_sub_vectors,
+            num_bits,
+            max_iterations,
+            hnsw_m,
+            hnsw_ef_construction,
+            sample_rate,
+        ]
+    );
+    record_struct!(
+        rust_records,
+        lance_c::LanceWriteParams,
+        [
+            max_rows_per_file,
+            max_rows_per_group,
+            max_bytes_per_file,
+            data_storage_version,
+            enable_stable_row_ids,
+        ]
+    );
+
+    assert_eq!(
+        c_records, rust_records,
+        "public C and Rust ABI layouts diverged"
+    );
 }
