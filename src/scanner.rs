@@ -56,6 +56,7 @@ pub struct LanceScanner {
     columns: Option<Vec<String>>,
     filter: Option<String>,
     substrait_filter: Option<Vec<u8>>,
+    additional_sql_filters: Vec<String>,
     limit: Option<i64>,
     offset: Option<i64>,
     batch_size: Option<usize>,
@@ -124,6 +125,7 @@ impl LanceScanner {
             columns: None,
             filter: None,
             substrait_filter: None,
+            additional_sql_filters: Vec::new(),
             limit: None,
             offset: None,
             batch_size: None,
@@ -177,6 +179,36 @@ impl LanceScanner {
         Ok(())
     }
 
+    fn apply_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
+        if let Some(substrait) = &self.substrait_filter {
+            scanner.filter_substrait(substrait)?;
+        } else if let Some(sql) = &self.filter {
+            scanner.filter(sql)?;
+        }
+
+        if self.additional_sql_filters.is_empty() {
+            return Ok(());
+        }
+
+        // Let Lance resolve every SQL expression against the scanner's full
+        // filterable schema. Besides stored columns, this includes metadata
+        // columns and query-generated columns such as _distance and _score.
+        let mut combined = scanner.get_expr_filter()?;
+        for sql in &self.additional_sql_filters {
+            let mut additional_scanner = scanner.clone();
+            additional_scanner.filter(sql)?;
+            let additional = additional_scanner
+                .get_expr_filter()?
+                .expect("additional SQL filter exists");
+            combined = Some(match combined {
+                Some(existing) => existing.and(additional),
+                None => additional,
+            });
+        }
+        scanner.filter_expr(combined.expect("additional SQL filter exists"));
+        Ok(())
+    }
+
     /// Build the underlying Scanner and open a stream.
     fn materialize_stream(&mut self) -> Result<()> {
         let prepared_scanner = self.build_scanner()?;
@@ -192,12 +224,6 @@ impl LanceScanner {
         let mut scanner = self.dataset.scan();
         if let Some(cols) = &self.columns {
             scanner.project(cols)?;
-        }
-        // Substrait filter takes precedence over SQL filter when both are set.
-        if let Some(bytes) = &self.substrait_filter {
-            scanner.filter_substrait(bytes)?;
-        } else if let Some(filter) = &self.filter {
-            scanner.filter(filter)?;
         }
         if self.limit.is_some() || self.offset.is_some() {
             scanner.limit(self.limit, self.offset)?;
@@ -270,6 +296,7 @@ impl LanceScanner {
         } else {
             None
         };
+        self.apply_filter(&mut scanner)?;
         if let Some(callback) = &self.scan_statistics_callback {
             scanner.scan_stats_callback(callback.clone());
         }
@@ -779,6 +806,50 @@ unsafe fn scanner_set_substrait_filter_inner(
     let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
     let s = unsafe { &mut *scanner };
     s.substrait_filter = Some(slice.to_vec());
+    Ok(0)
+}
+
+/// Add an SQL filter that is combined with the scanner's selected primary filter using AND.
+///
+/// The primary filter is the Substrait filter when one is set, otherwise it is the SQL filter
+/// passed to `lance_scanner_new`. Multiple additional SQL filters are also combined using AND.
+/// This must be called before the scan starts. The string is copied into the scanner.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_additional_sql_filter(
+    scanner: *mut LanceScanner,
+    filter: *const c_char,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_additional_sql_filter_inner(scanner, filter)
+    })
+}
+
+unsafe fn scanner_additional_sql_filter_inner(
+    scanner: *mut LanceScanner,
+    filter: *const c_char,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let filter = unsafe { helpers::parse_c_string(filter)? }
+        .ok_or_else(|| lance_core::Error::invalid_input_source("filter must not be NULL".into()))?;
+    if filter.is_empty() {
+        return Err(lance_core::Error::invalid_input_source(
+            "additional SQL filter must be non-empty".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    if scanner.scan_started.load(Ordering::Acquire) {
+        return Err(lance_core::Error::invalid_input_source(
+            "additional SQL filter must be set before the scan starts".into(),
+        ));
+    }
+    scanner.additional_sql_filters.push(filter.to_string());
     Ok(0)
 }
 

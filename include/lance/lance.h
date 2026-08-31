@@ -906,6 +906,22 @@ int32_t lance_scanner_set_substrait_filter(
     size_t len
 );
 
+/**
+ * Add an SQL filter that is combined with the selected primary filter using
+ * AND. The primary filter is the Substrait filter when set, otherwise it is
+ * the SQL filter passed to `lance_scanner_new`. Multiple additional SQL
+ * filters are also combined using AND.
+ *
+ * Must be called before the scan starts. The filter string is copied.
+ *
+ * @param filter  Non-NULL, non-empty SQL filter expression
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_additional_sql_filter(
+    LanceScanner* scanner,
+    const char* filter
+);
+
 /** Type of a dynamically named scan metric. */
 typedef enum {
     LANCE_SCAN_METRIC_COUNT = 0,
