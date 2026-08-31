@@ -181,11 +181,57 @@ void lance_free_string(const char* s);
 typedef struct LanceDataset  LanceDataset;
 typedef struct LanceScanner  LanceScanner;
 typedef struct LanceBatch    LanceBatch;
+typedef struct LanceSession  LanceSession;
 typedef struct LanceVersions LanceVersions;
 typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
+
+/* ─── Shared session ─── */
+
+/**
+ * Snapshot of a shared session's cache statistics.
+ *
+ * Cache sizes are the bytes currently retained, not their configured limits.
+ */
+typedef struct LanceSessionCacheStats {
+    uint64_t index_cache_hits;
+    uint64_t index_cache_misses;
+    uint64_t index_cache_entries;
+    uint64_t index_cache_size_bytes;
+    uint64_t metadata_cache_hits;
+    uint64_t metadata_cache_misses;
+    uint64_t metadata_cache_entries;
+    uint64_t metadata_cache_size_bytes;
+} LanceSessionCacheStats;
+
+/**
+ * Create a session that can share metadata and index caches across datasets.
+ *
+ * Cache limits are specified in bytes. Pass 0 to request zero capacity.
+ * @return Session handle, or NULL on error
+ */
+LanceSession* lance_session_new(
+    uint64_t index_cache_size_bytes,
+    uint64_t metadata_cache_size_bytes
+);
+
+/**
+ * Close a session handle. Safe to call with NULL. Datasets previously opened
+ * with the session remain valid and retain the shared cache state.
+ */
+void lance_session_close(LanceSession* session);
+
+/**
+ * Copy current cache statistics to `out_stats`.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_session_get_cache_stats(
+    const LanceSession* session,
+    LanceSessionCacheStats* out_stats
+);
 
 /* ─── Dataset lifecycle ─── */
 
@@ -206,6 +252,25 @@ LanceDataset* lance_dataset_open(
     const char* uri,
     const char* const* storage_opts,
     uint64_t version
+);
+
+/**
+ * Open a Lance dataset using a shared session.
+ *
+ * The dataset retains the shared session state and remains valid if the caller
+ * subsequently closes `session`.
+ *
+ * @param uri           Dataset path (file://, s3://, memory://, etc.)
+ * @param storage_opts  NULL-terminated key-value pairs ["k1","v1",NULL], or NULL
+ * @param version       Version to open (0 = latest)
+ * @param session       Shared session; must not be NULL
+ * @return Dataset handle, or NULL on error
+ */
+LanceDataset* lance_dataset_open_with_session(
+    const char* uri,
+    const char* const* storage_opts,
+    uint64_t version,
+    const LanceSession* session
 );
 
 /** Close and free a dataset handle. Safe to call with NULL. */

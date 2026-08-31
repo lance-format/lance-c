@@ -169,6 +169,27 @@ struct SqlColumn {
     std::string expression;
 };
 
+// ─── Shared Session ──────────────────────────────────────────────────────────
+
+class Session {
+    Handle<LanceSession, lance_session_close> handle_;
+
+public:
+    Session(uint64_t index_cache_size_bytes, uint64_t metadata_cache_size_bytes)
+        : handle_(lance_session_new(index_cache_size_bytes, metadata_cache_size_bytes)) {
+        if (!handle_) check_error();
+    }
+
+    LanceSessionCacheStats cache_stats() const {
+        LanceSessionCacheStats stats{};
+        if (lance_session_get_cache_stats(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+
+    const LanceSession* c_handle() const { return handle_.get(); }
+};
+
 // ─── Process-local FTS query context ────────────────────────────────────────
 
 /// Immutable, query-specific global BM25 scorer plus pinned FTS segment list.
@@ -192,6 +213,17 @@ public:
 class Dataset {
     Handle<LanceDataset, lance_dataset_close> handle_;
 
+    static std::vector<const char*> to_c_storage_options(
+        const std::vector<std::pair<std::string, std::string>>& storage_opts) {
+        std::vector<const char*> kv;
+        for (auto& [k, v] : storage_opts) {
+            kv.push_back(k.c_str());
+            kv.push_back(v.c_str());
+        }
+        kv.push_back(nullptr);
+        return kv;
+    }
+
 public:
     /// Open a dataset at the given URI. Pass `version` = 0 (the default) for
     /// the latest, or a specific version id from `versions()` to check out
@@ -201,18 +233,29 @@ public:
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
         uint64_t version = 0) {
 
-        // Build NULL-terminated key-value array for storage options.
-        std::vector<const char*> kv;
-        for (auto& [k, v] : storage_opts) {
-            kv.push_back(k.c_str());
-            kv.push_back(v.c_str());
-        }
-        kv.push_back(nullptr);
-
+        auto kv = to_c_storage_options(storage_opts);
         const char* const* opts_ptr =
             storage_opts.empty() ? nullptr : kv.data();
 
         auto* ds = lance_dataset_open(uri.c_str(), opts_ptr, version);
+        if (!ds) check_error();
+        return Dataset(ds);
+    }
+
+    /// Open a dataset with caches owned by `session`. The returned dataset
+    /// remains valid if the Session wrapper is destroyed first.
+    static Dataset open_with_session(
+        const Session& session,
+        const std::string& uri,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        uint64_t version = 0) {
+
+        auto kv = to_c_storage_options(storage_opts);
+        const char* const* opts_ptr =
+            storage_opts.empty() ? nullptr : kv.data();
+
+        auto* ds = lance_dataset_open_with_session(
+            uri.c_str(), opts_ptr, version, session.c_handle());
         if (!ds) check_error();
         return Dataset(ds);
     }

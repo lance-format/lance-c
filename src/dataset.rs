@@ -17,6 +17,7 @@ use lance_core::Result;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::helpers;
 use crate::runtime::block_on;
+use crate::session::LanceSession;
 use crate::stream_guard::guarded_ffi_stream_from_reader;
 
 /// Opaque handle representing an opened Lance dataset.
@@ -121,15 +122,48 @@ pub unsafe extern "C" fn lance_dataset_open(
     version: u64,
 ) -> *mut LanceDataset {
     ffi_try!(
-        unsafe { open_dataset_inner(uri, storage_options, version) },
+        unsafe { open_dataset_inner(uri, storage_options, version, None) },
         null
     )
+}
+
+/// Open a Lance dataset using a shared session.
+///
+/// The dataset retains shared ownership of the session state, so the caller
+/// may close the session handle after this function returns successfully.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_open_with_session(
+    uri: *const c_char,
+    storage_options: *const *const c_char,
+    version: u64,
+    session: *const LanceSession,
+) -> *mut LanceDataset {
+    ffi_try!(
+        unsafe { open_dataset_with_session_inner(uri, storage_options, version, session) },
+        null
+    )
+}
+
+unsafe fn open_dataset_with_session_inner(
+    uri: *const c_char,
+    storage_options: *const *const c_char,
+    version: u64,
+    session: *const LanceSession,
+) -> Result<*mut LanceDataset> {
+    if session.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "session must not be NULL".into(),
+        ));
+    }
+    let session = unsafe { &*session };
+    unsafe { open_dataset_inner(uri, storage_options, version, Some(session)) }
 }
 
 unsafe fn open_dataset_inner(
     uri: *const c_char,
     storage_options: *const *const c_char,
     version: u64,
+    session: Option<&LanceSession>,
 ) -> Result<*mut LanceDataset> {
     let uri_str = unsafe { helpers::parse_c_string(uri)? }
         .ok_or_else(|| lance_core::Error::invalid_input_source("uri must not be NULL".into()))?;
@@ -142,6 +176,9 @@ unsafe fn open_dataset_inner(
     }
     if version != 0 {
         builder = builder.with_version(version);
+    }
+    if let Some(session) = session {
+        builder = builder.with_session(session.inner.clone());
     }
 
     let dataset = block_on(builder.load())?;

@@ -169,6 +169,34 @@ ds.scan()
 // consume stream...
 ```
 
+### Share metadata and index caches
+
+Use a session to share Lance's metadata and index caches across dataset
+handles. Cache limits are bytes; zero requests zero capacity for the
+corresponding cache.
+
+```c
+LanceSession* session = lance_session_new(
+    6ULL * 1024 * 1024 * 1024,
+    1ULL * 1024 * 1024 * 1024);
+LanceDataset* ds =
+    lance_dataset_open_with_session("data.lance", NULL, 0, session);
+
+LanceSessionCacheStats stats;
+lance_session_get_cache_stats(session, &stats);
+
+lance_session_close(session);  /* ds remains valid */
+lance_dataset_close(ds);
+```
+
+```cpp
+lance::Session session(
+    6ULL * 1024 * 1024 * 1024,
+    1ULL * 1024 * 1024 * 1024);
+auto ds = lance::Dataset::open_with_session(session, "data.lance");
+auto stats = session.cache_stats();
+```
+
 ### Open at a specific version
 
 `lance_dataset_open` takes a `version` argument — `0` means the latest, any

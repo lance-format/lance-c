@@ -234,6 +234,86 @@ fn test_open_close() {
 }
 
 #[test]
+fn test_shared_session_open_and_cache_stats() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let session = lance_session_new(0, 16 * 1024 * 1024);
+    assert!(!session.is_null(), "session creation should succeed");
+
+    let mut initial = LanceSessionCacheStats::default();
+    assert_eq!(
+        unsafe { lance_session_get_cache_stats(session, &mut initial) },
+        0
+    );
+    assert_eq!(initial.metadata_cache_hits, 0);
+    assert_eq!(initial.metadata_cache_misses, 0);
+
+    let first = unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(!first.is_null(), "first shared-session open should succeed");
+    assert_eq!(
+        scan_all_rows(first)
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        5
+    );
+    unsafe { lance_dataset_close(first) };
+
+    let second =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(
+        !second.is_null(),
+        "second shared-session open should succeed"
+    );
+    assert_eq!(
+        scan_all_rows(second)
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        5
+    );
+
+    // Cache activity depends on whether the backend supplies manifest sizes.
+    let mut stats = LanceSessionCacheStats::default();
+    assert_eq!(
+        unsafe { lance_session_get_cache_stats(session, &mut stats) },
+        0
+    );
+
+    unsafe { lance_session_close(session) };
+    assert_eq!(unsafe { lance_dataset_count_rows(second) }, 5);
+    unsafe { lance_dataset_close(second) };
+}
+
+#[test]
+fn test_shared_session_rejects_null_inputs() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, ptr::null()) };
+    assert!(ds.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let session = lance_session_new(0, 0);
+    assert!(!session.is_null());
+    let mut stats = LanceSessionCacheStats::default();
+    assert_eq!(
+        unsafe { lance_session_get_cache_stats(ptr::null(), &mut stats) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_session_get_cache_stats(session, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe {
+        lance_session_close(session);
+        lance_session_close(ptr::null_mut());
+    }
+}
+
+#[test]
 fn test_open_nonexistent() {
     let c_uri = c_str("memory://nonexistent_dataset_xyz");
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };

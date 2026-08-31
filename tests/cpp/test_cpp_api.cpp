@@ -84,6 +84,21 @@ static void test_dataset_open(const std::string& uri) {
     PASS();
 }
 
+static void test_shared_session(const std::string& uri) {
+    TEST(test_shared_session);
+
+    auto session = std::make_unique<lance::Session>(0, 16 * 1024 * 1024);
+    auto ds = lance::Dataset::open_with_session(*session, uri);
+    auto stats = session->cache_stats();
+
+    session.reset();
+    assert(ds.count_rows() > 0);
+
+    printf("metadata_entries=%llu... ",
+           (unsigned long long)stats.metadata_cache_entries);
+    PASS();
+}
+
 static void test_dataset_schema(const std::string& uri) {
     TEST(test_dataset_schema);
 
@@ -906,6 +921,7 @@ int main(int argc, char** argv) {
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
+    test_shared_session(uri);
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
     test_scanner_async_stream_ownership(uri);

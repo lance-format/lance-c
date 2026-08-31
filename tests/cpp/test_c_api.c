@@ -102,6 +102,30 @@ static void test_open_and_metadata(const char *uri) {
     printf("OK\n");
 }
 
+static void test_shared_session(const char *uri) {
+    printf("  test_shared_session... ");
+
+    LanceSession *session = lance_session_new(0, 16 * 1024 * 1024);
+    ASSERT(session != NULL, "session creation failed");
+
+    LanceDataset *ds = lance_dataset_open_with_session(uri, NULL, 0, session);
+    ASSERT(ds != NULL, "shared-session dataset open failed");
+
+    LanceSessionCacheStats stats;
+    memset(&stats, 0, sizeof(stats));
+    int32_t rc = lance_session_get_cache_stats(session, &stats);
+    ASSERT(rc == 0, "session cache stats failed");
+
+    /* The dataset retains the shared state after the caller drops its handle. */
+    lance_session_close(session);
+    ASSERT(lance_dataset_count_rows(ds) > 0,
+           "dataset should remain valid after session close");
+
+    lance_dataset_close(ds);
+    printf("metadata_entries=%llu... OK\n",
+           (unsigned long long)stats.metadata_cache_entries);
+}
+
 static void test_scan(const char *uri) {
     printf("  test_scan... ");
 
@@ -948,6 +972,7 @@ int main(int argc, char **argv) {
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_open_and_metadata(uri);
+    test_shared_session(uri);
     test_scan(uri);
     test_scan_with_limit(uri);
     test_versions(uri);
