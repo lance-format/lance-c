@@ -182,6 +182,7 @@ typedef struct LanceDataset  LanceDataset;
 typedef struct LanceScanner  LanceScanner;
 typedef struct LanceBatch    LanceBatch;
 typedef struct LanceSession  LanceSession;
+typedef struct LanceReadProvider LanceReadProvider;
 typedef struct LanceVersions LanceVersions;
 typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
@@ -233,7 +234,103 @@ int32_t lance_session_get_cache_stats(
     LanceSessionCacheStats* out_stats
 );
 
+/* ─── Host read provider ─── */
+
+/** Status returned by host read-provider callbacks. */
+typedef enum LanceReadStatus {
+    LANCE_READ_OK = 0,
+    LANCE_READ_NOT_SUPPORTED = 1,
+    LANCE_READ_NOT_FOUND = 2,
+    LANCE_READ_CANCELLED = 3,
+    LANCE_READ_IO_ERROR = 4
+} LanceReadStatus;
+
+/**
+ * Stable identity of an object opened through a host read provider.
+ *
+ * All strings are borrowed and remain valid only for the duration of the
+ * `open` callback. `path` is relative to `store_prefix`. `e_tag` and
+ * `version` may be NULL.
+ */
+typedef struct LanceFileIdentity {
+    const char* store_prefix;
+    const char* path;
+    uint64_t size;
+    int64_t last_modified_millis;
+    const char* e_tag;
+    const char* version;
+} LanceFileIdentity;
+
+/**
+ * Host callbacks for random-access reads.
+ *
+ * `open` and `read_at` may run concurrently on blocking worker threads and
+ * must be thread-safe. A successful `open` must set `out_reader` to a non-NULL
+ * value. `close_reader` is called exactly once for every successfully opened
+ * reader. Callbacks must not throw or unwind across the C ABI.
+ */
+typedef struct LanceReadProviderOps {
+    int32_t (*open)(
+        void* context,
+        const LanceFileIdentity* identity,
+        void** out_reader
+    );
+    int32_t (*read_at)(
+        void* reader,
+        uint64_t offset,
+        uint8_t* buffer,
+        uint64_t length,
+        uint64_t* bytes_read
+    );
+    void (*close_reader)(void* reader);
+    void (*destroy_context)(void* context);
+    /**
+     * Return the current thread's last host error. The string is borrowed and
+     * copied by lance-c immediately. May be NULL.
+     */
+    const char* (*last_error_message)(void* context);
+} LanceReadProviderOps;
+
+/**
+ * Create a reference-counted host read provider.
+ *
+ * `max_concurrency` bounds simultaneous blocking `open` and `read_at`
+ * callbacks and must be greater than zero. On success the provider owns
+ * `context` and, when supplied, eventually calls `destroy_context` exactly
+ * once.
+ */
+LanceReadProvider* lance_read_provider_new(
+    const LanceReadProviderOps* ops,
+    void* context,
+    uint32_t max_concurrency
+);
+
+/**
+ * Close a provider handle. Datasets already opened with it remain valid and
+ * retain the provider until their outstanding reads are complete.
+ */
+void lance_read_provider_close(LanceReadProvider* provider);
+
 /* ─── Dataset lifecycle ─── */
+
+/**
+ * Complete options for opening a dataset.
+ *
+ * `session` and `read_provider` are optional and borrowed for the duration of
+ * this call. The returned dataset retains shared ownership of both.
+ */
+typedef struct LanceDatasetOpenOptions {
+    const char* uri;
+    const char* const* storage_options;
+    uint64_t version;
+    const LanceSession* session;
+    const LanceReadProvider* read_provider;
+} LanceDatasetOpenOptions;
+
+/** Open a dataset with an optional shared session and host read provider. */
+LanceDataset* lance_dataset_open_with_options(
+    const LanceDatasetOpenOptions* options
+);
 
 /**
  * Open a Lance dataset.
@@ -1016,7 +1113,7 @@ typedef struct {
  * best-effort and may be omitted if they cannot be materialized. `metrics` is
  * NULL when `metrics_len` is zero.
  */
-typedef struct {
+typedef struct LanceScanStatistics {
     uint64_t iops;
     uint64_t requests;
     uint64_t bytes_read;

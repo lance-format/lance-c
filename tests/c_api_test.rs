@@ -7,10 +7,13 @@
 //! validating the C API contract without needing a C compiler.
 
 use std::ffi::{CString, c_char, c_void};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::process::Command;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use arrow::ffi::from_ffi;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -311,6 +314,198 @@ fn test_shared_session_rejects_null_inputs() {
         lance_session_close(session);
         lance_session_close(ptr::null_mut());
     }
+}
+
+#[derive(Default)]
+struct ReadProviderCounters {
+    opens: AtomicUsize,
+    reads: AtomicUsize,
+    closes: AtomicUsize,
+    destroys: AtomicUsize,
+}
+
+struct TestReadProviderContext {
+    dataset_root: PathBuf,
+    counters: Arc<ReadProviderCounters>,
+}
+
+struct TestRandomAccessReader {
+    file: Mutex<File>,
+    counters: Arc<ReadProviderCounters>,
+}
+
+unsafe extern "C" fn test_read_provider_open(
+    context: *mut c_void,
+    identity: *const LanceFileIdentity,
+    out_reader: *mut *mut c_void,
+) -> i32 {
+    if context.is_null() || identity.is_null() || out_reader.is_null() {
+        return LANCE_READ_IO_ERROR;
+    }
+    let context = unsafe { &*context.cast::<TestReadProviderContext>() };
+    let identity = unsafe { &*identity };
+    if identity.path.is_null() {
+        return LANCE_READ_IO_ERROR;
+    }
+    let relative_path = unsafe { std::ffi::CStr::from_ptr(identity.path) };
+    let Ok(relative_path) = relative_path.to_str() else {
+        return LANCE_READ_IO_ERROR;
+    };
+    let relative_path = PathBuf::from(relative_path);
+    let absolute_path = PathBuf::from("/").join(&relative_path);
+    let path = if absolute_path.exists() {
+        absolute_path
+    } else {
+        context.dataset_root.join(relative_path)
+    };
+    let Ok(file) = File::open(path) else {
+        return LANCE_READ_NOT_FOUND;
+    };
+    context.counters.opens.fetch_add(1, AtomicOrdering::SeqCst);
+    let reader = Box::new(TestRandomAccessReader {
+        file: Mutex::new(file),
+        counters: Arc::clone(&context.counters),
+    });
+    unsafe { *out_reader = Box::into_raw(reader).cast() };
+    LANCE_READ_OK
+}
+
+unsafe extern "C" fn test_read_provider_read_at(
+    reader: *mut c_void,
+    offset: u64,
+    buffer: *mut u8,
+    length: u64,
+    bytes_read: *mut u64,
+) -> i32 {
+    if reader.is_null() || buffer.is_null() || bytes_read.is_null() {
+        return LANCE_READ_IO_ERROR;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return LANCE_READ_IO_ERROR;
+    };
+    let reader = unsafe { &*reader.cast::<TestRandomAccessReader>() };
+    let mut file = reader.file.lock().unwrap();
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return LANCE_READ_IO_ERROR;
+    }
+    let output = unsafe { std::slice::from_raw_parts_mut(buffer, length) };
+    if file.read_exact(output).is_err() {
+        return LANCE_READ_IO_ERROR;
+    }
+    unsafe { *bytes_read = length as u64 };
+    reader.counters.reads.fetch_add(1, AtomicOrdering::SeqCst);
+    LANCE_READ_OK
+}
+
+unsafe extern "C" fn test_read_provider_close_reader(reader: *mut c_void) {
+    if !reader.is_null() {
+        let reader = unsafe { Box::from_raw(reader.cast::<TestRandomAccessReader>()) };
+        reader.counters.closes.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
+unsafe extern "C" fn test_read_provider_destroy_context(context: *mut c_void) {
+    if !context.is_null() {
+        let context = unsafe { Box::from_raw(context.cast::<TestReadProviderContext>()) };
+        context
+            .counters
+            .destroys
+            .fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
+#[test]
+fn test_read_provider_is_dataset_scoped_with_shared_session() {
+    let (_tmp, uri) = create_test_dataset();
+    let counters = Arc::new(ReadProviderCounters::default());
+    let context = Box::new(TestReadProviderContext {
+        dataset_root: PathBuf::from(&uri),
+        counters: Arc::clone(&counters),
+    });
+    let ops = LanceReadProviderOps {
+        open: Some(test_read_provider_open),
+        read_at: Some(test_read_provider_read_at),
+        close_reader: Some(test_read_provider_close_reader),
+        destroy_context: Some(test_read_provider_destroy_context),
+        last_error_message: None,
+    };
+    let provider = unsafe { lance_read_provider_new(&ops, Box::into_raw(context).cast(), 4) };
+    assert!(!provider.is_null());
+    let session = lance_session_new(0, 16 * 1024 * 1024);
+    assert!(!session.is_null());
+    let c_uri = c_str(&uri);
+    let options = LanceDatasetOpenOptions {
+        uri: c_uri.as_ptr(),
+        storage_options: ptr::null(),
+        version: 0,
+        session,
+        read_provider: provider,
+    };
+    let dataset = unsafe { lance_dataset_open_with_options(&options) };
+    if dataset.is_null() {
+        let message = lance_last_error_message();
+        let message = if message.is_null() {
+            "unknown error".to_string()
+        } else {
+            let owned = unsafe { std::ffi::CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { lance_free_string(message) };
+            owned
+        };
+        panic!("dataset open with provider should succeed: {message}");
+    }
+
+    // The Dataset owns the provider after open.
+    unsafe { lance_read_provider_close(provider) };
+    assert_eq!(counters.destroys.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(
+        scan_all_rows(dataset)
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        5
+    );
+    assert!(counters.opens.load(AtomicOrdering::SeqCst) > 0);
+    assert!(counters.reads.load(AtomicOrdering::SeqCst) > 0);
+
+    unsafe { lance_dataset_close(dataset) };
+    assert_eq!(
+        counters.opens.load(AtomicOrdering::SeqCst),
+        counters.closes.load(AtomicOrdering::SeqCst)
+    );
+    assert_eq!(counters.destroys.load(AtomicOrdering::SeqCst), 1);
+
+    // Keeping the Session alive must not retain the Dataset-scoped provider.
+    // The same Session remains usable for a subsequent Dataset binding.
+    let second =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(!second.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(second) }, 5);
+    unsafe {
+        lance_dataset_close(second);
+        lance_session_close(session);
+    }
+}
+
+#[test]
+fn test_read_provider_rejects_invalid_inputs() {
+    assert!(unsafe { lance_read_provider_new(ptr::null(), ptr::null_mut(), 1) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let ops = LanceReadProviderOps {
+        open: Some(test_read_provider_open),
+        read_at: Some(test_read_provider_read_at),
+        close_reader: Some(test_read_provider_close_reader),
+        destroy_context: None,
+        last_error_message: None,
+    };
+    assert!(unsafe { lance_read_provider_new(&ops, ptr::null_mut(), 0) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_open_with_options(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_read_provider_close(ptr::null_mut()) };
 }
 
 #[test]

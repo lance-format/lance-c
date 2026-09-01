@@ -18,6 +18,8 @@ rust-version = "1.91.0"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+async-trait = "0.1"
+bytes = "1"
 lance = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c", features = ["substrait"] }
 lance-core = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
 lance-file = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
@@ -39,6 +41,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 futures = "0.3"
 log = "0.4"
 libc = "0.2"
+object_store = "0.13.2"
 pin-project = "1.0"
 prost = "0.14"
 snafu = "0.9"

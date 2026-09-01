@@ -45,6 +45,12 @@ typedef struct {
     int invalid;
 } ScanStatisticsCapture;
 
+static uint64_t tagged_scan_statistics_bytes_read(
+    const struct LanceScanStatistics *statistics
+) {
+    return statistics->bytes_read;
+}
+
 static void capture_scan_statistics(
     void *callback_ctx,
     const LanceScanStatistics *statistics
@@ -66,7 +72,7 @@ static void capture_scan_statistics(
         }
     }
     captured->calls += 1;
-    captured->bytes_read = statistics->bytes_read;
+    captured->bytes_read = tagged_scan_statistics_bytes_read(statistics);
 }
 
 static void test_open_and_metadata(const char *uri) {

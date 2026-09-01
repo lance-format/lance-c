@@ -13,9 +13,11 @@ use arrow_schema::Schema as ArrowSchema;
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance_core::Result;
+use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 
 use crate::error::{ffi_try, swallow_unwind};
 use crate::helpers;
+use crate::read_provider::{LanceReadProvider, ProviderWrapper};
 use crate::runtime::block_on;
 use crate::session::LanceSession;
 use crate::stream_guard::guarded_ffi_stream_from_reader;
@@ -23,6 +25,20 @@ use crate::stream_guard::guarded_ffi_stream_from_reader;
 /// Opaque handle representing an opened Lance dataset.
 pub struct LanceDataset {
     pub(crate) inner: RwLock<Arc<Dataset>>,
+}
+
+/// Complete set of options for opening a dataset.
+///
+/// `session` and `read_provider` are borrowed for this call. The returned
+/// dataset retains shared ownership of their underlying state.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceDatasetOpenOptions {
+    pub uri: *const c_char,
+    pub storage_options: *const *const c_char,
+    pub version: u64,
+    pub session: *const LanceSession,
+    pub read_provider: *const LanceReadProvider,
 }
 
 impl LanceDataset {
@@ -122,7 +138,7 @@ pub unsafe extern "C" fn lance_dataset_open(
     version: u64,
 ) -> *mut LanceDataset {
     ffi_try!(
-        unsafe { open_dataset_inner(uri, storage_options, version, None) },
+        unsafe { open_dataset_inner(uri, storage_options, version, None, None) },
         null
     )
 }
@@ -156,7 +172,45 @@ unsafe fn open_dataset_with_session_inner(
         ));
     }
     let session = unsafe { &*session };
-    unsafe { open_dataset_inner(uri, storage_options, version, Some(session)) }
+    unsafe { open_dataset_inner(uri, storage_options, version, Some(session), None) }
+}
+
+/// Open a dataset with an optional shared session and host read provider.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_open_with_options(
+    options: *const LanceDatasetOpenOptions,
+) -> *mut LanceDataset {
+    ffi_try!(unsafe { open_dataset_with_options_inner(options) }, null)
+}
+
+unsafe fn open_dataset_with_options_inner(
+    options: *const LanceDatasetOpenOptions,
+) -> Result<*mut LanceDataset> {
+    if options.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "options must not be NULL".into(),
+        ));
+    }
+    let options = unsafe { &*options };
+    let session = if options.session.is_null() {
+        None
+    } else {
+        Some(unsafe { &*options.session })
+    };
+    let read_provider = if options.read_provider.is_null() {
+        None
+    } else {
+        Some(unsafe { &*options.read_provider })
+    };
+    unsafe {
+        open_dataset_inner(
+            options.uri,
+            options.storage_options,
+            options.version,
+            session,
+            read_provider,
+        )
+    }
 }
 
 unsafe fn open_dataset_inner(
@@ -164,6 +218,7 @@ unsafe fn open_dataset_inner(
     storage_options: *const *const c_char,
     version: u64,
     session: Option<&LanceSession>,
+    read_provider: Option<&LanceReadProvider>,
 ) -> Result<*mut LanceDataset> {
     let uri_str = unsafe { helpers::parse_c_string(uri)? }
         .ok_or_else(|| lance_core::Error::invalid_input_source("uri must not be NULL".into()))?;
@@ -171,8 +226,17 @@ unsafe fn open_dataset_inner(
     let opts = unsafe { helpers::parse_storage_options(storage_options)? };
 
     let mut builder = DatasetBuilder::from_uri(uri_str);
-    if !opts.is_empty() {
-        builder = builder.with_storage_options(opts);
+    if !opts.is_empty() || read_provider.is_some() {
+        let mut store_params = ObjectStoreParams::default();
+        if !opts.is_empty() {
+            store_params.storage_options_accessor =
+                Some(Arc::new(StorageOptionsAccessor::with_static_options(opts)));
+        }
+        if let Some(read_provider) = read_provider {
+            store_params.object_store_wrapper =
+                Some(Arc::new(ProviderWrapper::new(&read_provider.inner)));
+        }
+        builder = builder.with_store_params(store_params);
     }
     if version != 0 {
         builder = builder.with_version(version);

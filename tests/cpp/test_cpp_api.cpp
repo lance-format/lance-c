@@ -34,6 +34,10 @@ struct ScanStatisticsCapture {
     bool invalid = false;
 };
 
+static_assert(std::is_same_v<
+              LanceScanStatistics,
+              struct LanceScanStatistics>);
+
 static void capture_scan_statistics(
     void* callback_ctx,
     const LanceScanStatistics* statistics) noexcept {
@@ -88,7 +92,9 @@ static void test_shared_session(const std::string& uri) {
     TEST(test_shared_session);
 
     auto session = std::make_unique<lance::Session>(0, 16 * 1024 * 1024);
-    auto ds = lance::Dataset::open_with_session(*session, uri);
+    lance::DatasetOpenOptions options;
+    options.session = session.get();
+    auto ds = lance::Dataset::open(uri, options);
     auto stats = session->cache_stats();
 
     session.reset();

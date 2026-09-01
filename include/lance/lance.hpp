@@ -190,6 +190,40 @@ public:
     const LanceSession* c_handle() const { return handle_.get(); }
 };
 
+// ─── Host Read Provider ─────────────────────────────────────────────────────
+
+/// Reference-counted host random-access reader. The provider takes ownership
+/// of `context` after successful construction and, when supplied, invokes
+/// `destroy_context` when the last Dataset/provider handle releases it.
+class ReadProvider {
+    Handle<LanceReadProvider, lance_read_provider_close> handle_;
+
+public:
+    ReadProvider(
+        const LanceReadProviderOps& ops,
+        void* context,
+        uint32_t max_concurrency)
+        : handle_(lance_read_provider_new(&ops, context, max_concurrency)) {
+        if (!handle_) check_error();
+    }
+
+    ReadProvider(ReadProvider&&) noexcept = default;
+    ReadProvider& operator=(ReadProvider&&) noexcept = default;
+    ReadProvider(const ReadProvider&) = delete;
+    ReadProvider& operator=(const ReadProvider&) = delete;
+
+    const LanceReadProvider* c_handle() const { return handle_.get(); }
+};
+
+/// Composable options for Dataset::open. Session caches and host reads have
+/// independent lifetimes and may be enabled separately or together.
+struct DatasetOpenOptions {
+    std::vector<std::pair<std::string, std::string>> storage_options;
+    uint64_t version = 0;
+    const Session* session = nullptr;
+    const ReadProvider* read_provider = nullptr;
+};
+
 // ─── Process-local FTS query context ────────────────────────────────────────
 
 /// Immutable, query-specific global BM25 scorer plus pinned FTS segment list.
@@ -225,6 +259,21 @@ class Dataset {
     }
 
 public:
+    /// Open a dataset with composable Session and host-read-provider options.
+    static Dataset open(const std::string& uri, const DatasetOpenOptions& options) {
+        auto kv = to_c_storage_options(options.storage_options);
+        LanceDatasetOpenOptions c_options{
+            uri.c_str(),
+            options.storage_options.empty() ? nullptr : kv.data(),
+            options.version,
+            options.session ? options.session->c_handle() : nullptr,
+            options.read_provider ? options.read_provider->c_handle() : nullptr,
+        };
+        auto* ds = lance_dataset_open_with_options(&c_options);
+        if (!ds) check_error();
+        return Dataset(ds);
+    }
+
     /// Open a dataset at the given URI. Pass `version` = 0 (the default) for
     /// the latest, or a specific version id from `versions()` to check out
     /// that version, e.g. `lance::Dataset::open("data.lance", {}, /*version=*/42)`.

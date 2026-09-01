@@ -68,6 +68,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
 | [x] | Dataset metadata | `lance_dataset_version()`, `lance_dataset_count_rows()`, `lance_dataset_latest_version()` |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
+| [x] | Host read provider | Query engines can route range reads through their native file reader and data cache while independently sharing Lance Session caches |
 
 ## Building
 
@@ -196,6 +197,43 @@ lance::Session session(
 auto ds = lance::Dataset::open_with_session(session, "data.lance");
 auto stats = session.cache_stats();
 ```
+
+### Combine a shared Session with a host read provider
+
+`LanceSession` and `LanceReadProvider` are intentionally independent. A
+Session is long-lived and caches portable metadata/index state. A read provider
+is bound to a Dataset and owns the current query engine's file readers,
+credentials, cancellation state, data-cache policy, and I/O statistics.
+
+```c
+LanceReadProviderOps provider_ops = {
+    .open = host_open,
+    .read_at = host_read_at,
+    .close_reader = host_close_reader,
+    .destroy_context = host_destroy_context,
+    .last_error_message = host_last_error_message,
+};
+LanceReadProvider* provider =
+    lance_read_provider_new(&provider_ops, host_context, 16);
+
+LanceDatasetOpenOptions options = {
+    .uri = "s3://bucket/data.lance",
+    .storage_options = storage_options,
+    .version = 0,
+    .session = session,
+    .read_provider = provider,
+};
+LanceDataset* ds = lance_dataset_open_with_options(&options);
+
+/* The Dataset retains both shared objects. */
+lance_read_provider_close(provider);
+lance_session_close(session);
+```
+
+The provider receives object metadata from Lance's native object store and is
+used only for object contents. Listing, metadata lookup, and writes continue to
+use the native store. Returning `LANCE_READ_NOT_SUPPORTED` from `open` falls
+back to the native read path for that object.
 
 ### Open at a specific version
 
