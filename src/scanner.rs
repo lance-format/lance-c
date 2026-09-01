@@ -179,6 +179,45 @@ impl LanceScanner {
         Ok(())
     }
 
+    /// Restrict an INDEX_ONLY prepared FTS scan to fragments covered by the
+    /// selected committed segments.  This is deliberately separate from
+    /// `fast_search`: that option is scanner-wide, changes unrelated scalar
+    /// index fallback behavior, and also forces `_rowid` into the output.
+    fn apply_prepared_fts_fragment_filter(
+        &self,
+        scanner: &mut lance::dataset::scanner::Scanner,
+        context: &FtsQueryContextInner,
+        segments: &[IndexMetadata],
+    ) -> Result<()> {
+        if !context.has_unindexed_fragments {
+            return Ok(());
+        }
+
+        let mut selected_fragment_ids = std::collections::HashSet::new();
+        for segment in segments {
+            let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+                lance_core::Error::internal(format!(
+                    "prepared FTS segment {} lost its validated fragment coverage",
+                    segment.uuid
+                ))
+            })?;
+            selected_fragment_ids.extend(fragment_bitmap.iter());
+        }
+
+        let selected_fragments = self
+            .dataset
+            .get_fragments()
+            .into_iter()
+            .filter(|fragment| {
+                u32::try_from(fragment.id())
+                    .is_ok_and(|fragment_id| selected_fragment_ids.contains(&fragment_id))
+            })
+            .map(|fragment| fragment.metadata().clone())
+            .collect();
+        scanner.with_fragments(selected_fragments);
+        Ok(())
+    }
+
     fn apply_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
         if let Some(substrait) = &self.substrait_filter {
             scanner.filter_substrait(substrait)?;
@@ -282,11 +321,8 @@ impl LanceScanner {
         let distributed_fts = if let Some(context) = &self.fts_context {
             context.validate_dataset_identity(&self.dataset)?;
             let segments = select_fts_segments(context, self.fts_index_segments.as_deref())?;
+            self.apply_prepared_fts_fragment_filter(&mut scanner, context, &segments)?;
             scanner.full_text_search(context.query.clone())?;
-            // Both STRICT and INDEX_ONLY context scans must use only the
-            // committed segments pinned in the context. In STRICT mode all
-            // current fragments were already proven covered during prepare.
-            scanner.fast_search();
             Some(PreparedFtsExecution {
                 context: Arc::clone(context),
                 segments,
