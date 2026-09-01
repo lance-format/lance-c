@@ -5944,6 +5944,85 @@ fn test_prepare_fts_query_index_only_allows_unindexed_fragment() {
 }
 
 #[test]
+fn test_prepared_fts_index_only_empty_segment_returns_empty_shard() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::{IndexType, scalar::InvertedIndexParams};
+
+    let (_tmp, uri) = create_test_dataset();
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index_builder(&["name"], IndexType::Inverted, &params)
+            .name("empty_name_fts".to_string())
+            .train(false)
+            .await
+            .unwrap();
+        let segments = dataset
+            .load_indices_by_name("empty_name_fts")
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        assert!(
+            segments[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|fragment_bitmap| fragment_bitmap.is_empty())
+        );
+    });
+
+    let uri_c = c_str(&uri);
+    let column = c_str("name");
+    let query = c_str("alice");
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let context = unsafe {
+        lance_dataset_prepare_fts_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            0,
+            LanceFtsCoverageMode::IndexOnly as i32,
+        )
+    };
+    assert!(!context.is_null(), "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    let segment_uuids = load_fts_segment_uuids(&uri, "name");
+    assert_eq!(segment_uuids.len(), 1);
+
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_fts_index_segments(
+                scanner,
+                segment_uuids.as_ptr().cast::<u8>(),
+                segment_uuids.len(),
+            )
+        },
+        0
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream).unwrap() };
+    let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 0);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_fts_query_context_close(context) };
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
 fn test_prepared_fts_global_scorer_is_shared_across_segment_splits() {
     use lance::index::DatasetIndexExt;
     use lance_index::optimize::OptimizeOptions;

@@ -54,7 +54,6 @@ pub(crate) struct FtsQueryContextInner {
     pub(crate) query: FullTextSearchQuery,
     pub(crate) segments: Vec<IndexMetadata>,
     pub(crate) scorer: Arc<MemBM25Scorer>,
-    pub(crate) has_unindexed_fragments: bool,
 }
 
 impl FtsQueryContextInner {
@@ -217,7 +216,6 @@ async fn prepare_fts_query_context(
         query,
         segments,
         scorer,
-        has_unindexed_fragments: !unindexed_fragment_ids.is_empty(),
     })
 }
 
