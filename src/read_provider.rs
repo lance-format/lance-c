@@ -26,7 +26,6 @@ use object_store::{
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     Result as ObjectStoreResult,
 };
-use tokio::sync::Semaphore;
 
 use crate::error::{ffi_try, swallow_unwind};
 
@@ -96,36 +95,25 @@ pub struct LanceReadProvider {
 
 /// Create a host read provider.
 ///
-/// `max_concurrency` bounds simultaneous blocking host callbacks. The provider
+/// Lance's I/O scheduler controls the number of concurrent reads. The provider
 /// owns `context` after this function succeeds.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_read_provider_new(
     ops: *const LanceReadProviderOps,
     context: *mut c_void,
-    max_concurrency: u32,
 ) -> *mut LanceReadProvider {
-    ffi_try!(
-        unsafe { read_provider_new_inner(ops, context, max_concurrency) },
-        null
-    )
+    ffi_try!(unsafe { read_provider_new_inner(ops, context) }, null)
 }
 
 unsafe fn read_provider_new_inner(
     ops: *const LanceReadProviderOps,
     context: *mut c_void,
-    max_concurrency: u32,
 ) -> Result<*mut LanceReadProvider> {
     if ops.is_null() {
         return Err(lance_core::Error::invalid_input_source(
             "ops must not be NULL".into(),
         ));
     }
-    if max_concurrency == 0 {
-        return Err(lance_core::Error::invalid_input_source(
-            "max_concurrency must be greater than zero".into(),
-        ));
-    }
-
     let ops = unsafe { *ops };
     if ops.open.is_none() || ops.read_at.is_none() || ops.close_reader.is_none() {
         return Err(lance_core::Error::invalid_input_source(
@@ -137,7 +125,6 @@ unsafe fn read_provider_new_inner(
         inner: Arc::new(ForeignReadProvider {
             ops,
             context: context as usize,
-            permits: Arc::new(Semaphore::new(max_concurrency as usize)),
         }),
     })))
 }
@@ -156,15 +143,11 @@ pub unsafe extern "C" fn lance_read_provider_close(provider: *mut LanceReadProvi
 pub(crate) struct ForeignReadProvider {
     ops: LanceReadProviderOps,
     context: usize,
-    permits: Arc<Semaphore>,
 }
 
 impl Debug for ForeignReadProvider {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ForeignReadProvider")
-            .field("max_concurrency", &self.permits.available_permits())
-            .finish_non_exhaustive()
+        formatter.debug_struct("ForeignReadProvider").finish()
     }
 }
 
@@ -218,18 +201,10 @@ impl ForeignReadProvider {
     ) -> ObjectStoreResult<Option<Arc<HostFile>>> {
         let provider = Arc::clone(self);
         let callback = self.ops.open.expect("validated at provider construction");
-        let permit = Arc::clone(&self.permits)
-            .acquire_owned()
-            .await
-            .map_err(|error| object_store::Error::Generic {
-                store: "host read provider",
-                source: Box::new(error),
-            })?;
         let callback_path = path.clone();
         let callback_meta = meta.clone();
 
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
             let store_prefix = CString::new(store_prefix.as_ref()).map_err(|error| {
                 object_store::Error::Generic {
                     store: "host read provider",
@@ -438,16 +413,7 @@ impl HostFile {
             .ops
             .read_at
             .expect("validated at provider construction");
-        let permit = Arc::clone(&self.provider.permits)
-            .acquire_owned()
-            .await
-            .map_err(|error| object_store::Error::Generic {
-                store: "host read provider",
-                source: Box::new(error),
-            })?;
-
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
             let mut buffer = vec![0_u8; length_usize];
             let mut bytes_read = 0_u64;
             let status = unsafe {

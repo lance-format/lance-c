@@ -199,11 +199,8 @@ class ReadProvider {
     Handle<LanceReadProvider, lance_read_provider_close> handle_;
 
 public:
-    ReadProvider(
-        const LanceReadProviderOps& ops,
-        void* context,
-        uint32_t max_concurrency)
-        : handle_(lance_read_provider_new(&ops, context, max_concurrency)) {
+    ReadProvider(const LanceReadProviderOps& ops, void* context)
+        : handle_(lance_read_provider_new(&ops, context)) {
         if (!handle_) check_error();
     }
 

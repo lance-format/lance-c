@@ -294,15 +294,13 @@ typedef struct LanceReadProviderOps {
 /**
  * Create a reference-counted host read provider.
  *
- * `max_concurrency` bounds simultaneous blocking `open` and `read_at`
- * callbacks and must be greater than zero. On success the provider owns
- * `context` and, when supplied, eventually calls `destroy_context` exactly
- * once.
+ * Lance's I/O scheduler controls the number of concurrent reads. On success
+ * the provider owns `context` and, when supplied, eventually calls
+ * `destroy_context` exactly once.
  */
 LanceReadProvider* lance_read_provider_new(
     const LanceReadProviderOps* ops,
-    void* context,
-    uint32_t max_concurrency
+    void* context
 );
 
 /**

@@ -429,7 +429,7 @@ fn test_read_provider_is_dataset_scoped_with_shared_session() {
         destroy_context: Some(test_read_provider_destroy_context),
         last_error_message: None,
     };
-    let provider = unsafe { lance_read_provider_new(&ops, Box::into_raw(context).cast(), 4) };
+    let provider = unsafe { lance_read_provider_new(&ops, Box::into_raw(context).cast()) };
     assert!(!provider.is_null());
     let session = lance_session_new(0, 16 * 1024 * 1024);
     assert!(!session.is_null());
@@ -490,17 +490,17 @@ fn test_read_provider_is_dataset_scoped_with_shared_session() {
 
 #[test]
 fn test_read_provider_rejects_invalid_inputs() {
-    assert!(unsafe { lance_read_provider_new(ptr::null(), ptr::null_mut(), 1) }.is_null());
+    assert!(unsafe { lance_read_provider_new(ptr::null(), ptr::null_mut()) }.is_null());
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 
     let ops = LanceReadProviderOps {
-        open: Some(test_read_provider_open),
+        open: None,
         read_at: Some(test_read_provider_read_at),
         close_reader: Some(test_read_provider_close_reader),
         destroy_context: None,
         last_error_message: None,
     };
-    assert!(unsafe { lance_read_provider_new(&ops, ptr::null_mut(), 0) }.is_null());
+    assert!(unsafe { lance_read_provider_new(&ops, ptr::null_mut()) }.is_null());
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert!(unsafe { lance_dataset_open_with_options(ptr::null()) }.is_null());
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);

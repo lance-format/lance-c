@@ -214,7 +214,7 @@ LanceReadProviderOps provider_ops = {
     .last_error_message = host_last_error_message,
 };
 LanceReadProvider* provider =
-    lance_read_provider_new(&provider_ops, host_context, 16);
+    lance_read_provider_new(&provider_ops, host_context);
 
 LanceDatasetOpenOptions options = {
     .uri = "s3://bucket/data.lance",
