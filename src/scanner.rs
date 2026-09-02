@@ -12,13 +12,13 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::SchemaRef;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, empty::EmptyExec};
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::scanner::{
     DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
 };
-use lance::io::exec::fts::MatchQueryExec;
+use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec};
 use lance_core::Result;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_io::stream::RecordBatchStream;
@@ -283,10 +283,6 @@ impl LanceScanner {
             context.validate_dataset_identity(&self.dataset)?;
             let segments = select_fts_segments(context, self.fts_index_segments.as_deref())?;
             scanner.full_text_search(context.query.clone())?;
-            // Both STRICT and INDEX_ONLY context scans must use only the
-            // committed segments pinned in the context. In STRICT mode all
-            // current fragments were already proven covered during prepare.
-            scanner.fast_search();
             Some(PreparedFtsExecution {
                 context: Arc::clone(context),
                 segments,
@@ -325,14 +321,24 @@ impl PreparedScanner {
             return self.scanner.try_into_stream().await;
         };
         let plan = self.scanner.create_plan().await?;
-        let (plan, replaced) = replace_match_query_exec(
+        let selected_segments_have_current_fragments = segments_have_current_fragments(
+            &distributed_fts.context.dataset,
+            &distributed_fts.segments,
+        )?;
+        let (plan, rewritten) = rewrite_prepared_fts_plan(
             plan,
             &distributed_fts.segments,
             &distributed_fts.context.scorer,
+            selected_segments_have_current_fragments,
         )?;
-        if replaced != 1 {
+        if rewritten.match_query_execs > 1
+            || rewritten.flat_match_query_execs > 1
+            || rewritten.match_query_execs + rewritten.flat_match_query_execs == 0
+            || (selected_segments_have_current_fragments && rewritten.match_query_execs != 1)
+        {
             return Err(lance_core::Error::internal(format!(
-                "expected exactly one MatchQueryExec in prepared FTS plan, replaced {replaced}"
+                "unexpected prepared FTS plan for selected segments with current fragment coverage {selected_segments_have_current_fragments}: rewrote {} MatchQueryExec node(s) and removed {} FlatMatchQueryExec node(s)",
+                rewritten.match_query_execs, rewritten.flat_match_query_execs
             )));
         }
         let stream = lance_datafusion::exec::execute_plan(
@@ -379,22 +385,81 @@ fn select_fts_segments(
     Ok(selected)
 }
 
-fn replace_match_query_exec(
+fn segments_have_current_fragments(
+    dataset: &lance::Dataset,
+    segments: &[IndexMetadata],
+) -> Result<bool> {
+    let current_fragment_ids = dataset
+        .get_fragments()
+        .into_iter()
+        .map(|fragment| {
+            u32::try_from(fragment.id()).map_err(|_| {
+                lance_core::Error::internal(format!(
+                    "current fragment id {} exceeds the validated u32 FTS coverage range",
+                    fragment.id()
+                ))
+            })
+        })
+        .collect::<Result<std::collections::HashSet<_>>>()?;
+    for segment in segments {
+        let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+            lance_core::Error::internal(format!(
+                "prepared FTS segment {} lost its validated fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        if fragment_bitmap
+            .iter()
+            .any(|fragment_id| current_fragment_ids.contains(&fragment_id))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Default)]
+struct PreparedFtsPlanRewriteCounts {
+    match_query_execs: usize,
+    flat_match_query_execs: usize,
+}
+
+fn rewrite_prepared_fts_plan(
     plan: Arc<dyn ExecutionPlan>,
     segments: &[IndexMetadata],
     scorer: &Arc<lance_index::scalar::inverted::MemBM25Scorer>,
-) -> Result<(Arc<dyn ExecutionPlan>, usize)> {
+    selected_segments_have_current_fragments: bool,
+) -> Result<(Arc<dyn ExecutionPlan>, PreparedFtsPlanRewriteCounts)> {
+    // Lance's ordinary FTS planner adds a flat-search branch for fragments not
+    // covered by the logical index. A prepared INDEX_ONLY scan must omit that
+    // branch, but using Scanner::with_fragments to do so would turn an
+    // otherwise unfiltered index search into a full row-id prefilter scan.
+    if plan.downcast_ref::<FlatMatchQueryExec>().is_some() {
+        return Ok((
+            Arc::new(EmptyExec::new(plan.schema())),
+            PreparedFtsPlanRewriteCounts {
+                match_query_execs: 0,
+                flat_match_query_execs: 1,
+            },
+        ));
+    }
+
     let children = plan.children();
-    let mut replaced = 0;
+    let mut rewritten = PreparedFtsPlanRewriteCounts::default();
     let rebuilt = if children.is_empty() {
         plan
     } else {
         let mut new_children = Vec::with_capacity(children.len());
         for child in children {
-            let (new_child, child_replaced) =
-                replace_match_query_exec(Arc::clone(child), segments, scorer)?;
+            let (new_child, child_rewritten) = rewrite_prepared_fts_plan(
+                Arc::clone(child),
+                segments,
+                scorer,
+                selected_segments_have_current_fragments,
+            )?;
             new_children.push(new_child);
-            replaced += child_replaced;
+            rewritten.match_query_execs += child_rewritten.match_query_execs;
+            rewritten.flat_match_query_execs += child_rewritten.flat_match_query_execs;
         }
         plan.with_new_children(new_children).map_err(|error| {
             lance_core::Error::internal(format!(
@@ -404,6 +469,10 @@ fn replace_match_query_exec(
     };
 
     if let Some(exec) = rebuilt.downcast_ref::<MatchQueryExec>() {
+        rewritten.match_query_execs += 1;
+        if !selected_segments_have_current_fragments {
+            return Ok((Arc::new(EmptyExec::new(rebuilt.schema())), rewritten));
+        }
         let replacement = MatchQueryExec::new_with_segments(
             Arc::clone(exec.dataset()),
             exec.query().clone(),
@@ -412,9 +481,9 @@ fn replace_match_query_exec(
             segments.to_vec(),
         )
         .with_base_scorer(Arc::clone(scorer));
-        return Ok((Arc::new(replacement), replaced + 1));
+        return Ok((Arc::new(replacement), rewritten));
     }
-    Ok((rebuilt, replaced))
+    Ok((rebuilt, rewritten))
 }
 
 /// Type of a dynamically named scan metric.
@@ -2082,6 +2151,9 @@ mod tests {
     use super::*;
     use crate::dataset::{lance_dataset_close, lance_dataset_open};
     use crate::error::{lance_last_error_code, lance_last_error_message};
+    use crate::fts_query::{
+        LanceFtsCoverageMode, lance_dataset_prepare_fts_query, lance_fts_query_context_close,
+    };
     use std::ffi::{CStr, CString};
     use std::sync::atomic::{AtomicI32, AtomicUsize};
     use std::sync::{Barrier, mpsc};
@@ -2089,6 +2161,9 @@ mod tests {
 
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use lance::index::DatasetIndexExt;
+    use lance::io::exec::PreFilterSource;
+    use lance_index::{IndexType, scalar::InvertedIndexParams};
 
     /// Write a 3-row dataset to a tempdir, returning (tempdir, uri).
     fn create_test_dataset() -> (tempfile::TempDir, String) {
@@ -2131,6 +2206,114 @@ mod tests {
         unsafe { &*scanner }
             .poison_flag()
             .store(true, Ordering::SeqCst);
+    }
+
+    fn prepared_fts_plan_shape(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize, usize) {
+        let mut match_query_execs = 0;
+        let mut flat_match_query_execs = 0;
+        let mut filtered_row_id_prefilters = 0;
+        if let Some(exec) = plan.downcast_ref::<MatchQueryExec>() {
+            match_query_execs += 1;
+            if matches!(exec.prefilter_source(), PreFilterSource::FilteredRowIds(_)) {
+                filtered_row_id_prefilters += 1;
+            }
+        }
+        if plan.downcast_ref::<FlatMatchQueryExec>().is_some() {
+            flat_match_query_execs += 1;
+        }
+        for child in plan.children() {
+            let (child_match, child_flat, child_filtered) =
+                prepared_fts_plan_shape(&Arc::clone(child));
+            match_query_execs += child_match;
+            flat_match_query_execs += child_flat;
+            filtered_row_id_prefilters += child_filtered;
+        }
+        (
+            match_query_execs,
+            flat_match_query_execs,
+            filtered_row_id_prefilters,
+        )
+    }
+
+    #[test]
+    fn prepared_fts_index_only_plan_does_not_scan_indexed_fragment_row_ids() {
+        let (_tmp, uri) = create_test_dataset();
+        block_on(async {
+            let mut dataset = Dataset::open(&uri).await.unwrap();
+            dataset
+                .create_index(
+                    &["name"],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![4])),
+                    Arc::new(StringArray::from(vec!["a"])),
+                ],
+            )
+            .unwrap();
+            dataset
+                .append(
+                    arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+                    None,
+                )
+                .await
+                .unwrap();
+        });
+
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let column = CString::new("name").unwrap();
+        let query = CString::new("a").unwrap();
+        let context = unsafe {
+            lance_dataset_prepare_fts_query(
+                dataset,
+                column.as_ptr(),
+                query.as_ptr(),
+                0,
+                LanceFtsCoverageMode::IndexOnly as i32,
+            )
+        };
+        assert!(!context.is_null());
+        assert_eq!(
+            unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+            0
+        );
+
+        let prepared = unsafe { &*scanner }.build_scanner().unwrap();
+        let distributed = prepared.distributed_fts.as_ref().unwrap();
+        let segments = distributed.segments.clone();
+        let scorer = Arc::clone(&distributed.context.scorer);
+        let plan = block_on(prepared.scanner.create_plan()).unwrap();
+        assert_eq!(
+            prepared_fts_plan_shape(&plan),
+            (1, 1, 0),
+            "an unfiltered prepared FTS plan must not materialize selected fragment row IDs"
+        );
+
+        let has_current_fragments =
+            segments_have_current_fragments(&distributed.context.dataset, &segments).unwrap();
+        let (rewritten, counts) =
+            rewrite_prepared_fts_plan(plan, &segments, &scorer, has_current_fragments).unwrap();
+        assert_eq!(counts.match_query_execs, 1);
+        assert_eq!(counts.flat_match_query_execs, 1);
+        assert_eq!(prepared_fts_plan_shape(&rewritten), (1, 0, 0));
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_fts_query_context_close(context);
+            lance_dataset_close(dataset);
+        }
     }
 
     /// Assert the pending thread-local error is `Panic` carrying the poison
