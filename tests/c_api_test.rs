@@ -5914,6 +5914,20 @@ fn test_prepared_fts_match_phrase_and_legacy_compatibility() {
     assert_eq!(phrase_with_slop_ids, vec![1, 5]);
     unsafe { lance_fts_query_context_close(phrase_with_slop) };
 
+    let negative_phrase_slop = unsafe {
+        lance_dataset_prepare_fts_phrase_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            -1,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(negative_phrase_slop.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("slop must be non-negative"), "{message}");
+
     unsafe { lance_dataset_close(dataset) };
 }
 

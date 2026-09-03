@@ -798,11 +798,12 @@ public:
         return FtsQueryContext(context);
     }
 
-    /// Prepare a Phrase query. Its FTS index must store token positions.
+    /// Prepare a Phrase query. Its FTS index must store token positions and
+    /// slop must be non-negative.
     FtsQueryContext prepare_fts_phrase_query(
         const std::string& column,
         const std::string& query,
-        uint32_t slop = 0,
+        int32_t slop = 0,
         FtsCoverageMode coverage_mode = FtsCoverageMode::Strict) const {
         auto* context = lance_dataset_prepare_fts_phrase_query(
             handle_.get(), column.c_str(), query.c_str(), slop,

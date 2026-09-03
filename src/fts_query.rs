@@ -401,7 +401,7 @@ pub unsafe extern "C" fn lance_dataset_prepare_fts_phrase_query(
     dataset: *const LanceDataset,
     column: *const c_char,
     query: *const c_char,
-    slop: u32,
+    slop: i32,
     coverage_mode: i32,
 ) -> *mut LanceFtsQueryContext {
     ffi_try!(
@@ -414,9 +414,11 @@ unsafe fn prepare_fts_phrase_query_inner(
     dataset: *const LanceDataset,
     column: *const c_char,
     query: *const c_char,
-    slop: u32,
+    slop: i32,
     coverage_mode: i32,
 ) -> Result<*mut LanceFtsQueryContext> {
+    let slop = u32::try_from(slop)
+        .map_err(|_| invalid_input(format!("slop must be non-negative, got {slop}")))?;
     let (snapshot, column, query_text, coverage_mode) =
         unsafe { parse_query_inputs(dataset, column, query, coverage_mode)? };
     let query = FullTextSearchQuery::new_query(

@@ -1761,8 +1761,8 @@ LanceFtsQueryContext* lance_dataset_prepare_fts_match_query(
  * Dataset identity, coverage, sharing, and segment-scoped execution follow the
  * same contract as lance_dataset_prepare_fts_match_query().
  *
- * @param slop Maximum number of intervening token positions permitted between
- *             adjacent phrase terms.
+ * @param slop Maximum non-negative number of intervening token positions
+ *             permitted between adjacent phrase terms.
  * @param coverage_mode Fixed-width LanceFtsCoverageMode discriminant.
  * @return Context handle on success, or NULL on error.
  */
@@ -1770,7 +1770,7 @@ LanceFtsQueryContext* lance_dataset_prepare_fts_phrase_query(
     const LanceDataset* dataset,
     const char* column,
     const char* query,
-    uint32_t slop,
+    int32_t slop,
     int32_t coverage_mode
 );
 
