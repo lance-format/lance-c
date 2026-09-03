@@ -5763,6 +5763,203 @@ fn load_fts_segment_uuids(uri: &str, column: &str) -> Vec<[u8; 16]> {
 }
 
 #[test]
+#[allow(deprecated)]
+fn test_prepared_fts_match_phrase_and_legacy_compatibility() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("prepared_fts_queries")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(StringArray::from(vec![
+                "quick brown fox",
+                "quick blue fox",
+                "slow brown fox",
+                "quik brown fox",
+                "quick red brown fox",
+            ])),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let uri_c = c_str(&uri);
+    let column = c_str("text");
+    let index_params =
+        c_str(r#"{"base_tokenizer":"simple","language":"English","with_position":true}"#);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::Inverted as i32,
+                index_params.as_ptr(),
+                false,
+            )
+        },
+        0
+    );
+
+    let query = c_str("quick brown");
+    let exact_or = unsafe {
+        lance_dataset_prepare_fts_match_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!exact_or.is_null());
+    assert_eq!(collect_context_fts_scores(dataset, exact_or, None).len(), 5);
+    unsafe { lance_fts_query_context_close(exact_or) };
+
+    let legacy_or = unsafe {
+        lance_dataset_prepare_fts_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!legacy_or.is_null());
+    assert_eq!(
+        collect_context_fts_scores(dataset, legacy_or, None).len(),
+        5
+    );
+    unsafe { lance_fts_query_context_close(legacy_or) };
+
+    let exact_and = unsafe {
+        lance_dataset_prepare_fts_match_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            LanceFtsMatchOperator::And as i32,
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!exact_and.is_null());
+    let exact_and_scores = collect_context_fts_scores(dataset, exact_and, None);
+    let mut exact_and_ids = exact_and_scores.keys().copied().collect::<Vec<_>>();
+    exact_and_ids.sort_unstable();
+    assert_eq!(exact_and_ids, vec![1, 5]);
+    unsafe { lance_fts_query_context_close(exact_and) };
+
+    let fuzzy_and = unsafe {
+        lance_dataset_prepare_fts_match_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            LanceFtsMatchOperator::And as i32,
+            1,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(fuzzy_and.is_null());
+    let message = take_last_error_message();
+    assert!(
+        message.contains("max_fuzzy_distance must be 0"),
+        "{message}"
+    );
+
+    let phrase = unsafe {
+        lance_dataset_prepare_fts_phrase_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!phrase.is_null(), "{}", take_last_error_message());
+    let phrase_scores = collect_context_fts_scores(dataset, phrase, None);
+    assert_eq!(phrase_scores.keys().copied().collect::<Vec<_>>(), vec![1]);
+    unsafe { lance_fts_query_context_close(phrase) };
+
+    let phrase_with_slop = unsafe {
+        lance_dataset_prepare_fts_phrase_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            1,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!phrase_with_slop.is_null(), "{}", take_last_error_message());
+    let phrase_with_slop_scores = collect_context_fts_scores(dataset, phrase_with_slop, None);
+    let mut phrase_with_slop_ids = phrase_with_slop_scores.keys().copied().collect::<Vec<_>>();
+    phrase_with_slop_ids.sort_unstable();
+    assert_eq!(phrase_with_slop_ids, vec![1, 5]);
+    unsafe { lance_fts_query_context_close(phrase_with_slop) };
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_prepared_fts_phrase_requires_positions() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let column = c_str("name");
+    let query = c_str("alice smith");
+    let index_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::Inverted as i32,
+                index_params.as_ptr(),
+                false,
+            )
+        },
+        0
+    );
+
+    let context = unsafe {
+        lance_dataset_prepare_fts_phrase_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(context.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("does not store token positions"),
+        "{message}"
+    );
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
 fn test_prepared_fts_row_id_output_is_explicit() {
     let (_tmp, uri) = create_test_dataset();
     let uri_c = c_str(&uri);
@@ -5785,10 +5982,11 @@ fn test_prepared_fts_row_id_output_is_explicit() {
         0
     );
     let context = unsafe {
-        lance_dataset_prepare_fts_query(
+        lance_dataset_prepare_fts_match_query(
             dataset,
             column.as_ptr(),
             query.as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
             0,
             LanceFtsCoverageMode::Strict as i32,
         )
@@ -5880,10 +6078,11 @@ fn test_prepare_fts_query_index_only_allows_unindexed_fragment() {
 
     let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     let strict = unsafe {
-        lance_dataset_prepare_fts_query(
+        lance_dataset_prepare_fts_match_query(
             dataset,
             column.as_ptr(),
             query.as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
             0,
             LanceFtsCoverageMode::Strict as i32,
         )
@@ -5898,10 +6097,11 @@ fn test_prepare_fts_query_index_only_allows_unindexed_fragment() {
     assert!(message.contains("unindexed fragments"), "{message}");
 
     let context = unsafe {
-        lance_dataset_prepare_fts_query(
+        lance_dataset_prepare_fts_match_query(
             dataset,
             column.as_ptr(),
             query.as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
             0,
             LanceFtsCoverageMode::IndexOnly as i32,
         )
@@ -5976,10 +6176,11 @@ fn test_prepared_fts_index_only_empty_segment_returns_empty_shard() {
     let query = c_str("alice");
     let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     let context = unsafe {
-        lance_dataset_prepare_fts_query(
+        lance_dataset_prepare_fts_match_query(
             dataset,
             column.as_ptr(),
             query.as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
             0,
             LanceFtsCoverageMode::IndexOnly as i32,
         )
@@ -6075,10 +6276,11 @@ fn test_prepared_fts_global_scorer_is_shared_across_segment_splits() {
 
     let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     let context = unsafe {
-        lance_dataset_prepare_fts_query(
+        lance_dataset_prepare_fts_match_query(
             dataset,
             column.as_ptr(),
             query.as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
             0,
             LanceFtsCoverageMode::Strict as i32,
         )
@@ -6186,7 +6388,7 @@ fn test_prepared_fts_global_scorer_is_shared_across_segment_splits() {
 }
 
 #[test]
-fn test_prepare_fts_query_rejects_null_empty_invalid_mode_and_fuzzy() {
+fn test_prepare_fts_queries_reject_invalid_inputs() {
     let (_tmp, uri) = create_test_dataset();
     let uri_c = c_str(&uri);
     let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
@@ -6196,10 +6398,11 @@ fn test_prepare_fts_query_rejects_null_empty_invalid_mode_and_fuzzy() {
 
     assert!(
         unsafe {
-            lance_dataset_prepare_fts_query(
+            lance_dataset_prepare_fts_match_query(
                 ptr::null(),
                 column.as_ptr(),
                 query.as_ptr(),
+                LanceFtsMatchOperator::Or as i32,
                 0,
                 LanceFtsCoverageMode::Strict as i32,
             )
@@ -6208,10 +6411,11 @@ fn test_prepare_fts_query_rejects_null_empty_invalid_mode_and_fuzzy() {
     );
     assert!(
         unsafe {
-            lance_dataset_prepare_fts_query(
+            lance_dataset_prepare_fts_match_query(
                 dataset,
                 empty.as_ptr(),
                 query.as_ptr(),
+                LanceFtsMatchOperator::Or as i32,
                 0,
                 LanceFtsCoverageMode::Strict as i32,
             )
@@ -6219,20 +6423,39 @@ fn test_prepare_fts_query_rejects_null_empty_invalid_mode_and_fuzzy() {
         .is_null()
     );
     assert!(
-        unsafe { lance_dataset_prepare_fts_query(dataset, column.as_ptr(), empty.as_ptr(), 0, 0) }
-            .is_null()
-    );
-    assert!(
-        unsafe { lance_dataset_prepare_fts_query(dataset, column.as_ptr(), query.as_ptr(), 0, 99) }
-            .is_null()
+        unsafe {
+            lance_dataset_prepare_fts_match_query(
+                dataset,
+                column.as_ptr(),
+                empty.as_ptr(),
+                LanceFtsMatchOperator::Or as i32,
+                0,
+                LanceFtsCoverageMode::Strict as i32,
+            )
+        }
+        .is_null()
     );
     assert!(
         unsafe {
-            lance_dataset_prepare_fts_query(
+            lance_dataset_prepare_fts_match_query(
                 dataset,
                 column.as_ptr(),
                 query.as_ptr(),
-                1,
+                LanceFtsMatchOperator::Or as i32,
+                0,
+                99,
+            )
+        }
+        .is_null()
+    );
+    assert!(
+        unsafe {
+            lance_dataset_prepare_fts_match_query(
+                dataset,
+                column.as_ptr(),
+                query.as_ptr(),
+                99,
+                0,
                 LanceFtsCoverageMode::Strict as i32,
             )
         }
@@ -6244,9 +6467,18 @@ fn test_prepare_fts_query_rejects_null_empty_invalid_mode_and_fuzzy() {
             .to_string_lossy()
             .into_owned()
     };
+    assert!(message.contains("invalid match_operator"), "{message}");
     assert!(
-        message.contains("max_fuzzy_distance must be 0"),
-        "{message}"
+        unsafe {
+            lance_dataset_prepare_fts_phrase_query(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                0,
+                LanceFtsCoverageMode::Strict as i32,
+            )
+        }
+        .is_null()
     );
     let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
     assert_eq!(

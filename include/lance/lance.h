@@ -1695,36 +1695,82 @@ typedef enum {
     LANCE_FTS_COVERAGE_INDEX_ONLY = 1,
 } LanceFtsCoverageMode;
 
+/** How the analyzed terms of one Match query are combined. */
+typedef enum {
+    /** At least one analyzed term must match. */
+    LANCE_FTS_MATCH_OPERATOR_OR = 0,
+    /** Every analyzed term must match. */
+    LANCE_FTS_MATCH_OPERATOR_AND = 1,
+} LanceFtsMatchOperator;
+
 /**
- * Prepare an immutable, process-local FTS query context for one column.
+ * Prepare an OR Match query context for one column.
  *
- * Preparation pins the dataset handle's current snapshot, enumerates all
- * committed FTS segments for `column`, checks fragment coverage, opens those
- * segments, and computes one query-specific global BM25 scorer across their
- * indexed documents. The context can then be shared by any number of scanners
- * created from the exact same process-local dataset snapshot. It has no
- * serialization or cross-process transport format. Reopening the same URI and
- * manifest version creates a different identity and cannot reuse the context,
- * because storage options and object-store endpoints may differ.
- *
- * In LANCE_FTS_COVERAGE_INDEX_ONLY mode, unindexed fragments are allowed and
- * excluded from both the scorer corpus and query results. In STRICT mode any
- * unindexed fragment makes this call fail.
- *
- * Prepared contexts currently support exact Match queries only.
- * `max_fuzzy_distance` must be zero because fuzzy execution requires its
- * canonical expanded vocabulary to be prepared together with the scorer.
- * This restriction does not apply to lance_scanner_full_text_search().
- *
- * @param max_fuzzy_distance Must be zero for prepared query contexts.
- * @param coverage_mode Fixed-width LanceFtsCoverageMode discriminant.
- * @return Context handle on success, or NULL on error.
+ * @deprecated Use lance_dataset_prepare_fts_match_query() to select the Match
+ *             operator explicitly. This compatibility API is equivalent to
+ *             LANCE_FTS_MATCH_OPERATOR_OR.
  */
 LanceFtsQueryContext* lance_dataset_prepare_fts_query(
     const LanceDataset* dataset,
     const char* column,
     const char* query,
     uint32_t max_fuzzy_distance,
+    int32_t coverage_mode
+);
+
+/**
+ * Prepare an immutable, process-local Match query context for one column.
+ *
+ * Preparation pins the dataset handle's current snapshot, enumerates all
+ * committed FTS segments for `column`, checks fragment coverage, opens those
+ * segments, and prepares one global BM25 scorer across their indexed
+ * documents. `match_operator` supports both AND and OR.
+ *
+ * The context can be shared by scanners created from the exact same
+ * process-local dataset snapshot. It has no serialization or cross-process
+ * transport format. Reopening the same URI and manifest version creates a
+ * different identity and cannot reuse the context because storage options and
+ * object-store endpoints may differ.
+ *
+ * In LANCE_FTS_COVERAGE_INDEX_ONLY mode, unindexed fragments are allowed and
+ * excluded from both the scorer corpus and query results. In STRICT mode any
+ * unindexed fragment makes this call fail.
+ *
+ * @param match_operator Fixed-width LanceFtsMatchOperator discriminant.
+ * @param max_fuzzy_distance Reserved for prepared fuzzy matching and currently
+ *                           must be 0. The parameter is retained so enabling
+ *                           canonical cross-segment fuzzy vocabulary injection
+ *                           later does not require another C ABI change.
+ * @param coverage_mode Fixed-width LanceFtsCoverageMode discriminant.
+ * @return Context handle on success, or NULL on error.
+ */
+LanceFtsQueryContext* lance_dataset_prepare_fts_match_query(
+    const LanceDataset* dataset,
+    const char* column,
+    const char* query,
+    int32_t match_operator,
+    uint32_t max_fuzzy_distance,
+    int32_t coverage_mode
+);
+
+/**
+ * Prepare an immutable, process-local Phrase query context for one column.
+ *
+ * The selected FTS index must store token positions. `slop == 0` requires an
+ * exact phrase; a positive value permits that many intervening positions.
+ * Dataset identity, coverage, sharing, and segment-scoped execution follow the
+ * same contract as lance_dataset_prepare_fts_match_query().
+ *
+ * @param slop Maximum number of intervening token positions permitted between
+ *             adjacent phrase terms.
+ * @param coverage_mode Fixed-width LanceFtsCoverageMode discriminant.
+ * @return Context handle on success, or NULL on error.
+ */
+LanceFtsQueryContext* lance_dataset_prepare_fts_phrase_query(
+    const LanceDataset* dataset,
+    const char* column,
+    const char* query,
+    uint32_t slop,
     int32_t coverage_mode
 );
 

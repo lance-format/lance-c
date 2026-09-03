@@ -14,7 +14,9 @@ use lance_core::{Error, Result};
 use lance_index::IndexCriteria;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::query::{FtsQuery, collect_query_tokens};
+use lance_index::scalar::inverted::query::{
+    FtsQuery, MatchQuery, Operator, PhraseQuery, collect_query_tokens,
+};
 use lance_index::scalar::inverted::{InvertedIndex, MemBM25Scorer, build_global_bm25_scorer};
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
@@ -48,12 +50,53 @@ impl TryFrom<i32> for LanceFtsCoverageMode {
     }
 }
 
+/// Operator used to combine the analyzed terms of a Match query.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceFtsMatchOperator {
+    /// At least one analyzed term must match.
+    Or = 0,
+    /// Every analyzed term must match.
+    And = 1,
+}
+
+impl TryFrom<i32> for LanceFtsMatchOperator {
+    type Error = Error;
+
+    fn try_from(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Or),
+            1 => Ok(Self::And),
+            _ => Err(Error::invalid_input(format!(
+                "invalid match_operator {value}; expected 0 (OR) or 1 (AND)"
+            ))),
+        }
+    }
+}
+
+impl From<LanceFtsMatchOperator> for Operator {
+    fn from(value: LanceFtsMatchOperator) -> Self {
+        match value {
+            LanceFtsMatchOperator::Or => Self::Or,
+            LanceFtsMatchOperator::And => Self::And,
+        }
+    }
+}
+
+/// Query-specific state that must be shared by every segment-scoped scan.
+pub(crate) enum PreparedFtsQuery {
+    /// Exact Match queries share one corpus-wide scorer.
+    Match(Arc<MemBM25Scorer>),
+    /// Phrase does not expand terms, so a shared global scorer is sufficient.
+    Phrase(Arc<MemBM25Scorer>),
+}
+
 /// Rust-owned immutable state behind [`LanceFtsQueryContext`].
 pub(crate) struct FtsQueryContextInner {
     pub(crate) dataset: Arc<lance::Dataset>,
     pub(crate) query: FullTextSearchQuery,
     pub(crate) segments: Vec<IndexMetadata>,
-    pub(crate) scorer: Arc<MemBM25Scorer>,
+    pub(crate) prepared: PreparedFtsQuery,
 }
 
 impl FtsQueryContextInner {
@@ -87,7 +130,7 @@ fn invalid_input(message: impl Into<String>) -> Error {
 async fn prepare_fts_query_context(
     dataset: Arc<lance::Dataset>,
     column: String,
-    query_text: String,
+    query: FullTextSearchQuery,
     coverage_mode: LanceFtsCoverageMode,
 ) -> Result<FtsQueryContextInner> {
     let logical_index = dataset
@@ -193,57 +236,54 @@ async fn prepare_fts_query_context(
         )));
     }
 
-    let query = FullTextSearchQuery::new(query_text).with_column(column.clone())?;
-    let match_query = match &query.query {
-        FtsQuery::Match(query) => query,
+    let prepared = match &query.query {
+        FtsQuery::Match(match_query) => {
+            let mut tokenizer = indices[0].tokenizer();
+            let query_tokens = collect_query_tokens(&match_query.terms, &mut tokenizer);
+            let params = query
+                .params()
+                .with_fuzziness(match_query.fuzziness)
+                .with_max_expansions(match_query.max_expansions)
+                .with_prefix_length(match_query.prefix_length);
+            PreparedFtsQuery::Match(Arc::new(
+                build_global_bm25_scorer(&indices, &query_tokens, &params).await?,
+            ))
+        }
+        FtsQuery::Phrase(phrase_query) => {
+            if !expected_params.has_positions() {
+                return Err(invalid_input(format!(
+                    "FTS index '{}' for column '{column}' does not store token positions required by Phrase queries; recreate the index with positions enabled",
+                    logical_index.name
+                )));
+            }
+            let mut tokenizer = indices[0].tokenizer();
+            let query_tokens = collect_query_tokens(&phrase_query.terms, &mut tokenizer);
+            let params = query.params().with_phrase_slop(Some(phrase_query.slop));
+            PreparedFtsQuery::Phrase(Arc::new(
+                build_global_bm25_scorer(&indices, &query_tokens, &params).await?,
+            ))
+        }
         _ => {
             return Err(Error::internal(
-                "prepared FTS query unexpectedly produced a non-Match query".to_string(),
+                "prepared FTS query must be a single-column Match or Phrase query".to_string(),
             ));
         }
     };
-    let mut tokenizer = indices[0].tokenizer();
-    let query_tokens = collect_query_tokens(&match_query.terms, &mut tokenizer);
-    let params = query
-        .params()
-        .with_fuzziness(match_query.fuzziness)
-        .with_max_expansions(match_query.max_expansions)
-        .with_prefix_length(match_query.prefix_length);
-    let scorer = Arc::new(build_global_bm25_scorer(&indices, &query_tokens, &params).await?);
 
     Ok(FtsQueryContextInner {
         dataset,
         query,
         segments,
-        scorer,
+        prepared,
     })
 }
 
-/// Prepare a process-local global BM25 scorer and the committed segment list
-/// for one single-column Match query against the dataset's pinned snapshot.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lance_dataset_prepare_fts_query(
+unsafe fn parse_query_inputs(
     dataset: *const LanceDataset,
     column: *const c_char,
     query: *const c_char,
-    max_fuzzy_distance: u32,
     coverage_mode: i32,
-) -> *mut LanceFtsQueryContext {
-    ffi_try!(
-        unsafe {
-            prepare_fts_query_inner(dataset, column, query, max_fuzzy_distance, coverage_mode)
-        },
-        null
-    )
-}
-
-unsafe fn prepare_fts_query_inner(
-    dataset: *const LanceDataset,
-    column: *const c_char,
-    query: *const c_char,
-    max_fuzzy_distance: u32,
-    coverage_mode: i32,
-) -> Result<*mut LanceFtsQueryContext> {
+) -> Result<(Arc<lance::Dataset>, String, String, LanceFtsCoverageMode)> {
     if dataset.is_null() || column.is_null() || query.is_null() {
         return Err(invalid_input("dataset, column, and query must not be NULL"));
     }
@@ -256,21 +296,142 @@ unsafe fn prepare_fts_query_inner(
         .ok_or_else(|| invalid_input("query must not be empty"))?
         .to_string();
     let coverage_mode = LanceFtsCoverageMode::try_from(coverage_mode)?;
+    let snapshot = unsafe { &*dataset }.snapshot();
+    Ok((snapshot, column, query, coverage_mode))
+}
+
+fn into_context(inner: FtsQueryContextInner) -> *mut LanceFtsQueryContext {
+    Box::into_raw(Box::new(LanceFtsQueryContext {
+        inner: Arc::new(inner),
+    }))
+}
+
+/// Compatibility API for an OR Match query.
+#[deprecated(note = "use lance_dataset_prepare_fts_match_query to select the Match operator")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_prepare_fts_query(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    query: *const c_char,
+    max_fuzzy_distance: u32,
+    coverage_mode: i32,
+) -> *mut LanceFtsQueryContext {
+    ffi_try!(
+        unsafe {
+            prepare_fts_match_query_inner(
+                dataset,
+                column,
+                query,
+                LanceFtsMatchOperator::Or as i32,
+                max_fuzzy_distance,
+                coverage_mode,
+            )
+        },
+        null
+    )
+}
+
+/// Prepare a process-local Match query context. AND and OR are supported.
+/// `max_fuzzy_distance` is retained for the future prepared-fuzzy path but
+/// must be zero with the currently pinned Lance revision.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_prepare_fts_match_query(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    query: *const c_char,
+    match_operator: i32,
+    max_fuzzy_distance: u32,
+    coverage_mode: i32,
+) -> *mut LanceFtsQueryContext {
+    ffi_try!(
+        unsafe {
+            prepare_fts_match_query_inner(
+                dataset,
+                column,
+                query,
+                match_operator,
+                max_fuzzy_distance,
+                coverage_mode,
+            )
+        },
+        null
+    )
+}
+
+unsafe fn prepare_fts_match_query_inner(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    query: *const c_char,
+    match_operator: i32,
+    max_fuzzy_distance: u32,
+    coverage_mode: i32,
+) -> Result<*mut LanceFtsQueryContext> {
+    let (snapshot, column, query_text, coverage_mode) =
+        unsafe { parse_query_inputs(dataset, column, query, coverage_mode)? };
+    let operator: Operator = LanceFtsMatchOperator::try_from(match_operator)?.into();
+    // The parameter remains in the public API so callers do not need another
+    // ABI change when Lance-C moves to a Lance revision that can inject the
+    // same canonical fuzzy vocabulary into every segment-scoped scan. The
+    // pinned Lance revision can share only the scorer, so accepting fuzzy here
+    // would allow different segments to choose different capped expansions.
     if max_fuzzy_distance != 0 {
         return Err(invalid_input(format!(
-            "max_fuzzy_distance must be 0 for prepared FTS query contexts, got {max_fuzzy_distance}; fuzzy queries require a canonical prepared BM25 vocabulary"
+            "max_fuzzy_distance must be 0 for prepared FTS with the pinned Lance revision, got {max_fuzzy_distance}; the parameter is reserved until canonical fuzzy vocabulary injection is available"
         )));
     }
-    let snapshot = unsafe { &*dataset }.snapshot();
+    let query = FullTextSearchQuery::new_query(
+        MatchQuery::new(query_text)
+            .with_column(Some(column.clone()))
+            .with_operator(operator)
+            .with_fuzziness(Some(0))
+            .into(),
+    );
     let inner = block_on(prepare_fts_query_context(
         snapshot,
         column,
         query,
         coverage_mode,
     ))?;
-    Ok(Box::into_raw(Box::new(LanceFtsQueryContext {
-        inner: Arc::new(inner),
-    })))
+    Ok(into_context(inner))
+}
+
+/// Prepare a process-local Phrase query context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_prepare_fts_phrase_query(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    query: *const c_char,
+    slop: u32,
+    coverage_mode: i32,
+) -> *mut LanceFtsQueryContext {
+    ffi_try!(
+        unsafe { prepare_fts_phrase_query_inner(dataset, column, query, slop, coverage_mode) },
+        null
+    )
+}
+
+unsafe fn prepare_fts_phrase_query_inner(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    query: *const c_char,
+    slop: u32,
+    coverage_mode: i32,
+) -> Result<*mut LanceFtsQueryContext> {
+    let (snapshot, column, query_text, coverage_mode) =
+        unsafe { parse_query_inputs(dataset, column, query, coverage_mode)? };
+    let query = FullTextSearchQuery::new_query(
+        PhraseQuery::new(query_text)
+            .with_column(Some(column.clone()))
+            .with_slop(slop)
+            .into(),
+    );
+    let inner = block_on(prepare_fts_query_context(
+        snapshot,
+        column,
+        query,
+        coverage_mode,
+    ))?;
+    Ok(into_context(inner))
 }
 
 /// Close a context handle. NULL-safe. Scanners that already attached the
