@@ -207,6 +207,36 @@ typedef struct LanceSessionCacheStats {
 } LanceSessionCacheStats;
 
 /**
+ * Configuration for the optional Foyer cache of immutable Lance data files.
+ *
+ * Whole-object, single-range, and batched range reads of direct
+ * `data/<file>.lance` children are cached. Conditional and versioned reads,
+ * plus metadata, deletion files, and index files, continue to use Lance's normal
+ * paths.
+ */
+typedef struct LanceDataCacheOptions {
+    const char* directory;
+    /** Maximum raw data bytes retained by Foyer's in-memory tier. */
+    uint64_t memory_capacity_bytes;
+    /** Maximum bytes allocated to Foyer's disk tier. */
+    uint64_t disk_capacity_bytes;
+    /** Data-file range cache unit, in bytes. */
+    uint64_t read_block_size_bytes;
+} LanceDataCacheOptions;
+
+/**
+ * Cumulative Foyer data-cache statistics for one opened dataset handle.
+ *
+ * Successful reads are accumulated. Both fields measure bytes returned to the
+ * dataset reader. Their sum is the logical data-file range bytes observed by
+ * the Foyer wrapper; block-aligned origin read amplification is not included.
+ */
+typedef struct LanceDataCacheStatistics {
+    uint64_t bytes_read_from_cache;
+    uint64_t bytes_read_from_remote;
+} LanceDataCacheStatistics;
+
+/**
  * Create a session that can share metadata and index caches across datasets.
  *
  * Cache limits are specified in bytes. Pass 0 to request zero capacity.
@@ -215,6 +245,25 @@ typedef struct LanceSessionCacheStats {
 LanceSession* lance_session_new(
     uint64_t index_cache_size_bytes,
     uint64_t metadata_cache_size_bytes
+);
+
+/**
+ * Create a shared Lance session with a Foyer data-file cache.
+ *
+ * `data_cache_options` and its `directory` field must not be NULL. The cache
+ * directory and all capacities are process configuration and remain owned by
+ * the caller; their values are copied during this call.
+ *
+ * `read_block_size_bytes` must be a non-zero multiple of 4096. The memory
+ * capacity must hold at least one read block. The disk capacity must be a
+ * multiple of 4096 and hold at least two read blocks.
+ *
+ * @return Session handle, or NULL on error
+ */
+LanceSession* lance_session_new_with_data_cache(
+    uint64_t index_cache_size_bytes,
+    uint64_t metadata_cache_size_bytes,
+    const LanceDataCacheOptions* data_cache_options
 );
 
 /**
@@ -271,6 +320,20 @@ LanceDataset* lance_dataset_open_with_session(
     const char* const* storage_opts,
     uint64_t version,
     const LanceSession* session
+);
+
+/**
+ * Copy this dataset handle's cumulative data-cache statistics.
+ *
+ * A dataset not opened with a data cache reports all-zero statistics. The
+ * snapshot belongs only to this dataset handle; the underlying cache may
+ * still be shared by other datasets through a session.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_get_data_cache_statistics(
+    const LanceDataset* dataset,
+    LanceDataCacheStatistics* out_statistics
 );
 
 /** Close and free a dataset handle. Safe to call with NULL. */
