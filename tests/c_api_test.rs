@@ -1252,7 +1252,7 @@ fn test_scanner_execution_tuning_options() {
 }
 
 #[test]
-fn test_scanner_execution_tuning_options_reject_zero() {
+fn test_scanner_execution_tuning_options_reject_invalid_values() {
     let (_tmp, uri) = create_test_dataset();
     let c_uri = c_str(&uri);
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
@@ -1273,6 +1273,21 @@ fn test_scanner_execution_tuning_options_reject_zero() {
     assert!(
         take_last_error_message().contains("io_buffer_size_bytes must be greater than 0, got 0")
     );
+
+    assert_eq!(
+        unsafe { lance_scanner_set_io_buffer_size(scanner, i64::MAX as u64) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_io_buffer_size(scanner, u64::MAX) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains(&format!(
+        "io_buffer_size_bytes must be at most {}, got {}",
+        i64::MAX,
+        u64::MAX
+    )));
 
     assert_eq!(unsafe { lance_scanner_set_batch_readahead(scanner, 0) }, -1);
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);

@@ -949,12 +949,12 @@ int32_t lance_scanner_set_batch_size_bytes(
 /**
  * Set the scanner I/O buffer size in bytes.
  *
- * The value must be greater than zero and must be set before scanning starts.
- * This bounds buffered I/O received from storage, but is not a hard limit on
- * all memory used by the scanner.
+ * The value must be between 1 and INT64_MAX, inclusive, and must be set before
+ * scanning starts. This bounds buffered I/O received from storage, but is not
+ * a hard limit on all memory used by the scanner.
  *
  * @param scanner               Scanner handle. Must not be NULL.
- * @param io_buffer_size_bytes  I/O buffer size in bytes. Must be greater than zero.
+ * @param io_buffer_size_bytes  I/O buffer size in bytes, in the range [1, INT64_MAX].
  * @return 0 on success, -1 on error.
  */
 int32_t lance_scanner_set_io_buffer_size(

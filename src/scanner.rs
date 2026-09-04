@@ -837,7 +837,7 @@ unsafe fn scanner_set_batch_size_bytes_inner(
 
 /// Set the scanner I/O buffer size in bytes. Returns 0 on success.
 ///
-/// The size must be greater than zero and must be set before the scan starts.
+/// The size must be between 1 and [`i64::MAX`] and must be set before the scan starts.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_io_buffer_size(
     scanner: *mut LanceScanner,
@@ -861,6 +861,15 @@ unsafe fn scanner_set_io_buffer_size_inner(
     if io_buffer_size_bytes == 0 {
         return Err(lance_core::Error::invalid_input_source(
             "io_buffer_size_bytes must be greater than 0, got 0".into(),
+        ));
+    }
+    if io_buffer_size_bytes > i64::MAX as u64 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "io_buffer_size_bytes must be at most {}, got {io_buffer_size_bytes}",
+                i64::MAX
+            )
+            .into(),
         ));
     }
     let scanner = unsafe { &mut *scanner };

@@ -1203,7 +1203,7 @@ public:
         return *this;
     }
 
-    /// Set the scanner I/O buffer size in bytes.
+    /// Set the scanner I/O buffer size in bytes, in the range [1, INT64_MAX].
     Scanner& io_buffer_size(uint64_t bytes) {
         if (lance_scanner_set_io_buffer_size(handle_.get(), bytes) != 0)
             check_error();
