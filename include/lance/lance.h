@@ -934,6 +934,74 @@ LanceScanner* lance_scanner_new(
 int32_t lance_scanner_set_limit(LanceScanner* scanner, int64_t limit);
 int32_t lance_scanner_set_offset(LanceScanner* scanner, int64_t offset);
 int32_t lance_scanner_set_batch_size(LanceScanner* scanner, int64_t batch_size);
+
+/**
+ * Set the target output batch size in bytes.
+ *
+ * When set, this takes precedence over the row-based batch size. The value
+ * must be greater than zero and must be set before scanning starts.
+ */
+int32_t lance_scanner_set_batch_size_bytes(
+    LanceScanner* scanner,
+    uint64_t batch_size_bytes
+);
+
+/**
+ * Set the scanner I/O buffer size in bytes.
+ *
+ * The value must be greater than zero and must be set before scanning starts.
+ * This bounds buffered I/O received from storage, but is not a hard limit on
+ * all memory used by the scanner.
+ *
+ * @param scanner               Scanner handle. Must not be NULL.
+ * @param io_buffer_size_bytes  I/O buffer size in bytes. Must be greater than zero.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_set_io_buffer_size(
+    LanceScanner* scanner,
+    uint64_t io_buffer_size_bytes
+);
+
+/**
+ * Set the maximum number of batches decoded concurrently.
+ *
+ * @param batch_readahead  Number of in-flight batch decode tasks. Must be greater than zero.
+ */
+int32_t lance_scanner_set_batch_readahead(
+    LanceScanner* scanner,
+    size_t batch_readahead
+);
+
+/**
+ * Set fragment readahead for unordered scans.
+ *
+ * This setting is only used when scan-in-order is disabled. The value must be
+ * greater than zero.
+ */
+int32_t lance_scanner_set_fragment_readahead(
+    LanceScanner* scanner,
+    size_t fragment_readahead
+);
+
+/**
+ * Set the target number of physical execution partitions.
+ *
+ * This controls the partition count used by the physical optimizer and can be
+ * used to bound scan CPU parallelism. The value must be greater than zero and
+ * must be set before scanning starts.
+ */
+int32_t lance_scanner_set_target_parallelism(
+    LanceScanner* scanner,
+    size_t target_parallelism
+);
+
+/**
+ * Configure whether batches are returned in storage order (default: true).
+ *
+ * Disabling ordering can improve throughput by returning batches as soon as
+ * they are ready.
+ */
+int32_t lance_scanner_set_scan_in_order(LanceScanner* scanner, bool scan_in_order);
 int32_t lance_scanner_with_row_id(LanceScanner* scanner, bool enable);
 
 /**
@@ -1656,6 +1724,19 @@ int32_t lance_scanner_nearest(
 );
 
 int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t n);
+
+/**
+ * Set vector index partition-search concurrency for each query.
+ *
+ * A value of -1 uses the CPU pool size, 0 selects Lance's automatic policy,
+ * 1 uses the sequential path, and values greater than 1 request parallel
+ * partition search. The effective value is capped by available parallelism.
+ * Values below -1 are rejected. Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_query_parallelism(
+    LanceScanner* scanner,
+    int32_t query_parallelism
+);
 int32_t lance_scanner_set_refine_factor(LanceScanner* scanner, uint32_t f);
 int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e);
 int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);

@@ -1196,6 +1196,48 @@ public:
         return *this;
     }
 
+    /// Set the target output batch size in bytes.
+    Scanner& batch_size_bytes(uint64_t bytes) {
+        if (lance_scanner_set_batch_size_bytes(handle_.get(), bytes) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Set the scanner I/O buffer size in bytes.
+    Scanner& io_buffer_size(uint64_t bytes) {
+        if (lance_scanner_set_io_buffer_size(handle_.get(), bytes) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Set the number of batches decoded concurrently.
+    Scanner& batch_readahead(size_t batches) {
+        if (lance_scanner_set_batch_readahead(handle_.get(), batches) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Set fragment readahead for unordered scans.
+    Scanner& fragment_readahead(size_t fragments) {
+        if (lance_scanner_set_fragment_readahead(handle_.get(), fragments) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Set the target number of physical execution partitions.
+    Scanner& target_parallelism(size_t partitions) {
+        if (lance_scanner_set_target_parallelism(handle_.get(), partitions) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Configure whether batches are returned in storage order.
+    Scanner& scan_in_order(bool ordered = true) {
+        if (lance_scanner_set_scan_in_order(handle_.get(), ordered) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Enable/disable row ID in output.
     Scanner& with_row_id(bool enable = true) {
         if (lance_scanner_with_row_id(handle_.get(), enable) != 0)
@@ -1311,6 +1353,11 @@ public:
 
     Scanner& nprobes(uint32_t n) {
         if (lance_scanner_set_nprobes(handle_.get(), n) != 0) check_error();
+        return *this;
+    }
+    Scanner& query_parallelism(int32_t parallelism) {
+        if (lance_scanner_set_query_parallelism(handle_.get(), parallelism) != 0)
+            check_error();
         return *this;
     }
     Scanner& refine_factor(uint32_t f) {
