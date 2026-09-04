@@ -18,7 +18,7 @@ use lance::Dataset;
 use lance::dataset::scanner::{
     DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
 };
-use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec};
+use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use lance_core::Result;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_io::stream::RecordBatchStream;
@@ -33,7 +33,8 @@ use crate::error::{
     panic_payload_message, set_lance_error, set_last_error, swallow_unwind,
 };
 use crate::fts_query::{
-    FtsQueryContextInner, LanceFtsQueryContext, clone_context, parse_segment_uuids,
+    FtsQueryContextInner, LanceFtsQueryContext, PreparedFtsQuery, clone_context,
+    parse_segment_uuids,
 };
 use crate::helpers;
 use crate::runtime::{RT, block_on};
@@ -328,17 +329,17 @@ impl PreparedScanner {
         let (plan, rewritten) = rewrite_prepared_fts_plan(
             plan,
             &distributed_fts.segments,
-            &distributed_fts.context.scorer,
+            &distributed_fts.context.prepared,
             selected_segments_have_current_fragments,
         )?;
-        if rewritten.match_query_execs > 1
+        if rewritten.indexed_query_execs > 1
             || rewritten.flat_match_query_execs > 1
-            || rewritten.match_query_execs + rewritten.flat_match_query_execs == 0
-            || (selected_segments_have_current_fragments && rewritten.match_query_execs != 1)
+            || rewritten.indexed_query_execs + rewritten.flat_match_query_execs == 0
+            || (selected_segments_have_current_fragments && rewritten.indexed_query_execs != 1)
         {
             return Err(lance_core::Error::internal(format!(
-                "unexpected prepared FTS plan for selected segments with current fragment coverage {selected_segments_have_current_fragments}: rewrote {} MatchQueryExec node(s) and removed {} FlatMatchQueryExec node(s)",
-                rewritten.match_query_execs, rewritten.flat_match_query_execs
+                "unexpected prepared FTS plan for selected segments with current fragment coverage {selected_segments_have_current_fragments}: rewrote {} indexed FTS query node(s) and removed {} FlatMatchQueryExec node(s)",
+                rewritten.indexed_query_execs, rewritten.flat_match_query_execs
             )));
         }
         let stream = lance_datafusion::exec::execute_plan(
@@ -420,14 +421,14 @@ fn segments_have_current_fragments(
 
 #[derive(Default)]
 struct PreparedFtsPlanRewriteCounts {
-    match_query_execs: usize,
+    indexed_query_execs: usize,
     flat_match_query_execs: usize,
 }
 
 fn rewrite_prepared_fts_plan(
     plan: Arc<dyn ExecutionPlan>,
     segments: &[IndexMetadata],
-    scorer: &Arc<lance_index::scalar::inverted::MemBM25Scorer>,
+    prepared: &PreparedFtsQuery,
     selected_segments_have_current_fragments: bool,
 ) -> Result<(Arc<dyn ExecutionPlan>, PreparedFtsPlanRewriteCounts)> {
     // Lance's ordinary FTS planner adds a flat-search branch for fragments not
@@ -438,7 +439,7 @@ fn rewrite_prepared_fts_plan(
         return Ok((
             Arc::new(EmptyExec::new(plan.schema())),
             PreparedFtsPlanRewriteCounts {
-                match_query_execs: 0,
+                indexed_query_execs: 0,
                 flat_match_query_execs: 1,
             },
         ));
@@ -454,11 +455,11 @@ fn rewrite_prepared_fts_plan(
             let (new_child, child_rewritten) = rewrite_prepared_fts_plan(
                 Arc::clone(child),
                 segments,
-                scorer,
+                prepared,
                 selected_segments_have_current_fragments,
             )?;
             new_children.push(new_child);
-            rewritten.match_query_execs += child_rewritten.match_query_execs;
+            rewritten.indexed_query_execs += child_rewritten.indexed_query_execs;
             rewritten.flat_match_query_execs += child_rewritten.flat_match_query_execs;
         }
         plan.with_new_children(new_children).map_err(|error| {
@@ -469,11 +470,36 @@ fn rewrite_prepared_fts_plan(
     };
 
     if let Some(exec) = rebuilt.downcast_ref::<MatchQueryExec>() {
-        rewritten.match_query_execs += 1;
+        rewritten.indexed_query_execs += 1;
         if !selected_segments_have_current_fragments {
             return Ok((Arc::new(EmptyExec::new(rebuilt.schema())), rewritten));
         }
+        let PreparedFtsQuery::Match(scorer) = prepared else {
+            return Err(lance_core::Error::internal(
+                "prepared Phrase state cannot be attached to MatchQueryExec".to_string(),
+            ));
+        };
         let replacement = MatchQueryExec::new_with_segments(
+            Arc::clone(exec.dataset()),
+            exec.query().clone(),
+            exec.params().clone(),
+            exec.prefilter_source().clone(),
+            segments.to_vec(),
+        )
+        .with_base_scorer(Arc::clone(scorer));
+        return Ok((Arc::new(replacement), rewritten));
+    }
+    if let Some(exec) = rebuilt.downcast_ref::<PhraseQueryExec>() {
+        rewritten.indexed_query_execs += 1;
+        if !selected_segments_have_current_fragments {
+            return Ok((Arc::new(EmptyExec::new(rebuilt.schema())), rewritten));
+        }
+        let PreparedFtsQuery::Phrase(scorer) = prepared else {
+            return Err(lance_core::Error::internal(
+                "prepared Match state cannot be attached to PhraseQueryExec".to_string(),
+            ));
+        };
+        let replacement = PhraseQueryExec::new_with_segments(
             Arc::clone(exec.dataset()),
             exec.query().clone(),
             exec.params().clone(),
@@ -2152,7 +2178,8 @@ mod tests {
     use crate::dataset::{lance_dataset_close, lance_dataset_open};
     use crate::error::{lance_last_error_code, lance_last_error_message};
     use crate::fts_query::{
-        LanceFtsCoverageMode, lance_dataset_prepare_fts_query, lance_fts_query_context_close,
+        LanceFtsCoverageMode, LanceFtsMatchOperator, lance_dataset_prepare_fts_match_query,
+        lance_fts_query_context_close,
     };
     use std::ffi::{CStr, CString};
     use std::sync::atomic::{AtomicI32, AtomicUsize};
@@ -2276,10 +2303,11 @@ mod tests {
         let column = CString::new("name").unwrap();
         let query = CString::new("a").unwrap();
         let context = unsafe {
-            lance_dataset_prepare_fts_query(
+            lance_dataset_prepare_fts_match_query(
                 dataset,
                 column.as_ptr(),
                 query.as_ptr(),
+                LanceFtsMatchOperator::Or as i32,
                 0,
                 LanceFtsCoverageMode::IndexOnly as i32,
             )
@@ -2293,7 +2321,6 @@ mod tests {
         let prepared = unsafe { &*scanner }.build_scanner().unwrap();
         let distributed = prepared.distributed_fts.as_ref().unwrap();
         let segments = distributed.segments.clone();
-        let scorer = Arc::clone(&distributed.context.scorer);
         let plan = block_on(prepared.scanner.create_plan()).unwrap();
         assert_eq!(
             prepared_fts_plan_shape(&plan),
@@ -2303,9 +2330,14 @@ mod tests {
 
         let has_current_fragments =
             segments_have_current_fragments(&distributed.context.dataset, &segments).unwrap();
-        let (rewritten, counts) =
-            rewrite_prepared_fts_plan(plan, &segments, &scorer, has_current_fragments).unwrap();
-        assert_eq!(counts.match_query_execs, 1);
+        let (rewritten, counts) = rewrite_prepared_fts_plan(
+            plan,
+            &segments,
+            &distributed.context.prepared,
+            has_current_fragments,
+        )
+        .unwrap();
+        assert_eq!(counts.indexed_query_execs, 1);
         assert_eq!(counts.flat_match_query_execs, 1);
         assert_eq!(prepared_fts_plan_shape(&rewritten), (1, 0, 0));
 

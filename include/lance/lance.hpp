@@ -128,6 +128,11 @@ enum class FtsCoverageMode : int32_t {
     IndexOnly = LANCE_FTS_COVERAGE_INDEX_ONLY,
 };
 
+enum class FtsMatchOperator : int32_t {
+    Or  = LANCE_FTS_MATCH_OPERATOR_OR,
+    And = LANCE_FTS_MATCH_OPERATOR_AND,
+};
+
 /// Tunable parameters for Dataset::write. Numeric fields default-out via 0;
 /// `data_storage_version` defaults out via `std::nullopt`.
 ///
@@ -764,18 +769,44 @@ public:
     /// Create a Scanner builder for this dataset.
     Scanner scan() const;
 
-    /// Prepare a query-specific global BM25 scorer over the committed FTS
-    /// segments of this pinned snapshot. IndexOnly permits unindexed fragments;
-    /// Strict rejects them. Prepared contexts currently require
-    /// `max_fuzzy_distance == 0`. The context can only be attached to scanners
-    /// created from this exact process-local dataset snapshot.
+    /// Compatibility wrapper for an OR Match query.
+    [[deprecated("Use prepare_fts_match_query() to select the Match operator")]]
     FtsQueryContext prepare_fts_query(
         const std::string& column,
         const std::string& query,
         uint32_t max_fuzzy_distance = 0,
         FtsCoverageMode coverage_mode = FtsCoverageMode::Strict) const {
-        auto* context = lance_dataset_prepare_fts_query(
-            handle_.get(), column.c_str(), query.c_str(), max_fuzzy_distance,
+        return prepare_fts_match_query(column, query, FtsMatchOperator::Or,
+                                       max_fuzzy_distance, coverage_mode);
+    }
+
+    /// Prepare a Match query with a global BM25 scorer. AND and OR are
+    /// supported. `max_fuzzy_distance` is reserved and currently must be zero;
+    /// keeping it here avoids another API change when canonical cross-segment
+    /// fuzzy vocabulary injection becomes available.
+    FtsQueryContext prepare_fts_match_query(
+        const std::string& column,
+        const std::string& query,
+        FtsMatchOperator match_operator = FtsMatchOperator::Or,
+        uint32_t max_fuzzy_distance = 0,
+        FtsCoverageMode coverage_mode = FtsCoverageMode::Strict) const {
+        auto* context = lance_dataset_prepare_fts_match_query(
+            handle_.get(), column.c_str(), query.c_str(),
+            static_cast<int32_t>(match_operator), max_fuzzy_distance,
+            static_cast<int32_t>(coverage_mode));
+        if (!context) check_error();
+        return FtsQueryContext(context);
+    }
+
+    /// Prepare a Phrase query. Its FTS index must store token positions and
+    /// slop must be non-negative.
+    FtsQueryContext prepare_fts_phrase_query(
+        const std::string& column,
+        const std::string& query,
+        int32_t slop = 0,
+        FtsCoverageMode coverage_mode = FtsCoverageMode::Strict) const {
+        auto* context = lance_dataset_prepare_fts_phrase_query(
+            handle_.get(), column.c_str(), query.c_str(), slop,
             static_cast<int32_t>(coverage_mode));
         if (!context) check_error();
         return FtsQueryContext(context);
