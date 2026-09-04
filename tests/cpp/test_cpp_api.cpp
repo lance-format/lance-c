@@ -134,6 +134,12 @@ static void test_scanner_fluent(const std::string& uri) {
     scanner.limit(5)
            .offset(0)
            .batch_size(2)
+           .batch_size_bytes(1024)
+           .io_buffer_size(64 * 1024)
+           .batch_readahead(1)
+           .fragment_readahead(1)
+           .target_parallelism(1)
+           .scan_in_order(false)
            .statistics_callback(capture_scan_statistics, &captured);
 
     ArrowArrayStream stream;
@@ -370,6 +376,7 @@ static void test_nearest_smoke(const std::string& uri) {
     try {
         scanner.nearest("embedding", q, 8, 5)
                .nprobes(2)
+               .query_parallelism(2)
                .refine_factor(1)
                .ef(50)
                .metric(LANCE_METRIC_L2)

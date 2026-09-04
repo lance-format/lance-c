@@ -1207,6 +1207,169 @@ fn test_scanner_batch_size() {
     unsafe { lance_dataset_close(ds) };
 }
 
+#[test]
+fn test_scanner_execution_tuning_options() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_size_bytes(scanner, 1024) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_io_buffer_size(scanner, 64 * 1024) },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_batch_readahead(scanner, 1) }, 0);
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_readahead(scanner, 1) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_target_parallelism(scanner, 1) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_scan_in_order(scanner, false) },
+        0
+    );
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+    assert_eq!(total_rows, 10);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_execution_tuning_options_reject_invalid_values() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_size_bytes(scanner, 0) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("batch_size_bytes must be greater than 0, got 0"));
+
+    assert_eq!(unsafe { lance_scanner_set_io_buffer_size(scanner, 0) }, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("io_buffer_size_bytes must be greater than 0, got 0")
+    );
+
+    assert_eq!(
+        unsafe { lance_scanner_set_io_buffer_size(scanner, i64::MAX as u64) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_io_buffer_size(scanner, u64::MAX) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains(&format!(
+        "io_buffer_size_bytes must be at most {}, got {}",
+        i64::MAX,
+        u64::MAX
+    )));
+
+    assert_eq!(unsafe { lance_scanner_set_batch_readahead(scanner, 0) }, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("batch_readahead must be greater than 0, got 0"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_readahead(scanner, 0) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("fragment_readahead must be greater than 0, got 0"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_target_parallelism(scanner, 0) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("target_parallelism must be greater than 0, got 0"));
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_execution_tuning_options_reject_after_scan_start() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0
+    );
+
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_size_bytes(scanner, 1024) },
+        -1
+    );
+    assert!(take_last_error_message().contains("batch_size_bytes must be set before"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_io_buffer_size(scanner, 64 * 1024) },
+        -1
+    );
+    assert!(take_last_error_message().contains("io_buffer_size_bytes must be set before"));
+
+    assert_eq!(unsafe { lance_scanner_set_batch_readahead(scanner, 1) }, -1);
+    assert!(take_last_error_message().contains("batch_readahead must be set before"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_readahead(scanner, 1) },
+        -1
+    );
+    assert!(take_last_error_message().contains("fragment_readahead must be set before"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_target_parallelism(scanner, 1) },
+        -1
+    );
+    assert!(take_last_error_message().contains("target_parallelism must be set before"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_scan_in_order(scanner, false) },
+        -1
+    );
+    assert!(take_last_error_message().contains("scan_in_order must be set before"));
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    assert_eq!(
+        reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
+        5
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
 // ---------------------------------------------------------------------------
 // Combined filter + projection + limit
 // ---------------------------------------------------------------------------
@@ -1439,6 +1602,34 @@ fn test_null_safety_comprehensive() {
     assert_eq!(unsafe { lance_scanner_set_offset(ptr::null_mut(), 10) }, -1);
     assert_eq!(
         unsafe { lance_scanner_set_batch_size(ptr::null_mut(), 10) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_size_bytes(ptr::null_mut(), 1024) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_io_buffer_size(ptr::null_mut(), 64 * 1024) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_readahead(ptr::null_mut(), 1) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_readahead(ptr::null_mut(), 1) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_target_parallelism(ptr::null_mut(), 1) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_query_parallelism(ptr::null_mut(), 1) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_scan_in_order(ptr::null_mut(), true) },
         -1
     );
     assert_eq!(
@@ -5216,6 +5407,7 @@ fn test_scanner_nearest_with_ivf_pq_index() {
             10,
         );
         lance_scanner_set_nprobes(scanner, 4);
+        assert_eq!(lance_scanner_set_query_parallelism(scanner, 4), 0);
     }
 
     let mut stream = FFI_ArrowArrayStream::empty();
@@ -5229,6 +5421,59 @@ fn test_scanner_nearest_with_ivf_pq_index() {
         total += batch.unwrap().num_rows();
     }
     assert_eq!(total, 10);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_query_parallelism_validation_and_lifecycle() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    assert_eq!(
+        unsafe { lance_scanner_set_query_parallelism(scanner, -1) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_query_parallelism(scanner, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_query_parallelism(scanner, 2) },
+        0
+    );
+
+    assert_eq!(
+        unsafe { lance_scanner_set_query_parallelism(scanner, -2) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message()
+            .contains("query_parallelism must be -1, 0, or greater than 0, got -2")
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_query_parallelism(scanner, 1) },
+        -1
+    );
+    assert!(take_last_error_message().contains("query_parallelism must be set before"));
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(
+        reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
+        5
+    );
 
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };

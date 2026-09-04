@@ -61,11 +61,18 @@ pub struct LanceScanner {
     limit: Option<i64>,
     offset: Option<i64>,
     batch_size: Option<usize>,
+    batch_size_bytes: Option<u64>,
+    io_buffer_size: Option<u64>,
+    batch_readahead: Option<usize>,
+    fragment_readahead: Option<usize>,
+    target_parallelism: Option<usize>,
+    scan_in_order: Option<bool>,
     with_row_id: bool,
     fragment_ids: Option<Vec<u64>>,
     index_segments: Option<Vec<Uuid>>,
     nearest: Option<NearestQuery>,
     nprobes: Option<u32>,
+    query_parallelism: Option<i32>,
     refine_factor: Option<u32>,
     ef: Option<u32>,
     metric_override: Option<crate::index::LanceMetricType>,
@@ -130,11 +137,18 @@ impl LanceScanner {
             limit: None,
             offset: None,
             batch_size: None,
+            batch_size_bytes: None,
+            io_buffer_size: None,
+            batch_readahead: None,
+            fragment_readahead: None,
+            target_parallelism: None,
+            scan_in_order: None,
             with_row_id: false,
             fragment_ids: None,
             index_segments: None,
             nearest: None,
             nprobes: None,
+            query_parallelism: None,
             refine_factor: None,
             ef: None,
             metric_override: None,
@@ -163,6 +177,15 @@ impl LanceScanner {
     /// panic caught there marks this handle unusable for later calls.
     pub(crate) fn poison_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.poisoned)
+    }
+
+    fn ensure_scan_not_started(&self, setting_name: &str) -> Result<()> {
+        if self.scan_started.load(Ordering::Acquire) {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("{setting_name} must be set before the scan starts").into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Apply fragment selection to a scanner builder if fragment_ids is set.
@@ -232,6 +255,24 @@ impl LanceScanner {
         if let Some(bs) = self.batch_size {
             scanner.batch_size(bs);
         }
+        if let Some(batch_size_bytes) = self.batch_size_bytes {
+            scanner.batch_size_bytes(batch_size_bytes);
+        }
+        if let Some(io_buffer_size) = self.io_buffer_size {
+            scanner.io_buffer_size(io_buffer_size);
+        }
+        if let Some(batch_readahead) = self.batch_readahead {
+            scanner.batch_readahead(batch_readahead);
+        }
+        if let Some(fragment_readahead) = self.fragment_readahead {
+            scanner.fragment_readahead(fragment_readahead);
+        }
+        if let Some(target_parallelism) = self.target_parallelism {
+            scanner.target_parallelism(target_parallelism);
+        }
+        if let Some(scan_in_order) = self.scan_in_order {
+            scanner.scan_in_order(scan_in_order);
+        }
         if self.with_row_id {
             scanner.with_row_id();
         }
@@ -260,6 +301,9 @@ impl LanceScanner {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
             if let Some(np) = self.nprobes {
                 scanner.nprobes(np as usize);
+            }
+            if let Some(query_parallelism) = self.query_parallelism {
+                scanner.query_parallelism(query_parallelism);
             }
             if let Some(rf) = self.refine_factor {
                 scanner.refine(rf);
@@ -780,6 +824,214 @@ unsafe fn scanner_set_batch_size_inner(scanner: *mut LanceScanner, batch_size: i
     }
     let s = unsafe { &mut *scanner };
     s.batch_size = Some(batch_size as usize);
+    Ok(0)
+}
+
+/// Set the target output batch size in bytes. Returns 0 on success.
+///
+/// The size must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_batch_size_bytes(
+    scanner: *mut LanceScanner,
+    batch_size_bytes: u64,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_batch_size_bytes_inner(scanner, batch_size_bytes)
+    })
+}
+
+unsafe fn scanner_set_batch_size_bytes_inner(
+    scanner: *mut LanceScanner,
+    batch_size_bytes: u64,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if batch_size_bytes == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "batch_size_bytes must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("batch_size_bytes")?;
+    scanner.batch_size_bytes = Some(batch_size_bytes);
+    Ok(0)
+}
+
+/// Set the scanner I/O buffer size in bytes. Returns 0 on success.
+///
+/// The size must be between 1 and [`i64::MAX`] and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_io_buffer_size(
+    scanner: *mut LanceScanner,
+    io_buffer_size_bytes: u64,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_io_buffer_size_inner(scanner, io_buffer_size_bytes)
+    })
+}
+
+unsafe fn scanner_set_io_buffer_size_inner(
+    scanner: *mut LanceScanner,
+    io_buffer_size_bytes: u64,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if io_buffer_size_bytes == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "io_buffer_size_bytes must be greater than 0, got 0".into(),
+        ));
+    }
+    if io_buffer_size_bytes > i64::MAX as u64 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "io_buffer_size_bytes must be at most {}, got {io_buffer_size_bytes}",
+                i64::MAX
+            )
+            .into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("io_buffer_size_bytes")?;
+    scanner.io_buffer_size = Some(io_buffer_size_bytes);
+    Ok(0)
+}
+
+/// Set the number of batches to decode concurrently. Returns 0 on success.
+///
+/// The value must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_batch_readahead(
+    scanner: *mut LanceScanner,
+    batch_readahead: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_batch_readahead_inner(scanner, batch_readahead)
+    })
+}
+
+unsafe fn scanner_set_batch_readahead_inner(
+    scanner: *mut LanceScanner,
+    batch_readahead: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if batch_readahead == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "batch_readahead must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("batch_readahead")?;
+    scanner.batch_readahead = Some(batch_readahead);
+    Ok(0)
+}
+
+/// Set the number of fragments to read ahead for unordered scans.
+///
+/// The value must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fragment_readahead(
+    scanner: *mut LanceScanner,
+    fragment_readahead: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fragment_readahead_inner(scanner, fragment_readahead)
+    })
+}
+
+unsafe fn scanner_set_fragment_readahead_inner(
+    scanner: *mut LanceScanner,
+    fragment_readahead: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if fragment_readahead == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "fragment_readahead must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("fragment_readahead")?;
+    scanner.fragment_readahead = Some(fragment_readahead);
+    Ok(0)
+}
+
+/// Set the target number of physical execution partitions.
+///
+/// The value must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_target_parallelism(
+    scanner: *mut LanceScanner,
+    target_parallelism: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_target_parallelism_inner(scanner, target_parallelism)
+    })
+}
+
+unsafe fn scanner_set_target_parallelism_inner(
+    scanner: *mut LanceScanner,
+    target_parallelism: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if target_parallelism == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "target_parallelism must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("target_parallelism")?;
+    scanner.target_parallelism = Some(target_parallelism);
+    Ok(0)
+}
+
+/// Configure whether scan results are returned in storage order.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_scan_in_order(
+    scanner: *mut LanceScanner,
+    scan_in_order: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_scan_in_order_inner(scanner, scan_in_order)
+    })
+}
+
+unsafe fn scanner_set_scan_in_order_inner(
+    scanner: *mut LanceScanner,
+    scan_in_order: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("scan_in_order")?;
+    scanner.scan_in_order = Some(scan_in_order);
     Ok(0)
 }
 
@@ -1791,6 +2043,42 @@ macro_rules! scanner_set_u32 {
 scanner_set_u32!(lance_scanner_set_nprobes, nprobes);
 scanner_set_u32!(lance_scanner_set_refine_factor, refine_factor);
 scanner_set_u32!(lance_scanner_set_ef, ef);
+
+/// Set vector index partition-search concurrency for each query.
+///
+/// `-1` uses the CPU pool size, `0` selects Lance's automatic policy, and
+/// positive values request that many workers. Values below `-1` are invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_query_parallelism(
+    scanner: *mut LanceScanner,
+    query_parallelism: i32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_query_parallelism_inner(scanner, query_parallelism)
+    })
+}
+
+unsafe fn scanner_set_query_parallelism_inner(
+    scanner: *mut LanceScanner,
+    query_parallelism: i32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if query_parallelism < -1 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("query_parallelism must be -1, 0, or greater than 0, got {query_parallelism}")
+                .into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("query_parallelism")?;
+    scanner.query_parallelism = Some(query_parallelism);
+    Ok(0)
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_metric(scanner: *mut LanceScanner, metric: i32) -> i32 {
