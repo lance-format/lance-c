@@ -2449,8 +2449,7 @@ fn test_robotics_e2e_write_then_finalize() {
                 format!("data/{}", filename),
                 field_ids,
                 column_indices,
-                meta.major_version as u32,
-                meta.minor_version as u32,
+                meta.version,
                 None, // file_size_bytes
                 None, // base_id
             );
@@ -3405,6 +3404,7 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
         created_at: Some(u64::MAX),
         base_id: None,
         files: Vec::new(),
+        covering_fields: Vec::new(),
     }
     .encode_to_vec();
     assert_eq!(
@@ -3429,6 +3429,7 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
         created_at: None,
         base_id: None,
         files: Vec::new(),
+        covering_fields: Vec::new(),
     }
     .encode_to_vec();
     assert_eq!(
@@ -3456,6 +3457,7 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
         created_at: None,
         base_id: None,
         files: Vec::new(),
+        covering_fields: Vec::new(),
     }
     .encode_to_vec();
     assert_eq!(
@@ -4033,7 +4035,7 @@ fn test_vector_index_segment_rejects_strict_subset_dot_pq() {
     let message = take_last_error_message();
     assert!(message.contains("metric=DOT"), "{message}");
     assert!(message.contains("strict fragment subset"), "{message}");
-    assert!(message.contains("e934cc2c"), "{message}");
+    assert!(message.contains("ab6b5bbe"), "{message}");
     assert!(message.contains("1 of 2 fragments"), "{message}");
     assert!(!centroids.is_released());
     assert!(!codebook.is_released());

@@ -246,7 +246,7 @@ async fn prepare_fts_query_context(
                 .with_max_expansions(match_query.max_expansions)
                 .with_prefix_length(match_query.prefix_length);
             PreparedFtsQuery::Match(Arc::new(
-                build_global_bm25_scorer(&indices, &query_tokens, &params).await?,
+                build_global_bm25_scorer(&indices, &query_tokens, &params, None).await?,
             ))
         }
         FtsQuery::Phrase(phrase_query) => {
@@ -260,7 +260,7 @@ async fn prepare_fts_query_context(
             let query_tokens = collect_query_tokens(&phrase_query.terms, &mut tokenizer);
             let params = query.params().with_phrase_slop(Some(phrase_query.slop));
             PreparedFtsQuery::Phrase(Arc::new(
-                build_global_bm25_scorer(&indices, &query_tokens, &params).await?,
+                build_global_bm25_scorer(&indices, &query_tokens, &params, None).await?,
             ))
         }
         _ => {

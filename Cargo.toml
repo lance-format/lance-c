@@ -18,14 +18,14 @@ rust-version = "1.91.0"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c", features = ["substrait"] }
-lance-core = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
-lance-index = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
-lance-io = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
-lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
-lance-table = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
-lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c", features = ["substrait"] }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe", features = ["substrait"] }
+lance-core = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe" }
+lance-index = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe" }
+lance-io = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe" }
+lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe" }
+lance-table = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe" }
+lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe", features = ["substrait"] }
 datafusion = { version = "54.0.0", default-features = false }
 arrow = { version = "58.0.0", features = ["prettyprint", "ffi"] }
 arrow-array = "58.0.0"
@@ -45,9 +45,9 @@ snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c", features = ["substrait"] }
-lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "e934cc2c" }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe", features = ["substrait"] }
+lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "ab6b5bbe" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
