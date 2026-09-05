@@ -529,7 +529,7 @@ fn rewrite_prepared_fts_plan(
             exec.params().clone(),
             exec.prefilter_source().clone(),
             segments.to_vec(),
-        )
+        )?
         .with_base_scorer(Arc::clone(scorer));
         return Ok((Arc::new(replacement), rewritten));
     }
@@ -549,7 +549,7 @@ fn rewrite_prepared_fts_plan(
             exec.params().clone(),
             exec.prefilter_source().clone(),
             segments.to_vec(),
-        )
+        )?
         .with_base_scorer(Arc::clone(scorer));
         return Ok((Arc::new(replacement), rewritten));
     }

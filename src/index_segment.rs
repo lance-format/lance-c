@@ -889,7 +889,7 @@ unsafe fn new_vector_builder_inner(
     // TODO(upstream-lance): Remove this fail-fast once Lance's distributed
     // vector-index path reconstructs a supplied PQ codebook with an L2
     // ProductQuantizer, matching the ordinary full-dataset path. Pinned Lance
-    // revision e934cc2c rewraps supplied codebooks with DistanceType::Dot in
+    // revision ab6b5bbe rewraps supplied codebooks with DistanceType::Dot in
     // `make_global_pq`, which silently switches PQ code assignment away from
     // the L2 contract shared by full-dataset builds and index readers.
     if matches!(
@@ -910,7 +910,7 @@ unsafe fn new_vector_builder_inner(
         let selected_fragment_ids: HashSet<u32> = fragment_ids.iter().copied().collect();
         if selected_fragment_ids != all_fragment_ids {
             return Err(invalid_input(format!(
-                "pq_codebook is supplied for metric=DOT, index_type={:?}, mode={:?}, and an effective strict fragment subset ({} of {} fragments): pinned Lance revision e934cc2c reconstructs the supplied codebook with a DOT ProductQuantizer in the distributed build path (make_global_pq), silently breaking the L2 PQ-assignment contract; cover the full dataset in one segment (pass NULL fragment_ids or list every fragment) or wait for upstream Lance DOT support",
+                "pq_codebook is supplied for metric=DOT, index_type={:?}, mode={:?}, and an effective strict fragment subset ({} of {} fragments): pinned Lance revision ab6b5bbe reconstructs the supplied codebook with a DOT ProductQuantizer in the distributed build path (make_global_pq), silently breaking the L2 PQ-assignment contract; cover the full dataset in one segment (pass NULL fragment_ids or list every fragment) or wait for upstream Lance DOT support",
                 params.index_type,
                 parsed.mode,
                 selected_fragment_ids.len(),
