@@ -1269,9 +1269,44 @@ public:
         return *this;
     }
 
+    /// Configure whether scalar indices may be used to optimize filters.
+    Scanner& use_scalar_index(bool enable = true) {
+        if (lance_scanner_set_use_scalar_index(handle_.get(), enable) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Configure whether row-based output batches are strict.
+    Scanner& strict_batch_size(bool strict_batch_size = true) {
+        if (lance_scanner_set_strict_batch_size(handle_.get(), strict_batch_size) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Configure whether file statistics may optimize the scan.
+    Scanner& use_stats(bool use_stats = true) {
+        if (lance_scanner_set_use_stats(handle_.get(), use_stats) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Enable/disable row ID in output.
     Scanner& with_row_id(bool enable = true) {
         if (lance_scanner_with_row_id(handle_.get(), enable) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Include or omit the `_rowaddr` metadata column.
+    Scanner& with_row_address(bool enable = true) {
+        if (lance_scanner_with_row_address(handle_.get(), enable) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Configure whether deleted rows still present in storage are returned.
+    Scanner& include_deleted_rows(bool include_deleted_rows = true) {
+        if (lance_scanner_set_include_deleted_rows(handle_.get(), include_deleted_rows) != 0)
             check_error();
         return *this;
     }
@@ -1384,6 +1419,18 @@ public:
 
     Scanner& nprobes(uint32_t n) {
         if (lance_scanner_set_nprobes(handle_.get(), n) != 0) check_error();
+        return *this;
+    }
+    Scanner& minimum_nprobes(uint32_t minimum_nprobes) {
+        if (lance_scanner_set_minimum_nprobes(handle_.get(), minimum_nprobes) != 0) check_error();
+        return *this;
+    }
+    Scanner& maximum_nprobes(uint32_t maximum_nprobes) {
+        if (lance_scanner_set_maximum_nprobes(handle_.get(), maximum_nprobes) != 0) check_error();
+        return *this;
+    }
+    Scanner& approx_mode(LanceApproxMode approx_mode) {
+        if (lance_scanner_set_approx_mode(handle_.get(), approx_mode) != 0) check_error();
         return *this;
     }
     Scanner& query_parallelism(int32_t parallelism) {

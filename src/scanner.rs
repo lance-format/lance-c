@@ -21,6 +21,7 @@ use lance::dataset::scanner::{
 use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use lance_core::Result;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::vector::ApproxMode;
 use lance_io::stream::RecordBatchStream;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
@@ -51,6 +52,38 @@ pub enum LanceDataType {
     Int8 = 4,
 }
 
+/// Speed / accuracy tradeoff for approximate vector search, mirroring the C
+/// enum `LanceApproxMode`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceApproxMode {
+    Fast = 0,
+    Normal = 1,
+    Accurate = 2,
+}
+
+impl LanceApproxMode {
+    fn from_i32(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Fast),
+            1 => Ok(Self::Normal),
+            2 => Ok(Self::Accurate),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!("approx_mode must be 0 (FAST), 1 (NORMAL), or 2 (ACCURATE), got {value}")
+                    .into(),
+            )),
+        }
+    }
+
+    fn to_approx_mode(self) -> ApproxMode {
+        match self {
+            Self::Fast => ApproxMode::Fast,
+            Self::Normal => ApproxMode::Normal,
+            Self::Accurate => ApproxMode::Accurate,
+        }
+    }
+}
+
 /// Opaque scanner handle. Stores configuration until stream materialization.
 pub struct LanceScanner {
     dataset: Arc<Dataset>,
@@ -62,16 +95,24 @@ pub struct LanceScanner {
     offset: Option<i64>,
     batch_size: Option<usize>,
     batch_size_bytes: Option<u64>,
+    strict_batch_size: Option<bool>,
     io_buffer_size: Option<u64>,
     batch_readahead: Option<usize>,
     fragment_readahead: Option<usize>,
     target_parallelism: Option<usize>,
     scan_in_order: Option<bool>,
+    use_scalar_index: Option<bool>,
+    use_stats: Option<bool>,
     with_row_id: bool,
+    with_row_address: bool,
+    include_deleted_rows: bool,
     fragment_ids: Option<Vec<u64>>,
     index_segments: Option<Vec<Uuid>>,
     nearest: Option<NearestQuery>,
     nprobes: Option<u32>,
+    minimum_nprobes: Option<u32>,
+    maximum_nprobes: Option<u32>,
+    approx_mode: Option<LanceApproxMode>,
     query_parallelism: Option<i32>,
     refine_factor: Option<u32>,
     ef: Option<u32>,
@@ -138,16 +179,24 @@ impl LanceScanner {
             offset: None,
             batch_size: None,
             batch_size_bytes: None,
+            strict_batch_size: None,
             io_buffer_size: None,
             batch_readahead: None,
             fragment_readahead: None,
             target_parallelism: None,
             scan_in_order: None,
+            use_scalar_index: None,
+            use_stats: None,
             with_row_id: false,
+            with_row_address: false,
+            include_deleted_rows: false,
             fragment_ids: None,
             index_segments: None,
             nearest: None,
             nprobes: None,
+            minimum_nprobes: None,
+            maximum_nprobes: None,
+            approx_mode: None,
             query_parallelism: None,
             refine_factor: None,
             ef: None,
@@ -258,6 +307,9 @@ impl LanceScanner {
         if let Some(batch_size_bytes) = self.batch_size_bytes {
             scanner.batch_size_bytes(batch_size_bytes);
         }
+        if let Some(strict_batch_size) = self.strict_batch_size {
+            scanner.strict_batch_size(strict_batch_size);
+        }
         if let Some(io_buffer_size) = self.io_buffer_size {
             scanner.io_buffer_size(io_buffer_size);
         }
@@ -273,8 +325,20 @@ impl LanceScanner {
         if let Some(scan_in_order) = self.scan_in_order {
             scanner.scan_in_order(scan_in_order);
         }
+        if let Some(use_scalar_index) = self.use_scalar_index {
+            scanner.use_scalar_index(use_scalar_index);
+        }
+        if let Some(use_stats) = self.use_stats {
+            scanner.use_stats(use_stats);
+        }
         if self.with_row_id {
             scanner.with_row_id();
+        }
+        if self.with_row_address {
+            scanner.with_row_address();
+        }
+        if self.include_deleted_rows {
+            scanner.include_deleted_rows();
         }
         self.apply_fragment_filter(&mut scanner)?;
         if self.index_segments.is_some() && self.nearest.is_none() {
@@ -301,6 +365,15 @@ impl LanceScanner {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
             if let Some(np) = self.nprobes {
                 scanner.nprobes(np as usize);
+            }
+            if let Some(minimum_nprobes) = self.minimum_nprobes {
+                scanner.minimum_nprobes(minimum_nprobes as usize);
+            }
+            if let Some(maximum_nprobes) = self.maximum_nprobes {
+                scanner.maximum_nprobes(maximum_nprobes as usize);
+            }
+            if let Some(approx_mode) = self.approx_mode {
+                scanner.approx_mode(approx_mode.to_approx_mode());
             }
             if let Some(query_parallelism) = self.query_parallelism {
                 scanner.query_parallelism(query_parallelism);
@@ -1035,6 +1108,92 @@ unsafe fn scanner_set_scan_in_order_inner(
     Ok(0)
 }
 
+/// Configure whether scalar indices may be used to optimize filters.
+///
+/// Scalar indices are enabled by default in Lance. Must be set before the scan
+/// starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_use_scalar_index(
+    scanner: *mut LanceScanner,
+    use_scalar_index: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_use_scalar_index_inner(scanner, use_scalar_index)
+    })
+}
+
+unsafe fn scanner_set_use_scalar_index_inner(
+    scanner: *mut LanceScanner,
+    use_scalar_index: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("use_scalar_index")?;
+    scanner.use_scalar_index = Some(use_scalar_index);
+    Ok(0)
+}
+
+/// Configure whether output batches use the exact row-based batch size.
+///
+/// Must be set before the scan starts. Lance rejects enabling this together
+/// with a byte-based batch-size limit when the scan is materialized.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_strict_batch_size(
+    scanner: *mut LanceScanner,
+    strict_batch_size: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_strict_batch_size_inner(scanner, strict_batch_size)
+    })
+}
+
+unsafe fn scanner_set_strict_batch_size_inner(
+    scanner: *mut LanceScanner,
+    strict_batch_size: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("strict_batch_size")?;
+    scanner.strict_batch_size = Some(strict_batch_size);
+    Ok(0)
+}
+
+/// Configure whether file statistics may be used to optimize the scan.
+///
+/// Statistics are enabled by default. Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_use_stats(
+    scanner: *mut LanceScanner,
+    use_stats: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_use_stats_inner(scanner, use_stats)
+    })
+}
+
+unsafe fn scanner_set_use_stats_inner(scanner: *mut LanceScanner, use_stats: bool) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("use_stats")?;
+    scanner.use_stats = Some(use_stats);
+    Ok(0)
+}
+
 /// Enable or disable row ID in scan output. Returns 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_with_row_id(
@@ -1055,6 +1214,62 @@ unsafe fn scanner_with_row_id_inner(scanner: *mut LanceScanner, enable: bool) ->
     }
     let s = unsafe { &mut *scanner };
     s.with_row_id = enable;
+    Ok(0)
+}
+
+/// Enable or disable the `_rowaddr` metadata column in scan output.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_with_row_address(
+    scanner: *mut LanceScanner,
+    enable: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_with_row_address_inner(scanner, enable)
+    })
+}
+
+unsafe fn scanner_with_row_address_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("with_row_address")?;
+    scanner.with_row_address = enable;
+    Ok(0)
+}
+
+/// Configure whether deleted rows still present in storage are returned.
+///
+/// Deleted rows have a NULL `_rowid`, so callers should also enable row IDs.
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_include_deleted_rows(
+    scanner: *mut LanceScanner,
+    include_deleted_rows: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_include_deleted_rows_inner(scanner, include_deleted_rows)
+    })
+}
+
+unsafe fn scanner_set_include_deleted_rows_inner(
+    scanner: *mut LanceScanner,
+    include_deleted_rows: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("include_deleted_rows")?;
+    scanner.include_deleted_rows = include_deleted_rows;
     Ok(0)
 }
 
@@ -2043,6 +2258,126 @@ macro_rules! scanner_set_u32 {
 scanner_set_u32!(lance_scanner_set_nprobes, nprobes);
 scanner_set_u32!(lance_scanner_set_refine_factor, refine_factor);
 scanner_set_u32!(lance_scanner_set_ef, ef);
+
+/// Set the minimum number of vector-index partitions to search.
+///
+/// The value must be greater than zero, no greater than a configured
+/// `maximum_nprobes`, and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_minimum_nprobes(
+    scanner: *mut LanceScanner,
+    minimum_nprobes: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_minimum_nprobes_inner(scanner, minimum_nprobes)
+    })
+}
+
+unsafe fn scanner_set_minimum_nprobes_inner(
+    scanner: *mut LanceScanner,
+    minimum_nprobes: u32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if minimum_nprobes == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "minimum_nprobes must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("minimum_nprobes")?;
+    if let Some(maximum_nprobes) = scanner.maximum_nprobes
+        && minimum_nprobes > maximum_nprobes
+    {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "minimum_nprobes ({minimum_nprobes}) must not exceed maximum_nprobes ({maximum_nprobes})"
+            )
+            .into(),
+        ));
+    }
+    scanner.minimum_nprobes = Some(minimum_nprobes);
+    Ok(0)
+}
+
+/// Set the maximum number of vector-index partitions to search.
+///
+/// The value must be greater than zero, no less than a configured
+/// `minimum_nprobes`, and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_maximum_nprobes(
+    scanner: *mut LanceScanner,
+    maximum_nprobes: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_maximum_nprobes_inner(scanner, maximum_nprobes)
+    })
+}
+
+unsafe fn scanner_set_maximum_nprobes_inner(
+    scanner: *mut LanceScanner,
+    maximum_nprobes: u32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if maximum_nprobes == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "maximum_nprobes must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("maximum_nprobes")?;
+    if let Some(minimum_nprobes) = scanner.minimum_nprobes
+        && maximum_nprobes < minimum_nprobes
+    {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "maximum_nprobes ({maximum_nprobes}) must not be less than minimum_nprobes ({minimum_nprobes})"
+            )
+            .into(),
+        ));
+    }
+    scanner.maximum_nprobes = Some(maximum_nprobes);
+    Ok(0)
+}
+
+/// Configure the speed / accuracy tradeoff for approximate vector search.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_approx_mode(
+    scanner: *mut LanceScanner,
+    approx_mode: i32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_approx_mode_inner(scanner, approx_mode)
+    })
+}
+
+unsafe fn scanner_set_approx_mode_inner(
+    scanner: *mut LanceScanner,
+    approx_mode: i32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let approx_mode = LanceApproxMode::from_i32(approx_mode)?;
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("approx_mode")?;
+    scanner.approx_mode = Some(approx_mode);
+    Ok(0)
+}
 
 /// Set vector index partition-search concurrency for each query.
 ///

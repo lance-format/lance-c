@@ -1237,6 +1237,12 @@ fn test_scanner_execution_tuning_options() {
         unsafe { lance_scanner_set_scan_in_order(scanner, false) },
         0
     );
+    assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(scanner, false) },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_use_stats(scanner, false) }, 0);
+    assert_eq!(unsafe { lance_scanner_with_row_address(scanner, true) }, 0);
 
     let mut ffi_stream = FFI_ArrowArrayStream::empty();
     assert_eq!(
@@ -1244,6 +1250,7 @@ fn test_scanner_execution_tuning_options() {
         0
     );
     let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    assert!(reader.schema().field_with_name("_rowaddr").is_ok());
     let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
     assert_eq!(total_rows, 10);
 
@@ -1360,10 +1367,107 @@ fn test_scanner_execution_tuning_options_reject_after_scan_start() {
     );
     assert!(take_last_error_message().contains("scan_in_order must be set before"));
 
+    assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(scanner, false) },
+        -1
+    );
+    assert!(take_last_error_message().contains("use_scalar_index must be set before"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(scanner, true) },
+        -1
+    );
+    assert!(take_last_error_message().contains("strict_batch_size must be set before"));
+
+    assert_eq!(unsafe { lance_scanner_set_use_stats(scanner, false) }, -1);
+    assert!(take_last_error_message().contains("use_stats must be set before"));
+
+    assert_eq!(unsafe { lance_scanner_with_row_address(scanner, true) }, -1);
+    assert!(take_last_error_message().contains("with_row_address must be set before"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_include_deleted_rows(scanner, true) },
+        -1
+    );
+    assert!(take_last_error_message().contains("include_deleted_rows must be set before"));
+
     let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
     assert_eq!(
         reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
         5
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_strict_batch_size_across_fragments() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(unsafe { lance_scanner_set_batch_size(scanner, 3) }, 0);
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(scanner, true) },
+        0
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let batch_sizes = reader
+        .map(|batch| batch.unwrap().num_rows())
+        .collect::<Vec<_>>();
+    assert_eq!(batch_sizes, vec![3, 3, 3, 1]);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_include_deleted_rows() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let predicate = c_str("id >= 8");
+    let mut num_deleted = 0;
+    assert_eq!(
+        unsafe { lance_dataset_delete(ds, predicate.as_ptr(), &mut num_deleted) },
+        0
+    );
+    assert_eq!(num_deleted, 2);
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(unsafe { lance_scanner_with_row_id(scanner, true) }, 0);
+    assert_eq!(
+        unsafe { lance_scanner_set_include_deleted_rows(scanner, true) },
+        0
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.column_by_name("_rowid").unwrap().null_count())
+            .sum::<usize>(),
+        2
     );
 
     unsafe { lance_scanner_close(scanner) };
@@ -1633,7 +1737,39 @@ fn test_null_safety_comprehensive() {
         -1
     );
     assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(ptr::null_mut(), false) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(ptr::null_mut(), true) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_use_stats(ptr::null_mut(), false) },
+        -1
+    );
+    assert_eq!(
         unsafe { lance_scanner_with_row_id(ptr::null_mut(), true) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_with_row_address(ptr::null_mut(), true) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_include_deleted_rows(ptr::null_mut(), true) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_minimum_nprobes(ptr::null_mut(), 1) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_maximum_nprobes(ptr::null_mut(), 1) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_approx_mode(ptr::null_mut(), LanceApproxMode::Normal as i32,) },
         -1
     );
 
@@ -3073,6 +3209,90 @@ fn test_create_scalar_index_btree() {
 
     let count = unsafe { lance_dataset_index_count(ds) };
     assert_eq!(count, 1);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_set_use_scalar_index_controls_filter_planning() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let column = c_str("id");
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0
+    );
+
+    let run_scan = |use_scalar_index: bool| {
+        let filter = c_str("id = 3");
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), filter.as_ptr()) };
+        assert!(!scanner.is_null());
+        assert_eq!(
+            unsafe { lance_scanner_set_use_scalar_index(scanner, use_scalar_index) },
+            0
+        );
+
+        let mut captured = CapturedScanStatistics::default();
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_statistics_callback(
+                    scanner,
+                    Some(capture_scan_statistics),
+                    (&mut captured as *mut CapturedScanStatistics).cast(),
+                )
+            },
+            0
+        );
+
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(
+            unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+            0
+        );
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+        let ids = reader
+            .flat_map(|batch| {
+                let batch = batch.unwrap();
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(captured.calls, 1);
+        unsafe { lance_scanner_close(scanner) };
+        (ids, captured)
+    };
+
+    let (indexed_ids, indexed_statistics) = run_scan(true);
+    let (unindexed_ids, unindexed_statistics) = run_scan(false);
+    assert_eq!(indexed_ids, vec![3]);
+    assert_eq!(unindexed_ids, indexed_ids);
+    assert!(
+        indexed_statistics.indices_loaded > 0,
+        "enabled scan should load the scalar index"
+    );
+    assert_eq!(
+        unindexed_statistics.indices_loaded, 0,
+        "disabled scan should bypass the scalar index"
+    );
 
     unsafe { lance_dataset_close(ds) };
 }
@@ -5409,6 +5629,12 @@ fn test_scanner_nearest_with_ivf_pq_index() {
             10,
         );
         lance_scanner_set_nprobes(scanner, 4);
+        assert_eq!(lance_scanner_set_minimum_nprobes(scanner, 2), 0);
+        assert_eq!(lance_scanner_set_maximum_nprobes(scanner, 6), 0);
+        assert_eq!(
+            lance_scanner_set_approx_mode(scanner, LanceApproxMode::Accurate as i32),
+            0
+        );
         assert_eq!(lance_scanner_set_query_parallelism(scanner, 4), 0);
     }
 
@@ -5423,6 +5649,76 @@ fn test_scanner_nearest_with_ivf_pq_index() {
         total += batch.unwrap().num_rows();
     }
     assert_eq!(total, 10);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_adaptive_nprobes_and_approx_mode_validation_and_lifecycle() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 0) }, -1);
+    assert!(take_last_error_message().contains("minimum_nprobes must be greater than 0, got 0"));
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 0) }, -1);
+    assert!(take_last_error_message().contains("maximum_nprobes must be greater than 0, got 0"));
+    assert_eq!(unsafe { lance_scanner_set_approx_mode(scanner, 3) }, -1);
+    assert!(
+        take_last_error_message()
+            .contains("approx_mode must be 0 (FAST), 1 (NORMAL), or 2 (ACCURATE), got 3")
+    );
+
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 2) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 3) }, -1);
+    assert!(
+        take_last_error_message()
+            .contains("minimum_nprobes (3) must not exceed maximum_nprobes (2)")
+    );
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 1) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 1) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 2) }, -1);
+    assert!(
+        take_last_error_message()
+            .contains("minimum_nprobes (2) must not exceed maximum_nprobes (1)")
+    );
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 2) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 2) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 1) }, -1);
+    assert!(
+        take_last_error_message()
+            .contains("maximum_nprobes (1) must not be less than minimum_nprobes (2)")
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_approx_mode(scanner, LanceApproxMode::Fast as i32) },
+        0
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 1) }, -1);
+    assert!(take_last_error_message().contains("minimum_nprobes must be set before"));
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 1) }, -1);
+    assert!(take_last_error_message().contains("maximum_nprobes must be set before"));
+    assert_eq!(
+        unsafe { lance_scanner_set_approx_mode(scanner, LanceApproxMode::Normal as i32) },
+        -1
+    );
+    assert!(take_last_error_message().contains("approx_mode must be set before"));
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(
+        reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
+        5
+    );
 
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
