@@ -1319,6 +1319,78 @@ fn test_scanner_execution_tuning_options_reject_invalid_values() {
 }
 
 #[test]
+fn test_scanner_strict_batch_size_and_bytes_conflict_is_recoverable() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let consume = |scanner| {
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(
+            unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+            0
+        );
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+        assert_eq!(
+            reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
+            5
+        );
+    };
+
+    // A byte limit already exists: strict=true is rejected without starting
+    // the scan or replacing the prior strict setting.
+    let bytes_first = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_size_bytes(bytes_first, 1024) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(bytes_first, true) },
+        -1
+    );
+    assert!(
+        take_last_error_message()
+            .contains("strict_batch_size=true cannot be combined with batch_size_bytes=1024")
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_use_stats(bytes_first, false) },
+        0,
+        "the rejected setter must not mark the scan as started"
+    );
+    consume(bytes_first);
+
+    // Strict sizing already exists: the byte limit is rejected without
+    // mutation. The caller can disable strict sizing and retry on this handle.
+    let strict_first = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(strict_first, true) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_size_bytes(strict_first, 1024) },
+        -1
+    );
+    assert!(
+        take_last_error_message()
+            .contains("strict_batch_size=true cannot be combined with batch_size_bytes=1024")
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(strict_first, false) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_size_bytes(strict_first, 1024) },
+        0
+    );
+    consume(strict_first);
+
+    unsafe { lance_scanner_close(bytes_first) };
+    unsafe { lance_scanner_close(strict_first) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_scanner_execution_tuning_options_reject_after_scan_start() {
     let (_tmp, uri) = create_test_dataset();
     let c_uri = c_str(&uri);
@@ -1760,6 +1832,7 @@ fn test_null_safety_comprehensive() {
         unsafe { lance_scanner_set_include_deleted_rows(ptr::null_mut(), true) },
         -1
     );
+    assert_eq!(unsafe { lance_scanner_set_nprobes(ptr::null_mut(), 1) }, -1);
     assert_eq!(
         unsafe { lance_scanner_set_minimum_nprobes(ptr::null_mut(), 1) },
         -1
@@ -5663,6 +5736,8 @@ fn test_scanner_adaptive_nprobes_and_approx_mode_validation_and_lifecycle() {
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
     assert!(!scanner.is_null());
 
+    assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 0) }, -1);
+    assert!(take_last_error_message().contains("nprobes must be greater than 0, got 0"));
     assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 0) }, -1);
     assert!(take_last_error_message().contains("minimum_nprobes must be greater than 0, got 0"));
     assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 0) }, -1);
@@ -5704,6 +5779,8 @@ fn test_scanner_adaptive_nprobes_and_approx_mode_validation_and_lifecycle() {
         0
     );
 
+    assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 1) }, -1);
+    assert!(take_last_error_message().contains("nprobes must be set before"));
     assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 1) }, -1);
     assert!(take_last_error_message().contains("minimum_nprobes must be set before"));
     assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 1) }, -1);

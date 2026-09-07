@@ -109,9 +109,7 @@ pub struct LanceScanner {
     fragment_ids: Option<Vec<u64>>,
     index_segments: Option<Vec<Uuid>>,
     nearest: Option<NearestQuery>,
-    nprobes: Option<u32>,
-    minimum_nprobes: Option<u32>,
-    maximum_nprobes: Option<u32>,
+    nprobes: NprobesRange,
     approx_mode: Option<LanceApproxMode>,
     query_parallelism: Option<i32>,
     refine_factor: Option<u32>,
@@ -146,6 +144,72 @@ struct NearestQuery {
     column: String,
     query: arrow_array::ArrayRef,
     k: u32,
+}
+
+/// The effective adaptive partition-search range shared by all three nprobes
+/// setters. Updates are computed and validated before replacing this state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NprobesRange {
+    minimum: Option<u32>,
+    maximum: Option<u32>,
+}
+
+impl NprobesRange {
+    fn exact(nprobes: u32) -> Result<Self> {
+        if nprobes == 0 {
+            return Err(lance_core::Error::invalid_input_source(
+                "nprobes must be greater than 0, got 0".into(),
+            ));
+        }
+        Ok(Self {
+            minimum: Some(nprobes),
+            maximum: Some(nprobes),
+        })
+    }
+
+    fn with_minimum(self, minimum_nprobes: u32) -> Result<Self> {
+        if minimum_nprobes == 0 {
+            return Err(lance_core::Error::invalid_input_source(
+                "minimum_nprobes must be greater than 0, got 0".into(),
+            ));
+        }
+        if let Some(maximum_nprobes) = self.maximum
+            && minimum_nprobes > maximum_nprobes
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "minimum_nprobes ({minimum_nprobes}) must not exceed maximum_nprobes ({maximum_nprobes})"
+                )
+                .into(),
+            ));
+        }
+        Ok(Self {
+            minimum: Some(minimum_nprobes),
+            ..self
+        })
+    }
+
+    fn with_maximum(self, maximum_nprobes: u32) -> Result<Self> {
+        if maximum_nprobes == 0 {
+            return Err(lance_core::Error::invalid_input_source(
+                "maximum_nprobes must be greater than 0, got 0".into(),
+            ));
+        }
+        if let Some(minimum_nprobes) = self.minimum
+            && maximum_nprobes < minimum_nprobes
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "maximum_nprobes ({maximum_nprobes}) must not be less than minimum_nprobes ({minimum_nprobes})"
+                )
+                .into(),
+            ));
+        }
+        Ok(Self {
+            maximum: Some(maximum_nprobes),
+            ..self
+        })
+    }
 }
 
 /// Poll status for `lance_scanner_poll_next`.
@@ -193,9 +257,7 @@ impl LanceScanner {
             fragment_ids: None,
             index_segments: None,
             nearest: None,
-            nprobes: None,
-            minimum_nprobes: None,
-            maximum_nprobes: None,
+            nprobes: NprobesRange::default(),
             approx_mode: None,
             query_parallelism: None,
             refine_factor: None,
@@ -363,13 +425,10 @@ impl LanceScanner {
         }
         if let Some(n) = &self.nearest {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
-            if let Some(np) = self.nprobes {
-                scanner.nprobes(np as usize);
-            }
-            if let Some(minimum_nprobes) = self.minimum_nprobes {
+            if let Some(minimum_nprobes) = self.nprobes.minimum {
                 scanner.minimum_nprobes(minimum_nprobes as usize);
             }
-            if let Some(maximum_nprobes) = self.maximum_nprobes {
+            if let Some(maximum_nprobes) = self.nprobes.maximum {
                 scanner.maximum_nprobes(maximum_nprobes as usize);
             }
             if let Some(approx_mode) = self.approx_mode {
@@ -930,6 +989,14 @@ unsafe fn scanner_set_batch_size_bytes_inner(
     }
     let scanner = unsafe { &mut *scanner };
     scanner.ensure_scan_not_started("batch_size_bytes")?;
+    if scanner.strict_batch_size == Some(true) {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "strict_batch_size=true cannot be combined with batch_size_bytes={batch_size_bytes}"
+            )
+            .into(),
+        ));
+    }
     scanner.batch_size_bytes = Some(batch_size_bytes);
     Ok(0)
 }
@@ -1140,8 +1207,8 @@ unsafe fn scanner_set_use_scalar_index_inner(
 
 /// Configure whether output batches use the exact row-based batch size.
 ///
-/// Must be set before the scan starts. Lance rejects enabling this together
-/// with a byte-based batch-size limit when the scan is materialized.
+/// Must be set before the scan starts. Enabling this together with a
+/// byte-based batch-size limit is rejected without changing scanner state.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_strict_batch_size(
     scanner: *mut LanceScanner,
@@ -1164,6 +1231,14 @@ unsafe fn scanner_set_strict_batch_size_inner(
     }
     let scanner = unsafe { &mut *scanner };
     scanner.ensure_scan_not_started("strict_batch_size")?;
+    if strict_batch_size && let Some(batch_size_bytes) = scanner.batch_size_bytes {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "strict_batch_size=true cannot be combined with batch_size_bytes={batch_size_bytes}"
+            )
+            .into(),
+        ));
+    }
     scanner.strict_batch_size = Some(strict_batch_size);
     Ok(0)
 }
@@ -2255,9 +2330,37 @@ macro_rules! scanner_set_u32 {
     };
 }
 
-scanner_set_u32!(lance_scanner_set_nprobes, nprobes);
 scanner_set_u32!(lance_scanner_set_refine_factor, refine_factor);
 scanner_set_u32!(lance_scanner_set_ef, ef);
+
+/// Set both vector-index partition-search bounds to the same value.
+///
+/// This replaces any values previously configured through
+/// `minimum_nprobes` or `maximum_nprobes`. The value must be greater than zero
+/// and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_nprobes(
+    scanner: *mut LanceScanner,
+    nprobes: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_nprobes_inner(scanner, nprobes)
+    })
+}
+
+unsafe fn scanner_set_nprobes_inner(scanner: *mut LanceScanner, nprobes: u32) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("nprobes")?;
+    let next = NprobesRange::exact(nprobes)?;
+    scanner.nprobes = next;
+    Ok(0)
+}
 
 /// Set the minimum number of vector-index partitions to search.
 ///
@@ -2283,24 +2386,10 @@ unsafe fn scanner_set_minimum_nprobes_inner(
             "scanner is NULL".into(),
         ));
     }
-    if minimum_nprobes == 0 {
-        return Err(lance_core::Error::invalid_input_source(
-            "minimum_nprobes must be greater than 0, got 0".into(),
-        ));
-    }
     let scanner = unsafe { &mut *scanner };
     scanner.ensure_scan_not_started("minimum_nprobes")?;
-    if let Some(maximum_nprobes) = scanner.maximum_nprobes
-        && minimum_nprobes > maximum_nprobes
-    {
-        return Err(lance_core::Error::invalid_input_source(
-            format!(
-                "minimum_nprobes ({minimum_nprobes}) must not exceed maximum_nprobes ({maximum_nprobes})"
-            )
-            .into(),
-        ));
-    }
-    scanner.minimum_nprobes = Some(minimum_nprobes);
+    let next = scanner.nprobes.with_minimum(minimum_nprobes)?;
+    scanner.nprobes = next;
     Ok(0)
 }
 
@@ -2328,24 +2417,10 @@ unsafe fn scanner_set_maximum_nprobes_inner(
             "scanner is NULL".into(),
         ));
     }
-    if maximum_nprobes == 0 {
-        return Err(lance_core::Error::invalid_input_source(
-            "maximum_nprobes must be greater than 0, got 0".into(),
-        ));
-    }
     let scanner = unsafe { &mut *scanner };
     scanner.ensure_scan_not_started("maximum_nprobes")?;
-    if let Some(minimum_nprobes) = scanner.minimum_nprobes
-        && maximum_nprobes < minimum_nprobes
-    {
-        return Err(lance_core::Error::invalid_input_source(
-            format!(
-                "maximum_nprobes ({maximum_nprobes}) must not be less than minimum_nprobes ({minimum_nprobes})"
-            )
-            .into(),
-        ));
-    }
-    scanner.maximum_nprobes = Some(maximum_nprobes);
+    let next = scanner.nprobes.with_maximum(maximum_nprobes)?;
+    scanner.nprobes = next;
     Ok(0)
 }
 
@@ -2883,6 +2958,49 @@ mod tests {
             flat_match_query_execs,
             filtered_row_id_prefilters,
         )
+    }
+
+    #[test]
+    fn nprobes_setters_share_one_validated_range() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let assert_range = |minimum, maximum| {
+            assert_eq!(
+                unsafe { &*scanner }.nprobes,
+                NprobesRange { minimum, maximum }
+            );
+        };
+
+        assert_range(None, None);
+        assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 2) }, 0);
+        assert_range(Some(2), None);
+        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 5) }, 0);
+        assert_range(Some(2), Some(5));
+
+        // The combined setter replaces both bounds.
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 4) }, 0);
+        assert_range(Some(4), Some(4));
+
+        // A failed partial update leaves both bounds unchanged.
+        assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 5) }, -1);
+        assert_range(Some(4), Some(4));
+
+        // Widening the maximum first makes the new minimum valid.
+        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 6) }, 0);
+        assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 5) }, 0);
+        assert_range(Some(5), Some(6));
+
+        // A later combined call deterministically replaces the widened range.
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 3) }, 0);
+        assert_range(Some(3), Some(3));
+        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 2) }, -1);
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 0) }, -1);
+        assert_range(Some(3), Some(3));
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
     }
 
     #[test]

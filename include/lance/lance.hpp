@@ -1417,14 +1417,17 @@ public:
         return *this;
     }
 
-    Scanner& nprobes(uint32_t n) {
-        if (lance_scanner_set_nprobes(handle_.get(), n) != 0) check_error();
+    /// Replace both minimum and maximum partition-search bounds.
+    Scanner& nprobes(uint32_t nprobes) {
+        if (lance_scanner_set_nprobes(handle_.get(), nprobes) != 0) check_error();
         return *this;
     }
+    /// Replace only the minimum partition-search bound.
     Scanner& minimum_nprobes(uint32_t minimum_nprobes) {
         if (lance_scanner_set_minimum_nprobes(handle_.get(), minimum_nprobes) != 0) check_error();
         return *this;
     }
+    /// Replace only the maximum partition-search bound.
     Scanner& maximum_nprobes(uint32_t maximum_nprobes) {
         if (lance_scanner_set_maximum_nprobes(handle_.get(), maximum_nprobes) != 0) check_error();
         return *this;
