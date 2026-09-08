@@ -36,6 +36,9 @@ An unknown UUID, absent fragment or invalid option combination is an error. A
 known segment with incomplete/unknown coverage, no suitable driver, unsupported
 index type, nested key, overlays, fragment reuse, non-exact results or unsupported
 row-ID domain falls back to a non-indexed scan of the entire explicit domain.
+Legacy (v1) storage also takes this fallback because ordinary scans cannot consume
+external row masks; it reports `scalar_segment_fallback_legacy_storage` without
+searching the index.
 I/O and corruption errors are propagated, not converted to empty results or
 successful fallback.
 
