@@ -12520,6 +12520,15 @@ fn create_scalar_segment_fixture(
     kind: lance_index::IndexType,
     stable: bool,
 ) -> (tempfile::TempDir, String, Vec<[u8; 16]>) {
+    create_scalar_segment_fixture_with_options(kind, stable, None, &[&[0], &[1]])
+}
+
+fn create_scalar_segment_fixture_with_options(
+    kind: lance_index::IndexType,
+    stable: bool,
+    storage_version: Option<lance_file::version::LanceFileVersion>,
+    segment_fragments: &[&[u32]],
+) -> (tempfile::TempDir, String, Vec<[u8; 16]>) {
     use lance::dataset::WriteParams;
     use lance::index::DatasetIndexExt;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
@@ -12548,6 +12557,7 @@ fn create_scalar_segment_fixture(
             Some(WriteParams {
                 max_rows_per_file: 4,
                 enable_stable_row_ids: stable,
+                data_storage_version: storage_version,
                 ..Default::default()
             }),
         )
@@ -12561,11 +12571,11 @@ fn create_scalar_segment_fixture(
         let fragments = ds.get_fragments();
         assert_eq!(fragments.len(), 3);
         let mut segments = Vec::new();
-        for fragment in fragments.iter().take(2) {
+        for fragment_ids in segment_fragments {
             segments.push(
                 ds.create_index_builder(&["key"], kind, &params)
                     .name("key_idx".into())
-                    .fragments(vec![fragment.id() as u32])
+                    .fragments(fragment_ids.to_vec())
                     .execute_uncommitted()
                     .await
                     .unwrap(),
@@ -12712,6 +12722,52 @@ fn test_scalar_segment_scope_residual_limit_and_unindexed_fallback() {
         let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0], "key = 99", None, 0);
         assert!(ids.is_empty());
     }
+}
+
+#[test]
+fn test_scalar_segment_legacy_storage_falls_back() {
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+
+    // Three fragments, with one segment covering 0 and 1. Reading only fragment
+    // 0 must retain the full predicate and must not leak rows from fragment 1.
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture_with_options(
+        lance_index::IndexType::BTree,
+        false,
+        Some(LanceFileVersion::Legacy),
+        &[&[0, 1]],
+    );
+    assert_eq!(uuids.len(), 1);
+    lance_c::runtime::block_on(async {
+        let ds = Dataset::open(&uri).await.unwrap();
+        assert_eq!(
+            ds.manifest().data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V1
+        );
+    });
+
+    let (ids, stats) =
+        scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
+    assert_eq!(ids, vec![2, 3]);
+    assert_eq!(stats.calls, 1);
+    assert_eq!(stats.indices_loaded, 0);
+    assert_eq!(stats.index_comparisons, 0);
+    assert!(stats.metrics.iter().any(|(name, _, value)| {
+        name == "scalar_segment_fallback_legacy_storage" && *value == 1
+    }));
+    assert!(
+        !stats
+            .metrics
+            .iter()
+            .any(|(name, _, value)| name == "scalar_segments_searched" && *value != 0)
+    );
+
+    let (ids, _) =
+        scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", Some(1), 1);
+    assert_eq!(
+        ids,
+        vec![3],
+        "fallback must retain LIMIT/OFFSET after filtering"
+    );
 }
 
 #[test]

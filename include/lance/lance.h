@@ -1870,8 +1870,8 @@ int32_t lance_scanner_set_index_segments(
  *
  * BTree/Bitmap searches use a necessary AND-conjunct of the full scanner filter
  * on the selected logical index. All predicates are reapplied during candidate
- * reads; other scalar indices are disabled. OR/NOT-only filters, overlays,
- * fragment reuse, unsupported index types / result domains
+ * reads; other scalar indices are disabled. Legacy storage, OR/NOT-only filters,
+ * overlays, fragment reuse, unsupported index types / result domains
  * and missing coverage use the same domain without an index. No filter also
  * falls back. LIMIT/OFFSET apply after the complete scanner filter, never to the
  * unfiltered candidate set. Vector/FTS queries are rejected.
