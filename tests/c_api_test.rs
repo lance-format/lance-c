@@ -12745,8 +12745,7 @@ fn test_scalar_segment_legacy_storage_falls_back() {
         );
     });
 
-    let (ids, stats) =
-        scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
+    let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
     assert_eq!(ids, vec![2, 3]);
     assert_eq!(stats.calls, 1);
     assert_eq!(stats.indices_loaded, 0);
@@ -12761,8 +12760,7 @@ fn test_scalar_segment_legacy_storage_falls_back() {
             .any(|(name, _, value)| name == "scalar_segments_searched" && *value != 0)
     );
 
-    let (ids, _) =
-        scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", Some(1), 1);
+    let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", Some(1), 1);
     assert_eq!(
         ids,
         vec![3],

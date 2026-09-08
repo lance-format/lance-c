@@ -140,7 +140,11 @@ impl PreparedScalarSegment {
             })?;
         // Match Lance's plain-scan external-mask restriction. Keep the scoped,
         // full-filtered reader intact and avoid index work on legacy storage.
-        if self.dataset.manifest().data_storage_format.lance_file_format()
+        if self
+            .dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_format()
             == lance_file::version::ConcreteFileVersion::V1
         {
             return Ok(Some("legacy_storage"));
