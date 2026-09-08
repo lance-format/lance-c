@@ -39,6 +39,7 @@ use crate::fts_query::{
 };
 use crate::helpers;
 use crate::runtime::{RT, block_on};
+use crate::scalar_segment::PreparedScalarSegment;
 use crate::stream_guard::GuardedReader;
 
 /// Data type tag for query vectors, mirroring the C enum `LanceDataType`.
@@ -108,6 +109,7 @@ pub struct LanceScanner {
     include_deleted_rows: bool,
     fragment_ids: Option<Vec<u64>>,
     index_segments: Option<Vec<Uuid>>,
+    scalar_index_segment: Option<Uuid>,
     nearest: Option<NearestQuery>,
     nprobes: NprobesRange,
     approx_mode: Option<LanceApproxMode>,
@@ -256,6 +258,7 @@ impl LanceScanner {
             include_deleted_rows: false,
             fragment_ids: None,
             index_segments: None,
+            scalar_index_segment: None,
             nearest: None,
             nprobes: NprobesRange::default(),
             approx_mode: None,
@@ -470,12 +473,37 @@ impl LanceScanner {
             None
         };
         self.apply_filter(&mut scanner)?;
+        let scalar_segment = if let Some(segment_uuid) = self.scalar_index_segment {
+            if self.nearest.is_some()
+                || self.fts_query.is_some()
+                || self.fts_context.is_some()
+                || self.index_segments.is_some()
+                || self.fts_index_segments.is_some()
+            {
+                return Err(lance_core::Error::invalid_input_source(
+                    "scalar_index_segment requires an ordinary scan of live rows".into(),
+                ));
+            }
+            let fragment_ids = self.fragment_ids.as_ref().filter(|ids| !ids.is_empty())
+                .ok_or_else(|| lance_core::Error::invalid_input_source(
+                    "scalar_index_segment requires explicit nonempty fragment_ids for its read and fallback domain".into(),
+                ))?;
+            Some(PreparedScalarSegment {
+                dataset: Arc::clone(&self.dataset),
+                segment_uuid,
+                fragment_ids: fragment_ids.clone(),
+                callback: self.scan_statistics_callback.clone(),
+            })
+        } else {
+            None
+        };
         if let Some(callback) = &self.scan_statistics_callback {
             scanner.scan_stats_callback(callback.clone());
         }
         Ok(PreparedScanner {
             scanner,
             distributed_fts,
+            scalar_segment,
         })
     }
 }
@@ -490,10 +518,18 @@ struct PreparedFtsExecution {
 struct PreparedScanner {
     scanner: lance::dataset::scanner::Scanner,
     distributed_fts: Option<PreparedFtsExecution>,
+    scalar_segment: Option<PreparedScalarSegment>,
 }
 
 impl PreparedScanner {
     async fn try_into_stream(self) -> Result<DatasetRecordBatchStream> {
+        if let Some(scalar_segment) = self.scalar_segment {
+            return scalar_segment
+                .configure(self.scanner)
+                .await?
+                .try_into_stream()
+                .await;
+        }
         let Some(distributed_fts) = self.distributed_fts else {
             return self.scanner.try_into_stream().await;
         };
@@ -856,6 +892,31 @@ macro_rules! scanner_ffi_try {
             },
         )
     }};
+}
+
+/// Select one physical scalar index segment. NULL clears the selection.
+/// Requires explicit fragment_ids and an ordinary live-row scan. See the C header.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_scalar_index_segment(
+    scanner: *mut LanceScanner,
+    segment_uuid: *const u8,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, {
+        let scanner = unsafe { scanner.as_mut() }
+            .ok_or_else(|| lance_core::Error::invalid_input_source("scanner is NULL".into()))?;
+        scanner.ensure_scan_not_started("scalar_index_segment")?;
+        let segment = if segment_uuid.is_null() {
+            None
+        } else {
+            Some(
+                Uuid::from_slice(unsafe { std::slice::from_raw_parts(segment_uuid, 16) })
+                    .map_err(|e| lance_core::Error::invalid_input_source(e.into()))?,
+            )
+        };
+        scanner.scalar_index_segment = segment;
+        Ok(0)
+    })
 }
 
 // ---------------------------------------------------------------------------

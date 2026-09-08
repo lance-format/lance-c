@@ -1311,6 +1311,20 @@ public:
         return *this;
     }
 
+    /// Restrict scalar candidate generation to one segment; fragment_ids is
+    /// required and defines the complete read/fallback domain. See lance.h.
+    Scanner& scalar_index_segment(const std::array<uint8_t, 16>& segment_uuid) {
+        if (lance_scanner_set_scalar_index_segment(handle_.get(), segment_uuid.data()) != 0)
+            check_error();
+        return *this;
+    }
+
+    Scanner& clear_scalar_index_segment() {
+        if (lance_scanner_set_scalar_index_segment(handle_.get(), nullptr) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Restrict scan to specific fragment IDs.
     Scanner& fragment_ids(const uint64_t* ids, size_t len) {
         if (lance_scanner_set_fragment_ids(handle_.get(), ids, len) != 0)

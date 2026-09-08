@@ -1858,6 +1858,30 @@ int32_t lance_scanner_set_index_segments(
     size_t len
 );
 
+/**
+ * Accelerate an ordinary scalar-filtered scan with one physical index segment.
+ * segment_uuid points to 16 UUID bytes in RFC 4122 order; NULL clears the setting.
+ * Must be configured before scanning. Requires explicit nonempty fragment_ids,
+ * which define BOTH the read and fallback domain, independently of the segment.
+ * Missing snapshot UUIDs / fragment IDs are errors. Extra segment coverage is
+ * excluded by fragment_ids; incomplete coverage falls back to a full filtered
+ * scan of those fragment_ids. Callers distributing work must assign disjoint
+ * fragment domains and separately include any unindexed data they wish to read.
+ *
+ * BTree/Bitmap searches use a necessary AND-conjunct of the full scanner filter
+ * on the selected logical index. All predicates are reapplied during candidate
+ * reads; other scalar indices are disabled. OR/NOT-only filters, overlays,
+ * fragment reuse, unsupported index types / result domains
+ * and missing coverage use the same domain without an index. No filter also
+ * falls back. LIMIT/OFFSET apply after the complete scanner filter, never to the
+ * unfiltered candidate set. Vector/FTS queries are rejected.
+ *
+ * UUID bytes are copied. Metadata and final option compatibility are validated
+ * when creating the stream. Index corruption or I/O failures remain errors.
+ */
+int32_t lance_scanner_set_scalar_index_segment(
+    LanceScanner* scanner, const uint8_t* segment_uuid);
+
 /* ─── Full-text search (Phase 2) ─── */
 
 /**
