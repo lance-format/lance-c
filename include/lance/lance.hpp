@@ -1311,8 +1311,8 @@ public:
         return *this;
     }
 
-    /// Restrict scalar candidate generation to one segment; fragment_ids is
-    /// required and defines the complete read/fallback domain. See lance.h.
+    /// Generate exact candidates from one BTree/Bitmap/LabelList segment.
+    /// fragment_ids is required and defines the complete read/fallback domain. See lance.h.
     Scanner& scalar_index_segment(const std::array<uint8_t, 16>& segment_uuid) {
         if (lance_scanner_set_scalar_index_segment(handle_.get(), segment_uuid.data()) != 0)
             check_error();
