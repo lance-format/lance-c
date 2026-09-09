@@ -27,6 +27,7 @@ pub(crate) struct PreparedScalarSegment {
     pub dataset: Arc<Dataset>,
     pub segment_uuid: Uuid,
     pub fragment_ids: Vec<u64>,
+    pub use_scalar_index: bool,
     pub callback: Option<ExecutionStatsCallback>,
 }
 
@@ -138,6 +139,11 @@ impl PreparedScalarSegment {
             self.dataset.schema().field_by_id(field_id).ok_or_else(|| {
                 invalid("scalar segment key field is absent from the dataset schema")
             })?;
+        // Explicitly disabling scalar indices also disables this accelerator.
+        // Keep snapshot validation above, but do not plan, open or search an index.
+        if !self.use_scalar_index {
+            return Ok(Some("disabled"));
+        }
         // Match Lance's plain-scan external-mask restriction. Keep the scoped,
         // full-filtered reader intact and avoid index work on legacy storage.
         if self
@@ -149,8 +155,8 @@ impl PreparedScalarSegment {
         {
             return Ok(Some("legacy_storage"));
         }
-        // Keep V1 to flat scalar fields. A dotted name is not sufficient to prove
-        // the field path of an evolved or nested schema.
+        // Keep this implementation to flat scalar fields. A dotted name cannot
+        // prove the field path of an evolved or nested schema.
         if !self
             .dataset
             .schema()
@@ -234,6 +240,8 @@ impl PreparedScalarSegment {
         );
         // Do not truncate candidates at LIMIT. The reader evaluates the complete
         // filter before applying its existing limit/offset operators.
+        // The raw selected bitmap can overlap NULL rows; the full filter removes
+        // those as well. The metric above counts semantic TRUE rows, not mask size.
         reader.with_row_addr_prefilter(RowAddrMask::from_allowed(rows.selected_rows().clone()));
         Ok(None)
     }
