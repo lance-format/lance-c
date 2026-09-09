@@ -1,9 +1,17 @@
 # Scalar index segment scans
 
-An ordinary scanner can use one physical BTree/Bitmap segment to generate
-candidates, then read those candidates with the complete scanner filter. This
+An ordinary scanner can use one physical BTree, Bitmap, or LabelList segment to
+generate candidates, then read them with the complete scanner filter. This
 does not run a global search of the other segments of the logical index. It does
 not subdivide a physical segment or make its own index search incremental.
+
+LabelList supports indexed array membership predicates. Every candidate search
+must return `SearchResult::Exact`.
+LabelList query values should match the array element type, for example
+`array_contains(int32_labels, CAST(42 AS INT))`; a cast on the indexed column
+can prevent the planner from finding an index driver and cause fallback.
+`AtMost` and `AtLeast` results still fall back; this mode does not enable FMIndex,
+NGram, BloomFilter, ZoneMap, or Inverted indices.
 
 ## Configuring a task
 

@@ -204,7 +204,12 @@ impl PreparedScalarSegment {
             .dataset
             .open_scalar_index(&search.column, &self.segment_uuid, metrics)
             .await?;
-        if !matches!(index.index_type(), IndexType::BTree | IndexType::Bitmap) {
+        // These implementations can return exact candidates. Keep the runtime
+        // Exact check below: a type alone is not a guarantee for every query.
+        if !matches!(
+            index.index_type(),
+            IndexType::BTree | IndexType::Bitmap | IndexType::LabelList
+        ) {
             return Ok(Some("index_type"));
         }
         // External masks use _rowid, not necessarily physical row addresses.
