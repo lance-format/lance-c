@@ -1270,6 +1270,7 @@ public:
     }
 
     /// Configure whether scalar indices may be used to optimize filters.
+    /// False also disables explicit scalar segment search, retaining its fragment domain.
     Scanner& use_scalar_index(bool enable = true) {
         if (lance_scanner_set_use_scalar_index(handle_.get(), enable) != 0)
             check_error();
@@ -1305,6 +1306,8 @@ public:
     }
 
     /// Configure whether deleted rows still present in storage are returned.
+    /// Requires with_row_id(true); use_scalar_index(false) is needed for filtered scans.
+    /// Incompatible with scalar_index_segment. See lance.h.
     Scanner& include_deleted_rows(bool include_deleted_rows = true) {
         if (lance_scanner_set_include_deleted_rows(handle_.get(), include_deleted_rows) != 0)
             check_error();
@@ -1313,6 +1316,8 @@ public:
 
     /// Generate exact candidates from one BTree/Bitmap/LabelList segment.
     /// fragment_ids is required and defines the complete read/fallback domain. See lance.h.
+    /// Requires live rows only: include_deleted_rows(true) is rejected at stream creation.
+    /// use_scalar_index(false) selects the scoped fallback without searching the segment.
     Scanner& scalar_index_segment(const std::array<uint8_t, 16>& segment_uuid) {
         if (lance_scanner_set_scalar_index_segment(handle_.get(), segment_uuid.data()) != 0)
             check_error();

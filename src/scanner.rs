@@ -479,9 +479,10 @@ impl LanceScanner {
                 || self.fts_context.is_some()
                 || self.index_segments.is_some()
                 || self.fts_index_segments.is_some()
+                || self.include_deleted_rows
             {
                 return Err(lance_core::Error::invalid_input_source(
-                    "scalar_index_segment requires an ordinary scan of live rows".into(),
+                    "scalar_index_segment requires an ordinary scan of live rows; vector/FTS queries and include_deleted_rows=true are unsupported".into(),
                 ));
             }
             let fragment_ids = self.fragment_ids.as_ref().filter(|ids| !ids.is_empty())
@@ -492,6 +493,7 @@ impl LanceScanner {
                 dataset: Arc::clone(&self.dataset),
                 segment_uuid,
                 fragment_ids: fragment_ids.clone(),
+                use_scalar_index: self.use_scalar_index.unwrap_or(true),
                 callback: self.scan_statistics_callback.clone(),
             })
         } else {
@@ -896,6 +898,8 @@ macro_rules! scanner_ffi_try {
 
 /// Select one physical scalar index segment. NULL clears the selection.
 /// Requires explicit fragment_ids and an ordinary live-row scan. See the C header.
+/// include_deleted_rows=true is rejected when preparing the scan, even if
+/// use_scalar_index=false selects the scoped non-indexed fallback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_scalar_index_segment(
     scanner: *mut LanceScanner,
@@ -1239,7 +1243,8 @@ unsafe fn scanner_set_scan_in_order_inner(
 /// Configure whether scalar indices may be used to optimize filters.
 ///
 /// Scalar indices are enabled by default in Lance. Must be set before the scan
-/// starts.
+/// starts. False also disables explicit scalar segment search while preserving
+/// the configured fragment domain and snapshot validation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_use_scalar_index(
     scanner: *mut LanceScanner,
@@ -1381,7 +1386,9 @@ unsafe fn scanner_with_row_address_inner(scanner: *mut LanceScanner, enable: boo
 
 /// Configure whether deleted rows still present in storage are returned.
 ///
-/// Deleted rows have a NULL `_rowid`, so callers should also enable row IDs.
+/// Requires with_row_id=true; deleted rows have a NULL `_rowid`.
+/// Filtered scans also need use_scalar_index=false because indices may omit
+/// tombstoned rows. Incompatible with scalar_index_segment.
 /// Must be set before the scan starts.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_include_deleted_rows(

@@ -1015,7 +1015,9 @@ int32_t lance_scanner_set_scan_in_order(LanceScanner* scanner, bool scan_in_orde
  * Configure whether scalar indices may be used to optimize filters.
  *
  * Scalar indices are enabled by default. Disable this to force filter
- * evaluation without scalar indices. This setting is independent of
+ * evaluation without scalar indices, including an explicitly selected scalar
+ * segment (which falls back to a scan of its explicit fragment_ids).
+ * This setting is independent of
  * `lance_scanner_set_use_index`, which controls vector ANN index usage.
  * Must be set before scanning starts.
  */
@@ -1051,7 +1053,11 @@ int32_t lance_scanner_with_row_address(LanceScanner* scanner, bool enable);
 
 /**
  * Configure whether deleted rows still present in storage are returned.
- * Deleted rows have a NULL `_rowid`; callers should also enable row IDs.
+ * Requires with_row_id=true; deleted rows have a NULL `_rowid`.
+ * For filtered scans, also set use_scalar_index=false: indices built after a
+ * deletion may omit tombstoned rows. Incompatible with scalar_index_segment,
+ * even when scalar indices are disabled.
+ * Fragments removed from the current snapshot are not scanned.
  * Must be set before scanning starts.
  */
 int32_t lance_scanner_set_include_deleted_rows(
@@ -1867,16 +1873,20 @@ int32_t lance_scanner_set_index_segments(
  * excluded by fragment_ids; incomplete coverage falls back to a full filtered
  * scan of those fragment_ids. Callers distributing work must assign disjoint
  * fragment domains and separately include any unindexed data they wish to read.
+ * The segment metadata must identify one key field present in the schema.
  *
  * BTree/Bitmap/LabelList searches use a necessary AND-conjunct of the
  * full scanner filter on the selected logical index and require an Exact result.
+ * use_scalar_index=false skips segment search and uses the scoped fallback;
+ * snapshot UUID and fragment validation still applies.
  * AtMost/AtLeast results fall back to a full filtered scan of fragment_ids.
  * All predicates are reapplied during candidate reads; other scalar indices
  * are disabled. Legacy storage, OR/NOT-only filters,
  * overlays, fragment reuse, unsupported index types / result domains
  * and missing coverage use the same domain without an index. No filter also
  * falls back. LIMIT/OFFSET apply after the complete scanner filter, never to the
- * unfiltered candidate set. Vector/FTS queries are rejected.
+ * unfiltered candidate set. Vector/FTS queries and include_deleted_rows=true
+ * are rejected even when use_scalar_index=false; segment mode is live-row-only.
  *
  * UUID bytes are copied. Metadata and final option compatibility are validated
  * when creating the stream. Index corruption or I/O failures remain errors.
