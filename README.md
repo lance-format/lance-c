@@ -68,6 +68,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
 | [x] | Dataset metadata | `lance_dataset_version()`, `lance_dataset_count_rows()`, `lance_dataset_latest_version()` |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
+| [x] | Data-file cache | Optional Foyer memory/disk cache for immutable `data/*.lance` reads |
 
 ## Building
 
@@ -195,6 +196,27 @@ lance::Session session(
     1ULL * 1024 * 1024 * 1024);
 auto ds = lance::Dataset::open_with_session(session, "data.lance");
 auto stats = session.cache_stats();
+```
+
+To add a process-local memory/disk cache for remote Lance data-file reads,
+create the session with Foyer configuration. The cache is deliberately narrow:
+whole-object, single-range, and batched range reads of direct `data/*.lance`
+children are cached. Conditional and versioned reads, plus manifests, deletion
+files, and index files, keep using Lance's normal paths. Use one shared session
+for datasets that share the cache directory.
+
+```cpp
+lance::DataCacheOptions data_cache{
+    "/var/cache/my-service/lance",
+    512ULL * 1024 * 1024,       // memory tier
+    100ULL * 1024 * 1024 * 1024, // disk tier
+    1ULL * 1024 * 1024,         // range-cache block
+};
+lance::Session session(
+    6ULL * 1024 * 1024 * 1024,
+    1ULL * 1024 * 1024 * 1024,
+    data_cache);
+auto ds = lance::Dataset::open_with_session(session, "s3://bucket/data.lance");
 ```
 
 ### Open at a specific version

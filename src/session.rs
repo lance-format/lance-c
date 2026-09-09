@@ -8,12 +8,14 @@ use std::sync::Arc;
 use lance::session::Session;
 use lance_core::Result;
 
+use crate::data_cache::DataCacheFactory;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::runtime::block_on;
 
-/// Opaque handle for sharing Lance metadata and index caches across datasets.
+/// Opaque handle for shared Lance caches across datasets.
 pub struct LanceSession {
     pub(crate) inner: Arc<Session>,
+    pub(crate) data_cache_factory: Option<Arc<dyn DataCacheFactory>>,
 }
 
 /// Snapshot of a session's metadata and index cache statistics.
@@ -48,6 +50,14 @@ fn session_new_inner(
     index_cache_size_bytes: u64,
     metadata_cache_size_bytes: u64,
 ) -> Result<*mut LanceSession> {
+    session_new_with_data_cache_factory(index_cache_size_bytes, metadata_cache_size_bytes, None)
+}
+
+pub(crate) fn session_new_with_data_cache_factory(
+    index_cache_size_bytes: u64,
+    metadata_cache_size_bytes: u64,
+    data_cache_factory: Option<Arc<dyn DataCacheFactory>>,
+) -> Result<*mut LanceSession> {
     let index_cache_size_bytes = u64_to_usize(index_cache_size_bytes, "index_cache_size_bytes")?;
     let metadata_cache_size_bytes =
         u64_to_usize(metadata_cache_size_bytes, "metadata_cache_size_bytes")?;
@@ -58,6 +68,7 @@ fn session_new_inner(
     );
     Ok(Box::into_raw(Box::new(LanceSession {
         inner: Arc::new(session),
+        data_cache_factory,
     })))
 }
 

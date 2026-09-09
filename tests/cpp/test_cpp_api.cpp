@@ -99,6 +99,28 @@ static void test_shared_session(const std::string& uri) {
     PASS();
 }
 
+static void test_data_cache_session(const std::string& uri,
+                                    const std::string& write_uri) {
+    TEST(test_data_cache_session);
+
+    lance::DataCacheOptions options{
+        write_uri + "_foyer_cache",
+        128 * 1024,
+        1024 * 1024,
+        64 * 1024,
+    };
+    auto session = std::make_unique<lance::Session>(
+        0, 16 * 1024 * 1024, options);
+    auto ds = lance::Dataset::open_with_session(*session, uri);
+    auto statistics = ds.data_cache_statistics();
+    assert(statistics.bytes_read_from_cache == 0);
+    assert(statistics.bytes_read_from_remote == 0);
+    session.reset();
+    assert(ds.count_rows() > 0);
+
+    PASS();
+}
+
 static void test_dataset_schema(const std::string& uri) {
     TEST(test_dataset_schema);
 
@@ -929,6 +951,7 @@ int main(int argc, char** argv) {
 
     test_dataset_open(uri);
     test_shared_session(uri);
+    test_data_cache_session(uri, write_uri);
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
     test_scanner_async_stream_ownership(uri);
