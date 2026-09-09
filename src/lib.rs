@@ -39,6 +39,7 @@ mod index_segment;
 mod merge_insert;
 mod restore;
 pub mod runtime;
+mod scalar_segment;
 mod scanner;
 mod session;
 pub mod stream_guard;

@@ -12513,3 +12513,657 @@ fn test_add_columns_stream_null_dataset_consumes_stream() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_stream_consumed(&stream, &drop_count);
 }
+
+// Segment scans deliberately use an unprojected nullable key and a residual
+// predicate so a candidate LIMIT or loss of filter columns changes the answer.
+fn create_scalar_segment_fixture(
+    kind: lance_index::IndexType,
+    stable: bool,
+) -> (tempfile::TempDir, String, Vec<[u8; 16]>) {
+    create_scalar_segment_fixture_with_options(kind, stable, None, &[&[0], &[1]])
+}
+
+fn create_scalar_segment_fixture_with_options(
+    kind: lance_index::IndexType,
+    stable: bool,
+    storage_version: Option<lance_file::version::LanceFileVersion>,
+    segment_fragments: &[&[u32]],
+) -> (tempfile::TempDir, String, Vec<[u8; 16]>) {
+    let key = Arc::new(Int32Array::from(
+        (0..12)
+            .map(|id| if id % 4 == 0 { None } else { Some(id % 3) })
+            .collect::<Vec<_>>(),
+    ));
+    create_scalar_segment_fixture_from_key(kind, stable, storage_version, segment_fragments, key)
+}
+
+fn create_scalar_segment_fixture_from_key(
+    kind: lance_index::IndexType,
+    stable: bool,
+    storage_version: Option<lance_file::version::LanceFileVersion>,
+    segment_fragments: &[&[u32]],
+    key: arrow_array::ArrayRef,
+) -> (tempfile::TempDir, String, Vec<[u8; 16]>) {
+    use lance::dataset::WriteParams;
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("segments").to_str().unwrap().to_owned();
+    let uuids = lance_c::runtime::block_on(async {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("key", key.data_type().clone(), true),
+        ]));
+        let row_count = key.len();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..row_count as i32)),
+                key,
+            ],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: stable,
+                data_storage_version: storage_version,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::try_from(kind).unwrap());
+        let fragments = ds.get_fragments();
+        assert_eq!(fragments.len(), row_count.div_ceil(4));
+        let mut segments = Vec::new();
+        for fragment_ids in segment_fragments {
+            segments.push(
+                ds.create_index_builder(&["key"], kind, &params)
+                    .name("key_idx".into())
+                    .fragments(fragment_ids.to_vec())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let uuids = segments.iter().map(|s| *s.uuid.as_bytes()).collect();
+        ds.commit_existing_index_segments("key_idx", "key", segments)
+            .await
+            .unwrap();
+        uuids
+    });
+    (tmp, uri, uuids)
+}
+
+fn scalar_segment_ids(
+    uri: &str,
+    uuid: &[u8; 16],
+    fragments: &[u64],
+    filter: &str,
+    limit: Option<i64>,
+    offset: i64,
+) -> (Vec<i32>, CapturedScanStatistics) {
+    let uri = c_str(uri);
+    let filter = c_str(filter);
+    let id = c_str("id");
+    let columns = [id.as_ptr(), ptr::null()];
+    let mut captured = CapturedScanStatistics::default();
+    let mut ids = Vec::new();
+    unsafe {
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!ds.is_null());
+        let scanner = lance_scanner_new(ds, columns.as_ptr(), filter.as_ptr());
+        assert!(!scanner.is_null());
+        assert_eq!(
+            lance_scanner_set_fragment_ids(scanner, fragments.as_ptr(), fragments.len()),
+            0
+        );
+        assert_eq!(
+            lance_scanner_set_scalar_index_segment(scanner, uuid.as_ptr()),
+            0
+        );
+        if let Some(limit) = limit {
+            assert_eq!(lance_scanner_set_limit(scanner, limit), 0);
+        }
+        assert_eq!(lance_scanner_set_offset(scanner, offset), 0);
+        assert_eq!(
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast()
+            ),
+            0
+        );
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let rc = lance_scanner_to_arrow_stream(scanner, &mut stream);
+        assert_eq!(
+            rc,
+            0,
+            "{}",
+            if rc != 0 {
+                take_last_error_message()
+            } else {
+                String::new()
+            }
+        );
+        assert_eq!(
+            lance_scanner_set_scalar_index_segment(scanner, ptr::null()),
+            -1
+        );
+        {
+            let reader = ArrowArrayStreamReader::from_raw(&mut stream).unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                assert_eq!(batch.num_columns(), 1);
+                ids.extend(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        lance_scanner_close(scanner);
+        lance_dataset_close(ds);
+    }
+    (ids, captured)
+}
+
+#[test]
+fn test_scalar_segment_scope_residual_limit_and_unindexed_fallback() {
+    for kind in [
+        lance_index::IndexType::BTree,
+        lance_index::IndexType::Bitmap,
+    ] {
+        let (_tmp, uri, uuids) = create_scalar_segment_fixture(kind, false);
+        let (ids, stats) =
+            scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
+        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(stats.calls, 1);
+        assert!(
+            stats
+                .metrics
+                .iter()
+                .any(|(name, _, value)| name == "scalar_segments_searched" && *value == 1)
+        );
+        let (ids, _) =
+            scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", Some(1), 1);
+        assert_eq!(
+            ids,
+            vec![3],
+            "offset and limit must apply after residual filtering"
+        );
+        let (ids, _) = scalar_segment_ids(&uri, &uuids[1], &[1], "key >= 0 AND id >= 2", None, 0);
+        assert_eq!(ids, vec![5, 6, 7]);
+        let (ids, stats) =
+            scalar_segment_ids(&uri, &uuids[0], &[0, 2], "key >= 0 AND id >= 2", None, 0);
+        assert_eq!(
+            ids,
+            vec![2, 3, 9, 10, 11],
+            "partial coverage must not omit unindexed rows"
+        );
+        assert!(
+            stats
+                .metrics
+                .iter()
+                .any(|(name, _, _)| name == "scalar_segment_fallback_partial_coverage")
+        );
+        let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], "key = 99 OR id = 0", None, 0);
+        assert_eq!(
+            ids,
+            vec![0],
+            "OR must not use just one branch as candidates"
+        );
+        assert!(
+            stats
+                .metrics
+                .iter()
+                .any(|(name, _, _)| name == "scalar_segment_fallback_no_driver")
+        );
+        let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0], "key = 99", None, 0);
+        assert!(ids.is_empty());
+    }
+}
+
+#[test]
+fn test_scalar_segment_label_list_exact_candidates() {
+    use arrow_array::builder::{Int32Builder, ListBuilder};
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+
+    for stable in [false, true] {
+        let mut lists = ListBuilder::new(Int32Builder::new());
+        for row in 0..16 {
+            match row {
+                0 | 9 | 13 => lists.append(false),
+                1 | 10 | 14 => lists.append(true),
+                4 => {
+                    lists.values().append_value(7);
+                    lists.append(true);
+                }
+                _ => {
+                    lists.values().append_value(42);
+                    if row == 3 || row == 11 || row == 15 {
+                        lists.values().append_value(7);
+                    }
+                    if row == 6 {
+                        lists.values().append_null();
+                    }
+                    lists.append(true);
+                }
+            }
+        }
+        // S0 covers fragments 0 and 1, S1 covers 2, and 3 is unindexed.
+        let (_tmp, uri, uuids) = create_scalar_segment_fixture_from_key(
+            IndexType::LabelList,
+            stable,
+            None,
+            &[&[0, 1], &[2]],
+            Arc::new(lists.finish()),
+        );
+        let predicate = "array_contains(key, CAST(42 AS INT))";
+        let filter = format!("{predicate} AND id >= 3");
+        for (fragments, expected) in [(vec![0, 1], vec![3, 5, 6, 7]), (vec![0], vec![3])] {
+            let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &fragments, &filter, None, 0);
+            assert_eq!(ids, expected, "stable={stable}");
+            assert_eq!(stats.calls, 1);
+            assert!(
+                stats
+                    .metrics
+                    .iter()
+                    .any(|(name, _, value)| { name == "scalar_segments_searched" && *value == 1 }),
+                "stable={stable}, metrics={:?}",
+                stats.metrics
+            );
+            assert!(
+                !stats
+                    .metrics
+                    .iter()
+                    .any(|(name, _, value)| { name == "scalar_segment_fallbacks" && *value != 0 })
+            );
+        }
+        let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], &filter, Some(1), 1);
+        assert_eq!(ids, vec![5], "limit/offset must follow the residual filter");
+        let (ids, _) = scalar_segment_ids(&uri, &uuids[1], &[2], &filter, None, 0);
+        assert_eq!(ids, vec![8, 11]);
+        let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0, 3], &filter, None, 0);
+        assert_eq!(ids, vec![3, 12, 15]);
+        assert!(stats.metrics.iter().any(|(name, _, value)| {
+            name == "scalar_segment_fallback_partial_coverage" && *value == 1
+        }));
+        let (ids, stats) = scalar_segment_ids(
+            &uri,
+            &uuids[0],
+            &[0],
+            &format!("{predicate} OR id = 0"),
+            None,
+            0,
+        );
+        assert_eq!(ids, vec![0, 2, 3]);
+        assert!(stats.metrics.iter().any(|(name, _, value)| {
+            name == "scalar_segment_fallback_no_driver" && *value == 1
+        }));
+
+        for (predicate, expected) in [
+            (
+                "array_has_all(key, [CAST(42 AS INT), CAST(7 AS INT)])",
+                vec![3],
+            ),
+            (
+                "array_has_any(key, [CAST(42 AS INT), CAST(99 AS INT)])",
+                vec![2, 3, 5, 6, 7],
+            ),
+            ("array_contains(key, CAST(99 AS INT))", vec![]),
+            ("array_contains(key, CAST(NULL AS INT))", vec![]),
+            ("array_has_any(key, [])", vec![]),
+        ] {
+            let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], predicate, None, 0);
+            assert_eq!(ids, expected, "{predicate}, stable={stable}");
+        }
+        // An untyped integer literal casts this Int32 list to Int64. Such
+        // a column expression must retain the scan fallback.
+        let (ids, stats) =
+            scalar_segment_ids(&uri, &uuids[0], &[0, 1], "array_contains(key, 42)", None, 0);
+        assert_eq!(ids, vec![2, 3, 5, 6, 7]);
+        assert!(stats.metrics.iter().any(|(name, _, value)| {
+            name == "scalar_segment_fallback_no_driver" && *value == 1
+        }));
+
+        lance_c::runtime::block_on(async {
+            let mut ds = Dataset::open(&uri).await.unwrap();
+            ds.delete("id = 3").await.unwrap();
+            assert_eq!(ds.load_indices().await.unwrap().len(), 2);
+        });
+        let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], &filter, None, 0);
+        assert_eq!(ids, vec![5, 6, 7]);
+    }
+}
+
+#[test]
+fn test_scalar_segment_text_indices_still_fall_back() {
+    for kind in [lance_index::IndexType::Fm, lance_index::IndexType::NGram] {
+        for stable in [false, true] {
+            let key = Arc::new(StringArray::from(vec![
+                Some("needle"),
+                None,
+                Some(""),
+                Some("other"),
+                Some("needle"),
+                Some("other"),
+                Some(""),
+                None,
+            ]));
+            let (_tmp, uri, uuids) =
+                create_scalar_segment_fixture_from_key(kind, stable, None, &[&[0, 1]], key);
+            for (predicate, expected) in [
+                ("contains(key, 'needle')", vec![0]),
+                ("contains(key, '')", vec![0, 2, 3]),
+            ] {
+                let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], predicate, None, 0);
+                assert_eq!(ids, expected, "{kind:?}, stable={stable}, {predicate}");
+                assert!(
+                    stats.metrics.iter().any(|(name, _, value)| {
+                        name == "scalar_segment_fallbacks" && *value == 1
+                    })
+                );
+                if predicate == "contains(key, 'needle')" {
+                    assert!(stats.metrics.iter().any(|(name, _, value)| {
+                        name == "scalar_segment_fallback_index_type" && *value == 1
+                    }));
+                }
+                assert!(
+                    !stats.metrics.iter().any(|(name, _, value)| {
+                        name == "scalar_segments_searched" && *value != 0
+                    })
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_scalar_segment_legacy_storage_falls_back() {
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+
+    // Three fragments, with one segment covering 0 and 1. Reading only fragment
+    // 0 must retain the full predicate and must not leak rows from fragment 1.
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture_with_options(
+        lance_index::IndexType::BTree,
+        false,
+        Some(LanceFileVersion::Legacy),
+        &[&[0, 1]],
+    );
+    assert_eq!(uuids.len(), 1);
+    lance_c::runtime::block_on(async {
+        let ds = Dataset::open(&uri).await.unwrap();
+        assert_eq!(
+            ds.manifest().data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V1
+        );
+    });
+
+    let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
+    assert_eq!(ids, vec![2, 3]);
+    assert_eq!(stats.calls, 1);
+    assert_eq!(stats.indices_loaded, 0);
+    assert_eq!(stats.index_comparisons, 0);
+    assert!(stats.metrics.iter().any(|(name, _, value)| {
+        name == "scalar_segment_fallback_legacy_storage" && *value == 1
+    }));
+    assert!(
+        !stats
+            .metrics
+            .iter()
+            .any(|(name, _, value)| name == "scalar_segments_searched" && *value != 0)
+    );
+
+    let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", Some(1), 1);
+    assert_eq!(
+        ids,
+        vec![3],
+        "fallback must retain LIMIT/OFFSET after filtering"
+    );
+}
+
+#[test]
+fn test_scalar_segment_stable_row_ids_and_deletes() {
+    use lance::index::DatasetIndexExt;
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture(lance_index::IndexType::BTree, true);
+    lance_c::runtime::block_on(async {
+        let mut ds = Dataset::open(&uri).await.unwrap();
+        ds.delete("id = 2").await.unwrap();
+        assert_eq!(ds.load_indices().await.unwrap().len(), 2);
+    });
+    let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
+    assert_eq!(ids, vec![3]);
+}
+
+#[test]
+fn test_scalar_segment_honors_use_scalar_index_false() {
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0", None, 0);
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert!(
+        stats
+            .metrics
+            .iter()
+            .any(|(name, _, value)| name == "scalar_segments_searched" && *value == 1)
+    );
+
+    let uri = c_str(&uri);
+    unsafe {
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!ds.is_null());
+        for disable_first in [false, true] {
+            for (fragments, filter, limit, offset, expected) in [
+                (vec![0u64], "key >= 0", None, 0, vec![1, 2, 3]),
+                (vec![0, 2], "key >= 0 AND id >= 2", Some(2), 1, vec![3, 9]),
+            ] {
+                let filter = c_str(filter);
+                let scanner = lance_scanner_new(ds, ptr::null(), filter.as_ptr());
+                assert!(!scanner.is_null());
+                assert_eq!(
+                    lance_scanner_set_fragment_ids(scanner, fragments.as_ptr(), fragments.len()),
+                    0
+                );
+                if disable_first {
+                    assert_eq!(lance_scanner_set_use_scalar_index(scanner, false), 0);
+                }
+                assert_eq!(
+                    lance_scanner_set_scalar_index_segment(scanner, uuids[0].as_ptr()),
+                    0
+                );
+                if !disable_first {
+                    assert_eq!(lance_scanner_set_use_scalar_index(scanner, false), 0);
+                }
+                if let Some(limit) = limit {
+                    assert_eq!(lance_scanner_set_limit(scanner, limit), 0);
+                }
+                assert_eq!(lance_scanner_set_offset(scanner, offset), 0);
+                let mut captured = CapturedScanStatistics::default();
+                assert_eq!(
+                    lance_scanner_set_statistics_callback(
+                        scanner,
+                        Some(capture_scan_statistics),
+                        (&mut captured as *mut CapturedScanStatistics).cast(),
+                    ),
+                    0
+                );
+                let mut stream = FFI_ArrowArrayStream::empty();
+                assert_eq!(lance_scanner_to_arrow_stream(scanner, &mut stream), 0);
+                let mut ids = Vec::new();
+                for batch in ArrowArrayStreamReader::from_raw(&mut stream).unwrap() {
+                    let batch = batch.unwrap();
+                    ids.extend_from_slice(
+                        batch
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values(),
+                    );
+                }
+                assert_eq!(ids, expected);
+                assert_eq!(captured.calls, 1);
+                for metric in ["scalar_segments_searched", "scalar_segment_candidate_rows"] {
+                    assert_eq!(
+                        captured
+                            .metrics
+                            .iter()
+                            .filter(|(name, _, _)| name == metric)
+                            .map(|(_, _, value)| *value)
+                            .sum::<u64>(),
+                        0,
+                        "{metric}"
+                    );
+                }
+                assert_eq!(captured.indices_loaded, 0);
+                assert_eq!(captured.index_comparisons, 0);
+                assert!(captured.metrics.iter().any(|(name, _, value)| name
+                    == "scalar_segment_fallback_disabled"
+                    && *value == 1));
+                lance_scanner_close(scanner);
+            }
+        }
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_scalar_segment_rejects_include_deleted_rows_after_index_rebuild() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+    let (_tmp, uri, _) = create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    let uuid = lance_c::runtime::block_on(async {
+        let mut ds = Dataset::open(&uri).await.unwrap();
+        ds.delete("id = 2").await.unwrap();
+        ds.drop_index("key_idx").await.unwrap();
+        // A segment built after the delete cannot return the tombstoned row,
+        // even though its search result is Exact for the indexed live rows.
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let segment = ds
+            .create_index_builder(&["key"], lance_index::IndexType::BTree, &params)
+            .name("key_idx".into())
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let uuid = *segment.uuid.as_bytes();
+        ds.commit_existing_index_segments("key_idx", "key", vec![segment])
+            .await
+            .unwrap();
+        uuid
+    });
+
+    let (ids, _) = scalar_segment_ids(&uri, &uuid, &[0], "key >= 0 AND id >= 2", None, 0);
+    assert_eq!(ids, vec![3], "live-row segment scans remain supported");
+
+    let uri = c_str(&uri);
+    let filter = c_str("key >= 0 AND id >= 2");
+    unsafe {
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!ds.is_null());
+        // Check both setter orders: compatibility is validated at stream creation.
+        for segment_first in [None, Some(false), Some(true)] {
+            let scanner = lance_scanner_new(ds, ptr::null(), filter.as_ptr());
+            assert!(!scanner.is_null());
+            assert_eq!(
+                lance_scanner_set_fragment_ids(scanner, [0u64].as_ptr(), 1),
+                0
+            );
+            assert_eq!(lance_scanner_with_row_id(scanner, true), 0);
+            if segment_first.is_none() {
+                assert_eq!(lance_scanner_set_use_scalar_index(scanner, false), 0);
+            }
+            if segment_first == Some(true) {
+                assert_eq!(
+                    lance_scanner_set_scalar_index_segment(scanner, uuid.as_ptr()),
+                    0
+                );
+            }
+            assert_eq!(lance_scanner_set_include_deleted_rows(scanner, true), 0);
+            if segment_first == Some(false) {
+                assert_eq!(
+                    lance_scanner_set_scalar_index_segment(scanner, uuid.as_ptr()),
+                    0
+                );
+            }
+            let mut stream = FFI_ArrowArrayStream::empty();
+            let rc = lance_scanner_to_arrow_stream(scanner, &mut stream);
+            if segment_first.is_some() {
+                assert_eq!(rc, -1, "segment scans must not silently omit deleted rows");
+                assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+                assert!(take_last_error_message().contains("include_deleted_rows=true"));
+            } else {
+                assert_eq!(rc, 0);
+                let reader = ArrowArrayStreamReader::from_raw(&mut stream).unwrap();
+                let mut ids = Vec::new();
+                for batch in reader {
+                    let batch = batch.unwrap();
+                    ids.extend_from_slice(
+                        batch
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values(),
+                    );
+                }
+                ids.sort_unstable();
+                assert_eq!(
+                    ids,
+                    vec![2, 3],
+                    "ordinary scans can still read tombstoned rows"
+                );
+            }
+            lance_scanner_close(scanner);
+        }
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_scalar_segment_requires_explicit_domain_and_checks_uuid() {
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    let uri = c_str(&uri);
+    let filter = c_str("key >= 0");
+    unsafe {
+        assert_eq!(
+            lance_scanner_set_scalar_index_segment(ptr::null_mut(), ptr::null()),
+            -1
+        );
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        let scanner = lance_scanner_new(ds, ptr::null(), filter.as_ptr());
+        assert_eq!(
+            lance_scanner_set_scalar_index_segment(scanner, uuids[0].as_ptr()),
+            0
+        );
+        let mut batch = ptr::null_mut();
+        assert_eq!(lance_scanner_next(scanner, &mut batch), -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        lance_scanner_close(scanner);
+        let scanner = lance_scanner_new(ds, ptr::null(), filter.as_ptr());
+        assert_eq!(
+            lance_scanner_set_fragment_ids(scanner, [0u64].as_ptr(), 1),
+            0
+        );
+        assert_eq!(
+            lance_scanner_set_scalar_index_segment(scanner, [0u8; 16].as_ptr()),
+            0
+        );
+        assert_eq!(lance_scanner_next(scanner, &mut batch), -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        lance_scanner_close(scanner);
+        lance_dataset_close(ds);
+    }
+}
