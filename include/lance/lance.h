@@ -147,6 +147,13 @@ typedef enum {
     LANCE_METRIC_HAMMING = 3,
 } LanceMetricType;
 
+/** Speed / accuracy tradeoff for approximate vector search. */
+typedef enum {
+    LANCE_APPROX_MODE_FAST     = 0,
+    LANCE_APPROX_MODE_NORMAL   = 1,
+    LANCE_APPROX_MODE_ACCURATE = 2,
+} LanceApproxMode;
+
 typedef enum {
     LANCE_DTYPE_FLOAT32 = 0,
     LANCE_DTYPE_FLOAT16 = 1,
@@ -939,7 +946,8 @@ int32_t lance_scanner_set_batch_size(LanceScanner* scanner, int64_t batch_size);
  * Set the target output batch size in bytes.
  *
  * When set, this takes precedence over the row-based batch size. The value
- * must be greater than zero and must be set before scanning starts.
+ * must be greater than zero and must be set before scanning starts. The call
+ * is rejected without changing scanner state if strict batch sizing is enabled.
  */
 int32_t lance_scanner_set_batch_size_bytes(
     LanceScanner* scanner,
@@ -1002,7 +1010,54 @@ int32_t lance_scanner_set_target_parallelism(
  * they are ready.
  */
 int32_t lance_scanner_set_scan_in_order(LanceScanner* scanner, bool scan_in_order);
+
+/**
+ * Configure whether scalar indices may be used to optimize filters.
+ *
+ * Scalar indices are enabled by default. Disable this to force filter
+ * evaluation without scalar indices. This setting is independent of
+ * `lance_scanner_set_use_index`, which controls vector ANN index usage.
+ * Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_use_scalar_index(
+    LanceScanner* scanner,
+    bool use_scalar_index
+);
+
+/**
+ * Configure whether row-based output batches are strict.
+ *
+ * When enabled, every batch except the last has exactly the configured row
+ * batch size. This may require copying and cannot be combined with a byte-based
+ * batch-size limit. The call is rejected without changing scanner state if a
+ * byte limit is already set. Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_strict_batch_size(
+    LanceScanner* scanner,
+    bool strict_batch_size
+);
+
+/**
+ * Configure whether file statistics may optimize the scan (default: true).
+ * Intended primarily for debugging and benchmarking. Must be set before
+ * scanning starts.
+ */
+int32_t lance_scanner_set_use_stats(LanceScanner* scanner, bool use_stats);
+
 int32_t lance_scanner_with_row_id(LanceScanner* scanner, bool enable);
+
+/** Include or omit the `_rowaddr` metadata column. Must be set before scanning. */
+int32_t lance_scanner_with_row_address(LanceScanner* scanner, bool enable);
+
+/**
+ * Configure whether deleted rows still present in storage are returned.
+ * Deleted rows have a NULL `_rowid`; callers should also enable row IDs.
+ * Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_include_deleted_rows(
+    LanceScanner* scanner,
+    bool include_deleted_rows
+);
 
 /**
  * Restrict scan to the given fragment IDs. Must be called before iteration.
@@ -1723,7 +1778,47 @@ int32_t lance_scanner_nearest(
     uint32_t k
 );
 
-int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t n);
+/**
+ * Set both the minimum and maximum vector-index partition-search bounds.
+ *
+ * This replaces both bounds configured by earlier calls to any nprobes
+ * setter. The value must be greater than zero. Must be set before scanning.
+ */
+int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t nprobes);
+
+/**
+ * Set the minimum number of vector-index partitions to search.
+ * This replaces only the minimum bound; the current maximum is preserved.
+ * Must be greater than zero and no greater than `maximum_nprobes` when set.
+ * An invalid resulting range is rejected without changing either bound.
+ * Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_minimum_nprobes(
+    LanceScanner* scanner,
+    uint32_t minimum_nprobes
+);
+
+/**
+ * Set the maximum number of vector-index partitions to search.
+ * This replaces only the maximum bound; the current minimum is preserved.
+ * Must be greater than zero and no less than `minimum_nprobes` when set.
+ * This only affects prefiltered searches that need more candidates.
+ * An invalid resulting range is rejected without changing either bound.
+ * Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_maximum_nprobes(
+    LanceScanner* scanner,
+    uint32_t maximum_nprobes
+);
+
+/**
+ * Configure the speed / accuracy tradeoff for approximate vector search.
+ * Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_approx_mode(
+    LanceScanner* scanner,
+    LanceApproxMode approx_mode
+);
 
 /**
  * Set vector index partition-search concurrency for each query.
