@@ -249,3 +249,19 @@ fn test_cpp_compilation_and_execution() {
 
     run_test_binary(&binary, &dataset_uri, &write_uri);
 }
+
+/// A fresh C executable must initialize OpenDAL even when archive constructors are omitted.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a C compiler, Python 3, and building the static library"]
+fn test_static_oss_transport() {
+    let (shared_library, _) = build_lance_c();
+    let static_library = shared_library.with_file_name("liblance_c.a");
+    assert!(static_library.exists(), "static library was not built");
+    let status = Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/static_oss_transport_test.py"))
+        .arg(static_library)
+        .status()
+        .expect("failed to run the static OSS transport test");
+    assert!(status.success(), "static OSS HTTP transport test failed");
+}

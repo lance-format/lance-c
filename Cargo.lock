@@ -3803,6 +3803,7 @@ dependencies = [
  "lance-table",
  "libc",
  "log",
+ "opendal",
  "pin-project",
  "prost",
  "snafu",
