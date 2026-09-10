@@ -8,7 +8,7 @@
  * This file is compiled by the Rust integration test to verify that
  * lance.h is valid C and the API works end-to-end.
  *
- * Usage: test_c_api <dataset_uri> <write_uri>
+ * Usage: test_c_api <dataset_uri> <write_uri> <blob_uri>
  */
 
 #include "lance/lance.h"
@@ -215,6 +215,171 @@ static void test_scan_with_limit(const char *uri) {
     if (stream.release) stream.release(&stream);
     lance_scanner_close(scanner);
     lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Copy the Arrow C Data Interface format of the `blob` column of a stream's
+ * schema into `out`; `out` is empty when the column is missing. */
+static void blob_column_format(struct ArrowArrayStream *stream, char *out, size_t out_len) {
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    int rc = stream->get_schema(stream, &schema);
+    ASSERT(rc == 0, "get_schema from stream failed");
+    out[0] = '\0';
+    for (int64_t i = 0; i < schema.n_children; i++) {
+        if (strcmp(schema.children[i]->name, "blob") == 0) {
+            snprintf(out, out_len, "%s", schema.children[i]->format);
+        }
+    }
+    if (schema.release) schema.release(&schema);
+}
+
+static void test_scanner_blob_handling(const char *blob_uri) {
+    printf("  test_scanner_blob_handling... ");
+
+    LanceDataset *ds = lance_dataset_open(blob_uri, NULL, 0);
+    ASSERT(ds != NULL, "blob dataset open failed");
+    uint64_t expected_rows = lance_dataset_count_rows(ds);
+    CHECK_OK();
+
+    char format[16];
+    struct ArrowArrayStream stream;
+
+    /* By default a blob column arrives as its description struct. */
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    memset(&stream, 0, sizeof(stream));
+    int32_t rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+    blob_column_format(&stream, format, sizeof(format));
+    ASSERT(strcmp(format, "+s") == 0, "default blob column should be a struct");
+    if (stream.release) stream.release(&stream);
+    lance_scanner_close(scanner);
+
+    /* ALL_BINARY materializes the bytes as LargeBinary and keeps every row. */
+    scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    rc = lance_scanner_set_blob_handling(scanner, LANCE_BLOB_HANDLING_ALL_BINARY);
+    ASSERT(rc == 0, "set_blob_handling failed");
+    memset(&stream, 0, sizeof(stream));
+    rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+    blob_column_format(&stream, format, sizeof(format));
+    ASSERT(strcmp(format, "Z") == 0, "ALL_BINARY blob column should be LargeBinary");
+
+    uint64_t total_rows = 0;
+    while (1) {
+        struct ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        rc = stream.get_next(&stream, &array);
+        ASSERT(rc == 0, "get_next failed");
+        if (array.release == NULL) {
+            break;
+        }
+        total_rows += (uint64_t)array.length;
+        array.release(&array);
+    }
+    ASSERT(total_rows == expected_rows, "row count mismatch");
+    if (stream.release) stream.release(&stream);
+
+    /* Once the scan has started the setting is rejected. */
+    rc = lance_scanner_set_blob_handling(scanner, LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS);
+    ASSERT(rc == -1, "set_blob_handling after the scan started should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT, "wrong error code");
+    const char *msg = lance_last_error_message();
+    if (msg) lance_free_string(msg);
+
+    printf("rows=%llu... ", (unsigned long long)total_rows);
+    lance_scanner_close(scanner);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Byte `i` of every blob payload in the smoke fixture. */
+static uint8_t blob_byte(size_t i) { return (uint8_t)(i * 7 + 3); }
+
+/* Check that `bytes` are the payload bytes starting at `offset`. */
+static void assert_blob_payload(const uint8_t *bytes, size_t len, size_t offset) {
+    for (size_t i = 0; i < len; i++) {
+        ASSERT(bytes[i] == blob_byte(offset + i), "blob payload mismatch");
+    }
+}
+
+static void test_take_blobs(const char *blob_uri) {
+    printf("  test_take_blobs... ");
+
+    LanceDataset *ds = lance_dataset_open(blob_uri, NULL, 0);
+    ASSERT(ds != NULL, "blob dataset open failed");
+
+    /* The first fragment holds an inline, a packed, a dedicated, an empty and
+     * a null blob, in that order. */
+    const uint64_t indices[] = {0, 1, 2, 3, 4};
+    LanceBlobFile *blobs[5] = {0};
+    int32_t rc = lance_dataset_take_blobs_by_indices(ds, indices, 5, "blob", blobs);
+    ASSERT(rc == 0, "take_blobs_by_indices failed");
+
+    const uint64_t sizes[] = {8, 128, 1024, 0};
+    uint8_t buffer[1024];
+    for (size_t i = 0; i < 4; i++) {
+        ASSERT(blobs[i] != NULL, "a non-null blob should yield a handle");
+        uint64_t size = lance_blob_file_size(blobs[i]);
+        CHECK_OK();
+        ASSERT(size == sizes[i], "blob size mismatch");
+        rc = lance_blob_file_read(blobs[i], buffer, (size_t)size);
+        ASSERT(rc == 0, "blob read failed");
+        assert_blob_payload(buffer, (size_t)size, 0);
+    }
+    ASSERT(blobs[4] == NULL, "a null blob should yield a NULL slot");
+
+    /* Cursor and positional reads on the packed blob. */
+    LanceBlobFile *packed = blobs[1];
+    rc = lance_blob_file_seek(packed, 100);
+    ASSERT(rc == 0, "seek failed");
+    size_t bytes_read = 0;
+    rc = lance_blob_file_read_up_to(packed, buffer, 64, &bytes_read);
+    ASSERT(rc == 0, "read_up_to failed");
+    ASSERT(bytes_read == 28, "read_up_to should stop at the end of the blob");
+    assert_blob_payload(buffer, bytes_read, 100);
+    uint64_t pos = 0;
+    rc = lance_blob_file_tell(packed, &pos);
+    ASSERT(rc == 0, "tell failed");
+    ASSERT(pos == 128, "cursor should be at the end");
+    rc = lance_blob_file_read_range(packed, 40, buffer, 16);
+    ASSERT(rc == 0, "read_range failed");
+    assert_blob_payload(buffer, 16, 40);
+    rc = lance_blob_file_tell(packed, &pos);
+    ASSERT(rc == 0 && pos == 128, "read_range must not move the cursor");
+
+    /* A buffer smaller than the remaining bytes is rejected, not truncated. */
+    rc = lance_blob_file_seek(packed, 0);
+    ASSERT(rc == 0, "seek failed");
+    rc = lance_blob_file_read(packed, buffer, 64);
+    ASSERT(rc == -1, "a short buffer should be rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT, "wrong error code");
+    const char *msg = lance_last_error_message();
+    ASSERT(msg != NULL, "an error message is expected");
+    lance_free_string(msg);
+
+    /* A column that is not a blob column is rejected and leaves `out` alone. */
+    LanceBlobFile *untouched[5] = {0};
+    rc = lance_dataset_take_blobs_by_indices(ds, indices, 5, "raw", untouched);
+    ASSERT(rc == -1, "a non-blob column should be rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT, "wrong error code");
+    msg = lance_last_error_message();
+    if (msg) lance_free_string(msg);
+    for (size_t i = 0; i < 5; i++) {
+        ASSERT(untouched[i] == NULL, "out must stay untouched on error");
+    }
+
+    /* Handles stay readable after the dataset is closed. */
+    lance_dataset_close(ds);
+    rc = lance_blob_file_read_range(blobs[2], 0, buffer, 16);
+    ASSERT(rc == 0, "read after the dataset was closed failed");
+    assert_blob_payload(buffer, 16, 0);
+
+    for (size_t i = 0; i < 5; i++) {
+        lance_blob_file_close(blobs[i]); /* NULL-safe for the null slot */
+    }
     printf("OK\n");
 }
 
@@ -962,19 +1127,22 @@ static void test_delete(const char *write_uri) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri>\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
         return 1;
     }
 
     const char *uri = argv[1];
     const char *write_uri = argv[2];
+    const char *blob_uri = argv[3];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_open_and_metadata(uri);
     test_shared_session(uri);
     test_scan(uri);
     test_scan_with_limit(uri);
+    test_scanner_blob_handling(blob_uri);
+    test_take_blobs(blob_uri);
     test_versions(uri);
     test_restore_to_current(uri);
     test_error_handling();

@@ -194,6 +194,7 @@ typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
+typedef struct LanceBlobFile LanceBlobFile;
 
 /* ─── Shared session ─── */
 
@@ -923,6 +924,180 @@ int32_t lance_dataset_take_rows(
     struct ArrowArrayStream* out
 );
 
+/* ─── Blob v2 random access ─── */
+
+/*
+ * A LanceBlobFile is a file-like handle over one value of a Blob v2 column,
+ * returned by lance_dataset_take_blobs() / lance_dataset_take_blobs_by_indices()
+ * and released with lance_blob_file_close(). It owns what it needs to read,
+ * so it stays valid after the dataset is closed. Not thread-safe per handle;
+ * distinct handles are independent.
+ *
+ * Reads are cursor-based: the cursor starts at 0, lance_blob_file_read() and
+ * lance_blob_file_read_up_to() advance it, lance_blob_file_read_range() does
+ * not, lance_blob_file_seek() sets it.
+ */
+
+/**
+ * Take blob handles by dataset row ID.
+ *
+ * Row IDs are values from the `_rowid` scanner column, not zero-based row
+ * offsets. They must belong to the same dataset snapshot used for this read.
+ *
+ * On success `out[i]` holds the handle for `row_ids[i]`, or NULL when that
+ * blob value is null (an empty blob is a handle of size 0). The caller closes
+ * every non-NULL handle exactly once. On failure `out` is left untouched; a
+ * row ID that does not resolve fails the whole call.
+ *
+ * @param dataset      Open dataset snapshot.
+ * @param row_ids      Array of dataset row IDs. May be NULL only when
+ *                     `num_row_ids` is zero.
+ * @param num_row_ids  Length of `row_ids`. Zero is a no-op that succeeds
+ *                     without writing to `out`.
+ * @param column       Name of a Blob v2 column. Must not be NULL. A missing
+ *                     column, or a column that is not a blob column, is an
+ *                     error.
+ * @param out          Caller-allocated array of at least `num_row_ids`
+ *                     handle pointers. Must not be NULL.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_take_blobs(
+    const LanceDataset* dataset,
+    const uint64_t* row_ids,
+    size_t num_row_ids,
+    const char* column,
+    LanceBlobFile** out
+);
+
+/**
+ * Take blob handles by row index.
+ *
+ * Row indices are 0-based offsets in the dataset, as used by
+ * lance_dataset_take(). Ownership, ordering, NULL slots, and failure
+ * behavior are identical to lance_dataset_take_blobs().
+ *
+ * @param dataset      Open dataset snapshot.
+ * @param indices      Array of 0-based row offsets. May be NULL only when
+ *                     `num_indices` is zero.
+ * @param num_indices  Length of `indices`. Zero is a no-op that succeeds
+ *                     without writing to `out`.
+ * @param column       Name of a Blob v2 column. Must not be NULL.
+ * @param out          Caller-allocated array of at least `num_indices`
+ *                     handle pointers. Must not be NULL.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_take_blobs_by_indices(
+    const LanceDataset* dataset,
+    const uint64_t* indices,
+    size_t num_indices,
+    const char* column,
+    LanceBlobFile** out
+);
+
+/**
+ * Return the size of the blob in bytes.
+ *
+ * Metadata carried by the handle: no storage access, independent of the
+ * cursor, still available after lance_dataset_close().
+ *
+ * @param blob  Blob handle. NULL is an error.
+ * @return The blob size, or 0 on error. A return of 0 may be an empty blob
+ *         or an error; check lance_last_error_code() to tell them apart.
+ */
+uint64_t lance_blob_file_size(const LanceBlobFile* blob);
+
+/**
+ * Read from the current cursor to the end of the blob.
+ *
+ * With the cursor at 0 that is the whole blob. The cursor ends up at the end.
+ * `dst` must hold every remaining byte; a smaller buffer is an error and
+ * reads nothing. At or past the end this writes nothing and succeeds.
+ *
+ * @param blob     Blob handle. NULL is an error.
+ * @param dst      Destination buffer. May be NULL only when no bytes remain
+ *                 from the current cursor.
+ * @param dst_len  Capacity of `dst` in bytes. Must be at least the number of
+ *                 bytes remaining from the cursor, or 0 if the cursor is at
+ *                 or past the end.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_read(LanceBlobFile* blob, uint8_t* dst, size_t dst_len);
+
+/**
+ * Read at most `len` bytes from the current cursor.
+ *
+ * Reads `min(len, size - cursor)` bytes and advances the cursor past them,
+ * so repeated calls walk the blob. At or past the end this writes no bytes,
+ * stores 0 in `*bytes_read`, and succeeds.
+ *
+ * @param blob        Blob handle. NULL is an error.
+ * @param dst         Destination buffer. May be NULL only when `len` is zero.
+ * @param len         Maximum number of bytes to read.
+ * @param bytes_read  Receives the number of bytes actually written to `dst`,
+ *                    never more than `len`. Must not be NULL. Written only on
+ *                    success.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_read_up_to(
+    LanceBlobFile* blob,
+    uint8_t* dst,
+    size_t len,
+    size_t* bytes_read
+);
+
+/**
+ * Read exactly `len` bytes starting at `offset`, without moving the cursor.
+ *
+ * `offset` is blob-relative. A non-empty range that ends past the blob size,
+ * or an `offset` plus `len` that overflows 64 bits, is an error; `len` 0
+ * succeeds without checking `offset`. Nothing is written to `dst` on error.
+ *
+ * @param blob    Blob handle. NULL is an error.
+ * @param offset  Byte offset from the start of the blob.
+ * @param dst     Destination buffer of at least `len` bytes. May be NULL only
+ *                when `len` is zero.
+ * @param len     Number of bytes to read. Zero is a no-op that succeeds.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_read_range(
+    const LanceBlobFile* blob,
+    uint64_t offset,
+    uint8_t* dst,
+    size_t len
+);
+
+/**
+ * Move the cursor to `pos`.
+ *
+ * Seeking past the end of the blob is allowed, mirroring the underlying Lance
+ * API; a subsequent read then returns zero bytes.
+ *
+ * @param blob  Blob handle. NULL is an error.
+ * @param pos   New cursor position, in bytes from the start of the blob.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_seek(LanceBlobFile* blob, uint64_t pos);
+
+/**
+ * Report the current cursor position.
+ *
+ * @param blob  Blob handle. NULL is an error.
+ * @param pos   Receives the cursor position in bytes from the start of the
+ *              blob. Must not be NULL. Written only on success.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_tell(const LanceBlobFile* blob, uint64_t* pos);
+
+/**
+ * Close a blob handle and free it.
+ *
+ * Call exactly once per non-NULL handle; the handle is invalid afterwards.
+ * NULL is a no-op. Never fails and leaves the pending error untouched.
+ *
+ * @param blob  Blob handle, or NULL.
+ */
+void lance_blob_file_close(LanceBlobFile* blob);
+
 /* ─── Scanner builder ─── */
 
 /**
@@ -1058,6 +1233,38 @@ int32_t lance_scanner_set_include_deleted_rows(
     LanceScanner* scanner,
     bool include_deleted_rows
 );
+
+/** How blob columns are materialized by a scan. Validated as an integer. */
+typedef enum {
+    /**
+     * Default: blob columns are returned as descriptor structs and every
+     * other binary column is returned as bytes. The descriptor layout
+     * depends on the storage format of the column: Blob v2 columns yield
+     * (kind, position, size, blob_id, blob_uri), while legacy blob columns
+     * (large_binary tagged `lance-encoding: blob`) yield (position, size).
+     */
+    LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS = 0,
+    /** Every blob column is materialized as bytes (LargeBinary). */
+    LANCE_BLOB_HANDLING_ALL_BINARY = 1,
+    /**
+     * Requests descriptors for every binary column. On lance v11.0.0 only
+     * columns carrying blob metadata are affected; other binary columns keep
+     * their bytes, so this behaves like
+     * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS.
+     */
+    LANCE_BLOB_HANDLING_ALL_DESCRIPTIONS = 2,
+} LanceBlobHandling;
+
+/**
+ * Choose how blob columns are materialized by this scan. Default:
+ * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS. ALL_BINARY pulls the full payload
+ * into the batches, so keep descriptors for large values. Columns without
+ * blob metadata keep their bytes under every mode.
+ *
+ * Must be set before scanning starts; values outside the enum are rejected.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_set_blob_handling(LanceScanner* scanner, LanceBlobHandling handling);
 
 /**
  * Restrict scan to the given fragment IDs. Must be called before iteration.

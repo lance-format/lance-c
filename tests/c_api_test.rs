@@ -17,7 +17,10 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;
-use arrow_array::{Array, Float32Array, Int32Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    Array, BinaryArray, Float32Array, Int32Array, LargeBinaryArray, RecordBatch, StringArray,
+    UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_c::*;
@@ -12512,4 +12515,1492 @@ fn test_add_columns_stream_null_dataset_consumes_stream() {
     assert_eq!(rc, -1);
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_stream_consumed(&stream, &drop_count);
+}
+
+// ---------------------------------------------------------------------------
+// Scanner blob handling
+// ---------------------------------------------------------------------------
+
+// Mirror of the C enum `LanceBlobHandling`; the FFI parameter is an int32.
+const BLOB_HANDLING_BLOBS_DESCRIPTIONS: i32 = 0;
+const BLOB_HANDLING_ALL_BINARY: i32 = 1;
+const BLOB_HANDLING_ALL_DESCRIPTIONS: i32 = 2;
+
+/// Sub-fields of a Blob v2 description struct, in schema order.
+const BLOB_DESCRIPTION_FIELDS: [&str; 5] = ["kind", "position", "size", "blob_id", "blob_uri"];
+
+/// Blob storage thresholds used by [`create_blob_v2_dataset`].
+const BLOB_INLINE_THRESHOLD: usize = 16;
+const BLOB_DEDICATED_THRESHOLD: usize = 256;
+
+/// Blob sizes of the five rows in each fragment: inline, packed and dedicated
+/// against the thresholds above, then an empty blob and a null.
+const BLOB_ROW_SIZES: [Option<usize>; 5] = [Some(8), Some(128), Some(1024), Some(0), None];
+
+/// First `id` of each fragment; also seeds its payloads.
+const BLOB_FRAGMENT_BASE_IDS: [u32; 2] = [0, 100];
+
+/// Blob payload: byte `i` is `(i * 7 + 3 + seed) as u8`.
+fn blob_payload(len: usize, seed: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 + 3 + seed) as u8).collect()
+}
+
+/// One fragment's batch: ids `base_id..base_id + 5`, blobs per
+/// [`BLOB_ROW_SIZES`], `raw-<id>` in the plain binary column (null where the
+/// blob is null).
+fn blob_batch(schema: &Arc<Schema>, base_id: u32) -> RecordBatch {
+    let seed = base_id as usize;
+    let mut blobs = lance::BlobArrayBuilder::new(BLOB_ROW_SIZES.len());
+    for size in BLOB_ROW_SIZES {
+        match size {
+            Some(0) => blobs.push_empty().unwrap(),
+            Some(len) => blobs.push_bytes(blob_payload(len, seed)).unwrap(),
+            None => blobs.push_null().unwrap(),
+        }
+    }
+
+    let ids: Vec<u32> = (0..BLOB_ROW_SIZES.len() as u32)
+        .map(|row| base_id + row)
+        .collect();
+    let raw: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|id| format!("raw-{id}").into_bytes())
+        .collect();
+    let raw_array = BinaryArray::from_iter(
+        raw.iter()
+            .zip(BLOB_ROW_SIZES)
+            .map(|(value, size)| size.map(|_| value.as_slice())),
+    );
+
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(ids)),
+            blobs.finish().unwrap(),
+            Arc::new(raw_array),
+        ],
+    )
+    .unwrap()
+}
+
+/// Two-fragment v2.2 dataset with a blob column, a plain binary column and an
+/// id column; one [`blob_batch`] per entry of [`BLOB_FRAGMENT_BASE_IDS`].
+///
+/// With `enable_stable_row_ids` a `_rowid` goes through the row id index
+/// instead of being the row address.
+fn create_blob_v2_dataset(enable_stable_row_ids: bool) -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("blob_ds").to_str().unwrap().to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        lance::blob_field_with_options(
+            "blob",
+            true,
+            lance::BlobFieldOptions {
+                inline_size_threshold: Some(BLOB_INLINE_THRESHOLD),
+                dedicated_size_threshold: std::num::NonZeroUsize::new(BLOB_DEDICATED_THRESHOLD),
+            },
+        ),
+        Field::new("raw", DataType::Binary, true),
+    ]));
+
+    lance_c::runtime::block_on(async {
+        for (fragment, base_id) in BLOB_FRAGMENT_BASE_IDS.into_iter().enumerate() {
+            let params = lance::dataset::WriteParams {
+                mode: if fragment == 0 {
+                    lance::dataset::WriteMode::Create
+                } else {
+                    lance::dataset::WriteMode::Append
+                },
+                // Blob v2 is a 2.2 storage feature.
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                enable_stable_row_ids,
+                ..Default::default()
+            };
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(
+                    vec![Ok(blob_batch(&schema, base_id))],
+                    schema.clone(),
+                ),
+                &uri,
+                Some(params),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    (tmp, uri)
+}
+
+/// Run the scanner through the C Arrow stream; return its schema and batches.
+fn scan_stream(scanner: *mut LanceScanner) -> (Schema, Vec<RecordBatch>) {
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0,
+        "to_arrow_stream should succeed"
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let schema = reader.schema().as_ref().clone();
+    let batches: Vec<RecordBatch> = reader.map(|batch| batch.unwrap()).collect();
+    (schema, batches)
+}
+
+/// Collect `(id, blob bytes)` pairs from batches whose blob column was
+/// materialized as bytes, sorted by id.
+fn collect_blob_bytes(batches: &[RecordBatch]) -> Vec<(u32, Option<Vec<u8>>)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("id is UInt32");
+        let blobs = batch
+            .column_by_name("blob")
+            .expect("blob column")
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("blob is LargeBinary");
+        for row in 0..batch.num_rows() {
+            let value = (!blobs.is_null(row)).then(|| blobs.value(row).to_vec());
+            rows.push((ids.value(row), value));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+    rows
+}
+
+/// Collect `(id, raw bytes)` pairs from the plain binary column, sorted by id.
+fn collect_raw_bytes(batches: &[RecordBatch]) -> Vec<(u32, Option<Vec<u8>>)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("id is UInt32");
+        let raw = batch
+            .column_by_name("raw")
+            .expect("raw column")
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("raw is Binary");
+        for row in 0..batch.num_rows() {
+            let value = (!raw.is_null(row)).then(|| raw.value(row).to_vec());
+            rows.push((ids.value(row), value));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+    rows
+}
+
+/// Assert that the plain binary column of the fragment based at `base_id`
+/// round-tripped: `raw-<id>` bytes, and null in the last row.
+fn assert_raw_bytes_of_fragment(rows: &[(u32, Option<Vec<u8>>)], base_id: u32) {
+    let row = |id: u32| -> &Option<Vec<u8>> {
+        &rows
+            .iter()
+            .find(|(row_id, _)| *row_id == id)
+            .unwrap_or_else(|| panic!("row {id} missing from scan output"))
+            .1
+    };
+
+    for offset in 0..4 {
+        let id = base_id + offset;
+        assert_eq!(
+            row(id).as_deref(),
+            Some(format!("raw-{id}").as_bytes()),
+            "plain binary payload of row {id} must round-trip byte for byte"
+        );
+    }
+    assert_eq!(
+        row(base_id + 4),
+        &None,
+        "null plain binary value must stay null"
+    );
+}
+
+/// Assert that the five rows written for `base_id` round-tripped byte for byte.
+fn assert_blob_bytes_of_fragment(rows: &[(u32, Option<Vec<u8>>)], base_id: u32) {
+    let row = |id: u32| -> &Option<Vec<u8>> {
+        &rows
+            .iter()
+            .find(|(row_id, _)| *row_id == id)
+            .unwrap_or_else(|| panic!("row {id} missing from scan output"))
+            .1
+    };
+    let seed = base_id as usize;
+
+    assert_eq!(
+        row(base_id).as_deref(),
+        Some(blob_payload(8, seed).as_slice()),
+        "inline blob (8 bytes) must round-trip byte for byte"
+    );
+    assert_eq!(
+        row(base_id + 1).as_deref(),
+        Some(blob_payload(128, seed).as_slice()),
+        "packed blob (128 bytes) must round-trip byte for byte"
+    );
+    assert_eq!(
+        row(base_id + 2).as_deref(),
+        Some(blob_payload(1024, seed).as_slice()),
+        "dedicated blob (1024 bytes) must round-trip byte for byte"
+    );
+    assert_eq!(
+        row(base_id + 3).as_deref(),
+        Some([].as_slice()),
+        "empty blob must be a zero-length, non-null value"
+    );
+    assert_eq!(row(base_id + 4), &None, "null blob must stay null");
+}
+
+/// Assert that the named field is a blob description struct.
+fn assert_blob_description_field(schema: &Schema, name: &str) {
+    let field = schema.field_with_name(name).expect("field exists");
+    match field.data_type() {
+        DataType::Struct(children) => {
+            let names: Vec<&str> = children.iter().map(|c| c.name().as_str()).collect();
+            assert_eq!(
+                names, BLOB_DESCRIPTION_FIELDS,
+                "{name} should be a blob description struct"
+            );
+        }
+        other => panic!("{name} should be a blob description struct, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_scanner_blob_handling_all_binary_materializes_bytes() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_BINARY) },
+        0
+    );
+
+    let (schema, batches) = scan_stream(scanner);
+    let blob_field = schema.field_with_name("blob").expect("blob column");
+    assert_eq!(
+        *blob_field.data_type(),
+        DataType::LargeBinary,
+        "ALL_BINARY should materialize the blob column as bytes"
+    );
+
+    // Neither blob marker survives materialization (lance v11), so a C caller
+    // cannot tell a materialized blob from a plain binary column by metadata.
+    let metadata = blob_field.metadata();
+    assert!(
+        !metadata.contains_key("lance-encoding:blob"),
+        "the blob marker should not survive materialization: {metadata:?}"
+    );
+    assert!(
+        !metadata.contains_key("ARROW:extension:name"),
+        "the blob v2 extension name should not survive materialization: {metadata:?}"
+    );
+
+    let rows = collect_blob_bytes(&batches);
+    assert_eq!(rows.len(), 10, "both fragments should be scanned");
+    assert_blob_bytes_of_fragment(&rows, 0);
+    assert_blob_bytes_of_fragment(&rows, 100);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_defaults_to_descriptions() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // Without the setter, and with an explicit BLOBS_DESCRIPTIONS, the blob
+    // column is a description struct while plain binary columns stay bytes.
+    for handling in [None, Some(BLOB_HANDLING_BLOBS_DESCRIPTIONS)] {
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+        assert!(!scanner.is_null());
+        if let Some(handling) = handling {
+            assert_eq!(
+                unsafe { lance_scanner_set_blob_handling(scanner, handling) },
+                0
+            );
+        }
+
+        let (schema, batches) = scan_stream(scanner);
+        assert_blob_description_field(&schema, "blob");
+        assert_eq!(
+            *schema
+                .field_with_name("raw")
+                .expect("raw column")
+                .data_type(),
+            DataType::Binary,
+            "a plain binary column stays bytes under {handling:?}"
+        );
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            10,
+            "both fragments should be scanned under {handling:?}"
+        );
+
+        let raw_rows = collect_raw_bytes(&batches);
+        assert_raw_bytes_of_fragment(&raw_rows, 0);
+        assert_raw_bytes_of_fragment(&raw_rows, 100);
+
+        unsafe { lance_scanner_close(scanner) };
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_all_descriptions() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_DESCRIPTIONS) },
+        0
+    );
+
+    let (schema, batches) = scan_stream(scanner);
+    assert_blob_description_field(&schema, "blob");
+    // On lance v11 ALL_DESCRIPTIONS only rewrites fields with blob metadata
+    // (`Field::unloaded_mut` is gated on `is_blob`), so `raw` keeps its bytes.
+    assert_eq!(
+        *schema
+            .field_with_name("raw")
+            .expect("raw column")
+            .data_type(),
+        DataType::Binary,
+        "a column without blob metadata is not turned into a description"
+    );
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        10,
+        "both fragments should be scanned"
+    );
+
+    let raw_rows = collect_raw_bytes(&batches);
+    assert_raw_bytes_of_fragment(&raw_rows, 0);
+    assert_raw_bytes_of_fragment(&raw_rows, 100);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_rejected_after_scan_started() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0
+    );
+    // Release the stream; the scan has started either way.
+    drop(unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap());
+
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_BINARY) },
+        -1,
+        "blob handling must not change once the scan has started"
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("blob_handling must be set before the scan starts"),
+        "unexpected error: {message}"
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_rejects_invalid_values() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    for invalid in [3, -1] {
+        assert_eq!(
+            unsafe { lance_scanner_set_blob_handling(scanner, invalid) },
+            -1,
+            "blob_handling {invalid} should be rejected"
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = take_last_error_message();
+        assert!(
+            message.contains(&format!("got {invalid}")),
+            "error for {invalid} should name the rejected value: {message}"
+        );
+    }
+
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(ptr::null_mut(), BLOB_HANDLING_ALL_BINARY) },
+        -1,
+        "NULL scanner should be rejected"
+    );
+
+    // A rejected value leaves the default handling in place.
+    let (schema, _batches) = scan_stream(scanner);
+    assert_blob_description_field(&schema, "blob");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_all_binary_with_fragment_ids() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+
+    let mut fragment_ids = vec![0u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, fragment_ids.as_mut_ptr()) },
+        0
+    );
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, fragment_ids[1..].as_ptr(), 1) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_BINARY) },
+        0
+    );
+
+    let (schema, batches) = scan_stream(scanner);
+    assert_eq!(
+        *schema
+            .field_with_name("blob")
+            .expect("blob column")
+            .data_type(),
+        DataType::LargeBinary
+    );
+
+    let rows = collect_blob_bytes(&batches);
+    assert_eq!(
+        rows.len(),
+        5,
+        "only the selected fragment should be scanned"
+    );
+    assert!(
+        rows.iter().all(|(id, _)| (100..105).contains(id)),
+        "unexpected rows from the unselected fragment: {:?}",
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
+    assert_blob_bytes_of_fragment(&rows, 100);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ---------------------------------------------------------------------------
+// Blob v2 random access
+// ---------------------------------------------------------------------------
+
+/// Row offset (in `id` order) of the packed blob used by the cursor tests.
+const PACKED_BLOB_ROW: usize = 1;
+/// Row offset (in `id` order) of the dedicated blob used by the cursor tests.
+const DEDICATED_BLOB_ROW: usize = 2;
+
+/// Expected bytes at row offset `row` (in `id` order); `None` for the null row.
+fn expected_blob(row: usize) -> Option<Vec<u8>> {
+    let fragment = row / BLOB_ROW_SIZES.len();
+    let seed = BLOB_FRAGMENT_BASE_IDS[fragment] as usize;
+    BLOB_ROW_SIZES[row % BLOB_ROW_SIZES.len()].map(|len| blob_payload(len, seed))
+}
+
+/// Row ids of every row in `id` order, read through the scanner.
+fn scan_blob_row_ids(dataset: *const LanceDataset) -> Vec<u64> {
+    let id_column = c_str("id");
+    let columns: [*const c_char; 2] = [id_column.as_ptr(), ptr::null()];
+    let scanner = unsafe { lance_scanner_new(dataset, columns.as_ptr(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(unsafe { lance_scanner_with_row_id(scanner, true) }, 0);
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+
+    let mut rows: Vec<(u32, u64)> = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((ids.value(row), row_ids.value(row)));
+        }
+    }
+    unsafe { lance_scanner_close(scanner) };
+
+    rows.sort_by_key(|(id, _)| *id);
+    rows.into_iter().map(|(_, row_id)| row_id).collect()
+}
+
+/// Take every blob of the dataset by row ID, asserting the call succeeds.
+fn take_all_blobs(dataset: *const LanceDataset) -> Vec<*mut LanceBlobFile> {
+    let row_ids = scan_blob_row_ids(dataset);
+    assert_eq!(
+        row_ids.len(),
+        2 * BLOB_ROW_SIZES.len(),
+        "two fragments of five rows"
+    );
+
+    let column = c_str("blob");
+    let mut handles = vec![ptr::null_mut::<LanceBlobFile>(); row_ids.len()];
+    let rc = unsafe {
+        lance_dataset_take_blobs(
+            dataset,
+            row_ids.as_ptr(),
+            row_ids.len(),
+            column.as_ptr(),
+            handles.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rc, 0, "take_blobs failed: {}", take_last_error_message());
+    handles
+}
+
+/// Read a handle from its current cursor to the end, asserting success.
+fn read_blob_to_end(handle: *mut LanceBlobFile) -> Vec<u8> {
+    let size = unsafe { lance_blob_file_size(handle) };
+    let mut cursor = 0u64;
+    assert_eq!(unsafe { lance_blob_file_tell(handle, &mut cursor) }, 0);
+    let mut buffer = vec![0u8; size.saturating_sub(cursor) as usize];
+    assert_eq!(
+        unsafe { lance_blob_file_read(handle, buffer.as_mut_ptr(), buffer.len()) },
+        0,
+        "read failed: {}",
+        take_last_error_message()
+    );
+    buffer
+}
+
+/// Close every handle; NULL slots are accepted.
+fn close_blob_handles(handles: &[*mut LanceBlobFile]) {
+    for handle in handles {
+        unsafe { lance_blob_file_close(*handle) };
+    }
+}
+
+#[test]
+fn test_blob_take_by_row_ids_covers_every_storage_layout() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+
+    // Input order, both fragments: inline, packed, dedicated, empty, null.
+    for (row, handle) in handles.iter().copied().enumerate() {
+        match expected_blob(row) {
+            None => assert!(
+                handle.is_null(),
+                "row {row}: a null blob must yield a NULL slot"
+            ),
+            Some(expected) => {
+                assert!(
+                    !handle.is_null(),
+                    "row {row}: a non-null blob must yield a handle"
+                );
+                assert_eq!(
+                    unsafe { lance_blob_file_size(handle) },
+                    expected.len() as u64,
+                    "row {row}: size must match the written payload"
+                );
+                assert_eq!(read_blob_to_end(handle), expected, "row {row}: bytes");
+            }
+        }
+    }
+
+    // An empty blob is a real handle of size 0, not a NULL slot.
+    let empty = handles[3];
+    assert!(!empty.is_null());
+    assert_eq!(unsafe { lance_blob_file_size(empty) }, 0);
+    let mut untouched = [0xABu8; 4];
+    assert_eq!(
+        unsafe { lance_blob_file_read(empty, untouched.as_mut_ptr(), untouched.len()) },
+        0,
+        "reading an empty blob failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(untouched, [0xABu8; 4], "an empty blob must write no bytes");
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_take_by_indices_matches_take_by_row_ids() {
+    assert_blob_take_by_indices_matches_row_ids(false);
+}
+
+#[test]
+fn test_blob_take_by_indices_matches_take_by_row_ids_with_stable_row_ids() {
+    // With stable row ids a `_rowid` is not the row address.
+    assert_blob_take_by_indices_matches_row_ids(true);
+}
+
+fn assert_blob_take_by_indices_matches_row_ids(enable_stable_row_ids: bool) {
+    let (_tmp, uri) = create_blob_v2_dataset(enable_stable_row_ids);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let by_row_id = take_all_blobs(ds);
+
+    let indices = (0..2 * BLOB_ROW_SIZES.len() as u64).collect::<Vec<_>>();
+    let column = c_str("blob");
+    let mut by_index = vec![ptr::null_mut::<LanceBlobFile>(); indices.len()];
+    let rc = unsafe {
+        lance_dataset_take_blobs_by_indices(
+            ds,
+            indices.as_ptr(),
+            indices.len(),
+            column.as_ptr(),
+            by_index.as_mut_ptr(),
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "take_blobs_by_indices failed: {}",
+        take_last_error_message()
+    );
+
+    for row in 0..indices.len() {
+        match (by_row_id[row].is_null(), by_index[row].is_null()) {
+            (true, true) => continue,
+            (false, false) => assert_eq!(
+                read_blob_to_end(by_index[row]),
+                read_blob_to_end(by_row_id[row]),
+                "row {row}: both addressing schemes must return the same bytes"
+            ),
+            (row_id_null, index_null) => panic!(
+                "row {row}: NULL slots disagree (by row id: {row_id_null}, by index: {index_null})"
+            ),
+        }
+    }
+
+    close_blob_handles(&by_row_id);
+    close_blob_handles(&by_index);
+    unsafe { lance_dataset_close(ds) };
+}
+
+/// Rows requested out of storage order: two fragments, a repeated row, and a
+/// null blob in the middle.
+const PERMUTED_ROWS: [usize; 5] = [7, 2, 2, 9, 0];
+
+#[test]
+fn test_blob_take_preserves_permuted_and_duplicated_input_order() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let all_row_ids = scan_blob_row_ids(ds);
+    let row_ids = PERMUTED_ROWS
+        .iter()
+        .map(|row| all_row_ids[*row])
+        .collect::<Vec<_>>();
+    let indices = PERMUTED_ROWS
+        .iter()
+        .map(|row| *row as u64)
+        .collect::<Vec<_>>();
+    let column = c_str("blob");
+
+    for (entry_point, ids) in [("row ids", &row_ids), ("indices", &indices)] {
+        let mut handles = vec![ptr::null_mut::<LanceBlobFile>(); ids.len()];
+        let rc = if entry_point == "row ids" {
+            unsafe {
+                lance_dataset_take_blobs(
+                    ds,
+                    ids.as_ptr(),
+                    ids.len(),
+                    column.as_ptr(),
+                    handles.as_mut_ptr(),
+                )
+            }
+        } else {
+            unsafe {
+                lance_dataset_take_blobs_by_indices(
+                    ds,
+                    ids.as_ptr(),
+                    ids.len(),
+                    column.as_ptr(),
+                    handles.as_mut_ptr(),
+                )
+            }
+        };
+        assert_eq!(
+            rc,
+            0,
+            "{entry_point}: take failed: {}",
+            take_last_error_message()
+        );
+
+        for (slot, row) in PERMUTED_ROWS.iter().copied().enumerate() {
+            let handle = handles[slot];
+            match expected_blob(row) {
+                None => assert!(
+                    handle.is_null(),
+                    "{entry_point}: slot {slot} (row {row}) must be NULL"
+                ),
+                Some(expected) => {
+                    assert!(
+                        !handle.is_null(),
+                        "{entry_point}: slot {slot} (row {row}) must hold a handle"
+                    );
+                    assert_eq!(
+                        unsafe { lance_blob_file_size(handle) },
+                        expected.len() as u64,
+                        "{entry_point}: slot {slot} (row {row}) size"
+                    );
+                    assert_eq!(
+                        read_blob_to_end(handle),
+                        expected,
+                        "{entry_point}: slot {slot} (row {row}) bytes"
+                    );
+                }
+            }
+        }
+
+        // Duplicate rows get independent handles with their own cursors.
+        assert_eq!(unsafe { lance_blob_file_seek(handles[1], 0) }, 0);
+        let mut first = u64::MAX;
+        let mut second = u64::MAX;
+        assert_eq!(unsafe { lance_blob_file_tell(handles[1], &mut first) }, 0);
+        assert_eq!(unsafe { lance_blob_file_tell(handles[2], &mut second) }, 0);
+        assert_eq!(first, 0, "{entry_point}: the rewound duplicate");
+        assert_eq!(
+            second,
+            unsafe { lance_blob_file_size(handles[2]) },
+            "{entry_point}: duplicates must not share a cursor"
+        );
+
+        close_blob_handles(&handles);
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_fixture_uses_all_three_storage_layouts() {
+    // The fixture must really produce three storage kinds; only the Rust API
+    // exposes the kind.
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let kinds = lance_c::runtime::block_on(async {
+        let dataset = Arc::new(Dataset::open(&uri).await.unwrap());
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1, 2], "blob")
+            .await
+            .unwrap();
+        blobs
+            .into_iter()
+            .map(|blob| blob.unwrap().kind())
+            .collect::<Vec<_>>()
+    });
+
+    use lance_core::datatypes::BlobKind;
+    assert_eq!(
+        kinds,
+        vec![BlobKind::Inline, BlobKind::Packed, BlobKind::Dedicated],
+        "the 8, 128 and 1024 byte rows must land in three different layouts"
+    );
+}
+
+#[test]
+fn test_blob_cursor_advances_only_on_sequential_reads() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let payload = expected_blob(PACKED_BLOB_ROW).unwrap();
+    let size = unsafe { lance_blob_file_size(blob) };
+    assert_eq!(size, payload.len() as u64);
+
+    let mut cursor = u64::MAX;
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 0, "a fresh handle starts at the beginning");
+
+    // A short read moves the cursor by exactly what it read.
+    let mut buffer = vec![0u8; 32];
+    let mut bytes_read = usize::MAX;
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_up_to(blob, buffer.as_mut_ptr(), buffer.len(), &mut bytes_read)
+        },
+        0,
+        "read_up_to failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(bytes_read, 32);
+    assert_eq!(buffer, payload[..32]);
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 32);
+
+    // Asking for more than remains reads only what is left.
+    let mut rest = vec![0u8; payload.len()];
+    assert_eq!(
+        unsafe { lance_blob_file_read_up_to(blob, rest.as_mut_ptr(), rest.len(), &mut bytes_read) },
+        0,
+        "read_up_to failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(bytes_read, payload.len() - 32);
+    assert_eq!(&rest[..bytes_read], &payload[32..]);
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, size);
+
+    // At the end, read_up_to reports zero bytes instead of failing.
+    assert_eq!(
+        unsafe { lance_blob_file_read_up_to(blob, rest.as_mut_ptr(), rest.len(), &mut bytes_read) },
+        0
+    );
+    assert_eq!(bytes_read, 0);
+
+    // seek positions the cursor, and read then starts there.
+    assert_eq!(unsafe { lance_blob_file_seek(blob, 64) }, 0);
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 64);
+    let mut tail = vec![0u8; (size - 64) as usize];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, tail.as_mut_ptr(), tail.len()) },
+        0,
+        "read failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(tail, payload[64..]);
+
+    // Seeking past the end is allowed; the read that follows writes nothing.
+    assert_eq!(unsafe { lance_blob_file_seek(blob, size + 16) }, 0);
+    let mut untouched = [0xCDu8; 8];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, untouched.as_mut_ptr(), untouched.len()) },
+        0,
+        "reading past the end failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(untouched, [0xCDu8; 8]);
+
+    // read_range is positional and leaves the cursor wherever it was.
+    assert_eq!(unsafe { lance_blob_file_seek(blob, 5) }, 0);
+    let mut window = vec![0u8; 16];
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, 40, window.as_mut_ptr(), window.len()) },
+        0,
+        "read_range failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(window, payload[40..56]);
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 5, "read_range must not move the cursor");
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_read_rejects_buffer_smaller_than_remaining() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let payload = expected_blob(PACKED_BLOB_ROW).unwrap();
+
+    // One byte short of the whole blob.
+    let mut buffer = vec![0xEEu8; payload.len() - 1];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, buffer.as_mut_ptr(), buffer.len()) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dst_len 127"), "{message}");
+    assert!(message.contains("128 bytes remaining"), "{message}");
+    assert!(message.contains("cursor 0"), "{message}");
+    assert!(message.contains("blob size 128"), "{message}");
+    assert!(
+        buffer.iter().all(|byte| *byte == 0xEE),
+        "a rejected read must not touch the buffer"
+    );
+
+    // The same rejection from a non-zero cursor reports the bytes remaining,
+    // not the blob size.
+    assert_eq!(unsafe { lance_blob_file_seek(blob, 100) }, 0);
+    let mut short = vec![0u8; 27];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, short.as_mut_ptr(), short.len()) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dst_len 27"), "{message}");
+    assert!(message.contains("28 bytes remaining"), "{message}");
+    assert!(message.contains("cursor 100"), "{message}");
+    assert!(message.contains("blob size 128"), "{message}");
+
+    // An exactly sized buffer succeeds.
+    let mut exact = vec![0u8; 28];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, exact.as_mut_ptr(), exact.len()) },
+        0,
+        "read failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(exact, payload[100..]);
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_read_range_rejects_out_of_bounds() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let size = unsafe { lance_blob_file_size(blob) };
+
+    // Four bytes past the end.
+    let mut buffer = vec![0x5Au8; 8];
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, size - 4, buffer.as_mut_ptr(), buffer.len()) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("132"), "{message}");
+    assert!(message.contains("exceeds blob size 128"), "{message}");
+    assert!(
+        buffer.iter().all(|byte| *byte == 0x5A),
+        "a rejected read_range must not touch the buffer"
+    );
+
+    // An offset plus length that overflows 64 bits is rejected before any read.
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, u64::MAX, buffer.as_mut_ptr(), 2) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains(&u64::MAX.to_string()), "{message}");
+    assert!(message.contains("len 2"), "{message}");
+
+    // An empty range succeeds and accepts a NULL destination.
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, 0, ptr::null_mut(), 0) },
+        0,
+        "empty read_range failed: {}",
+        take_last_error_message()
+    );
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_handles_outlive_the_dataset() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+
+    // Handles own their readers; the dataset can go first.
+    unsafe { lance_dataset_close(ds) };
+
+    for (row, handle) in handles.iter().copied().enumerate() {
+        let Some(expected) = expected_blob(row) else {
+            continue;
+        };
+        assert_eq!(
+            unsafe { lance_blob_file_size(handle) },
+            expected.len() as u64,
+            "row {row}: size after the dataset was closed"
+        );
+        assert_eq!(
+            read_blob_to_end(handle),
+            expected,
+            "row {row}: read after the dataset was closed"
+        );
+
+        if expected.is_empty() {
+            continue;
+        }
+        let mut window = vec![0u8; expected.len().min(16)];
+        assert_eq!(
+            unsafe { lance_blob_file_read_range(handle, 0, window.as_mut_ptr(), window.len()) },
+            0,
+            "row {row}: read_range after the dataset was closed: {}",
+            take_last_error_message()
+        );
+        assert_eq!(window, expected[..window.len()], "row {row}: range bytes");
+    }
+
+    close_blob_handles(&handles);
+}
+
+#[test]
+fn test_blob_take_rejects_invalid_arguments() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let row_ids = scan_blob_row_ids(ds);
+    let blob_column = c_str("blob");
+
+    // Sentinel that no rejected call may overwrite; never dereferenced.
+    let sentinel = ptr::without_provenance_mut::<LanceBlobFile>(0xDEAD_BEEF);
+    let mut out = vec![sentinel; row_ids.len()];
+    let assert_out_untouched = |out: &[*mut LanceBlobFile], case: &str| {
+        for (slot, handle) in out.iter().enumerate() {
+            assert_eq!(*handle, sentinel, "{case}: slot {slot} was written");
+        }
+    };
+
+    let missing = c_str("does_not_exist");
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                missing.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    // Read the code first; taking the message clears the error.
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::InvalidArgument,
+        "a misspelled column is a caller error, not an internal one"
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("does_not_exist"), "{message}");
+    assert_out_untouched(&out, "missing column");
+
+    let not_a_blob = c_str("raw");
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                not_a_blob.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("raw"), "{message}");
+    assert!(message.contains("not a blob column"), "{message}");
+    assert_out_untouched(&out, "non-blob column");
+
+    // Zero identifiers is a no-op success that writes nothing.
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(ds, ptr::null(), 0, blob_column.as_ptr(), out.as_mut_ptr())
+        },
+        0,
+        "empty take failed: {}",
+        take_last_error_message()
+    );
+    assert_out_untouched(&out, "zero row ids");
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_indices(
+                ds,
+                ptr::null(),
+                0,
+                blob_column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        0,
+        "empty take by index failed: {}",
+        take_last_error_message()
+    );
+    assert_out_untouched(&out, "zero indices");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(ds, ptr::null(), 1, blob_column.as_ptr(), out.as_mut_ptr())
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("row_ids must not be NULL"), "{message}");
+    assert!(message.contains("num_row_ids = 1"), "{message}");
+    assert_out_untouched(&out, "NULL row_ids");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_indices(
+                ds,
+                ptr::null(),
+                1,
+                blob_column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("indices must not be NULL"), "{message}");
+    assert!(message.contains("num_indices = 1"), "{message}");
+    assert_out_untouched(&out, "NULL indices");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ptr::null(),
+                row_ids.as_ptr(),
+                row_ids.len(),
+                blob_column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dataset must not be NULL"), "{message}");
+    assert_out_untouched(&out, "NULL dataset");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                ptr::null(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("column must not be NULL"), "{message}");
+    assert_out_untouched(&out, "NULL column");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                blob_column.as_ptr(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("out must not be NULL"), "{message}");
+
+    // Invalid UTF-8 in the column name.
+    let invalid_utf8 = CString::new(b"bl\xFFob".to_vec()).unwrap();
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                invalid_utf8.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    assert_out_untouched(&out, "invalid UTF-8 column");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_reads_reject_null_destination_and_out_params() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let size = unsafe { lance_blob_file_size(blob) };
+
+    // A NULL destination is only legal for a request that reads no bytes.
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, ptr::null_mut(), size as usize) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dst must not be NULL"), "{message}");
+
+    let mut bytes_read = usize::MAX;
+    assert_eq!(
+        unsafe { lance_blob_file_read_up_to(blob, ptr::null_mut(), 8, &mut bytes_read) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dst must not be NULL"), "{message}");
+    assert_eq!(
+        bytes_read,
+        usize::MAX,
+        "a rejected read must not report a length"
+    );
+
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, 0, ptr::null_mut(), 8) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dst must not be NULL"), "{message}");
+
+    let mut pos = u64::MAX;
+    assert_eq!(unsafe { lance_blob_file_tell(blob, ptr::null_mut()) }, -1);
+    let message = take_last_error_message();
+    assert!(message.contains("pos must not be NULL"), "{message}");
+
+    // None of the rejections moved the cursor.
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut pos) }, 0);
+    assert_eq!(pos, 0);
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_take_rejects_unknown_row_id() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let column = c_str("blob");
+    let sentinel = ptr::without_provenance_mut::<LanceBlobFile>(0xDEAD_BEEF);
+    let mut out = [sentinel];
+    let unknown = [u64::MAX - 1];
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(ds, unknown.as_ptr(), 1, column.as_ptr(), out.as_mut_ptr())
+        },
+        -1
+    );
+    // The row id decodes to a fragment that does not exist; upstream rejects
+    // the whole call.
+    let message = take_last_error_message();
+    assert!(message.contains("18446744073709551614"), "{message}");
+    assert!(message.contains("non-existent fragment"), "{message}");
+    assert_eq!(out[0], sentinel, "a rejected take must not write `out`");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_take_by_indices_rejects_out_of_range_index() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let column = c_str("blob");
+    let sentinel = ptr::without_provenance_mut::<LanceBlobFile>(0xDEAD_BEEF);
+    let mut out = [sentinel, sentinel];
+    // A valid offset next to one just past the end of the dataset.
+    let indices = [0u64, 2 * BLOB_ROW_SIZES.len() as u64];
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_indices(
+                ds,
+                indices.as_ptr(),
+                indices.len(),
+                column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    // An offset past the end becomes a tombstone address, which upstream
+    // rejects; the valid slot is not written either.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("non-existent fragment"), "{message}");
+    assert_eq!(
+        out,
+        [sentinel, sentinel],
+        "a rejected take must not write `out`"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_read_up_to_requires_bytes_read_out_param() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[DEDICATED_BLOB_ROW];
+    let mut buffer = [0u8; 8];
+
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_up_to(blob, buffer.as_mut_ptr(), buffer.len(), ptr::null_mut())
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("bytes_read must not be NULL"), "{message}");
+
+    // A zero-length request accepts a NULL destination and reports 0 bytes.
+    let mut bytes_read = usize::MAX;
+    assert_eq!(
+        unsafe { lance_blob_file_read_up_to(blob, ptr::null_mut(), 0, &mut bytes_read) },
+        0,
+        "zero-length read_up_to failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(bytes_read, 0);
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_null_handle_is_rejected_without_crashing() {
+    /// Assert that the pending error names the NULL handle.
+    fn assert_null_handle_reported() {
+        let message = take_last_error_message();
+        assert!(message.contains("blob must not be NULL"), "{message}");
+    }
+
+    assert_eq!(unsafe { lance_blob_file_size(ptr::null()) }, 0);
+    assert_ne!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "size must report a NULL handle through the error channel"
+    );
+    assert_null_handle_reported();
+
+    let mut buffer = [0u8; 4];
+    assert_eq!(
+        unsafe { lance_blob_file_read(ptr::null_mut(), buffer.as_mut_ptr(), buffer.len()) },
+        -1
+    );
+    assert_null_handle_reported();
+    let mut bytes_read = 0usize;
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_up_to(
+                ptr::null_mut(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut bytes_read,
+            )
+        },
+        -1
+    );
+    assert_null_handle_reported();
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(ptr::null(), 0, buffer.as_mut_ptr(), buffer.len()) },
+        -1
+    );
+    assert_null_handle_reported();
+    assert_eq!(unsafe { lance_blob_file_seek(ptr::null_mut(), 0) }, -1);
+    assert_null_handle_reported();
+    let mut pos = 0u64;
+    assert_eq!(unsafe { lance_blob_file_tell(ptr::null(), &mut pos) }, -1);
+    assert_null_handle_reported();
+
+    // Closing NULL is a no-op.
+    unsafe { lance_blob_file_close(ptr::null_mut()) };
+}
+
+#[test]
+fn test_blob_close_keeps_the_pending_error_readable() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let mut too_small = [0u8; 4];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, too_small.as_mut_ptr(), too_small.len()) },
+        -1
+    );
+
+    // Closing must not clear an error the caller has not read yet.
+    unsafe { lance_blob_file_close(blob) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("dst_len 4"), "{message}");
+
+    let rest = handles
+        .iter()
+        .copied()
+        .filter(|handle| *handle != blob)
+        .collect::<Vec<_>>();
+    close_blob_handles(&rest);
+    unsafe { lance_dataset_close(ds) };
 }

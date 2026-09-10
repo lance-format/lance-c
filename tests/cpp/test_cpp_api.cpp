@@ -7,7 +7,7 @@
  *
  * Tests the RAII wrappers, exception handling, and builder pattern.
  *
- * Usage: test_cpp_api <dataset_uri> <write_uri>
+ * Usage: test_cpp_api <dataset_uri> <write_uri> <blob_uri>
  */
 
 #include "lance/lance.hpp"
@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -210,6 +211,142 @@ static void test_scanner_async_stream_ownership(const std::string& uri) {
     // library-allocated outer structure. It is also explicitly NULL-safe.
     lance::scanner_async_stream_free(stream);
     lance::scanner_async_stream_free(nullptr);
+
+    PASS();
+}
+
+/// Arrow C Data Interface format of the `blob` column in a stream's schema,
+/// or an empty string when the column is missing.
+static std::string blob_column_format(ArrowArrayStream& stream) {
+    ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    int rc = stream.get_schema(&stream, &schema);
+    assert(rc == 0);
+    std::string format;
+    for (int64_t i = 0; i < schema.n_children; i++) {
+        if (strcmp(schema.children[i]->name, "blob") == 0) {
+            format = schema.children[i]->format;
+        }
+    }
+    if (schema.release) schema.release(&schema);
+    return format;
+}
+
+static void test_scanner_blob_handling(const std::string& blob_uri) {
+    TEST(test_scanner_blob_handling);
+
+    auto ds = lance::Dataset::open(blob_uri);
+
+    // By default a blob column arrives as its description struct ("+s").
+    {
+        auto scanner = ds.scan();
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        assert(blob_column_format(stream) == "+s");
+        if (stream.release) stream.release(&stream);
+    }
+
+    // ALL_BINARY: LargeBinary ("Z"), and every row is still returned.
+    auto scanner = ds.scan();
+    scanner.blob_handling(LANCE_BLOB_HANDLING_ALL_BINARY);
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    assert(blob_column_format(stream) == "Z");
+
+    uint64_t total = 0;
+    while (true) {
+        ArrowArray arr;
+        memset(&arr, 0, sizeof(arr));
+        int rc = stream.get_next(&stream, &arr);
+        assert(rc == 0);
+        if (!arr.release) break;
+        total += (uint64_t)arr.length;
+        arr.release(&arr);
+    }
+    assert(total == ds.count_rows());
+    if (stream.release) stream.release(&stream);
+
+    // Once the scan has started the setting is rejected.
+    bool caught = false;
+    try {
+        scanner.blob_handling(LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS);
+    } catch (const lance::Error& e) {
+        caught = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+
+    printf("rows=%llu... ", (unsigned long long)total);
+    PASS();
+}
+
+/// Byte `i` of every blob payload in the smoke fixture.
+static uint8_t blob_byte(size_t i) { return static_cast<uint8_t>(i * 7 + 3); }
+
+/// Check that `bytes` are the payload bytes starting at `offset`.
+static void assert_blob_payload(const std::vector<uint8_t>& bytes, size_t offset) {
+    for (size_t i = 0; i < bytes.size(); i++) {
+        assert(bytes[i] == blob_byte(offset + i));
+    }
+}
+
+static void test_take_blobs(const std::string& blob_uri) {
+    TEST(test_take_blobs);
+
+    std::vector<std::optional<lance::BlobFile>> survivors;
+    {
+        auto ds = lance::Dataset::open(blob_uri);
+
+        // The first fragment holds an inline, a packed, a dedicated, an empty
+        // and a null blob, in that order.
+        uint64_t indices[] = {0, 1, 2, 3, 4};
+        auto blobs = ds.take_blobs_by_indices(indices, 5, "blob");
+        assert(blobs.size() == 5);
+        const uint64_t sizes[] = {8, 128, 1024, 0};
+        for (size_t i = 0; i < 4; i++) {
+            assert(blobs[i].has_value());
+            assert(blobs[i]->size() == sizes[i]);
+            assert_blob_payload(blobs[i]->read(), 0);
+            assert(blobs[i]->tell() == sizes[i]);
+        }
+        assert(!blobs[4].has_value());
+
+        // Cursor and positional reads on the packed blob.
+        lance::BlobFile& packed = *blobs[1];
+        packed.seek(100);
+        auto tail = packed.read_up_to(64);
+        assert(tail.size() == 28);
+        assert_blob_payload(tail, 100);
+        assert(packed.tell() == 128);
+        auto window = packed.read_range(40, 16);
+        assert(window.size() == 16);
+        assert_blob_payload(window, 40);
+        assert(packed.tell() == 128);
+
+        // The same column by row ID. Without stable row ids a row id is the
+        // row address, so the second fragment starts at 1 << 32.
+        uint64_t row_ids[] = {0, (uint64_t{1} << 32) | 2};
+        survivors = ds.take_blobs(row_ids, 2, "blob");
+        assert(survivors.size() == 2);
+        assert(survivors[0]->size() == 8);
+        assert(survivors[1]->size() == 1024);
+
+        // A column that is not a blob column is rejected.
+        bool caught = false;
+        try {
+            ds.take_blobs_by_indices(indices, 5, "raw");
+        } catch (const lance::Error& e) {
+            caught = true;
+            assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+        }
+        assert(caught);
+    }
+
+    // Handles stay readable after the Dataset is gone.
+    assert_blob_payload(survivors[1]->read(), 0);
+    assert(survivors[1]->tell() == 1024);
 
     PASS();
 }
@@ -926,13 +1063,14 @@ static void test_delete_rows(const std::string& dst_uri) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri>\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
         return 1;
     }
 
     std::string uri(argv[1]);
     std::string write_uri(argv[2]);
+    std::string blob_uri(argv[3]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -940,6 +1078,8 @@ int main(int argc, char** argv) {
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
     test_scanner_async_stream_ownership(uri);
+    test_scanner_blob_handling(blob_uri);
+    test_take_blobs(blob_uri);
     test_dataset_take(uri);
     test_dataset_take_rows(uri);
     test_raii_cleanup(uri);
