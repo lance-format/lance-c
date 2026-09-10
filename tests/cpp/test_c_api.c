@@ -295,6 +295,94 @@ static void test_scanner_blob_handling(const char *blob_uri) {
     printf("OK\n");
 }
 
+/* Byte `i` of every blob payload in the smoke fixture. */
+static uint8_t blob_byte(size_t i) { return (uint8_t)(i * 7 + 3); }
+
+/* Check that `bytes` are the payload bytes starting at `offset`. */
+static void assert_blob_payload(const uint8_t *bytes, size_t len, size_t offset) {
+    for (size_t i = 0; i < len; i++) {
+        ASSERT(bytes[i] == blob_byte(offset + i), "blob payload mismatch");
+    }
+}
+
+static void test_take_blobs(const char *blob_uri) {
+    printf("  test_take_blobs... ");
+
+    LanceDataset *ds = lance_dataset_open(blob_uri, NULL, 0);
+    ASSERT(ds != NULL, "blob dataset open failed");
+
+    /* The first fragment holds an inline, a packed, a dedicated, an empty and
+     * a null blob, in that order. */
+    const uint64_t indices[] = {0, 1, 2, 3, 4};
+    LanceBlobFile *blobs[5] = {0};
+    int32_t rc = lance_dataset_take_blobs_by_indices(ds, indices, 5, "blob", blobs);
+    ASSERT(rc == 0, "take_blobs_by_indices failed");
+
+    const uint64_t sizes[] = {8, 128, 1024, 0};
+    uint8_t buffer[1024];
+    for (size_t i = 0; i < 4; i++) {
+        ASSERT(blobs[i] != NULL, "a non-null blob should yield a handle");
+        uint64_t size = lance_blob_file_size(blobs[i]);
+        CHECK_OK();
+        ASSERT(size == sizes[i], "blob size mismatch");
+        rc = lance_blob_file_read(blobs[i], buffer, (size_t)size);
+        ASSERT(rc == 0, "blob read failed");
+        assert_blob_payload(buffer, (size_t)size, 0);
+    }
+    ASSERT(blobs[4] == NULL, "a null blob should yield a NULL slot");
+
+    /* Cursor and positional reads on the packed blob. */
+    LanceBlobFile *packed = blobs[1];
+    rc = lance_blob_file_seek(packed, 100);
+    ASSERT(rc == 0, "seek failed");
+    size_t bytes_read = 0;
+    rc = lance_blob_file_read_up_to(packed, buffer, 64, &bytes_read);
+    ASSERT(rc == 0, "read_up_to failed");
+    ASSERT(bytes_read == 28, "read_up_to should stop at the end of the blob");
+    assert_blob_payload(buffer, bytes_read, 100);
+    uint64_t pos = 0;
+    rc = lance_blob_file_tell(packed, &pos);
+    ASSERT(rc == 0, "tell failed");
+    ASSERT(pos == 128, "cursor should be at the end");
+    rc = lance_blob_file_read_range(packed, 40, buffer, 16);
+    ASSERT(rc == 0, "read_range failed");
+    assert_blob_payload(buffer, 16, 40);
+    rc = lance_blob_file_tell(packed, &pos);
+    ASSERT(rc == 0 && pos == 128, "read_range must not move the cursor");
+
+    /* A buffer smaller than the remaining bytes is rejected, not truncated. */
+    rc = lance_blob_file_seek(packed, 0);
+    ASSERT(rc == 0, "seek failed");
+    rc = lance_blob_file_read(packed, buffer, 64);
+    ASSERT(rc == -1, "a short buffer should be rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT, "wrong error code");
+    const char *msg = lance_last_error_message();
+    ASSERT(msg != NULL, "an error message is expected");
+    lance_free_string(msg);
+
+    /* A column that is not a blob column is rejected and leaves `out` alone. */
+    LanceBlobFile *untouched[5] = {0};
+    rc = lance_dataset_take_blobs_by_indices(ds, indices, 5, "raw", untouched);
+    ASSERT(rc == -1, "a non-blob column should be rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT, "wrong error code");
+    msg = lance_last_error_message();
+    if (msg) lance_free_string(msg);
+    for (size_t i = 0; i < 5; i++) {
+        ASSERT(untouched[i] == NULL, "out must stay untouched on error");
+    }
+
+    /* Handles stay readable after the dataset is closed. */
+    lance_dataset_close(ds);
+    rc = lance_blob_file_read_range(blobs[2], 0, buffer, 16);
+    ASSERT(rc == 0, "read after the dataset was closed failed");
+    assert_blob_payload(buffer, 16, 0);
+
+    for (size_t i = 0; i < 5; i++) {
+        lance_blob_file_close(blobs[i]); /* NULL-safe for the null slot */
+    }
+    printf("OK\n");
+}
+
 static void test_versions(const char *uri) {
     printf("  test_versions... ");
 
@@ -1054,6 +1142,7 @@ int main(int argc, char **argv) {
     test_scan(uri);
     test_scan_with_limit(uri);
     test_scanner_blob_handling(blob_uri);
+    test_take_blobs(blob_uri);
     test_versions(uri);
     test_restore_to_current(uri);
     test_error_handling();

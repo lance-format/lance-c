@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -278,6 +279,75 @@ static void test_scanner_blob_handling(const std::string& blob_uri) {
     assert(caught);
 
     printf("rows=%llu... ", (unsigned long long)total);
+    PASS();
+}
+
+/// Byte `i` of every blob payload in the smoke fixture.
+static uint8_t blob_byte(size_t i) { return static_cast<uint8_t>(i * 7 + 3); }
+
+/// Check that `bytes` are the payload bytes starting at `offset`.
+static void assert_blob_payload(const std::vector<uint8_t>& bytes, size_t offset) {
+    for (size_t i = 0; i < bytes.size(); i++) {
+        assert(bytes[i] == blob_byte(offset + i));
+    }
+}
+
+static void test_take_blobs(const std::string& blob_uri) {
+    TEST(test_take_blobs);
+
+    std::vector<std::optional<lance::BlobFile>> survivors;
+    {
+        auto ds = lance::Dataset::open(blob_uri);
+
+        // The first fragment holds an inline, a packed, a dedicated, an empty
+        // and a null blob, in that order.
+        uint64_t indices[] = {0, 1, 2, 3, 4};
+        auto blobs = ds.take_blobs_by_indices(indices, 5, "blob");
+        assert(blobs.size() == 5);
+        const uint64_t sizes[] = {8, 128, 1024, 0};
+        for (size_t i = 0; i < 4; i++) {
+            assert(blobs[i].has_value());
+            assert(blobs[i]->size() == sizes[i]);
+            assert_blob_payload(blobs[i]->read(), 0);
+            assert(blobs[i]->tell() == sizes[i]);
+        }
+        assert(!blobs[4].has_value());
+
+        // Cursor and positional reads on the packed blob.
+        lance::BlobFile& packed = *blobs[1];
+        packed.seek(100);
+        auto tail = packed.read_up_to(64);
+        assert(tail.size() == 28);
+        assert_blob_payload(tail, 100);
+        assert(packed.tell() == 128);
+        auto window = packed.read_range(40, 16);
+        assert(window.size() == 16);
+        assert_blob_payload(window, 40);
+        assert(packed.tell() == 128);
+
+        // The same column by row ID. Without stable row ids a row id is the
+        // row address, so the second fragment starts at 1 << 32.
+        uint64_t row_ids[] = {0, (uint64_t{1} << 32) | 2};
+        survivors = ds.take_blobs(row_ids, 2, "blob");
+        assert(survivors.size() == 2);
+        assert(survivors[0]->size() == 8);
+        assert(survivors[1]->size() == 1024);
+
+        // A column that is not a blob column is rejected.
+        bool caught = false;
+        try {
+            ds.take_blobs_by_indices(indices, 5, "raw");
+        } catch (const lance::Error& e) {
+            caught = true;
+            assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+        }
+        assert(caught);
+    }
+
+    // Handles stay readable after the Dataset is gone.
+    assert_blob_payload(survivors[1]->read(), 0);
+    assert(survivors[1]->tell() == 1024);
+
     PASS();
 }
 
@@ -1009,6 +1079,7 @@ int main(int argc, char** argv) {
     test_scanner_fluent(uri);
     test_scanner_async_stream_ownership(uri);
     test_scanner_blob_handling(blob_uri);
+    test_take_blobs(blob_uri);
     test_dataset_take(uri);
     test_dataset_take_rows(uri);
     test_raii_cleanup(uri);
