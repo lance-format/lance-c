@@ -17,7 +17,10 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;
-use arrow_array::{Array, Float32Array, Int32Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    Array, BinaryArray, Float32Array, Int32Array, LargeBinaryArray, RecordBatch, StringArray,
+    UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_c::*;
@@ -12512,4 +12515,525 @@ fn test_add_columns_stream_null_dataset_consumes_stream() {
     assert_eq!(rc, -1);
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_stream_consumed(&stream, &drop_count);
+}
+
+// ---------------------------------------------------------------------------
+// Scanner blob handling
+// ---------------------------------------------------------------------------
+
+// Mirror of the C enum `LanceBlobHandling`; the FFI parameter is an int32.
+const BLOB_HANDLING_BLOBS_DESCRIPTIONS: i32 = 0;
+const BLOB_HANDLING_ALL_BINARY: i32 = 1;
+const BLOB_HANDLING_ALL_DESCRIPTIONS: i32 = 2;
+
+/// Sub-fields of a Blob v2 description struct, in schema order. Legacy blob
+/// columns use a two-field layout instead, which this fixture does not write.
+const BLOB_DESCRIPTION_FIELDS: [&str; 5] = ["kind", "position", "size", "blob_id", "blob_uri"];
+
+/// Blob storage thresholds used by [`create_blob_v2_dataset`]. Given
+/// explicitly so the tests do not depend on the library defaults.
+const BLOB_INLINE_THRESHOLD: usize = 16;
+const BLOB_DEDICATED_THRESHOLD: usize = 256;
+
+/// Payload sizes of the five rows written into each fragment by
+/// [`create_blob_v2_dataset`]; `None` is a null blob. Against the thresholds
+/// above, 8 bytes stays inline in the data file, 128 bytes goes to packed
+/// blob storage, 1024 bytes gets a dedicated blob file, and the fourth row is
+/// a valid but empty blob.
+const BLOB_ROW_SIZES: [Option<usize>; 5] = [Some(8), Some(128), Some(1024), Some(0), None];
+
+/// `id` of the first row of each fragment written by [`create_blob_v2_dataset`].
+/// The gap lets a row's id, and its payload bytes, identify its fragment.
+const BLOB_FRAGMENT_BASE_IDS: [u32; 2] = [0, 100];
+
+/// Deterministic blob payload: byte `i` is `(i * 7 + 3 + seed) as u8`.
+/// `seed` is the fragment's base id so a row's bytes identify its fragment.
+fn blob_payload(len: usize, seed: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 + 3 + seed) as u8).collect()
+}
+
+/// One five-row batch of the blob dataset, with ids `base_id..base_id + 5`
+/// and the blob rows described by [`BLOB_ROW_SIZES`]. The plain binary column
+/// holds `raw-<id>` and is null in the same row as the blob column.
+fn blob_batch(schema: &Arc<Schema>, base_id: u32) -> RecordBatch {
+    let seed = base_id as usize;
+    let mut blobs = lance::BlobArrayBuilder::new(BLOB_ROW_SIZES.len());
+    for size in BLOB_ROW_SIZES {
+        match size {
+            Some(0) => blobs.push_empty().unwrap(),
+            Some(len) => blobs.push_bytes(blob_payload(len, seed)).unwrap(),
+            None => blobs.push_null().unwrap(),
+        }
+    }
+
+    let ids: Vec<u32> = (0..BLOB_ROW_SIZES.len() as u32)
+        .map(|row| base_id + row)
+        .collect();
+    let raw: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|id| format!("raw-{id}").into_bytes())
+        .collect();
+    let raw_array = BinaryArray::from_iter(
+        raw.iter()
+            .zip(BLOB_ROW_SIZES)
+            .map(|(value, size)| size.map(|_| value.as_slice())),
+    );
+
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(ids)),
+            blobs.finish().unwrap(),
+            Arc::new(raw_array),
+        ],
+    )
+    .unwrap()
+}
+
+/// Helper: two-fragment dataset in the v2.2 storage format holding a blob
+/// column (`blob`) and a plain binary column (`raw`) next to an id column.
+/// Each fragment holds the five rows of [`BLOB_ROW_SIZES`], with ids starting
+/// at [`BLOB_FRAGMENT_BASE_IDS`].
+fn create_blob_v2_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("blob_ds").to_str().unwrap().to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        lance::blob_field_with_options(
+            "blob",
+            true,
+            lance::BlobFieldOptions {
+                inline_size_threshold: Some(BLOB_INLINE_THRESHOLD),
+                dedicated_size_threshold: std::num::NonZeroUsize::new(BLOB_DEDICATED_THRESHOLD),
+            },
+        ),
+        Field::new("raw", DataType::Binary, true),
+    ]));
+
+    lance_c::runtime::block_on(async {
+        for (fragment, base_id) in BLOB_FRAGMENT_BASE_IDS.into_iter().enumerate() {
+            let params = lance::dataset::WriteParams {
+                mode: if fragment == 0 {
+                    lance::dataset::WriteMode::Create
+                } else {
+                    lance::dataset::WriteMode::Append
+                },
+                // Blob v2 is a 2.2 storage feature.
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            };
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(
+                    vec![Ok(blob_batch(&schema, base_id))],
+                    schema.clone(),
+                ),
+                &uri,
+                Some(params),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    (tmp, uri)
+}
+
+/// Materialize a scanner through the C Arrow stream entry point and return the
+/// stream schema together with every batch it produced. The stream's `release`
+/// callback runs exactly once, when the reader is dropped.
+fn scan_stream(scanner: *mut LanceScanner) -> (Schema, Vec<RecordBatch>) {
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0,
+        "to_arrow_stream should succeed"
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let schema = reader.schema().as_ref().clone();
+    let batches: Vec<RecordBatch> = reader.map(|batch| batch.unwrap()).collect();
+    (schema, batches)
+}
+
+/// Collect `(id, blob bytes)` pairs from batches whose blob column was
+/// materialized as bytes, sorted by id.
+fn collect_blob_bytes(batches: &[RecordBatch]) -> Vec<(u32, Option<Vec<u8>>)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("id is UInt32");
+        let blobs = batch
+            .column_by_name("blob")
+            .expect("blob column")
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("blob is LargeBinary");
+        for row in 0..batch.num_rows() {
+            let value = (!blobs.is_null(row)).then(|| blobs.value(row).to_vec());
+            rows.push((ids.value(row), value));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+    rows
+}
+
+/// Collect `(id, raw bytes)` pairs from the plain binary column, sorted by id.
+/// That column keeps its bytes under every blob handling mode.
+fn collect_raw_bytes(batches: &[RecordBatch]) -> Vec<(u32, Option<Vec<u8>>)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("id is UInt32");
+        let raw = batch
+            .column_by_name("raw")
+            .expect("raw column")
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("raw is Binary");
+        for row in 0..batch.num_rows() {
+            let value = (!raw.is_null(row)).then(|| raw.value(row).to_vec());
+            rows.push((ids.value(row), value));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+    rows
+}
+
+/// Assert that the plain binary column of the fragment based at `base_id`
+/// round-tripped: `raw-<id>` bytes, and null in the last row.
+fn assert_raw_bytes_of_fragment(rows: &[(u32, Option<Vec<u8>>)], base_id: u32) {
+    let row = |id: u32| -> &Option<Vec<u8>> {
+        &rows
+            .iter()
+            .find(|(row_id, _)| *row_id == id)
+            .unwrap_or_else(|| panic!("row {id} missing from scan output"))
+            .1
+    };
+
+    for offset in 0..4 {
+        let id = base_id + offset;
+        assert_eq!(
+            row(id).as_deref(),
+            Some(format!("raw-{id}").as_bytes()),
+            "plain binary payload of row {id} must round-trip byte for byte"
+        );
+    }
+    assert_eq!(
+        row(base_id + 4),
+        &None,
+        "null plain binary value must stay null"
+    );
+}
+
+/// Assert that the five rows written for `base_id` round-tripped byte for byte.
+fn assert_blob_bytes_of_fragment(rows: &[(u32, Option<Vec<u8>>)], base_id: u32) {
+    let row = |id: u32| -> &Option<Vec<u8>> {
+        &rows
+            .iter()
+            .find(|(row_id, _)| *row_id == id)
+            .unwrap_or_else(|| panic!("row {id} missing from scan output"))
+            .1
+    };
+    let seed = base_id as usize;
+
+    assert_eq!(
+        row(base_id).as_deref(),
+        Some(blob_payload(8, seed).as_slice()),
+        "inline blob (8 bytes) must round-trip byte for byte"
+    );
+    assert_eq!(
+        row(base_id + 1).as_deref(),
+        Some(blob_payload(128, seed).as_slice()),
+        "packed blob (128 bytes) must round-trip byte for byte"
+    );
+    assert_eq!(
+        row(base_id + 2).as_deref(),
+        Some(blob_payload(1024, seed).as_slice()),
+        "dedicated blob (1024 bytes) must round-trip byte for byte"
+    );
+    assert_eq!(
+        row(base_id + 3).as_deref(),
+        Some([].as_slice()),
+        "empty blob must be a zero-length, non-null value"
+    );
+    assert_eq!(row(base_id + 4), &None, "null blob must stay null");
+}
+
+/// Assert that the named field is a blob description struct.
+fn assert_blob_description_field(schema: &Schema, name: &str) {
+    let field = schema.field_with_name(name).expect("field exists");
+    match field.data_type() {
+        DataType::Struct(children) => {
+            let names: Vec<&str> = children.iter().map(|c| c.name().as_str()).collect();
+            assert_eq!(
+                names, BLOB_DESCRIPTION_FIELDS,
+                "{name} should be a blob description struct"
+            );
+        }
+        other => panic!("{name} should be a blob description struct, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_scanner_blob_handling_all_binary_materializes_bytes() {
+    let (_tmp, uri) = create_blob_v2_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_BINARY) },
+        0
+    );
+
+    let (schema, batches) = scan_stream(scanner);
+    let blob_field = schema.field_with_name("blob").expect("blob column");
+    assert_eq!(
+        *blob_field.data_type(),
+        DataType::LargeBinary,
+        "ALL_BINARY should materialize the blob column as bytes"
+    );
+
+    // Measured against lance v11.0.0: neither of the two keys that mark a
+    // column as a blob survives materialization, so a C consumer cannot tell
+    // a materialized blob from a plain binary column by metadata alone. The
+    // field only keeps the two threshold keys echoed from `BlobFieldOptions`.
+    let metadata = blob_field.metadata();
+    assert!(
+        !metadata.contains_key("lance-encoding:blob"),
+        "the blob marker should not survive materialization: {metadata:?}"
+    );
+    assert!(
+        !metadata.contains_key("ARROW:extension:name"),
+        "the blob v2 extension name should not survive materialization: {metadata:?}"
+    );
+
+    let rows = collect_blob_bytes(&batches);
+    assert_eq!(rows.len(), 10, "both fragments should be scanned");
+    assert_blob_bytes_of_fragment(&rows, 0);
+    assert_blob_bytes_of_fragment(&rows, 100);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_defaults_to_descriptions() {
+    let (_tmp, uri) = create_blob_v2_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // Without the setter, and with an explicit BLOBS_DESCRIPTIONS, the blob
+    // column is a description struct while plain binary columns stay bytes.
+    for handling in [None, Some(BLOB_HANDLING_BLOBS_DESCRIPTIONS)] {
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+        assert!(!scanner.is_null());
+        if let Some(handling) = handling {
+            assert_eq!(
+                unsafe { lance_scanner_set_blob_handling(scanner, handling) },
+                0
+            );
+        }
+
+        let (schema, batches) = scan_stream(scanner);
+        assert_blob_description_field(&schema, "blob");
+        assert_eq!(
+            *schema
+                .field_with_name("raw")
+                .expect("raw column")
+                .data_type(),
+            DataType::Binary,
+            "a plain binary column stays bytes under {handling:?}"
+        );
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            10,
+            "both fragments should be scanned under {handling:?}"
+        );
+
+        let raw_rows = collect_raw_bytes(&batches);
+        assert_raw_bytes_of_fragment(&raw_rows, 0);
+        assert_raw_bytes_of_fragment(&raw_rows, 100);
+
+        unsafe { lance_scanner_close(scanner) };
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_all_descriptions() {
+    let (_tmp, uri) = create_blob_v2_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_DESCRIPTIONS) },
+        0
+    );
+
+    let (schema, batches) = scan_stream(scanner);
+    assert_blob_description_field(&schema, "blob");
+    // Measured against lance v11.0.0: a column that is not marked as a blob
+    // keeps its bytes under ALL_DESCRIPTIONS. `BlobHandling::should_unload`
+    // does select every binary-like field, but the rewrite it triggers,
+    // `Field::unloaded_mut`, only replaces fields for which `Field::is_blob`
+    // holds, i.e. fields carrying blob metadata. So on this version
+    // ALL_DESCRIPTIONS and BLOBS_DESCRIPTIONS agree on the output schema.
+    assert_eq!(
+        *schema
+            .field_with_name("raw")
+            .expect("raw column")
+            .data_type(),
+        DataType::Binary,
+        "a column without blob metadata is not turned into a description"
+    );
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        10,
+        "both fragments should be scanned"
+    );
+
+    let raw_rows = collect_raw_bytes(&batches);
+    assert_raw_bytes_of_fragment(&raw_rows, 0);
+    assert_raw_bytes_of_fragment(&raw_rows, 100);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_rejected_after_scan_started() {
+    let (_tmp, uri) = create_blob_v2_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0
+    );
+    // Drop the reader so the stream's release callback runs exactly once.
+    drop(unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap());
+
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_BINARY) },
+        -1,
+        "blob handling must not change once the scan has started"
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("blob_handling must be set before the scan starts"),
+        "unexpected error: {message}"
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_rejects_invalid_values() {
+    let (_tmp, uri) = create_blob_v2_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    for invalid in [3, -1] {
+        assert_eq!(
+            unsafe { lance_scanner_set_blob_handling(scanner, invalid) },
+            -1,
+            "blob_handling {invalid} should be rejected"
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = take_last_error_message();
+        assert!(
+            message.contains(&format!("got {invalid}")),
+            "error for {invalid} should name the rejected value: {message}"
+        );
+    }
+
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(ptr::null_mut(), BLOB_HANDLING_ALL_BINARY) },
+        -1,
+        "NULL scanner should be rejected"
+    );
+
+    // A rejected value leaves the default handling in place.
+    let (schema, _batches) = scan_stream(scanner);
+    assert_blob_description_field(&schema, "blob");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_all_binary_with_fragment_ids() {
+    let (_tmp, uri) = create_blob_v2_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+
+    let mut fragment_ids = vec![0u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, fragment_ids.as_mut_ptr()) },
+        0
+    );
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, fragment_ids[1..].as_ptr(), 1) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_BINARY) },
+        0
+    );
+
+    let (schema, batches) = scan_stream(scanner);
+    assert_eq!(
+        *schema
+            .field_with_name("blob")
+            .expect("blob column")
+            .data_type(),
+        DataType::LargeBinary
+    );
+
+    let rows = collect_blob_bytes(&batches);
+    assert_eq!(
+        rows.len(),
+        5,
+        "only the selected fragment should be scanned"
+    );
+    assert!(
+        rows.iter().all(|(id, _)| (100..105).contains(id)),
+        "unexpected rows from the unselected fragment: {:?}",
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
+    assert_blob_bytes_of_fragment(&rows, 100);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
 }

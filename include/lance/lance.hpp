@@ -1290,6 +1290,14 @@ public:
         return *this;
     }
 
+    /// Choose how blob columns are materialized (default: descriptors for blob
+    /// columns, bytes for every other binary column).
+    Scanner& blob_handling(LanceBlobHandling handling) {
+        if (lance_scanner_set_blob_handling(handle_.get(), handling) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Enable/disable row ID in output.
     Scanner& with_row_id(bool enable = true) {
         if (lance_scanner_with_row_id(handle_.get(), enable) != 0)

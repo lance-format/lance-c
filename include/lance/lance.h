@@ -1059,6 +1059,38 @@ int32_t lance_scanner_set_include_deleted_rows(
     bool include_deleted_rows
 );
 
+/** How blob columns are materialized by a scan. Validated as an integer. */
+typedef enum {
+    /**
+     * Default: blob columns are returned as descriptor structs and every
+     * other binary column is returned as bytes. The descriptor layout
+     * depends on the storage format of the column: Blob v2 columns yield
+     * (kind, position, size, blob_id, blob_uri), while legacy blob columns
+     * (large_binary tagged `lance-encoding: blob`) yield (position, size).
+     */
+    LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS = 0,
+    /** Every blob column is materialized as bytes (LargeBinary). */
+    LANCE_BLOB_HANDLING_ALL_BINARY = 1,
+    /**
+     * Requests descriptors for every binary column. On lance v11.0.0 only
+     * columns carrying blob metadata are affected; other binary columns keep
+     * their bytes, so this behaves like
+     * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS.
+     */
+    LANCE_BLOB_HANDLING_ALL_DESCRIPTIONS = 2,
+} LanceBlobHandling;
+
+/**
+ * Choose how blob columns are materialized by this scan. Default:
+ * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS. ALL_BINARY pulls the full payload
+ * into the batches, so keep descriptors for large values. Columns without
+ * blob metadata keep their bytes under every mode.
+ *
+ * Must be set before scanning starts; values outside the enum are rejected.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_set_blob_handling(LanceScanner* scanner, LanceBlobHandling handling);
+
 /**
  * Restrict scan to the given fragment IDs. Must be called before iteration.
  * @param ids  Array of fragment IDs
