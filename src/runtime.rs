@@ -8,6 +8,11 @@ use std::sync::LazyLock;
 /// Global multi-threaded Tokio runtime, shared across all FFI calls.
 /// Initialized lazily on first access.
 pub static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    // A native linker can omit OpenDAL's automatic constructor from liblance_c.a.
+    // Keep initialization reachable from the FFI entry points, before any HTTP I/O.
+    // Installation is idempotent and preserves an already installed transport.
+    opendal::install_default();
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

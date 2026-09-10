@@ -39,6 +39,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 futures = "0.3"
 log = "0.4"
 libc = "0.2"
+# Explicitly install the HTTP transport when embedded in a static C/C++ executable.
+opendal = { version = "=0.58.2", default-features = false, features = ["http-transport-reqwest"] }
 pin-project = "1.0"
 prost = "0.14"
 snafu = "0.9"
