@@ -213,6 +213,73 @@ public:
     const LanceFtsQueryContext* c_handle() const { return handle_.get(); }
 };
 
+// ─── Blob file ───────────────────────────────────────────────────────────────
+
+/// RAII handle over one value of a Blob v2 column, from `Dataset::take_blobs()`
+/// or `take_blobs_by_indices()`. Stays usable after the Dataset is destroyed.
+/// `read()` and `read_up_to()` advance the cursor, `read_range()` does not.
+/// Not thread-safe per handle.
+class BlobFile {
+    Handle<LanceBlobFile, lance_blob_file_close> handle_;
+
+public:
+    /// Adopt a handle from the C API; closed on destruction.
+    explicit BlobFile(LanceBlobFile* blob) : handle_(blob) {}
+
+    /// Size of the blob in bytes. Independent of the cursor.
+    uint64_t size() const {
+        uint64_t n = lance_blob_file_size(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return n;
+    }
+
+    /// Read from the cursor to the end (the whole blob when the cursor is 0).
+    std::vector<uint8_t> read() {
+        uint64_t blob_size = size();
+        uint64_t cursor = tell();
+        uint64_t remaining = cursor >= blob_size ? 0 : blob_size - cursor;
+        std::vector<uint8_t> out(static_cast<size_t>(remaining));
+        if (lance_blob_file_read(handle_.get(), out.data(), out.size()) != 0)
+            check_error();
+        return out;
+    }
+
+    /// Read at most `len` bytes from the current cursor, advancing it past
+    /// them. The result is shorter than `len` at the end of the blob.
+    std::vector<uint8_t> read_up_to(size_t len) {
+        std::vector<uint8_t> out(len);
+        size_t bytes_read = 0;
+        if (lance_blob_file_read_up_to(
+                handle_.get(), out.data(), len, &bytes_read) != 0)
+            check_error();
+        out.resize(bytes_read);
+        return out;
+    }
+
+    /// Read exactly `len` bytes at `offset` without moving the cursor. The
+    /// range must lie within the blob.
+    std::vector<uint8_t> read_range(uint64_t offset, size_t len) const {
+        std::vector<uint8_t> out(len);
+        if (lance_blob_file_read_range(
+                handle_.get(), offset, out.data(), len) != 0)
+            check_error();
+        return out;
+    }
+
+    /// Move the cursor. Seeking past the end is allowed; reads then return
+    /// no bytes.
+    void seek(uint64_t pos) {
+        if (lance_blob_file_seek(handle_.get(), pos) != 0) check_error();
+    }
+
+    /// Current cursor position, in bytes from the start of the blob.
+    uint64_t tell() const {
+        uint64_t pos = 0;
+        if (lance_blob_file_tell(handle_.get(), &pos) != 0) check_error();
+        return pos;
+    }
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -227,6 +294,19 @@ class Dataset {
         }
         kv.push_back(nullptr);
         return kv;
+    }
+
+    /// Move raw handles into RAII owners. `blobs` must be reserved up front so
+    /// nothing can throw while handles are still unowned.
+    static void adopt_blobs(const std::vector<LanceBlobFile*>& raw,
+                            std::vector<std::optional<BlobFile>>& blobs) {
+        for (auto* blob : raw) {
+            if (blob) {
+                blobs.emplace_back(BlobFile(blob));
+            } else {
+                blobs.emplace_back(std::nullopt);
+            }
+        }
     }
 
 public:
@@ -764,6 +844,43 @@ public:
                 handle_.get(), row_ids, num_row_ids, nullptr, out) != 0) {
             check_error();
         }
+    }
+
+    /// Take blob handles by dataset row ID; element `i` is for `row_ids[i]`,
+    /// `std::nullopt` for a null blob value.
+    std::vector<std::optional<BlobFile>> take_blobs(
+        const uint64_t* row_ids, size_t num_row_ids,
+        const std::string& column) const {
+        std::vector<LanceBlobFile*> raw(num_row_ids, nullptr);
+        std::vector<std::optional<BlobFile>> blobs;
+        blobs.reserve(num_row_ids);
+        // An empty vector's data() may be null, which the C side rejects.
+        if (num_row_ids > 0 &&
+            lance_dataset_take_blobs(handle_.get(), row_ids, num_row_ids,
+                                     column.c_str(), raw.data()) != 0) {
+            check_error();
+        }
+        adopt_blobs(raw, blobs);
+        return blobs;
+    }
+
+    /// Take blob handles by 0-based row index, with the same ownership and
+    /// null-slot semantics as the overload above.
+    std::vector<std::optional<BlobFile>> take_blobs_by_indices(
+        const uint64_t* indices, size_t num_indices,
+        const std::string& column) const {
+        std::vector<LanceBlobFile*> raw(num_indices, nullptr);
+        std::vector<std::optional<BlobFile>> blobs;
+        blobs.reserve(num_indices);
+        // Same empty-request shortcut as take_blobs().
+        if (num_indices > 0 &&
+            lance_dataset_take_blobs_by_indices(
+                handle_.get(), indices, num_indices,
+                column.c_str(), raw.data()) != 0) {
+            check_error();
+        }
+        adopt_blobs(raw, blobs);
+        return blobs;
     }
 
     /// Create a Scanner builder for this dataset.
