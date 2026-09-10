@@ -246,8 +246,7 @@ static void test_scanner_blob_handling(const std::string& blob_uri) {
         if (stream.release) stream.release(&stream);
     }
 
-    // ALL_BINARY materializes it as LargeBinary ("Z") and still yields every
-    // row of both fragments.
+    // ALL_BINARY: LargeBinary ("Z"), and every row is still returned.
     auto scanner = ds.scan();
     scanner.blob_handling(LANCE_BLOB_HANDLING_ALL_BINARY);
     ArrowArrayStream stream;

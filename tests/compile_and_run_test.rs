@@ -130,11 +130,10 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
 
 /// Create a two-fragment Blob v2 dataset on disk and return (TempDir, path_string).
 ///
-/// Each fragment holds five rows next to an `id` column and a plain `raw`
-/// binary column: blobs of 8, 128 and 1024 bytes, which the 16 / 256 byte
-/// thresholds route to inline, packed and dedicated storage, then an empty
-/// blob and a null. Byte `i` of every payload is `(i * 7 + 3) as u8`, the
-/// formula the C and C++ programs check the bytes they read against.
+/// Each fragment has five rows: blobs of 8, 128 and 1024 bytes (inline, packed
+/// and dedicated under the 16 / 256 thresholds), an empty blob and a null,
+/// next to `id` and a plain `raw` binary column. Payload byte `i` is
+/// `(i * 7 + 3) as u8`.
 fn create_blob_dataset_on_disk() -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().join("blob_ds").to_str().unwrap().to_string();

@@ -12526,35 +12526,28 @@ const BLOB_HANDLING_BLOBS_DESCRIPTIONS: i32 = 0;
 const BLOB_HANDLING_ALL_BINARY: i32 = 1;
 const BLOB_HANDLING_ALL_DESCRIPTIONS: i32 = 2;
 
-/// Sub-fields of a Blob v2 description struct, in schema order. Legacy blob
-/// columns use a two-field layout instead, which this fixture does not write.
+/// Sub-fields of a Blob v2 description struct, in schema order.
 const BLOB_DESCRIPTION_FIELDS: [&str; 5] = ["kind", "position", "size", "blob_id", "blob_uri"];
 
-/// Blob storage thresholds used by [`create_blob_v2_dataset`]. Given
-/// explicitly so the tests do not depend on the library defaults.
+/// Blob storage thresholds used by [`create_blob_v2_dataset`].
 const BLOB_INLINE_THRESHOLD: usize = 16;
 const BLOB_DEDICATED_THRESHOLD: usize = 256;
 
-/// Payload sizes of the five rows written into each fragment by
-/// [`create_blob_v2_dataset`]; `None` is a null blob. Against the thresholds
-/// above, 8 bytes stays inline in the data file, 128 bytes goes to packed
-/// blob storage, 1024 bytes gets a dedicated blob file, and the fourth row is
-/// a valid but empty blob.
+/// Blob sizes of the five rows in each fragment: inline, packed and dedicated
+/// against the thresholds above, then an empty blob and a null.
 const BLOB_ROW_SIZES: [Option<usize>; 5] = [Some(8), Some(128), Some(1024), Some(0), None];
 
-/// `id` of the first row of each fragment written by [`create_blob_v2_dataset`].
-/// The gap lets a row's id, and its payload bytes, identify its fragment.
+/// First `id` of each fragment; also seeds its payloads.
 const BLOB_FRAGMENT_BASE_IDS: [u32; 2] = [0, 100];
 
-/// Deterministic blob payload: byte `i` is `(i * 7 + 3 + seed) as u8`.
-/// `seed` is the fragment's base id so a row's bytes identify its fragment.
+/// Blob payload: byte `i` is `(i * 7 + 3 + seed) as u8`.
 fn blob_payload(len: usize, seed: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 + 3 + seed) as u8).collect()
 }
 
-/// One five-row batch of the blob dataset, with ids `base_id..base_id + 5`
-/// and the blob rows described by [`BLOB_ROW_SIZES`]. The plain binary column
-/// holds `raw-<id>` and is null in the same row as the blob column.
+/// One fragment's batch: ids `base_id..base_id + 5`, blobs per
+/// [`BLOB_ROW_SIZES`], `raw-<id>` in the plain binary column (null where the
+/// blob is null).
 fn blob_batch(schema: &Arc<Schema>, base_id: u32) -> RecordBatch {
     let seed = base_id as usize;
     let mut blobs = lance::BlobArrayBuilder::new(BLOB_ROW_SIZES.len());
@@ -12590,10 +12583,8 @@ fn blob_batch(schema: &Arc<Schema>, base_id: u32) -> RecordBatch {
     .unwrap()
 }
 
-/// Helper: two-fragment dataset in the v2.2 storage format holding a blob
-/// column (`blob`) and a plain binary column (`raw`) next to an id column.
-/// Each fragment holds the five rows of [`BLOB_ROW_SIZES`], with ids starting
-/// at [`BLOB_FRAGMENT_BASE_IDS`].
+/// Two-fragment v2.2 dataset with a blob column, a plain binary column and an
+/// id column; one [`blob_batch`] per entry of [`BLOB_FRAGMENT_BASE_IDS`].
 fn create_blob_v2_dataset() -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().join("blob_ds").to_str().unwrap().to_string();
@@ -12639,9 +12630,7 @@ fn create_blob_v2_dataset() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
-/// Materialize a scanner through the C Arrow stream entry point and return the
-/// stream schema together with every batch it produced. The stream's `release`
-/// callback runs exactly once, when the reader is dropped.
+/// Run the scanner through the C Arrow stream; return its schema and batches.
 fn scan_stream(scanner: *mut LanceScanner) -> (Schema, Vec<RecordBatch>) {
     let mut ffi_stream = FFI_ArrowArrayStream::empty();
     assert_eq!(
@@ -12682,7 +12671,6 @@ fn collect_blob_bytes(batches: &[RecordBatch]) -> Vec<(u32, Option<Vec<u8>>)> {
 }
 
 /// Collect `(id, raw bytes)` pairs from the plain binary column, sorted by id.
-/// That column keeps its bytes under every blob handling mode.
 fn collect_raw_bytes(batches: &[RecordBatch]) -> Vec<(u32, Option<Vec<u8>>)> {
     let mut rows = Vec::new();
     for batch in batches {
@@ -12804,10 +12792,8 @@ fn test_scanner_blob_handling_all_binary_materializes_bytes() {
         "ALL_BINARY should materialize the blob column as bytes"
     );
 
-    // Measured against lance v11.0.0: neither of the two keys that mark a
-    // column as a blob survives materialization, so a C consumer cannot tell
-    // a materialized blob from a plain binary column by metadata alone. The
-    // field only keeps the two threshold keys echoed from `BlobFieldOptions`.
+    // Neither blob marker survives materialization (lance v11), so a C caller
+    // cannot tell a materialized blob from a plain binary column by metadata.
     let metadata = blob_field.metadata();
     assert!(
         !metadata.contains_key("lance-encoding:blob"),
@@ -12888,12 +12874,8 @@ fn test_scanner_blob_handling_all_descriptions() {
 
     let (schema, batches) = scan_stream(scanner);
     assert_blob_description_field(&schema, "blob");
-    // Measured against lance v11.0.0: a column that is not marked as a blob
-    // keeps its bytes under ALL_DESCRIPTIONS. `BlobHandling::should_unload`
-    // does select every binary-like field, but the rewrite it triggers,
-    // `Field::unloaded_mut`, only replaces fields for which `Field::is_blob`
-    // holds, i.e. fields carrying blob metadata. So on this version
-    // ALL_DESCRIPTIONS and BLOBS_DESCRIPTIONS agree on the output schema.
+    // On lance v11 ALL_DESCRIPTIONS only rewrites fields with blob metadata
+    // (`Field::unloaded_mut` is gated on `is_blob`), so `raw` keeps its bytes.
     assert_eq!(
         *schema
             .field_with_name("raw")
@@ -12931,7 +12913,7 @@ fn test_scanner_blob_handling_rejected_after_scan_started() {
         unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
         0
     );
-    // Drop the reader so the stream's release callback runs exactly once.
+    // Release the stream; the scan has started either way.
     drop(unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap());
 
     assert_eq!(
