@@ -8,7 +8,7 @@
  * This file is compiled by the Rust integration test to verify that
  * lance.h is valid C and the API works end-to-end.
  *
- * Usage: test_c_api <dataset_uri> <write_uri>
+ * Usage: test_c_api <dataset_uri> <write_uri> <blob_uri>
  */
 
 #include "lance/lance.h"
@@ -213,6 +213,83 @@ static void test_scan_with_limit(const char *uri) {
     printf("rows=%llu... ", (unsigned long long)total_rows);
 
     if (stream.release) stream.release(&stream);
+    lance_scanner_close(scanner);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Copy the Arrow C Data Interface format of the `blob` column of a stream's
+ * schema into `out`; `out` is empty when the column is missing. */
+static void blob_column_format(struct ArrowArrayStream *stream, char *out, size_t out_len) {
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    int rc = stream->get_schema(stream, &schema);
+    ASSERT(rc == 0, "get_schema from stream failed");
+    out[0] = '\0';
+    for (int64_t i = 0; i < schema.n_children; i++) {
+        if (strcmp(schema.children[i]->name, "blob") == 0) {
+            snprintf(out, out_len, "%s", schema.children[i]->format);
+        }
+    }
+    if (schema.release) schema.release(&schema);
+}
+
+static void test_scanner_blob_handling(const char *blob_uri) {
+    printf("  test_scanner_blob_handling... ");
+
+    LanceDataset *ds = lance_dataset_open(blob_uri, NULL, 0);
+    ASSERT(ds != NULL, "blob dataset open failed");
+    uint64_t expected_rows = lance_dataset_count_rows(ds);
+    CHECK_OK();
+
+    char format[16];
+    struct ArrowArrayStream stream;
+
+    /* By default a blob column arrives as its description struct. */
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    memset(&stream, 0, sizeof(stream));
+    int32_t rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+    blob_column_format(&stream, format, sizeof(format));
+    ASSERT(strcmp(format, "+s") == 0, "default blob column should be a struct");
+    if (stream.release) stream.release(&stream);
+    lance_scanner_close(scanner);
+
+    /* ALL_BINARY materializes the bytes as LargeBinary and keeps every row. */
+    scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    rc = lance_scanner_set_blob_handling(scanner, LANCE_BLOB_HANDLING_ALL_BINARY);
+    ASSERT(rc == 0, "set_blob_handling failed");
+    memset(&stream, 0, sizeof(stream));
+    rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+    blob_column_format(&stream, format, sizeof(format));
+    ASSERT(strcmp(format, "Z") == 0, "ALL_BINARY blob column should be LargeBinary");
+
+    uint64_t total_rows = 0;
+    while (1) {
+        struct ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        rc = stream.get_next(&stream, &array);
+        ASSERT(rc == 0, "get_next failed");
+        if (array.release == NULL) {
+            break;
+        }
+        total_rows += (uint64_t)array.length;
+        array.release(&array);
+    }
+    ASSERT(total_rows == expected_rows, "row count mismatch");
+    if (stream.release) stream.release(&stream);
+
+    /* Once the scan has started the setting is rejected. */
+    rc = lance_scanner_set_blob_handling(scanner, LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS);
+    ASSERT(rc == -1, "set_blob_handling after the scan started should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT, "wrong error code");
+    const char *msg = lance_last_error_message();
+    if (msg) lance_free_string(msg);
+
+    printf("rows=%llu... ", (unsigned long long)total_rows);
     lance_scanner_close(scanner);
     lance_dataset_close(ds);
     printf("OK\n");
@@ -962,19 +1039,21 @@ static void test_delete(const char *write_uri) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri>\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
         return 1;
     }
 
     const char *uri = argv[1];
     const char *write_uri = argv[2];
+    const char *blob_uri = argv[3];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_open_and_metadata(uri);
     test_shared_session(uri);
     test_scan(uri);
     test_scan_with_limit(uri);
+    test_scanner_blob_handling(blob_uri);
     test_versions(uri);
     test_restore_to_current(uri);
     test_error_handling();

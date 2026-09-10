@@ -16,9 +16,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{
+    BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
+    UInt32Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
+use lance::dataset::{WriteMode, WriteParams};
+use lance_file::version::LanceFileVersion;
 
 /// Build the lance-c cdylib and return the path to the shared library and include dir.
 fn build_lance_c() -> (PathBuf, PathBuf) {
@@ -123,6 +128,76 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a two-fragment Blob v2 dataset on disk and return (TempDir, path_string).
+///
+/// Each fragment has five rows: blobs of 8, 128 and 1024 bytes (inline, packed
+/// and dedicated under the 16 / 256 thresholds), an empty blob and a null,
+/// next to `id` and a plain `raw` binary column. Payload byte `i` is
+/// `(i * 7 + 3) as u8`.
+fn create_blob_dataset_on_disk() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("blob_ds").to_str().unwrap().to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        lance::blob_field_with_options(
+            "blob",
+            true,
+            lance::BlobFieldOptions {
+                inline_size_threshold: Some(16),
+                dedicated_size_threshold: std::num::NonZeroUsize::new(256),
+            },
+        ),
+        Field::new("raw", DataType::Binary, true),
+    ]));
+
+    let make_batch = |first_id: u32| {
+        let mut blobs = lance::BlobArrayBuilder::new(5);
+        for len in [8usize, 128, 1024] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            blobs.push_bytes(payload).unwrap();
+        }
+        blobs.push_empty().unwrap();
+        blobs.push_null().unwrap();
+
+        let ids: Vec<u32> = (first_id..first_id + 5).collect();
+        // The plain binary column is null in the same row as the blob column.
+        let raw = BinaryArray::from_iter((0..5).map(|row| (row < 4).then_some(&b"raw"[..])));
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(ids)),
+                blobs.finish().unwrap(),
+                Arc::new(raw),
+            ],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        for (first_id, mode) in [(0u32, WriteMode::Create), (100u32, WriteMode::Append)] {
+            let params = WriteParams {
+                mode,
+                // Blob v2 is a 2.2 storage feature.
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            };
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(
+                    vec![Ok(make_batch(first_id))],
+                    schema.clone(),
+                ),
+                &uri,
+                Some(params),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    (tmp, uri)
+}
+
 /// Compile a C source file, linking against lance-c.
 fn compile_c_test(source: &Path, output: &Path, include_dir: &Path, lib_path: &Path) -> bool {
     let lib_dir = lib_path.parent().unwrap();
@@ -174,12 +249,14 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
         .success()
 }
 
-/// Run a compiled test binary with the source dataset URI and a destination URI
-/// for the write test. The destination path must not pre-exist.
-fn run_test_binary(binary: &Path, dataset_uri: &str, write_uri: &str) {
+/// Run a compiled test binary with the source dataset URI, a destination URI
+/// for the write test and the URI of a Blob v2 dataset. The destination path
+/// must not pre-exist.
+fn run_test_binary(binary: &Path, dataset_uri: &str, write_uri: &str, blob_uri: &str) {
     let output = Command::new(binary)
         .arg(dataset_uri)
         .arg(write_uri)
+        .arg(blob_uri)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -207,6 +284,7 @@ fn test_c_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
     let (tmp, dataset_uri) = create_test_dataset_on_disk();
     let write_uri = tmp.path().join("c_write_ds").to_str().unwrap().to_string();
+    let (_blob_tmp, blob_uri) = create_blob_dataset_on_disk();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -220,7 +298,7 @@ fn test_c_compilation_and_execution() {
         "C test compilation failed"
     );
 
-    run_test_binary(&binary, &dataset_uri, &write_uri);
+    run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri);
 }
 
 #[test]
@@ -234,6 +312,7 @@ fn test_cpp_compilation_and_execution() {
         .to_str()
         .unwrap()
         .to_string();
+    let (_blob_tmp, blob_uri) = create_blob_dataset_on_disk();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -247,5 +326,5 @@ fn test_cpp_compilation_and_execution() {
         "C++ test compilation failed"
     );
 
-    run_test_binary(&binary, &dataset_uri, &write_uri);
+    run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri);
 }

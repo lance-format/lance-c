@@ -20,6 +20,7 @@ use lance::dataset::scanner::{
 };
 use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use lance_core::Result;
+use lance_core::datatypes::BlobHandling;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::ApproxMode;
 use lance_io::stream::RecordBatchStream;
@@ -91,6 +92,7 @@ pub struct LanceScanner {
     filter: Option<String>,
     substrait_filter: Option<Vec<u8>>,
     additional_sql_filters: Vec<String>,
+    blob_handling: Option<BlobHandling>,
     limit: Option<i64>,
     offset: Option<i64>,
     batch_size: Option<usize>,
@@ -239,6 +241,7 @@ impl LanceScanner {
             filter: None,
             substrait_filter: None,
             additional_sql_filters: Vec::new(),
+            blob_handling: None,
             limit: None,
             offset: None,
             batch_size: None,
@@ -359,6 +362,9 @@ impl LanceScanner {
         let mut scanner = self.dataset.scan();
         if let Some(cols) = &self.columns {
             scanner.project(cols)?;
+        }
+        if let Some(handling) = &self.blob_handling {
+            scanner.blob_handling(handling.clone());
         }
         if self.limit.is_some() || self.offset.is_some() {
             scanner.limit(self.limit, self.offset)?;
@@ -1266,6 +1272,46 @@ unsafe fn scanner_set_use_stats_inner(scanner: *mut LanceScanner, use_stats: boo
     let scanner = unsafe { &mut *scanner };
     scanner.ensure_scan_not_started("use_stats")?;
     scanner.use_stats = Some(use_stats);
+    Ok(0)
+}
+
+/// Set how blob columns are materialized. `handling` is the C enum
+/// `LanceBlobHandling` as an integer: 0 descriptors for blob columns (the
+/// default), 1 bytes for every blob column, 2 descriptors for every binary
+/// column. Other values are rejected. Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_blob_handling(
+    scanner: *mut LanceScanner,
+    handling: i32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_blob_handling_inner(scanner, handling)
+    })
+}
+
+unsafe fn scanner_set_blob_handling_inner(
+    scanner: *mut LanceScanner,
+    handling: i32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("blob_handling")?;
+    let parsed = match handling {
+        0 => BlobHandling::BlobsDescriptions,
+        1 => BlobHandling::AllBinary,
+        2 => BlobHandling::AllDescriptions,
+        other => {
+            return Err(lance_core::Error::invalid_input(format!(
+                "blob_handling must be 0 (blobs as descriptions), 1 (all binary) or 2 (all descriptions); got {other}"
+            )));
+        }
+    };
+    scanner.blob_handling = Some(parsed);
     Ok(0)
 }
 
@@ -3121,6 +3167,48 @@ mod tests {
         assert!(msg.contains("callback must not be NULL"), "got: {msg}");
         unsafe { crate::error::lance_free_string(msg_ptr) };
         assert!(!unsafe { &*scanner }.is_poisoned());
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn set_blob_handling_stores_the_matching_upstream_variant() {
+        // A scan cannot tell AllDescriptions from BlobsDescriptions on lance
+        // v11, so check the stored variant directly.
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+
+        assert_eq!(
+            unsafe { &*scanner }.blob_handling,
+            None,
+            "blob handling should be unset until the setter is called"
+        );
+
+        for (handling, expected) in [
+            (0, BlobHandling::BlobsDescriptions),
+            (1, BlobHandling::AllBinary),
+            (2, BlobHandling::AllDescriptions),
+        ] {
+            assert_eq!(
+                unsafe { lance_scanner_set_blob_handling(scanner, handling) },
+                0
+            );
+            assert_eq!(
+                unsafe { &*scanner }.blob_handling,
+                Some(expected),
+                "blob handling {handling} stored the wrong variant"
+            );
+        }
+
+        // A rejected value leaves the last accepted mode in place.
+        assert_eq!(unsafe { lance_scanner_set_blob_handling(scanner, 3) }, -1);
+        assert_eq!(
+            unsafe { &*scanner }.blob_handling,
+            Some(BlobHandling::AllDescriptions)
+        );
 
         unsafe {
             lance_scanner_close(scanner);
