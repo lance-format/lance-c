@@ -126,6 +126,37 @@ static void test_shared_session(const char *uri) {
            (unsigned long long)stats.metadata_cache_entries);
 }
 
+static void test_data_cache_session(const char *uri, const char *write_uri) {
+    printf("  test_data_cache_session... ");
+
+    char cache_directory[4096];
+    int path_len = snprintf(cache_directory, sizeof(cache_directory),
+                            "%s_foyer_cache", write_uri);
+    ASSERT(path_len > 0 && (size_t)path_len < sizeof(cache_directory),
+           "cache directory path is too long");
+    LanceDataCacheOptions options = {
+        .directory = cache_directory,
+        .memory_capacity_bytes = 128 * 1024,
+        .disk_capacity_bytes = 1024 * 1024,
+        .read_block_size_bytes = 64 * 1024,
+    };
+    LanceSession *session =
+        lance_session_new_with_data_cache(0, 16 * 1024 * 1024, &options);
+    ASSERT(session != NULL, "data-cache session creation failed");
+
+    LanceDataset *ds = lance_dataset_open_with_session(uri, NULL, 0, session);
+    ASSERT(ds != NULL, "data-cache session dataset open failed");
+    LanceDataCacheStatistics statistics;
+    memset(&statistics, 0, sizeof(statistics));
+    ASSERT(lance_dataset_get_data_cache_statistics(ds, &statistics) == 0,
+           "data-cache dataset statistics failed");
+    lance_session_close(session);
+    ASSERT(lance_dataset_count_rows(ds) > 0,
+           "dataset should remain valid after data-cache session close");
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static void test_scan(const char *uri) {
     printf("  test_scan... ");
 
@@ -973,6 +1004,7 @@ int main(int argc, char **argv) {
 
     test_open_and_metadata(uri);
     test_shared_session(uri);
+    test_data_cache_session(uri, write_uri);
     test_scan(uri);
     test_scan_with_limit(uri);
     test_versions(uri);

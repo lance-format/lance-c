@@ -14,6 +14,7 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance_core::Result;
 
+use crate::data_cache::DatasetDataCache;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::helpers;
 use crate::runtime::block_on;
@@ -23,6 +24,7 @@ use crate::stream_guard::guarded_ffi_stream_from_reader;
 /// Opaque handle representing an opened Lance dataset.
 pub struct LanceDataset {
     pub(crate) inner: RwLock<Arc<Dataset>>,
+    pub(crate) data_cache: Option<Arc<dyn DatasetDataCache>>,
 }
 
 impl LanceDataset {
@@ -182,8 +184,16 @@ unsafe fn open_dataset_inner(
     }
 
     let dataset = block_on(builder.load())?;
+    let (dataset, data_cache) =
+        if let Some(factory) = session.and_then(|session| session.data_cache_factory.clone()) {
+            let (dataset, data_cache) = factory.attach(dataset);
+            (dataset, Some(data_cache))
+        } else {
+            (dataset, None)
+        };
     let handle = LanceDataset {
         inner: RwLock::new(Arc::new(dataset)),
+        data_cache,
     };
     Ok(Box::into_raw(Box::new(handle)))
 }
@@ -519,6 +529,7 @@ mod tests {
         .unwrap();
         let handle = LanceDataset {
             inner: RwLock::new(Arc::new(dataset)),
+            data_cache: None,
         };
         (tmp, handle)
     }

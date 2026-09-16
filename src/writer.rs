@@ -282,6 +282,7 @@ unsafe fn write_dataset_inner(
     if !out_dataset.is_null() {
         let handle = LanceDataset {
             inner: RwLock::new(Arc::new(dataset)),
+            data_cache: None,
         };
         // SAFETY: `out_dataset` is non-NULL (checked above) and the caller
         // guarantees it points to caller-owned, writable storage of size
