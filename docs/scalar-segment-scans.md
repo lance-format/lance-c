@@ -62,6 +62,14 @@ row-ID domain falls back to a non-indexed scan of the entire explicit domain.
 Legacy (v1) storage also takes this fallback because ordinary scans cannot consume
 external row masks; it reports `scalar_segment_fallback_legacy_storage` without
 searching the index.
+Filters referencing scanner metadata columns such as `_rowid`, `_rowaddr`,
+`_row_created_at_version`, or `_row_last_updated_at_version` also fall back
+without opening or searching the index. Lance validates these filters against
+its full filterable schema; the segment planner only has the stored schema.
+This fallback reports `scalar_segment_fallback_filter_schema` when reached,
+preserves the full predicate and explicit fragment domain, and applies
+LIMIT/OFFSET after filtering. Other fallback checks, such as partial coverage,
+can take precedence. Invalid filter columns still produce an error.
 I/O and corruption errors are propagated, not converted to empty results or
 successful fallback.
 

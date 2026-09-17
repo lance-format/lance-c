@@ -193,7 +193,19 @@ impl PreparedScalarSegment {
         let Some(filter) = reader.get_expr_filter()? else {
             return Ok(Some("no_filter"));
         };
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
+        let stored_schema: arrow_schema::Schema = self.dataset.schema().into();
+        // get_expr_filter validates against the scanner's full filterable
+        // schema, including metadata columns absent from the stored schema.
+        // Keep the scoped reader's complete filter instead of replanning such
+        // expressions against a narrower schema or dropping their residuals.
+        if filter
+            .column_refs()
+            .iter()
+            .any(|column| stored_schema.field_with_name(&column.name).is_err())
+        {
+            return Ok(Some("filter_schema"));
+        }
+        let planner = Planner::new(Arc::new(stored_schema));
         let index_info = self.dataset.scalar_index_info().await?;
         let filter_plan = planner.create_filter_plan(filter, &index_info, true)?;
         let Some(search) = filter_plan

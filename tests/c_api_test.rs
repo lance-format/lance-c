@@ -12758,6 +12758,73 @@ fn test_scalar_segment_scope_residual_limit_and_unindexed_fallback() {
 }
 
 #[test]
+fn test_scalar_segment_metadata_residuals_fall_back_within_scope() {
+    for kind in [
+        lance_index::IndexType::BTree,
+        lance_index::IndexType::Bitmap,
+    ] {
+        for stable in [false, true] {
+            // One segment covers two fragments; the third fragment is unindexed.
+            // Project only id so metadata residuals must survive independently
+            // of both the stored schema and the output projection.
+            let (_tmp, uri, uuids) =
+                create_scalar_segment_fixture_with_options(kind, stable, None, &[&[0, 1]]);
+            for residual in [
+                "_rowid > 0",
+                "_rowaddr > 0",
+                "_row_created_at_version IS NOT NULL",
+                "_row_last_updated_at_version IS NOT NULL",
+            ] {
+                let filter = format!("key >= 0 AND {residual}");
+                for (fragments, expected) in [
+                    (vec![0], vec![1, 2, 3]),
+                    (vec![1], vec![5, 6, 7]),
+                    (vec![0, 1], vec![1, 2, 3, 5, 6, 7]),
+                ] {
+                    let (ids, stats) =
+                        scalar_segment_ids(&uri, &uuids[0], &fragments, &filter, None, 0);
+                    assert_eq!(ids, expected, "{kind:?}, stable={stable}, {filter}");
+                    assert_eq!(stats.calls, 1);
+                    assert_eq!(stats.indices_loaded, 0);
+                    assert_eq!(stats.index_comparisons, 0);
+                    assert!(stats.metrics.iter().any(|(name, _, value)| {
+                        name == "scalar_segment_fallback_filter_schema" && *value == 1
+                    }));
+                    assert!(!stats.metrics.iter().any(|(name, _, value)| {
+                        name == "scalar_segments_searched" && *value != 0
+                    }));
+                }
+            }
+            let (ids, _) = scalar_segment_ids(
+                &uri,
+                &uuids[0],
+                &[0],
+                "key >= 0 AND _rowid > 1 AND _rowaddr > 1",
+                Some(1),
+                1,
+            );
+            assert_eq!(ids, vec![3], "apply the residual before LIMIT/OFFSET");
+            for column in [
+                "_rowid",
+                "_rowaddr",
+                "_row_created_at_version",
+                "_row_last_updated_at_version",
+            ] {
+                let filter = format!("key >= 0 AND {column} IS NULL");
+                let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], &filter, None, 0);
+                assert!(ids.is_empty(), "must retain the residual: {filter}");
+            }
+            let (ids, stats) =
+                scalar_segment_ids(&uri, &uuids[0], &[0, 2], "key >= 0 AND _rowid > 0", None, 0);
+            assert_eq!(ids, vec![1, 2, 3, 9, 10, 11]);
+            assert!(stats.metrics.iter().any(|(name, _, value)| {
+                name == "scalar_segment_fallback_partial_coverage" && *value == 1
+            }));
+        }
+    }
+}
+
+#[test]
 fn test_scalar_segment_label_list_exact_candidates() {
     use arrow_array::builder::{Int32Builder, ListBuilder};
     use lance::index::DatasetIndexExt;
