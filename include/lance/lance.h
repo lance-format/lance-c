@@ -1726,6 +1726,11 @@ void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
  * index type, and the commit fails if `column` does not exist. Every segment
  * must declare `column` as its keyed field — that is, have been built for
  * `column` — or the commit fails with LANCE_ERR_INVALID_ARGUMENT.
+ * Vector segments that will coexist (incoming segments and retained existing
+ * segments) must have compatible distance metrics, dimensions, sub-index
+ * types, and quantizer kinds. Independently trained IVF centroids and PQ
+ * codebooks may differ. Incompatible segments are rejected with
+ * LANCE_ERR_INVALID_ARGUMENT without changing the dataset version or index.
  *
  * Replacement is automatic and coverage-driven — there is no replace flag:
  * existing same-name segments of the same index type whose fragment coverage
@@ -1736,6 +1741,8 @@ void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
  * from the existing same-name index replaces that index entirely, and
  * therefore requires the incoming segments to cover every current fragment;
  * a partial-coverage type change is rejected with LANCE_ERR_INVALID_ARGUMENT.
+ * Vector compatibility is checked after selecting replacements, so a complete
+ * replacement may change the metric without conflicting with removed segments.
  *
  * @param dataset    Open dataset (mutated; same handle remains valid).
  * @param index_name Logical index name; must not be NULL or empty.

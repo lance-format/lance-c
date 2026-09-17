@@ -4799,6 +4799,256 @@ fn segment_uuid(bytes: *const u8, len: usize) -> [u8; 16] {
     uuid
 }
 
+fn build_vector_segment_bytes(
+    dataset: *mut LanceDataset,
+    metric: LanceMetricType,
+    fragment_ids: &[u32],
+) -> Vec<u8> {
+    let column = c_str("embedding");
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: metric as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: fragment_ids.as_ptr(),
+        fragment_count: fragment_ids.len(),
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            c_str("worker_idx").as_ptr(),
+            &params,
+            &options,
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let metadata = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+    }
+    metadata
+}
+
+fn commit_vector_segments(dataset: *mut LanceDataset, segments: &[&[u8]]) -> i32 {
+    let bytes = segments
+        .iter()
+        .map(|segment| segment.as_ptr())
+        .collect::<Vec<_>>();
+    let lengths = segments
+        .iter()
+        .map(|segment| segment.len())
+        .collect::<Vec<_>>();
+    unsafe {
+        lance_dataset_commit_index_segments(
+            dataset,
+            c_str("embedding_idx").as_ptr(),
+            c_str("embedding").as_ptr(),
+            bytes.as_ptr(),
+            lengths.as_ptr(),
+            segments.len(),
+        )
+    }
+}
+
+fn vector_segment_query_ids(dataset: *mut LanceDataset, use_index: bool) -> Vec<i32> {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    // Offset from row 5 to avoid tied distances in the top three.
+    let query: [f32; 8] = std::array::from_fn(|component| 5.25 + component as f32 / 8.0);
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest(
+                scanner,
+                c_str("embedding").as_ptr(),
+                query.as_ptr().cast(),
+                query.len(),
+                LanceDataType::Float32 as i32,
+                3,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_metric(scanner, LanceMetricType::L2 as i32) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_use_index(scanner, use_index) },
+        0
+    );
+    // Probe every partition so the assertion does not depend on ANN recall.
+    assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 2) }, 0);
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let ids = reader
+        .flat_map(|batch| {
+            batch
+                .unwrap()
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    unsafe { lance_scanner_close(scanner) };
+    ids
+}
+
+fn assert_mixed_vector_metrics_rejected(retain_existing: bool) {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let l2 = build_vector_segment_bytes(dataset, LanceMetricType::L2, &[0]);
+    let cosine = build_vector_segment_bytes(dataset, LanceMetricType::Cosine, &[1]);
+    if retain_existing {
+        assert_eq!(commit_vector_segments(dataset, &[&l2]), 0);
+    }
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let incoming: Vec<&[u8]> = if retain_existing {
+        vec![&cosine]
+    } else {
+        vec![&l2, &cosine]
+    };
+    assert_eq!(
+        commit_vector_segments(dataset, &incoming),
+        -1,
+        "incompatible vector metrics must be rejected before committing"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.to_lowercase().contains("metric"), "{message}");
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+
+    // Check both the caller's handle and a fresh reader of the persisted manifest.
+    let reopened = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null());
+    for handle in [dataset, reopened] {
+        assert_eq!(unsafe { lance_dataset_version(handle) }, version_before);
+        assert_eq!(
+            unsafe { lance_dataset_index_count(handle) },
+            if retain_existing { 1 } else { 0 }
+        );
+        if retain_existing {
+            let mut uuid = [0; 16];
+            let mut count = 0;
+            assert_eq!(
+                unsafe {
+                    lance_dataset_index_segments(
+                        handle,
+                        c_str("embedding_idx").as_ptr(),
+                        uuid.as_mut_ptr(),
+                        1,
+                        &mut count,
+                    )
+                },
+                0
+            );
+            assert_eq!(count, 1);
+            assert_eq!(uuid, segment_uuid(l2.as_ptr(), l2.len()));
+            assert_eq!(
+                vector_segment_query_ids(handle, true),
+                vector_segment_query_ids(handle, false)
+            );
+        }
+    }
+    unsafe {
+        lance_dataset_close(reopened);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_rejects_mixed_vector_metrics() {
+    assert_mixed_vector_metrics_rejected(false);
+}
+
+#[test]
+fn test_commit_index_segments_rejects_metric_mismatch_with_retained_segment() {
+    assert_mixed_vector_metrics_rejected(true);
+}
+
+#[test]
+fn test_commit_index_segments_vector_delta_and_complete_metric_replacement() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    // Each worker independently trains its IVF model on different data.
+    let first = build_vector_segment_bytes(dataset, LanceMetricType::L2, &[0]);
+    assert_eq!(commit_vector_segments(dataset, &[&first]), 0);
+    let second = build_vector_segment_bytes(dataset, LanceMetricType::L2, &[1]);
+    assert_eq!(commit_vector_segments(dataset, &[&second]), 0);
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 2
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 2);
+    let indexed_ids = vector_segment_query_ids(dataset, true);
+    assert_eq!(indexed_ids, [5, 6, 4]);
+    assert_eq!(indexed_ids, vector_segment_query_ids(dataset, false));
+
+    // A new metric is valid when no old segment will remain in the index.
+    let replacement = build_vector_segment_bytes(dataset, LanceMetricType::Cosine, &[0, 1]);
+    assert_eq!(
+        commit_vector_segments(dataset, &[&replacement]),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 3
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 1);
+    let mut uuid = [0; 16];
+    let mut count = 0;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                c_str("embedding_idx").as_ptr(),
+                uuid.as_mut_ptr(),
+                1,
+                &mut count,
+            )
+        },
+        0
+    );
+    assert_eq!(count, 1);
+    assert_eq!(uuid, segment_uuid(replacement.as_ptr(), replacement.len()));
+    unsafe { lance_dataset_close(dataset) };
+}
+
 #[test]
 fn test_commit_index_segments_happy_path_multi_segment_vector_index() {
     let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);

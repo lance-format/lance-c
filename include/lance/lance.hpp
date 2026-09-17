@@ -941,15 +941,20 @@ public:
     /// `segment_metadata` is the protobuf-encoded IndexMetadata produced by
     /// `IndexSegmentBuilder::execute_uncommitted()`. The commit is a single
     /// dataset version bump. Every segment must have been built for `column`.
+    /// Coexisting vector segments, including retained existing segments, must
+    /// have compatible metrics, dimensions, sub-index types, and quantizer
+    /// kinds; independently trained IVF centroids and PQ codebooks may differ.
     /// Replacement of existing same-name segments is automatic and
     /// coverage-driven: fully covered segments are replaced, disjoint ones
     /// are retained as deltas, and partial overlap is rejected. A commit
     /// whose index type differs from the existing same-name index replaces
     /// that index entirely, so it must cover every current fragment; a
     /// partial-coverage type change is rejected.
+    /// Fully replaced vector segments do not constrain the new metric.
     /// Throws lance::Error on validation failures (empty set, duplicate
     /// segment UUIDs, overlapping fragment coverage, unknown or mismatched
-    /// column).
+    /// column, incompatible vector segments), leaving the version and index
+    /// unchanged.
     void commit_index_segments(
         const std::string& index_name,
         const std::string& column,
