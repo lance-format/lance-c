@@ -902,6 +902,92 @@ static void test_vector_models_and_reusable_segments(const char *uri) {
     printf("OK\n");
 }
 
+/* Builds one uncommitted vector segment per fragment and commits them as a
+ * single logical multi-segment index from a real C caller. */
+static void test_commit_index_segments(const char *uri) {
+    printf("  test_commit_index_segments... ");
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t all_ids[2] = {0, 0};
+    ASSERT(lance_dataset_fragment_ids(ds, all_ids) == 0,
+           "fragment enumeration failed");
+    uint32_t fragment_ids[2] = {(uint32_t)all_ids[0], (uint32_t)all_ids[1]};
+
+    LanceVectorIndexSegmentParams params = {
+        LANCE_INDEX_IVF_FLAT, LANCE_METRIC_L2, 2, 0, 0, 2, 0, 0, 16,
+    };
+    uint8_t *segment_bytes[2] = {NULL, NULL};
+    size_t segment_lens[2] = {0, 0};
+    uint8_t expected_uuids[2][16];
+    memset(expected_uuids, 0, sizeof(expected_uuids));
+    for (size_t i = 0; i < 2; i++) {
+        LanceIndexSegmentBuildOptions options = {0};
+        options.fragment_ids = &fragment_ids[i];
+        options.fragment_count = 1;
+        options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+        LanceIndexSegmentBuilder *builder =
+            lance_index_segment_builder_new_vector(
+                ds, "embedding", "c_distributed_idx", &params, &options);
+        ASSERT(builder != NULL, "vector segment builder failed");
+        ASSERT(lance_index_segment_builder_execute_uncommitted(
+                   builder, &segment_bytes[i], &segment_lens[i]) == 0,
+               "vector segment execution failed");
+        LanceIndexSegmentMetadata *metadata = NULL;
+        ASSERT(lance_index_segment_metadata_parse(
+                   segment_bytes[i], segment_lens[i], &metadata) == 0,
+               "metadata parse failed");
+        ASSERT(lance_index_segment_metadata_uuid(metadata,
+                                                 expected_uuids[i]) == 0,
+               "metadata UUID read failed");
+        lance_index_segment_metadata_free(metadata);
+        lance_index_segment_builder_free(builder);
+    }
+
+    /* One commit registers both segments as a single logical index. */
+    uint64_t version_before = lance_dataset_version(ds);
+    const uint8_t *const_bytes[2] = {segment_bytes[0], segment_bytes[1]};
+    int32_t rc = lance_dataset_commit_index_segments(
+        ds, "c_distributed_idx", "embedding", const_bytes, segment_lens, 2);
+    ASSERT(rc == 0, "commit_index_segments failed");
+    ASSERT(lance_dataset_version(ds) == version_before + 1,
+           "commit must bump the dataset version exactly once");
+    ASSERT(lance_dataset_index_segment_count(ds, "c_distributed_idx") == 2,
+           "committed index must have two segments");
+    uint8_t committed_uuids[32] = {0};
+    uint64_t committed_count = 0;
+    ASSERT(lance_dataset_index_segments(ds, "c_distributed_idx",
+                                        committed_uuids, 2,
+                                        &committed_count) == 0,
+           "segment enumeration failed");
+    ASSERT(committed_count == 2, "committed segment count mismatch");
+    ASSERT(memcmp(committed_uuids, expected_uuids[0], 16) == 0 &&
+               memcmp(committed_uuids + 16, expected_uuids[1], 16) == 0,
+           "committed segment UUIDs mismatch");
+
+    /* Duplicate segment UUIDs in the commit set are rejected. */
+    const uint8_t *dup_bytes[2] = {segment_bytes[0], segment_bytes[0]};
+    size_t dup_lens[2] = {segment_lens[0], segment_lens[0]};
+    rc = lance_dataset_commit_index_segments(ds, "c_dup_idx", "embedding",
+                                             dup_bytes, dup_lens, 2);
+    ASSERT(rc == -1, "duplicate segment UUIDs must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+
+    /* An empty commit set is rejected. */
+    rc = lance_dataset_commit_index_segments(ds, "c_empty_idx", "embedding",
+                                             const_bytes, segment_lens, 0);
+    ASSERT(rc == -1, "empty commit set must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+    ASSERT(lance_dataset_version(ds) == version_before + 1,
+           "rejected commits must not bump the version");
+
+    lance_free_bytes(segment_bytes[0]);
+    lance_free_bytes(segment_bytes[1]);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_compact_files`. The smoke fixture is a single
  * fragment, so the default planner has nothing to compact — we expect
@@ -980,6 +1066,7 @@ int main(int argc, char **argv) {
     test_error_handling();
     test_index_segment_builder(uri);
     test_vector_models_and_reusable_segments(uri);
+    test_commit_index_segments(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_data_statistics(write_uri);
     test_update(write_uri);

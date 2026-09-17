@@ -1048,6 +1048,98 @@ pub unsafe extern "C" fn lance_index_segment_builder_free(builder: *mut LanceInd
     }
 }
 
+/// Commit previously built uncommitted index segments as one logical index.
+///
+/// All segments are committed in a single dataset version. Validation of the
+/// segment set (distinct UUIDs, disjoint fragment coverage, consistent index
+/// details) is performed by the Lance core; replacement of existing same-name
+/// segments is automatic and coverage-driven.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_commit_index_segments(
+    dataset: *mut LanceDataset,
+    index_name: *const c_char,
+    column: *const c_char,
+    segment_metadata_bytes: *const *const u8,
+    segment_metadata_lens: *const usize,
+    segment_count: usize,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            commit_index_segments_inner(
+                dataset,
+                index_name,
+                column,
+                segment_metadata_bytes,
+                segment_metadata_lens,
+                segment_count,
+            )
+        },
+        neg
+    )
+}
+
+unsafe fn commit_index_segments_inner(
+    dataset: *mut LanceDataset,
+    index_name: *const c_char,
+    column: *const c_char,
+    segment_metadata_bytes: *const *const u8,
+    segment_metadata_lens: *const usize,
+    segment_count: usize,
+) -> Result<i32> {
+    if dataset.is_null() || index_name.is_null() || column.is_null() {
+        return Err(invalid_input(
+            "dataset, index_name, and column must not be NULL",
+        ));
+    }
+    let index_name = unsafe { helpers::parse_c_string(index_name)? }
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_input("index_name must not be NULL or empty"))?;
+    let column = unsafe { helpers::parse_c_string(column)? }
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_input("column must not be NULL or empty"))?;
+    if segment_count == 0 {
+        return Err(invalid_input(
+            "segment_count must be > 0; at least one index segment is required to commit an index",
+        ));
+    }
+    if segment_metadata_bytes.is_null() || segment_metadata_lens.is_null() {
+        return Err(invalid_input(format!(
+            "segment_metadata_bytes and segment_metadata_lens must not be NULL when segment_count is {segment_count}"
+        )));
+    }
+    if segment_count > isize::MAX as usize / std::mem::size_of::<*const u8>() {
+        return Err(invalid_input(format!(
+            "segment_count {segment_count} exceeds the maximum addressable pointer slice length"
+        )));
+    }
+    let bytes_array = unsafe { slice::from_raw_parts(segment_metadata_bytes, segment_count) };
+    let lens_array = unsafe { slice::from_raw_parts(segment_metadata_lens, segment_count) };
+    let mut segments = Vec::with_capacity(segment_count);
+    for (position, (&bytes, &len)) in bytes_array.iter().zip(lens_array.iter()).enumerate() {
+        if bytes.is_null() || len == 0 {
+            return Err(invalid_input(format!(
+                "segment_metadata_bytes[{position}] must be non-NULL and segment_metadata_lens[{position}] must be > 0; bytes={bytes:p}, len={len}"
+            )));
+        }
+        if len > isize::MAX as usize {
+            return Err(invalid_input(format!(
+                "segment_metadata_lens[{position}]={len} exceeds the maximum addressable byte slice length"
+            )));
+        }
+        let metadata = decode_segment_metadata(unsafe { slice::from_raw_parts(bytes, len) })
+            .map_err(|error| {
+                invalid_input(format!("segment_metadata_bytes[{position}]: {error}"))
+            })?;
+        segments.push(metadata);
+    }
+
+    let ds = unsafe { &*dataset };
+    ds.with_mut(|dataset| {
+        block_on(dataset.commit_existing_index_segments(index_name, column, segments))
+    })?;
+    Ok(0)
+}
+
 /// Parse a protobuf-encoded Lance `IndexMetadata` value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_index_segment_metadata_parse(
@@ -1061,22 +1153,10 @@ pub unsafe extern "C" fn lance_index_segment_metadata_parse(
     )
 }
 
-unsafe fn parse_metadata_inner(
-    bytes: *const u8,
-    len: usize,
-    out_metadata: *mut *mut LanceIndexSegmentMetadata,
-) -> Result<i32> {
-    if bytes.is_null() || len == 0 || out_metadata.is_null() {
-        return Err(invalid_input(format!(
-            "bytes must be non-NULL, len must be > 0, and out_metadata must be non-NULL; bytes={bytes:p}, len={len}, out_metadata={out_metadata:p}"
-        )));
-    }
-    if len > isize::MAX as usize {
-        return Err(invalid_input(format!(
-            "len {len} exceeds the maximum addressable byte slice length"
-        )));
-    }
-    let proto = pb::IndexMetadata::decode(unsafe { slice::from_raw_parts(bytes, len) })
+/// Decode protobuf-encoded `IndexMetadata` bytes into the table-format type,
+/// rejecting values whose ranges cannot be represented safely.
+fn decode_segment_metadata(bytes: &[u8]) -> Result<IndexMetadata> {
+    let proto = pb::IndexMetadata::decode(bytes)
         .map_err(|error| invalid_input(format!("invalid IndexMetadata protobuf: {error}")))?;
     if let Some(created_at) = proto.created_at {
         let created_at = i64::try_from(created_at).map_err(|_| {
@@ -1106,7 +1186,25 @@ unsafe fn parse_metadata_inner(
             "IndexMetadata fields[{position}] must be >= 0, got {field_id}"
         )));
     }
-    let metadata = IndexMetadata::try_from(proto)?;
+    IndexMetadata::try_from(proto)
+}
+
+unsafe fn parse_metadata_inner(
+    bytes: *const u8,
+    len: usize,
+    out_metadata: *mut *mut LanceIndexSegmentMetadata,
+) -> Result<i32> {
+    if bytes.is_null() || len == 0 || out_metadata.is_null() {
+        return Err(invalid_input(format!(
+            "bytes must be non-NULL, len must be > 0, and out_metadata must be non-NULL; bytes={bytes:p}, len={len}, out_metadata={out_metadata:p}"
+        )));
+    }
+    if len > isize::MAX as usize {
+        return Err(invalid_input(format!(
+            "len {len} exceeds the maximum addressable byte slice length"
+        )));
+    }
+    let metadata = decode_segment_metadata(unsafe { slice::from_raw_parts(bytes, len) })?;
     let name = CString::new(metadata.name.as_str())
         .map_err(|_| invalid_input("index metadata name contains an embedded NUL byte"))?;
     let index_details_type_url = metadata

@@ -533,6 +533,68 @@ static void test_vector_models_and_reusable_segments(const std::string& uri) {
     PASS();
 }
 
+static void test_commit_index_segments(const std::string& uri) {
+    TEST(test_commit_index_segments);
+
+    auto ds = lance::Dataset::open(uri);
+    auto all_ids = ds.fragment_ids();
+    assert(all_ids.size() >= 2);
+
+    LanceVectorIndexParams params = {
+        LANCE_INDEX_IVF_FLAT, LANCE_METRIC_L2, 2, 0, 0, 2, 0, 0, 16,
+    };
+
+    // Build one uncommitted segment per fragment (the distributed workers).
+    std::vector<std::vector<uint8_t>> segments;
+    std::vector<std::array<uint8_t, 16>> expected_uuids;
+    for (size_t i = 0; i < 2; ++i) {
+        uint32_t fragment_id = static_cast<uint32_t>(all_ids[i]);
+        LanceIndexSegmentBuildOptions options = {};
+        options.fragment_ids = &fragment_id;
+        options.fragment_count = 1;
+        options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+        auto builder = ds.new_vector_index_segment_builder(
+            "embedding", params, "cpp_distributed_idx", &options);
+        segments.push_back(builder.execute_uncommitted());
+        auto metadata = lance::IndexSegmentMetadata::parse(segments.back());
+        expected_uuids.push_back(metadata.uuid());
+    }
+
+    // One commit registers both segments as a single logical index.
+    uint64_t version_before = ds.version();
+    ds.commit_index_segments("cpp_distributed_idx", "embedding", segments);
+    assert(ds.version() == version_before + 1);
+    assert(ds.index_segment_count("cpp_distributed_idx") == 2);
+    auto committed = ds.index_segments("cpp_distributed_idx");
+    assert(committed.size() == 2);
+    for (size_t i = 0; i < 2; ++i) assert(committed[i] == expected_uuids[i]);
+
+    // Duplicate segment UUIDs in the commit set are rejected.
+    bool caught = false;
+    try {
+        ds.commit_index_segments(
+            "cpp_dup_idx", "embedding", {segments[0], segments[0]});
+    } catch (const lance::Error& e) {
+        caught = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+
+    // An empty commit set is rejected.
+    caught = false;
+    try {
+        ds.commit_index_segments(
+            "cpp_empty_idx", "embedding", {});
+    } catch (const lance::Error& e) {
+        caught = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+    assert(ds.version() == version_before + 1);
+
+    PASS();
+}
+
 static void test_fts_smoke(const std::string& uri) {
     TEST(test_fts_smoke);
 
@@ -966,6 +1028,7 @@ int main(int argc, char** argv) {
     test_index_segments_smoke(uri);
     test_index_segment_builder(uri);
     test_vector_models_and_reusable_segments(uri);
+    test_commit_index_segments(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_data_statistics(write_uri);

@@ -1710,6 +1710,51 @@ int32_t lance_index_segment_metadata_fragment_ids(
 /** Free parsed segment metadata. NULL-safe. */
 void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
 
+/**
+ * Commit previously built uncommitted index segments as one logical index.
+ *
+ * `segment_metadata_bytes[i]` must point to
+ * `segment_metadata_lens[i]` bytes of protobuf-encoded IndexMetadata produced
+ * by lance_index_segment_builder_execute_uncommitted() (typically built on
+ * distributed workers). All segments are registered under `index_name` on
+ * `column` in a single commit, so the dataset version increases by exactly
+ * one on success.
+ *
+ * The segment set is validated by the Lance core and rejected with
+ * LANCE_ERR_INVALID_ARGUMENT when it is empty, contains duplicate segment
+ * UUIDs, or has overlapping fragment coverage. All segments must share one
+ * index type, and the commit fails if `column` does not exist. Every segment
+ * must declare `column` as its keyed field — that is, have been built for
+ * `column` — or the commit fails with LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * Replacement is automatic and coverage-driven — there is no replace flag:
+ * existing same-name segments of the same index type whose fragment coverage
+ * is fully covered by the incoming set are replaced, while existing segments
+ * covering disjoint fragments are retained as additional deltas of the
+ * logical index. A commit that would orphan fragments from an existing
+ * segment (partial overlap) is rejected. A commit whose index type differs
+ * from the existing same-name index replaces that index entirely, and
+ * therefore requires the incoming segments to cover every current fragment;
+ * a partial-coverage type change is rejected with LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * @param dataset    Open dataset (mutated; same handle remains valid).
+ * @param index_name Logical index name; must not be NULL or empty.
+ * @param column     Indexed column; must not be NULL or empty.
+ * @param segment_metadata_bytes Array of pointers to encoded IndexMetadata.
+ * @param segment_metadata_lens  Array of byte lengths, parallel to
+ *                               segment_metadata_bytes.
+ * @param segment_count          Number of segments; must be > 0.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_commit_index_segments(
+    LanceDataset* dataset,
+    const char* index_name,
+    const char* column,
+    const uint8_t* const* segment_metadata_bytes,
+    const size_t* segment_metadata_lens,
+    size_t segment_count
+);
+
 /** Drop an index by name. Returns -1 (NOT_FOUND) if no such index. */
 int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name);
 

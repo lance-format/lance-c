@@ -4733,6 +4733,907 @@ fn test_index_segment_options_reject_invalid_fragment_and_train_combinations() {
     unsafe { lance_dataset_close(dataset) };
 }
 
+/// Scalar (bitmap) segment builds reserve tens of MB from the shared
+/// datafusion spill pool; serialize them so parallel commit tests cannot
+/// exhaust the pool.
+static SCALAR_SEGMENT_BUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Build one uncommitted scalar segment on the `id` column and return the
+/// malloc-owned protobuf metadata bytes (free with `lance_free_bytes`).
+fn build_scalar_segment_bytes(
+    dataset: *mut LanceDataset,
+    index_name: &CString,
+    index_type: LanceScalarIndexType,
+    fragment_ids: Option<&[u32]>,
+) -> (*mut u8, usize) {
+    let _build_guard = SCALAR_SEGMENT_BUILD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let column = c_str("id");
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: fragment_ids.map_or(ptr::null(), |ids| ids.as_ptr()),
+        fragment_count: fragment_ids.map_or(0, |ids| ids.len()),
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            index_name.as_ptr(),
+            index_type as i32,
+            ptr::null(),
+            &options,
+        )
+    };
+    assert!(!builder.is_null());
+    let mut bytes = ptr::null_mut();
+    let mut len = 0_usize;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    unsafe { lance_index_segment_builder_free(builder) };
+    (bytes, len)
+}
+
+/// Read the UUID of an encoded segment without freeing the bytes.
+fn segment_uuid(bytes: *const u8, len: usize) -> [u8; 16] {
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+        0
+    );
+    let mut uuid = [0_u8; 16];
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_uuid(metadata, uuid.as_mut_ptr()) },
+        0
+    );
+    unsafe { lance_index_segment_metadata_free(metadata) };
+    uuid
+}
+
+#[test]
+fn test_commit_index_segments_happy_path_multi_segment_vector_index() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+
+    let column = c_str("embedding");
+    let index_name = c_str("embedding_distributed_idx");
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+
+    // Build one uncommitted segment per fragment (the distributed workers).
+    let mut segment_bytes = [ptr::null_mut(); 2];
+    let mut segment_lens = [0_usize; 2];
+    let mut expected_uuids = Vec::new();
+    for (worker, fragment_id) in fragment_ids.iter().enumerate() {
+        let fragment = *fragment_id as u32;
+        let options = LanceIndexSegmentBuildOptions {
+            fragment_ids: &fragment,
+            fragment_count: 1,
+            index_uuid: ptr::null(),
+            ivf_centroids: ptr::null_mut(),
+            ivf_centroids_schema: ptr::null(),
+            pq_codebook: ptr::null_mut(),
+            pq_codebook_schema: ptr::null(),
+            mode: LanceIndexSegmentBuildMode::Auto as i32,
+        };
+        let builder = unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                &params,
+                &options,
+            )
+        };
+        assert!(!builder.is_null());
+        assert_eq!(
+            unsafe {
+                lance_index_segment_builder_execute_uncommitted(
+                    builder,
+                    &mut segment_bytes[worker],
+                    &mut segment_lens[worker],
+                )
+            },
+            0,
+            "{}",
+            unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+        );
+        unsafe { lance_index_segment_builder_free(builder) };
+        expected_uuids.push(segment_uuid(segment_bytes[worker], segment_lens[worker]));
+    }
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr().cast::<*const u8>(),
+                segment_lens.as_ptr(),
+                segment_lens.len(),
+            )
+        },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+
+    // One commit for the whole segment set: exactly one version bump.
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1
+    );
+    // index_count counts physical segments; both segments share one logical
+    // index name, which index_segment_count/index_segments resolve below.
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 2);
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        2
+    );
+    let mut committed_uuids = [0_u8; 32];
+    let mut committed_count = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                committed_uuids.as_mut_ptr(),
+                2,
+                &mut committed_count,
+            )
+        },
+        0
+    );
+    assert_eq!(committed_count, 2);
+    for (worker, expected_uuid) in expected_uuids.iter().enumerate() {
+        assert_eq!(
+            &committed_uuids[worker * 16..(worker + 1) * 16],
+            expected_uuid
+        );
+    }
+
+    // A k-NN query resolves through the committed multi-segment index.
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    // Row 5's vector: component i is 5 + i/8, so the nearest neighbor is row 5.
+    let query: Vec<f32> = (0..8).map(|i| 5.0 + i as f32 / 8.0).collect();
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr() as *const c_void,
+                8,
+                LanceDataType::Float32 as i32,
+                3,
+            )
+        },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let ids = reader
+        .flat_map(|batch| {
+            let batch = batch.unwrap();
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 3);
+    assert_eq!(
+        ids[0], 5,
+        "nearest neighbor of row 5's vector must be row 5"
+    );
+
+    unsafe {
+        lance_scanner_close(scanner);
+        for bytes in segment_bytes {
+            lance_free_bytes(bytes);
+        }
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_rejects_duplicate_segment_uuids() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let fragment = 0_u32;
+    let (bytes, len) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[fragment]),
+    );
+
+    let column = c_str("id");
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    // The same encoded segment (hence the same UUID) appears twice in the set.
+    let segment_bytes = [bytes as *const u8, bytes as *const u8];
+    let segment_lens = [len, len];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                2,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_rejects_overlapping_fragment_coverage() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let fragment = 0_u32;
+    let (bytes_a, len_a) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[fragment]),
+    );
+    let (bytes_b, len_b) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[fragment]),
+    );
+    assert_ne!(segment_uuid(bytes_a, len_a), segment_uuid(bytes_b, len_b));
+
+    let column = c_str("id");
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let segment_bytes = [bytes_a as *const u8, bytes_b as *const u8];
+    let segment_lens = [len_a, len_b];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                2,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_free_bytes(bytes_a);
+        lance_free_bytes(bytes_b);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_rejects_malformed_metadata() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let column = c_str("id");
+    let fragment = 0_u32;
+    let (valid_bytes, valid_len) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[fragment]),
+    );
+
+    // Garbage that is not a protobuf message at all.
+    let garbage = [0xab_u8, 0xcd, 0xef];
+    let segment_bytes = [garbage.as_ptr()];
+    let segment_lens = [garbage.len()];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // A valid message truncated mid-record.
+    let truncated_len = valid_len / 2;
+    let segment_bytes = [valid_bytes as *const u8];
+    let segment_lens = [truncated_len];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_free_bytes(valid_bytes);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_validates_null_and_empty_inputs() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let column = c_str("id");
+    let empty_name = c_str("");
+    // Every case below is rejected at the FFI boundary before the metadata
+    // bytes are decoded, so a placeholder buffer is sufficient — no real
+    // segment build is needed.
+    let placeholder = [0x01_u8, 0x02, 0x03];
+    let segment_bytes = [placeholder.as_ptr()];
+    let segment_lens = [placeholder.len()];
+    let version_before = unsafe { lance_dataset_version(dataset) };
+
+    let expect_invalid = |rc: i32, case: &str| {
+        assert_eq!(rc, -1, "{case}");
+        assert_eq!(
+            lance_last_error_code(),
+            LanceErrorCode::InvalidArgument,
+            "{case}"
+        );
+    };
+
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                ptr::null_mut(),
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "NULL dataset",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                ptr::null(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "NULL index_name",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                empty_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "empty index_name",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                ptr::null(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "NULL column",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                0,
+            )
+        },
+        "segment_count 0",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                ptr::null(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "NULL segment_metadata_bytes",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                ptr::null(),
+                1,
+            )
+        },
+        "NULL segment_metadata_lens",
+    );
+    let null_element = [ptr::null()];
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                null_element.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "NULL segment element",
+    );
+    let zero_len = [0_usize];
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                zero_len.as_ptr(),
+                1,
+            )
+        },
+        "zero-length segment element",
+    );
+
+    // None of the rejected calls touched the dataset.
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_commit_index_segments_rejects_unknown_column() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let missing_column = c_str("no_such_column");
+    let fragment = 0_u32;
+    let (bytes, len) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[fragment]),
+    );
+
+    let segment_bytes = [bytes as *const u8];
+    let segment_lens = [len];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                missing_column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        -1
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_replaces_fully_covered_segments() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let all_fragments = [fragment_ids[0] as u32, fragment_ids[1] as u32];
+    let index_name = c_str("id_idx");
+    let column = c_str("id");
+
+    // Commit one segment covering every fragment.
+    let (bytes_a, len_a) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&all_fragments),
+    );
+    let uuid_a = segment_uuid(bytes_a, len_a);
+    let segment_bytes = [bytes_a as *const u8];
+    let segment_lens = [len_a];
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1
+    );
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+
+    // Rebuild the same coverage under a fresh UUID and commit again: the old
+    // segment is replaced automatically (no replace flag). The uncommitted
+    // builder refuses to reuse a name that is already committed, so the
+    // rebuild happens under a scratch name; the commit registers it under
+    // `index_name` regardless of the name the segment was built with.
+    let rebuild_name = c_str("id_idx_rebuild");
+    let (bytes_b, len_b) = build_scalar_segment_bytes(
+        dataset,
+        &rebuild_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&all_fragments),
+    );
+    let uuid_b = segment_uuid(bytes_b, len_b);
+    assert_ne!(uuid_a, uuid_b);
+    let segment_bytes = [bytes_b as *const u8];
+    let segment_lens = [len_b];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 2
+    );
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+    let mut committed_uuid = [0_u8; 16];
+    let mut committed_count = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                committed_uuid.as_mut_ptr(),
+                1,
+                &mut committed_count,
+            )
+        },
+        0
+    );
+    assert_eq!(committed_count, 1);
+    assert_eq!(committed_uuid, uuid_b);
+
+    // A later commit covering only a strict subset of the live coverage
+    // would orphan the remaining fragment, so it is rejected.
+    let first_fragment = [all_fragments[0]];
+    let delta_name = c_str("id_idx_delta");
+    let (bytes_c, len_c) = build_scalar_segment_bytes(
+        dataset,
+        &delta_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&first_fragment),
+    );
+    let segment_bytes = [bytes_c as *const u8];
+    let segment_lens = [len_c];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        -1,
+        "partial overlap must be rejected instead of orphaning fragments"
+    );
+
+    unsafe {
+        lance_free_bytes(bytes_a);
+        lance_free_bytes(bytes_b);
+        lance_free_bytes(bytes_c);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_rejects_wrong_column() {
+    // A segment built for one column cannot be committed under another
+    // existing column: the core rejects segments whose keyed field does not
+    // match the commit-time column's field id.
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 16, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let (bytes, len) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[0]),
+    );
+
+    let wrong_column = c_str("embedding");
+    let segment_bytes = [bytes as *const u8];
+    let segment_lens = [len];
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                wrong_column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(message.contains("keyed field"), "{message}");
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_type_change() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let all_fragments = [fragment_ids[0] as u32, fragment_ids[1] as u32];
+    let index_name = c_str("id_idx");
+    let column = c_str("id");
+
+    let commit = |bytes: *const u8, len: usize| -> i32 {
+        let segment_bytes = [bytes];
+        let segment_lens = [len];
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        }
+    };
+
+    // Commit a BTree index covering every fragment.
+    let (bytes_a, len_a) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::BTree,
+        Some(&all_fragments),
+    );
+    let uuid_a = segment_uuid(bytes_a, len_a);
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(commit(bytes_a, len_a), 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1
+    );
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+
+    // A full-coverage commit of a different index type replaces the existing
+    // index entirely. The builder refuses to reuse a committed index name,
+    // so the Bitmap rebuild happens under a scratch name.
+    let rebuild_name = c_str("id_idx_bitmap");
+    let (bytes_b, len_b) = build_scalar_segment_bytes(
+        dataset,
+        &rebuild_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&all_fragments),
+    );
+    let uuid_b = segment_uuid(bytes_b, len_b);
+    assert_ne!(uuid_a, uuid_b);
+    assert_eq!(commit(bytes_b, len_b), 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 2
+    );
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+    let mut committed_uuid = [0_u8; 16];
+    let mut committed_count = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                committed_uuid.as_mut_ptr(),
+                1,
+                &mut committed_count,
+            )
+        },
+        0
+    );
+    assert_eq!(committed_count, 1);
+    assert_eq!(
+        committed_uuid, uuid_b,
+        "type change must replace the old segment"
+    );
+
+    // A type change with partial coverage is rejected: it would orphan the
+    // uncovered fragments of the existing index.
+    let first_fragment = [all_fragments[0]];
+    let partial_name = c_str("id_idx_partial");
+    let (bytes_c, len_c) = build_scalar_segment_bytes(
+        dataset,
+        &partial_name,
+        LanceScalarIndexType::BTree,
+        Some(&first_fragment),
+    );
+    assert_eq!(
+        commit(bytes_c, len_c),
+        -1,
+        "partial-coverage type change must be rejected"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(message.contains("partial fragment coverage"), "{message}");
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 2
+    );
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+
+    unsafe {
+        lance_free_bytes(bytes_a);
+        lance_free_bytes(bytes_b);
+        lance_free_bytes(bytes_c);
+        lance_dataset_close(dataset);
+    }
+}
+
 #[test]
 fn test_vector_model_rejects_malformed_arrow_inputs_without_panicking() {
     let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);

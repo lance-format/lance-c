@@ -936,6 +936,36 @@ public:
         return out;
     }
 
+    /// Commit previously built uncommitted index segments as one logical
+    /// index under `index_name` on `column`. Each entry of
+    /// `segment_metadata` is the protobuf-encoded IndexMetadata produced by
+    /// `IndexSegmentBuilder::execute_uncommitted()`. The commit is a single
+    /// dataset version bump. Every segment must have been built for `column`.
+    /// Replacement of existing same-name segments is automatic and
+    /// coverage-driven: fully covered segments are replaced, disjoint ones
+    /// are retained as deltas, and partial overlap is rejected. A commit
+    /// whose index type differs from the existing same-name index replaces
+    /// that index entirely, so it must cover every current fragment; a
+    /// partial-coverage type change is rejected.
+    /// Throws lance::Error on validation failures (empty set, duplicate
+    /// segment UUIDs, overlapping fragment coverage, unknown or mismatched
+    /// column).
+    void commit_index_segments(
+        const std::string& index_name,
+        const std::string& column,
+        const std::vector<std::vector<uint8_t>>& segment_metadata) {
+        std::vector<const uint8_t*> bytes(segment_metadata.size());
+        std::vector<size_t> lens(segment_metadata.size());
+        for (size_t i = 0; i < segment_metadata.size(); ++i) {
+            bytes[i] = segment_metadata[i].data();
+            lens[i] = segment_metadata[i].size();
+        }
+        if (lance_dataset_commit_index_segments(
+                handle_.get(), index_name.c_str(), column.c_str(), bytes.data(),
+                lens.data(), segment_metadata.size()) != 0)
+            check_error();
+    }
+
     /// Access the underlying C handle (does not transfer ownership).
     const LanceDataset* c_handle() const { return handle_.get(); }
 
