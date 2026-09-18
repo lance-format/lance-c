@@ -3788,6 +3788,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "chrono",
  "datafusion",
  "futures",

@@ -69,6 +69,51 @@ static void capture_scan_statistics(
     captured->bytes_read = statistics->bytes_read;
 }
 
+typedef struct {
+    uint64_t events;
+    uint64_t starts;
+    uint64_t completes;
+    int saw_shuffle_start;
+    int saw_shuffle_complete;
+    int invalid;
+    void *expected_ctx;
+    int ctx_mismatch;
+} BuildProgressCapture;
+
+static void capture_build_progress(
+    void *callback_ctx,
+    int32_t event,
+    const char *stage,
+    uint64_t total,
+    const char *unit,
+    uint64_t completed) {
+    (void)total;
+    (void)completed;
+    if (callback_ctx == NULL) return;
+    BuildProgressCapture *captured = (BuildProgressCapture *)callback_ctx;
+    if (callback_ctx != captured->expected_ctx) {
+        captured->ctx_mismatch = 1;
+    }
+    if (stage == NULL || unit == NULL) {
+        captured->invalid = 1;
+        return;
+    }
+    /* Exercise strcmp on the borrowed stage string. */
+    if (strcmp(stage, "shuffle") == 0) {
+        if (event == LANCE_INDEX_BUILD_PROGRESS_STAGE_START)
+            captured->saw_shuffle_start = 1;
+        if (event == LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE)
+            captured->saw_shuffle_complete = 1;
+    }
+    if (event == LANCE_INDEX_BUILD_PROGRESS_STAGE_START)
+        captured->starts += 1;
+    else if (event == LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE)
+        captured->completes += 1;
+    else if (event != LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS)
+        captured->invalid = 1;
+    captured->events += 1;
+}
+
 static void test_open_and_metadata(const char *uri) {
     printf("  test_open_and_metadata... ");
 
@@ -908,6 +953,59 @@ static void test_index_segment_builder(const char *uri) {
     printf("OK\n");
 }
 
+/* Runs a small vector segment build with a progress callback and verifies
+ * events are delivered with a readable stage name and a round-tripped
+ * callback context. */
+static void test_index_segment_builder_progress(const char *uri) {
+    printf("  test_index_segment_builder_progress... ");
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    uint64_t fragment_count = lance_dataset_fragment_count(ds);
+    ASSERT(fragment_count >= 2, "vector fixture must have two fragments");
+    uint64_t all_ids[2] = {0, 0};
+    ASSERT(lance_dataset_fragment_ids(ds, all_ids) == 0,
+           "fragment enumeration failed");
+    uint32_t fragment_ids[2] = {(uint32_t)all_ids[0], (uint32_t)all_ids[1]};
+
+    LanceVectorIndexSegmentParams params = {
+        LANCE_INDEX_IVF_FLAT, LANCE_METRIC_L2, 2, 0, 0, 2, 0, 0, 16,
+    };
+    LanceIndexSegmentBuildOptions options = {0};
+    options.fragment_ids = fragment_ids;
+    options.fragment_count = 2;
+    options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+    LanceIndexSegmentBuilder *builder =
+        lance_index_segment_builder_new_vector(
+            ds, "embedding", "c_progress_idx", &params, &options);
+    ASSERT(builder != NULL, "vector segment builder failed");
+
+    BuildProgressCapture captured = {0};
+    captured.expected_ctx = &captured;
+    ASSERT(lance_index_segment_builder_set_progress_callback(
+               builder, capture_build_progress, &captured) == 0,
+           "progress callback registration failed");
+
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    ASSERT(lance_index_segment_builder_execute_uncommitted(
+               builder, &bytes, &len) == 0,
+           "vector segment execution failed");
+    ASSERT(bytes != NULL && len > 0, "empty segment metadata");
+
+    ASSERT(captured.events > 0, "expected progress events");
+    ASSERT(captured.invalid == 0, "malformed progress event");
+    ASSERT(captured.ctx_mismatch == 0, "callback_ctx must round-trip");
+    ASSERT(captured.starts > 0 && captured.completes > 0,
+           "expected at least one START and one COMPLETE stage");
+    ASSERT(captured.saw_shuffle_start && captured.saw_shuffle_complete,
+           "expected shuffle START and COMPLETE events");
+
+    lance_free_bytes(bytes);
+    lance_index_segment_builder_free(builder);
+    lance_dataset_close(ds);
+    printf("events=%llu... OK\n", (unsigned long long)captured.events);
+}
+
 static void test_vector_models_and_reusable_segments(const char *uri) {
     printf("  test_vector_models_and_reusable_segments... ");
     LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
@@ -1144,6 +1242,7 @@ int main(int argc, char **argv) {
     test_restore_to_current(uri);
     test_error_handling();
     test_index_segment_builder(uri);
+    test_index_segment_builder_progress(uri);
     test_vector_models_and_reusable_segments(uri);
     test_commit_index_segments(uri);
     test_dataset_write_roundtrip(uri, write_uri);

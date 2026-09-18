@@ -70,6 +70,37 @@ static void capture_async_scan(
     captured->ready.notify_one();
 }
 
+struct BuildProgressCapture {
+    uint64_t events = 0;
+    uint64_t starts = 0;
+    uint64_t completes = 0;
+    bool invalid = false;
+};
+
+static void capture_build_progress(
+    void* callback_ctx,
+    int32_t event,
+    const char* stage,
+    uint64_t total,
+    const char* unit,
+    uint64_t completed) noexcept {
+    (void)total;
+    (void)completed;
+    if (!callback_ctx) return;
+    auto* captured = static_cast<BuildProgressCapture*>(callback_ctx);
+    if (!stage || !unit) {
+        captured->invalid = true;
+        return;
+    }
+    if (event == LANCE_INDEX_BUILD_PROGRESS_STAGE_START)
+        captured->starts += 1;
+    else if (event == LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE)
+        captured->completes += 1;
+    else if (event != LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS)
+        captured->invalid = true;
+    captured->events += 1;
+}
+
 static void test_dataset_open(const std::string& uri) {
     TEST(test_dataset_open);
 
@@ -561,6 +592,35 @@ static void test_index_segment_builder(const std::string& uri) {
     assert(metadata.fragment_ids() ==
            std::vector<uint32_t>{selected_fragment_id});
 
+    PASS();
+}
+
+static void test_index_segment_builder_progress(const std::string& uri) {
+    TEST(test_index_segment_builder_progress);
+    auto ds = lance::Dataset::open(uri);
+    auto all_ids = ds.fragment_ids();
+    assert(all_ids.size() >= 2);
+    std::vector<uint32_t> fragment_ids;
+    for (auto id : all_ids) fragment_ids.push_back(static_cast<uint32_t>(id));
+
+    LanceVectorIndexParams params = {
+        LANCE_INDEX_IVF_FLAT, LANCE_METRIC_L2, 2, 0, 0, 2, 0, 0, 16,
+    };
+    LanceIndexSegmentBuildOptions options = {};
+    options.fragment_ids = fragment_ids.data();
+    options.fragment_count = fragment_ids.size();
+    options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+
+    BuildProgressCapture captured;
+    auto builder = ds.new_vector_index_segment_builder(
+        "embedding", params, "cpp_progress_idx", &options);
+    builder.progress_callback(capture_build_progress, &captured);
+    auto bytes = builder.execute_uncommitted();
+
+    assert(!bytes.empty());
+    assert(captured.events > 0);
+    assert(captured.starts > 0 && captured.completes > 0);
+    assert(!captured.invalid);
     PASS();
 }
 
@@ -1096,6 +1156,7 @@ int main(int argc, char** argv) {
     test_multivector_rejects_flat_column(uri);
     test_index_segments_smoke(uri);
     test_index_segment_builder(uri);
+    test_index_segment_builder_progress(uri);
     test_vector_models_and_reusable_segments(uri);
     test_commit_index_segments(uri);
     test_fts_smoke(uri);

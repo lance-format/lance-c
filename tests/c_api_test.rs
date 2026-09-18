@@ -10,6 +10,7 @@ use std::ffi::{CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
 use arrow::ffi::from_ffi;
@@ -176,6 +177,134 @@ unsafe extern "C" fn capture_scan_statistics_atomically(
         return;
     }
     captured.calls.fetch_add(1, AtomicOrdering::SeqCst);
+}
+
+// ─── Index build progress capture fixture ───
+
+/// Records progress events plus the exact `callback_ctx` pointer each
+/// invocation received, so tests can verify the context round-trips.
+#[derive(Default)]
+struct ProgressCapture {
+    events: Vec<(i32, String, u64, String, u64)>,
+    contexts: Vec<*mut c_void>,
+}
+
+/// Heap-allocate a capture and return it as an opaque callback context.
+fn new_progress_capture() -> *mut c_void {
+    let capture: Box<Mutex<ProgressCapture>> = Box::new(Mutex::new(ProgressCapture::default()));
+    Box::into_raw(capture).cast()
+}
+
+/// Reclaim a capture created by `new_progress_capture` and return its contents.
+fn take_progress_capture(callback_ctx: *mut c_void) -> ProgressCapture {
+    assert!(!callback_ctx.is_null());
+    let capture = unsafe { Box::from_raw(callback_ctx.cast::<Mutex<ProgressCapture>>()) };
+    capture.into_inner().unwrap()
+}
+
+/// Progress callback that records every event (and the context pointer it was
+/// invoked with) into the heap `ProgressCapture` passed as `callback_ctx`.
+/// Tolerates a NULL context by ignoring the call.
+unsafe extern "C" fn record_build_progress(
+    callback_ctx: *mut c_void,
+    event: i32,
+    stage: *const c_char,
+    total: u64,
+    unit: *const c_char,
+    completed: u64,
+) {
+    if callback_ctx.is_null() {
+        return;
+    }
+    let capture = unsafe { &*callback_ctx.cast::<Mutex<ProgressCapture>>() };
+    let stage = unsafe { std::ffi::CStr::from_ptr(stage) }
+        .to_string_lossy()
+        .into_owned();
+    let unit = unsafe { std::ffi::CStr::from_ptr(unit) }
+        .to_string_lossy()
+        .into_owned();
+    let mut guard = capture.lock().unwrap();
+    guard.contexts.push(callback_ctx);
+    guard.events.push((event, stage, total, unit, completed));
+}
+
+/// Log of every raw `callback_ctx` a build invoked (as `usize` so the static
+/// stays `Sync`), for round-trip checks that pass a sentinel or NULL context
+/// instead of a capture.
+static RECORDED_PROGRESS_CONTEXTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Progress callback that records only the raw `callback_ctx` pointer, never
+/// dereferencing it. Used for sentinel / NULL context round-trip checks.
+unsafe extern "C" fn record_progress_ctx(
+    callback_ctx: *mut c_void,
+    _event: i32,
+    _stage: *const c_char,
+    _total: u64,
+    _unit: *const c_char,
+    _completed: u64,
+) {
+    RECORDED_PROGRESS_CONTEXTS
+        .lock()
+        .unwrap()
+        .push(callback_ctx as usize);
+}
+
+/// Assert the well-formedness invariants shared by every progress-capturing
+/// build: event codes are only {START, PROGRESS, COMPLETE}, stage strings are
+/// non-empty, the documented numeric mapping holds per event (PROGRESS
+/// reports total == 0, START reports completed == 0, COMPLETE zeroes both,
+/// and only START carries a unit), and per stage the first event is START,
+/// the last is COMPLETE, and START/COMPLETE counts match (one active stage at
+/// a time).
+fn assert_progress_events_well_formed(capture: &ProgressCapture) {
+    use std::collections::HashMap;
+    for (event, stage, total, unit, completed) in &capture.events {
+        assert!(
+            *event == 0 || *event == 1 || *event == 2,
+            "unexpected progress event code {event}"
+        );
+        assert!(!stage.is_empty(), "progress stage must be non-empty");
+        if *event == 1 {
+            assert_eq!(*total, 0, "PROGRESS event must report total == 0");
+        }
+        if *event == 0 {
+            assert_eq!(*completed, 0, "START event must report completed == 0");
+        }
+        if *event == 2 {
+            assert_eq!(*total, 0, "COMPLETE event must report total == 0");
+            assert_eq!(*completed, 0, "COMPLETE event must report completed == 0");
+        }
+        if *event != 0 {
+            assert!(unit.is_empty(), "non-START event must report unit == \"\"");
+        }
+    }
+    let mut order: Vec<&str> = Vec::new();
+    let mut by_stage: HashMap<&str, Vec<i32>> = HashMap::new();
+    for (event, stage, ..) in &capture.events {
+        if !by_stage.contains_key(stage.as_str()) {
+            order.push(stage);
+        }
+        by_stage.entry(stage.as_str()).or_default().push(*event);
+    }
+    for stage in order {
+        let events = &by_stage[stage];
+        assert_eq!(
+            events.first().copied(),
+            Some(0),
+            "stage {stage} must begin with START"
+        );
+        assert_eq!(
+            events.last().copied(),
+            Some(2),
+            "stage {stage} must end with COMPLETE"
+        );
+        let starts = events.iter().filter(|&&event| event == 0).count();
+        let completes = events.iter().filter(|&&event| event == 2).count();
+        assert_eq!(
+            starts, completes,
+            "stage {stage} must pair each START with a COMPLETE"
+        );
+    }
 }
 
 /// Helper: build a tiny dataset whose `value` column is nullable AND contains
@@ -4528,6 +4657,505 @@ fn test_vector_index_segment_trains_locally_for_fragment_subset() {
     unsafe {
         lance_index_segment_metadata_free(metadata);
         lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_vector_index_segment_progress_callback() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let column = c_str("embedding");
+    // Mirror test_create_vector_index_ivf_pq: IVF_PQ over 256 rows, dim 16,
+    // 8 partitions, 4 sub-vectors, driven here through the segment builder.
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 8,
+        num_sub_vectors: 4,
+        num_bits: 8,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                capture_ctx,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+
+    let capture = take_progress_capture(capture_ctx);
+    // The installed context pointer round-trips to every invocation.
+    assert!(!capture.contexts.is_empty(), "expected progress events");
+    assert!(
+        capture.contexts.iter().all(|ctx| *ctx == capture_ctx),
+        "callback_ctx must round-trip unchanged"
+    );
+
+    assert_progress_events_well_formed(&capture);
+
+    let stage_names: Vec<&str> = capture
+        .events
+        .iter()
+        .map(|(_, stage, ..)| stage.as_str())
+        .collect();
+    assert!(
+        stage_names.contains(&"shuffle"),
+        "expected a shuffle stage, saw {stage_names:?}"
+    );
+    assert!(
+        stage_names.contains(&"merge_partitions"),
+        "expected a merge_partitions stage, saw {stage_names:?}"
+    );
+
+    // The shuffle stage must report at least one PROGRESS event whose
+    // completed count does not exceed the START total.
+    let shuffle_start = capture
+        .events
+        .iter()
+        .find(|(event, stage, ..)| *event == 0 && stage == "shuffle")
+        .expect("shuffle START must be present");
+    let shuffle_total = shuffle_start.2;
+    // Shuffle counts rows (rust/lance/src/index/vector/builder.rs).
+    assert_eq!(
+        shuffle_start.3, "rows",
+        "shuffle START must report unit \"rows\""
+    );
+    assert!(shuffle_total > 0, "shuffle total must be positive");
+    assert!(
+        capture
+            .events
+            .iter()
+            .any(|(event, stage, _, _, completed)| {
+                *event == 1 && stage == "shuffle" && *completed <= shuffle_total
+            }),
+        "expected shuffle PROGRESS with completed <= total ({shuffle_total})"
+    );
+}
+
+#[test]
+fn test_scalar_index_segment_progress_callback_sees_load_data() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let column = c_str("id");
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                capture_ctx,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+
+    let capture = take_progress_capture(capture_ctx);
+    assert!(!capture.events.is_empty(), "expected progress events");
+    assert!(
+        capture
+            .events
+            .iter()
+            .any(|(event, stage, ..)| { *event == 0 && stage == "load_data" }),
+        "expected load_data START, saw {:?}",
+        capture.events
+    );
+    assert!(
+        capture
+            .events
+            .iter()
+            .any(|(event, stage, ..)| { *event == 2 && stage == "load_data" }),
+        "expected load_data COMPLETE, saw {:?}",
+        capture.events
+    );
+}
+
+#[test]
+fn test_vector_index_segment_progress_callback_multi_fragment_subset() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let selected_fragment = fragment_ids[0] as u32;
+    let column = c_str("embedding");
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &selected_fragment,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                capture_ctx,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+
+    // The fragment-scoped build still succeeds and reports progress.
+    let capture = take_progress_capture(capture_ctx);
+    assert!(!capture.events.is_empty(), "expected progress events");
+    assert_progress_events_well_formed(&capture);
+}
+
+#[test]
+fn test_index_segment_builder_progress_callback_edge_cases() {
+    // NULL builder is rejected and sets the error channel.
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                ptr::null_mut(),
+                Some(record_build_progress),
+                capture_ctx,
+            )
+        },
+        -1
+    );
+    assert_ne!(lance_last_error_code(), lance_c::LanceErrorCode::Ok);
+    take_progress_capture(capture_ctx);
+
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+
+    // NULL callback is rejected.
+    let column = c_str("id");
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(builder, None, ptr::null_mut())
+        },
+        -1
+    );
+
+    // Setting with a NULL callback_ctx succeeds and the NULL context reaches
+    // the callback verbatim.
+    RECORDED_PROGRESS_CONTEXTS.lock().unwrap().clear();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_progress_ctx),
+                ptr::null_mut(),
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe { lance_free_bytes(bytes) };
+    assert!(
+        RECORDED_PROGRESS_CONTEXTS
+            .lock()
+            .unwrap()
+            .contains(&(ptr::null_mut::<c_void>() as usize)),
+        "NULL callback_ctx must reach the callback"
+    );
+
+    // A distinctive sentinel context round-trips to the callback.
+    let sentinel = 0xC0FFEE_usize as *mut c_void;
+    RECORDED_PROGRESS_CONTEXTS.lock().unwrap().clear();
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_progress_ctx),
+                sentinel,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe { lance_free_bytes(bytes) };
+    assert!(
+        RECORDED_PROGRESS_CONTEXTS
+            .lock()
+            .unwrap()
+            .contains(&(sentinel as usize)),
+        "sentinel callback_ctx must round-trip"
+    );
+
+    // Setting a callback after execution is rejected: the builder is single-use.
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_progress_ctx),
+                sentinel,
+            )
+        },
+        -1
+    );
+    unsafe { lance_index_segment_builder_free(builder) };
+
+    // Setting a callback twice installs only the second one.
+    let first_ctx = new_progress_capture();
+    let second_ctx = new_progress_capture();
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                first_ctx,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                second_ctx,
+            )
+        },
+        0
+    );
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+    let first = take_progress_capture(first_ctx);
+    let second = take_progress_capture(second_ctx);
+    assert!(
+        first.events.is_empty(),
+        "the replaced callback must not receive events"
+    );
+    assert!(
+        !second.events.is_empty(),
+        "the replacement callback must receive events"
+    );
+}
+
+#[test]
+fn test_index_segment_builder_progress_callback_success_clears_error() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let column = c_str("id");
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+
+    // A failed set leaves a non-OK error code...
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(builder, None, ptr::null_mut())
+        },
+        -1
+    );
+    assert_ne!(lance_last_error_code(), lance_c::LanceErrorCode::Ok);
+
+    // ...and a successful set clears it back to OK.
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                capture_ctx,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(lance_last_error_code(), lance_c::LanceErrorCode::Ok);
+    take_progress_capture(capture_ctx);
+    unsafe {
         lance_index_segment_builder_free(builder);
         lance_dataset_close(dataset);
     }

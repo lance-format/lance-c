@@ -18,6 +18,10 @@ rust-version = "1.91.0"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+# Direct for the `#[async_trait::async_trait]` impl of lance's
+# `lance_index::progress::IndexBuildProgress`; already in the graph
+# transitively via lance-index.
+async-trait = "0.1"
 lance = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7", features = ["substrait"] }
 lance-core = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7" }
 lance-file = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7" }
