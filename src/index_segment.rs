@@ -4,7 +4,7 @@
 //! Distributed index segment build and metadata C API.
 
 use std::collections::HashSet;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use lance::Dataset;
 use lance::index::DatasetIndexExt;
 use lance_core::{Error, Result};
+use lance_index::progress::IndexBuildProgress;
 use lance_index::scalar::ScalarIndexParams;
 use lance_table::format::{IndexMetadata, pb};
 use prost::Message;
@@ -117,6 +118,7 @@ pub struct LanceIndexSegmentBuilder {
     kind: SegmentKind,
     fragment_ids: Option<Vec<u32>>,
     index_uuid: Option<Uuid>,
+    progress: Option<SendIndexBuildProgressCallback>,
     executed: bool,
 }
 
@@ -130,6 +132,120 @@ enum SegmentKind {
         centroids: Option<Arc<FixedSizeListArray>>,
         codebook: Option<ArrayRef>,
     },
+}
+
+/// Event code delivered to `LanceIndexBuildProgressCallback`; mirrors
+/// `LanceIndexBuildProgressEvent` in lance.h.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexBuildProgressEvent {
+    /// A build stage began.
+    StageStart = 0,
+    /// Work units completed within the active stage.
+    StageProgress = 1,
+    /// The active stage finished.
+    StageComplete = 2,
+}
+
+/// Index build progress callback bridged to a C function pointer.
+///
+/// The public C type is an `Option` of the raw function pointer so NULL can be
+/// rejected at the setter; once stored here the callback is known non-NULL.
+pub type LanceIndexBuildProgressCallback = Option<
+    unsafe extern "C" fn(
+        callback_ctx: *mut c_void,
+        event: i32,
+        stage: *const c_char,
+        total: u64,
+        unit: *const c_char,
+        completed: u64,
+    ),
+>;
+
+#[derive(Debug, Clone)]
+struct SendIndexBuildProgressCallback {
+    callback: unsafe extern "C" fn(
+        callback_ctx: *mut c_void,
+        event: i32,
+        stage: *const c_char,
+        total: u64,
+        unit: *const c_char,
+        completed: u64,
+    ),
+    ctx: *mut c_void,
+}
+
+// SAFETY: The C API requires the callback and its context to remain valid and
+// safe to invoke until the segment builder is freed, and the builder is
+// single-use, so no invocation can outlive the builder. Certain build stages
+// report progress concurrently from parallel worker tasks, so the callback
+// may be invoked concurrently; the C contract requires it to be thread-safe.
+unsafe impl Send for SendIndexBuildProgressCallback {}
+unsafe impl Sync for SendIndexBuildProgressCallback {}
+
+/// Build a `CString` for a stage or unit name without panicking.
+///
+/// Lance core never emits interior NUL bytes, but the FFI contract is
+/// panic-free, so any that appear are stripped rather than aborting the
+/// process. The strip removes every NUL byte, so `CString::new` cannot fail;
+/// the `map_err` below is defensive-only and unreachable.
+fn progress_c_string(value: &str) -> Result<CString> {
+    let cleaned = if value.contains('\0') {
+        value.replace('\0', "")
+    } else {
+        value.to_owned()
+    };
+    CString::new(cleaned)
+        .map_err(|_| Error::internal("index build progress stage/unit contained an interior NUL"))
+}
+
+#[async_trait::async_trait]
+impl IndexBuildProgress for SendIndexBuildProgressCallback {
+    async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> Result<()> {
+        let stage = progress_c_string(stage)?;
+        let unit = progress_c_string(unit)?;
+        unsafe {
+            (self.callback)(
+                self.ctx,
+                IndexBuildProgressEvent::StageStart as i32,
+                stage.as_ptr(),
+                total.unwrap_or(0),
+                unit.as_ptr(),
+                0,
+            )
+        };
+        Ok(())
+    }
+
+    async fn stage_progress(&self, stage: &str, completed: u64) -> Result<()> {
+        let stage = progress_c_string(stage)?;
+        unsafe {
+            (self.callback)(
+                self.ctx,
+                IndexBuildProgressEvent::StageProgress as i32,
+                stage.as_ptr(),
+                0,
+                c"".as_ptr(),
+                completed,
+            )
+        };
+        Ok(())
+    }
+
+    async fn stage_complete(&self, stage: &str) -> Result<()> {
+        let stage = progress_c_string(stage)?;
+        unsafe {
+            (self.callback)(
+                self.ctx,
+                IndexBuildProgressEvent::StageComplete as i32,
+                stage.as_ptr(),
+                0,
+                c"".as_ptr(),
+                0,
+            )
+        };
+        Ok(())
+    }
 }
 
 /// Opaque parsed index segment metadata.
@@ -317,6 +433,7 @@ unsafe fn new_scalar_builder_inner(
         },
         fragment_ids: parsed.fragment_ids,
         index_uuid: parsed.index_uuid,
+        progress: None,
         executed: false,
     })))
 }
@@ -930,6 +1047,7 @@ unsafe fn new_vector_builder_inner(
         },
         fragment_ids: parsed.fragment_ids,
         index_uuid: parsed.index_uuid,
+        progress: None,
         executed: false,
     })))
 }
@@ -988,6 +1106,9 @@ unsafe fn execute_uncommitted_inner(
             if let Some(index_uuid) = builder.index_uuid {
                 core_builder = core_builder.index_uuid(index_uuid);
             }
+            if let Some(progress) = builder.progress.clone() {
+                core_builder = core_builder.progress(Arc::new(progress));
+            }
             block_on(core_builder.execute_uncommitted())?
         }
         SegmentKind::Vector {
@@ -1011,6 +1132,9 @@ unsafe fn execute_uncommitted_inner(
             if let Some(index_uuid) = builder.index_uuid {
                 core_builder = core_builder.index_uuid(index_uuid);
             }
+            if let Some(progress) = builder.progress.clone() {
+                core_builder = core_builder.progress(Arc::new(progress));
+            }
             // Core's train=false means "create an empty index".  Model presence
             // itself controls whether IVF/PQ training is skipped.
             block_on(core_builder.train(true).execute_uncommitted())?
@@ -1029,6 +1153,57 @@ unsafe fn execute_uncommitted_inner(
         ptr::write(out_bytes, allocation);
         ptr::write(out_len, bytes.len());
     }
+    Ok(0)
+}
+
+/// Install (or replace) the index-build progress callback for a segment
+/// builder.
+///
+/// The callback is invoked from lance-c's internal tokio runtime worker
+/// threads while `lance_index_segment_builder_execute_uncommitted` runs.
+/// Lance core may deliver events from spawned worker tasks, and error paths
+/// can detach them before they finish, so the callback and `callback_ctx`
+/// must remain valid until the builder is freed rather than being retired
+/// when `execute_uncommitted` returns. Certain stages report progress
+/// concurrently from parallel worker tasks, so the callback must be
+/// thread-safe and reentrant, must be non-blocking, and must not call back
+/// into any `lance_*` function. It is invoked without a panic guard: it must
+/// return normally, because unwinding or throwing across this boundary can
+/// abort the host process. Progress reporting is advisory and cannot affect
+/// the build outcome or abort the build.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_builder_set_progress_callback(
+    builder: *mut LanceIndexSegmentBuilder,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
+) -> i32 {
+    ffi_try!(
+        unsafe { set_progress_callback_inner(builder, callback, callback_ctx) },
+        neg
+    )
+}
+
+unsafe fn set_progress_callback_inner(
+    builder: *mut LanceIndexSegmentBuilder,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
+) -> Result<i32> {
+    if builder.is_null() {
+        return Err(invalid_input("builder must not be NULL"));
+    }
+    let Some(callback) = callback else {
+        return Err(invalid_input("progress callback must not be NULL"));
+    };
+    let builder = unsafe { &mut *builder };
+    if builder.executed {
+        return Err(invalid_input(
+            "progress callback must be set before the builder is executed",
+        ));
+    }
+    builder.progress = Some(SendIndexBuildProgressCallback {
+        callback,
+        ctx: callback_ctx,
+    });
     Ok(0)
 }
 
