@@ -35,6 +35,7 @@ datafusion = { version = "54.0.0", default-features = false }
 arrow = { version = "58.0.0", features = ["prettyprint", "ffi"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
+bytes = "1"
 # Direct to name `chrono::TimeDelta` (the field type of lance's public
 # `AutoCleanupParams`) and `chrono::DateTime`/`Utc` (index metadata
 # timestamps); already in the graph transitively via lance.
@@ -42,10 +43,12 @@ chrono = { version = "0.4", default-features = false }
 half = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 futures = "0.3"
+foyer = "=0.22.6"
 log = "0.4"
 libc = "0.2"
 # Explicitly install the HTTP transport when embedded in a static C/C++ executable.
 opendal = { version = "=0.59.2", default-features = false, features = ["http-transport-reqwest"] }
+object_store = "0.14.2"
 pin-project = "1.0"
 prost = "0.14"
 snafu = "0.9"

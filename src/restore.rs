@@ -65,8 +65,16 @@ unsafe fn restore_inner(dataset: *const LanceDataset, version: u64) -> Result<*m
         Ok::<_, lance_core::Error>(checked_out)
     })?;
 
+    let (restored, data_cache) = if let Some(data_cache) = &ds.data_cache {
+        let (restored, data_cache) = data_cache.attach_fresh(restored);
+        (restored, Some(data_cache))
+    } else {
+        (restored, None)
+    };
+
     let handle = LanceDataset {
         inner: RwLock::new(Arc::new(restored)),
+        data_cache,
     };
     Ok(Box::into_raw(Box::new(handle)))
 }
