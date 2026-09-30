@@ -9,7 +9,7 @@ use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
 use std::path::Path as FsPath;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -33,8 +33,31 @@ use crate::helpers;
 use crate::runtime::block_on;
 use crate::session::{LanceSession, session_new_with_data_cache_factory};
 
-const CACHE_KEY_VERSION: &str = "lance-data-v1";
+const CACHE_KEY_VERSION: &str = "lance-data-v2";
 const FOYER_PAGE_SIZE: usize = 4096;
+
+struct OriginNamespace {
+    origin: Weak<dyn ObjectStore>,
+    namespace: uuid::Uuid,
+}
+
+static ORIGIN_NAMESPACES: LazyLock<Mutex<HashMap<usize, OriginNamespace>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn origin_namespace(origin: &Arc<dyn ObjectStore>) -> uuid::Uuid {
+    // store_prefix omits endpoint/credentials, and this interface exposes no stable
+    // backend identity. Only the same live origin may reuse metadata or data.
+    // Persist a random namespace, never an address that another process can reuse.
+    let mut namespaces = ORIGIN_NAMESPACES.lock().unwrap();
+    namespaces.retain(|_, entry| entry.origin.strong_count() != 0);
+    namespaces
+        .entry(Arc::as_ptr(origin) as *const () as usize)
+        .or_insert_with(|| OriginNamespace {
+            origin: Arc::downgrade(origin),
+            namespace: uuid::Uuid::new_v4(),
+        })
+        .namespace
+}
 
 /// Configuration for the optional Foyer data-file cache.
 #[repr(C)]
@@ -384,7 +407,7 @@ impl WrappingObjectStore for DatasetFoyerDataCache {
         let original = self.cache.unwrap_store(original);
         let reader = DataCacheReader {
             cache: self.cache.clone(),
-            store_prefix: store_prefix.to_owned(),
+            store_prefix: format!("{}\0{store_prefix}", origin_namespace(&original)),
             original: original.clone(),
             statistics: self.statistics.clone(),
         };
@@ -467,18 +490,29 @@ impl DataCacheObjectStore {
                 .await?;
             // Cache only immutable metadata and attributes, never request-specific state.
             self.reader.cache.metadata.insert(
-                metadata_key,
+                metadata_key.clone(),
                 (result.meta.clone(), result.attributes.clone()),
             );
             (result.meta, result.attributes)
         };
         let object_size = metadata.size;
-        self.reader.cache.cache.insert(
+        let size_bytes = object_size.to_le_bytes();
+        // WriteOnInsertion enqueues disk I/O even for an identical value. Look in
+        // both tiers so warm reads, including recovered entries, remain read-only.
+        let size_is_cached = match self.reader.cache.cache.get(&metadata_key).await {
+            Ok(Some(entry)) => entry.value().as_ref() == size_bytes,
+            Ok(None) => false,
+            Err(error) => {
+                log::warn!("Foyer data-cache size lookup failed for {location}: {error}");
+                false
+            }
+        };
+        if !size_is_cached {
             self.reader
                 .cache
-                .size_key(&self.reader.store_prefix, location),
-            Bytes::copy_from_slice(&object_size.to_le_bytes()),
-        );
+                .cache
+                .insert(metadata_key, Bytes::copy_from_slice(&size_bytes));
+        }
 
         let range = match options.range.clone() {
             Some(requested) => match requested.as_range(object_size) {
@@ -861,8 +895,14 @@ mod tests {
         (scope.wrap("memory://test", original), scope)
     }
 
-    #[tokio::test]
-    async fn cached_http_ranges_do_not_repeat_head_requests() {
+    async fn http_store(
+        data: Bytes,
+    ) -> (
+        Arc<dyn ObjectStore>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use object_store::aws::AmazonS3Builder;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -872,7 +912,6 @@ mod tests {
         let gets = Arc::new(AtomicU64::new(0));
         let server_heads = heads.clone();
         let server_gets = gets.clone();
-        let data = Bytes::from((0..8192).map(|value| value as u8).collect::<Vec<_>>());
         let server_data = data.clone();
         let server = tokio::spawn(async move {
             loop {
@@ -935,6 +974,13 @@ mod tests {
                 .build()
                 .unwrap(),
         );
+        (original, heads, gets, server)
+    }
+
+    #[tokio::test]
+    async fn cached_http_ranges_do_not_repeat_head_requests() {
+        let data = Bytes::from((0..8192).map(|value| value as u8).collect::<Vec<_>>());
+        let (original, heads, gets, server) = http_store(data.clone()).await;
         let directory = tempfile::tempdir().unwrap();
         let cache = FoyerDataCache::try_new(directory.path(), 128 * 1024, 1024 * 1024, 4096)
             .await
@@ -993,6 +1039,126 @@ mod tests {
             "explicit HEAD must bypass cache"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn same_bucket_and_path_on_distinct_endpoints_remain_isolated() {
+        let (first, _, _, first_server) = http_store(Bytes::from(vec![11; 8192])).await;
+        let (second, second_heads, second_gets, second_server) =
+            http_store(Bytes::from(vec![29; 4096])).await;
+        let directory = tempfile::tempdir().unwrap();
+        let cache = FoyerDataCache::try_new(directory.path(), 128 * 1024, 1024 * 1024, 4096)
+            .await
+            .unwrap();
+        let path = Path::from("table.lance/data/shared.lance");
+        let first = cache.create_scope().wrap("s3$example-bucket", first);
+        let second = cache.create_scope().wrap("s3$example-bucket", second);
+        assert_eq!(
+            first.get(&path).await.unwrap().bytes().await.unwrap(),
+            Bytes::from(vec![11; 8192])
+        );
+        let result = second.get(&path).await.unwrap();
+        assert_eq!(
+            result.meta.size, 4096,
+            "metadata must belong to the second endpoint"
+        );
+        assert_eq!(result.bytes().await.unwrap(), Bytes::from(vec![29; 4096]));
+        assert_eq!(second_heads.load(Ordering::SeqCst), 1);
+        assert_eq!(second_gets.load(Ordering::SeqCst), 1);
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn batched_ranges_do_not_reuse_another_store_or_mask_not_found() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = FoyerDataCache::try_new(directory.path(), 128 * 1024, 1024 * 1024, 4096)
+            .await
+            .unwrap();
+        let first = Arc::new(InMemory::new());
+        let second = Arc::new(InMemory::new());
+        let missing = Arc::new(InMemory::new());
+        let path = Path::from("table.lance/data/shared.lance");
+        first
+            .put(&path, Bytes::from(vec![11; 8192]).into())
+            .await
+            .unwrap();
+        second
+            .put(&path, Bytes::from(vec![29; 8192]).into())
+            .await
+            .unwrap();
+        let (first, _) = wrap_for_test(&cache, first);
+        let (second, _) = wrap_for_test(&cache, second);
+        let (missing, _) = wrap_for_test(&cache, missing);
+        assert_eq!(
+            first
+                .get_ranges(&path, &[0..4096, 4096..8192])
+                .await
+                .unwrap()[0],
+            Bytes::from(vec![11; 4096])
+        );
+        assert_eq!(
+            second
+                .get_ranges(&path, &[0..4096, 4096..8192])
+                .await
+                .unwrap()[0],
+            Bytes::from(vec![29; 4096])
+        );
+        assert!(matches!(
+            missing.get(&path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(matches!(
+            missing.get_ranges(&path, &[0..16, 16..32]).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn warm_range_reads_do_not_rewrite_size_entries_to_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = Arc::new(InMemory::new());
+        let path = Path::from("table.lance/data/sample.lance");
+        original
+            .put(&path, Bytes::from(vec![7; 8192]).into())
+            .await
+            .unwrap();
+        let cache = FoyerDataCache::try_new(directory.path(), 128 * 1024, 1024 * 1024, 4096)
+            .await
+            .unwrap();
+        let (wrapped, _) = wrap_for_test(&cache, original.clone());
+        assert_eq!(
+            wrapped
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .len(),
+            8192
+        );
+        drop(wrapped);
+        cache.cache.close().await.unwrap();
+        drop(cache);
+
+        let cache = FoyerDataCache::try_new(directory.path(), 128 * 1024, 1024 * 1024, 4096)
+            .await
+            .unwrap();
+        let (wrapped, _) = wrap_for_test(&cache, original);
+        for _ in 0..5 {
+            assert_eq!(
+                wrapped.get_range(&path, 100..200).await.unwrap(),
+                Bytes::from(vec![7; 100])
+            );
+        }
+        // Drain the real disk writer so asynchronous enqueues cannot hide behind the assertion.
+        cache.cache.close().await.unwrap();
+        assert_eq!(
+            cache.cache.statistics().disk_write_bytes(),
+            0,
+            "warm reads must not enqueue size records for disk storage"
+        );
     }
 
     #[tokio::test]
@@ -1268,6 +1434,49 @@ mod tests {
         );
         assert_eq!(statistics.snapshot().bytes_read_from_cache, 89_990);
         assert_eq!(statistics.snapshot().bytes_read_from_remote, 0);
+    }
+
+    #[tokio::test]
+    async fn recovered_disk_entries_do_not_outlive_their_origin_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::from("table.lance/data/shared.lance");
+        let original = Arc::new(InMemory::new());
+        let weak = Arc::downgrade(&original);
+        original
+            .put(&path, Bytes::from(vec![11; 8192]).into())
+            .await
+            .unwrap();
+        let cache = FoyerDataCache::try_new(directory.path(), 128 * 1024, 1024 * 1024, 4096)
+            .await
+            .unwrap();
+        let (wrapped, _) = wrap_for_test(&cache, original);
+        assert_eq!(wrapped.get_range(&path, 0..8192).await.unwrap().len(), 8192);
+        drop(wrapped);
+        assert!(
+            weak.upgrade().is_none(),
+            "the namespace registry must not retain stores"
+        );
+        cache.cache.close().await.unwrap();
+        drop(cache);
+
+        let recovered = FoyerDataCache::try_new(directory.path(), 128 * 1024, 1024 * 1024, 4096)
+            .await
+            .unwrap();
+        let replacement = Arc::new(InMemory::new());
+        replacement
+            .put(&path, Bytes::from(vec![29; 8192]).into())
+            .await
+            .unwrap();
+        let (wrapped, statistics) = wrap_for_test(&recovered, replacement);
+        assert_eq!(
+            wrapped
+                .get_ranges(&path, &[0..4096, 4096..8192])
+                .await
+                .unwrap(),
+            vec![Bytes::from(vec![29; 4096]); 2]
+        );
+        assert_eq!(statistics.snapshot().bytes_read_from_cache, 0);
+        assert_eq!(statistics.snapshot().bytes_read_from_remote, 8192);
     }
 
     #[tokio::test]
