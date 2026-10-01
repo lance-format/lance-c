@@ -1017,6 +1017,14 @@ public:
             check_error();
     }
 
+    /// Synchronously prewarm all segments of an index in this snapshot.
+    /// Uses the dataset's session index cache; entries remain evictable.
+    /// Throws lance::Error on failure, including an absent or empty index name.
+    void prewarm_index(const std::string& index_name) const {
+        if (lance_dataset_prewarm_index(handle_.get(), index_name.c_str()) != 0)
+            check_error();
+    }
+
     /// Number of user indexes (excludes system indexes).
     uint64_t index_count() const {
         uint64_t n = lance_dataset_index_count(handle_.get());

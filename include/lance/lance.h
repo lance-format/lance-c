@@ -2051,6 +2051,26 @@ int32_t lance_dataset_commit_index_segments(
     size_t segment_count
 );
 
+/**
+ * Synchronously prewarm a logical index in the dataset's session index cache.
+ *
+ * Delegates to the Rust SDK's prewarm_index for all segments with index_name
+ * in the handle's current snapshot. Does not change the dataset version.
+ * Index types/formats follow the SDK's prewarm support and error behavior.
+ *
+ * Reuse the same LanceSession when opening subsequent query datasets to reuse
+ * warmed entries across handles. Cache entries remain evictable; success does
+ * not guarantee full or permanent residency. Ordinary data columns are not
+ * prewarmed. An error may leave partially warmed entries; retrying is safe.
+ *
+ * dataset must be valid and index_name must be a non-empty, NUL-terminated
+ * UTF-8 string. Both must remain valid until this blocking call returns.
+ * Returns 0 on success, -1 on error (see lance_last_error_code/message).
+ * NULL/empty/invalid UTF-8 arguments yield LANCE_ERR_INVALID_ARGUMENT;
+ * an index absent from this snapshot yields LANCE_ERR_NOT_FOUND.
+ */
+int32_t lance_dataset_prewarm_index(const LanceDataset* dataset, const char* index_name);
+
 /** Drop an index by name. Returns -1 (NOT_FOUND) if no such index. */
 int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name);
 

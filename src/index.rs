@@ -269,6 +269,38 @@ unsafe fn dataset_index_segments_inner(
     Ok(0)
 }
 
+/// Synchronously prewarm all segments of a logical index in this snapshot.
+///
+/// Uses the dataset's session index cache. Success does not pin cache entries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_prewarm_index(
+    dataset: *const LanceDataset,
+    index_name: *const c_char,
+) -> i32 {
+    ffi_try!(unsafe { prewarm_index_inner(dataset, index_name) }, neg)
+}
+
+unsafe fn prewarm_index_inner(
+    dataset: *const LanceDataset,
+    index_name: *const c_char,
+) -> Result<i32> {
+    if dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
+    }
+    let index_name = unsafe { helpers::parse_c_string(index_name)? }
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source("index_name must not be NULL or empty".into())
+        })?;
+    // Keep one snapshot and its shared session alive without holding the
+    // dataset lock across potentially long-running index IO.
+    let snapshot = unsafe { &*dataset }.snapshot();
+    block_on(snapshot.prewarm_index(index_name))?;
+    Ok(0)
+}
+
 /// Drop an index by name.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_drop_index(

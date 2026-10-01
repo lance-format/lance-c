@@ -528,6 +528,18 @@ static void test_index_lifecycle(const std::string& uri) {
     assert(json.find("id_idx") != std::string::npos);
     printf("listed: %s... ", json.c_str());
 
+    const auto& readonly_ds = ds;
+    readonly_ds.prewarm_index("id_idx");
+    readonly_ds.prewarm_index("id_idx");
+    bool missing_index = false;
+    try {
+        readonly_ds.prewarm_index("missing_idx");
+    } catch (const lance::Error& error) {
+        assert(error.code == LANCE_ERR_NOT_FOUND);
+        missing_index = true;
+    }
+    assert(missing_index);
+
     ds.drop_index("id_idx");
     assert(ds.index_count() == 0);
 

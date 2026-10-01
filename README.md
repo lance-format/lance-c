@@ -362,6 +362,53 @@ auto ds = lance::Dataset::open_with_session(session, "data.lance");
 auto stats = session.cache_stats();
 ```
 
+### Prewarm an index synchronously
+
+Prewarm a logical index before serving queries to move cold index reads out of
+foreground query execution. The call blocks until the Rust SDK's
+`Dataset::prewarm_index` finishes for all segments with that name in the dataset
+handle's snapshot. It does not create an index or change the dataset version.
+
+```c
+LanceSession* session = lance_session_new(64 * 1024 * 1024, 16 * 1024 * 1024);
+if (!session) return -1;
+LanceDataset* ds = lance_dataset_open_with_session("data.lance", NULL, 0, session);
+if (!ds) {
+    lance_session_close(session);
+    return -1;
+}
+/* Assumes an index named embedding_idx already exists. */
+int32_t status = lance_dataset_prewarm_index(ds, "embedding_idx");
+if (status != 0) {
+    const char* message = lance_last_error_message();
+    fprintf(stderr, "%s\n", message);
+    lance_free_string(message);
+}
+lance_dataset_close(ds);
+/* Keep session alive and reuse it when opening subsequent query datasets. */
+lance_session_close(session);
+```
+
+```cpp
+lance::Session session(64 * 1024 * 1024, 16 * 1024 * 1024);
+auto ds = lance::Dataset::open_with_session(session, "data.lance");
+ds.prewarm_index("embedding_idx"); // Blocks; throws lance::Error on failure.
+```
+
+The destination is the dataset's process-local session index cache. Reusing the
+same session across handles preserves warmed entries after a dataset closes.
+Independent sessions and other processes do not share that cache. Entries remain
+evictable: success guarantees completion, not that the entire index fits in the
+cache or remains resident. Replacing an index creates new segments that must be
+warmed separately; historical handles still use their own snapshots. A failure
+can leave partially warmed entries in the cache; retrying is safe.
+
+This binding uses the SDK's index-specific prewarm behavior without additional
+options. Tests cover multi-segment IVF-Flat and B-tree indexes; other index types
+and formats follow the underlying SDK's support and error behavior. It does not
+prewarm ordinary data columns or eliminate result-row reads, and it adds no
+persistent cache, automatic refresh, or background task management.
+
 ### Open at a specific version
 
 `lance_dataset_open` takes a `version` argument — `0` means the latest, any

@@ -1216,6 +1216,11 @@ static void test_commit_index_segments(const char *uri) {
            "commit must bump the dataset version exactly once");
     ASSERT(lance_dataset_index_segment_count(ds, "c_distributed_idx") == 2,
            "committed index must have two segments");
+    ASSERT(lance_dataset_prewarm_index(ds, "c_distributed_idx") == 0,
+           "prewarm both index segments");
+    ASSERT(lance_dataset_prewarm_index(ds, "c_distributed_idx") == 0,
+           "repeat prewarm");
+
     uint8_t committed_uuids[32] = {0};
     uint64_t committed_count = 0;
     ASSERT(lance_dataset_index_segments(ds, "c_distributed_idx",

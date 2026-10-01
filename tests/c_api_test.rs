@@ -17804,3 +17804,179 @@ fn test_scanner_nearest_batch_null_arguments() {
         lance_dataset_close(ds);
     }
 }
+
+#[test]
+fn test_prewarm_index_invalid_arguments_and_missing_index() {
+    let (_tmp, uri) = create_test_dataset();
+    unsafe {
+        let ds = lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0);
+        assert!(!ds.is_null());
+        let name = c_str("missing_idx");
+        assert_eq!(lance_dataset_prewarm_index(ptr::null(), name.as_ptr()), -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        for name in [ptr::null(), c"".as_ptr(), c"\xff".as_ptr()] {
+            assert_eq!(lance_dataset_prewarm_index(ds, name), -1);
+            assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        }
+        assert_eq!(lance_dataset_prewarm_index(ds, name.as_ptr()), -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+        let message = lance_last_error_message();
+        assert!(!message.is_null());
+        assert!(
+            std::ffi::CStr::from_ptr(message)
+                .to_string_lossy()
+                .contains("missing_idx")
+        );
+        lance_free_string(message);
+        assert_eq!(lance_dataset_count_rows(ds), 5);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_prewarm_index_scalar_segments_and_snapshot() {
+    let (_tmp, uri, _) = create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    unsafe {
+        let ds = lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0);
+        assert!(!ds.is_null());
+        assert_eq!(lance_dataset_index_count(ds), 2);
+        let version = lance_dataset_version(ds);
+        let historical = lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), version);
+        assert!(!historical.is_null());
+        assert_eq!(lance_dataset_prewarm_index(ds, c"key_idx".as_ptr()), 0);
+        assert_eq!(lance_dataset_version(ds), version);
+        assert_eq!(lance_dataset_drop_index(ds, c"key_idx".as_ptr()), 0);
+        assert_eq!(lance_dataset_prewarm_index(ds, c"key_idx".as_ptr()), -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+        assert_eq!(
+            lance_dataset_prewarm_index(historical, c"key_idx".as_ptr()),
+            0
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+        assert_eq!(lance_dataset_version(historical), version);
+        lance_dataset_close(historical);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_prewarm_index_vector_segments_reuse_shared_session() {
+    use lance::index::{DatasetIndexExt, vector::VectorIndexParams};
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    lance_c::runtime::block_on(async {
+        let mut ds = Dataset::open(&uri).await.unwrap();
+        let params = VectorIndexParams::ivf_flat(2, lance_linalg::distance::MetricType::L2);
+        let mut segments = Vec::new();
+        for fragment in ds.get_fragments() {
+            segments.push(
+                ds.create_index_builder(&["embedding"], lance_index::IndexType::Vector, &params)
+                    .name("vector_idx".into())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        ds.commit_existing_index_segments("vector_idx", "embedding", segments)
+            .await
+            .unwrap();
+    });
+
+    fn query(ds: *mut LanceDataset, row: i32) -> CapturedScanStatistics {
+        unsafe {
+            let scanner = lance_scanner_new(ds, ptr::null(), ptr::null());
+            assert!(!scanner.is_null());
+            let query: Vec<f32> = (0..8).map(|i| row as f32 + i as f32 / 8.0).collect();
+            assert_eq!(
+                lance_scanner_nearest(
+                    scanner,
+                    c"embedding".as_ptr(),
+                    query.as_ptr().cast(),
+                    8,
+                    LanceDataType::Float32 as i32,
+                    1
+                ),
+                0
+            );
+            assert_eq!(lance_scanner_set_nprobes(scanner, 2), 0);
+            let mut captured = CapturedScanStatistics::default();
+            assert_eq!(
+                lance_scanner_set_statistics_callback(
+                    scanner,
+                    Some(capture_scan_statistics),
+                    (&mut captured as *mut CapturedScanStatistics).cast()
+                ),
+                0
+            );
+            let batches = scan_all_rows_from_scanner(scanner);
+            assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+            assert_eq!(
+                batches[0]
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                row
+            );
+            assert_eq!(captured.calls, 1);
+            lance_scanner_close(scanner);
+            captured
+        }
+    }
+
+    // Build the index with a different session, so only prewarm can populate
+    // the cache used by the first query on each subsequently opened handle.
+    unsafe {
+        let cold = lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0);
+        assert!(!cold.is_null());
+        assert!(query(cold, 5).index_partitions_loaded > 0);
+        lance_dataset_close(cold);
+
+        let session = lance_session_new(64 * 1024 * 1024, 16 * 1024 * 1024);
+        assert!(!session.is_null());
+        let ds = lance_dataset_open_with_session(c_str(&uri).as_ptr(), ptr::null(), 0, session);
+        assert!(!ds.is_null());
+        assert_eq!(
+            lance_dataset_index_segment_count(ds, c"vector_idx".as_ptr()),
+            2
+        );
+        let version = lance_dataset_version(ds);
+        assert_eq!(lance_dataset_prewarm_index(ds, c"vector_idx".as_ptr()), 0);
+        assert_eq!(lance_dataset_version(ds), version);
+        let mut warmed = LanceSessionCacheStats::default();
+        assert_eq!(lance_session_get_cache_stats(session, &mut warmed), 0);
+        assert!(warmed.index_cache_entries > 0);
+        assert!(warmed.index_cache_size_bytes > 0);
+        lance_dataset_close(ds);
+
+        let reopened =
+            lance_dataset_open_with_session(c_str(&uri).as_ptr(), ptr::null(), version, session);
+        assert!(!reopened.is_null());
+        let mut query_stats = Vec::new();
+        // Query both segments and all IVF partitions, rather than a single
+        // vector that could pass even if prewarm skipped one segment.
+        for row in [5, 100] {
+            query_stats.push(query(reopened, row));
+        }
+        let mut queried = LanceSessionCacheStats::default();
+        assert_eq!(lance_session_get_cache_stats(session, &mut queried), 0);
+        assert!(queried.index_cache_hits > warmed.index_cache_hits);
+        for stats in query_stats {
+            assert_eq!(
+                stats.index_partitions_loaded, 0,
+                "prewarmed partitions should not be loaded again"
+            );
+        }
+        // Repeating the operation is safe, and the dataset owns the session
+        // even after its C session handle is released.
+        lance_session_close(session);
+        assert_eq!(
+            lance_dataset_prewarm_index(reopened, c"vector_idx".as_ptr()),
+            0
+        );
+        assert_eq!(lance_dataset_version(reopened), version);
+        lance_dataset_close(reopened);
+    }
+}
