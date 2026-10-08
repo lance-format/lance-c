@@ -238,12 +238,6 @@ whole-object, single-range, and batched range reads of direct `data/*.lance`
 children are cached. Conditional and versioned reads, plus manifests, deletion
 files, and index files, keep using Lance's normal paths. Use one shared session
 for datasets that share the cache directory.
-Cache entries are isolated by the underlying object-store instance because the
-wrapper interface does not expose a complete backend identity. Datasets sharing
-the same live store can reuse entries; a new store instance or process restart
-starts a new cache namespace. Reopening the disk tier while that same store is
-still alive can recover its entries. Identical bucket/path names on different
-endpoints never share metadata, sizes, or data blocks.
 
 ```cpp
 lance::DataCacheOptions data_cache{

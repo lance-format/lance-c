@@ -539,12 +539,6 @@ fn test_session_with_data_cache_serves_repeated_scan() {
         !cached_dataset.is_null(),
         "second dataset open should succeed"
     );
-    // A fresh open may create a different underlying store. Warm its isolated
-    // namespace before removing origin files; only the same live store can reuse
-    // entries because bucket/path alone does not identify a storage backend.
-    assert_eq!(scanned_row_count(cached_dataset), 20_000);
-    let reopened_statistics = data_cache_statistics(cached_dataset);
-    assert!(reopened_statistics.bytes_read_from_remote > 0);
     unsafe { lance_session_close(session) };
 
     for entry in std::fs::read_dir(tmp.path().join("large_ds/data")).unwrap() {
@@ -552,11 +546,8 @@ fn test_session_with_data_cache_serves_repeated_scan() {
     }
     assert_eq!(scanned_row_count(cached_dataset), 20_000);
     let cached_statistics = data_cache_statistics(cached_dataset);
-    assert!(cached_statistics.bytes_read_from_cache > reopened_statistics.bytes_read_from_cache);
-    assert_eq!(
-        cached_statistics.bytes_read_from_remote,
-        reopened_statistics.bytes_read_from_remote
-    );
+    assert!(cached_statistics.bytes_read_from_cache > 0);
+    assert_eq!(cached_statistics.bytes_read_from_remote, 0);
 
     assert_eq!(data_cache_statistics(dataset), first_statistics);
 
