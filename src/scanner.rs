@@ -24,7 +24,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::ApproxMode;
 use lance_io::stream::RecordBatchStream;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{Fragment, IndexMetadata};
 use uuid::Uuid;
 
 use crate::async_dispatcher::{self, LanceCallback};
@@ -353,7 +353,9 @@ impl LanceScanner {
         Ok(())
     }
 
-    /// Apply fragment selection to a scanner builder if fragment_ids is set.
+    /// Restrict the scan/search domain to fragment_ids when they are set.
+    /// For nearest queries this limits candidates before Top-K regardless of prefilter;
+    /// it is not a predicate applied to the ranked results.
     fn apply_fragment_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
         if let Some(ids) = &self.fragment_ids {
             let all_fragments = self.dataset.get_fragments();
@@ -477,7 +479,14 @@ impl LanceScanner {
         if self.include_deleted_rows {
             scanner.include_deleted_rows();
         }
-        self.apply_fragment_filter(&mut scanner)?;
+        // Lance rejects nearest() when fragments are already configured and prefilter is off.
+        // Deferring with_fragments only works around that configuration-time guard: fragments
+        // still restrict indexed and flat-search inputs before Top-K. The prefilter setting
+        // controls scanner filter expressions, not this search-domain scope.
+        let apply_fragment_filter_after_nearest = self.nearest.is_some() && !self.prefilter;
+        if !apply_fragment_filter_after_nearest {
+            self.apply_fragment_filter(&mut scanner)?;
+        }
         if self.index_segments.is_some() && self.nearest.is_none() {
             return Err(lance_core::Error::invalid_input_source(
                 "index_segments requires nearest() to be configured".into(),
@@ -493,8 +502,6 @@ impl LanceScanner {
                 "fragment_ids cannot be combined with an FTS query context; split the query by FTS index segment UUID instead".into(),
             ));
         }
-        // nearest() checks the current prefilter setting before accepting a
-        // fragment-scoped search. Enable it before installing the query.
         if self.prefilter {
             scanner.prefilter(true);
         }
@@ -552,6 +559,10 @@ impl LanceScanner {
                 scanner.with_index_segments(segments.clone())?;
             }
         }
+        if apply_fragment_filter_after_nearest {
+            // This delayed builder call preserves the same fragment search domain.
+            self.apply_fragment_filter(&mut scanner)?;
+        }
         if let Some(fts) = &self.fts_query {
             scanner.full_text_search(fts.clone())?;
         }
@@ -562,6 +573,10 @@ impl LanceScanner {
             Some(PreparedFtsExecution {
                 context: Arc::clone(context),
                 segments,
+                scope_prefilter_to_fts_segments: self.prefilter
+                    && (self.filter.is_some()
+                        || self.substrait_filter.is_some()
+                        || !self.additional_sql_filters.is_empty()),
                 batch_size: self.batch_size,
                 scan_statistics_callback: self.scan_statistics_callback.clone(),
             })
@@ -615,6 +630,7 @@ impl LanceScanner {
 struct PreparedFtsExecution {
     context: Arc<FtsQueryContextInner>,
     segments: Vec<IndexMetadata>,
+    scope_prefilter_to_fts_segments: bool,
     batch_size: Option<usize>,
     scan_statistics_callback: Option<ExecutionStatsCallback>,
 }
@@ -653,11 +669,21 @@ impl PreparedScanner {
         let Some(distributed_fts) = self.distributed_fts else {
             return self.scanner.try_into_stream().await;
         };
-        let plan = self.scanner.create_plan().await?;
-        let selected_segments_have_current_fragments = segments_have_current_fragments(
+        let selected_fragments = selected_current_fts_fragments(
             &distributed_fts.context.dataset,
             &distributed_fts.segments,
         )?;
+        let selected_segments_have_current_fragments = !selected_fragments.is_empty();
+        let mut scanner = self.scanner;
+        if distributed_fts.scope_prefilter_to_fts_segments
+            && selected_segments_have_current_fragments
+        {
+            // The scanner is already split by the selected FTS segment(s). Applying the same
+            // fragment scope before plan creation lets Lance restrict scalar-index segment loads
+            // for the TVF prefilter without changing unfiltered FTS scans.
+            scanner.with_fragments(selected_fragments);
+        }
+        let plan = scanner.create_plan().await?;
         let (plan, rewritten) = rewrite_prepared_fts_plan(
             plan,
             &distributed_fts.segments,
@@ -718,22 +744,11 @@ fn select_fts_segments(
     Ok(selected)
 }
 
-fn segments_have_current_fragments(
+fn selected_current_fts_fragments(
     dataset: &lance::Dataset,
     segments: &[IndexMetadata],
-) -> Result<bool> {
-    let current_fragment_ids = dataset
-        .get_fragments()
-        .into_iter()
-        .map(|fragment| {
-            u32::try_from(fragment.id()).map_err(|_| {
-                lance_core::Error::internal(format!(
-                    "current fragment id {} exceeds the validated u32 FTS coverage range",
-                    fragment.id()
-                ))
-            })
-        })
-        .collect::<Result<std::collections::HashSet<_>>>()?;
+) -> Result<Vec<Fragment>> {
+    let mut selected_fragment_ids = std::collections::HashSet::new();
     for segment in segments {
         let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
             lance_core::Error::internal(format!(
@@ -741,14 +756,22 @@ fn segments_have_current_fragments(
                 segment.uuid
             ))
         })?;
-        if fragment_bitmap
-            .iter()
-            .any(|fragment_id| current_fragment_ids.contains(&fragment_id))
-        {
-            return Ok(true);
+        selected_fragment_ids.extend(fragment_bitmap.iter());
+    }
+
+    let mut selected_fragments = Vec::new();
+    for fragment in dataset.get_fragments() {
+        let fragment_id = u32::try_from(fragment.id()).map_err(|_| {
+            lance_core::Error::internal(format!(
+                "current fragment id {} exceeds the validated u32 FTS coverage range",
+                fragment.id()
+            ))
+        })?;
+        if selected_fragment_ids.contains(&fragment_id) {
+            selected_fragments.push(fragment.metadata().clone());
         }
     }
-    Ok(false)
+    Ok(selected_fragments)
 }
 
 #[derive(Default)]
@@ -3808,7 +3831,9 @@ mod tests {
         );
 
         let has_current_fragments =
-            segments_have_current_fragments(&distributed.context.dataset, &segments).unwrap();
+            !selected_current_fts_fragments(&distributed.context.dataset, &segments)
+                .unwrap()
+                .is_empty();
         let (rewritten, counts) = rewrite_prepared_fts_plan(
             plan,
             &segments,

@@ -1273,7 +1273,10 @@ typedef enum {
 int32_t lance_scanner_set_blob_handling(LanceScanner* scanner, LanceBlobHandling handling);
 
 /**
- * Restrict scan to the given fragment IDs. Must be called before iteration.
+ * Restrict the scan/search domain to the given fragment IDs. For nearest-neighbor
+ * queries, this limits the candidates searched before Top-K regardless of the
+ * prefilter setting; it is not a predicate applied to ranked results.
+ * Must be called before iteration.
  * @param ids  Array of fragment IDs
  * @param len  Number of fragment IDs
  * @return 0 on success, -1 on error
@@ -2270,6 +2273,13 @@ int32_t lance_scanner_set_refine_factor(LanceScanner* scanner, uint32_t f);
 int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e);
 int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);
 int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
+
+/**
+ * Choose when scanner filter expressions are applied during nearest-neighbor search.
+ * When enabled, filters constrain ANN candidates; when disabled, they refine the
+ * candidates after ANN and may produce fewer than k rows. This does not change the
+ * fragment search domain set by lance_scanner_set_fragment_ids().
+ */
 int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
 
 /**

@@ -8276,6 +8276,101 @@ fn test_scanner_nearest_full_snapshot_prefilter_statistics() {
 }
 
 #[test]
+fn test_scanner_nearest_indexed_fragment_scope_with_prefilter_disabled() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
+    let uri = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfFlat,
+        metric: LanceMetricType::L2,
+        num_partitions: 1,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index(dataset, column.as_ptr(), ptr::null(), &params, false)
+        },
+        0
+    );
+
+    let mut fragments = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragments.as_mut_ptr()) },
+        0
+    );
+    let filter = c_str("id >= 32");
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
+    assert!(!scanner.is_null());
+    // Model Doris: the split's fragments remain the search domain while the
+    // search filter is configured for postfiltering.
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, fragments[1..].as_ptr(), 1) },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, false) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_use_index(scanner, true) }, 0);
+
+    // The dataset-wide nearest rows are in fragment 0. Restricting the search
+    // domain to fragment 1 must return that fragment's local Top-K, not an empty
+    // result from filtering the dataset-wide Top-K afterward.
+    let query = [0.0_f32; 8];
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr().cast(),
+                query.len(),
+                LanceDataType::Float32 as i32,
+                5,
+            )
+        },
+        0
+    );
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+
+    let batches = scan_all_rows_from_scanner(scanner);
+    let mut ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![32, 33, 34, 35, 36]);
+    assert_eq!(captured.calls, 1);
+    assert!(captured.indices_loaded > 0, "expected the indexed ANN path");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
 fn test_scanner_nearest_segment_prefilter_statistics() {
     for stable_row_ids in [false, true] {
         for segmented in [true, false] {
@@ -9548,6 +9643,212 @@ fn test_prepared_fts_global_scorer_is_shared_across_segment_splits() {
 
     unsafe { lance_fts_query_context_close(context) };
     unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_prepared_fts_prefilter_is_scoped_to_selected_segments() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexCriteria;
+    use lance_index::optimize::OptimizeOptions;
+
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let column = c_str("name");
+    let query = c_str("alice");
+    let inverted_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::Inverted as i32,
+                inverted_params.as_ptr(),
+                false,
+            )
+        },
+        0
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    append_batch(
+        &uri,
+        schema.clone(),
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![6, 7])),
+                Arc::new(StringArray::from(vec!["alice", "alice alice"])),
+            ],
+        )
+        .unwrap(),
+    );
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+    });
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let context = unsafe {
+        lance_dataset_prepare_fts_match_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!context.is_null(), "{}", take_last_error_message());
+
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(unsafe { lance_dataset_fragment_count(dataset) }, 2);
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let selected_segment_uuid = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let logical_index = dataset
+            .load_scalar_index(IndexCriteria::default().for_column("name").supports_fts())
+            .await
+            .unwrap()
+            .unwrap();
+        let segments = dataset
+            .load_indices_by_name(&logical_index.name)
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), 2);
+
+        let selected_fragment_id = u32::try_from(fragment_ids[1]).unwrap();
+        let unselected_fragment_id = u32::try_from(fragment_ids[0]).unwrap();
+        let selected_segments = segments
+            .iter()
+            .filter(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.iter().any(|id| id == selected_fragment_id))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(selected_segments.len(), 1);
+        assert!(
+            !selected_segments[0]
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|id| id == unselected_fragment_id),
+            "the selected FTS segment should cover only the appended fragment"
+        );
+        *selected_segments[0].uuid.as_bytes()
+    });
+
+    let full_scores = collect_context_fts_scores(dataset, context, None);
+    let mut full_ids = full_scores.keys().copied().collect::<Vec<_>>();
+    full_ids.sort_unstable();
+    assert_eq!(full_ids, vec![1, 6, 7]);
+
+    // Match rows in both fragments: four rows in the unselected fragment and
+    // both rows in the selected fragment. The prefilter scan must stay scoped
+    // to the selected segment's fragment.
+    let filter = c_str("id != 2");
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_index_segments(scanner, selected_segment_uuid.as_ptr(), 1) },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, true) }, 0);
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream).unwrap() };
+    let mut filtered_scores = std::collections::HashMap::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let scores = batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            assert!(
+                filtered_scores
+                    .insert(ids.value(row), scores.value(row))
+                    .is_none()
+            );
+        }
+    }
+    let mut filtered_ids = filtered_scores.keys().copied().collect::<Vec<_>>();
+    filtered_ids.sort_unstable();
+    assert_eq!(filtered_ids, vec![6, 7]);
+    for id in &filtered_ids {
+        let actual_score = filtered_scores[id];
+        let global_score = full_scores[id];
+        assert!(
+            (actual_score - global_score).abs() < 1e-6,
+            "id={id}, selected-segment score={actual_score}, global score={global_score}"
+        );
+    }
+
+    let metric_count = |name: &str| {
+        captured
+            .metrics
+            .iter()
+            .filter(|(metric, kind, _)| metric == name && *kind == LanceScanMetricKind::Count)
+            .map(|(_, _, value)| *value)
+            .sum::<u64>()
+    };
+    assert_eq!(captured.calls, 1);
+    assert_eq!(
+        metric_count("prefilter_input_rows"),
+        2,
+        "prefilter should read only the two rows in the selected segment's fragment"
+    );
+    assert_eq!(metric_count("prefilter_row_ids"), 2);
+
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_fts_query_context_close(context);
+        lance_dataset_close(dataset);
+    }
 }
 
 #[test]

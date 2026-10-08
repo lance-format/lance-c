@@ -1524,14 +1524,15 @@ public:
         return *this;
     }
 
-    /// Restrict scan to specific fragment IDs.
+    /// Restrict the scan/search domain to specific fragment IDs. For nearest
+    /// queries, they limit candidates before Top-K regardless of prefilter().
     Scanner& fragment_ids(const uint64_t* ids, size_t len) {
         if (lance_scanner_set_fragment_ids(handle_.get(), ids, len) != 0)
             check_error();
         return *this;
     }
 
-    /// Restrict scan to specific fragment IDs (vector overload).
+    /// Restrict the scan/search domain to specific fragment IDs (vector overload).
     Scanner& fragment_ids(const std::vector<uint64_t>& ids) {
         return fragment_ids(ids.data(), ids.size());
     }
@@ -1710,6 +1711,9 @@ public:
         if (lance_scanner_set_use_index(handle_.get(), enable) != 0) check_error();
         return *this;
     }
+    /// Apply scanner filters before ANN when enabled, or refine ANN candidates
+    /// afterward when disabled; postfiltering may return fewer than k rows. This
+    /// does not change the fragment search domain.
     Scanner& prefilter(bool enable) {
         if (lance_scanner_set_prefilter(handle_.get(), enable) != 0) check_error();
         return *this;
