@@ -305,7 +305,9 @@ impl LanceScanner {
         Ok(())
     }
 
-    /// Apply fragment selection to a scanner builder if fragment_ids is set.
+    /// Restrict the scan/search domain to fragment_ids when they are set.
+    /// For nearest queries this limits candidates before Top-K regardless of prefilter;
+    /// it is not a predicate applied to the ranked results.
     fn apply_fragment_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
         if let Some(ids) = &self.fragment_ids {
             let all_fragments = self.dataset.get_fragments();
@@ -421,6 +423,10 @@ impl LanceScanner {
         if self.include_deleted_rows {
             scanner.include_deleted_rows();
         }
+        // Lance rejects nearest() when fragments are already configured and prefilter is off.
+        // Deferring with_fragments only works around that configuration-time guard: fragments
+        // still restrict indexed and flat-search inputs before Top-K. The prefilter setting
+        // controls scanner filter expressions, not this search-domain scope.
         let apply_fragment_filter_after_nearest = self.nearest.is_some() && !self.prefilter;
         if !apply_fragment_filter_after_nearest {
             self.apply_fragment_filter(&mut scanner)?;
@@ -440,8 +446,6 @@ impl LanceScanner {
                 "fragment_ids cannot be combined with an FTS query context; split the query by FTS index segment UUID instead".into(),
             ));
         }
-        // nearest() checks this setting at configuration time. In postfilter mode, defer
-        // applying fragment IDs until after nearest() is installed.
         if self.prefilter {
             scanner.prefilter(true);
         }
@@ -499,6 +503,7 @@ impl LanceScanner {
             }
         }
         if apply_fragment_filter_after_nearest {
+            // This delayed builder call preserves the same fragment search domain.
             self.apply_fragment_filter(&mut scanner)?;
         }
         if let Some(fts) = &self.fts_query {
