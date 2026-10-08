@@ -9439,7 +9439,7 @@ fn test_prepared_fts_prefilter_is_scoped_to_selected_segments() {
         0
     );
     let selected_segment_uuid = lance_c::runtime::block_on(async {
-        let mut dataset = Dataset::open(&uri).await.unwrap();
+        let dataset = Dataset::open(&uri).await.unwrap();
         let logical_index = dataset
             .load_scalar_index(IndexCriteria::default().for_column("name").supports_fts())
             .await
