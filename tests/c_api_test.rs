@@ -9480,7 +9480,10 @@ fn test_prepared_fts_prefilter_is_scoped_to_selected_segments() {
     full_ids.sort_unstable();
     assert_eq!(full_ids, vec![1, 6, 7]);
 
-    let filter = c_str("id >= 6");
+    // Match rows in both fragments: four rows in the unselected fragment and
+    // both rows in the selected fragment. The prefilter scan must stay scoped
+    // to the selected segment's fragment.
+    let filter = c_str("id != 2");
     let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
     assert!(!scanner.is_null());
     assert_eq!(
