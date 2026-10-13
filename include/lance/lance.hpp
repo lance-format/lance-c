@@ -1537,6 +1537,31 @@ public:
         return fragment_ids(ids.data(), ids.size());
     }
 
+    /// Restrict the scan or search to rows whose `_rowid` is in `row_ids`
+    /// (applied before ranking). `len == 0` allows no rows.
+    Scanner& row_addr_allowlist(const uint64_t* row_ids, size_t len) {
+        if (lance_scanner_set_row_addr_allowlist(handle_.get(), row_ids, len) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Restrict the scan or search to rows whose `_rowid` is in `row_ids` (vector overload).
+    Scanner& row_addr_allowlist(const std::vector<uint64_t>& row_ids) {
+        return row_addr_allowlist(row_ids.data(), row_ids.size());
+    }
+
+    /// Exclude rows whose `_rowid` is in `row_ids` (applied before ranking).
+    Scanner& row_addr_blocklist(const uint64_t* row_ids, size_t len) {
+        if (lance_scanner_set_row_addr_blocklist(handle_.get(), row_ids, len) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Exclude rows whose `_rowid` is in `row_ids` (vector overload).
+    Scanner& row_addr_blocklist(const std::vector<uint64_t>& row_ids) {
+        return row_addr_blocklist(row_ids.data(), row_ids.size());
+    }
+
     /// Set a Substrait filter (serialized ExtendedExpression bytes).
     /// Wins over any SQL filter passed to the Scanner constructor.
     Scanner& substrait_filter(const uint8_t* bytes, size_t len) {

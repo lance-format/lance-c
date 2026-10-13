@@ -205,6 +205,43 @@ static void test_scanner_fluent(const std::string& uri) {
     PASS();
 }
 
+static void test_scanner_row_addr_lists(const std::string& uri) {
+    TEST(test_scanner_row_addr_lists);
+
+    auto ds = lance::Dataset::open(uri);
+
+    // Rows 0, 2 and 4 of the first fragment, minus row 2.
+    auto scanner = ds.scan();
+    scanner.row_addr_allowlist(std::vector<uint64_t>{4, 0, 2})
+           .row_addr_blocklist(std::vector<uint64_t>{2});
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    uint64_t total = 0;
+    while (true) {
+        ArrowArray arr;
+        memset(&arr, 0, sizeof(arr));
+        int rc = stream.get_next(&stream, &arr);
+        assert(rc == 0);
+        if (!arr.release) break;
+        total += (uint64_t)arr.length;
+        arr.release(&arr);
+    }
+    if (stream.release) stream.release(&stream);
+    assert(total == 2);
+
+    bool caught = false;
+    try {
+        ds.scan().row_addr_allowlist(nullptr, 1);
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    assert(caught);
+    printf("rows=%llu... ", (unsigned long long)total);
+
+    PASS();
+}
+
 static void test_scanner_async_stream_ownership(const std::string& uri) {
     TEST(test_scanner_async_stream_ownership);
 
@@ -1367,6 +1404,7 @@ int main(int argc, char** argv) {
     test_shared_session(uri);
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
+    test_scanner_row_addr_lists(uri);
     test_distance_range(uri);
     test_scanner_async_stream_ownership(uri);
     test_scanner_blob_handling(blob_uri);

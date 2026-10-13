@@ -16,7 +16,8 @@ use datafusion::physical_plan::{ExecutionPlan, empty::EmptyExec};
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::scanner::{
-    DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
+    DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts, RowAddrMask,
+    RowAddrTreeMap,
 };
 use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use lance_core::Result;
@@ -110,6 +111,10 @@ pub struct LanceScanner {
     with_row_address: bool,
     include_deleted_rows: bool,
     fragment_ids: Option<Vec<u64>>,
+    // External row prefilter keyed in the dataset's `_rowid` space; combined into
+    // a single `RowAddrMask` (allowed AND NOT blocked) when the scanner is built.
+    row_addr_allowlist: Option<RowAddrTreeMap>,
+    row_addr_blocklist: Option<RowAddrTreeMap>,
     index_segments: Option<Vec<Uuid>>,
     scalar_index_segment: Option<Uuid>,
     nearest: Option<NearestQuery>,
@@ -308,6 +313,8 @@ impl LanceScanner {
             with_row_address: false,
             include_deleted_rows: false,
             fragment_ids: None,
+            row_addr_allowlist: None,
+            row_addr_blocklist: None,
             index_segments: None,
             scalar_index_segment: None,
             nearest: None,
@@ -368,6 +375,20 @@ impl LanceScanner {
             scanner.with_fragments(selected);
         }
         Ok(())
+    }
+
+    /// The external row prefilter, combined the same way as
+    /// `RowAddrMask::from_serialized_parts`: rows in the allowlist and not in the
+    /// blocklist. `None` when neither list is set (no mask, not "select nothing").
+    fn row_addr_mask(&self) -> Option<RowAddrMask> {
+        match (&self.row_addr_allowlist, &self.row_addr_blocklist) {
+            (Some(allow), Some(block)) => {
+                Some(RowAddrMask::from_allowed(allow.clone()).also_block(block.clone()))
+            }
+            (Some(allow), None) => Some(RowAddrMask::from_allowed(allow.clone())),
+            (None, Some(block)) => Some(RowAddrMask::from_block(block.clone())),
+            (None, None) => None,
+        }
     }
 
     fn apply_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
@@ -502,6 +523,18 @@ impl LanceScanner {
                 "fragment_ids cannot be combined with an FTS query context; split the query by FTS index segment UUID instead".into(),
             ));
         }
+        // A segment-scoped scalar scan installs its own row prefilter from the segment's
+        // candidates, which would replace this one.
+        let row_addr_mask = self.row_addr_mask().map(Arc::new);
+        if row_addr_mask.is_some() && self.scalar_index_segment.is_some() {
+            return Err(lance_core::Error::invalid_input_source(
+                "row address allowlist/blocklist cannot be combined with scalar_index_segment"
+                    .into(),
+            ));
+        }
+        if let Some(mask) = &row_addr_mask {
+            scanner.with_row_addr_prefilter(RowAddrMask::clone(mask));
+        }
         if self.prefilter {
             scanner.prefilter(true);
         }
@@ -577,6 +610,7 @@ impl LanceScanner {
                     && (self.filter.is_some()
                         || self.substrait_filter.is_some()
                         || !self.additional_sql_filters.is_empty()),
+                row_addr_mask,
                 batch_size: self.batch_size,
                 scan_statistics_callback: self.scan_statistics_callback.clone(),
             })
@@ -631,6 +665,9 @@ struct PreparedFtsExecution {
     context: Arc<FtsQueryContextInner>,
     segments: Vec<IndexMetadata>,
     scope_prefilter_to_fts_segments: bool,
+    // Re-applied to the rebuilt Match/Phrase execs: they are reconstructed from the
+    // planned ones, which do not expose the external mask Lance attached to them.
+    row_addr_mask: Option<Arc<RowAddrMask>>,
     batch_size: Option<usize>,
     scan_statistics_callback: Option<ExecutionStatsCallback>,
 }
@@ -689,6 +726,7 @@ impl PreparedScanner {
             &distributed_fts.segments,
             &distributed_fts.context.prepared,
             selected_segments_have_current_fragments,
+            distributed_fts.row_addr_mask.as_ref(),
         )?;
         if rewritten.indexed_query_execs > 1
             || rewritten.flat_match_query_execs > 1
@@ -785,6 +823,7 @@ fn rewrite_prepared_fts_plan(
     segments: &[IndexMetadata],
     prepared: &PreparedFtsQuery,
     selected_segments_have_current_fragments: bool,
+    row_addr_mask: Option<&Arc<RowAddrMask>>,
 ) -> Result<(Arc<dyn ExecutionPlan>, PreparedFtsPlanRewriteCounts)> {
     // Lance's ordinary FTS planner adds a flat-search branch for fragments not
     // covered by the logical index. A prepared INDEX_ONLY scan must omit that
@@ -812,6 +851,7 @@ fn rewrite_prepared_fts_plan(
                 segments,
                 prepared,
                 selected_segments_have_current_fragments,
+                row_addr_mask,
             )?;
             new_children.push(new_child);
             rewritten.indexed_query_execs += child_rewritten.indexed_query_execs;
@@ -841,7 +881,8 @@ fn rewrite_prepared_fts_plan(
             exec.prefilter_source().clone(),
             segments.to_vec(),
         )?
-        .with_base_scorer(Arc::clone(scorer));
+        .with_base_scorer(Arc::clone(scorer))
+        .with_external_mask(row_addr_mask.cloned());
         return Ok((Arc::new(replacement), rewritten));
     }
     if let Some(exec) = rebuilt.downcast_ref::<PhraseQueryExec>() {
@@ -861,7 +902,8 @@ fn rewrite_prepared_fts_plan(
             exec.prefilter_source().clone(),
             segments.to_vec(),
         )?
-        .with_base_scorer(Arc::clone(scorer));
+        .with_base_scorer(Arc::clone(scorer))
+        .with_external_mask(row_addr_mask.cloned());
         return Ok((Arc::new(replacement), rewritten));
     }
     Ok((rebuilt, rewritten))
@@ -1651,6 +1693,87 @@ unsafe fn scanner_set_fragment_ids_inner(
         &[]
     };
     s.fragment_ids = Some(id_slice.to_vec());
+    Ok(0)
+}
+
+/// Restrict the scan or search to rows whose `_rowid` is in `row_ids`.
+///
+/// The ids are in the dataset's `_rowid` space: the stable row id when stable
+/// row ids are enabled, otherwise the row address. The allowlist is applied
+/// before ranking: a nearest or full-text search (including a prepared FTS
+/// query context) computes its top-k over the allowed rows only, and a plain
+/// scan reads only those rows. Combined with any filter expression (AND) and
+/// with a blocklist (allowed AND NOT blocked). `len == 0` allows no rows.
+/// Calling it again replaces the previous allowlist. Must be called before the
+/// scan starts; the ids are copied.
+///
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_row_addr_allowlist(
+    scanner: *mut LanceScanner,
+    row_ids: *const u64,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_row_addr_list_inner(scanner, row_ids, len, RowAddrList::Allow)
+    })
+}
+
+/// Exclude rows whose `_rowid` is in `row_ids` from the scan or search.
+///
+/// Same `_rowid` space, timing, and replacement semantics as
+/// `lance_scanner_set_row_addr_allowlist`. `len == 0` blocks no rows.
+///
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_row_addr_blocklist(
+    scanner: *mut LanceScanner,
+    row_ids: *const u64,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_row_addr_list_inner(scanner, row_ids, len, RowAddrList::Block)
+    })
+}
+
+enum RowAddrList {
+    Allow,
+    Block,
+}
+
+unsafe fn scanner_set_row_addr_list_inner(
+    scanner: *mut LanceScanner,
+    row_ids: *const u64,
+    len: usize,
+    list: RowAddrList,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if row_ids.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "row_ids is NULL but len > 0".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started(match list {
+        RowAddrList::Allow => "row_addr_allowlist",
+        RowAddrList::Block => "row_addr_blocklist",
+    })?;
+    let ids = if len > 0 {
+        unsafe { std::slice::from_raw_parts(row_ids, len) }
+    } else {
+        &[]
+    };
+    let tree_map: RowAddrTreeMap = ids.iter().collect();
+    match list {
+        RowAddrList::Allow => s.row_addr_allowlist = Some(tree_map),
+        RowAddrList::Block => s.row_addr_blocklist = Some(tree_map),
+    }
     Ok(0)
 }
 
@@ -3839,6 +3962,7 @@ mod tests {
             &segments,
             &distributed.context.prepared,
             has_current_fragments,
+            None,
         )
         .unwrap();
         assert_eq!(counts.indexed_query_execs, 1);

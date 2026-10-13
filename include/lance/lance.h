@@ -1288,6 +1288,42 @@ int32_t lance_scanner_set_fragment_ids(
 );
 
 /**
+ * Restrict the scan or search to rows whose `_rowid` is in `row_ids`.
+ *
+ * The ids are in the dataset's `_rowid` space: the stable row id when stable
+ * row ids are enabled, otherwise the row address. The allowlist is applied
+ * before ranking: a nearest or full-text search (including one using a
+ * prepared FTS query context) computes its top-k over the allowed rows only,
+ * and a plain scan reads only those rows. It is combined with any filter
+ * expression (AND) and with a blocklist (allowed AND NOT blocked). It cannot be
+ * combined with lance_scanner_set_scalar_index_segment().
+ * Calling it again replaces the previous allowlist. Must be called before
+ * iteration; the ids are copied.
+ * @param row_ids  Array of `_rowid` values, in any order (may be NULL when len is 0)
+ * @param len      Number of ids; 0 allows no rows
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_set_row_addr_allowlist(
+    LanceScanner* scanner,
+    const uint64_t* row_ids,
+    size_t len
+);
+
+/**
+ * Exclude rows whose `_rowid` is in `row_ids` from the scan or search.
+ * Same `_rowid` space, ordering, and restrictions as
+ * lance_scanner_set_row_addr_allowlist().
+ * @param row_ids  Array of `_rowid` values, in any order (may be NULL when len is 0)
+ * @param len      Number of ids; 0 blocks no rows
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_set_row_addr_blocklist(
+    LanceScanner* scanner,
+    const uint64_t* row_ids,
+    size_t len
+);
+
+/**
  * Set a Substrait filter on the scanner.
  *
  * `bytes` must point to a serialized Substrait `ExtendedExpression` message

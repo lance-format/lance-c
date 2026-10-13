@@ -263,6 +263,58 @@ static void test_scan_with_limit(const char *uri) {
     printf("OK\n");
 }
 
+static uint64_t count_stream_rows(struct ArrowArrayStream *stream) {
+    uint64_t total_rows = 0;
+    while (1) {
+        struct ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        ASSERT(stream->get_next(stream, &array) == 0, "get_next failed");
+        if (array.release == NULL) break;
+        total_rows += (uint64_t)array.length;
+        array.release(&array);
+    }
+    if (stream->release) stream->release(stream);
+    return total_rows;
+}
+
+static void test_scan_with_row_addr_lists(const char *uri) {
+    printf("  test_scan_with_row_addr_lists... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "dataset open failed");
+    uint64_t expected_rows = lance_dataset_count_rows(ds);
+    CHECK_OK();
+
+    /* Rows 0, 2 and 4 of the first fragment, minus row 2. */
+    const uint64_t allowed[] = {4, 0, 2};
+    const uint64_t blocked[] = {2};
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    ASSERT(lance_scanner_set_row_addr_allowlist(scanner, allowed, 3) == 0, "set allowlist");
+    ASSERT(lance_scanner_set_row_addr_blocklist(scanner, blocked, 1) == 0, "set blocklist");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0, "to_arrow_stream failed");
+    ASSERT(count_stream_rows(&stream) == 2, "allowlist minus blocklist should keep 2 rows");
+    ASSERT(lance_scanner_set_row_addr_allowlist(scanner, allowed, 3) == -1,
+           "allowlist after the scan started must fail");
+    lance_scanner_close(scanner);
+
+    /* An empty blocklist keeps every row; NULL is valid when len is 0. */
+    scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    ASSERT(lance_scanner_set_row_addr_blocklist(scanner, NULL, 0) == 0, "set empty blocklist");
+    ASSERT(lance_scanner_set_row_addr_allowlist(scanner, NULL, 1) == -1,
+           "NULL row_ids with len > 0 must fail");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0, "to_arrow_stream failed");
+    ASSERT(count_stream_rows(&stream) == expected_rows, "empty blocklist should keep every row");
+    lance_scanner_close(scanner);
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 /* Copy the Arrow C Data Interface format of the `blob` column of a stream's
  * schema into `out`; `out` is empty when the column is missing. */
 static void blob_column_format(struct ArrowArrayStream *stream, char *out, size_t out_len) {
@@ -1479,6 +1531,7 @@ int main(int argc, char **argv) {
     test_scan(uri);
     test_distance_range(uri);
     test_scan_with_limit(uri);
+    test_scan_with_row_addr_lists(uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_versions(uri);
