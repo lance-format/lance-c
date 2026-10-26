@@ -111,6 +111,45 @@ also treats an empty all-label query as true even for NULL lists. Integrators
 should initially push only non-NULL constant labels with matching element types
 and retain conditions whose semantics have not been verified in the calling engine.
 
+## Runtime BTree segment selection
+
+Ordinary segment-scoped scans can opt in to comparing BTree page costs at scan
+preparation time. Configure `lance_scanner_set_scalar_index_auto_selection(scanner,
+true)`, or call `Scanner::scalar_index_auto_selection(true)` in C++, together with
+`scalar_index_segment` and an explicit, nonempty fragment list. The selected
+segment remains the default when estimation is unavailable. The option is disabled
+by default and does not affect vector or full-text searches.
+
+The estimator reads `page_lookup.lance` min/max and NULL-count metadata for equality,
+range, bounded IN, IS NULL, and supported AND/OR expressions. Estimated work is
+matching pages times the index's configured rows per page. It can select a cheaper
+BTree segment only when its known coverage contains the entire read domain. A best
+estimate at least as large as the domain's physical row count selects a scoped
+non-indexed scan. The full filter, deletion handling, explicit fragment scope and
+LIMIT/OFFSET remain in effect on every path; estimates never remove result rows.
+
+Each preparation considers at most eight physical segments, an aggregate 8 MiB
+of lookup files, and a separate 8 MiB allowance for decoded lookup buffers. The
+decoded allowance is checked from schema and row count before materialization and
+charged for both cached and newly loaded lookups. Only fixed-width scalar lookup
+columns have a known bound with the current reader API. Variable-width keys such
+as strings/binary therefore have unknown costs: a default on such a key is kept,
+and an alternative is skipped without opening its lookup for estimation. Such
+indices remain usable through the caller's existing segment-selection path.
+
+One lookup is limited to 65,536 pages, IN predicates to 256 values, and one estimate
+to 1,000,000 page/predicate checks. Lookup batches share the Session's bounded
+metadata cache. Unknown manifest file sizes, unsupported formats, probe errors,
+or an unestimable default retain the original segment path. Bitmap and LabelList
+segments retain their existing behavior and are not cost-ranked.
+
+Statistics callbacks report `scalar_index_auto_candidates`,
+`scalar_index_auto_changed`, `scalar_index_auto_estimated_pages`,
+`scalar_index_auto_estimated_rows`, and `scalar_index_auto_full_scans`. Estimated
+rows are a page-level approximation, not an exact result count or measured latency.
+The model does not account for cache residency, projected-row width, or random
+row-fetch cost. Warm lookups avoid storage I/O but still require estimation work.
+
 ## Distance-bounded vector search
 
 After configuring a single-vector nearest-neighbor query, use

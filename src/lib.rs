@@ -41,6 +41,7 @@ mod merge_insert;
 mod multivector;
 mod restore;
 pub mod runtime;
+mod scalar_index_selection;
 mod scalar_segment;
 mod scanner;
 mod session;

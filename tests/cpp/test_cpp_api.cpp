@@ -173,6 +173,8 @@ static void test_scanner_fluent(const std::string& uri) {
            .target_parallelism(1)
            .scan_in_order(false)
            .use_scalar_index(false)
+           .scalar_index_auto_selection(true)
+           .scalar_index_auto_selection(false)
            .strict_batch_size(false)
            .use_stats(false)
            .with_row_address(true)

@@ -26,6 +26,7 @@ use uuid::Uuid;
 pub(crate) struct PreparedScalarSegment {
     pub dataset: Arc<Dataset>,
     pub segment_uuid: Uuid,
+    pub auto_selection: bool,
     pub fragment_ids: Vec<u64>,
     pub use_scalar_index: bool,
     pub callback: Option<ExecutionStatsCallback>,
@@ -39,7 +40,7 @@ fn invalid(message: impl Into<String>) -> Error {
 const MAX_EXPRESSION_NODES: usize = 128;
 const MAX_EXPRESSION_DEPTH: usize = 32;
 
-fn scoped_expression(
+pub(crate) fn scoped_expression(
     expr: &ScalarIndexExpr,
     index_name: &str,
     column: &str,
@@ -304,9 +305,47 @@ impl PreparedScalarSegment {
             Ok(None) => return Ok(Some("no_driver")),
             Err(reason) => return Ok(Some(reason)),
         };
+        let (segment_uuid, expr) = if self.auto_selection {
+            let physical_rows = fragments
+                .iter()
+                .filter(|f| scope.contains(&(f.id() as u64)))
+                .fold(0_u64, |sum, f| {
+                    sum.saturating_add(f.metadata().physical_rows.unwrap_or(0) as u64)
+                });
+            let Some(selected) = crate::scalar_index_selection::choose(
+                &self.dataset,
+                &indices,
+                index_meta,
+                expr,
+                filter_plan.index_query.as_ref().unwrap(),
+                crate::scalar_index_selection::ReadDomain {
+                    fragment_ids: &self.fragment_ids,
+                    physical_rows,
+                },
+                stats,
+            )
+            .await
+            else {
+                return Ok(Some("runtime_cost"));
+            };
+            selected
+        } else {
+            (self.segment_uuid, expr)
+        };
+        let index_meta = indices
+            .iter()
+            .find(|i| i.uuid == segment_uuid)
+            .ok_or_else(|| invalid("runtime scalar index is absent from the dataset snapshot"))?;
+        let field = self
+            .dataset
+            .schema()
+            .field_by_id(index_meta.keyed_field().unwrap())
+            .ok_or_else(|| {
+                invalid("runtime scalar index field is absent from the dataset schema")
+            })?;
         let index = self
             .dataset
-            .open_scalar_index(&field.name, &self.segment_uuid, metrics)
+            .open_scalar_index(&field.name, &segment_uuid, metrics)
             .await?;
         // These implementations can return exact candidates. Keep the runtime
         // Exact check below: a type alone is not a guarantee for every query.

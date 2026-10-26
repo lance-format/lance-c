@@ -2376,6 +2376,12 @@ int32_t lance_scanner_set_index_segments(
 int32_t lance_scanner_set_scalar_index_segment(
     LanceScanner* scanner, const uint8_t* segment_uuid);
 
+/* Opt in to bounded runtime BTree page-cost selection for a scalar segment scan.
+ * Applies only to scalar_index_segment scans and defaults to false.
+ * The explicit fragment domain and complete filter are preserved.
+ * Unsupported/unknown estimates retain the selected segment. Returns 0 or -1. */
+int32_t lance_scanner_set_scalar_index_auto_selection(LanceScanner* scanner, bool enabled);
+
 /* ─── Full-text search (Phase 2) ─── */
 
 /**

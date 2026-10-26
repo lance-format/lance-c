@@ -1518,6 +1518,14 @@ public:
         return *this;
     }
 
+    /// Enable bounded page-cost selection among BTree segments covering the read domain.
+    /// Applies only to scalar_index_segment scans; fragment_ids remains required. Disabled by default.
+    Scanner& scalar_index_auto_selection(bool enabled = true) {
+        if (lance_scanner_set_scalar_index_auto_selection(handle_.get(), enabled) != 0)
+            check_error();
+        return *this;
+    }
+
     Scanner& clear_scalar_index_segment() {
         if (lance_scanner_set_scalar_index_segment(handle_.get(), nullptr) != 0)
             check_error();

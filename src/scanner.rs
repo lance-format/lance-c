@@ -117,6 +117,7 @@ pub struct LanceScanner {
     row_addr_blocklist: Option<RowAddrTreeMap>,
     index_segments: Option<Vec<Uuid>>,
     scalar_index_segment: Option<Uuid>,
+    scalar_index_auto_selection: bool,
     nearest: Option<NearestQuery>,
     nprobes: NprobesRange,
     approx_mode: Option<LanceApproxMode>,
@@ -317,6 +318,7 @@ impl LanceScanner {
             row_addr_blocklist: None,
             index_segments: None,
             scalar_index_segment: None,
+            scalar_index_auto_selection: false,
             nearest: None,
             nprobes: NprobesRange::default(),
             approx_mode: None,
@@ -637,6 +639,7 @@ impl LanceScanner {
             Some(PreparedScalarSegment {
                 dataset: Arc::clone(&self.dataset),
                 segment_uuid,
+                auto_selection: self.scalar_index_auto_selection,
                 fragment_ids: fragment_ids.clone(),
                 use_scalar_index: self.use_scalar_index.unwrap_or(true),
                 callback: self.scan_statistics_callback.clone(),
@@ -1077,6 +1080,22 @@ macro_rules! scanner_ffi_try {
             },
         )
     }};
+}
+
+/// Enable bounded runtime BTree selection for an explicitly scoped scalar segment scan.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_scalar_index_auto_selection(
+    scanner: *mut LanceScanner,
+    enabled: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, {
+        let scanner = unsafe { scanner.as_mut() }
+            .ok_or_else(|| lance_core::Error::invalid_input_source("scanner is NULL".into()))?;
+        scanner.ensure_scan_not_started("scalar_index_auto_selection")?;
+        scanner.scalar_index_auto_selection = enabled;
+        Ok(0)
+    })
 }
 
 /// Select one physical scalar index segment. NULL clears the selection.

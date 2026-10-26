@@ -15484,6 +15484,18 @@ fn scalar_segment_ids_with_filter(
     limit: Option<i64>,
     offset: i64,
 ) -> (Vec<i32>, CapturedScanStatistics) {
+    scalar_segment_ids_with_auto(uri, uuid, fragments, filter, limit, offset, false)
+}
+
+fn scalar_segment_ids_with_auto(
+    uri: &str,
+    uuid: &[u8; 16],
+    fragments: &[u64],
+    filter: ScalarSegmentFilter<'_>,
+    limit: Option<i64>,
+    offset: i64,
+    auto_selection: bool,
+) -> (Vec<i32>, CapturedScanStatistics) {
     let uri = c_str(uri);
     let sql = match filter {
         ScalarSegmentFilter::Sql(sql) => Some(c_str(sql)),
@@ -15516,6 +15528,10 @@ fn scalar_segment_ids_with_filter(
             lance_scanner_set_scalar_index_segment(scanner, uuid.as_ptr()),
             0
         );
+        assert_eq!(
+            lance_scanner_set_scalar_index_auto_selection(scanner, auto_selection),
+            0
+        );
         if let Some(limit) = limit {
             assert_eq!(lance_scanner_set_limit(scanner, limit), 0);
         }
@@ -15544,6 +15560,10 @@ fn scalar_segment_ids_with_filter(
             lance_scanner_set_scalar_index_segment(scanner, ptr::null()),
             -1
         );
+        assert_eq!(
+            lance_scanner_set_scalar_index_auto_selection(scanner, !auto_selection),
+            -1
+        );
         {
             let reader = ArrowArrayStreamReader::from_raw(&mut stream).unwrap();
             for batch in reader {
@@ -15565,6 +15585,143 @@ fn scalar_segment_ids_with_filter(
         lance_dataset_close(ds);
     }
     (ids, captured)
+}
+
+#[test]
+fn test_runtime_scalar_index_selection_uses_page_cost_and_honors_switch() {
+    assert_eq!(
+        unsafe { lance_scanner_set_scalar_index_auto_selection(ptr::null_mut(), true) },
+        -1
+    );
+    use lance::dataset::WriteParams;
+    use lance::index::DatasetIndexExt;
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("runtime_selection")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let (grouping, fragments) = lance_c::runtime::block_on(async {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("key", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..16384)),
+                Arc::new(Int32Array::from_iter_values(0..16384)),
+            ],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 4096,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["key"],
+            IndexType::BTree,
+            Some("key_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let indices = ds.load_indices().await.unwrap();
+        let uuid = *indices
+            .iter()
+            .find(|i| i.name == "key_idx")
+            .unwrap()
+            .uuid
+            .as_bytes();
+        let fragments: Vec<_> = ds.get_fragments().iter().map(|f| f.id() as u64).collect();
+        (uuid, fragments)
+    });
+    let metric = |stats: &CapturedScanStatistics, key: &str| {
+        stats
+            .metrics
+            .iter()
+            .filter(|(name, _, _)| name == key)
+            .map(|(_, _, n)| n)
+            .sum::<u64>()
+    };
+    for enabled in [false, true] {
+        let (ids, stats) = scalar_segment_ids_with_auto(
+            &uri,
+            &grouping,
+            &fragments,
+            ScalarSegmentFilter::Sql("key >= 0 AND id = 123"),
+            None,
+            0,
+            enabled,
+        );
+        assert_eq!(ids, vec![123]);
+        assert_eq!(
+            metric(&stats, "scalar_index_auto_changed"),
+            u64::from(enabled)
+        );
+        assert_eq!(
+            metric(&stats, "scalar_index_auto_candidates"),
+            if enabled { 2 } else { 0 }
+        );
+        if enabled {
+            assert_eq!(metric(&stats, "scalar_index_auto_estimated_pages"), 1);
+            assert_eq!(metric(&stats, "scalar_index_auto_estimated_rows"), 4096);
+            assert_eq!(metric(&stats, "scalar_segments_searched"), 1);
+        }
+    }
+    let (ids, stats) = scalar_segment_ids_with_auto(
+        &uri,
+        &grouping,
+        &fragments,
+        ScalarSegmentFilter::Sql("key >= 0"),
+        None,
+        0,
+        true,
+    );
+    assert_eq!(ids.len(), 16384);
+    assert_eq!(metric(&stats, "scalar_index_auto_full_scans"), 1);
+    assert_eq!(metric(&stats, "scalar_segments_searched"), 0);
+    let (ids, stats) = scalar_segment_ids_with_auto(
+        &uri,
+        &grouping,
+        &fragments,
+        ScalarSegmentFilter::Sql("key >= 0 AND id = 20000"),
+        None,
+        0,
+        true,
+    );
+    assert!(ids.is_empty());
+    assert_eq!(metric(&stats, "scalar_index_auto_changed"), 1);
+    assert_eq!(metric(&stats, "scalar_index_auto_estimated_pages"), 0);
+    // A switch cannot broaden an explicitly assigned fragment domain.
+    let (ids, _) = scalar_segment_ids_with_auto(
+        &uri,
+        &grouping,
+        &[fragments[1]],
+        ScalarSegmentFilter::Sql("key >= 0 AND id >= 0"),
+        Some(2),
+        1,
+        true,
+    );
+    assert_eq!(ids, vec![4097, 4098]);
 }
 
 #[test]
