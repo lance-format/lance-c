@@ -1,19 +1,16 @@
 sources:
-  "0.1.0":
+  "0.1.9":
     "Linux-x86_64":
-      url: "https://github.com/lance-format/lance-c/releases/download/v0.1.0/lance-c-v0.1.0-x86_64-unknown-linux-gnu.tar.xz"
-      sha256: "REPLACE_WITH_REAL_SHA256_AT_RELEASE"
+      url: "https://github.com/lance-format/lance-c/releases/download/v0.1.9/lance-c-v0.1.9-x86_64-unknown-linux-gnu-debian12.tar.xz"
+      sha256: "51e8175efe3420149039525524b803878c1054dc2cd881a92295a27301b780aa"
     "Linux-armv8":
-      url: "https://github.com/lance-format/lance-c/releases/download/v0.1.0/lance-c-v0.1.0-aarch64-unknown-linux-gnu.tar.xz"
-      sha256: "REPLACE_WITH_REAL_SHA256_AT_RELEASE"
-    "Macos-x86_64":
-      url: "https://github.com/lance-format/lance-c/releases/download/v0.1.0/lance-c-v0.1.0-x86_64-apple-darwin.tar.xz"
-      sha256: "REPLACE_WITH_REAL_SHA256_AT_RELEASE"
+      url: "https://github.com/lance-format/lance-c/releases/download/v0.1.9/lance-c-v0.1.9-aarch64-unknown-linux-gnu.tar.xz"
+      sha256: "fb48f848c128f12b209a4b6dd12bf7fa547434eba1483326a9c39b645bb142bd"
     "Macos-armv8":
-      url: "https://github.com/lance-format/lance-c/releases/download/v0.1.0/lance-c-v0.1.0-aarch64-apple-darwin.tar.xz"
-      sha256: "REPLACE_WITH_REAL_SHA256_AT_RELEASE"
+      url: "https://github.com/lance-format/lance-c/releases/download/v0.1.9/lance-c-v0.1.9-aarch64-apple-darwin.tar.xz"
+      sha256: "dbbf6b62d091c134643e4ce84eda868fe72c3dcb43414ecacce83f60756b6b31"
 
 source-from-tag:
-  "0.1.0":
-    url: "https://github.com/lance-format/lance-c/archive/refs/tags/v0.1.0.tar.gz"
-    sha256: "REPLACE_WITH_SOURCE_TARBALL_SHA256"
+  "0.1.9":
+    url: "https://github.com/lance-format/lance-c/archive/refs/tags/v0.1.9.tar.gz"
+    sha256: "c81fd9c9b4e1aa89c1ce6b5c7d71b8c62d4bfd2ebc55925db75d53c0c7383bfb"
