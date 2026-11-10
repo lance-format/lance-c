@@ -519,15 +519,17 @@ typedef struct LanceCleanupOperationOptions {
  * Relative-duration cleanup options for
  * `lance_dataset_cleanup_old_versions`.
  *
- * `older_than_seconds + older_than_nanos / 1000000000` is converted to a
- * native `std::time::Duration`; `older_than_nanos` must be in
- * [0, 999999999]. This entry point calls `Dataset::cleanup_old_versions`, so
- * Lance owns the time cutoff. The optional booleans use independent presence
- * flags; leaving them unset preserves native defaults.
+ * `older_than_seconds + older_than_nanos / 1000000000` is converted to the
+ * native `chrono::TimeDelta` range without narrowing through signed 64-bit
+ * nanoseconds. Both components carry the sign; `older_than_nanos` must be in
+ * [-999999999, 999999999]. This entry point calls
+ * `Dataset::cleanup_old_versions`, so Lance owns the time cutoff. The optional
+ * booleans use independent presence flags; leaving them unset preserves native
+ * defaults.
  */
 typedef struct LanceCleanupOldVersionsOptions {
-    uint64_t older_than_seconds;
-    uint32_t older_than_nanos;
+    int64_t  older_than_seconds;
+    int32_t  older_than_nanos;
     int32_t  has_delete_unverified;
     bool     delete_unverified;
     int32_t  has_error_if_tagged_old_versions;

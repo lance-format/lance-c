@@ -11,7 +11,6 @@
 
 use std::ffi::{CString, c_char};
 use std::ptr;
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use lance::Dataset;
@@ -23,6 +22,7 @@ use lance_core::Result;
 
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
+use crate::helpers;
 use crate::runtime::block_on;
 
 /// Native cleanup policy fields with explicit presence for every optional
@@ -93,10 +93,11 @@ pub struct LanceCleanupOperationOptions {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LanceCleanupOldVersionsOptions {
-    /// Whole seconds in the native `std::time::Duration` window.
-    pub older_than_seconds: u64,
-    /// Nanosecond component in `[0, 999_999_999]`.
-    pub older_than_nanos: u32,
+    /// Whole-second component of the native `chrono::TimeDelta` window.
+    pub older_than_seconds: i64,
+    /// Signed normalized nanosecond component in
+    /// `[-999_999_999, 999_999_999]`.
+    pub older_than_nanos: i32,
     /// Non-zero selects `delete_unverified`.
     pub has_delete_unverified: i32,
     /// Native `delete_unverified` value when present.
@@ -448,7 +449,7 @@ unsafe fn warning_at<'a>(
     })
 }
 
-/// Clean versions older than a native `std::time::Duration` window.
+/// Clean versions older than a native `chrono::TimeDelta` window.
 ///
 /// This calls `Dataset::cleanup_old_versions`, so Lance core computes the
 /// timestamp cutoff. `options` and `out_stats` must not be NULL. Stats are
@@ -479,13 +480,8 @@ unsafe fn cleanup_old_versions_inner(
     // SAFETY: options is non-NULL and valid for this call. Every field is
     // copied before asynchronous work.
     let raw = unsafe { &*options };
-    if raw.older_than_nanos >= 1_000_000_000 {
-        return Err(invalid(format!(
-            "older_than_nanos={} must be in [0, 999999999]",
-            raw.older_than_nanos
-        )));
-    }
-    let older_than = Duration::new(raw.older_than_seconds, raw.older_than_nanos);
+    let older_than =
+        helpers::time_delta_from_ffi(raw.older_than_seconds, raw.older_than_nanos, "cleanup")?;
     let delete_unverified = (raw.has_delete_unverified != 0).then_some(raw.delete_unverified);
     let error_if_tagged_old_versions =
         (raw.has_error_if_tagged_old_versions != 0).then_some(raw.error_if_tagged_old_versions);

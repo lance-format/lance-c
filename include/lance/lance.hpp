@@ -235,8 +235,8 @@ struct CleanupOperationOptions {
 
 /// Relative-duration inputs for `Dataset::cleanup_old_versions`.
 struct CleanupOldVersionsOptions {
-    uint64_t            older_than_seconds = 0;
-    uint32_t            older_than_nanos = 0;
+    int64_t             older_than_seconds = 0;
+    int32_t             older_than_nanos = 0;
     std::optional<bool> delete_unverified;
     std::optional<bool> error_if_tagged_old_versions;
 };
