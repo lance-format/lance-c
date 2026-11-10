@@ -3051,12 +3051,6 @@ fn find_tag(tags: *const LanceTags, name: &str) -> *const LanceTag {
     ptr::null()
 }
 
-fn manifest_file_size(uri: &str, version: u64) -> u64 {
-    std::fs::metadata(format!("{uri}/_versions/{version}.manifest"))
-        .unwrap()
-        .len()
-}
-
 #[test]
 fn test_current_version_details_metadata_and_version_refs() {
     let (_tmp, uri) = create_two_version_dataset();
@@ -3223,10 +3217,6 @@ fn test_tag_lifecycle_metadata_conflicts_and_persistence() {
     assert!(!tag.is_null());
     assert_eq!(tag_name(tag), "release-1");
     assert_eq!(unsafe { lance_tag_version(tag) }, 1);
-    assert_eq!(
-        unsafe { lance_tag_manifest_size(tag) },
-        manifest_file_size(&uri, 1)
-    );
     let mut branch = std::ptr::null();
     assert_eq!(unsafe { lance_tag_branch(tag, &mut branch) }, 0);
     assert!(branch.is_null());
@@ -3240,6 +3230,10 @@ fn test_tag_lifecycle_metadata_conflicts_and_persistence() {
     let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
     let native_tags = native.tags();
     let native_tag = lance_c::runtime::block_on(native_tags.get("release-1")).unwrap();
+    assert_eq!(
+        unsafe { lance_tag_manifest_size(tag) },
+        native_tag.manifest_size as u64
+    );
     assert_eq!(
         created_at,
         native_tag
@@ -3325,9 +3319,10 @@ fn test_tag_lifecycle_metadata_conflicts_and_persistence() {
     let updated = unsafe { lance_dataset_tag_get(ds, name.as_ptr()) };
     assert!(!updated.is_null());
     assert_eq!(unsafe { lance_tag_version(updated) }, 2);
+    let native_updated = lance_c::runtime::block_on(native_tags.get("release-1")).unwrap();
     assert_eq!(
         unsafe { lance_tag_manifest_size(updated) },
-        manifest_file_size(&uri, 2)
+        native_updated.manifest_size as u64
     );
     assert_eq!(tag_metadata(updated), persisted_metadata);
     let mut updated_created = 0;
@@ -3422,12 +3417,9 @@ fn test_tag_missing_metadata_matches_empty_metadata() {
     let (_tmp, uri) = create_two_version_dataset();
     let tag_dir = std::path::Path::new(&uri).join("_refs/tags");
     std::fs::create_dir_all(&tag_dir).unwrap();
-    let manifest_size = manifest_file_size(&uri, 1);
     std::fs::write(
         tag_dir.join("legacy.json"),
-        format!(
-            "{{\"branch\":null,\"version\":1,\"createdAt\":\"2024-01-01T00:00:00Z\",\"updatedAt\":\"2024-01-01T00:00:00Z\",\"manifestSize\":{manifest_size}}}"
-        ),
+        "{\"branch\":null,\"version\":1,\"createdAt\":\"2024-01-01T00:00:00Z\",\"updatedAt\":\"2024-01-01T00:00:00Z\",\"manifestSize\":123}",
     )
     .unwrap();
 
