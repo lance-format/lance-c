@@ -4778,6 +4778,10 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
         vec![Some("d"), Some("a"), Some("d")]
     );
     let batch_schema = batches[0].schema();
+    assert_eq!(
+        batch_schema.field_with_name("meta").unwrap().data_type(),
+        &DataType::LargeUtf8
+    );
     let meta = batch_schema
         .field_with_name("meta")
         .unwrap()
@@ -5065,6 +5069,14 @@ fn test_fragment_scan_uses_normal_scanner_and_owned_snapshot() {
     assert_eq!(fragment_id_values(&batches), vec![0, 2, 3]);
     assert_eq!(batches[0].num_columns(), 3);
     let batch_schema = batches[0].schema();
+    let meta = batch_schema.field_with_name("meta").unwrap();
+    assert_eq!(meta.data_type(), &DataType::LargeUtf8);
+    assert_eq!(
+        meta.metadata()
+            .get("ARROW:extension:name")
+            .map(String::as_str),
+        Some("arrow.json")
+    );
     let names = batch_schema
         .fields()
         .iter()

@@ -2117,7 +2117,7 @@ static void test_fragment_snapshots(const std::string& uri) {
     assert(find_schema_child(*profile, "score"));
     const ArrowSchema* meta = find_schema_child(schema, "meta");
     assert(meta);
-    assert(meta->format && strcmp(meta->format, "u") == 0);
+    assert(meta->format && strcmp(meta->format, "z") == 0);
     if (schema.release) schema.release(&schema);
 
     bool caught = false;
@@ -2166,7 +2166,7 @@ static std::vector<int32_t> read_fragment_take_ids(
     assert(profile->n_children == (profile_name_only ? 1 : 2));
     const ArrowSchema* meta = find_schema_child(schema, "meta");
     assert(meta);
-    assert(meta->format && strcmp(meta->format, "u") == 0);
+    assert(meta->format && strcmp(meta->format, "U") == 0);
     schema.release(&schema);
 
     std::vector<int32_t> ids;
