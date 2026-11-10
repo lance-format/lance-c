@@ -12,7 +12,7 @@ readme = "README.md"
 description = "C/C++ bindings for the Lance columnar data format"
 keywords = ["lance", "ffi", "c", "cpp", "arrow"]
 categories = ["database-implementations", "external-ffi-bindings"]
-rust-version = "1.91.0"
+rust-version = "1.94.0"
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
@@ -22,15 +22,18 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # `lance_index::progress::IndexBuildProgress`; already in the graph
 # transitively via lance-index.
 async-trait = "0.1"
-# Keep the dependency on the segment-prefilter fix and its float-consistent PQ prerequisite.
-lance = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57", features = ["substrait"] }
-lance-core = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57" }
-lance-index = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57" }
-lance-io = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57" }
-lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57" }
-lance-table = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57" }
-lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57", features = ["substrait"] }
+# Keep every Lance crate on the upstream v14.0.2 release commit.
+lance = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
+lance-core = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-file = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-index = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-io = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-linalg = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+# Direct to name `NullableIndexExprResult` in the segment-scoped
+# `ScalarIndexLoader` adapter; already in the graph transitively via lance-index.
+lance-select = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-table = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-datafusion = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
 datafusion = { version = "54.0.0", default-features = false }
 arrow = { version = "58.0.0", features = ["prettyprint", "ffi"] }
 arrow-array = "58.0.0"
@@ -54,9 +57,9 @@ snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57", features = ["substrait"] }
-lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "68c12dfd7efe02f90ad2d7f3a239a7eb64884e57" }
+lance = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
+lance-datagen = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-file = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
