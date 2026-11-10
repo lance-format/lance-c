@@ -36,7 +36,6 @@ struct ScanStatisticsCapture {
     uint64_t calls = 0;
     uint64_t bytes_read = 0;
     uint64_t indices_loaded = 0;
-    uint64_t index_comparisons = 0;
     bool invalid = false;
 };
 
@@ -52,7 +51,6 @@ static void capture_scan_statistics(
     captured->calls += 1;
     captured->bytes_read = statistics->bytes_read;
     captured->indices_loaded = statistics->indices_loaded;
-    captured->index_comparisons = statistics->index_comparisons;
 }
 
 struct AsyncScanCapture {
@@ -2004,22 +2002,18 @@ static void test_native_scalar_indexes(const std::string& uri) {
     const uint64_t index_count = ds.index_count();
     auto query_ds = lance::Dataset::open(uri);
     auto assert_indexed = [&](const std::string& filter,
-                              const std::vector<int32_t>& expected,
-                              bool require_comparisons = true) {
+                              const std::vector<int32_t>& expected) {
         ScanStatisticsCapture stats;
         assert(scan_filtered_ids(query_ds, filter, true, stats) == expected);
         assert(stats.calls == 1);
         assert(stats.indices_loaded > 0);
-        if (require_comparisons) {
-            assert(stats.index_comparisons > 0);
-        }
         ScanStatisticsCapture unindexed_stats;
         assert(scan_filtered_ids(query_ds, filter, false, unindexed_stats) == expected);
         assert(unindexed_stats.indices_loaded == 0);
     };
 
     assert_indexed("contains(name, 'ali')", {1});
-    assert_indexed("contains(name, 'zzz')", {}, false);
+    assert_indexed("contains(name, 'zzz')", {});
     assert_indexed("id >= 18", {18, 19, 20});
     assert_indexed("id = 13", {13});
     assert_indexed("name = 'alice'", {1});

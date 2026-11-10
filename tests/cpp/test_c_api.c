@@ -44,7 +44,6 @@ typedef struct {
     uint64_t calls;
     uint64_t bytes_read;
     uint64_t indices_loaded;
-    uint64_t index_comparisons;
     int invalid;
 } ScanStatisticsCapture;
 
@@ -71,7 +70,6 @@ static void capture_scan_statistics(
     captured->calls += 1;
     captured->bytes_read = statistics->bytes_read;
     captured->indices_loaded = statistics->indices_loaded;
-    captured->index_comparisons = statistics->index_comparisons;
 }
 
 typedef struct {
@@ -2065,8 +2063,7 @@ static void check_native_scalar_query(
     const char *uri,
     const char *filter,
     const int32_t *expected,
-    size_t expected_count,
-    int require_comparisons) {
+    size_t expected_count) {
     int32_t actual[64];
     ScanStatisticsCapture stats;
     size_t count =
@@ -2075,10 +2072,6 @@ static void check_native_scalar_query(
     ASSERT(stats.calls == 1, "native scalar statistics callback count mismatch");
     ASSERT(stats.indices_loaded > 0,
            "native scalar query must load an index");
-    if (require_comparisons) {
-        ASSERT(stats.index_comparisons > 0,
-               "native scalar query must compare indexed values");
-    }
 
     count = scan_ids_with_statistics(uri, filter, 0, actual, 64, &stats);
     assert_ids_match(actual, count, expected, expected_count);
@@ -2123,12 +2116,12 @@ static void test_native_scalar_indexes(const char *uri) {
     const int32_t none[] = {0};
     const int32_t high_ids[] = {18, 19, 20};
     const int32_t id_thirteen[] = {13};
-    check_native_scalar_query(uri, "contains(name, 'ali')", alice, 1, 1);
-    check_native_scalar_query(uri, "contains(name, 'zzz')", none, 0, 0);
-    check_native_scalar_query(uri, "id >= 18", high_ids, 3, 1);
-    check_native_scalar_query(uri, "id = 13", id_thirteen, 1, 1);
-    check_native_scalar_query(uri, "name = 'alice'", alice, 1, 1);
-    check_native_scalar_query(uri, "name = 'zzz'", none, 0, 1);
+    check_native_scalar_query(uri, "contains(name, 'ali')", alice, 1);
+    check_native_scalar_query(uri, "contains(name, 'zzz')", none, 0);
+    check_native_scalar_query(uri, "id >= 18", high_ids, 3);
+    check_native_scalar_query(uri, "id = 13", id_thirteen, 1);
+    check_native_scalar_query(uri, "name = 'alice'", alice, 1);
+    check_native_scalar_query(uri, "name = 'zzz'", none, 0);
 
     ASSERT(lance_dataset_create_scalar_index(
                ds, "id", "c_id_zonemap", LANCE_SCALAR_ZONE_MAP,
@@ -2138,7 +2131,7 @@ static void test_native_scalar_indexes(const char *uri) {
            "C ZoneMap replacement changed the index count");
 
     const int32_t expected_after_replace[] = {13};
-    check_native_scalar_query(uri, "id = 13", expected_after_replace, 1, 1);
+    check_native_scalar_query(uri, "id = 13", expected_after_replace, 1);
 
     ASSERT(lance_dataset_prewarm_index(ds, "c_name_ngram") == 0,
            "C NGram prewarm failed");

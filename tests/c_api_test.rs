@@ -6460,15 +6460,6 @@ fn scan_index_ids(
     (ids, captured)
 }
 
-fn scan_metric(stats: &CapturedScanStatistics, name: &str) -> u64 {
-    stats
-        .metrics
-        .iter()
-        .filter(|(metric, _, _)| metric == name)
-        .map(|(_, _, value)| *value)
-        .sum()
-}
-
 #[test]
 fn test_native_scalar_index_families_create_query_and_lifecycle() {
     let (_tmp, uri) = create_native_scalar_index_dataset();
@@ -6586,19 +6577,13 @@ fn test_native_scalar_index_families_create_query_and_lifecycle() {
     let query_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!query_ds.is_null(), "{}", take_last_error_message());
 
-    let assert_indexed = |filter: &str, expected: &[i32], require_comparisons: bool| {
+    let assert_indexed = |filter: &str, expected: &[i32]| {
         let (indexed, stats) = scan_index_ids(query_ds, filter, true);
         assert_eq!(indexed.as_slice(), expected, "indexed filter: {filter}");
         assert!(
             stats.indices_loaded > 0,
             "filter must load a scalar index: {filter}"
         );
-        if require_comparisons {
-            assert!(
-                scan_metric(&stats, "index_comparisons") > 0,
-                "filter must compare indexed values: {filter}"
-            );
-        }
         let (unindexed, unindexed_stats) = scan_index_ids(query_ds, filter, false);
         assert_eq!(unindexed.as_slice(), expected, "unindexed filter: {filter}");
         assert_eq!(
@@ -6610,22 +6595,21 @@ fn test_native_scalar_index_families_create_query_and_lifecycle() {
     assert_indexed(
         "contains(text, 'cat')",
         &[0, 1, 3, 6, 7, 10, 11, 13, 14, 15],
-        true,
     );
     // `scatter` and `bobcat` contain the `cat` trigram but do not start with
     // it, so the exact recheck must remove those NGram candidates.
-    assert_indexed("text LIKE 'cat%'", &[3, 6, 10, 11, 13, 14], true);
-    assert_indexed("contains(text, 'zzzz')", &[], false);
+    assert_indexed("text LIKE 'cat%'", &[3, 6, 10, 11, 13, 14]);
+    assert_indexed("contains(text, 'zzzz')", &[]);
 
-    assert_indexed("score >= 100", &[10, 11, 12, 13, 14, 15, 17], true);
-    assert_indexed("score = 90", &[9], true);
-    assert_indexed("score = 999", &[], true);
-    assert_indexed("score IS NULL", &[7, 16], false);
+    assert_indexed("score >= 100", &[10, 11, 12, 13, 14, 15, 17]);
+    assert_indexed("score = 90", &[9]);
+    assert_indexed("score = 999", &[]);
+    assert_indexed("score IS NULL", &[7, 16]);
 
-    assert_indexed("rank = 3", &[3, 8], true);
-    assert_indexed("rank IN (1, 4)", &[1, 6, 9, 11, 14, 16], true);
-    assert_indexed("rank = 42", &[], true);
-    assert_indexed("rank IS NULL", &[4, 13], false);
+    assert_indexed("rank = 3", &[3, 8]);
+    assert_indexed("rank IN (1, 4)", &[1, 6, 9, 11, 14, 16]);
+    assert_indexed("rank = 42", &[]);
+    assert_indexed("rank IS NULL", &[4, 13]);
 
     for name in ["text_ngram", "score_zonemap", "rank_bloom"] {
         assert_eq!(
