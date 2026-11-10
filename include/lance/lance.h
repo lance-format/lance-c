@@ -134,10 +134,13 @@ typedef enum {
 } LanceVectorIndexType;
 
 typedef enum {
-    LANCE_SCALAR_BTREE      = 1,
-    LANCE_SCALAR_BITMAP     = 2,
-    LANCE_SCALAR_LABEL_LIST = 3,
-    LANCE_SCALAR_INVERTED   = 4,
+    LANCE_SCALAR_BTREE        = 1,
+    LANCE_SCALAR_BITMAP       = 2,
+    LANCE_SCALAR_LABEL_LIST   = 3,
+    LANCE_SCALAR_INVERTED     = 4,
+    LANCE_SCALAR_NGRAM        = 5,
+    LANCE_SCALAR_ZONE_MAP     = 6,
+    LANCE_SCALAR_BLOOM_FILTER = 7,
 } LanceScalarIndexType;
 
 typedef enum {
@@ -2244,7 +2247,11 @@ int32_t lance_dataset_create_vector_index(
 
 /**
  * Create a scalar index on a column.
- * @param params_json Optional JSON params string (e.g. inverted tokenizer config), or NULL.
+ * @param params_json Optional JSON params forwarded unchanged to the native
+ *                    Lance scalar-index plugin, or NULL for plugin defaults.
+ *                    Plugin field names and validation apply; for example
+ *                    ZoneMap uses `rows_per_zone`/`use_seeds` and BloomFilter
+ *                    uses `number_of_items`/`probability`.
  * @return 0 on success, -1 on error.
  */
 int32_t lance_dataset_create_scalar_index(

@@ -34,6 +34,9 @@ pub enum LanceScalarIndexType {
     Bitmap = 2,
     LabelList = 3,
     Inverted = 4,
+    NGram = 5,
+    ZoneMap = 6,
+    BloomFilter = 7,
 }
 
 impl LanceScalarIndexType {
@@ -43,9 +46,26 @@ impl LanceScalarIndexType {
             2 => Ok(Self::Bitmap),
             3 => Ok(Self::LabelList),
             4 => Ok(Self::Inverted),
+            5 => Ok(Self::NGram),
+            6 => Ok(Self::ZoneMap),
+            7 => Ok(Self::BloomFilter),
             _ => Err(lance_core::Error::invalid_input_source(
                 format!("invalid scalar index type: {}", v).into(),
             )),
+        }
+    }
+
+    pub(crate) fn from_details_type_url(type_url: &str) -> Option<Self> {
+        let details_name = type_url.rsplit('.').next().unwrap_or(type_url);
+        match details_name {
+            "BTreeIndexDetails" => Some(Self::BTree),
+            "BitmapIndexDetails" => Some(Self::Bitmap),
+            "LabelListIndexDetails" => Some(Self::LabelList),
+            "InvertedIndexDetails" => Some(Self::Inverted),
+            "NGramIndexDetails" => Some(Self::NGram),
+            "ZoneMapIndexDetails" => Some(Self::ZoneMap),
+            "BloomFilterIndexDetails" => Some(Self::BloomFilter),
+            _ => None,
         }
     }
 
@@ -55,6 +75,9 @@ impl LanceScalarIndexType {
             Self::Bitmap => BuiltinIndexType::Bitmap,
             Self::LabelList => BuiltinIndexType::LabelList,
             Self::Inverted => BuiltinIndexType::Inverted,
+            Self::NGram => BuiltinIndexType::NGram,
+            Self::ZoneMap => BuiltinIndexType::ZoneMap,
+            Self::BloomFilter => BuiltinIndexType::BloomFilter,
         }
     }
 
@@ -64,6 +87,9 @@ impl LanceScalarIndexType {
             Self::Bitmap => IndexType::Bitmap,
             Self::LabelList => IndexType::LabelList,
             Self::Inverted => IndexType::Inverted,
+            Self::NGram => IndexType::NGram,
+            Self::ZoneMap => IndexType::ZoneMap,
+            Self::BloomFilter => IndexType::BloomFilter,
         }
     }
 }

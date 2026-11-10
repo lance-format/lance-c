@@ -35,6 +35,8 @@
 struct ScanStatisticsCapture {
     uint64_t calls = 0;
     uint64_t bytes_read = 0;
+    uint64_t indices_loaded = 0;
+    uint64_t index_comparisons = 0;
     bool invalid = false;
 };
 
@@ -49,6 +51,8 @@ static void capture_scan_statistics(
     }
     captured->calls += 1;
     captured->bytes_read = statistics->bytes_read;
+    captured->indices_loaded = statistics->indices_loaded;
+    captured->index_comparisons = statistics->index_comparisons;
 }
 
 struct AsyncScanCapture {
@@ -1960,6 +1964,95 @@ static void test_scanner_order_by(const std::string& uri) {
     PASS();
 }
 
+static std::vector<int32_t> scan_filtered_ids(
+    lance::Dataset& ds,
+    const std::string& filter,
+    bool use_scalar_index,
+    ScanStatisticsCapture& captured) {
+    auto scanner = ds.scan({"id", "name"}, filter);
+    captured = ScanStatisticsCapture{};
+    scanner.use_scalar_index(use_scalar_index)
+        .statistics_callback(capture_scan_statistics, &captured);
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    auto ids = collect_ordering_ids(stream);
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+static void test_native_scalar_indexes(const std::string& uri) {
+    TEST(test_native_scalar_indexes);
+
+    auto ds = lance::Dataset::open(uri);
+    ds.create_scalar_index("name", LANCE_SCALAR_NGRAM, "cpp_name_ngram");
+    ds.create_scalar_index(
+        "id", LANCE_SCALAR_ZONE_MAP, "cpp_id_zonemap",
+        R"({"rows_per_zone":3,"use_seeds":false})");
+    ds.create_scalar_index(
+        "name", LANCE_SCALAR_BLOOM_FILTER, "cpp_name_bloom",
+        R"({"number_of_items":8,"probability":0.01})");
+
+    ds.prewarm_index("cpp_name_ngram");
+    ds.prewarm_index("cpp_id_zonemap");
+    ds.prewarm_index("cpp_name_bloom");
+
+    auto json = ds.list_indices_json();
+    assert(json.find("\"name\":\"cpp_name_ngram\"") != std::string::npos);
+    assert(json.find("\"type\":\"NGram\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_id_zonemap\"") != std::string::npos);
+    assert(json.find("\"type\":\"ZoneMap\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_name_bloom\"") != std::string::npos);
+    assert(json.find("\"type\":\"BloomFilter\"") != std::string::npos);
+
+    const uint64_t index_count = ds.index_count();
+    auto assert_indexed = [&](const std::string& filter,
+                              const std::vector<int32_t>& expected,
+                              bool require_comparisons = true) {
+        ScanStatisticsCapture stats;
+        assert(scan_filtered_ids(ds, filter, true, stats) == expected);
+        assert(stats.calls == 1);
+        assert(stats.indices_loaded > 0);
+        if (require_comparisons) {
+            assert(stats.index_comparisons > 0);
+        }
+        ScanStatisticsCapture unindexed_stats;
+        assert(scan_filtered_ids(ds, filter, false, unindexed_stats) == expected);
+        assert(unindexed_stats.indices_loaded == 0);
+    };
+
+    assert_indexed("contains(name, 'ali')", {1});
+    assert_indexed("contains(name, 'zzz')", {}, false);
+    assert_indexed("id >= 18", {18, 19, 20});
+    assert_indexed("id = 13", {13});
+    assert_indexed("name = 'alice'", {1});
+    assert_indexed("name = 'zzz'", {});
+
+    ds.create_scalar_index(
+        "id", LANCE_SCALAR_ZONE_MAP, "cpp_id_zonemap",
+        R"({"rows_per_zone":4,"use_seeds":false})", true);
+    assert(ds.index_count() == index_count);
+    assert_indexed("id = 13", {13});
+
+    {
+        auto reopened = lance::Dataset::open(uri);
+        json = reopened.list_indices_json();
+        assert(json.find("\"name\":\"cpp_name_ngram\"") != std::string::npos);
+        assert(json.find("\"name\":\"cpp_id_zonemap\"") != std::string::npos);
+        assert(json.find("\"name\":\"cpp_name_bloom\"") != std::string::npos);
+
+        reopened.drop_index("cpp_name_ngram");
+        reopened.drop_index("cpp_id_zonemap");
+        reopened.drop_index("cpp_name_bloom");
+        json = reopened.list_indices_json();
+        assert(json.find("cpp_name_ngram") == std::string::npos);
+        assert(json.find("cpp_id_zonemap") == std::string::npos);
+        assert(json.find("cpp_name_bloom") == std::string::npos);
+    }
+
+    PASS();
+}
+
 static const ArrowSchema* find_schema_child(
     const ArrowSchema& schema,
     const char* name) {
@@ -2093,6 +2186,7 @@ int main(int argc, char** argv) {
     test_restore_to_current(uri);
     test_error_exception(uri);
     test_index_lifecycle(uri);
+    test_native_scalar_indexes(uri);
     test_batch_nearest(uri);
     test_scanner_materialization_fast_search(uri);
     test_nearest_smoke(uri);
