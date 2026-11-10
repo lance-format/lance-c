@@ -306,6 +306,7 @@ The batch API does not guarantee shared execution or a particular speedup.
 ## Building
 
 There are four supported entry points; pick whichever matches your toolchain.
+Source builds require Rust 1.94 or newer.
 
 ### From source via cargo (Rust developers)
 
