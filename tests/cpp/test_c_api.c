@@ -1204,7 +1204,7 @@ static void test_dataset_field_metadata(const char *fragment_uri) {
         {{LANCE_FIELD_REFERENCE_ID, id_id, NULL}, root_keys, first_values, 1,
          LANCE_METADATA_UPDATE_MERGE},
         {{LANCE_FIELD_REFERENCE_PATH, 0, "id"}, root_keys, last_values, 1,
-         LANCE_METADATA_UPDATE_MERGE},
+         LANCE_METADATA_UPDATE_REPLACE},
     };
     version_before = lance_dataset_version(ds);
     ASSERT(lance_dataset_update_field_metadata(ds, duplicate_updates, 2) == 0,
