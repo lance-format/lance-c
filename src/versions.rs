@@ -618,9 +618,8 @@ unsafe fn branch_create_inner(
     let reference = unsafe { reference_at(reference)? }.clone();
     let store_params = unsafe { optional_object_store_params(storage_opts)? };
     let dataset = unsafe { &*dataset };
-    let created = dataset.with_mut(|source| {
-        block_on(source.create_branch(branch_name, reference, store_params))
-    })?;
+    let created = dataset
+        .with_mut(|source| block_on(source.create_branch(branch_name, reference, store_params)))?;
     Ok(Box::into_raw(Box::new(LanceDataset {
         inner: RwLock::new(Arc::new(created)),
     })))
@@ -706,7 +705,10 @@ pub unsafe extern "C" fn lance_dataset_branch_delete(
     dataset: *const LanceDataset,
     branch_name: *const c_char,
 ) -> i32 {
-    ffi_try!(unsafe { branch_delete_inner(dataset, branch_name, false) }, neg)
+    ffi_try!(
+        unsafe { branch_delete_inner(dataset, branch_name, false) },
+        neg
+    )
 }
 
 /// Delete a branch, bypassing only a missing `BranchContents`.
@@ -715,7 +717,10 @@ pub unsafe extern "C" fn lance_dataset_branch_force_delete(
     dataset: *const LanceDataset,
     branch_name: *const c_char,
 ) -> i32 {
-    ffi_try!(unsafe { branch_delete_inner(dataset, branch_name, true) }, neg)
+    ffi_try!(
+        unsafe { branch_delete_inner(dataset, branch_name, true) },
+        neg
+    )
 }
 
 unsafe fn branch_delete_inner(
