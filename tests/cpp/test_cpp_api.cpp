@@ -1433,7 +1433,7 @@ static void test_scanner_order_by(const std::string& uri) {
 
     auto ds = lance::Dataset::open(uri);
     std::vector<lance::ColumnOrdering> ordering = {
-        {"group", LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_FIRST},
+        {"category", LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_FIRST},
         {"rank", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
         {"id", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
     };
