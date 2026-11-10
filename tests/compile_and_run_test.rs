@@ -230,6 +230,66 @@ fn create_typed_fts_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+
+/// Create a two-fragment dataset for scanner ordering tests.
+fn create_ordering_dataset_on_disk() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ordering_ds").to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, true),
+        Field::new("rank", DataType::Int32, true),
+    ]));
+    let make_batch = |ids: Vec<i32>, groups: &[Option<&str>], ranks: &[Option<i32>]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(groups.to_vec())),
+                Arc::new(Int32Array::from(ranks.to_vec())),
+            ],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        let first = make_batch(
+            vec![0, 1, 2, 3, 4, 5],
+            &[
+                Some("b"),
+                Some("b"),
+                Some("a"),
+                Some("a"),
+                Some("b"),
+                Some("a"),
+            ],
+            &[Some(2), None, Some(1), Some(1), Some(2), None],
+        );
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let second = make_batch(
+            vec![6, 7, 8, 9, 10, 11],
+            &[Some("b"), Some("a"), None, Some("b"), Some("a"), None],
+            &[Some(2), Some(1), Some(3), None, Some(1), Some(2)],
+        );
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+    });
+
+    (tmp, uri)
+}
+
 /// Create a two-fragment Blob v2 dataset on disk and return (TempDir, path_string).
 ///
 /// Each fragment has five rows: blobs of 8, 128 and 1024 bytes (inline, packed
@@ -352,13 +412,20 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
 }
 
 /// Run a compiled test binary with the source dataset URI, a destination URI
-/// for the write test and the URI of a Blob v2 dataset. The destination path
-/// must not pre-exist.
-fn run_test_binary(binary: &Path, dataset_uri: &str, write_uri: &str, blob_uri: &str) {
+/// for the write test, the URI of a Blob v2 dataset, and the ordering dataset.
+/// The destination path must not pre-exist.
+fn run_test_binary(
+    binary: &Path,
+    dataset_uri: &str,
+    write_uri: &str,
+    blob_uri: &str,
+    ordering_uri: &str,
+) {
     let output = Command::new(binary)
         .arg(dataset_uri)
         .arg(write_uri)
         .arg(blob_uri)
+        .arg(ordering_uri)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -411,6 +478,7 @@ fn test_c_compilation_and_execution() {
     let (tmp, dataset_uri) = create_test_dataset_on_disk();
     let write_uri = tmp.path().join("c_write_ds").to_str().unwrap().to_string();
     let (_blob_tmp, blob_uri) = create_blob_dataset_on_disk();
+    let (_ordering_tmp, ordering_uri) = create_ordering_dataset_on_disk();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -424,7 +492,7 @@ fn test_c_compilation_and_execution() {
         "C test compilation failed"
     );
 
-    run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri);
+    run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri, &ordering_uri);
 }
 
 #[test]
@@ -439,6 +507,7 @@ fn test_cpp_compilation_and_execution() {
         .unwrap()
         .to_string();
     let (_blob_tmp, blob_uri) = create_blob_dataset_on_disk();
+    let (_ordering_tmp, ordering_uri) = create_ordering_dataset_on_disk();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -452,7 +521,7 @@ fn test_cpp_compilation_and_execution() {
         "C++ test compilation failed"
     );
 
-    run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri);
+    run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri, &ordering_uri);
 }
 
 #[test]

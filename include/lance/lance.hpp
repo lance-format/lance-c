@@ -1594,6 +1594,13 @@ inline IndexModel Dataset::train_pq_model(
 
 // ─── Scanner ─────────────────────────────────────────────────────────────────
 
+/// One native scanner ordering key. Entries are applied in vector order.
+struct ColumnOrdering {
+    std::string column_name;
+    LanceOrderDirection direction = LANCE_ORDER_ASCENDING;
+    LanceNullOrder null_order = LANCE_ORDER_NULLS_LAST;
+};
+
 class Scanner {
     Handle<LanceScanner, lance_scanner_close> handle_;
 
@@ -1681,6 +1688,34 @@ public:
     /// Configure whether file statistics may optimize the scan.
     Scanner& use_stats(bool use_stats = true) {
         if (lance_scanner_set_use_stats(handle_.get(), use_stats) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Replace the native result ordering. `std::nullopt` clears it; an empty
+    /// vector is the explicit native empty ordering. Lance validates column
+    /// names when the scan is materialized. Not supported with
+    /// nearest_multivector(); that scan fails on start.
+    Scanner& order_by(std::nullopt_t) {
+        if (lance_scanner_set_order_by(handle_.get(), nullptr, 0) != 0)
+            check_error();
+        return *this;
+    }
+
+    Scanner& order_by(const std::vector<ColumnOrdering>& orderings) {
+        std::vector<LanceColumnOrdering> native;
+        native.reserve(orderings.size());
+        for (const auto& ordering : orderings) {
+            native.push_back({
+                ordering.column_name.c_str(),
+                static_cast<int32_t>(ordering.direction),
+                static_cast<int32_t>(ordering.null_order),
+            });
+        }
+        LanceColumnOrdering explicit_empty = {};
+        const LanceColumnOrdering* data =
+            native.empty() ? &explicit_empty : native.data();
+        if (lance_scanner_set_order_by(handle_.get(), data, native.size()) != 0)
             check_error();
         return *this;
     }
