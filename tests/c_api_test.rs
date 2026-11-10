@@ -3668,7 +3668,21 @@ fn test_fragment_historical_snapshot_matches_native() {
     let expected = serde_json::to_value(native_fragment.metadata()).unwrap();
     assert_eq!(actual, expected);
     assert_eq!(actual["physical_rows"].as_u64(), Some(512));
+    assert_eq!(native_fragment.metadata().physical_rows, Some(512));
     unsafe { lance_free_string(metadata_ptr) };
+
+    // The checked-in fixture carries a cached physical row count. Clearing
+    // only writer_version in memory forces the legacy branch that ignores the
+    // cache and reads the data file, proving the Native method mapped by the
+    // binding supports old manifests rather than relying on fast_* helpers.
+    let mut legacy = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    Arc::make_mut(&mut legacy.manifest).writer_version = None;
+    let legacy_fragment = legacy.get_fragment(ids[0] as usize).unwrap();
+    assert!(legacy_fragment.fast_physical_rows().is_err());
+    assert_eq!(
+        lance_c::runtime::block_on(legacy_fragment.physical_rows()).unwrap(),
+        512
+    );
 
     unsafe { lance_fragment_close(fragment) };
     unsafe { lance_dataset_close(ds) };
