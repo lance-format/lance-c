@@ -193,9 +193,11 @@ pub unsafe extern "C" fn lance_dataset_write(
                 schema,
                 stream,
                 mode,
-                std::ptr::null(),
-                std::ptr::null(),
-                true,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options: std::ptr::null(),
+                    legacy_auto_cleanup: true,
+                },
                 storage_opts,
                 out_dataset,
             )
@@ -227,9 +229,11 @@ pub unsafe extern "C" fn lance_dataset_write_with_params(
                 schema,
                 stream,
                 mode,
-                params,
-                std::ptr::null(),
-                true,
+                WriteSettings {
+                    params,
+                    options: std::ptr::null(),
+                    legacy_auto_cleanup: true,
+                },
                 storage_opts,
                 out_dataset,
             )
@@ -268,9 +272,11 @@ pub unsafe extern "C" fn lance_dataset_write_with_options(
                 schema,
                 stream,
                 mode,
-                std::ptr::null(),
-                options,
-                false,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options,
+                    legacy_auto_cleanup: false,
+                },
                 storage_opts,
                 out_dataset,
             )
@@ -279,14 +285,21 @@ pub unsafe extern "C" fn lance_dataset_write_with_options(
     )
 }
 
+/// Internal selection between the legacy write entry points and the native
+/// options entry point. Raw pointers stay valid for the synchronous FFI call.
+#[derive(Clone, Copy)]
+struct WriteSettings {
+    params: *const LanceWriteParams,
+    options: *const LanceWriteOptions,
+    legacy_auto_cleanup: bool,
+}
+
 unsafe fn write_dataset_inner(
     uri: *const c_char,
     schema: *const FFI_ArrowSchema,
     stream: *mut FFI_ArrowArrayStream,
     mode: i32,
-    params: *const LanceWriteParams,
-    options: *const LanceWriteOptions,
-    legacy_auto_cleanup: bool,
+    settings: WriteSettings,
     storage_opts: *const *const c_char,
     out_dataset: *mut *mut LanceDataset,
 ) -> Result<i32> {
@@ -365,13 +378,13 @@ unsafe fn write_dataset_inner(
         store_params,
         ..WriteParams::default()
     };
-    if !options.is_null() {
-        // SAFETY: `options` is non-NULL (checked above) and the caller
+    if !settings.options.is_null() {
+        // SAFETY: `settings.options` is non-NULL (checked above) and the caller
         // guarantees it points to a properly-initialized `LanceWriteOptions`
         // valid for the duration of this call. The borrow ends before any
         // await point because `apply_write_params` and the auto-cleanup
         // conversion are synchronous.
-        let options = unsafe { &*options };
+        let options = unsafe { &*settings.options };
         unsafe { apply_write_params(&mut write_params, &options.params)? };
         if !options.auto_cleanup.is_null() {
             // SAFETY: the caller guarantees a non-NULL `auto_cleanup` points
@@ -381,14 +394,14 @@ unsafe fn write_dataset_inner(
                 Some(unsafe { auto_cleanup_from_ffi(&*options.auto_cleanup)? });
         }
         write_params.skip_auto_cleanup = options.skip_auto_cleanup;
-    } else if !params.is_null() {
-        // SAFETY: `params` is non-NULL (checked above) and the caller
+    } else if !settings.params.is_null() {
+        // SAFETY: `settings.params` is non-NULL (checked above) and the caller
         // guarantees it points to a properly-initialized `LanceWriteParams`
         // valid for the duration of this call. We borrow by shared reference
         // and only read; the borrow is consumed before any await point.
-        unsafe { apply_write_params(&mut write_params, &*params)? };
+        unsafe { apply_write_params(&mut write_params, &*settings.params)? };
     }
-    if legacy_auto_cleanup {
+    if settings.legacy_auto_cleanup {
         // Lance 9.1 changed the upstream default to `auto_cleanup: None`.
         // The long-standing C entry points still expose the pre-9.1 policy
         // (every 20 versions, older than 14 days) so datasets created through
