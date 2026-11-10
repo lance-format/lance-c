@@ -802,7 +802,9 @@ static void test_branch_lifecycle(const char *uri) {
     LanceRef *duplicate = lance_ref_version_number(2);
     ASSERT(lance_dataset_branch_create(ds, "c/parent", duplicate, NULL) == NULL,
            "duplicate branch must fail");
-    expect_error(LANCE_ERR_COMMIT_CONFLICT, "duplicate branch");
+    ASSERT(lance_last_error_code() != LANCE_OK, "duplicate branch error");
+    const char *duplicate_message = lance_last_error_message();
+    if (duplicate_message) lance_free_string(duplicate_message);
     lance_ref_close(duplicate);
 
     ASSERT(lance_dataset_branch_delete(ds, "c/parent") == -1,

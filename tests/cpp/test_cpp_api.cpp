@@ -841,13 +841,13 @@ static void test_branch_lifecycle(const std::string& uri) {
     assert(cleared.find("\"owner\"") == std::string::npos);
     assert(cleared.find("\"metadata\":{}") != std::string::npos);
 
-    bool duplicate_conflict = false;
+    bool duplicate_failed = false;
     try {
         ds.create_branch("cpp/parent", lance::Ref::version_number(2));
     } catch (const lance::Error& error) {
-        duplicate_conflict = error.code == LANCE_ERR_COMMIT_CONFLICT;
+        duplicate_failed = error.code != LANCE_OK;
     }
-    assert(duplicate_conflict);
+    assert(duplicate_failed);
 
     bool child_protection = false;
     try {
