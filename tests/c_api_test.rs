@@ -350,14 +350,14 @@ fn scan_all_rows(ds: *const LanceDataset) -> Vec<RecordBatch> {
 
 /// Two-fragment ordering fixture with nullable, duplicated sort keys.
 ///
-/// `id` is unique and provides the explicit tie-breaker; `group` and `rank`
+/// `id` is unique and provides the explicit tie-breaker; `category` and `rank`
 /// carry NULLs and duplicates across both fragments.
 fn create_ordering_dataset() -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().join("ordering_ds").to_str().unwrap().to_string();
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
-        Field::new("group", DataType::Utf8, true),
+        Field::new("category", DataType::Utf8, true),
         Field::new("rank", DataType::Int32, true),
     ]));
 
@@ -458,7 +458,7 @@ fn ordering_rows(batches: &[RecordBatch]) -> Vec<(i32, Option<String>, Option<i3
             .downcast_ref::<Int32Array>()
             .unwrap();
         let groups = batch
-            .column_by_name("group")
+            .column_by_name("category")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
@@ -878,7 +878,7 @@ fn test_scanner_order_by_single_and_multi_key() {
         (
             vec![
                 (
-                    "group",
+                    "category",
                     LanceOrderDirection::Ascending,
                     LanceNullOrder::NullsLast,
                 ),
@@ -893,7 +893,7 @@ fn test_scanner_order_by_single_and_multi_key() {
         (
             vec![
                 (
-                    "group",
+                    "category",
                     LanceOrderDirection::Descending,
                     LanceNullOrder::NullsFirst,
                 ),
@@ -941,7 +941,7 @@ fn test_scanner_order_by_matches_native_rust() {
 
     let specs = vec![
         (
-            "group",
+            "category",
             LanceOrderDirection::Descending,
             LanceNullOrder::NullsFirst,
         ),
@@ -989,7 +989,7 @@ fn test_scanner_order_by_filter_projection_and_window() {
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
     assert!(!ds.is_null());
 
-    let filter = c_str(r#"id >= 3 AND "group" IS NOT NULL"#);
+    let filter = c_str("id >= 3 AND category IS NOT NULL");
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), filter.as_ptr()) };
     assert!(!scanner.is_null());
     let specs = [

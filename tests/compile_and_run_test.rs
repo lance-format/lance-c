@@ -134,7 +134,7 @@ fn create_ordering_dataset_on_disk() -> (tempfile::TempDir, String) {
     let uri = tmp.path().join("ordering_ds").to_str().unwrap().to_string();
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
-        Field::new("group", DataType::Utf8, true),
+        Field::new("category", DataType::Utf8, true),
         Field::new("rank", DataType::Int32, true),
     ]));
     let make_batch = |ids: Vec<i32>, groups: &[Option<&str>], ranks: &[Option<i32>]| {
