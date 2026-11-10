@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
 
+use chrono::TimeDelta;
 use lance_core::Result;
 
 /// Parse a nullable C string pointer into an `Option<&str>`.
@@ -78,4 +79,31 @@ pub unsafe fn parse_c_string_map(
 /// Parse NULL-terminated storage option pairs. NULL means no options.
 pub unsafe fn parse_storage_options(ptr: *const *const c_char) -> Result<HashMap<String, String>> {
     unsafe { parse_c_string_map(ptr, "storage options") }
+}
+
+/// Convert seconds plus a normalized signed nanosecond component into the
+/// native chrono range without narrowing through signed 64-bit nanoseconds.
+pub(crate) fn time_delta_from_ffi(seconds: i64, nanos: i32, context: &str) -> Result<TimeDelta> {
+    const MAX_NANOS: i32 = 999_999_999;
+    if !(-MAX_NANOS..=MAX_NANOS).contains(&nanos) {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{context}.older_than_nanos={nanos} must be in [-{MAX_NANOS}, {MAX_NANOS}]")
+                .into(),
+        ));
+    }
+    let seconds_delta = TimeDelta::try_seconds(seconds).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!("{context}.older_than_seconds={seconds} is outside chrono::TimeDelta range")
+                .into(),
+        )
+    })?;
+    let nanos_delta = TimeDelta::nanoseconds(i64::from(nanos));
+    seconds_delta.checked_add(&nanos_delta).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "{context} older_than ({seconds} seconds + {nanos} nanoseconds) is outside chrono::TimeDelta range"
+            )
+            .into(),
+        )
+    })
 }

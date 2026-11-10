@@ -10854,6 +10854,813 @@ fn take_last_error_message() -> String {
     message
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedCleanupCandidate {
+    path: String,
+    kind: i32,
+    unverified: bool,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedCleanupBranch {
+    name: String,
+    referenced_version: u64,
+    cleanup_candidate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedCleanupExplanation {
+    read_version: u64,
+    stats: LanceRemovalStats,
+    candidate_files: Vec<CapturedCleanupCandidate>,
+    candidate_files_truncated: bool,
+    candidate_file_limit: u64,
+    referenced_branches: Vec<CapturedCleanupBranch>,
+    warnings: Vec<String>,
+}
+
+fn borrowed_c_string(value: *const c_char) -> String {
+    assert!(!value.is_null(), "{}", take_last_error_message());
+    unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+fn capture_cleanup_explanation(
+    explanation: *const LanceCleanupExplanation,
+) -> CapturedCleanupExplanation {
+    let read_version = unsafe { lance_cleanup_explanation_read_version(explanation) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+
+    let mut stats = LanceRemovalStats::default();
+    assert_eq!(
+        unsafe { lance_cleanup_explanation_stats(explanation, &mut stats) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let candidate_count = unsafe { lance_cleanup_explanation_candidate_count(explanation) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut candidate_files = Vec::new();
+    for index in 0..candidate_count as usize {
+        let path = unsafe { lance_cleanup_explanation_candidate_path_at(explanation, index) };
+        let path = borrowed_c_string(path);
+        let kind = unsafe { lance_cleanup_explanation_candidate_kind_at(explanation, index) };
+        assert!(kind >= 0, "{}", take_last_error_message());
+        let unverified =
+            unsafe { lance_cleanup_explanation_candidate_unverified_at(explanation, index) };
+        assert!(unverified >= 0, "{}", take_last_error_message());
+        let size_bytes =
+            unsafe { lance_cleanup_explanation_candidate_size_bytes_at(explanation, index) };
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+        candidate_files.push(CapturedCleanupCandidate {
+            path,
+            kind,
+            unverified: unverified != 0,
+            size_bytes,
+        });
+    }
+
+    let candidate_files_truncated =
+        unsafe { lance_cleanup_explanation_candidate_files_truncated(explanation) };
+    assert!(
+        candidate_files_truncated >= 0,
+        "{}",
+        take_last_error_message()
+    );
+    let candidate_file_limit =
+        unsafe { lance_cleanup_explanation_candidate_file_limit(explanation) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+
+    let branch_count = unsafe { lance_cleanup_explanation_referenced_branch_count(explanation) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut referenced_branches = Vec::new();
+    for index in 0..branch_count as usize {
+        let name =
+            unsafe { lance_cleanup_explanation_referenced_branch_name_at(explanation, index) };
+        let name = borrowed_c_string(name);
+        let referenced_version =
+            unsafe { lance_cleanup_explanation_referenced_branch_version_at(explanation, index) };
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+        let cleanup_candidate = unsafe {
+            lance_cleanup_explanation_referenced_branch_cleanup_candidate_at(explanation, index)
+        };
+        assert!(cleanup_candidate >= 0, "{}", take_last_error_message());
+        referenced_branches.push(CapturedCleanupBranch {
+            name,
+            referenced_version,
+            cleanup_candidate: cleanup_candidate != 0,
+        });
+    }
+
+    let warning_count = unsafe { lance_cleanup_explanation_warning_count(explanation) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut warnings = Vec::new();
+    for index in 0..warning_count as usize {
+        let warning = unsafe { lance_cleanup_explanation_warning_at(explanation, index) };
+        warnings.push(borrowed_c_string(warning));
+    }
+
+    CapturedCleanupExplanation {
+        read_version,
+        stats,
+        candidate_files,
+        candidate_files_truncated: candidate_files_truncated != 0,
+        candidate_file_limit,
+        referenced_branches,
+        warnings,
+    }
+}
+
+fn cleanup_fixture_batch(schema: Arc<Schema>, start: i32, rows: i32) -> RecordBatch {
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from_iter_values(start..start + rows))],
+    )
+    .unwrap()
+}
+
+fn create_cleanup_fixture(
+    name: &str,
+    fragments: i32,
+    delete_predicate: Option<&str>,
+) -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join(name).to_str().unwrap().to_string();
+    lance_c::runtime::block_on(async {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let first = cleanup_fixture_batch(schema.clone(), 0, 4);
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        for fragment in 1..fragments {
+            let batch = cleanup_fixture_batch(schema.clone(), fragment * 4, 4);
+            dataset
+                .append(
+                    arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        if let Some(predicate) = delete_predicate {
+            dataset.delete(predicate).await.unwrap();
+        }
+    });
+    (tmp, uri)
+}
+
+fn native_cleanup_version_ids(uri: &str, branch: Option<&str>) -> Vec<u64> {
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        if let Some(branch) = branch {
+            dataset = dataset.checkout_branch(branch).await.unwrap();
+        }
+        dataset
+            .version_refs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|version| version.version)
+            .collect()
+    })
+}
+
+fn count_files_with_extension(path: &std::path::Path, extension: &str) -> usize {
+    if path.is_dir() {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| count_files_with_extension(&entry.unwrap().path(), extension))
+            .sum()
+    } else {
+        usize::from(
+            path.extension()
+                .is_some_and(|candidate| candidate == std::ffi::OsStr::new(extension)),
+        )
+    }
+}
+
+fn files_with_extension(
+    path: &std::path::Path,
+    extension: &str,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            files_with_extension(&entry.unwrap().path(), extension, out);
+        }
+    } else if path
+        .extension()
+        .is_some_and(|candidate| candidate == std::ffi::OsStr::new(extension))
+    {
+        out.push(path.to_path_buf());
+    }
+}
+
+fn sentinel_cleanup_stats() -> LanceRemovalStats {
+    LanceRemovalStats {
+        bytes_removed: u64::MAX,
+        old_versions: u64::MAX,
+        data_files_removed: u64::MAX,
+        transaction_files_removed: u64::MAX,
+        index_files_removed: u64::MAX,
+        deletion_files_removed: u64::MAX,
+        failed_deletes: u64::MAX,
+    }
+}
+
+#[test]
+fn test_cleanup_selectors_explanation_owned_output_and_reexecution() {
+    let (tmp, uri) = create_cleanup_fixture("cleanup-selectors", 4, Some("id = 1"));
+    let root = std::path::Path::new(&uri);
+    let uri_c = c_str(&uri);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 2, 3, 4, 5]);
+    assert_eq!(count_files_with_extension(root, "manifest"), 5);
+
+    let selected_versions = [2_u64, 3];
+    let mut policy = LanceCleanupPolicy {
+        has_before_timestamp: 1,
+        // Beyond the i64-nanosecond range (year 3000).
+        before_timestamp_seconds: 32_503_680_000,
+        before_timestamp_nanos: 999_999_999,
+        has_before_version: 1,
+        before_version: 5,
+        versions: selected_versions.as_ptr(),
+        num_versions: selected_versions.len(),
+        ..LanceCleanupPolicy::default()
+    };
+    let mut operation = LanceCleanupOperationOptions {
+        has_max_candidate_files: 1,
+        max_candidate_files: 1,
+        ..LanceCleanupOperationOptions::default()
+    };
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, &operation) };
+    assert!(!explanation.is_null(), "{}", take_last_error_message());
+    assert_eq!(count_files_with_extension(root, "manifest"), 5);
+
+    // The explanation owns every field and remains readable after the dataset
+    // handle is gone.
+    unsafe { lance_dataset_close(dataset) };
+    let captured = capture_cleanup_explanation(explanation);
+    assert_eq!(captured.read_version, 5);
+    assert_eq!(captured.stats.old_versions, 2);
+    assert_eq!(captured.candidate_files.len(), 1);
+    assert_eq!(captured.candidate_file_limit, 1);
+    assert!(captured.candidate_files_truncated);
+    assert_eq!(captured.warnings.len(), 1);
+    assert!(captured.warnings[0].contains("candidate_files truncated to 1 entries"));
+    assert!(!captured.candidate_files[0].path.is_empty());
+    assert!(captured.candidate_files[0].size_bytes > 0);
+    unsafe { lance_cleanup_explanation_close(explanation) };
+    assert_eq!(count_files_with_extension(root, "manifest"), 5);
+
+    // The timestamp selector is independent from the version selectors and
+    // combines with AND.
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    policy.before_timestamp_seconds = 0;
+    policy.before_timestamp_nanos = 0;
+    operation.max_candidate_files = 100;
+    let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, &operation) };
+    assert!(!explanation.is_null(), "{}", take_last_error_message());
+    let captured = capture_cleanup_explanation(explanation);
+    assert_eq!(captured.stats.old_versions, 0);
+    assert!(captured.candidate_files.is_empty());
+    assert!(!captured.candidate_files_truncated);
+    unsafe {
+        lance_cleanup_explanation_close(explanation);
+        lance_dataset_close(dataset);
+    }
+
+    // An explicit zero candidate limit is valid and still reports full
+    // aggregate stats plus truncation.
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    policy.before_timestamp_seconds = 32_503_680_000;
+    policy.before_timestamp_nanos = 0;
+    operation.max_candidate_files = 0;
+    let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, &operation) };
+    assert!(!explanation.is_null(), "{}", take_last_error_message());
+    let captured = capture_cleanup_explanation(explanation);
+    assert_eq!(captured.stats.old_versions, 2);
+    assert!(captured.candidate_files.is_empty());
+    assert!(captured.candidate_files_truncated);
+    assert_eq!(captured.candidate_file_limit, 0);
+    unsafe {
+        lance_cleanup_explanation_close(explanation);
+        lance_dataset_close(dataset);
+    }
+
+    // Add a tag after the explanation. Execution re-evaluates references:
+    // version 3 is now protected, while version 2 is still removable.
+    lance_c::runtime::block_on(async {
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .tags()
+            .create("pinned-after-explain", 3_u64)
+            .await
+            .unwrap();
+    });
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    policy.has_error_if_tagged_old_versions = 1;
+    policy.error_if_tagged_old_versions = false;
+    operation = LanceCleanupOperationOptions {
+        has_delete_concurrency: 1,
+        delete_concurrency: 2,
+        has_delete_rate_limit: 1,
+        delete_rate_limit: 1_000_000,
+        ..LanceCleanupOperationOptions::default()
+    };
+    let mut stats = sentinel_cleanup_stats();
+    assert_eq!(
+        unsafe { lance_dataset_cleanup(dataset, &policy, &operation, &mut stats) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(stats.old_versions, 1);
+    assert_eq!(stats.failed_deletes, 0);
+    unsafe { lance_dataset_close(dataset) };
+
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 3, 4, 5]);
+    assert_eq!(count_files_with_extension(root, "manifest"), 4);
+    let tag_version = lance_c::runtime::block_on(async {
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .tags()
+            .get("pinned-after-explain")
+            .await
+            .unwrap()
+            .version
+    });
+    assert_eq!(tag_version, 3);
+    drop(tmp);
+}
+
+#[test]
+fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
+    let (tmp, uri) = create_cleanup_fixture("cleanup-retain", 5, None);
+    let root = std::path::Path::new(&uri);
+    lance_c::runtime::block_on(async {
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .tags()
+            .create("pinned-old", 2_u64)
+            .await
+            .unwrap();
+    });
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+
+    // A zero-initialized optional tag flag inherits the native true default.
+    let mut policy = LanceCleanupPolicy {
+        has_before_version: 1,
+        before_version: 5,
+        ..LanceCleanupPolicy::default()
+    };
+    let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, ptr::null()) };
+    assert!(explanation.is_null());
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+    assert!(take_last_error_message().contains("tagged version"));
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 2, 3, 4, 5]);
+
+    // Retain-N uses the native asynchronous builder. Explicitly disabling the
+    // tag error leaves the tagged version protected but continues cleanup.
+    policy = LanceCleanupPolicy {
+        has_retain_versions: 1,
+        retain_versions: 3,
+        has_error_if_tagged_old_versions: 1,
+        error_if_tagged_old_versions: false,
+        ..LanceCleanupPolicy::default()
+    };
+    let mut stats = sentinel_cleanup_stats();
+    assert_eq!(
+        unsafe { lance_dataset_cleanup(dataset, &policy, ptr::null(), &mut stats) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(stats.old_versions, 1);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 3, 4, 5]);
+
+    // Native retain-N validation.
+    policy = LanceCleanupPolicy {
+        has_retain_versions: 1,
+        retain_versions: 0,
+        ..LanceCleanupPolicy::default()
+    };
+    let mut stats = sentinel_cleanup_stats();
+    assert_eq!(
+        unsafe { lance_dataset_cleanup(dataset, &policy, ptr::null(), &mut stats) },
+        -1
+    );
+    assert_eq!(stats, sentinel_cleanup_stats());
+    assert!(take_last_error_message().contains("retain_versions must be greater than 0"));
+
+    // An explicit empty version selection reaches the native builder and is
+    // rejected there rather than being treated as an absent selector.
+    let empty_version_sentinel = 0_u64;
+    policy = LanceCleanupPolicy {
+        versions: &empty_version_sentinel,
+        num_versions: 0,
+        ..LanceCleanupPolicy::default()
+    };
+    let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, ptr::null()) };
+    assert!(explanation.is_null());
+    assert!(take_last_error_message().contains("versions must not be empty when specified"));
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 3, 4, 5]);
+
+    // before_version and retain_versions write the same native field, so the
+    // binding rejects the ambiguous combination instead of choosing silently.
+    policy = LanceCleanupPolicy {
+        has_before_version: 1,
+        before_version: 4,
+        has_retain_versions: 1,
+        retain_versions: 2,
+        ..LanceCleanupPolicy::default()
+    };
+    assert_eq!(
+        unsafe { lance_dataset_cleanup(dataset, &policy, ptr::null(), &mut stats) },
+        -1
+    );
+    assert!(take_last_error_message().contains("both set the native before_version"));
+
+    let selected = [3_u64];
+    policy = LanceCleanupPolicy {
+        versions: selected.as_ptr(),
+        num_versions: selected.len(),
+        ..LanceCleanupPolicy::default()
+    };
+
+    // Native operation setters validate through their own stages.
+    let invalid_concurrency = LanceCleanupOperationOptions {
+        has_delete_concurrency: 1,
+        delete_concurrency: 0,
+        ..LanceCleanupOperationOptions::default()
+    };
+    let mut stats = sentinel_cleanup_stats();
+    assert_eq!(
+        unsafe { lance_dataset_cleanup(dataset, &policy, &invalid_concurrency, &mut stats,) },
+        -1
+    );
+    assert_eq!(stats, sentinel_cleanup_stats());
+    assert!(take_last_error_message().contains("delete_concurrency must be between 1"));
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 3, 4, 5]);
+
+    let invalid_rate = LanceCleanupOperationOptions {
+        has_delete_rate_limit: 1,
+        delete_rate_limit: 0,
+        ..LanceCleanupOperationOptions::default()
+    };
+    assert_eq!(
+        unsafe { lance_dataset_cleanup(dataset, &policy, &invalid_rate, &mut stats) },
+        -1
+    );
+    assert_eq!(stats, sentinel_cleanup_stats());
+    assert!(take_last_error_message().contains("delete_rate_limit must be greater than 0"));
+
+    let valid_operation = LanceCleanupOperationOptions {
+        has_delete_concurrency: 1,
+        delete_concurrency: 2,
+        has_delete_rate_limit: 1,
+        delete_rate_limit: 1_000_000,
+        has_max_candidate_files: 1,
+        max_candidate_files: 0,
+    };
+    assert_eq!(
+        unsafe { lance_dataset_cleanup(dataset, &policy, &valid_operation, &mut stats,) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(stats.old_versions, 1);
+    assert_eq!(stats.failed_deletes, 0);
+    unsafe { lance_dataset_close(dataset) };
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 4, 5]);
+    assert_eq!(count_files_with_extension(root, "manifest"), 3);
+    drop(tmp);
+}
+
+#[test]
+fn test_cleanup_relative_duration_and_unverified_candidates() {
+    let (tmp, uri) = create_cleanup_fixture("cleanup-relative", 5, None);
+    let root = std::path::Path::new(&uri);
+    let orphan = root.join("data").join("orphan-cleanup.lance");
+    let orphan_bytes = b"unverified cleanup candidate";
+    std::fs::write(&orphan, orphan_bytes).unwrap();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+
+    let selected = [2_u64];
+    let mut policy = LanceCleanupPolicy {
+        versions: selected.as_ptr(),
+        num_versions: selected.len(),
+        ..LanceCleanupPolicy::default()
+    };
+    let operation = LanceCleanupOperationOptions {
+        has_max_candidate_files: 1,
+        max_candidate_files: 100,
+        ..LanceCleanupOperationOptions::default()
+    };
+
+    let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, &operation) };
+    assert!(!explanation.is_null(), "{}", take_last_error_message());
+    let captured = capture_cleanup_explanation(explanation);
+    assert!(
+        captured
+            .candidate_files
+            .iter()
+            .all(|candidate| !candidate.path.ends_with("orphan-cleanup.lance"))
+    );
+    assert_eq!(captured.stats.data_files_removed, 0);
+    unsafe { lance_cleanup_explanation_close(explanation) };
+
+    policy.has_delete_unverified = 1;
+    policy.delete_unverified = true;
+    let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, &operation) };
+    assert!(!explanation.is_null(), "{}", take_last_error_message());
+    let captured = capture_cleanup_explanation(explanation);
+    let orphan_candidate = captured
+        .candidate_files
+        .iter()
+        .find(|candidate| candidate.path.ends_with("orphan-cleanup.lance"))
+        .expect("explicit delete_unverified must expose the orphan candidate");
+    assert_eq!(orphan_candidate.kind, 1);
+    assert!(orphan_candidate.unverified);
+    assert_eq!(orphan_candidate.size_bytes, orphan_bytes.len() as u64);
+    assert_eq!(captured.stats.data_files_removed, 1);
+    assert!(orphan.exists(), "explain must not delete files");
+    unsafe { lance_cleanup_explanation_close(explanation) };
+
+    // Relative older-than cleanup calls the native convenience operation, so
+    // Lance core owns the cutoff. A negative window beyond the i64-nanosecond
+    // range produces a future cutoff and removes every non-current version;
+    // the recent unverified orphan remains protected by the default.
+    let relative = LanceCleanupOldVersionsOptions {
+        older_than_seconds: -10_000_000_000,
+        ..LanceCleanupOldVersionsOptions::default()
+    };
+    let mut stats = sentinel_cleanup_stats();
+    assert_eq!(
+        unsafe { lance_dataset_cleanup_old_versions(dataset, &relative, &mut stats,) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(stats.old_versions, 4);
+    assert!(orphan.exists());
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![5]);
+    assert_eq!(count_files_with_extension(root, "manifest"), 1);
+
+    let invalid_relative = LanceCleanupOldVersionsOptions {
+        older_than_nanos: 1_000_000_000,
+        ..LanceCleanupOldVersionsOptions::default()
+    };
+    let mut invalid_stats = sentinel_cleanup_stats();
+    assert_eq!(
+        unsafe {
+            lance_dataset_cleanup_old_versions(dataset, &invalid_relative, &mut invalid_stats)
+        },
+        -1
+    );
+    assert_eq!(invalid_stats, sentinel_cleanup_stats());
+    assert!(take_last_error_message().contains("older_than_nanos=1000000000"));
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![5]);
+    unsafe { lance_dataset_close(dataset) };
+    drop(tmp);
+}
+
+#[test]
+fn test_dataset_validation_deleted_rows_and_small_files() {
+    let (tmp, uri) = create_cleanup_fixture("lifecycle-stats", 4, Some("id IN (1, 5)"));
+    let uri_c = c_str(&uri);
+    let native_deleted = lance_c::runtime::block_on(async {
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .count_deleted_rows()
+            .await
+            .unwrap() as u64
+    });
+    assert_eq!(native_deleted, 2);
+
+    for (threshold, expected) in [(0_usize, 0_usize), (4, 0), (5, 4), (8, 4)] {
+        let native = lance_c::runtime::block_on(async {
+            Dataset::open(&uri)
+                .await
+                .unwrap()
+                .num_small_files(threshold)
+                .await
+        });
+        assert_eq!(native, expected);
+    }
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_validate(dataset) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut deleted = u64::MAX;
+    assert_eq!(
+        unsafe { lance_dataset_count_deleted_rows(dataset, &mut deleted) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(deleted, 2);
+    let mut small_files = u64::MAX;
+    assert_eq!(
+        unsafe { lance_dataset_num_small_files(dataset, 5, &mut small_files) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(small_files, 4);
+    assert_eq!(
+        unsafe { lance_dataset_num_small_files(dataset, 4, &mut small_files) },
+        0
+    );
+    assert_eq!(small_files, 0);
+    assert_eq!(
+        unsafe { lance_dataset_num_small_files(dataset, 0, &mut small_files) },
+        0
+    );
+    assert_eq!(small_files, 0);
+
+    let mut untouched = 123_u64;
+    assert_eq!(
+        unsafe { lance_dataset_count_deleted_rows(ptr::null(), &mut untouched) },
+        -1
+    );
+    assert_eq!(untouched, 123);
+    assert_eq!(
+        unsafe { lance_dataset_num_small_files(ptr::null(), 5, &mut untouched) },
+        -1
+    );
+    assert_eq!(untouched, 123);
+    assert_eq!(unsafe { lance_dataset_validate(ptr::null()) }, -1);
+    unsafe { lance_dataset_close(dataset) };
+
+    // A controlled invalid fixture: opening only reads the manifest, while
+    // validation checks fragment data and must reach the native failure.
+    let mut data_files = Vec::new();
+    files_with_extension(std::path::Path::new(&uri), "lance", &mut data_files);
+    assert!(!data_files.is_empty());
+    std::fs::remove_file(&data_files[0]).unwrap();
+    let native_failure =
+        lance_c::runtime::block_on(async { Dataset::open(&uri).await.unwrap().validate().await });
+    assert!(native_failure.is_err());
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    assert_eq!(unsafe { lance_dataset_validate(dataset) }, -1);
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+    assert!(!take_last_error_message().is_empty());
+    unsafe { lance_dataset_close(dataset) };
+    drop(tmp);
+}
+
+#[test]
+fn test_cleanup_branch_cascade_and_copied_explanation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("cleanup-branches")
+        .to_str()
+        .unwrap()
+        .to_string();
+    lance_c::runtime::block_on(async {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let first = cleanup_fixture_batch(schema.clone(), 0, 4);
+        let mut main = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            Some(WriteParams {
+                auto_cleanup: Some(AutoCleanupParams {
+                    interval: 1,
+                    older_than: chrono::TimeDelta::zero(),
+                }),
+                skip_auto_cleanup: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for fragment in 1..3 {
+            let batch = cleanup_fixture_batch(schema.clone(), fragment * 4, 4);
+            main.append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                Some(WriteParams {
+                    skip_auto_cleanup: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let mut branch = main.create_branch("dev", 2_u64, None).await.unwrap();
+        let branch_batch = cleanup_fixture_batch(schema.clone(), 100, 4);
+        branch
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(
+                    vec![Ok(branch_batch)],
+                    schema.clone(),
+                ),
+                Some(WriteParams {
+                    skip_auto_cleanup: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let main_batch = cleanup_fixture_batch(schema.clone(), 200, 4);
+        main.append(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(main_batch)], schema),
+            Some(WriteParams {
+                skip_auto_cleanup: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 2, 3, 4]);
+    assert_eq!(native_cleanup_version_ids(&uri, Some("dev")), vec![2, 3]);
+    let root = std::path::Path::new(&uri);
+    let before_manifests = count_files_with_extension(root, "manifest");
+
+    let policy = LanceCleanupPolicy {
+        has_retain_versions: 1,
+        retain_versions: 1,
+        has_clean_referenced_branches: 1,
+        clean_referenced_branches: true,
+        ..LanceCleanupPolicy::default()
+    };
+    let operation = LanceCleanupOperationOptions {
+        has_max_candidate_files: 1,
+        max_candidate_files: 100,
+        ..LanceCleanupOperationOptions::default()
+    };
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, &operation) };
+    assert!(!explanation.is_null(), "{}", take_last_error_message());
+    let captured = capture_cleanup_explanation(explanation);
+    assert_eq!(captured.read_version, 4);
+    assert_eq!(captured.referenced_branches.len(), 1);
+    assert_eq!(captured.referenced_branches[0].name, "dev");
+    // The native BranchIdentifier records the parent version this branch
+    // descends from, not the branch's own latest version.
+    assert_eq!(captured.referenced_branches[0].referenced_version, 2);
+    assert!(captured.referenced_branches[0].cleanup_candidate);
+    assert_eq!(
+        count_files_with_extension(root, "manifest"),
+        before_manifests
+    );
+    unsafe { lance_cleanup_explanation_close(explanation) };
+
+    let mut stats = sentinel_cleanup_stats();
+    assert_eq!(
+        unsafe { lance_dataset_cleanup(dataset, &policy, &operation, &mut stats) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let after_manifests = count_files_with_extension(root, "manifest");
+    assert_eq!(
+        before_manifests - after_manifests,
+        stats.old_versions as usize
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    // Cascade cleanup uses the referenced branch's own manifest config. The
+    // parent manifest that anchors the branch's remaining lineage is retained.
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 4]);
+    assert_eq!(native_cleanup_version_ids(&uri, Some("dev")), vec![3]);
+    assert_eq!(after_manifests, 3);
+    drop(tmp);
+}
+
 #[test]
 fn test_vector_index_segment_rejects_strict_subset_dot_pq() {
     let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
