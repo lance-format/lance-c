@@ -222,6 +222,61 @@ typedef struct LanceSessionCacheStats {
 } LanceSessionCacheStats;
 
 /**
+ * Cache selection for one session cache tier.
+ *
+ * Discriminants are ABI-stable. The `kind` field in
+ * LanceSessionCacheSpec is a fixed-width int32_t, not this enum type, so
+ * callers built with non-default enum sizing cannot mismatch the Rust ABI.
+ */
+typedef enum {
+    /* Use the native Lance default capacity for this tier. */
+    LANCE_SESSION_CACHE_SPEC_DEFAULT = 0,
+    /* Use the native default in-memory backend with an explicit capacity. */
+    LANCE_SESSION_CACHE_SPEC_SIZE = 1,
+    /* Build a backend from a backend URI. */
+    LANCE_SESSION_CACHE_SPEC_URI = 2,
+    /* Build a backend from a kind plus string options. */
+    LANCE_SESSION_CACHE_SPEC_CONFIG = 3,
+} LanceSessionCacheSpecKind;
+
+/**
+ * Description of one session cache tier.
+ *
+ * Only the field selected by `kind` is read:
+ *
+ *  - DEFAULT reads no additional fields.
+ *  - SIZE reads `size_bytes`. Zero is an explicit zero capacity, not DEFAULT.
+ *  - URI reads `backend_uri`.
+ *  - CONFIG reads `backend_kind`, then `option_count` entries from the
+ *    parallel `option_keys` and `option_values` arrays.
+ *
+ * All strings must be NUL-terminated UTF-8. `option_count` is an exact count,
+ * not a NULL-terminated sentinel: when it is non-zero, both option arrays must
+ * be non-NULL and each selected key/value must be non-NULL. Duplicate option
+ * keys are rejected. Unused fields are ignored.
+ *
+ * Every buffer is borrowed only for the duration of
+ * lance_session_new_with_cache_specs(). Backend construction happens before
+ * it returns, and the caller retains ownership of all buffers.
+ */
+typedef struct LanceSessionCacheSpec {
+    /* LanceSessionCacheSpecKind discriminant. */
+    int32_t     kind;
+    /* Explicit capacity for SIZE, in bytes. */
+    uint64_t    size_bytes;
+    /* Backend URI for URI, e.g. "moka://?capacity=1048576". */
+    const char* backend_uri;
+    /* Registry kind for CONFIG, e.g. "moka". */
+    const char* backend_kind;
+    /* Parallel option-key array for CONFIG. */
+    const char* const* option_keys;
+    /* Parallel option-value array for CONFIG. */
+    const char* const* option_values;
+    /* Number of entries in option_keys and option_values. */
+    size_t      option_count;
+} LanceSessionCacheSpec;
+
+/**
  * Create a session that can share metadata and index caches across datasets.
  *
  * Cache limits are specified in bytes. Pass 0 to request zero capacity.
@@ -230,6 +285,25 @@ typedef struct LanceSessionCacheStats {
 LanceSession* lance_session_new(
     uint64_t index_cache_size_bytes,
     uint64_t metadata_cache_size_bytes
+);
+
+/**
+ * Create a session with independent cache configuration for each tier.
+ *
+ * Each spec maps to the native Lance CacheSpec: DEFAULT uses the tier default,
+ * SIZE uses the native default in-memory backend with an explicit capacity,
+ * and URI/CONFIG build a backend through the native cache registry. Backend
+ * URI parsing, kind normalization, option validation, and unknown-kind errors
+ * come from Lance core.
+ *
+ * Both spec pointers must be non-NULL. The specs and all buffers they
+ * reference are borrowed only for this call.
+ *
+ * @return Session handle, or NULL on error
+ */
+LanceSession* lance_session_new_with_cache_specs(
+    const LanceSessionCacheSpec* index_cache,
+    const LanceSessionCacheSpec* metadata_cache
 );
 
 /**
@@ -246,6 +320,34 @@ void lance_session_close(LanceSession* session);
 int32_t lance_session_get_cache_stats(
     const LanceSession* session,
     LanceSessionCacheStats* out_stats
+);
+
+/**
+ * Copy the current deep size of the session to `out_size_bytes`.
+ *
+ * This walks live cache contents and includes retained session state. It is
+ * not an RSS measurement or a configured capacity limit. The output is
+ * written only on success.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_session_get_size_bytes(
+    const LanceSession* session,
+    uint64_t* out_size_bytes
+);
+
+/**
+ * Copy the approximate number of items in the session to `out_num_items`.
+ *
+ * This is the native explicitly approximate inspection value. It can differ
+ * from the exact cache entry counts and may change as cache maintenance runs.
+ * The output is written only on success.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_session_get_approx_num_items(
+    const LanceSession* session,
+    uint64_t* out_num_items
 );
 
 /* ─── Dataset lifecycle ─── */
@@ -310,6 +412,81 @@ uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
  * lance_last_error_code()).
  */
 uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
+
+/* ─── Dataset table and schema metadata ─── */
+
+/** How a metadata update applies to the existing map. */
+typedef enum {
+    /* Merge entries into the existing map. */
+    LANCE_METADATA_UPDATE_MERGE   = 0,
+    /* Replace the existing map with the entries that carry values. */
+    LANCE_METADATA_UPDATE_REPLACE = 1,
+} LanceMetadataUpdateMode;
+
+/**
+ * Return this snapshot's table metadata as a JSON object mapping keys to
+ * string values. Keys and values are JSON-escaped. An empty map is `{}`.
+ *
+ * Schema metadata is part of the Arrow schema returned by
+ * `lance_dataset_schema()` and is not duplicated here.
+ *
+ * Caller must free the returned string with `lance_free_string()`.
+ * Returns NULL on error.
+ */
+const char* lance_dataset_metadata_json(const LanceDataset* dataset);
+
+/**
+ * Merge or replace table metadata and return the complete updated map as a
+ * JSON object.
+ *
+ * `keys` and `values` are parallel arrays of length `count`.
+ * - `keys[i]` must be a non-NULL, NUL-terminated UTF-8 string.
+ * - `values[i] == NULL` removes `keys[i]`, matching the native `None` value.
+ *   It does not store an empty value.
+ * - An empty string value is a real value and is stored as `""`.
+ * - `keys` and `values` may be NULL only when `count == 0`.
+ *
+ * `mode` is explicit:
+ * - `LANCE_METADATA_UPDATE_MERGE` applies the entries to the existing map.
+ * - `LANCE_METADATA_UPDATE_REPLACE` replaces the entire map. With
+ *   `count == 0`, this clears the map; value-less entries are omitted.
+ *
+ * The native builder performs the commit. This mutates `dataset` in place;
+ * the same handle remains valid and sees the new version, while existing
+ * dataset snapshots and scanners keep their prior view. Key validation,
+ * version transitions, concurrent transaction behavior and error semantics
+ * follow the pinned Lance core.
+ *
+ * Caller must free the returned JSON string with `lance_free_string()`.
+ * Returns NULL on error. Commit and error semantics follow the native core.
+ */
+const char* lance_dataset_update_metadata_json(
+    LanceDataset* dataset,
+    const char* const* keys,
+    const char* const* values,
+    size_t count,
+    LanceMetadataUpdateMode mode
+);
+
+/**
+ * Merge or replace schema metadata and return the complete updated schema
+ * metadata map as a JSON object. Input and ownership rules match
+ * `lance_dataset_update_metadata_json`.
+ *
+ * This changes only schema metadata: dataset fields, fragments, table
+ * metadata and configuration are unchanged. Read the committed schema
+ * metadata through the Arrow schema returned by `lance_dataset_schema()`.
+ *
+ * Caller must free the returned JSON string with `lance_free_string()`.
+ * Returns NULL on error. Commit and error semantics follow the native core.
+ */
+const char* lance_dataset_update_schema_metadata_json(
+    LanceDataset* dataset,
+    const char* const* keys,
+    const char* const* values,
+    size_t count,
+    LanceMetadataUpdateMode mode
+);
 
 /* ─── Version history ─── */
 

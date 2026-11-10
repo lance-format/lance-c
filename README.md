@@ -66,11 +66,50 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | Status | Component | Description |
 |--------|-----------|-------------|
 | [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
-| [x] | Dataset metadata | `lance_dataset_version()`, `lance_dataset_count_rows()`, `lance_dataset_latest_version()` |
+| [x] | Dataset metadata | Version/count accessors plus JSON table metadata reads and native merge/replace updates for table and schema metadata |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
 | [x] | Row prefilter | `lance_scanner_set_row_addr_allowlist()` / `lance_scanner_set_row_addr_blocklist()` restrict scans, nearest-neighbor and full-text searches to (or exclude) a set of `_rowid`s before ranking |
 | [x] | Native ordering | `lance_scanner_set_order_by()` and C++ `Scanner::order_by()` sort by one or more columns with direction and NULL placement |
 | [x] | Expression projection | `lance_scanner_set_projection()` binds named SQL expressions, aliases and nested fields; `lance_scanner_disable_scoring_autoprojection()` controls automatic `_score` / `_distance` output |
+
+## Dataset metadata
+
+Table metadata is available through `lance_dataset_metadata_json()` or
+`Dataset::metadata_json()`. Updates return the complete post-commit map:
+
+```c
+const char* keys[] = {"owner", "retired", "empty"};
+const char* values[] = {"c-consumer", NULL, ""};
+const char* updated = lance_dataset_update_metadata_json(
+    dataset, keys, values, 3, LANCE_METADATA_UPDATE_MERGE);
+if (!updated) {
+    /* Check lance_last_error_code()/message. */
+}
+lance_free_string(updated);
+```
+
+```cpp
+ds.update_metadata_json({
+    {"owner", std::string("c++")},
+    {"retired", std::nullopt},
+    {"empty", std::string("")},
+}, lance::MetadataUpdateMode::Merge);
+
+ds.update_schema_metadata_json({
+    {"schema-owner", std::string("c++")},
+});
+```
+
+A NULL value removes the key. An empty string remains a real empty value.
+`LANCE_METADATA_UPDATE_REPLACE` / `MetadataUpdateMode::Replace` replaces the
+whole map; an empty update in replace mode clears it. Updates mutate the same
+dataset handle under Lance's native snapshot and commit semantics: the handle
+sees the new version, while existing dataset snapshots and scanners keep their
+prior view. Table and schema maps are independent.
+
+The exported Arrow schema is still the schema metadata read path. Use
+`lance_dataset_schema()` or `Dataset::schema()` to inspect the committed schema
+metadata; no duplicate C-side metadata cache is maintained.
 
 ## Scanner ordering
 
@@ -345,7 +384,52 @@ The batch API does not guarantee shared execution or a particular speedup.
 ## Building
 
 There are four supported entry points; pick whichever matches your toolchain.
-Source builds require Rust 1.94 or newer.
+Building this source tree requires Rust 1.94.0 or newer. The `from-source`
+recipes fetch the v0.1.9 tag, whose `Cargo.toml` declares
+`rust-version = "1.91.0"`. Prebuilt archives do not require a Rust toolchain.
+
+### Published prebuilt archives
+
+The v0.1.9 release publishes five archives. vcpkg and Conan currently select
+three of them:
+
+| Archive | Selected by |
+| --- | --- |
+| `lance-c-v0.1.9-x86_64-unknown-linux-gnu.tar.xz` | Not selected by the current recipes |
+| `lance-c-v0.1.9-x86_64-unknown-linux-gnu-debian12.tar.xz` | vcpkg `x64-linux`, `x64-linux-dynamic`, Conan `Linux/x86_64` |
+| `lance-c-v0.1.9-aarch64-unknown-linux-gnu.tar.xz` | vcpkg `arm64-linux`, `arm64-linux-dynamic`, Conan `Linux/armv8` |
+| `lance-c-v0.1.9-aarch64-unknown-linux-gnu-debian12.tar.xz` | Not selected by the current recipes |
+| `lance-c-v0.1.9-aarch64-apple-darwin.tar.xz` | vcpkg `arm64-osx`, `arm64-osx-dynamic`, Conan `Macos/armv8` |
+
+Intel macOS (`x86_64-apple-darwin`) uses the `from-source` path for v0.1.9.
+The archives contain headers, static and shared libraries,
+CMake package files, pkg-config metadata, and the license. The package recipes
+install only the linkage selected for that package.
+
+Static inspection of the published Linux shared libraries found:
+
+| Archive | Highest GLIBC symbol reference | Direct dynamic dependencies |
+| --- | --- | --- |
+| x86_64 standard | `GLIBC_2.39` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` |
+| x86_64 Debian 12 | `GLIBC_2.35` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` |
+| aarch64 standard | `GLIBC_2.39` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` |
+| aarch64 Debian 12 | `GLIBC_2.35` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` |
+
+None of the Linux libraries records GLIBCXX or CXXABI version requirements.
+The macOS dylib is a thin `arm64` Mach-O binary with install name
+`@rpath/liblance_c.dylib`, `minos 11.0`, SDK `14.5`, and dependencies on
+`SystemConfiguration`, `libobjc.A.dylib`, `IOKit`, `CoreFoundation`,
+`Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`.
+
+The highest GLIBC symbol reference records a dynamic-loader requirement.
+The Mach-O `minos` field records the binary's declared deployment target.
+Runtime compatibility requires consumer verification on the intended OS.
+Static archive inspection established object architecture. The complete
+binary metadata is recorded in the [artifact
+audit](https://github.com/lance-format/lance-c/blob/2c00796/validation/issue-103/RESULTS.md).
+Runtime consumer evidence covers Linux x86_64 and is recorded in the
+[issue 100 validation
+record](https://github.com/lance-format/lance-c/blob/5a29b67/validation/issue-100/RESULTS.md).
 
 ### From source via cargo (Rust developers)
 
@@ -389,12 +473,10 @@ unsupported triples, opt into a source build with the `from-source` feature:
 vcpkg install 'lance-c[from-source]'  # requires Rust toolchain
 ```
 
-Prebuilt v0.1.9 archives cover Linux x86_64/aarch64 and macOS arm64. The Linux
-x86_64 mapping uses the Debian 12 build, which lowers its libc requirement to
-the Debian 12 baseline; the arm64 mapping still uses the standard release
-archive. Intel macOS has no prebuilt asset in this release, so use
-`lance-c[from-source]` there. Source builds also require CMake and `protoc` on
-the build host.
+The prebuilt archives and vcpkg mappings are listed under [Published prebuilt
+archives](#published-prebuilt-archives). Intel macOS has no prebuilt asset in
+this release, so use `lance-c[from-source]` there. Source builds also require
+CMake and `protoc` on the build host.
 
 ### Conan
 
@@ -412,6 +494,8 @@ this release.
 #include <lance/lance.h>     // C
 #include <lance/lance.hpp>   // C++
 ```
+
+The C++ wrappers require C++17. The C header is usable from C.
 
 ## Usage
 
@@ -478,6 +562,38 @@ lance::Session session(
 auto ds = lance::Dataset::open_with_session(session, "data.lance");
 auto stats = session.cache_stats();
 ```
+
+Each tier can independently use the native default, an explicit capacity, a
+backend URI, or a backend kind plus options. `Default` and an explicit zero
+capacity are different choices.
+
+```c
+LanceSessionCacheSpec index = {0};
+index.kind = LANCE_SESSION_CACHE_SPEC_URI;
+index.backend_uri = "moka://?capacity=67108864";
+
+LanceSessionCacheSpec metadata = {0};
+metadata.kind = LANCE_SESSION_CACHE_SPEC_SIZE;
+metadata.size_bytes = 0; /* explicit zero capacity */
+
+LanceSession* session = lance_session_new_with_cache_specs(&index, &metadata);
+uint64_t size_bytes = 0;
+uint64_t approx_items = 0;
+lance_session_get_size_bytes(session, &size_bytes);
+lance_session_get_approx_num_items(session, &approx_items);
+```
+
+```cpp
+lance::Session session(
+    lance::SessionCacheSpec::from_uri("moka://?capacity=67108864"),
+    lance::SessionCacheSpec::with_size(0));
+auto size_bytes = session.size_bytes();
+auto approx_items = session.approx_num_items();
+```
+
+`size_bytes()` is the native deep size of live session state, not an RSS
+measurement or a configured limit. `approx_num_items()` is explicitly
+approximate and may change as cache maintenance runs.
 
 ### Prewarm an index synchronously
 
@@ -563,7 +679,7 @@ There is no C-side timestamp/asof selector.
 
 ## Releasing
 
-Releases are tag-driven: pushing a `v*.*.*` tag fires [`release.yml`](.github/workflows/release.yml), which builds prebuilt tarballs for `linux-{x86_64,aarch64}` and `macos-aarch64` and attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. (`macos-x86_64` is temporarily disabled — see the matrix comment in `release.yml`.)
+Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds five prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, and macOS arm64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. Intel macOS consumers use the source build described above.
 
 ### Recommended: cut a release via Actions UI
 
@@ -607,7 +723,7 @@ If you need to cut a release without the workflow (e.g. local tag with extra com
    git tag v0.2.0
    git push origin v0.2.0
    ```
-5. `release.yml` fires on the tag push and builds the four prebuilt tarballs as above.
+5. `release.yml` fires on the tag push and builds the five prebuilt tarballs as above.
 
 A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 

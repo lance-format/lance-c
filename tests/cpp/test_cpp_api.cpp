@@ -119,6 +119,8 @@ static void test_dataset_open(const std::string& uri) {
     PASS();
 }
 
+static uint64_t drain_scan_rows(ArrowArrayStream& stream);
+
 static void test_shared_session(const std::string& uri) {
     TEST(test_shared_session);
 
@@ -131,6 +133,91 @@ static void test_shared_session(const std::string& uri) {
 
     printf("metadata_entries=%llu... ",
            (unsigned long long)stats.metadata_cache_entries);
+    PASS();
+}
+
+static void test_session_cache_config(const std::string& uri) {
+    TEST(test_session_cache_config);
+
+    {
+        auto session = std::make_unique<lance::Session>(
+            lance::SessionCacheSpec::with_size(0),
+            lance::SessionCacheSpec::with_size(0));
+        const uint64_t initial_size = session->size_bytes();
+        assert(session->approx_num_items() == 0);
+
+        auto ds = lance::Dataset::open_with_session(*session, uri);
+        assert(ds.fragment_count() >= 2);
+        ds.prewarm_index("id_idx");
+
+        auto scanner = ds.scan({"id"}, "id >= 5 AND id < 8");
+        scanner.use_scalar_index(true);
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        assert(drain_scan_rows(stream) == 3);
+
+        auto stats = session->cache_stats();
+        assert(stats.index_cache_entries == 0);
+        assert(stats.index_cache_size_bytes == 0);
+        assert(stats.metadata_cache_entries == 0);
+        assert(stats.metadata_cache_size_bytes == 0);
+        assert(session->approx_num_items() == 0);
+        assert(session->size_bytes() == initial_size);
+
+        session.reset();
+        auto after_close = ds.scan({"id"}, "id >= 5 AND id < 8");
+        after_close.use_scalar_index(true);
+        ArrowArrayStream after_stream;
+        memset(&after_stream, 0, sizeof(after_stream));
+        after_close.to_arrow_stream(&after_stream);
+        assert(drain_scan_rows(after_stream) == 3);
+    }
+
+    {
+        auto session = std::make_unique<lance::Session>(
+            lance::SessionCacheSpec::from_uri("moka://?capacity=67108864"),
+            lance::SessionCacheSpec::from_config(
+                "MOKA", {{"capacity", "33554432"}}));
+        const uint64_t initial_size = session->size_bytes();
+
+        auto ds = lance::Dataset::open_with_session(*session, uri);
+        ds.prewarm_index("id_idx");
+
+        auto scanner = ds.scan({"id"}, "id >= 5 AND id < 8");
+        scanner.use_scalar_index(true);
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        assert(drain_scan_rows(stream) == 3);
+
+        auto stats = session->cache_stats();
+        assert(stats.index_cache_entries > 0);
+        assert(stats.metadata_cache_entries > 0);
+        assert(session->approx_num_items() > 0);
+        assert(session->size_bytes() > initial_size);
+
+        session.reset();
+        auto after_close = ds.scan({"id"}, "id >= 9");
+        after_close.use_scalar_index(true);
+        ArrowArrayStream after_stream;
+        memset(&after_stream, 0, sizeof(after_stream));
+        after_close.to_arrow_stream(&after_stream);
+        assert(drain_scan_rows(after_stream) == 12);
+    }
+
+    bool caught = false;
+    try {
+        lance::Session invalid(
+            lance::SessionCacheSpec::from_uri("moka://?capacity"),
+            lance::SessionCacheSpec{});
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        assert(std::string(error.what()).find("missing '='") != std::string::npos);
+    }
+    assert(caught);
+
     PASS();
 }
 
@@ -1246,6 +1333,70 @@ static void test_data_statistics(const std::string& dst_uri) {
     PASS();
 }
 
+// Exercises table/schema metadata through the C++17 wrappers, including
+// removal, real empty values, replace/clear, snapshot isolation and reopen.
+static void test_dataset_metadata(const std::string& dst_uri) {
+    TEST(test_dataset_metadata);
+    using MetadataUpdates =
+        std::vector<std::pair<std::string, std::optional<std::string>>>;
+
+    auto old = lance::Dataset::open(dst_uri);
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t initial_version = ds.version();
+    assert(ds.metadata_json() == "{}");
+
+    auto updated = ds.update_metadata_json(MetadataUpdates{
+        {"empty", std::string("")},
+        {"escaped", std::string("line\n\"quoted\"\\path")},
+        {"owner", std::string("c++")},
+        {"remove", std::string("temporary")},
+    });
+    assert(updated.find("\"empty\":\"\"") != std::string::npos);
+    assert(updated.find("\"owner\":\"c++\"") != std::string::npos);
+    assert(updated.find("\\n") != std::string::npos);
+    assert(updated.find("\\\"quoted\\\"") != std::string::npos);
+    assert(old.version() == initial_version);
+    assert(old.metadata_json() == "{}");
+
+    auto removed = ds.update_metadata_json(
+        MetadataUpdates{{"remove", std::nullopt}});
+    assert(removed.find("\"remove\"") == std::string::npos);
+
+    auto schema_updated = ds.update_schema_metadata_json(
+        MetadataUpdates{{"schema-owner", std::string("c++")}});
+    assert(schema_updated.find("\"schema-owner\":\"c++\"") !=
+           std::string::npos);
+    assert(ds.metadata_json().find("schema-owner") == std::string::npos);
+
+    auto cleared = ds.update_metadata_json(
+        MetadataUpdates{}, lance::MetadataUpdateMode::Replace);
+    assert(cleared == "{}");
+    ds.update_metadata_json(
+        MetadataUpdates{{"persist", std::string("yes")}});
+    auto schema_cleared = ds.update_schema_metadata_json(
+        MetadataUpdates{}, lance::MetadataUpdateMode::Replace);
+    assert(schema_cleared == "{}");
+
+    auto reopened = lance::Dataset::open(dst_uri);
+    assert(reopened.version() > initial_version);
+    assert(reopened.metadata_json().find("\"persist\":\"yes\"") !=
+           std::string::npos);
+
+    bool caught = false;
+    try {
+        ds.update_metadata_json(
+            MetadataUpdates{{"bad", std::string("value")}},
+            static_cast<lance::MetadataUpdateMode>(99));
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+    assert(ds.metadata_json().find("\"bad\"") == std::string::npos);
+
+    PASS();
+}
+
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::update`. Must run before `test_delete_rows`, which
 // empties the dataset.
@@ -2054,10 +2205,10 @@ static void test_fragment_snapshots(const std::string& uri) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 6) {
+    if (argc < 7) {
         fprintf(stderr,
-                "Usage: %s <dataset_uri> <write_uri> <blob_uri> "
-                "<ordering_uri> <fragment_uri>\n",
+                "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
+                "<session_uri> <fragment_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -2066,11 +2217,13 @@ int main(int argc, char** argv) {
     std::string write_uri(argv[2]);
     std::string blob_uri(argv[3]);
     std::string ordering_uri(argv[4]);
-    std::string fragment_uri(argv[5]);
+    std::string session_uri(argv[5]);
+    std::string fragment_uri(argv[6]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
     test_shared_session(uri);
+    test_session_cache_config(session_uri);
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
     test_scanner_projection_filter(uri);
@@ -2102,6 +2255,7 @@ int main(int argc, char** argv) {
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_data_statistics(write_uri);
+    test_dataset_metadata(write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);

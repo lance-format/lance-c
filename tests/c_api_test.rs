@@ -27,6 +27,7 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
 use lance::io::RecordBatchStream;
+use lance::session::{CacheSpec as NativeCacheSpec, Session as NativeSession};
 use lance_c::*;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::DocumentGranularity;
@@ -917,6 +918,425 @@ fn test_shared_session_rejects_null_inputs() {
         lance_session_close(session);
         lance_session_close(ptr::null_mut());
     }
+}
+
+fn empty_session_cache_spec() -> LanceSessionCacheSpec {
+    LanceSessionCacheSpec {
+        kind: LanceSessionCacheSpecKind::Default as i32,
+        size_bytes: 0,
+        backend_uri: ptr::null(),
+        backend_kind: ptr::null(),
+        option_keys: ptr::null(),
+        option_values: ptr::null(),
+        option_count: 0,
+    }
+}
+
+fn sized_session_cache_spec(size_bytes: u64) -> LanceSessionCacheSpec {
+    LanceSessionCacheSpec {
+        kind: LanceSessionCacheSpecKind::Size as i32,
+        size_bytes,
+        ..empty_session_cache_spec()
+    }
+}
+
+fn session_stats(session: *const LanceSession) -> LanceSessionCacheStats {
+    let mut stats = LanceSessionCacheStats::default();
+    assert_eq!(
+        unsafe { lance_session_get_cache_stats(session, &mut stats) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    stats
+}
+
+fn session_size_bytes(session: *const LanceSession) -> u64 {
+    let mut size = 0;
+    assert_eq!(
+        unsafe { lance_session_get_size_bytes(session, &mut size) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    size
+}
+
+fn session_approx_num_items(session: *const LanceSession) -> u64 {
+    let mut count = 0;
+    assert_eq!(
+        unsafe { lance_session_get_approx_num_items(session, &mut count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    count
+}
+
+fn scan_filtered_with_index(dataset: *const LanceDataset, filter: &std::ffi::CStr) -> usize {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
+    assert!(!scanner.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(scanner, true) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let rows = scan_all_rows_from_scanner(scanner)
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    unsafe { lance_scanner_close(scanner) };
+    rows
+}
+
+fn create_session_cache_fixture() -> (tempfile::TempDir, String) {
+    let fixture = create_multi_fragment_dataset();
+    let c_uri = c_str(&fixture.1);
+    unsafe {
+        let dataset = lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0);
+        assert!(!dataset.is_null(), "{}", take_last_error_message());
+        assert_eq!(lance_dataset_fragment_count(dataset), 2);
+        assert_eq!(
+            lance_dataset_create_scalar_index(
+                dataset,
+                c"id".as_ptr(),
+                c"id_idx".as_ptr(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                false,
+            ),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert_eq!(lance_dataset_index_count(dataset), 1);
+        lance_dataset_close(dataset);
+    }
+    fixture
+}
+
+struct NativeSessionCacheProbe {
+    index_entries: usize,
+    index_size_bytes: usize,
+    metadata_entries: usize,
+    metadata_size_bytes: usize,
+    size_bytes: u64,
+    approx_num_items: usize,
+}
+
+fn native_session_cache_probe(
+    uri: &str,
+    index_cache: NativeCacheSpec,
+    metadata_cache: NativeCacheSpec,
+) -> NativeSessionCacheProbe {
+    use lance::dataset::builder::DatasetBuilder;
+    use lance::index::DatasetIndexExt;
+
+    lance_c::runtime::block_on(async {
+        let session = Arc::new(NativeSession::with_cache_backends(
+            index_cache,
+            metadata_cache,
+            Default::default(),
+        ));
+        let dataset = DatasetBuilder::from_uri(uri)
+            .with_session(session.clone())
+            .load()
+            .await
+            .unwrap();
+        dataset.prewarm_index("id_idx").await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.filter("id >= 5 AND id < 8").unwrap();
+        scanner.use_index(true);
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+
+        let index = session.index_cache_stats().await;
+        let metadata = session.metadata_cache_stats().await;
+        NativeSessionCacheProbe {
+            index_entries: index.num_entries,
+            index_size_bytes: index.size_bytes,
+            metadata_entries: metadata.num_entries,
+            metadata_size_bytes: metadata.size_bytes,
+            size_bytes: session.size_bytes(),
+            approx_num_items: session.approx_num_items(),
+        }
+    })
+}
+
+#[test]
+fn test_session_cache_specs_default_size_and_explicit_zero() {
+    let (_tmp, uri) = create_session_cache_fixture();
+    let c_uri = c_str(&uri);
+
+    let native_zero =
+        native_session_cache_probe(&uri, NativeCacheSpec::Size(0), NativeCacheSpec::Size(0));
+    assert_eq!(native_zero.index_entries, 0);
+    assert_eq!(native_zero.index_size_bytes, 0);
+    assert_eq!(native_zero.metadata_entries, 0);
+    assert_eq!(native_zero.metadata_size_bytes, 0);
+    assert_eq!(native_zero.approx_num_items, 0);
+
+    let zero = sized_session_cache_spec(0);
+    let session = unsafe { lance_session_new_with_cache_specs(&zero, &zero) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    let initial_size = session_size_bytes(session);
+    assert_eq!(session_approx_num_items(session), 0);
+
+    let dataset =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_dataset_prewarm_index(dataset, c"id_idx".as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(scan_filtered_with_index(dataset, c"id >= 5 AND id < 8"), 3);
+
+    let stats = session_stats(session);
+    assert_eq!(stats.index_cache_entries, 0);
+    assert_eq!(stats.index_cache_size_bytes, 0);
+    assert_eq!(stats.metadata_cache_entries, 0);
+    assert_eq!(stats.metadata_cache_size_bytes, 0);
+    assert_eq!(session_approx_num_items(session), 0);
+    assert_eq!(
+        session_size_bytes(session),
+        initial_size,
+        "a zero-capacity session retains no cache entries"
+    );
+
+    unsafe { lance_session_close(session) };
+    assert_eq!(
+        scan_filtered_with_index(dataset, c"id >= 5 AND id < 8"),
+        3,
+        "the dataset must retain zero-capacity session state after handle close"
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let native_default =
+        native_session_cache_probe(&uri, NativeCacheSpec::Default, NativeCacheSpec::Size(0));
+    assert!(native_default.index_entries > 0);
+    assert_eq!(native_default.metadata_entries, 0);
+    assert!(native_default.approx_num_items > 0);
+    assert!(native_default.size_bytes > native_zero.size_bytes);
+
+    let default_index = empty_session_cache_spec();
+    let zero_metadata = sized_session_cache_spec(0);
+    let session = unsafe { lance_session_new_with_cache_specs(&default_index, &zero_metadata) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    let initial_size = session_size_bytes(session);
+    let dataset =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_dataset_prewarm_index(dataset, c"id_idx".as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(scan_filtered_with_index(dataset, c"id >= 5 AND id < 8"), 3);
+    let stats = session_stats(session);
+    assert!(stats.index_cache_entries > 0);
+    assert!(stats.index_cache_size_bytes > 0);
+    assert_eq!(stats.metadata_cache_entries, 0);
+    assert!(session_approx_num_items(session) > 0);
+    assert!(session_size_bytes(session) > initial_size);
+    unsafe { lance_session_close(session) };
+    assert_eq!(
+        unsafe { lance_dataset_count_rows(dataset) },
+        10,
+        "the dataset remains usable after a default-index session handle closes"
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let native_size = native_session_cache_probe(
+        &uri,
+        NativeCacheSpec::Size(64 * 1024 * 1024),
+        NativeCacheSpec::Default,
+    );
+    assert!(native_size.index_entries > 0);
+    assert!(native_size.metadata_entries > 0);
+    assert!(native_size.approx_num_items > 0);
+    assert!(native_size.size_bytes > native_zero.size_bytes);
+
+    let sized_index = sized_session_cache_spec(64 * 1024 * 1024);
+    let default_metadata = empty_session_cache_spec();
+    let session = unsafe { lance_session_new_with_cache_specs(&sized_index, &default_metadata) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    let dataset =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_dataset_prewarm_index(dataset, c"id_idx".as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(scan_filtered_with_index(dataset, c"id >= 5 AND id < 8"), 3);
+    let stats = session_stats(session);
+    assert!(stats.index_cache_entries > 0);
+    assert!(stats.metadata_cache_entries > 0);
+    assert!(session_approx_num_items(session) > 0);
+    unsafe {
+        lance_session_close(session);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_session_cache_specs_accept_moka_uri_and_config() {
+    let (_tmp, uri) = create_session_cache_fixture();
+    let c_uri = c_str(&uri);
+
+    let mut index_uri = b"moka://?capacity=67108864\0".to_vec();
+    let mut metadata_kind = b"MOKA\0".to_vec();
+    let mut option_key = b"capacity\0".to_vec();
+    let mut option_value = b"33554432\0".to_vec();
+    let option_keys = [option_key.as_ptr().cast()];
+    let option_values = [option_value.as_ptr().cast()];
+    let mut index_spec = empty_session_cache_spec();
+    index_spec.kind = LanceSessionCacheSpecKind::Uri as i32;
+    index_spec.backend_uri = index_uri.as_ptr().cast();
+    let mut metadata_spec = empty_session_cache_spec();
+    metadata_spec.kind = LanceSessionCacheSpecKind::Config as i32;
+    metadata_spec.backend_kind = metadata_kind.as_ptr().cast();
+    metadata_spec.option_keys = option_keys.as_ptr();
+    metadata_spec.option_values = option_values.as_ptr();
+    metadata_spec.option_count = 1;
+
+    let session = unsafe { lance_session_new_with_cache_specs(&index_spec, &metadata_spec) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+
+    index_uri.fill(b'x');
+    metadata_kind.fill(b'x');
+    option_key.fill(b'x');
+    option_value.fill(b'x');
+
+    let initial_size = session_size_bytes(session);
+    let dataset =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(
+        !dataset.is_null(),
+        "caller buffers must be copied before the call returns: {}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_prewarm_index(dataset, c"id_idx".as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(scan_filtered_with_index(dataset, c"id >= 5 AND id < 8"), 3);
+
+    let stats = session_stats(session);
+    assert!(stats.index_cache_entries > 0);
+    assert!(stats.metadata_cache_entries > 0);
+    assert!(session_approx_num_items(session) > 0);
+    assert!(session_size_bytes(session) > initial_size);
+
+    unsafe { lance_session_close(session) };
+    assert_eq!(
+        scan_filtered_with_index(dataset, c"id >= 9"),
+        1,
+        "the dataset must retain configured session state after handle close"
+    );
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_session_cache_specs_reject_invalid_inputs() {
+    let metadata = empty_session_cache_spec();
+    let session = unsafe { lance_session_new_with_cache_specs(ptr::null(), &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let mut unknown_kind = empty_session_cache_spec();
+    unknown_kind.kind = 99;
+    let session = unsafe { lance_session_new_with_cache_specs(&unknown_kind, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("invalid session cache spec kind 99"));
+
+    let mut uri_spec = empty_session_cache_spec();
+    uri_spec.kind = LanceSessionCacheSpecKind::Uri as i32;
+    let session = unsafe { lance_session_new_with_cache_specs(&uri_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("backend_uri must not be NULL"));
+
+    uri_spec.backend_uri = c"moka://?capacity".as_ptr();
+    let session = unsafe { lance_session_new_with_cache_specs(&uri_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("missing '='"));
+
+    let mut config_spec = empty_session_cache_spec();
+    config_spec.kind = LanceSessionCacheSpecKind::Config as i32;
+    config_spec.backend_kind = c"moka".as_ptr();
+    let session = unsafe { lance_session_new_with_cache_specs(&config_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("capacity is required"));
+
+    config_spec.option_count = 1;
+    let session = unsafe { lance_session_new_with_cache_specs(&config_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("option_count=1"));
+
+    let keys = [c"mystery".as_ptr()];
+    let values = [c"1".as_ptr()];
+    config_spec.option_keys = keys.as_ptr();
+    config_spec.option_values = values.as_ptr();
+    let session = unsafe { lance_session_new_with_cache_specs(&config_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("unknown option \"mystery\""));
+
+    let keys = [c"capacity".as_ptr(), c"capacity".as_ptr()];
+    let values = [c"1".as_ptr(), c"2".as_ptr()];
+    config_spec.option_keys = keys.as_ptr();
+    config_spec.option_values = values.as_ptr();
+    config_spec.option_count = 2;
+    let session = unsafe { lance_session_new_with_cache_specs(&config_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("duplicate option key \"capacity\""));
+
+    let valid = sized_session_cache_spec(1024);
+    let session = unsafe { lance_session_new_with_cache_specs(&valid, &valid) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    let mut out = 17u64;
+    assert_eq!(
+        unsafe { lance_session_get_size_bytes(ptr::null(), &mut out) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out, 17);
+    assert_eq!(
+        unsafe { lance_session_get_size_bytes(session, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_session_get_approx_num_items(ptr::null(), &mut out) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out, 17);
+    assert_eq!(
+        unsafe { lance_session_get_approx_num_items(session, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_session_close(session) };
 }
 
 #[test]
@@ -3893,6 +4313,459 @@ fn test_fragment_ids() {
     assert_eq!(rc, 0);
     assert_eq!(ids.len(), 2);
 
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ---------------------------------------------------------------------------
+// Dataset table and schema metadata
+// ---------------------------------------------------------------------------
+
+fn take_json_value(ptr: *const c_char) -> serde_json::Value {
+    assert!(
+        !ptr.is_null(),
+        "expected a JSON result; current error: {}",
+        take_last_error_message()
+    );
+    let json = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(ptr) };
+    serde_json::from_str(&json).unwrap()
+}
+
+fn metadata_map(entries: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+fn update_metadata_via_c(
+    dataset: *mut LanceDataset,
+    entries: &[(&str, Option<&str>)],
+    mode: LanceMetadataUpdateMode,
+    schema_metadata: bool,
+) -> serde_json::Value {
+    let keys: Vec<CString> = entries.iter().map(|(key, _)| c_str(key)).collect();
+    let values: Vec<Option<CString>> = entries.iter().map(|(_, value)| value.map(c_str)).collect();
+    let key_ptrs: Vec<*const c_char> = keys.iter().map(|key| key.as_ptr()).collect();
+    let value_ptrs: Vec<*const c_char> = values
+        .iter()
+        .map(|value| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+        .collect();
+
+    let json = unsafe {
+        if schema_metadata {
+            lance_dataset_update_schema_metadata_json(
+                dataset,
+                key_ptrs.as_ptr(),
+                value_ptrs.as_ptr(),
+                entries.len(),
+                mode as i32,
+            )
+        } else {
+            lance_dataset_update_metadata_json(
+                dataset,
+                key_ptrs.as_ptr(),
+                value_ptrs.as_ptr(),
+                entries.len(),
+                mode as i32,
+            )
+        }
+    };
+    take_json_value(json)
+}
+
+fn native_metadata_map(
+    uri: &str,
+    schema_metadata: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let metadata = if schema_metadata {
+        dataset.schema().metadata.clone()
+    } else {
+        dataset.metadata().clone()
+    };
+    metadata.into_iter().collect()
+}
+
+fn schema_metadata_via_c(
+    dataset: *const LanceDataset,
+) -> std::collections::BTreeMap<String, String> {
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(unsafe { lance_dataset_schema(dataset, &mut ffi_schema) }, 0);
+    let schema = Schema::try_from(&ffi_schema).unwrap();
+    schema.metadata().clone().into_iter().collect()
+}
+
+fn assert_metadata_update_failed(ptr: *const c_char, expected_message: &str) {
+    assert!(ptr.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message_ptr = lance_last_error_message();
+    assert!(!message_ptr.is_null());
+    let message = unsafe { std::ffi::CStr::from_ptr(message_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(message_ptr) };
+    assert!(
+        message.contains(expected_message),
+        "expected error containing {expected_message:?}, got {message:?}"
+    );
+}
+
+#[test]
+fn test_dataset_metadata_merge_replace_and_clear() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut expected_version = unsafe { lance_dataset_version(ds) };
+    assert_eq!(expected_version, 2, "fixture writes two versions");
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(ds) }),
+        serde_json::json!({})
+    );
+
+    let escaped_value = "line\n\"quoted\"\\path";
+    let merged = update_metadata_via_c(
+        ds,
+        &[
+            ("empty", Some("")),
+            ("escaped", Some(escaped_value)),
+            ("owner", Some("lance-c")),
+            ("remove", Some("gone")),
+            ("unicode", Some("你好")),
+            ("unicode-key", Some("value")),
+        ],
+        LanceMetadataUpdateMode::Merge,
+        false,
+    );
+    let mut expected = metadata_map(&[
+        ("empty", ""),
+        ("escaped", escaped_value),
+        ("owner", "lance-c"),
+        ("remove", "gone"),
+        ("unicode", "你好"),
+        ("unicode-key", "value"),
+    ]);
+    assert_eq!(merged, serde_json::to_value(&expected).unwrap());
+    assert_eq!(native_metadata_map(&uri, false), expected);
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let merged = update_metadata_via_c(
+        ds,
+        &[("owner", Some("updated")), ("remove", None)],
+        LanceMetadataUpdateMode::Merge,
+        false,
+    );
+    expected.insert("owner".to_string(), "updated".to_string());
+    expected.remove("remove");
+    assert_eq!(merged, serde_json::to_value(&expected).unwrap());
+    assert_eq!(native_metadata_map(&uri, false), expected);
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let replaced = update_metadata_via_c(
+        ds,
+        &[
+            ("ignored", None),
+            ("shared", Some("table")),
+            ("table-only", Some("one")),
+        ],
+        LanceMetadataUpdateMode::Replace,
+        false,
+    );
+    expected = metadata_map(&[("shared", "table"), ("table-only", "one")]);
+    assert_eq!(replaced, serde_json::to_value(&expected).unwrap());
+    assert_eq!(native_metadata_map(&uri, false), expected);
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let schema_merged = update_metadata_via_c(
+        ds,
+        &[
+            ("empty", Some("")),
+            ("schema-key", Some("schema")),
+            ("shared", Some("schema")),
+        ],
+        LanceMetadataUpdateMode::Merge,
+        true,
+    );
+    let expected_schema = metadata_map(&[
+        ("empty", ""),
+        ("schema-key", "schema"),
+        ("shared", "schema"),
+    ]);
+    assert_eq!(
+        schema_merged,
+        serde_json::to_value(&expected_schema).unwrap()
+    );
+    assert_eq!(native_metadata_map(&uri, true), expected_schema);
+    assert_eq!(schema_metadata_via_c(ds), expected_schema);
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        expected,
+        "schema metadata updates must not change table metadata"
+    );
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let schema_replaced = update_metadata_via_c(
+        ds,
+        &[("ignored", None), ("schema-only", Some("two"))],
+        LanceMetadataUpdateMode::Replace,
+        true,
+    );
+    let expected_schema = metadata_map(&[("schema-only", "two")]);
+    assert_eq!(
+        schema_replaced,
+        serde_json::to_value(&expected_schema).unwrap()
+    );
+    assert_eq!(native_metadata_map(&uri, true), expected_schema);
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        expected,
+        "schema replacement must not change table metadata"
+    );
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let schema_cleared = take_json_value(unsafe {
+        lance_dataset_update_schema_metadata_json(
+            ds,
+            ptr::null(),
+            ptr::null(),
+            0,
+            LanceMetadataUpdateMode::Replace as i32,
+        )
+    });
+    assert_eq!(schema_cleared, serde_json::json!({}));
+    assert!(native_metadata_map(&uri, true).is_empty());
+    assert!(schema_metadata_via_c(ds).is_empty());
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        expected,
+        "clearing schema metadata must not change table metadata"
+    );
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let cleared = take_json_value(unsafe {
+        lance_dataset_update_metadata_json(
+            ds,
+            ptr::null(),
+            ptr::null(),
+            0,
+            LanceMetadataUpdateMode::Replace as i32,
+        )
+    });
+    assert_eq!(cleared, serde_json::json!({}));
+    assert!(native_metadata_map(&uri, false).is_empty());
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 10);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_metadata_reopen_and_snapshot_identity() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let writer = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let old = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!writer.is_null() && !old.is_null());
+
+    let initial_version = unsafe { lance_dataset_version(old) };
+    assert_eq!(initial_version, 2);
+    update_metadata_via_c(
+        writer,
+        &[("persist", Some("yes"))],
+        LanceMetadataUpdateMode::Merge,
+        false,
+    );
+    update_metadata_via_c(
+        writer,
+        &[("persist-schema", Some("yes"))],
+        LanceMetadataUpdateMode::Merge,
+        true,
+    );
+
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 2
+    );
+    assert_eq!(unsafe { lance_dataset_version(old) }, initial_version);
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(old) }),
+        serde_json::json!({})
+    );
+    assert!(schema_metadata_via_c(old).is_empty());
+
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_version(reopened) },
+        initial_version + 2
+    );
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        metadata_map(&[("persist", "yes")])
+    );
+    assert_eq!(
+        native_metadata_map(&uri, true),
+        metadata_map(&[("persist-schema", "yes")])
+    );
+    assert_eq!(
+        schema_metadata_via_c(reopened),
+        metadata_map(&[("persist-schema", "yes")])
+    );
+
+    let previous = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), initial_version + 1) };
+    assert!(!previous.is_null());
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(previous) }),
+        serde_json::to_value(metadata_map(&[("persist", "yes")])).unwrap()
+    );
+    assert!(
+        schema_metadata_via_c(previous).is_empty(),
+        "schema metadata commit must be isolated to the later version"
+    );
+
+    unsafe {
+        lance_dataset_close(previous);
+        lance_dataset_close(reopened);
+        lance_dataset_close(old);
+        lance_dataset_close(writer);
+    }
+}
+
+#[test]
+fn test_dataset_metadata_invalid_inputs_preserve_state() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let version = unsafe { lance_dataset_version(ds) };
+    let table_before = take_json_value(unsafe { lance_dataset_metadata_json(ds) });
+    let schema_before = schema_metadata_via_c(ds);
+
+    let key = c_str("key");
+    let value = c_str("value");
+    let keys = [key.as_ptr()];
+    let values = [value.as_ptr()];
+
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ptr::null_mut(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "dataset must not be NULL",
+    );
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_schema_metadata_json(
+                ptr::null_mut(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "dataset must not be NULL",
+    );
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                ptr::null(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "keys must not be NULL",
+    );
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                keys.as_ptr(),
+                ptr::null(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "values must not be NULL",
+    );
+
+    let null_key = [ptr::null()];
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                null_key.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "keys[0] must not be NULL",
+    );
+
+    let invalid_utf8 = CString::new(vec![0xff]).unwrap();
+    let invalid_key = [invalid_utf8.as_ptr()];
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                invalid_key.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "utf-8",
+    );
+    let invalid_value = [invalid_utf8.as_ptr()];
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                keys.as_ptr(),
+                invalid_value.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "utf-8",
+    );
+    assert_metadata_update_failed(
+        unsafe { lance_dataset_update_metadata_json(ds, keys.as_ptr(), values.as_ptr(), 1, 99) },
+        "metadata update mode",
+    );
+    assert_metadata_update_failed(
+        unsafe { lance_dataset_metadata_json(ptr::null()) },
+        "dataset must not be NULL",
+    );
+
+    assert_eq!(unsafe { lance_dataset_version(ds) }, version);
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(ds) }),
+        table_before
+    );
+    assert_eq!(schema_metadata_via_c(ds), schema_before);
     unsafe { lance_dataset_close(ds) };
 }
 
