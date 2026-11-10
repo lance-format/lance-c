@@ -297,7 +297,7 @@ static void test_scanner_projection_filter(const std::string& uri) {
         memset(&stream, 0, sizeof(stream));
         scanner.to_arrow_stream(&stream);
         assert_scan_schema(stream, {
-            {"id", "i"}, {"name", "u"}, {"embedding", nullptr},
+            {"id", "i"}, {"name", "u"}, {"score", "i"}, {"embedding", nullptr},
         });
         assert(drain_scan_rows(stream) == ds.count_rows());
     }
@@ -335,7 +335,7 @@ static void test_scanner_projection_filter(const std::string& uri) {
         memset(&stream, 0, sizeof(stream));
         scanner.to_arrow_stream(&stream);
         assert_scan_schema(stream, {
-            {"id", "i"}, {"name", "u"}, {"embedding", nullptr},
+            {"id", "i"}, {"name", "u"}, {"score", "i"}, {"embedding", nullptr},
         });
         assert(drain_scan_rows(stream) == 1);
     }
