@@ -208,11 +208,23 @@ fn multivector_projection_keeps_the_internal_scoring_window() {
     let q = [1.0f32, 0., 0., 1.];
     let alias = [("id_alias", "id")];
     let explicit_distance = [("id_alias", "id"), ("_distance", "_distance")];
+    let negated_distance = [("id_alias", "id"), ("_distance", "-_distance")];
+    let distances = [0.0, 6.0, 8.0];
+    let negated_distances = [0.0, -6.0, -8.0];
 
-    for (projection, disable, expect_distance) in [
-        (alias.as_slice(), false, true),
-        (alias.as_slice(), true, false),
-        (explicit_distance.as_slice(), true, true),
+    for (projection, disable, expected_distances) in [
+        (alias.as_slice(), false, Some(distances.as_slice())),
+        (alias.as_slice(), true, None),
+        (
+            explicit_distance.as_slice(),
+            true,
+            Some(distances.as_slice()),
+        ),
+        (
+            negated_distance.as_slice(),
+            true,
+            Some(negated_distances.as_slice()),
+        ),
     ] {
         unsafe {
             let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
@@ -240,15 +252,19 @@ fn multivector_projection_keeps_the_internal_scoring_window() {
             let (fields, rows) = collect_projected(scan);
             assert_eq!(
                 fields.contains(&"_distance".to_string()),
-                expect_distance,
+                expected_distances.is_some(),
                 "projection={projection:?} disable={disable}"
             );
             let ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
             assert_eq!(ids, vec![1, 2, 3]);
-            if expect_distance {
+            if let Some(expected_distances) = expected_distances {
                 assert_eq!(
                     rows.iter().map(|row| row.1).collect::<Vec<_>>(),
-                    vec![Some(0.0), Some(6.0), Some(8.0)]
+                    expected_distances
+                        .iter()
+                        .copied()
+                        .map(Some)
+                        .collect::<Vec<_>>()
                 );
             } else {
                 assert!(rows.iter().all(|row| row.1.is_none()));
