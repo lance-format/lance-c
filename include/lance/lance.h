@@ -1250,9 +1250,9 @@ typedef struct LanceColumnOrdering {
  * Replace the scanner's native result ordering.
  *
  * Entries are applied in array order, matching Lance's ColumnOrdering list.
- * The sort key need not be part of the projected output. With limit/offset,
- * Lance sorts all rows before applying the window. For nearest or full-text
- * search, Lance first selects its query result set and then sorts that set.
+ * With limit/offset, Lance sorts all rows before applying the window. For
+ * nearest or full-text search, Lance first selects its query result set and
+ * then sorts that set.
  *
  * Passing `orderings == NULL` with `len == 0` clears the ordering (the native
  * `None` option). Passing a non-NULL pointer with `len == 0` is an explicit

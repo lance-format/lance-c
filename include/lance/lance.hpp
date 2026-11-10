@@ -1485,9 +1485,9 @@ public:
     }
 
     /// Replace the native result ordering. `std::nullopt` clears it; an empty
-    /// vector is the explicit native empty ordering. The sort key need not be
-    /// projected. Lance validates column names when the scan is materialized.
-    /// Not supported with nearest_multivector(); that scan fails on start.
+    /// vector is the explicit native empty ordering. Lance validates column
+    /// names when the scan is materialized. Not supported with
+    /// nearest_multivector(); that scan fails on start.
     Scanner& order_by(std::nullopt_t) {
         if (lance_scanner_set_order_by(handle_.get(), nullptr, 0) != 0)
             check_error();

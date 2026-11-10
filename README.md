@@ -87,9 +87,9 @@ scanner.order_by({
 
 Tie ordering must be explicit when rows can compare equal; the binding does not
 add a row-id or stable-order tie-breaker. Lance validates referenced columns
-when the scan starts. The sort column may be omitted from the final projection.
-With limit/offset, Lance sorts all rows before applying the window. With
-nearest or full-text search, Lance sorts the rows selected by the query.
+when the scan starts. With limit/offset, Lance sorts all rows before applying
+the window. With nearest or full-text search, Lance sorts the rows selected by
+the query.
 
 Pass `std::nullopt` or `lance_scanner_set_order_by(scanner, NULL, 0)` to clear
 the ordering. An explicit empty vector is the native empty ordering and has the
