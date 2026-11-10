@@ -440,10 +440,7 @@ fn materialization_rejections_preserve_state_and_lifecycle() {
         },
         -1
     );
-    assert_eq!(
-        unsafe { lance_last_error_code() },
-        LanceErrorCode::InvalidArgument
-    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!(
         unsafe {
             lance_scanner_set_materialization_style(
