@@ -1532,6 +1532,129 @@ static void test_batch_nearest(const char *uri) {
     check_batch_nearest_results(&stream);
 }
 
+static void test_materialization_and_fast_search(const char *uri) {
+    printf("  test_materialization_and_fast_search... ");
+
+    LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "open materialization dataset");
+    const char *projection[] = {"id", "name", NULL};
+    const char *except_name[] = {"name"};
+    const char *missing_name[] = {"missing"};
+    struct ArrowArrayStream stream;
+
+    for (int style = LANCE_MATERIALIZATION_STYLE_HEURISTIC;
+         style <= LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT; ++style) {
+        LanceScanner *scanner =
+            lance_scanner_new(dataset, projection, "id >= 18");
+        ASSERT(scanner != NULL, "create materialization scanner");
+        const char *const *columns =
+            style == LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT
+                ? except_name
+                : NULL;
+        size_t column_count =
+            style == LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT ? 1 : 0;
+        ASSERT(lance_scanner_set_materialization_style(
+                   scanner, (LanceMaterializationStyle)style,
+                   columns, column_count) == 0,
+               "set materialization style");
+        memset(&stream, 0, sizeof(stream));
+        ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+               "materialization stream");
+        ASSERT(count_stream_rows(&stream) == 3,
+               "materialization result count");
+        lance_scanner_close(scanner);
+    }
+
+    LanceScanner *scanner = lance_scanner_new(dataset, projection, "id >= 18");
+    ASSERT(scanner != NULL, "create validation scanner");
+    ASSERT(lance_scanner_set_materialization_style(
+               scanner, LANCE_MATERIALIZATION_STYLE_ALL_LATE, NULL, 0) == 0,
+           "set all-late");
+    ASSERT(lance_scanner_set_materialization_style(
+               scanner, LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT,
+               missing_name, 1) == -1,
+           "missing exception column must fail");
+    ASSERT(lance_last_error_code() != LANCE_OK,
+           "missing exception column must set an error");
+    ASSERT(lance_scanner_set_materialization_style(
+               scanner, (LanceMaterializationStyle)99, NULL, 0) == -1,
+           "unknown materialization style must fail");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "scan after rejected style");
+    ASSERT(count_stream_rows(&stream) == 3,
+           "rejected style must preserve prior configuration");
+    ASSERT(lance_scanner_set_materialization_style(
+               scanner, LANCE_MATERIALIZATION_STYLE_ALL_EARLY, NULL, 0) == -1,
+           "style after scan start must fail");
+    ASSERT(lance_scanner_set_fast_search(scanner, true) == -1,
+           "fast search after scan start must fail");
+    lance_scanner_close(scanner);
+
+    float query[8];
+    for (int i = 0; i < 8; ++i) query[i] = 0.1f + (float)i;
+
+    scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "create ordinary nearest scanner");
+    ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                LANCE_DTYPE_FLOAT32, 5) == 0,
+           "ordinary nearest");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "ordinary nearest stream");
+    ASSERT(count_stream_rows(&stream) == 5,
+           "ordinary nearest must use native fallback without an index");
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "create fast scanner");
+    ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                LANCE_DTYPE_FLOAT32, 5) == 0,
+           "fast nearest");
+    ASSERT(lance_scanner_set_fast_search(scanner, true) == 0, "fast search");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "fast nearest stream");
+    ASSERT(count_stream_rows(&stream) == 0,
+           "fast search without an index must preserve native empty result");
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "create fast-without-index scanner");
+    ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                LANCE_DTYPE_FLOAT32, 5) == 0,
+           "fast-without-index nearest");
+    ASSERT(lance_scanner_set_fast_search(scanner, true) == 0,
+           "enable fast search");
+    ASSERT(lance_scanner_set_use_index(scanner, false) == 0,
+           "disable index under fast search");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "fast-without-index stream");
+    ASSERT(count_stream_rows(&stream) == 0,
+           "fast search must not restore flat fallback");
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "create fast-reset scanner");
+    ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                LANCE_DTYPE_FLOAT32, 5) == 0,
+           "fast-reset nearest");
+    ASSERT(lance_scanner_set_fast_search(scanner, true) == 0,
+           "enable fast search before reset");
+    ASSERT(lance_scanner_set_fast_search(scanner, false) == 0,
+           "reset fast search");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "fast-reset stream");
+    ASSERT(count_stream_rows(&stream) == 5,
+           "disabling fast search must restore native fallback");
+    lance_scanner_close(scanner);
+
+    lance_dataset_close(dataset);
+    printf("OK\n");
+}
+
 /* Collect the `id` column from an ordering stream. Returns the row count and
  * stores up to `capacity` ids in `out`. */
 static size_t collect_ordering_ids(
@@ -1709,6 +1832,7 @@ int main(int argc, char **argv) {
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
+    test_materialization_and_fast_search(uri);
     test_open_and_metadata(uri);
     test_shared_session(uri);
     test_scan(uri);

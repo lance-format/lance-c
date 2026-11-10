@@ -1335,6 +1335,56 @@ typedef enum {
 int32_t lance_scanner_set_blob_handling(LanceScanner* scanner, LanceBlobHandling handling);
 
 /**
+ * Materialization style for ordinary scanner payload columns.
+ *
+ * This follows Lance's native materialization policy. It affects columns that
+ * are not required for filtering. Vector search and full-text search always use
+ * their native late-materialization paths.
+ */
+typedef enum {
+    /** Native heuristic based on storage type and column width (default). */
+    LANCE_MATERIALIZATION_STYLE_HEURISTIC = 0,
+    /** Fetch projected payload columns for matching rows only where possible. */
+    LANCE_MATERIALIZATION_STYLE_ALL_LATE = 1,
+    /** Fetch every projected payload column eagerly where possible. */
+    LANCE_MATERIALIZATION_STYLE_ALL_EARLY = 2,
+    /**
+     * Fetch every projected payload column eagerly except the named columns.
+     * Names use Lance's schema projection paths, including nested paths.
+     */
+    LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT = 3,
+} LanceMaterializationStyle;
+
+/**
+ * Configure native materialization for ordinary scanner payload columns.
+ *
+ * For ALL_EARLY_EXCEPT, `early_except_columns` contains
+ * `early_except_column_count` column paths to exclude from early materialization.
+ * Passing a NULL array with count 0 is an explicit empty exception list, so all
+ * columns are early. Lance resolves the names against the dataset schema at call
+ * time, including nested paths. Resolution and validation follow Lance's native
+ * schema projection. The strings and array are copied; the caller may release
+ * them when this function returns.
+ *
+ * For HEURISTIC, ALL_LATE, and ALL_EARLY, the column count must be 0. Other style
+ * values are rejected. A rejected call leaves the previous style unchanged.
+ * The style must be configured before the scan starts.
+ *
+ * @param scanner                   Scanner handle. Must not be NULL.
+ * @param style                     One of `LanceMaterializationStyle`.
+ * @param early_except_columns      Column paths for ALL_EARLY_EXCEPT; may be NULL
+ *                                  when `early_except_column_count` is 0.
+ * @param early_except_column_count Number of column path pointers.
+ * @return 0 on success, -1 on error (check `lance_last_error_*`).
+ */
+int32_t lance_scanner_set_materialization_style(
+    LanceScanner* scanner,
+    LanceMaterializationStyle style,
+    const char* const* early_except_columns,
+    size_t early_except_column_count
+);
+
+/**
  * Restrict the scan/search domain to the given fragment IDs. For nearest-neighbor
  * queries, this limits the candidates searched before Top-K regardless of the
  * prefilter setting; it is not a predicate applied to ranked results.
@@ -2392,6 +2442,29 @@ int32_t lance_scanner_set_refine_factor(LanceScanner* scanner, uint32_t f);
 int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e);
 int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);
 int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
+
+/**
+ * Configure native indexed-only fast search.
+ *
+ * This weak-consistency mode applies to vector queries, scalar-indexed filters
+ * and full-text search. Index-backed paths can omit unindexed data. Ordinary
+ * scans and expressions without an indexable path follow the native planner's
+ * behavior.
+ *
+ * Lance's native `fast_search()` is applied before the nearest query and
+ * explicit `use_index` setting. For vector queries, unindexed fragments are
+ * omitted and the result is empty when no usable index is selected, including
+ * when `use_index=false`. Disabling restores the default native behavior.
+ * Disabled by default. Must be set before the scan starts.
+ *
+ * Passing NULL scanner or setting this after scanning starts returns -1 and
+ * leaves the prior state unchanged.
+ *
+ * @param scanner Scanner handle. Must not be NULL.
+ * @param enable  True for indexed-only search, false for native default.
+ * @return 0 on success, -1 on error (check `lance_last_error_*`).
+ */
+int32_t lance_scanner_set_fast_search(LanceScanner* scanner, bool enable);
 
 /**
  * Choose when scanner filter expressions are applied during nearest-neighbor search.
