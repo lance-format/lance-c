@@ -1481,6 +1481,67 @@ int32_t lance_scanner_set_strict_batch_size(
  */
 int32_t lance_scanner_set_use_stats(LanceScanner* scanner, bool use_stats);
 
+/** Sort direction for one scanner ordering key. */
+typedef enum {
+    LANCE_ORDER_ASCENDING = 0,
+    LANCE_ORDER_DESCENDING = 1,
+} LanceOrderDirection;
+
+/** Placement of NULL values for one scanner ordering key. */
+typedef enum {
+    LANCE_ORDER_NULLS_LAST = 0,
+    LANCE_ORDER_NULLS_FIRST = 1,
+} LanceNullOrder;
+
+/**
+ * One native scanner ordering key.
+ *
+ * `direction` is a LanceOrderDirection value and `null_order` is a
+ * LanceNullOrder value. Both are int32_t at the ABI boundary so out-of-range
+ * values can be rejected safely. `column_name` is copied during the call.
+ */
+typedef struct LanceColumnOrdering {
+    const char* column_name;
+    int32_t direction;
+    int32_t null_order;
+} LanceColumnOrdering;
+
+/**
+ * Replace the scanner's native result ordering.
+ *
+ * Entries are applied in array order, matching Lance's ColumnOrdering list.
+ * With limit/offset, Lance sorts all rows before applying the window. For
+ * nearest or full-text search, Lance first selects its query result set and
+ * then sorts that set.
+ *
+ * Passing `orderings == NULL` with `len == 0` clears the ordering (the native
+ * `None` option). Passing a non-NULL pointer with `len == 0` is an explicit
+ * empty ordering list (the native `Some(empty)` option); Lance treats it as
+ * clearing the ordering. Both forms are accepted. `orderings == NULL` with
+ * `len > 0` is invalid.
+ *
+ * The array, every column name, and all scalar fields are copied before this
+ * call returns. A NULL column name, an invalid direction, or an invalid
+ * null_order is rejected without changing the previous ordering. Column names
+ * are validated by Lance when the scan is materialized, so a missing column is
+ * reported by starting the scan. Must be called before the scan starts.
+ *
+ * The ordering cannot be combined with `lance_scanner_nearest_multivector`:
+ * that API's result window is always restored to distance order, so accepting
+ * an ordering would silently ignore it. Materializing such a scan fails with
+ * LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * @param scanner    Scanner handle. Must not be NULL.
+ * @param orderings  Ordering keys, or NULL to clear.
+ * @param len        Number of ordering keys.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_set_order_by(
+    LanceScanner* scanner,
+    const LanceColumnOrdering* orderings,
+    size_t len
+);
+
 int32_t lance_scanner_with_row_id(LanceScanner* scanner, bool enable);
 
 /** Include or omit the `_rowaddr` metadata column. Must be set before scanning. */
