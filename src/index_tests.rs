@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::cell::Cell;
+use std::collections::HashMap;
 
 use futures::{FutureExt, channel::oneshot, poll};
 
@@ -21,6 +22,64 @@ fn segment(id: u128, field_id: Option<i32>) -> IndexMetadata {
         base_id: None,
         files: None,
     }
+}
+
+#[test]
+fn index_segments_json_distinguishes_unknown_empty_and_historical_coverage() {
+    let mut unknown = segment(1, Some(0));
+    unknown.name = "unknown".to_string();
+    unknown.dataset_version = 7;
+    unknown.index_version = 3;
+
+    let mut empty = segment(2, Some(0));
+    empty.name = "empty".to_string();
+    empty.fragment_bitmap = Some(Default::default());
+
+    let mut historical = segment(3, Some(1));
+    historical.name = "quote\"backslash\\newline\n".to_string();
+    historical.fragment_bitmap = Some([2_u32, 9].into_iter().collect());
+    historical.index_version = 5;
+
+    let mut system = segment(4, None);
+    system.name = lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME.to_string();
+
+    let columns = HashMap::from([(0, "id".to_string()), (1, "quote\"column\\".to_string())]);
+    let json = serialize_index_segments_json(
+        &[unknown, empty, historical, system],
+        &HashMap::new(),
+        |field_id| columns.get(&field_id).cloned(),
+    )
+    .unwrap();
+    let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let entries = entries.as_array().unwrap();
+    assert_eq!(entries.len(), 3, "system segments must be excluded");
+
+    let unknown = entries
+        .iter()
+        .find(|entry| entry["name"] == "unknown")
+        .unwrap();
+    assert!(unknown["fragment_ids"].is_null());
+    assert_eq!(unknown["index_version"], 3);
+    assert_eq!(unknown["dataset_version"], 7);
+
+    let empty = entries
+        .iter()
+        .find(|entry| entry["name"] == "empty")
+        .unwrap();
+    assert_eq!(empty["fragment_ids"], serde_json::json!([]));
+
+    let historical = entries
+        .iter()
+        .find(|entry| entry["name"] == "quote\"backslash\\newline\n")
+        .unwrap();
+    assert_eq!(historical["fragment_ids"], serde_json::json!([2, 9]));
+    assert_eq!(historical["index_version"], 5);
+    assert_eq!(
+        historical["columns"],
+        serde_json::json!(["quote\"column\\"])
+    );
+    let expected_uuid = Uuid::from_u128(3).to_string();
+    assert_eq!(historical["uuid"], expected_uuid);
 }
 
 #[test]

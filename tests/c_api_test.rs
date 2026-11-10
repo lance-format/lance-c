@@ -4086,6 +4086,233 @@ fn test_list_indices_json() {
     unsafe { lance_dataset_close(ds) };
 }
 
+#[test]
+fn test_index_segments_json_reports_physical_metadata() {
+    use lance::index::DatasetIndexExt;
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+    use uuid::Uuid;
+
+    let first_uuid = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+    let second_uuid = Uuid::from_u128(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210);
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(3, 16, 8, false);
+    // The fixture writes three fragments as three dataset versions.
+    let expected_dataset_version = 3_u64;
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        assert_eq!(dataset.version().version, expected_dataset_version);
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| u32::try_from(fragment.id()).unwrap())
+            .collect::<Vec<_>>();
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        let first = dataset
+            .create_index_builder(&["embedding"], lance_index::IndexType::Vector, &params)
+            .name("embedding_segments".to_string())
+            .fragments(vec![fragment_ids[0], fragment_ids[2]])
+            .index_uuid(first_uuid)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let second = dataset
+            .create_index_builder(&["embedding"], lance_index::IndexType::Vector, &params)
+            .name("embedding_segments".to_string())
+            .fragments(vec![fragment_ids[1]])
+            .index_uuid(second_uuid)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("embedding_segments", "embedding", vec![first, second])
+            .await
+            .unwrap();
+    });
+
+    let ds = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let json_ptr = unsafe { lance_dataset_index_segments_json(ds) };
+    assert!(!json_ptr.is_null(), "{}", take_last_error_message());
+    let json = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(json_ptr) };
+    let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let entries = entries.as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    let by_uuid = entries
+        .iter()
+        .map(|entry| (entry["uuid"].as_str().unwrap().to_string(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let first = by_uuid.get(&first_uuid.to_string()).unwrap();
+    assert_eq!(first["name"], "embedding_segments");
+    assert_eq!(first["columns"], serde_json::json!(["embedding"]));
+    assert_eq!(first["type"], "IVF_FLAT");
+    assert_eq!(first["dataset_version"], expected_dataset_version);
+    assert_eq!(first["index_version"], 1);
+    assert_eq!(first["fragment_ids"], serde_json::json!([0, 2]));
+
+    let second = by_uuid.get(&second_uuid.to_string()).unwrap();
+    assert_eq!(second["name"], "embedding_segments");
+    assert_eq!(second["columns"], serde_json::json!(["embedding"]));
+    assert_eq!(second["type"], "IVF_FLAT");
+    assert_eq!(second["dataset_version"], expected_dataset_version);
+    assert_eq!(second["index_version"], 1);
+    assert_eq!(second["fragment_ids"], serde_json::json!([1]));
+
+    let legacy_ptr = unsafe { lance_dataset_index_list_json(ds) };
+    assert!(!legacy_ptr.is_null());
+    let legacy = unsafe { std::ffi::CStr::from_ptr(legacy_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(legacy_ptr) };
+    let legacy: serde_json::Value = serde_json::from_str(&legacy).unwrap();
+    let legacy = legacy.as_array().unwrap();
+    assert_eq!(legacy.len(), 2);
+    for entry in legacy {
+        let mut keys = entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, ["columns", "dataset_version", "name", "type", "uuid"]);
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_index_segments_json_unknown_coverage() {
+    use lance::dataset::transaction::Operation;
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let expected_version = 3_u64;
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        assert_eq!(dataset.version().version, expected_version - 1);
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let mut segment = dataset
+            .create_index_builder(&["id"], IndexType::Bitmap, &params)
+            .name("unknown_coverage".to_string())
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        segment.fragment_bitmap = None;
+        Dataset::commit(
+            &uri,
+            Operation::CreateIndex {
+                new_indices: vec![segment],
+                removed_indices: Vec::new(),
+            },
+            Some(expected_version - 1),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    });
+
+    let ds = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let json_ptr = unsafe { lance_dataset_index_segments_json(ds) };
+    assert!(!json_ptr.is_null(), "{}", take_last_error_message());
+    let json = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(json_ptr) };
+    let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let entries = entries.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "unknown_coverage");
+    assert_eq!(entries[0]["columns"], serde_json::json!(["id"]));
+    assert_eq!(entries[0]["type"], "Bitmap");
+    assert_eq!(entries[0]["dataset_version"], expected_version);
+    assert_eq!(entries[0]["index_version"], 0);
+    assert!(entries[0]["fragment_ids"].is_null());
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_index_segments_json_empty_coverage() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::InvertedIndexParams;
+
+    let (_tmp, uri) = create_test_dataset();
+    let expected_version = 2_u64;
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        assert_eq!(dataset.version().version, expected_version - 1);
+        dataset
+            .create_index_builder(
+                &["name"],
+                IndexType::Inverted,
+                &InvertedIndexParams::default(),
+            )
+            .name("empty_name_fts".to_string())
+            .train(false)
+            .await
+            .unwrap();
+        assert_eq!(dataset.version().version, expected_version);
+    });
+
+    let ds = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let json_ptr = unsafe { lance_dataset_index_segments_json(ds) };
+    assert!(!json_ptr.is_null(), "{}", take_last_error_message());
+    let json = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(json_ptr) };
+    let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let entries = entries.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "empty_name_fts");
+    assert_eq!(entries[0]["columns"], serde_json::json!(["name"]));
+    assert_eq!(entries[0]["type"], "Inverted");
+    assert_eq!(entries[0]["dataset_version"], expected_version);
+    assert_eq!(entries[0]["index_version"], 0);
+    assert_eq!(entries[0]["fragment_ids"], serde_json::json!([]));
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_index_segments_json_null_and_empty_listing() {
+    let null = unsafe { lance_dataset_index_segments_json(ptr::null()) };
+    assert!(null.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("dataset is NULL"));
+
+    let (_tmp, uri) = create_test_dataset();
+    let ds = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let json_ptr = unsafe { lance_dataset_index_segments_json(ds) };
+    assert!(!json_ptr.is_null());
+    assert_eq!(
+        unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+            .to_str()
+            .unwrap(),
+        "[]"
+    );
+    unsafe { lance_free_string(json_ptr) };
+    unsafe { lance_dataset_close(ds) };
+}
+
 // ---------------------------------------------------------------------------
 // Vector index lifecycle tests (Phase 2)
 // ---------------------------------------------------------------------------

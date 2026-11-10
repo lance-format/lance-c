@@ -2127,6 +2127,28 @@ uint64_t lance_dataset_index_count(const LanceDataset* dataset);
  */
 const char* lance_dataset_index_list_json(const LanceDataset* dataset);
 
+/**
+ * JSON array describing every non-system physical index segment.
+ *
+ * Unlike lance_dataset_index_list_json(), this listing has one entry per
+ * physical segment rather than one best-effort logical index description. Each
+ * entry contains `name`, `uuid`, `columns`, `type`, `dataset_version`,
+ * `index_version`, and `fragment_ids`.
+ *
+ * `index_version` is the physical index format version recorded in the
+ * segment's Lance IndexMetadata. `fragment_ids` is the recorded coverage in
+ * ascending order, including fragment IDs that no longer exist in the current
+ * dataset; the listing does not intersect it with the dataset's live
+ * fragments. A JSON null means the recorded coverage is unknown, while an
+ * empty array means the recorded coverage is known to be empty. Per-segment
+ * row counts are not provided.
+ *
+ * Index names, column names, and other string values are JSON-escaped.
+ * Caller must free the returned string with lance_free_string().
+ * Returns NULL on error (see lance_last_error_code/message).
+ */
+const char* lance_dataset_index_segments_json(const LanceDataset* dataset);
+
 /* ─── Distributed vector search: index segment enumeration ─── */
 
 /**

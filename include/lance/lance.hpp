@@ -1041,6 +1041,19 @@ public:
         return out;
     }
 
+    /// JSON array with one entry per non-system physical index segment.
+    /// Each entry includes the recorded fragment coverage and physical index
+    /// format version. `fragment_ids` is null for unknown coverage and empty
+    /// for known-empty coverage; historical fragment IDs are reported as
+    /// recorded. Throws lance::Error on failure.
+    std::string index_segments_json() const {
+        const char* json = lance_dataset_index_segments_json(handle_.get());
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
+    }
+
     /// Number of segments that make up a logical vector index.
     /// Throws lance::Error with code NotFound if the index does not exist.
     uint64_t index_segment_count(const std::string& index_name) const {
