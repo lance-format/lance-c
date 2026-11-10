@@ -8,7 +8,8 @@
  * This file is compiled by the Rust integration test to verify that
  * lance.h is valid C and the API works end-to-end.
  *
- * Usage: test_c_api <dataset_uri> <write_uri> <blob_uri>
+ * Usage: test_c_api <dataset_uri> <write_uri> <blob_uri> <ordering_uri>
+ *                    <fragment_uri>
  */
 
 #include "lance/lance.h"
@@ -652,6 +653,199 @@ static void test_versions(const char *uri) {
     }
 
     lance_versions_close(vs);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+static const char *version_metadata_get(const LanceVersion *version, const char *key) {
+    uint64_t count = lance_version_metadata_count(version);
+    CHECK_OK();
+    for (uint64_t i = 0; i < count; ++i) {
+        const char *candidate = lance_version_metadata_key_at(version, (size_t)i);
+        ASSERT(candidate != NULL, "version metadata key");
+        if (strcmp(candidate, key) == 0) {
+            const char *value = lance_version_metadata_value_at(version, (size_t)i);
+            ASSERT(value != NULL, "version metadata value");
+            return value;
+        }
+    }
+    return NULL;
+}
+
+static const char *tag_metadata_get(const LanceTag *tag, const char *key) {
+    uint64_t count = lance_tag_metadata_count(tag);
+    CHECK_OK();
+    for (uint64_t i = 0; i < count; ++i) {
+        const char *candidate = lance_tag_metadata_key_at(tag, (size_t)i);
+        ASSERT(candidate != NULL, "tag metadata key");
+        if (strcmp(candidate, key) == 0) {
+            const char *value = lance_tag_metadata_value_at(tag, (size_t)i);
+            ASSERT(value != NULL, "tag metadata value");
+            return value;
+        }
+    }
+    return NULL;
+}
+
+static void expect_error(LanceErrorCode expected, const char *operation) {
+    if (lance_last_error_code() != expected) {
+        const char *msg = lance_last_error_message();
+        fprintf(stderr, "FAIL: %s returned error code %d, expected %d: %s\n",
+                operation, (int)lance_last_error_code(), (int)expected,
+                msg ? msg : "unknown");
+        if (msg) lance_free_string(msg);
+        exit(1);
+    }
+    const char *msg = lance_last_error_message();
+    if (msg) lance_free_string(msg);
+}
+
+static void test_native_refs_and_tags(const char *uri) {
+    printf("  test_native_refs_and_tags... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    ASSERT(lance_dataset_version(ds) == 2, "fixture must have two versions");
+    ASSERT(lance_dataset_count_rows(ds) == 20, "fixture must have twenty rows");
+
+    LanceVersion *current = lance_dataset_current_version(ds);
+    ASSERT(current != NULL, "current version snapshot failed");
+    ASSERT(lance_version_id(current) == 2, "wrong current version id");
+    ASSERT(lance_version_timestamp_ns(current) > 0, "missing native timestamp");
+    ASSERT(strcmp(version_metadata_get(current, "total_rows"), "20") == 0,
+           "current version row metadata");
+    ASSERT(strcmp(version_metadata_get(current, "total_fragments"), "2") == 0,
+           "current version fragment metadata");
+
+    LanceVersions *versions = lance_dataset_versions(ds);
+    ASSERT(versions != NULL, "version snapshot failed");
+    ASSERT(lance_versions_count(versions) == 2, "wrong version count");
+    const LanceVersion *first = lance_versions_at(versions, 0);
+    ASSERT(first != NULL, "first version details");
+    ASSERT(lance_version_id(first) == 1, "wrong first version id");
+    ASSERT(strcmp(version_metadata_get(first, "total_rows"), "10") == 0,
+           "first version row metadata");
+
+    LanceVersionRefs *refs = lance_dataset_version_refs(ds);
+    ASSERT(refs != NULL, "version refs snapshot failed");
+    ASSERT(lance_version_refs_count(refs) == 2, "wrong version ref count");
+    ASSERT(lance_version_refs_id_at(refs, 0) == 1, "first version ref");
+    ASSERT(lance_version_refs_id_at(refs, 1) == 2, "second version ref");
+
+    LanceRef *version1 = lance_ref_version_number(1);
+    LanceRef *latest = lance_ref_version(NULL, false, 0);
+    LanceRef *main_v1 = lance_ref_version("main", true, 1);
+    ASSERT(version1 != NULL && latest != NULL && main_v1 != NULL, "ref creation");
+
+    LanceDataset *checked_v1 = lance_dataset_checkout_ref(ds, version1);
+    LanceDataset *checked_latest = lance_dataset_checkout_ref(ds, latest);
+    LanceDataset *checked_main = lance_dataset_checkout_ref(ds, main_v1);
+    ASSERT(checked_v1 != NULL && checked_latest != NULL && checked_main != NULL,
+           "ref checkout");
+    ASSERT(lance_dataset_version(checked_v1) == 1 &&
+           lance_dataset_count_rows(checked_v1) == 10,
+           "version-number checkout");
+    ASSERT(lance_dataset_version(checked_latest) == 2 &&
+           lance_dataset_count_rows(checked_latest) == 20,
+           "latest checkout");
+    ASSERT(lance_dataset_version(checked_main) == 1,
+           "main branch alias checkout");
+
+    LanceRef *tag_source = lance_ref_version_number(1);
+    ASSERT(lance_dataset_tag_create(ds, "c-release", tag_source) == 0,
+           "tag create");
+    lance_ref_close(tag_source);
+    LanceTag *tag = lance_dataset_tag_get(ds, "c-release");
+    ASSERT(tag != NULL, "tag get");
+    ASSERT(strcmp(lance_tag_name(tag), "c-release") == 0, "tag name");
+    ASSERT(lance_tag_version(tag) == 1, "tag version");
+    ASSERT(lance_tag_manifest_size(tag) > 0, "tag manifest size");
+    const char *branch = "unset";
+    ASSERT(lance_tag_branch(tag, &branch) == 0 && branch == NULL,
+           "main tag has no explicit branch");
+    int64_t created_at = 0;
+    int64_t updated_at = 0;
+    ASSERT(lance_tag_created_at_ns(tag, &created_at) == 1 && created_at > 0,
+           "tag created timestamp");
+    ASSERT(lance_tag_updated_at_ns(tag, &updated_at) == 1 && updated_at >= created_at,
+           "tag updated timestamp");
+
+    LanceRef *duplicate = lance_ref_version_number(2);
+    ASSERT(lance_dataset_tag_create(ds, "c-release", duplicate) == -1,
+           "duplicate tag must conflict");
+    expect_error(LANCE_ERR_COMMIT_CONFLICT, "duplicate tag");
+    lance_ref_close(duplicate);
+
+    LanceRef *tag_ref = lance_ref_tag("c-release");
+    LanceDataset *tag_checkout = lance_dataset_checkout_ref(ds, tag_ref);
+    ASSERT(tag_checkout != NULL && lance_dataset_version(tag_checkout) == 1,
+           "tag checkout before update");
+
+    const char *metadata[] = {"owner", "c-api", "empty", "", NULL};
+    ASSERT(lance_dataset_tag_replace_metadata(ds, "c-release", metadata) == 0,
+           "tag metadata replace");
+
+    LanceTags *tags = lance_dataset_tags(ds);
+    ASSERT(tags != NULL && lance_tags_count(tags) == 1, "tag list");
+    const LanceTag *listed = lance_tags_at(tags, 0);
+    ASSERT(listed != NULL && strcmp(lance_tag_name(listed), "c-release") == 0,
+           "listed tag");
+
+    lance_dataset_close(ds);
+    ASSERT(lance_version_id(current) == 2, "current snapshot after dataset close");
+    ASSERT(lance_versions_count(versions) == 2, "versions snapshot after dataset close");
+    ASSERT(lance_version_refs_count(refs) == 2, "refs snapshot after dataset close");
+    ASSERT(lance_tags_count(tags) == 1, "tags snapshot after dataset close");
+    ASSERT(lance_dataset_version(tag_checkout) == 1,
+           "old checkout after dataset close");
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "reopen failed");
+    tag = lance_dataset_tag_get(ds, "c-release");
+    ASSERT(tag != NULL, "persisted tag");
+    ASSERT(strcmp(tag_metadata_get(tag, "owner"), "c-api") == 0,
+           "persisted metadata value");
+    ASSERT(strcmp(tag_metadata_get(tag, "empty"), "") == 0,
+           "empty metadata value");
+    lance_tag_close(tag);
+
+    LanceRef *version2 = lance_ref_version_number(2);
+    ASSERT(lance_dataset_tag_update(ds, "c-release", version2) == 0,
+           "tag update");
+    lance_ref_close(version2);
+    tag = lance_dataset_tag_get(ds, "c-release");
+    ASSERT(tag != NULL && lance_tag_version(tag) == 2, "updated tag target");
+    ASSERT(strcmp(tag_metadata_get(tag, "owner"), "c-api") == 0,
+           "update preserves metadata");
+    int64_t updated_created_at = 0;
+    ASSERT(lance_tag_created_at_ns(tag, &updated_created_at) == 1 &&
+           updated_created_at == created_at,
+           "update preserves created_at");
+    lance_tag_close(tag);
+
+    ASSERT(lance_dataset_version(tag_checkout) == 1,
+           "pre-update checkout remains old");
+    LanceDataset *updated_checkout = lance_dataset_checkout_ref(ds, tag_ref);
+    ASSERT(updated_checkout != NULL && lance_dataset_version(updated_checkout) == 2,
+           "updated tag checkout");
+
+    ASSERT(lance_dataset_tag_delete(ds, "c-release") == 0, "tag delete");
+    ASSERT(lance_dataset_tag_delete(ds, "c-release") == -1, "unknown tag delete");
+    expect_error(LANCE_ERR_NOT_FOUND, "unknown tag delete");
+
+    lance_ref_close(tag_ref);
+    lance_dataset_close(updated_checkout);
+    lance_dataset_close(tag_checkout);
+    lance_dataset_close(checked_main);
+    lance_dataset_close(checked_latest);
+    lance_dataset_close(checked_v1);
+    lance_ref_close(main_v1);
+    lance_ref_close(latest);
+    lance_ref_close(version1);
+    lance_tags_close(tags);
+    lance_version_refs_close(refs);
+    lance_versions_close(versions);
+    lance_version_close(current);
     lance_dataset_close(ds);
     printf("OK\n");
 }
@@ -1682,6 +1876,129 @@ static void test_batch_nearest(const char *uri) {
     check_batch_nearest_results(&stream);
 }
 
+static void test_materialization_and_fast_search(const char *uri) {
+    printf("  test_materialization_and_fast_search... ");
+
+    LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "open materialization dataset");
+    const char *projection[] = {"id", "name", NULL};
+    const char *except_name[] = {"name"};
+    const char *missing_name[] = {"missing"};
+    struct ArrowArrayStream stream;
+
+    for (int style = LANCE_MATERIALIZATION_STYLE_HEURISTIC;
+         style <= LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT; ++style) {
+        LanceScanner *scanner =
+            lance_scanner_new(dataset, projection, "id >= 18");
+        ASSERT(scanner != NULL, "create materialization scanner");
+        const char *const *columns =
+            style == LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT
+                ? except_name
+                : NULL;
+        size_t column_count =
+            style == LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT ? 1 : 0;
+        ASSERT(lance_scanner_set_materialization_style(
+                   scanner, (LanceMaterializationStyle)style,
+                   columns, column_count) == 0,
+               "set materialization style");
+        memset(&stream, 0, sizeof(stream));
+        ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+               "materialization stream");
+        ASSERT(count_stream_rows(&stream) == 3,
+               "materialization result count");
+        lance_scanner_close(scanner);
+    }
+
+    LanceScanner *scanner = lance_scanner_new(dataset, projection, "id >= 18");
+    ASSERT(scanner != NULL, "create validation scanner");
+    ASSERT(lance_scanner_set_materialization_style(
+               scanner, LANCE_MATERIALIZATION_STYLE_ALL_LATE, NULL, 0) == 0,
+           "set all-late");
+    ASSERT(lance_scanner_set_materialization_style(
+               scanner, LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT,
+               missing_name, 1) == -1,
+           "missing exception column must fail");
+    ASSERT(lance_last_error_code() != LANCE_OK,
+           "missing exception column must set an error");
+    ASSERT(lance_scanner_set_materialization_style(
+               scanner, (LanceMaterializationStyle)99, NULL, 0) == -1,
+           "unknown materialization style must fail");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "scan after rejected style");
+    ASSERT(count_stream_rows(&stream) == 3,
+           "rejected style must preserve prior configuration");
+    ASSERT(lance_scanner_set_materialization_style(
+               scanner, LANCE_MATERIALIZATION_STYLE_ALL_EARLY, NULL, 0) == -1,
+           "style after scan start must fail");
+    ASSERT(lance_scanner_set_fast_search(scanner, true) == -1,
+           "fast search after scan start must fail");
+    lance_scanner_close(scanner);
+
+    float query[8];
+    for (int i = 0; i < 8; ++i) query[i] = 0.1f + (float)i;
+
+    scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "create ordinary nearest scanner");
+    ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                LANCE_DTYPE_FLOAT32, 5) == 0,
+           "ordinary nearest");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "ordinary nearest stream");
+    ASSERT(count_stream_rows(&stream) == 5,
+           "ordinary nearest must use native fallback without an index");
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "create fast scanner");
+    ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                LANCE_DTYPE_FLOAT32, 5) == 0,
+           "fast nearest");
+    ASSERT(lance_scanner_set_fast_search(scanner, true) == 0, "fast search");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "fast nearest stream");
+    ASSERT(count_stream_rows(&stream) == 0,
+           "fast search without an index must preserve native empty result");
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "create fast-without-index scanner");
+    ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                LANCE_DTYPE_FLOAT32, 5) == 0,
+           "fast-without-index nearest");
+    ASSERT(lance_scanner_set_fast_search(scanner, true) == 0,
+           "enable fast search");
+    ASSERT(lance_scanner_set_use_index(scanner, false) == 0,
+           "disable index under fast search");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "fast-without-index stream");
+    ASSERT(count_stream_rows(&stream) == 0,
+           "fast search must not restore flat fallback");
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "create fast-reset scanner");
+    ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                LANCE_DTYPE_FLOAT32, 5) == 0,
+           "fast-reset nearest");
+    ASSERT(lance_scanner_set_fast_search(scanner, true) == 0,
+           "enable fast search before reset");
+    ASSERT(lance_scanner_set_fast_search(scanner, false) == 0,
+           "reset fast search");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "fast-reset stream");
+    ASSERT(count_stream_rows(&stream) == 5,
+           "disabling fast search must restore native fallback");
+    lance_scanner_close(scanner);
+
+    lance_dataset_close(dataset);
+    printf("OK\n");
+}
+
 /* Collect the `id` column from an ordering stream. Returns the row count and
  * stores up to `capacity` ids in `out`. */
 static size_t collect_ordering_ids(
@@ -1844,11 +2161,147 @@ static void test_scanner_order_by(const char *uri) {
     printf("OK\n");
 }
 
+static const struct ArrowSchema *find_schema_child(
+    const struct ArrowSchema *schema,
+    const char *name
+) {
+    for (int64_t i = 0; i < schema->n_children; ++i) {
+        const struct ArrowSchema *child = schema->children[i];
+        if (child != NULL && child->name != NULL &&
+            strcmp(child->name, name) == 0) {
+            return child;
+        }
+    }
+    return NULL;
+}
+
+static void test_fragment_snapshot(const char *uri) {
+    printf("  test_fragment_snapshot... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "fragment fixture open failed");
+    CHECK_OK();
+
+    ASSERT(lance_dataset_fragment_count(ds) == 2,
+           "fragment fixture must contain two fragments");
+    CHECK_OK();
+    uint64_t ids[2] = {0, 0};
+    ASSERT(lance_dataset_fragment_ids(ds, ids) == 0,
+           "fragment enumeration failed");
+    CHECK_OK();
+
+    LanceFragment *fragment = lance_dataset_open_fragment(ds, ids[0]);
+    ASSERT(fragment != NULL, "fragment lookup failed");
+    CHECK_OK();
+
+    LanceFragment *missing =
+        lance_dataset_open_fragment(ds, UINT64_MAX);
+    ASSERT(missing == NULL, "out-of-range fragment ID must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_NOT_FOUND,
+           "out-of-range fragment ID must be NOT_FOUND");
+    const char *message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "fragment_id") != NULL,
+           "missing fragment error must name fragment_id");
+    if (message) lance_free_string(message);
+
+    ASSERT(lance_dataset_open_fragment(NULL, ids[0]) == NULL,
+           "NULL dataset must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL dataset must be INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    uint64_t rows = 123;
+    ASSERT(lance_fragment_physical_rows(fragment, NULL) == -1,
+           "NULL physical-row output must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL physical-row output must be INVALID_ARGUMENT");
+    ASSERT(rows == 123, "failed count must not write the output");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    ASSERT(lance_fragment_deleted_rows(NULL, &rows) == -1,
+           "NULL fragment deleted-row count must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL fragment must be INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    ASSERT(lance_fragment_id(NULL) == 0, "NULL fragment ID must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL fragment ID must be INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    ASSERT(lance_fragment_metadata_json(NULL) == NULL,
+           "NULL fragment metadata must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL fragment metadata must be INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    /* The fragment owns its snapshot; every read remains valid after close. */
+    lance_dataset_close(ds);
+    ASSERT(lance_fragment_id(fragment) == ids[0],
+           "fragment ID changed after dataset close");
+    CHECK_OK();
+    ASSERT(lance_fragment_data_file_count(fragment) == 1,
+           "fragment should have one base data file");
+    CHECK_OK();
+
+    const char *metadata = lance_fragment_metadata_json(fragment);
+    ASSERT(metadata != NULL, "fragment metadata JSON failed");
+    CHECK_OK();
+    ASSERT(strstr(metadata, "\"files\":[") != NULL,
+           "metadata must include data files");
+    ASSERT(strstr(metadata, "\"path\":\"") != NULL,
+           "metadata must include data file paths");
+    ASSERT(strstr(metadata, "\"physical_rows\":4") != NULL,
+           "metadata must preserve the native physical row count");
+    ASSERT(strstr(metadata, "\"deletion_file\":{") != NULL,
+           "metadata must include deletion-file information");
+    ASSERT(strstr(metadata, "\"num_deleted_rows\":1") != NULL,
+           "metadata must preserve the native deletion count");
+    lance_free_string(metadata);
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_fragment_schema(fragment, &schema) == 0,
+           "fragment schema export failed");
+    CHECK_OK();
+    ASSERT(schema.n_children == 2, "fragment schema field count mismatch");
+    const struct ArrowSchema *profile = find_schema_child(&schema, "profile");
+    ASSERT(profile != NULL, "nested profile field missing");
+    ASSERT(profile->format != NULL && strcmp(profile->format, "+s") == 0,
+           "profile must remain a struct");
+    ASSERT(profile->n_children == 2, "struct field children missing");
+    ASSERT(find_schema_child(profile, "name") != NULL,
+           "nested name field missing");
+    ASSERT(find_schema_child(profile, "score") != NULL,
+           "nested score field missing");
+    if (schema.release) schema.release(&schema);
+
+    ASSERT(lance_fragment_physical_rows(fragment, &rows) == 0,
+           "physical row count failed");
+    ASSERT(rows == 4, "physical row count mismatch");
+    rows = 0;
+    ASSERT(lance_fragment_deleted_rows(fragment, &rows) == 0,
+           "deleted row count failed");
+    ASSERT(rows == 1, "deleted row count mismatch");
+    rows = 0;
+    ASSERT(lance_fragment_logical_rows(fragment, &rows) == 0,
+           "logical row count failed");
+    ASSERT(rows == 3, "logical row count mismatch");
+
+    lance_fragment_close(fragment);
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
-    if (argc < 6) {
+    if (argc < 7) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
-                "<session_uri>\n",
+                "<session_uri> <fragment_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -1858,9 +2311,11 @@ int main(int argc, char **argv) {
     const char *blob_uri = argv[3];
     const char *ordering_uri = argv[4];
     const char *session_uri = argv[5];
+    const char *fragment_uri = argv[6];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
+    test_materialization_and_fast_search(uri);
     test_open_and_metadata(uri);
     test_shared_session(uri);
     test_session_cache_config(session_uri);
@@ -1869,9 +2324,11 @@ int main(int argc, char **argv) {
     test_scan_with_limit(uri);
     test_scan_with_row_addr_lists(uri);
     test_scanner_order_by(ordering_uri);
+    test_fragment_snapshot(fragment_uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_versions(uri);
+    test_native_refs_and_tags(uri);
     test_restore_to_current(uri);
     test_error_handling();
     test_index_segment_builder(uri);

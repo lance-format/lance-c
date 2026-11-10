@@ -47,7 +47,10 @@ pub unsafe fn parse_c_string_array(ptr: *const *const c_char) -> Result<Option<V
 /// Parse NULL-terminated key-value pairs into a `HashMap`.
 /// Format: `["key1", "val1", "key2", "val2", NULL]`
 /// If `ptr` is NULL, returns an empty map.
-pub unsafe fn parse_storage_options(ptr: *const *const c_char) -> Result<HashMap<String, String>> {
+pub unsafe fn parse_c_string_map(
+    ptr: *const *const c_char,
+    label: &str,
+) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
     if ptr.is_null() {
         return Ok(map);
@@ -61,7 +64,7 @@ pub unsafe fn parse_storage_options(ptr: *const *const c_char) -> Result<HashMap
         let val_ptr = unsafe { *ptr.add(i + 1) };
         if val_ptr.is_null() {
             return Err(lance_core::Error::invalid_input_source(
-                "storage options must be key-value pairs; odd number of entries".into(),
+                format!("{label} must be key-value pairs; odd number of entries").into(),
             ));
         }
         let key = unsafe { parse_c_string(key_ptr)? }.unwrap().to_string();
@@ -70,4 +73,9 @@ pub unsafe fn parse_storage_options(ptr: *const *const c_char) -> Result<HashMap
         i += 2;
     }
     Ok(map)
+}
+
+/// Parse NULL-terminated storage option pairs. NULL means no options.
+pub unsafe fn parse_storage_options(ptr: *const *const c_char) -> Result<HashMap<String, String>> {
+    unsafe { parse_c_string_map(ptr, "storage options") }
 }
