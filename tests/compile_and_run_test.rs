@@ -230,7 +230,6 @@ fn create_typed_fts_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
-
 /// Create a two-fragment dataset for scanner ordering tests.
 fn create_ordering_dataset_on_disk() -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
