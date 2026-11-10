@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use arrow_array::{
     BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
-    UInt32Array,
+    StructArray, UInt32Array,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
@@ -187,6 +187,71 @@ fn create_ordering_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a three-version, two-fragment dataset with nested schema and one
+/// deleted row in each fragment. Version 2 is the multi-fragment state before
+/// deletion; version 3 adds the deletion files.
+fn create_fragment_dataset_on_disk() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("fragment_ds").to_str().unwrap().to_string();
+
+    let profile_fields = Fields::from(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Float32, true),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("profile", DataType::Struct(profile_fields.clone()), true),
+    ]));
+
+    let make_batch = |ids: Vec<i32>, names: Vec<Option<&str>>, scores: Vec<Option<f32>>| {
+        let profiles = StructArray::new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(Float32Array::from(scores)),
+            ],
+            None,
+        );
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(profiles)],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        let first = make_batch(
+            vec![0, 1, 2, 3],
+            vec![Some("a"), Some("b"), None, Some("d")],
+            vec![Some(1.0), Some(2.0), Some(3.5), None],
+        );
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let second = make_batch(
+            vec![10, 11, 12, 13],
+            vec![Some("j"), None, Some("l"), Some("m")],
+            vec![Some(10.0), Some(11.0), None, Some(13.0)],
+        );
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset.delete("id IN (1, 12)").await.unwrap();
+    });
+
+    (tmp, uri)
+}
+
 /// Create a two-fragment Blob v2 dataset on disk and return (TempDir, path_string).
 ///
 /// Each fragment has five rows: blobs of 8, 128 and 1024 bytes (inline, packed
@@ -317,12 +382,14 @@ fn run_test_binary(
     write_uri: &str,
     blob_uri: &str,
     ordering_uri: &str,
+    fragment_uri: &str,
 ) {
     let output = Command::new(binary)
         .arg(dataset_uri)
         .arg(write_uri)
         .arg(blob_uri)
         .arg(ordering_uri)
+        .arg(fragment_uri)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -352,6 +419,7 @@ fn test_c_compilation_and_execution() {
     let write_uri = tmp.path().join("c_write_ds").to_str().unwrap().to_string();
     let (_blob_tmp, blob_uri) = create_blob_dataset_on_disk();
     let (_ordering_tmp, ordering_uri) = create_ordering_dataset_on_disk();
+    let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -365,7 +433,14 @@ fn test_c_compilation_and_execution() {
         "C test compilation failed"
     );
 
-    run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri, &ordering_uri);
+    run_test_binary(
+        &binary,
+        &dataset_uri,
+        &write_uri,
+        &blob_uri,
+        &ordering_uri,
+        &fragment_uri,
+    );
 }
 
 #[test]
@@ -381,6 +456,7 @@ fn test_cpp_compilation_and_execution() {
         .to_string();
     let (_blob_tmp, blob_uri) = create_blob_dataset_on_disk();
     let (_ordering_tmp, ordering_uri) = create_ordering_dataset_on_disk();
+    let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -394,7 +470,14 @@ fn test_cpp_compilation_and_execution() {
         "C++ test compilation failed"
     );
 
-    run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri, &ordering_uri);
+    run_test_binary(
+        &binary,
+        &dataset_uri,
+        &write_uri,
+        &blob_uri,
+        &ordering_uri,
+        &fragment_uri,
+    );
 }
 
 /// A fresh C executable must initialize OpenDAL even when archive constructors are omitted.

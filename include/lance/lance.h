@@ -195,6 +195,7 @@ typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
 typedef struct LanceBlobFile LanceBlobFile;
+typedef struct LanceFragment LanceFragment;
 
 /* ─── Shared session ─── */
 
@@ -863,6 +864,115 @@ uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
  * @return 0 on success, -1 on error
  */
 int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_ids);
+
+/* ─── Read-only fragment snapshots ─── */
+
+/**
+ * Resolve a fragment by ID from this dataset snapshot.
+ *
+ * The returned handle retains Native `FileFragment` snapshot ownership: it
+ * remains valid, and keeps reading the same dataset version, after `dataset`
+ * is closed or mutated.
+ *
+ * @param dataset      Open dataset snapshot.
+ * @param fragment_id  Fragment ID from lance_dataset_fragment_ids().
+ * @return Fragment handle, or NULL on error. A missing ID sets
+ *         LANCE_ERR_NOT_FOUND; a NULL dataset sets
+ *         LANCE_ERR_INVALID_ARGUMENT.
+ */
+LanceFragment* lance_dataset_open_fragment(
+    const LanceDataset* dataset,
+    uint64_t fragment_id
+);
+
+/** Close and free a fragment handle. Safe to call with NULL. */
+void lance_fragment_close(LanceFragment* fragment);
+
+/**
+ * Return the fragment ID. Returns 0 and sets LANCE_ERR_INVALID_ARGUMENT on a
+ * NULL handle.
+ */
+uint64_t lance_fragment_id(const LanceFragment* fragment);
+
+/**
+ * Return the number of Native base data files in the fragment. Overlay files
+ * and the deletion file are not included. Returns 0 and sets an error on a
+ * NULL handle.
+ */
+uint64_t lance_fragment_data_file_count(const LanceFragment* fragment);
+
+/**
+ * Serialize the Native fragment metadata as JSON.
+ *
+ * The object is Lance's `Fragment` serialization. It includes base data files
+ * (path, field IDs, column indices, file version, size, base ID), overlays,
+ * deletion-file metadata, row-id/version metadata, and physical_rows. Optional
+ * unknown values remain null or omitted as Native serializes them; they are
+ * never replaced with zero.
+ *
+ * The caller must free the returned string with lance_free_string(). Returns
+ * NULL and sets an error for a NULL handle or serialization failure.
+ */
+const char* lance_fragment_metadata_json(const LanceFragment* fragment);
+
+/**
+ * Export the fragment's logical dataset schema via Arrow C Data Interface.
+ *
+ * This is FileFragment::schema(), the logical dataset schema, not a physical
+ * file schema. `out` is caller-allocated and remains caller-owned; invoke its
+ * non-NULL release callback exactly once.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_schema(
+    const LanceFragment* fragment,
+    struct ArrowSchema* out
+);
+
+/**
+ * Read the physical row count, including deleted rows.
+ *
+ * Calls FileFragment::physical_rows(), which may perform data-file I/O when
+ * the manifest has no trustworthy cached count. Native errors propagate.
+ *
+ * @param fragment  Fragment snapshot.
+ * @param out_rows  Receives the count on success; unchanged on failure.
+ * @return 0 on success, -1 on error (including NULL fragment/out_rows).
+ */
+int32_t lance_fragment_physical_rows(
+    const LanceFragment* fragment,
+    uint64_t* out_rows
+);
+
+/**
+ * Read the deleted-row count.
+ *
+ * Calls FileFragment::count_deletions(), which may load the deletion vector
+ * when its count is not cached in the manifest. Native errors propagate.
+ *
+ * @param fragment  Fragment snapshot.
+ * @param out_rows  Receives the count on success; unchanged on failure.
+ * @return 0 on success, -1 on error (including NULL fragment/out_rows).
+ */
+int32_t lance_fragment_deleted_rows(
+    const LanceFragment* fragment,
+    uint64_t* out_rows
+);
+
+/**
+ * Read the logical row count.
+ *
+ * Calls FileFragment::count_rows(None) directly; the binding does not subtract
+ * the deletion count itself. Native errors propagate.
+ *
+ * @param fragment  Fragment snapshot.
+ * @param out_rows  Receives the count on success; unchanged on failure.
+ * @return 0 on success, -1 on error (including NULL fragment/out_rows).
+ */
+int32_t lance_fragment_logical_rows(
+    const LanceFragment* fragment,
+    uint64_t* out_rows
+);
 
 /* ─── Random access ─── */
 

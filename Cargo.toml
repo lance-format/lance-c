@@ -52,6 +52,7 @@ opendal = { version = "=0.59.2", default-features = false, features = ["http-tra
 pin-project = "1.0"
 prost = "0.14"
 snafu = "0.9"
+serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

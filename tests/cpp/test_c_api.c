@@ -1676,10 +1676,147 @@ static void test_scanner_order_by(const char *uri) {
     printf("OK\n");
 }
 
+static const struct ArrowSchema *find_schema_child(
+    const struct ArrowSchema *schema,
+    const char *name
+) {
+    for (int64_t i = 0; i < schema->n_children; ++i) {
+        const struct ArrowSchema *child = schema->children[i];
+        if (child != NULL && child->name != NULL &&
+            strcmp(child->name, name) == 0) {
+            return child;
+        }
+    }
+    return NULL;
+}
+
+static void test_fragment_snapshot(const char *uri) {
+    printf("  test_fragment_snapshot... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "fragment fixture open failed");
+    CHECK_OK();
+
+    ASSERT(lance_dataset_fragment_count(ds) == 2,
+           "fragment fixture must contain two fragments");
+    CHECK_OK();
+    uint64_t ids[2] = {0, 0};
+    ASSERT(lance_dataset_fragment_ids(ds, ids) == 0,
+           "fragment enumeration failed");
+    CHECK_OK();
+
+    LanceFragment *fragment = lance_dataset_open_fragment(ds, ids[0]);
+    ASSERT(fragment != NULL, "fragment lookup failed");
+    CHECK_OK();
+
+    LanceFragment *missing =
+        lance_dataset_open_fragment(ds, UINT64_MAX);
+    ASSERT(missing == NULL, "out-of-range fragment ID must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_NOT_FOUND,
+           "out-of-range fragment ID must be NOT_FOUND");
+    const char *message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "fragment_id") != NULL,
+           "missing fragment error must name fragment_id");
+    if (message) lance_free_string(message);
+
+    ASSERT(lance_dataset_open_fragment(NULL, ids[0]) == NULL,
+           "NULL dataset must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL dataset must be INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    uint64_t rows = 123;
+    ASSERT(lance_fragment_physical_rows(fragment, NULL) == -1,
+           "NULL physical-row output must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL physical-row output must be INVALID_ARGUMENT");
+    ASSERT(rows == 123, "failed count must not write the output");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    ASSERT(lance_fragment_deleted_rows(NULL, &rows) == -1,
+           "NULL fragment deleted-row count must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL fragment must be INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    ASSERT(lance_fragment_id(NULL) == 0, "NULL fragment ID must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL fragment ID must be INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    ASSERT(lance_fragment_metadata_json(NULL) == NULL,
+           "NULL fragment metadata must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL fragment metadata must be INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    /* The fragment owns its snapshot; every read remains valid after close. */
+    lance_dataset_close(ds);
+    ASSERT(lance_fragment_id(fragment) == ids[0],
+           "fragment ID changed after dataset close");
+    CHECK_OK();
+    ASSERT(lance_fragment_data_file_count(fragment) == 1,
+           "fragment should have one base data file");
+    CHECK_OK();
+
+    const char *metadata = lance_fragment_metadata_json(fragment);
+    ASSERT(metadata != NULL, "fragment metadata JSON failed");
+    CHECK_OK();
+    ASSERT(strstr(metadata, "\"files\":[") != NULL,
+           "metadata must include data files");
+    ASSERT(strstr(metadata, "\"path\":\"") != NULL,
+           "metadata must include data file paths");
+    ASSERT(strstr(metadata, "\"physical_rows\":4") != NULL,
+           "metadata must preserve the native physical row count");
+    ASSERT(strstr(metadata, "\"deletion_file\":{") != NULL,
+           "metadata must include deletion-file information");
+    ASSERT(strstr(metadata, "\"num_deleted_rows\":1") != NULL,
+           "metadata must preserve the native deletion count");
+    lance_free_string(metadata);
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_fragment_schema(fragment, &schema) == 0,
+           "fragment schema export failed");
+    CHECK_OK();
+    ASSERT(schema.n_children == 2, "fragment schema field count mismatch");
+    const struct ArrowSchema *profile = find_schema_child(&schema, "profile");
+    ASSERT(profile != NULL, "nested profile field missing");
+    ASSERT(profile->format != NULL && strcmp(profile->format, "+s") == 0,
+           "profile must remain a struct");
+    ASSERT(profile->n_children == 2, "struct field children missing");
+    ASSERT(find_schema_child(profile, "name") != NULL,
+           "nested name field missing");
+    ASSERT(find_schema_child(profile, "score") != NULL,
+           "nested score field missing");
+    if (schema.release) schema.release(&schema);
+
+    ASSERT(lance_fragment_physical_rows(fragment, &rows) == 0,
+           "physical row count failed");
+    ASSERT(rows == 4, "physical row count mismatch");
+    rows = 0;
+    ASSERT(lance_fragment_deleted_rows(fragment, &rows) == 0,
+           "deleted row count failed");
+    ASSERT(rows == 1, "deleted row count mismatch");
+    rows = 0;
+    ASSERT(lance_fragment_logical_rows(fragment, &rows) == 0,
+           "logical row count failed");
+    ASSERT(rows == 3, "logical row count mismatch");
+
+    lance_fragment_close(fragment);
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
-    if (argc < 5) {
+    if (argc < 6) {
         fprintf(stderr,
-                "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri>\n",
+                "Usage: %s <dataset_uri> <write_uri> <blob_uri> "
+                "<ordering_uri> <fragment_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -1688,6 +1825,7 @@ int main(int argc, char **argv) {
     const char *write_uri = argv[2];
     const char *blob_uri = argv[3];
     const char *ordering_uri = argv[4];
+    const char *fragment_uri = argv[5];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
@@ -1698,6 +1836,7 @@ int main(int argc, char **argv) {
     test_scan_with_limit(uri);
     test_scan_with_row_addr_lists(uri);
     test_scanner_order_by(ordering_uri);
+    test_fragment_snapshot(fragment_uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_versions(uri);
