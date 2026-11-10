@@ -10965,7 +10965,9 @@ fn test_cleanup_branch_cascade_and_copied_explanation() {
     assert_eq!(captured.read_version, 4);
     assert_eq!(captured.referenced_branches.len(), 1);
     assert_eq!(captured.referenced_branches[0].name, "dev");
-    assert_eq!(captured.referenced_branches[0].referenced_version, 3);
+    // The native BranchIdentifier records the parent version this branch
+    // descends from, not the branch's own latest version.
+    assert_eq!(captured.referenced_branches[0].referenced_version, 2);
     assert!(captured.referenced_branches[0].cleanup_candidate);
     assert_eq!(
         count_files_with_extension(root, "manifest"),
