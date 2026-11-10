@@ -17,8 +17,8 @@ case "$phase" in
     fmt) command=(cargo "+$toolchain" fmt --check) ;;
     check) command=(cargo "+$toolchain" check --all-targets --locked) ;;
     clippy) command=(cargo "+$toolchain" clippy --all-targets --locked -- -D warnings) ;;
-    focused-materialization) command=(cargo "+$toolchain" test --locked --test c_api_test scanner_materialization -- --nocapture) ;;
-    focused-fast-search) command=(cargo "+$toolchain" test --locked --test c_api_test fast_search -- --nocapture) ;;
+    focused-materialization) command=(cargo "+$toolchain" test --locked --test scanner_materialization_fast_search_test materialization_ -- --nocapture) ;;
+    focused-fast-search) command=(cargo "+$toolchain" test --locked --test scanner_materialization_fast_search_test fast_search_ -- --nocapture) ;;
     focused-unit) command=(cargo "+$toolchain" test --locked --lib scanner_materialization_and_fast_search_setters_preserve_state_on_errors -- --nocapture) ;;
     all-rust) command=(cargo "+$toolchain" test --locked) ;;
     c-consumer) command=(cargo "+$toolchain" test --locked --test compile_and_run_test -- --ignored --nocapture test_c_compilation_and_execution) ;;
