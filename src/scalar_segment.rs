@@ -390,7 +390,7 @@ impl PreparedScalarSegment {
         // Do not truncate candidates at LIMIT. The reader evaluates the complete
         // filter before applying its existing limit/offset operators. Its explicit
         // fragment domain also bounds complement masks produced by NOT.
-        reader.with_row_addr_prefilter(result.upper);
+        reader.with_row_id_prefilter(result.upper);
         Ok(None)
     }
 }

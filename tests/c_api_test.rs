@@ -3830,6 +3830,8 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
         base_id: None,
         files: Vec::new(),
         covering_fields: Vec::new(),
+        clustering_id: None,
+        metadata: Default::default(),
     }
     .encode_to_vec();
     assert_eq!(
@@ -3855,6 +3857,8 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
         base_id: None,
         files: Vec::new(),
         covering_fields: Vec::new(),
+        clustering_id: None,
+        metadata: Default::default(),
     }
     .encode_to_vec();
     assert_eq!(
@@ -3883,6 +3887,8 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
         base_id: None,
         files: Vec::new(),
         covering_fields: Vec::new(),
+        clustering_id: None,
+        metadata: Default::default(),
     }
     .encode_to_vec();
     assert_eq!(
