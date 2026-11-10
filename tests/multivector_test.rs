@@ -12,6 +12,7 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, Int32Array, ListArray
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::io::RecordBatchStream;
 use lance_c::*;
 
 fn fixture() -> (tempfile::TempDir, CString) {
