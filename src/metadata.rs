@@ -14,8 +14,8 @@ use std::ffi::{CString, c_char};
 use std::future::IntoFuture;
 use std::ptr;
 
-use lance_core::datatypes::FieldRef;
 use lance_core::Result;
+use lance_core::datatypes::FieldRef;
 
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
@@ -277,10 +277,7 @@ pub unsafe extern "C" fn lance_dataset_field_id_count(
     ffi_try!(unsafe { field_id_count_inner(dataset, out_count) }, neg)
 }
 
-unsafe fn field_id_count_inner(
-    dataset: *const LanceDataset,
-    out_count: *mut usize,
-) -> Result<i32> {
+unsafe fn field_id_count_inner(dataset: *const LanceDataset, out_count: *mut usize) -> Result<i32> {
     if out_count.is_null() {
         return Err(lance_core::Error::invalid_input(
             "out_count must not be NULL",
@@ -346,9 +343,7 @@ unsafe fn resolve_field_id_inner(
     out_field_id: *mut i32,
 ) -> Result<i32> {
     if field.is_null() {
-        return Err(lance_core::Error::invalid_input(
-            "field must not be NULL",
-        ));
+        return Err(lance_core::Error::invalid_input("field must not be NULL"));
     }
     if out_field_id.is_null() {
         return Err(lance_core::Error::invalid_input(
@@ -406,13 +401,12 @@ unsafe fn parse_field_updates(
     let mut parsed = Vec::with_capacity(update_count);
     for index in 0..update_count {
         let update = unsafe { &*updates.add(index) };
-        let field = unsafe {
-            parse_field_reference(&update.field, &format!("updates[{index}].field"))?
-        };
+        let field =
+            unsafe { parse_field_reference(&update.field, &format!("updates[{index}].field"))? };
         let entries = unsafe { parse_metadata_entries(update.keys, update.values, update.count) }
             .map_err(|error| {
-                lance_core::Error::invalid_input(format!("updates[{index}]: {error}"))
-            })?;
+            lance_core::Error::invalid_input(format!("updates[{index}]: {error}"))
+        })?;
         let mode = LanceMetadataUpdateMode::from_raw(update.mode).map_err(|error| {
             lance_core::Error::invalid_input(format!("updates[{index}]: {error}"))
         })?;

@@ -6,13 +6,13 @@
 //! These tests call the `extern "C"` functions directly from Rust,
 //! validating the C API contract without needing a C compiler.
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::collections::BTreeMap;
 
 use arrow::ffi::from_ffi;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -3778,10 +3778,7 @@ struct TestFieldUpdate<'a> {
     mode: i32,
 }
 
-fn update_field_metadata_via_c(
-    dataset: *mut LanceDataset,
-    updates: &[TestFieldUpdate<'_>],
-) -> i32 {
+fn update_field_metadata_via_c(dataset: *mut LanceDataset, updates: &[TestFieldUpdate<'_>]) -> i32 {
     let paths: Vec<Option<CString>> = updates
         .iter()
         .map(|update| match update.field {
@@ -3872,7 +3869,9 @@ fn arrow_field_at_path<'a>(schema: &'a Schema, path: &str) -> &'a Field {
     }
 
     let segments = path.split('.').collect::<Vec<_>>();
-    let (first, remaining) = segments.split_first().expect("field path must not be empty");
+    let (first, remaining) = segments
+        .split_first()
+        .expect("field path must not be empty");
     let field = schema
         .field_with_name(*first)
         .unwrap_or_else(|_| panic!("missing field {first}"));
@@ -4051,15 +4050,9 @@ fn test_dataset_field_metadata_batch_matches_native_builder() {
     lance_c::runtime::block_on(async {
         native
             .update_field_metadata()
-            .update(
-                "profile.name",
-                [("stale", "old"), ("empty", "old")],
-            )
+            .update("profile.name", [("stale", "old"), ("empty", "old")])
             .unwrap()
-            .update(
-                score_field_id,
-                [("score", "old"), ("remove", "old")],
-            )
+            .update(score_field_id, [("score", "old"), ("remove", "old")])
             .unwrap()
             .await
             .unwrap();
@@ -4128,22 +4121,12 @@ fn test_dataset_field_metadata_batch_matches_native_builder() {
             .update_field_metadata()
             .update(
                 id_field_id,
-                [
-                    ("root", "first"),
-                    ("empty", ""),
-                    ("remove", "temporary"),
-                ],
+                [("root", "first"), ("empty", ""), ("remove", "temporary")],
             )
             .unwrap()
-            .replace(
-                "profile.name",
-                [("nested", "value"), ("empty", "")],
-            )
+            .replace("profile.name", [("nested", "value"), ("empty", "")])
             .unwrap()
-            .update(
-                score_field_id,
-                [("score", Some("1.5")), ("remove", None)],
-            )
+            .update(score_field_id, [("score", Some("1.5")), ("remove", None)])
             .unwrap()
             .update("id", [("root", "last")])
             .unwrap()
@@ -4240,9 +4223,7 @@ fn test_dataset_field_metadata_semantics_errors_and_snapshots() {
         mode: LanceMetadataUpdateMode::Merge as i32,
     }];
     assert_field_invalid_argument(
-        unsafe {
-            lance_dataset_update_field_metadata(writer, null_keys.as_ptr(), null_keys.len())
-        },
+        unsafe { lance_dataset_update_field_metadata(writer, null_keys.as_ptr(), null_keys.len()) },
         "keys must not be NULL",
     );
     let null_values = [LanceFieldMetadataUpdate {
@@ -4359,7 +4340,10 @@ fn test_dataset_field_metadata_semantics_errors_and_snapshots() {
         "{}",
         take_last_error_message()
     );
-    assert_eq!(unsafe { lance_dataset_version(writer) }, initial_version + 1);
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 1
+    );
     assert_eq!(
         field_metadata_via_c(writer, "id"),
         BTreeMap::from([
@@ -4391,7 +4375,10 @@ fn test_dataset_field_metadata_semantics_errors_and_snapshots() {
         "{}",
         take_last_error_message()
     );
-    assert_eq!(unsafe { lance_dataset_version(writer) }, initial_version + 2);
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 2
+    );
     assert_eq!(
         field_metadata_via_c(writer, "id"),
         BTreeMap::from([
@@ -4432,7 +4419,10 @@ fn test_dataset_field_metadata_semantics_errors_and_snapshots() {
         "{}",
         take_last_error_message()
     );
-    assert_eq!(unsafe { lance_dataset_version(writer) }, initial_version + 3);
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 3
+    );
     assert!(field_metadata_via_c(writer, "profile.name").is_empty());
     assert!(field_metadata_via_c(writer, "profile.score").is_empty());
     assert_eq!(
@@ -4664,11 +4654,7 @@ fn test_dataset_snapshot_inspection_matches_native() {
         .to_str()
         .unwrap()
         .to_string();
-    let legacy_schema = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int32,
-        false,
-    )]));
+    let legacy_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let legacy_batch = RecordBatch::try_new(
         legacy_schema.clone(),
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
