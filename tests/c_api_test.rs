@@ -401,7 +401,7 @@ fn create_ordering_dataset() -> (tempfile::TempDir, String) {
         let mut dataset = Dataset::open(&uri).await.unwrap();
         dataset
             .append(
-                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
                 None,
             )
             .await
