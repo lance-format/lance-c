@@ -332,7 +332,9 @@ fn reorder_taken_batch(batch: RecordBatch, reorder: &UInt32Array) -> Result<Reco
             &options,
         )?);
     }
-    Ok(arrow::compute::take::take_record_batch(&batch, reorder)?)
+    Ok(arrow::compute::kernels::take::take_record_batch(
+        &batch, reorder,
+    )?)
 }
 
 /// Take fragment-local logical rows by index.

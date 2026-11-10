@@ -4751,7 +4751,7 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
         &fragment_projection(&native_fragment, None),
     ))
     .unwrap();
-    let expected_reordered = arrow::compute::take::take_record_batch(
+    let expected_reordered = arrow::compute::kernels::take::take_record_batch(
         &native_unique,
         &UInt32Array::from(vec![1_u32, 0, 1]),
     )
@@ -4798,7 +4798,7 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
         &fragment_projection(&native_fragment, Some(&column_names)),
     ))
     .unwrap();
-    let expected_nested_reordered = arrow::compute::take::take_record_batch(
+    let expected_nested_reordered = arrow::compute::kernels::take::take_record_batch(
         &native_nested_unique,
         &UInt32Array::from(vec![1_u32, 0, 1]),
     )
