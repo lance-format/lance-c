@@ -3380,6 +3380,10 @@ static void test_fragment_read_operations(const char *uri) {
     LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
     ASSERT(ds != NULL, "fragment read fixture open failed");
     CHECK_OK();
+    bool stable_row_ids = false;
+    ASSERT(lance_dataset_has_stable_row_ids(ds, &stable_row_ids) == 0,
+           "fragment read stable-row-ID inspection failed");
+    ASSERT(stable_row_ids, "fragment read fixture must use stable row IDs");
     uint64_t ids[2] = {0, 0};
     ASSERT(lance_dataset_fragment_ids(ds, ids) == 0,
            "fragment read enumeration failed");
@@ -3531,10 +3535,10 @@ static void test_fragment_read_operations(const char *uri) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 7) {
+    if (argc < 8) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
-                "<session_uri> <fragment_uri>\n",
+                "<session_uri> <fragment_uri> <fragment_read_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -3545,6 +3549,7 @@ int main(int argc, char **argv) {
     const char *ordering_uri = argv[4];
     const char *session_uri = argv[5];
     const char *fragment_uri = argv[6];
+    const char *fragment_read_uri = argv[7];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
@@ -3559,7 +3564,7 @@ int main(int argc, char **argv) {
     test_scan_with_row_addr_lists(uri);
     test_scanner_order_by(ordering_uri);
     test_fragment_snapshot(fragment_uri);
-    test_fragment_read_operations(fragment_uri);
+    test_fragment_read_operations(fragment_read_uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_versions(uri);

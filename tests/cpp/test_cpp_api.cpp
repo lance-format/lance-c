@@ -2819,6 +2819,7 @@ static void test_fragment_read_operations(const std::string& uri) {
     TEST(test_fragment_read_operations);
 
     auto latest = lance::Dataset::open(uri);
+    assert(latest.has_stable_row_ids());
     auto ids = latest.fragment_ids();
     assert(ids.size() == 2);
     auto fragment = latest.open_fragment(ids[0]);
@@ -2917,10 +2918,10 @@ static void test_fragment_read_operations(const std::string& uri) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 7) {
+    if (argc < 8) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
-                "<session_uri> <fragment_uri>\n",
+                "<session_uri> <fragment_uri> <fragment_read_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -2931,6 +2932,7 @@ int main(int argc, char** argv) {
     std::string ordering_uri(argv[4]);
     std::string session_uri(argv[5]);
     std::string fragment_uri(argv[6]);
+    std::string fragment_read_uri(argv[7]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -2942,7 +2944,7 @@ int main(int argc, char** argv) {
     test_scanner_projection(uri);
     test_scanner_order_by(ordering_uri);
     test_fragment_snapshots(fragment_uri);
-    test_fragment_read_operations(fragment_uri);
+    test_fragment_read_operations(fragment_read_uri);
     test_scanner_row_addr_lists(uri);
     test_distance_range(uri);
     test_scanner_async_stream_ownership(uri);

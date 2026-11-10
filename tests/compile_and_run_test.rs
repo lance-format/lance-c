@@ -339,7 +339,7 @@ fn create_ordering_dataset_on_disk() -> (tempfile::TempDir, String) {
 /// Create a three-version, two-fragment dataset with nested schema and one
 /// deleted row in each fragment. Version 2 is the multi-fragment state before
 /// deletion; version 3 adds the deletion files.
-fn create_fragment_dataset_on_disk() -> (tempfile::TempDir, String) {
+fn create_fragment_dataset_on_disk(enable_stable_row_ids: bool) -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().join("fragment_ds").to_str().unwrap().to_string();
 
@@ -394,7 +394,7 @@ fn create_fragment_dataset_on_disk() -> (tempfile::TempDir, String) {
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
             &uri,
             Some(WriteParams {
-                enable_stable_row_ids: true,
+                enable_stable_row_ids,
                 ..Default::default()
             }),
         )
@@ -549,8 +549,9 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
 
 /// Run a compiled test binary with the source dataset URI, a destination URI
 /// for the write test, the Blob v2 and ordering datasets, the indexed session
-/// cache dataset and the nested-schema fragment-deletion dataset. The
+/// cache dataset and separate non-stable/stable fragment-deletion datasets. The
 /// destination path must not pre-exist.
+#[allow(clippy::too_many_arguments)]
 fn run_test_binary(
     binary: &Path,
     dataset_uri: &str,
@@ -559,6 +560,7 @@ fn run_test_binary(
     ordering_uri: &str,
     session_uri: &str,
     fragment_uri: &str,
+    fragment_read_uri: &str,
 ) {
     let output = Command::new(binary)
         .arg(dataset_uri)
@@ -567,6 +569,7 @@ fn run_test_binary(
         .arg(ordering_uri)
         .arg(session_uri)
         .arg(fragment_uri)
+        .arg(fragment_read_uri)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -621,7 +624,8 @@ fn test_c_compilation_and_execution() {
     let (_blob_tmp, blob_uri) = create_blob_dataset_on_disk();
     let (_ordering_tmp, ordering_uri) = create_ordering_dataset_on_disk();
     let (_session_tmp, session_uri) = create_session_cache_dataset_on_disk();
-    let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk();
+    let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk(false);
+    let (_fragment_read_tmp, fragment_read_uri) = create_fragment_dataset_on_disk(true);
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -643,6 +647,7 @@ fn test_c_compilation_and_execution() {
         &ordering_uri,
         &session_uri,
         &fragment_uri,
+        &fragment_read_uri,
     );
 }
 
@@ -660,7 +665,8 @@ fn test_cpp_compilation_and_execution() {
     let (_blob_tmp, blob_uri) = create_blob_dataset_on_disk();
     let (_ordering_tmp, ordering_uri) = create_ordering_dataset_on_disk();
     let (_session_tmp, session_uri) = create_session_cache_dataset_on_disk();
-    let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk();
+    let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk(false);
+    let (_fragment_read_tmp, fragment_read_uri) = create_fragment_dataset_on_disk(true);
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -682,6 +688,7 @@ fn test_cpp_compilation_and_execution() {
         &ordering_uri,
         &session_uri,
         &fragment_uri,
+        &fragment_read_uri,
     );
 }
 
