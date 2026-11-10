@@ -82,8 +82,11 @@ do
     fi
 done
 
-[[ "$(git rev-parse HEAD^)" == "$PRODUCT_COMMIT" ]] \
-    || fail "validation parent is not the expected product commit"
+git merge-base --is-ancestor "$PRODUCT_COMMIT" HEAD \
+    || fail "validation checkout does not contain the expected product commit"
+validation_only_changes="$(git diff --name-only "$PRODUCT_COMMIT" HEAD)"
+[[ "$validation_only_changes" == "scripts/validate_fragment_scan_take_count.sh" ]] \
+    || fail "validation commit changed product files: $validation_only_changes"
 git merge-base --is-ancestor "$BASE_COMMIT" "$PRODUCT_COMMIT" \
     || fail "product commit does not descend from the accepted base"
 git diff --exit-code "$BASE_COMMIT" "$PRODUCT_COMMIT" -- Cargo.toml Cargo.lock \
