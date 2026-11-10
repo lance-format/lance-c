@@ -13,7 +13,6 @@ use std::ptr;
 
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
-use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment;
 use lance_core::datatypes::Schema as LanceSchema;
@@ -304,43 +303,14 @@ fn fragment_take_projection(
     }
 }
 
-fn prepare_take_indices(indices: &[u32]) -> (Vec<u32>, Option<UInt32Array>) {
-    let mut native_indices = indices.to_vec();
-    native_indices.sort_unstable();
-    native_indices.dedup();
-    if native_indices == indices {
-        return (native_indices, None);
-    }
-
-    let reorder = indices
-        .iter()
-        .map(|index| {
-            native_indices
-                .binary_search(index)
-                .expect("every requested index remains in the normalized set") as u32
-        })
-        .collect::<Vec<_>>();
-    (native_indices, Some(UInt32Array::from(reorder)))
-}
-
-fn reorder_taken_batch(batch: RecordBatch, reorder: &UInt32Array) -> Result<RecordBatch> {
-    Ok(arrow::compute::kernels::take::take_record_batch(
-        &batch, reorder,
-    )?)
-}
-
 /// Take fragment-local logical rows by index.
 ///
 /// `indices` address logical rows in this fragment after deletion vectors are
 /// resolved. They are not dataset `_rowid` values or physical row addresses.
-/// Input order and duplicates are preserved, and an out-of-range logical index
-/// returns the native range error.
-///
-/// Lance 14.0.2's v2 decoder requires strictly increasing indices. The binding
-/// therefore calls native `FileFragment::take` once with the sorted unique set,
-/// then restores the requested order and duplicates with Arrow take. Deletion
-/// resolution, range validation, projection, and JSON conversion stay in the
-/// native fragment take path.
+/// Indices are forwarded unchanged to native `FileFragment::take`. Deletion
+/// resolution, supported index ordering, duplicate handling, range validation,
+/// projection, and JSON conversion follow the selected core. Lance 14.0.2's
+/// v2 decoder can reject unsorted or duplicate indices.
 ///
 /// `columns` is a NULL-terminated array. NULL selects the fragment's full
 /// logical schema. A non-NULL array whose first entry is NULL is passed to
@@ -388,12 +358,7 @@ unsafe fn fragment_take_inner(
     let columns = unsafe { helpers::parse_c_string_array(columns)? };
     let projection = fragment_take_projection(fragment, columns.as_deref())?;
 
-    let (native_indices, reorder) = prepare_take_indices(indices);
-    let batch = block_on(fragment.inner.take(&native_indices, &projection))?;
-    let batch = match &reorder {
-        Some(reorder) => reorder_taken_batch(batch, reorder)?,
-        None => batch,
-    };
+    let batch = block_on(fragment.inner.take(indices, &projection))?;
     let schema = batch.schema();
     let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
     let ffi_stream = guarded_ffi_stream_from_reader(reader)?;

@@ -779,6 +779,7 @@ public:
     Scanner scan() const;
 
     /// Take fragment-local logical rows by index with an explicit projection.
+    /// Indices retain the selected core's ordering and duplicate constraints.
     /// `out` is caller-owned and its non-null `release` must be called exactly
     /// once. An empty `columns` vector is an explicit empty projection.
     void take(const uint32_t* indices, size_t num_indices,

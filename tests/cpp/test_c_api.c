@@ -2631,26 +2631,26 @@ static void test_fragment_read_operations(const char *uri) {
     ASSERT(message != NULL, "empty fragment filter must set an error");
     lance_free_string(message);
 
-    const uint32_t indices[] = {2, 0, 2};
-    const int32_t expected[] = {3, 0, 3};
+    const uint32_t indices[] = {0, 2};
+    const int32_t expected[] = {0, 3};
     struct ArrowArrayStream stream = {0};
     ASSERT(lance_fragment_take(
-               fragment, indices, 3, NULL, &stream) == 0,
+               fragment, indices, 2, NULL, &stream) == 0,
            "fragment take full projection failed");
     CHECK_OK();
     check_fragment_take_ids(
-        &stream, "fragment take must preserve order and duplicates",
-        expected, 3, 0);
+        &stream, "fragment take logical offsets",
+        expected, 2, 0);
 
     const char *nested_columns[] = {"id", "profile.name", "meta", NULL};
     memset(&stream, 0, sizeof(stream));
     ASSERT(lance_fragment_take(
-               fragment, indices, 3, nested_columns, &stream) == 0,
+               fragment, indices, 2, nested_columns, &stream) == 0,
            "fragment take nested projection failed");
     CHECK_OK();
     check_fragment_take_ids(
         &stream, "fragment take nested projection rows",
-        expected, 3, 1);
+        expected, 2, 1);
 
     const char *empty_columns[] = {NULL};
     const uint32_t one_index[] = {0};

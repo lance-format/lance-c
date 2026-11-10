@@ -2268,18 +2268,18 @@ static void test_fragment_read_operations(const std::string& uri) {
     }
     assert(caught);
 
-    std::vector<uint32_t> indices{2, 0, 2};
+    std::vector<uint32_t> indices{0, 2};
     ArrowArrayStream stream;
     memset(&stream, 0, sizeof(stream));
     fragment.take(indices.data(), indices.size(), &stream);
     assert((read_fragment_take_ids(stream, false) ==
-            std::vector<int32_t>{3, 0, 3}));
+            std::vector<int32_t>{0, 3}));
 
     std::vector<std::string> columns{"id", "profile.name", "meta"};
     memset(&stream, 0, sizeof(stream));
     fragment.take(indices.data(), indices.size(), columns, &stream);
     assert((read_fragment_take_ids(stream, true) ==
-            std::vector<int32_t>{3, 0, 3}));
+            std::vector<int32_t>{0, 3}));
 
     std::vector<std::string> empty_columns;
     std::vector<uint32_t> one_index{0};

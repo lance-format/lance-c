@@ -4744,23 +4744,16 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
     let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
     let native_fragment = native.get_fragment(ids[0] as usize).unwrap();
 
-    let indices = [2_u32, 0, 2];
+    let indices = [0_u32, 2];
     let (schema, batches) = take_fragment_via_c(fragment, Some(&indices), None);
-    let native_indices = [0_u32, 2];
-    let native_unique = lance_c::runtime::block_on(native_fragment.take(
-        &native_indices,
-        &fragment_projection(&native_fragment, None),
-    ))
-    .unwrap();
-    let expected_reordered = arrow::compute::kernels::take::take_record_batch(
-        &native_unique,
-        &UInt32Array::from(vec![1_u32, 0, 1]),
+    let native_unique = lance_c::runtime::block_on(
+        native_fragment.take(&indices, &fragment_projection(&native_fragment, None)),
     )
     .unwrap();
     assert_eq!(schema, *native_unique.schema());
     assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0], expected_reordered);
-    assert_eq!(fragment_id_values(&batches), vec![3, 0, 3]);
+    assert_eq!(batches[0], native_unique);
+    assert_eq!(fragment_id_values(&batches), vec![0, 3]);
     let names = batches[0]
         .column_by_name("profile")
         .unwrap()
@@ -4776,7 +4769,7 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
         (0..names.len())
             .map(|row| (!names.is_null(row)).then(|| names.value(row)))
             .collect::<Vec<_>>(),
-        vec![Some("d"), Some("a"), Some("d")]
+        vec![Some("a"), Some("d")]
     );
     let batch_schema = batches[0].schema();
     assert_eq!(
@@ -4799,18 +4792,13 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
     let (nested_schema, nested_batches) =
         take_fragment_via_c(fragment, Some(&indices), Some(columns.as_slice()));
     let native_nested_unique = lance_c::runtime::block_on(native_fragment.take(
-        &native_indices,
+        &indices,
         &fragment_projection(&native_fragment, Some(&column_names)),
     ))
     .unwrap();
-    let expected_nested_reordered = arrow::compute::kernels::take::take_record_batch(
-        &native_nested_unique,
-        &UInt32Array::from(vec![1_u32, 0, 1]),
-    )
-    .unwrap();
     assert_eq!(nested_schema, *native_nested_unique.schema());
     assert_eq!(nested_batches.len(), 1);
-    assert_eq!(nested_batches[0], expected_nested_reordered);
+    assert_eq!(nested_batches[0], native_nested_unique);
     assert_eq!(nested_schema.fields().len(), 3);
     let DataType::Struct(profile_fields) = nested_schema.field(1).data_type() else {
         panic!("profile projection must remain a struct");
@@ -4822,7 +4810,39 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
             .collect::<Vec<_>>(),
         vec!["name"]
     );
-    assert_eq!(fragment_id_values(&nested_batches), vec![3, 0, 3]);
+    assert_eq!(fragment_id_values(&nested_batches), vec![0, 3]);
+
+    // Compare the same inputs with the public Rust operation, including its
+    // decoder-specific failures for unsorted or duplicate offsets.
+    for indices in [[2_u32, 0], [0_u32, 0]] {
+        let native_result = lance_c::runtime::block_on(
+            native_fragment.take(&indices, &fragment_projection(&native_fragment, None)),
+        );
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let rc = unsafe {
+            lance_fragment_take(
+                fragment,
+                indices.as_ptr(),
+                indices.len(),
+                ptr::null(),
+                &mut stream,
+            )
+        };
+        match native_result {
+            Ok(expected) => {
+                assert_eq!(rc, 0, "{indices:?}");
+                let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+                let actual = reader.collect::<std::result::Result<Vec<_>, _>>().unwrap();
+                assert_eq!(actual, vec![expected]);
+            }
+            Err(error) => {
+                assert_eq!(rc, -1, "{indices:?}");
+                assert!(stream.release.is_none());
+                let message = take_last_error_message();
+                assert!(message.contains(&error.to_string()), "{message}");
+            }
+        }
+    }
 
     let empty_indices: Option<&[u32]> = None;
     let (empty_schema, empty_batches) = take_fragment_via_c(fragment, empty_indices, None);
