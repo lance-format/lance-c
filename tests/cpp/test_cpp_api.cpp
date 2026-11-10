@@ -1547,15 +1547,152 @@ static void test_batch_nearest(const std::string& uri) {
     PASS();
 }
 
+static std::vector<int32_t> collect_ordering_ids(ArrowArrayStream& stream) {
+    ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    assert(stream.get_schema(&stream, &schema) == 0);
+    int id_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (strcmp(schema.children[i]->name, "id") == 0) id_column = static_cast<int>(i);
+    }
+    assert(id_column >= 0);
+    assert(strcmp(schema.children[id_column]->format, "i") == 0);
+    if (schema.release) schema.release(&schema);
+
+    std::vector<int32_t> ids;
+    while (true) {
+        ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        assert(stream.get_next(&stream, &array) == 0);
+        if (!array.release) break;
+        const auto* values = static_cast<const int32_t*>(
+            array.children[id_column]->buffers[1]);
+        const auto offset = array.children[id_column]->offset;
+        for (int64_t i = 0; i < array.length; ++i) {
+            ids.push_back(values[offset + i]);
+        }
+        array.release(&array);
+    }
+    if (stream.release) stream.release(&stream);
+    return ids;
+}
+
+static std::vector<int32_t> scan_ordering_ids(lance::Scanner& scanner) {
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    return collect_ordering_ids(stream);
+}
+
+static void test_scanner_order_by(const std::string& uri) {
+    TEST(test_scanner_order_by);
+
+    auto ds = lance::Dataset::open(uri);
+    std::vector<lance::ColumnOrdering> ordering = {
+        {"category", LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_FIRST},
+        {"rank", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+        {"id", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+    };
+    const std::vector<int32_t> expected =
+        {11, 8, 0, 4, 6, 1, 9, 2, 3, 7, 10, 5};
+
+    {
+        auto scanner = ds.scan();
+        auto copied = ordering;
+        scanner.order_by(copied);
+        // The C ABI copies the names; later caller mutation must not matter.
+        copied[0].column_name = "junk";
+        assert(scan_ordering_ids(scanner) == expected);
+        bool caught = false;
+        try {
+            scanner.order_by(std::nullopt);
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::string(error.what()).find(
+                       "order_by must be set before the scan starts") !=
+                   std::string::npos);
+        }
+        assert(caught);
+    }
+
+    {
+        auto scanner = ds.scan();
+        scanner.order_by(ordering);
+        bool caught = false;
+        try {
+            scanner.order_by(std::vector<lance::ColumnOrdering>{
+                {"rank", static_cast<LanceOrderDirection>(7),
+                 LANCE_ORDER_NULLS_LAST},
+            });
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::string(error.what()).find("order_by direction") !=
+                   std::string::npos);
+        }
+        assert(caught);
+        // The rejected call retained the previous ordering.
+        assert(scan_ordering_ids(scanner) == expected);
+    }
+
+    std::vector<int32_t> unordered;
+    {
+        auto scanner = ds.scan();
+        unordered = scan_ordering_ids(scanner);
+    }
+    {
+        auto scanner = ds.scan();
+        scanner.order_by(ordering).order_by(std::nullopt);
+        assert(scan_ordering_ids(scanner) == unordered);
+    }
+    {
+        auto scanner = ds.scan();
+        scanner.order_by(ordering).order_by(
+            std::vector<lance::ColumnOrdering>{});
+        assert(scan_ordering_ids(scanner) == unordered);
+    }
+    {
+        auto scanner = ds.scan();
+        scanner.order_by(ordering).offset(2).limit(4);
+        assert((scan_ordering_ids(scanner) ==
+                std::vector<int32_t>{0, 4, 6, 1}));
+    }
+
+    {
+        auto scanner = ds.scan();
+        bool caught = false;
+        try {
+            scanner.order_by(std::vector<lance::ColumnOrdering>{
+                {"missing", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+            });
+            ArrowArrayStream stream;
+            memset(&stream, 0, sizeof(stream));
+            scanner.to_arrow_stream(&stream);
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::string(error.what()).find("Column missing not found") !=
+                   std::string::npos);
+        }
+        assert(caught);
+    }
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
+    if (argc < 5) {
+        fprintf(stderr,
+                "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri>\n",
+                argv[0]);
         return 1;
     }
 
     std::string uri(argv[1]);
     std::string write_uri(argv[2]);
     std::string blob_uri(argv[3]);
+    std::string ordering_uri(argv[4]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -1563,6 +1700,7 @@ int main(int argc, char** argv) {
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
     test_scanner_projection_filter(uri);
+    test_scanner_order_by(ordering_uri);
     test_scanner_row_addr_lists(uri);
     test_distance_range(uri);
     test_scanner_async_stream_ownership(uri);
