@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly PRODUCT_COMMIT="0658493e12e1176510fe7e97b6a1c389a2868b2c"
+readonly PRODUCT_COMMIT="0fef84bb2f9441f88a29b202043c45b5084c6f51"
 readonly BASE_COMMIT="684fabc5aff9954b09a5a57fefd255678a35b7c5"
 readonly NATIVE_COMMIT="40f15ed1b71b66950961b175829fdf17a763f108"
 readonly CARGO_TOOLCHAIN="1.94.0"
-readonly EVIDENCE_DIR="${EVIDENCE_DIR:-/home/xuanwo/Code/validation-evidence/lance-c/native-fragment-scan-take-count-0658493e12e1}"
+readonly EVIDENCE_DIR="${EVIDENCE_DIR:-/home/xuanwo/Code/validation-evidence/lance-c/native-fragment-scan-take-count-0fef84bb2f94}"
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
