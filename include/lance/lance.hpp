@@ -891,6 +891,13 @@ public:
     /// Create a Scanner builder for this dataset.
     Scanner scan() const;
 
+    /// Create a Scanner builder with a column projection and primary SQL
+    /// filter. An empty `columns` selects every column, and an empty `filter`
+    /// disables filtering; both are forwarded to the C API as NULL. Invalid
+    /// projections or filters are reported when the scanner is materialized.
+    Scanner scan(const std::vector<std::string>& columns,
+                 const std::string& filter = "") const;
+
     /// Compatibility wrapper for an OR Match query.
     [[deprecated("Use prepare_fts_match_query() to select the Match operator")]]
     FtsQueryContext prepare_fts_query(
@@ -1797,7 +1804,20 @@ public:
 };
 
 inline Scanner Dataset::scan() const {
-    auto* s = lance_scanner_new(handle_.get(), nullptr, nullptr);
+    return scan({}, "");
+}
+
+inline Scanner Dataset::scan(const std::vector<std::string>& columns,
+                             const std::string& filter) const {
+    std::vector<const char*> col_ptrs;
+    col_ptrs.reserve(columns.size() + 1);
+    for (const auto& column : columns) col_ptrs.push_back(column.c_str());
+    col_ptrs.push_back(nullptr);
+
+    auto* s = lance_scanner_new(
+        handle_.get(),
+        columns.empty() ? nullptr : col_ptrs.data(),
+        filter.empty() ? nullptr : filter.c_str());
     if (!s) check_error();
     return Scanner(s);
 }
