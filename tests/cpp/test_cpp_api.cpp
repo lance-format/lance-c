@@ -1383,7 +1383,7 @@ static void test_alter_columns(const std::string& dst_uri) {
 }
 
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
-// exercises `Dataset::drop_columns`. Drops `name` and `embedding` so the
+// exercises `Dataset::drop_columns`. Drops `name`, `embedding` and `score` so the
 // dataset is left with `id` only; subsequent tests (`compact_files`, `delete_rows`)
 // do not reference any dropped column. Must run after `test_update` /
 // `test_merge_insert`.
@@ -1394,7 +1394,7 @@ static void test_drop_columns(const std::string& dst_uri) {
     uint64_t before_rows = ds.count_rows();
     uint64_t v_before = ds.version();
 
-    ds.drop_columns({"name", "embedding"});
+    ds.drop_columns({"name", "embedding", "score"});
     assert(ds.count_rows() == before_rows
            && "metadata-only drop must preserve row count");
     assert(ds.version() > v_before

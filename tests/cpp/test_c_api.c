@@ -1139,8 +1139,8 @@ static void test_drop_columns(const char *write_uri) {
     int64_t fields_before = schema_before.n_children;
     if (schema_before.release) schema_before.release(&schema_before);
 
-    const char *cols[] = {"name", "embedding"};
-    rc = lance_dataset_drop_columns(ds, cols, 2);
+    const char *cols[] = {"name", "embedding", "score"};
+    rc = lance_dataset_drop_columns(ds, cols, 3);
     ASSERT(rc == 0, "drop_columns failed");
     uint64_t after_rows = lance_dataset_count_rows(ds);
     CHECK_OK();
@@ -1149,8 +1149,8 @@ static void test_drop_columns(const char *write_uri) {
     ASSERT(lance_dataset_version(ds) > v_before,
            "drop_columns must bump the version");
 
-    /* Schema field count must have decreased by exactly 2. The C-test
-     * fixture has 3 columns (`id`, `name`, `embedding`) — assert `fields_after == 1`
+    /* Schema field count must have decreased by exactly 3. The C-test
+     * fixture has 4 columns (`id`, `name`, `score`, `embedding`) — assert `fields_after == 1`
      * so this self-documents the post-drop expectation and trips if the
      * fixture ever grows additional columns. Release the exported
      * schema before any assertion so we never leak it on failure. */
@@ -1160,8 +1160,8 @@ static void test_drop_columns(const char *write_uri) {
     ASSERT(rc == 0, "schema export failed after drop");
     int64_t fields_after = schema_after.n_children;
     if (schema_after.release) schema_after.release(&schema_after);
-    ASSERT(fields_after == fields_before - 2,
-           "schema field count must decrease by 2 after drop");
+    ASSERT(fields_after == fields_before - 3,
+           "schema field count must decrease by 3 after drop");
     ASSERT(fields_after == 1,
            "C-test fixture should be left with `id` only after dropping columns");
 
