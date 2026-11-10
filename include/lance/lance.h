@@ -1300,8 +1300,9 @@ typedef enum {
  * `early_except_column_count` column paths to exclude from early materialization.
  * Passing a NULL array with count 0 is an explicit empty exception list, so all
  * columns are early. Lance resolves the names against the dataset schema at call
- * time, including nested paths, and rejects missing names. The strings and array
- * are copied; the caller may release them when this function returns.
+ * time, including nested paths. Resolution and validation follow Lance's native
+ * schema projection. The strings and array are copied; the caller may release
+ * them when this function returns.
  *
  * For HEURISTIC, ALL_LATE, and ALL_EARLY, the column count must be 0. Other style
  * values are rejected. A rejected call leaves the previous style unchanged.
