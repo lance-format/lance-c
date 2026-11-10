@@ -847,6 +847,122 @@ static void test_data_statistics(const char *write_uri) {
     printf("fields=%llu... OK\n", (unsigned long long)n);
 }
 
+/* Exercises native table/schema metadata reads and updates through the C API,
+ * including removal, empty values, replace/clear and reopen persistence. */
+static void test_dataset_metadata(const char *write_uri) {
+    printf("  test_dataset_metadata... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "metadata test dataset open failed");
+
+    uint64_t version_before = lance_dataset_version(ds);
+    CHECK_OK();
+
+    const char *initial = lance_dataset_metadata_json(ds);
+    ASSERT(initial != NULL, "initial metadata JSON must not be NULL");
+    ASSERT(strcmp(initial, "{}") == 0, "newly written dataset should have empty table metadata");
+    lance_free_string(initial);
+
+    const char *keys[] = {"owner", "empty", "remove"};
+    const char *values[] = {"c-consumer", "", "temporary"};
+    const char *updated = lance_dataset_update_metadata_json(
+        ds, keys, values, 3, LANCE_METADATA_UPDATE_MERGE);
+    ASSERT(updated != NULL, "table metadata merge failed");
+    ASSERT(strstr(updated, "\"owner\":\"c-consumer\"") != NULL,
+           "merged owner missing");
+    ASSERT(strstr(updated, "\"empty\":\"\"") != NULL,
+           "empty string must remain a real value");
+    lance_free_string(updated);
+
+    const char *delete_keys[] = {"remove"};
+    const char *delete_values[] = {NULL};
+    updated = lance_dataset_update_metadata_json(
+        ds, delete_keys, delete_values, 1, LANCE_METADATA_UPDATE_MERGE);
+    ASSERT(updated != NULL, "table metadata removal failed");
+    ASSERT(strstr(updated, "\"remove\"") == NULL,
+           "NULL value must remove the key");
+    lance_free_string(updated);
+
+    const char *schema_keys[] = {"schema-owner", "shared"};
+    const char *schema_values[] = {"c-consumer", "schema"};
+    const char *schema_updated = lance_dataset_update_schema_metadata_json(
+        ds, schema_keys, schema_values, 2, LANCE_METADATA_UPDATE_MERGE);
+    ASSERT(schema_updated != NULL, "schema metadata merge failed");
+    ASSERT(strstr(schema_updated, "\"schema-owner\":\"c-consumer\"") != NULL,
+           "updated schema metadata missing");
+    lance_free_string(schema_updated);
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0, "schema export failed");
+    ASSERT(schema.metadata != NULL, "Arrow schema must expose schema metadata");
+    if (schema.release) schema.release(&schema);
+
+    const char *table = lance_dataset_metadata_json(ds);
+    ASSERT(table != NULL, "table metadata read failed");
+    ASSERT(strstr(table, "\"schema-owner\"") == NULL,
+           "schema metadata update must not change table metadata");
+    lance_free_string(table);
+
+    const char *cleared = lance_dataset_update_metadata_json(
+        ds, NULL, NULL, 0, LANCE_METADATA_UPDATE_REPLACE);
+    ASSERT(cleared != NULL, "table metadata clear failed");
+    ASSERT(strcmp(cleared, "{}") == 0,
+           "empty replacement must clear the table metadata map");
+    lance_free_string(cleared);
+
+    const char *persist_keys[] = {"persist"};
+    const char *persist_values[] = {"yes"};
+    updated = lance_dataset_update_metadata_json(
+        ds, persist_keys, persist_values, 1, LANCE_METADATA_UPDATE_MERGE);
+    ASSERT(updated != NULL, "persistent table metadata update failed");
+    lance_free_string(updated);
+
+    schema_updated = lance_dataset_update_schema_metadata_json(
+        ds, NULL, NULL, 0, LANCE_METADATA_UPDATE_REPLACE);
+    ASSERT(schema_updated != NULL, "schema metadata clear failed");
+    ASSERT(strcmp(schema_updated, "{}") == 0,
+           "empty replacement must clear schema metadata");
+    lance_free_string(schema_updated);
+    ASSERT(lance_dataset_version(ds) > version_before,
+           "metadata updates must advance the dataset version");
+
+    /* Invalid inputs fail without changing the committed metadata. */
+    ASSERT(lance_dataset_metadata_json(NULL) == NULL,
+           "NULL dataset metadata read must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL dataset metadata read must return INVALID_ARGUMENT");
+    ASSERT(lance_dataset_update_metadata_json(
+               ds, NULL, persist_values, 1, LANCE_METADATA_UPDATE_MERGE) == NULL,
+           "NULL keys must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL keys must return INVALID_ARGUMENT");
+    ASSERT(lance_dataset_update_metadata_json(
+               ds, persist_keys, NULL, 1, LANCE_METADATA_UPDATE_MERGE) == NULL,
+           "NULL values array must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL values array must return INVALID_ARGUMENT");
+    ASSERT(lance_dataset_update_metadata_json(
+               ds, persist_keys, persist_values, 1,
+               (LanceMetadataUpdateMode)99) == NULL,
+           "invalid update mode must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid update mode must return INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+
+    ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "metadata test reopen failed");
+    const char *reopened = lance_dataset_metadata_json(ds);
+    ASSERT(reopened != NULL, "reopened metadata read failed");
+    ASSERT(strstr(reopened, "\"persist\":\"yes\"") != NULL,
+           "table metadata must persist across reopen");
+    lance_free_string(reopened);
+    lance_dataset_close(ds);
+
+    printf("OK\n");
+}
+
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_update`. Must run before `test_delete`, which
  * empties the dataset. */
@@ -2185,6 +2301,7 @@ int main(int argc, char **argv) {
     test_commit_index_segments(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_data_statistics(write_uri);
+    test_dataset_metadata(write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);
