@@ -3413,13 +3413,18 @@ fn test_tag_lifecycle_metadata_conflicts_and_persistence() {
 }
 
 #[test]
-fn test_tag_missing_metadata_matches_empty_metadata() {
+fn test_tag_optional_fields_match_native_defaults() {
     let (_tmp, uri) = create_two_version_dataset();
     let tag_dir = std::path::Path::new(&uri).join("_refs/tags");
     std::fs::create_dir_all(&tag_dir).unwrap();
     std::fs::write(
         tag_dir.join("legacy.json"),
-        "{\"branch\":null,\"version\":1,\"createdAt\":\"2024-01-01T00:00:00Z\",\"updatedAt\":\"2024-01-01T00:00:00Z\",\"manifestSize\":123}",
+        "{\"branch\":null,\"version\":1,\"manifestSize\":123}",
+    )
+    .unwrap();
+    std::fs::write(
+        tag_dir.join("branch-bound.json"),
+        "{\"branch\":\"feature\",\"version\":1,\"manifestSize\":123,\"metadata\":{}}",
     )
     .unwrap();
 
@@ -3429,8 +3434,32 @@ fn test_tag_missing_metadata_matches_empty_metadata() {
     let tag = unsafe { lance_dataset_tag_get(ds, c_str("legacy").as_ptr()) };
     assert!(!tag.is_null());
     assert_eq!(unsafe { lance_tag_metadata_count(tag) }, 0);
+    let mut created_at = 0;
+    let mut updated_at = 0;
+    assert_eq!(unsafe { lance_tag_created_at_ns(tag, &mut created_at) }, 0);
+    assert_eq!(unsafe { lance_tag_updated_at_ns(tag, &mut updated_at) }, 0);
+    let mut branch = std::ptr::null();
+    assert_eq!(unsafe { lance_tag_branch(tag, &mut branch) }, 0);
+    assert!(branch.is_null());
     assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
     unsafe { lance_tag_close(tag) };
+
+    let branch_tag = unsafe { lance_dataset_tag_get(ds, c_str("branch-bound").as_ptr()) };
+    assert!(!branch_tag.is_null());
+    let mut branch: *const c_char = std::ptr::null();
+    assert_eq!(
+        unsafe { lance_tag_branch(branch_tag, &mut branch) },
+        1,
+        "an explicit native branch must remain present"
+    );
+    assert!(!branch.is_null());
+    assert_eq!(
+        unsafe { std::ffi::CStr::from_ptr(branch) }
+            .to_str()
+            .unwrap(),
+        "feature"
+    );
+    assert_eq!(unsafe { lance_tag_metadata_count(branch_tag) }, 0);
 
     // An explicitly empty map is observationally identical to the missing
     // field, matching native TagContents deserialization.
@@ -3443,6 +3472,7 @@ fn test_tag_missing_metadata_matches_empty_metadata() {
     assert_eq!(unsafe { lance_tag_metadata_count(tag) }, 0);
     assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
     unsafe {
+        lance_tag_close(branch_tag);
         lance_tag_close(tag);
         lance_dataset_close(ds);
     }
