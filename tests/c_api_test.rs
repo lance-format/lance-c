@@ -26,6 +26,8 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::refs::BranchContents;
 use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
+use lance::dataset::{AutoCleanupParams, WriteParams};
+use lance::session::{CacheSpec as NativeCacheSpec, Session as NativeSession};
 use lance_c::*;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::DocumentGranularity;
@@ -714,6 +716,425 @@ fn test_shared_session_rejects_null_inputs() {
         lance_session_close(session);
         lance_session_close(ptr::null_mut());
     }
+}
+
+fn empty_session_cache_spec() -> LanceSessionCacheSpec {
+    LanceSessionCacheSpec {
+        kind: LanceSessionCacheSpecKind::Default as i32,
+        size_bytes: 0,
+        backend_uri: ptr::null(),
+        backend_kind: ptr::null(),
+        option_keys: ptr::null(),
+        option_values: ptr::null(),
+        option_count: 0,
+    }
+}
+
+fn sized_session_cache_spec(size_bytes: u64) -> LanceSessionCacheSpec {
+    LanceSessionCacheSpec {
+        kind: LanceSessionCacheSpecKind::Size as i32,
+        size_bytes,
+        ..empty_session_cache_spec()
+    }
+}
+
+fn session_stats(session: *const LanceSession) -> LanceSessionCacheStats {
+    let mut stats = LanceSessionCacheStats::default();
+    assert_eq!(
+        unsafe { lance_session_get_cache_stats(session, &mut stats) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    stats
+}
+
+fn session_size_bytes(session: *const LanceSession) -> u64 {
+    let mut size = 0;
+    assert_eq!(
+        unsafe { lance_session_get_size_bytes(session, &mut size) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    size
+}
+
+fn session_approx_num_items(session: *const LanceSession) -> u64 {
+    let mut count = 0;
+    assert_eq!(
+        unsafe { lance_session_get_approx_num_items(session, &mut count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    count
+}
+
+fn scan_filtered_with_index(dataset: *const LanceDataset, filter: &std::ffi::CStr) -> usize {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
+    assert!(!scanner.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(scanner, true) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let rows = scan_all_rows_from_scanner(scanner)
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    unsafe { lance_scanner_close(scanner) };
+    rows
+}
+
+fn create_session_cache_fixture() -> (tempfile::TempDir, String) {
+    let fixture = create_multi_fragment_dataset();
+    let c_uri = c_str(&fixture.1);
+    unsafe {
+        let dataset = lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0);
+        assert!(!dataset.is_null(), "{}", take_last_error_message());
+        assert_eq!(lance_dataset_fragment_count(dataset), 2);
+        assert_eq!(
+            lance_dataset_create_scalar_index(
+                dataset,
+                c"id".as_ptr(),
+                c"id_idx".as_ptr(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                false,
+            ),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert_eq!(lance_dataset_index_count(dataset), 1);
+        lance_dataset_close(dataset);
+    }
+    fixture
+}
+
+struct NativeSessionCacheProbe {
+    index_entries: usize,
+    index_size_bytes: usize,
+    metadata_entries: usize,
+    metadata_size_bytes: usize,
+    size_bytes: u64,
+    approx_num_items: usize,
+}
+
+fn native_session_cache_probe(
+    uri: &str,
+    index_cache: NativeCacheSpec,
+    metadata_cache: NativeCacheSpec,
+) -> NativeSessionCacheProbe {
+    use lance::dataset::builder::DatasetBuilder;
+    use lance::index::DatasetIndexExt;
+
+    lance_c::runtime::block_on(async {
+        let session = Arc::new(NativeSession::with_cache_backends(
+            index_cache,
+            metadata_cache,
+            Default::default(),
+        ));
+        let dataset = DatasetBuilder::from_uri(uri)
+            .with_session(session.clone())
+            .load()
+            .await
+            .unwrap();
+        dataset.prewarm_index("id_idx").await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.filter("id >= 5 AND id < 8").unwrap();
+        scanner.use_index(true);
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+
+        let index = session.index_cache_stats().await;
+        let metadata = session.metadata_cache_stats().await;
+        NativeSessionCacheProbe {
+            index_entries: index.num_entries,
+            index_size_bytes: index.size_bytes,
+            metadata_entries: metadata.num_entries,
+            metadata_size_bytes: metadata.size_bytes,
+            size_bytes: session.size_bytes(),
+            approx_num_items: session.approx_num_items(),
+        }
+    })
+}
+
+#[test]
+fn test_session_cache_specs_default_size_and_explicit_zero() {
+    let (_tmp, uri) = create_session_cache_fixture();
+    let c_uri = c_str(&uri);
+
+    let native_zero =
+        native_session_cache_probe(&uri, NativeCacheSpec::Size(0), NativeCacheSpec::Size(0));
+    assert_eq!(native_zero.index_entries, 0);
+    assert_eq!(native_zero.index_size_bytes, 0);
+    assert_eq!(native_zero.metadata_entries, 0);
+    assert_eq!(native_zero.metadata_size_bytes, 0);
+    assert_eq!(native_zero.approx_num_items, 0);
+
+    let zero = sized_session_cache_spec(0);
+    let session = unsafe { lance_session_new_with_cache_specs(&zero, &zero) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    let initial_size = session_size_bytes(session);
+    assert_eq!(session_approx_num_items(session), 0);
+
+    let dataset =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_dataset_prewarm_index(dataset, c"id_idx".as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(scan_filtered_with_index(dataset, c"id >= 5 AND id < 8"), 3);
+
+    let stats = session_stats(session);
+    assert_eq!(stats.index_cache_entries, 0);
+    assert_eq!(stats.index_cache_size_bytes, 0);
+    assert_eq!(stats.metadata_cache_entries, 0);
+    assert_eq!(stats.metadata_cache_size_bytes, 0);
+    assert_eq!(session_approx_num_items(session), 0);
+    assert_eq!(
+        session_size_bytes(session),
+        initial_size,
+        "a zero-capacity session retains no cache entries"
+    );
+
+    unsafe { lance_session_close(session) };
+    assert_eq!(
+        scan_filtered_with_index(dataset, c"id >= 5 AND id < 8"),
+        3,
+        "the dataset must retain zero-capacity session state after handle close"
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let native_default =
+        native_session_cache_probe(&uri, NativeCacheSpec::Default, NativeCacheSpec::Size(0));
+    assert!(native_default.index_entries > 0);
+    assert_eq!(native_default.metadata_entries, 0);
+    assert!(native_default.approx_num_items > 0);
+    assert!(native_default.size_bytes > native_zero.size_bytes);
+
+    let default_index = empty_session_cache_spec();
+    let zero_metadata = sized_session_cache_spec(0);
+    let session = unsafe { lance_session_new_with_cache_specs(&default_index, &zero_metadata) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    let initial_size = session_size_bytes(session);
+    let dataset =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_dataset_prewarm_index(dataset, c"id_idx".as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(scan_filtered_with_index(dataset, c"id >= 5 AND id < 8"), 3);
+    let stats = session_stats(session);
+    assert!(stats.index_cache_entries > 0);
+    assert!(stats.index_cache_size_bytes > 0);
+    assert_eq!(stats.metadata_cache_entries, 0);
+    assert!(session_approx_num_items(session) > 0);
+    assert!(session_size_bytes(session) > initial_size);
+    unsafe { lance_session_close(session) };
+    assert_eq!(
+        unsafe { lance_dataset_count_rows(dataset) },
+        10,
+        "the dataset remains usable after a default-index session handle closes"
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let native_size = native_session_cache_probe(
+        &uri,
+        NativeCacheSpec::Size(64 * 1024 * 1024),
+        NativeCacheSpec::Default,
+    );
+    assert!(native_size.index_entries > 0);
+    assert!(native_size.metadata_entries > 0);
+    assert!(native_size.approx_num_items > 0);
+    assert!(native_size.size_bytes > native_zero.size_bytes);
+
+    let sized_index = sized_session_cache_spec(64 * 1024 * 1024);
+    let default_metadata = empty_session_cache_spec();
+    let session = unsafe { lance_session_new_with_cache_specs(&sized_index, &default_metadata) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    let dataset =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_dataset_prewarm_index(dataset, c"id_idx".as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(scan_filtered_with_index(dataset, c"id >= 5 AND id < 8"), 3);
+    let stats = session_stats(session);
+    assert!(stats.index_cache_entries > 0);
+    assert!(stats.metadata_cache_entries > 0);
+    assert!(session_approx_num_items(session) > 0);
+    unsafe {
+        lance_session_close(session);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_session_cache_specs_accept_moka_uri_and_config() {
+    let (_tmp, uri) = create_session_cache_fixture();
+    let c_uri = c_str(&uri);
+
+    let mut index_uri = b"moka://?capacity=67108864\0".to_vec();
+    let mut metadata_kind = b"MOKA\0".to_vec();
+    let mut option_key = b"capacity\0".to_vec();
+    let mut option_value = b"33554432\0".to_vec();
+    let option_keys = [option_key.as_ptr().cast()];
+    let option_values = [option_value.as_ptr().cast()];
+    let mut index_spec = empty_session_cache_spec();
+    index_spec.kind = LanceSessionCacheSpecKind::Uri as i32;
+    index_spec.backend_uri = index_uri.as_ptr().cast();
+    let mut metadata_spec = empty_session_cache_spec();
+    metadata_spec.kind = LanceSessionCacheSpecKind::Config as i32;
+    metadata_spec.backend_kind = metadata_kind.as_ptr().cast();
+    metadata_spec.option_keys = option_keys.as_ptr();
+    metadata_spec.option_values = option_values.as_ptr();
+    metadata_spec.option_count = 1;
+
+    let session = unsafe { lance_session_new_with_cache_specs(&index_spec, &metadata_spec) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+
+    index_uri.fill(b'x');
+    metadata_kind.fill(b'x');
+    option_key.fill(b'x');
+    option_value.fill(b'x');
+
+    let initial_size = session_size_bytes(session);
+    let dataset =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(
+        !dataset.is_null(),
+        "caller buffers must be copied before the call returns: {}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_prewarm_index(dataset, c"id_idx".as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(scan_filtered_with_index(dataset, c"id >= 5 AND id < 8"), 3);
+
+    let stats = session_stats(session);
+    assert!(stats.index_cache_entries > 0);
+    assert!(stats.metadata_cache_entries > 0);
+    assert!(session_approx_num_items(session) > 0);
+    assert!(session_size_bytes(session) > initial_size);
+
+    unsafe { lance_session_close(session) };
+    assert_eq!(
+        scan_filtered_with_index(dataset, c"id >= 9"),
+        1,
+        "the dataset must retain configured session state after handle close"
+    );
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_session_cache_specs_reject_invalid_inputs() {
+    let metadata = empty_session_cache_spec();
+    let session = unsafe { lance_session_new_with_cache_specs(ptr::null(), &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let mut unknown_kind = empty_session_cache_spec();
+    unknown_kind.kind = 99;
+    let session = unsafe { lance_session_new_with_cache_specs(&unknown_kind, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("invalid session cache spec kind 99"));
+
+    let mut uri_spec = empty_session_cache_spec();
+    uri_spec.kind = LanceSessionCacheSpecKind::Uri as i32;
+    let session = unsafe { lance_session_new_with_cache_specs(&uri_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("backend_uri must not be NULL"));
+
+    uri_spec.backend_uri = c"moka://?capacity".as_ptr();
+    let session = unsafe { lance_session_new_with_cache_specs(&uri_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("missing '='"));
+
+    let mut config_spec = empty_session_cache_spec();
+    config_spec.kind = LanceSessionCacheSpecKind::Config as i32;
+    config_spec.backend_kind = c"moka".as_ptr();
+    let session = unsafe { lance_session_new_with_cache_specs(&config_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("capacity is required"));
+
+    config_spec.option_count = 1;
+    let session = unsafe { lance_session_new_with_cache_specs(&config_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("option_count=1"));
+
+    let keys = [c"mystery".as_ptr()];
+    let values = [c"1".as_ptr()];
+    config_spec.option_keys = keys.as_ptr();
+    config_spec.option_values = values.as_ptr();
+    let session = unsafe { lance_session_new_with_cache_specs(&config_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("unknown option \"mystery\""));
+
+    let keys = [c"capacity".as_ptr(), c"capacity".as_ptr()];
+    let values = [c"1".as_ptr(), c"2".as_ptr()];
+    config_spec.option_keys = keys.as_ptr();
+    config_spec.option_values = values.as_ptr();
+    config_spec.option_count = 2;
+    let session = unsafe { lance_session_new_with_cache_specs(&config_spec, &metadata) };
+    assert!(session.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("duplicate option key \"capacity\""));
+
+    let valid = sized_session_cache_spec(1024);
+    let session = unsafe { lance_session_new_with_cache_specs(&valid, &valid) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    let mut out = 17u64;
+    assert_eq!(
+        unsafe { lance_session_get_size_bytes(ptr::null(), &mut out) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out, 17);
+    assert_eq!(
+        unsafe { lance_session_get_size_bytes(session, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_session_get_approx_num_items(ptr::null(), &mut out) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out, 17);
+    assert_eq!(
+        unsafe { lance_session_get_approx_num_items(session, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_session_close(session) };
 }
 
 #[test]
@@ -3309,6 +3730,459 @@ fn test_fragment_ids() {
     assert_eq!(rc, 0);
     assert_eq!(ids.len(), 2);
 
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ---------------------------------------------------------------------------
+// Dataset table and schema metadata
+// ---------------------------------------------------------------------------
+
+fn take_json_value(ptr: *const c_char) -> serde_json::Value {
+    assert!(
+        !ptr.is_null(),
+        "expected a JSON result; current error: {}",
+        take_last_error_message()
+    );
+    let json = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(ptr) };
+    serde_json::from_str(&json).unwrap()
+}
+
+fn metadata_map(entries: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+fn update_metadata_via_c(
+    dataset: *mut LanceDataset,
+    entries: &[(&str, Option<&str>)],
+    mode: LanceMetadataUpdateMode,
+    schema_metadata: bool,
+) -> serde_json::Value {
+    let keys: Vec<CString> = entries.iter().map(|(key, _)| c_str(key)).collect();
+    let values: Vec<Option<CString>> = entries.iter().map(|(_, value)| value.map(c_str)).collect();
+    let key_ptrs: Vec<*const c_char> = keys.iter().map(|key| key.as_ptr()).collect();
+    let value_ptrs: Vec<*const c_char> = values
+        .iter()
+        .map(|value| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+        .collect();
+
+    let json = unsafe {
+        if schema_metadata {
+            lance_dataset_update_schema_metadata_json(
+                dataset,
+                key_ptrs.as_ptr(),
+                value_ptrs.as_ptr(),
+                entries.len(),
+                mode as i32,
+            )
+        } else {
+            lance_dataset_update_metadata_json(
+                dataset,
+                key_ptrs.as_ptr(),
+                value_ptrs.as_ptr(),
+                entries.len(),
+                mode as i32,
+            )
+        }
+    };
+    take_json_value(json)
+}
+
+fn native_metadata_map(
+    uri: &str,
+    schema_metadata: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let metadata = if schema_metadata {
+        dataset.schema().metadata.clone()
+    } else {
+        dataset.metadata().clone()
+    };
+    metadata.into_iter().collect()
+}
+
+fn schema_metadata_via_c(
+    dataset: *const LanceDataset,
+) -> std::collections::BTreeMap<String, String> {
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(unsafe { lance_dataset_schema(dataset, &mut ffi_schema) }, 0);
+    let schema = Schema::try_from(&ffi_schema).unwrap();
+    schema.metadata().clone().into_iter().collect()
+}
+
+fn assert_metadata_update_failed(ptr: *const c_char, expected_message: &str) {
+    assert!(ptr.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message_ptr = lance_last_error_message();
+    assert!(!message_ptr.is_null());
+    let message = unsafe { std::ffi::CStr::from_ptr(message_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(message_ptr) };
+    assert!(
+        message.contains(expected_message),
+        "expected error containing {expected_message:?}, got {message:?}"
+    );
+}
+
+#[test]
+fn test_dataset_metadata_merge_replace_and_clear() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut expected_version = unsafe { lance_dataset_version(ds) };
+    assert_eq!(expected_version, 2, "fixture writes two versions");
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(ds) }),
+        serde_json::json!({})
+    );
+
+    let escaped_value = "line\n\"quoted\"\\path";
+    let merged = update_metadata_via_c(
+        ds,
+        &[
+            ("empty", Some("")),
+            ("escaped", Some(escaped_value)),
+            ("owner", Some("lance-c")),
+            ("remove", Some("gone")),
+            ("unicode", Some("你好")),
+            ("unicode-key", Some("value")),
+        ],
+        LanceMetadataUpdateMode::Merge,
+        false,
+    );
+    let mut expected = metadata_map(&[
+        ("empty", ""),
+        ("escaped", escaped_value),
+        ("owner", "lance-c"),
+        ("remove", "gone"),
+        ("unicode", "你好"),
+        ("unicode-key", "value"),
+    ]);
+    assert_eq!(merged, serde_json::to_value(&expected).unwrap());
+    assert_eq!(native_metadata_map(&uri, false), expected);
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let merged = update_metadata_via_c(
+        ds,
+        &[("owner", Some("updated")), ("remove", None)],
+        LanceMetadataUpdateMode::Merge,
+        false,
+    );
+    expected.insert("owner".to_string(), "updated".to_string());
+    expected.remove("remove");
+    assert_eq!(merged, serde_json::to_value(&expected).unwrap());
+    assert_eq!(native_metadata_map(&uri, false), expected);
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let replaced = update_metadata_via_c(
+        ds,
+        &[
+            ("ignored", None),
+            ("shared", Some("table")),
+            ("table-only", Some("one")),
+        ],
+        LanceMetadataUpdateMode::Replace,
+        false,
+    );
+    expected = metadata_map(&[("shared", "table"), ("table-only", "one")]);
+    assert_eq!(replaced, serde_json::to_value(&expected).unwrap());
+    assert_eq!(native_metadata_map(&uri, false), expected);
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let schema_merged = update_metadata_via_c(
+        ds,
+        &[
+            ("empty", Some("")),
+            ("schema-key", Some("schema")),
+            ("shared", Some("schema")),
+        ],
+        LanceMetadataUpdateMode::Merge,
+        true,
+    );
+    let expected_schema = metadata_map(&[
+        ("empty", ""),
+        ("schema-key", "schema"),
+        ("shared", "schema"),
+    ]);
+    assert_eq!(
+        schema_merged,
+        serde_json::to_value(&expected_schema).unwrap()
+    );
+    assert_eq!(native_metadata_map(&uri, true), expected_schema);
+    assert_eq!(schema_metadata_via_c(ds), expected_schema);
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        expected,
+        "schema metadata updates must not change table metadata"
+    );
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let schema_replaced = update_metadata_via_c(
+        ds,
+        &[("ignored", None), ("schema-only", Some("two"))],
+        LanceMetadataUpdateMode::Replace,
+        true,
+    );
+    let expected_schema = metadata_map(&[("schema-only", "two")]);
+    assert_eq!(
+        schema_replaced,
+        serde_json::to_value(&expected_schema).unwrap()
+    );
+    assert_eq!(native_metadata_map(&uri, true), expected_schema);
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        expected,
+        "schema replacement must not change table metadata"
+    );
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let schema_cleared = take_json_value(unsafe {
+        lance_dataset_update_schema_metadata_json(
+            ds,
+            ptr::null(),
+            ptr::null(),
+            0,
+            LanceMetadataUpdateMode::Replace as i32,
+        )
+    });
+    assert_eq!(schema_cleared, serde_json::json!({}));
+    assert!(native_metadata_map(&uri, true).is_empty());
+    assert!(schema_metadata_via_c(ds).is_empty());
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        expected,
+        "clearing schema metadata must not change table metadata"
+    );
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let cleared = take_json_value(unsafe {
+        lance_dataset_update_metadata_json(
+            ds,
+            ptr::null(),
+            ptr::null(),
+            0,
+            LanceMetadataUpdateMode::Replace as i32,
+        )
+    });
+    assert_eq!(cleared, serde_json::json!({}));
+    assert!(native_metadata_map(&uri, false).is_empty());
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 10);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_metadata_reopen_and_snapshot_identity() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let writer = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let old = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!writer.is_null() && !old.is_null());
+
+    let initial_version = unsafe { lance_dataset_version(old) };
+    assert_eq!(initial_version, 2);
+    update_metadata_via_c(
+        writer,
+        &[("persist", Some("yes"))],
+        LanceMetadataUpdateMode::Merge,
+        false,
+    );
+    update_metadata_via_c(
+        writer,
+        &[("persist-schema", Some("yes"))],
+        LanceMetadataUpdateMode::Merge,
+        true,
+    );
+
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 2
+    );
+    assert_eq!(unsafe { lance_dataset_version(old) }, initial_version);
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(old) }),
+        serde_json::json!({})
+    );
+    assert!(schema_metadata_via_c(old).is_empty());
+
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_version(reopened) },
+        initial_version + 2
+    );
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        metadata_map(&[("persist", "yes")])
+    );
+    assert_eq!(
+        native_metadata_map(&uri, true),
+        metadata_map(&[("persist-schema", "yes")])
+    );
+    assert_eq!(
+        schema_metadata_via_c(reopened),
+        metadata_map(&[("persist-schema", "yes")])
+    );
+
+    let previous = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), initial_version + 1) };
+    assert!(!previous.is_null());
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(previous) }),
+        serde_json::to_value(metadata_map(&[("persist", "yes")])).unwrap()
+    );
+    assert!(
+        schema_metadata_via_c(previous).is_empty(),
+        "schema metadata commit must be isolated to the later version"
+    );
+
+    unsafe {
+        lance_dataset_close(previous);
+        lance_dataset_close(reopened);
+        lance_dataset_close(old);
+        lance_dataset_close(writer);
+    }
+}
+
+#[test]
+fn test_dataset_metadata_invalid_inputs_preserve_state() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let version = unsafe { lance_dataset_version(ds) };
+    let table_before = take_json_value(unsafe { lance_dataset_metadata_json(ds) });
+    let schema_before = schema_metadata_via_c(ds);
+
+    let key = c_str("key");
+    let value = c_str("value");
+    let keys = [key.as_ptr()];
+    let values = [value.as_ptr()];
+
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ptr::null_mut(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "dataset must not be NULL",
+    );
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_schema_metadata_json(
+                ptr::null_mut(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "dataset must not be NULL",
+    );
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                ptr::null(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "keys must not be NULL",
+    );
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                keys.as_ptr(),
+                ptr::null(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "values must not be NULL",
+    );
+
+    let null_key = [ptr::null()];
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                null_key.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "keys[0] must not be NULL",
+    );
+
+    let invalid_utf8 = CString::new(vec![0xff]).unwrap();
+    let invalid_key = [invalid_utf8.as_ptr()];
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                invalid_key.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "utf-8",
+    );
+    let invalid_value = [invalid_utf8.as_ptr()];
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                keys.as_ptr(),
+                invalid_value.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "utf-8",
+    );
+    assert_metadata_update_failed(
+        unsafe { lance_dataset_update_metadata_json(ds, keys.as_ptr(), values.as_ptr(), 1, 99) },
+        "metadata update mode",
+    );
+    assert_metadata_update_failed(
+        unsafe { lance_dataset_metadata_json(ptr::null()) },
+        "dataset must not be NULL",
+    );
+
+    assert_eq!(unsafe { lance_dataset_version(ds) }, version);
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(ds) }),
+        table_before
+    );
+    assert_eq!(schema_metadata_via_c(ds), schema_before);
     unsafe { lance_dataset_close(ds) };
 }
 
@@ -15672,6 +16546,140 @@ fn default_write_params() -> LanceWriteParams {
     }
 }
 
+fn write_with_native_options(
+    uri: &str,
+    batch: RecordBatch,
+    mode: LanceWriteMode,
+    options: *const LanceWriteOptions,
+) -> i32 {
+    let c_uri = c_str(uri);
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(batch);
+    unsafe {
+        lance_dataset_write_with_options(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            mode as i32,
+            options,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    }
+}
+
+fn write_native(uri: &str, batch: RecordBatch, params: WriteParams) -> lance::Result<Dataset> {
+    let schema = batch.schema();
+    lance_c::runtime::block_on(Dataset::write(
+        arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(params),
+    ))
+}
+
+fn c_config_entries(dataset: *const LanceDataset) -> Vec<(String, String)> {
+    let config = unsafe { lance_dataset_config(dataset) };
+    assert!(
+        !config.is_null(),
+        "config snapshot failed: {}",
+        take_last_error_message()
+    );
+    let count = unsafe { lance_dataset_config_count(config) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut entries = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let key = unsafe { lance_dataset_config_key_at(config, i) };
+        assert!(!key.is_null(), "config key {i} was NULL");
+        let value = unsafe { lance_dataset_config_value_at(config, i) };
+        assert!(!value.is_null(), "config value {i} was NULL");
+        entries.push((
+            unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned(),
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        ));
+    }
+    unsafe { lance_dataset_config_close(config) };
+    entries.sort();
+    entries
+}
+
+fn c_config_entries_for_uri(uri: &str) -> Vec<(String, String)> {
+    let c_uri = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(
+        !dataset.is_null(),
+        "open failed: {}",
+        take_last_error_message()
+    );
+    let entries = c_config_entries(dataset);
+    unsafe { lance_dataset_close(dataset) };
+    entries
+}
+
+fn native_config_entries(uri: &str) -> Vec<(String, String)> {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let mut entries: Vec<_> = dataset
+        .config()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn c_dataset_observation(uri: &str) -> (u64, u64, u64) {
+    let c_uri = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(
+        !dataset.is_null(),
+        "open failed: {}",
+        take_last_error_message()
+    );
+    let observation = (
+        unsafe { lance_dataset_version(dataset) },
+        unsafe { lance_dataset_count_rows(dataset) },
+        unsafe { lance_dataset_fragment_count(dataset) },
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    unsafe { lance_dataset_close(dataset) };
+    observation
+}
+
+fn native_dataset_observation(uri: &str) -> (u64, u64, u64) {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let rows = lance_c::runtime::block_on(dataset.count_rows(None)).unwrap() as u64;
+    (
+        dataset.version().version,
+        rows,
+        dataset.count_fragments() as u64,
+    )
+}
+
+fn native_version_ids(uri: &str) -> Vec<u64> {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let mut ids: Vec<_> = lance_c::runtime::block_on(dataset.versions())
+        .unwrap()
+        .into_iter()
+        .map(|version| version.version)
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn c_update_config_entries(
+    dataset: *mut LanceDataset,
+    entries: &[(CString, Option<CString>)],
+) -> i32 {
+    let keys: Vec<*const c_char> = entries.iter().map(|(key, _)| key.as_ptr()).collect();
+    let values: Vec<*const c_char> = entries
+        .iter()
+        .map(|(_, value)| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+        .collect();
+    unsafe { lance_dataset_update_config(dataset, keys.as_ptr(), values.as_ptr(), entries.len()) }
+}
+
 /// Build a larger batch than the minimal test batch so `max_rows_per_file`
 /// has enough rows to exercise multi-file output.
 fn large_write_batch(n: i32) -> RecordBatch {
@@ -15957,6 +16965,825 @@ fn test_write_with_params_stable_row_ids_accepted() {
         )
     };
     assert_eq!(rc, 0);
+}
+
+// ===========================================================================
+// lance_dataset_write_with_options / native auto-cleanup
+// ===========================================================================
+
+#[test]
+fn test_write_options_null_uses_native_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_default").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_default")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+
+    let native = write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams::default(),
+    )
+    .unwrap();
+
+    let c_entries = c_config_entries_for_uri(&c_uri);
+    let native_entries = native_config_entries(&native_uri);
+    assert_eq!(c_entries, native_entries);
+    assert!(
+        !c_entries
+            .iter()
+            .any(|(key, _)| key.starts_with("lance.auto_cleanup.")),
+        "NULL options must select native auto_cleanup=None: {c_entries:?}"
+    );
+    assert_eq!(native.version().version, 1);
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+}
+
+#[test]
+fn test_write_options_create_auto_cleanup_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_cleanup").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_cleanup")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 0,
+        older_than_seconds: 5,
+        older_than_nanos: 250_000_123,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+
+    let older_than = chrono::TimeDelta::try_seconds(5)
+        .unwrap()
+        .checked_add(&chrono::TimeDelta::nanoseconds(250_000_123))
+        .unwrap();
+    let native = write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams {
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 0,
+                older_than,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(native.version().version, 1);
+
+    let entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(entries, native_config_entries(&native_uri));
+    assert_eq!(
+        entries
+            .iter()
+            .find(|(key, _)| key == "lance.auto_cleanup.interval")
+            .map(|(_, value)| value.as_str()),
+        Some("0"),
+        "interval 0 must remain an explicit native policy"
+    );
+
+    // Reopen both to prove the config is persisted, not only visible on the
+    // writer's returned snapshot.
+    assert_eq!(entries, c_config_entries_for_uri(&c_uri));
+    assert_eq!(entries, native_config_entries(&native_uri));
+}
+
+#[test]
+fn test_write_options_existing_dataset_keeps_persisted_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_existing").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_existing")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let initial_cleanup = LanceAutoCleanupParams {
+        interval: 7,
+        older_than_seconds: 93_600,
+        older_than_nanos: 0,
+    };
+    let initial_params = LanceWriteParams {
+        max_rows_per_file: 2,
+        ..default_write_params()
+    };
+    let initial_options = LanceWriteOptions {
+        params: initial_params,
+        auto_cleanup: &initial_cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3, 4, 5], vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        LanceWriteMode::Create,
+        &initial_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3, 4, 5], vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        WriteParams {
+            max_rows_per_file: 2,
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 7,
+                older_than: chrono::TimeDelta::try_seconds(93_600).unwrap(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let initial_entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(initial_entries, native_config_entries(&native_uri));
+    let initial_observation = c_dataset_observation(&c_uri);
+    assert!(
+        initial_observation.2 > 1,
+        "fixture must produce multiple fragments, got {initial_observation:?}"
+    );
+    assert_eq!(initial_observation, native_dataset_observation(&native_uri));
+
+    let append_cleanup = LanceAutoCleanupParams {
+        interval: 0,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let append_options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: &append_cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![6, 7, 8, 9], vec![6.0, 7.0, 8.0, 9.0]),
+        LanceWriteMode::Append,
+        &append_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![6, 7, 8, 9], vec![6.0, 7.0, 8.0, 9.0]),
+        WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            max_rows_per_file: 2,
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 0,
+                older_than: chrono::TimeDelta::zero(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri),
+        "APPEND must not rewrite the persisted cleanup policy"
+    );
+    assert_eq!(c_config_entries_for_uri(&c_uri), initial_entries);
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+
+    let overwrite_options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: ptr::null(),
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![10, 11, 12], vec![10.0, 11.0, 12.0]),
+        LanceWriteMode::Overwrite,
+        &overwrite_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![10, 11, 12], vec![10.0, 11.0, 12.0]),
+        WriteParams {
+            mode: lance::dataset::WriteMode::Overwrite,
+            max_rows_per_file: 2,
+            auto_cleanup: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let overwritten_entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(overwritten_entries, native_config_entries(&native_uri));
+    assert_eq!(
+        overwritten_entries, initial_entries,
+        "OVERWRITE with None must not delete persisted cleanup config"
+    );
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+}
+
+fn run_auto_cleanup_sequence(uri: &str, via_c: bool, skip_auto_cleanup: bool) -> Vec<u64> {
+    let cleanup = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let initial_options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let first_batch = write_batch(vec![1, 2, 3, 4], vec![1.0, 2.0, 3.0, 4.0]);
+    if via_c {
+        let rc =
+            write_with_native_options(uri, first_batch, LanceWriteMode::Create, &initial_options);
+        assert_eq!(rc, 0, "{}", take_last_error_message());
+    } else {
+        write_native(
+            uri,
+            first_batch,
+            WriteParams {
+                max_rows_per_file: 2,
+                auto_cleanup: Some(AutoCleanupParams {
+                    interval: 1,
+                    older_than: chrono::TimeDelta::zero(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    for rows in [vec![5, 6], vec![7, 8], vec![9, 10]] {
+        let values: Vec<f32> = rows.iter().map(|row| *row as f32).collect();
+        let batch = write_batch(rows, values);
+        if via_c {
+            let append_options = LanceWriteOptions {
+                params: default_write_params(),
+                auto_cleanup: ptr::null(),
+                skip_auto_cleanup,
+            };
+            let rc = write_with_native_options(uri, batch, LanceWriteMode::Append, &append_options);
+            assert_eq!(rc, 0, "{}", take_last_error_message());
+        } else {
+            write_native(
+                uri,
+                batch,
+                WriteParams {
+                    mode: lance::dataset::WriteMode::Append,
+                    skip_auto_cleanup,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+    }
+    native_version_ids(uri)
+}
+
+#[test]
+fn test_write_options_skip_auto_cleanup_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_cleanup_run")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_cleanup_run")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let c_skip_uri = tmp
+        .path()
+        .join("c_cleanup_skip")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_skip_uri = tmp
+        .path()
+        .join("native_cleanup_skip")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let c_versions = run_auto_cleanup_sequence(&c_uri, true, false);
+    let native_versions = run_auto_cleanup_sequence(&native_uri, false, false);
+    assert_eq!(c_versions, native_versions);
+    assert!(
+        c_versions.len() < 4,
+        "auto-cleanup should have removed an old version: {c_versions:?}"
+    );
+
+    let c_skip_versions = run_auto_cleanup_sequence(&c_skip_uri, true, true);
+    let native_skip_versions = run_auto_cleanup_sequence(&native_skip_uri, false, true);
+    assert_eq!(c_skip_versions, native_skip_versions);
+    assert_eq!(
+        c_skip_versions,
+        vec![1, 2, 3, 4],
+        "skip_auto_cleanup must preserve every version"
+    );
+}
+
+#[test]
+fn test_write_options_auto_cleanup_retains_tagged_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_cleanup_tag")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3, 4], vec![1.0, 2.0, 3.0, 4.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+
+    let tagged = lance_c::runtime::block_on(Dataset::open(&c_uri)).unwrap();
+    lance_c::runtime::block_on(tagged.tags().create("keep_v1", 1u64)).unwrap();
+    drop(tagged);
+
+    for (ids, values) in [
+        (vec![5, 6], vec![5.0, 6.0]),
+        (vec![7, 8], vec![7.0, 8.0]),
+        (vec![9, 10], vec![9.0, 10.0]),
+    ] {
+        let append_options = LanceWriteOptions {
+            params: default_write_params(),
+            auto_cleanup: ptr::null(),
+            skip_auto_cleanup: false,
+        };
+        let rc = write_with_native_options(
+            &c_uri,
+            write_batch(ids, values),
+            LanceWriteMode::Append,
+            &append_options,
+        );
+        assert_eq!(rc, 0, "{}", take_last_error_message());
+    }
+
+    let versions = native_version_ids(&c_uri);
+    assert!(
+        versions.contains(&1),
+        "tagged version 1 must survive auto-cleanup: {versions:?}"
+    );
+    let dataset = lance_c::runtime::block_on(Dataset::open(&c_uri)).unwrap();
+    assert!(
+        lance_c::runtime::block_on(dataset.checkout_version(1)).is_ok(),
+        "tagged version 1 must remain readable"
+    );
+}
+
+#[test]
+fn test_write_options_cleanup_hook_failure_keeps_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_cleanup_fail")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_cleanup_fail")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let create_batch = write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]);
+    let rc = write_with_native_options(
+        &c_uri,
+        create_batch.clone(),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        create_batch,
+        WriteParams {
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 1,
+                older_than: chrono::TimeDelta::zero(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    let entries = [(c_str("lance.auto_cleanup.interval"), Some(c_str("invalid")))];
+    assert_eq!(
+        c_update_config_entries(c_ds, &entries),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(c_ds) };
+
+    let mut native_ds = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+    lance_c::runtime::block_on(async {
+        native_ds
+            .update_config([("lance.auto_cleanup.interval", "invalid")])
+            .await
+    })
+    .unwrap();
+    drop(native_ds);
+
+    let append_batch = write_batch(vec![4, 5], vec![4.0, 5.0]);
+    let append_options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: ptr::null(),
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        append_batch.clone(),
+        LanceWriteMode::Append,
+        &append_options,
+    );
+    assert_eq!(
+        rc,
+        0,
+        "cleanup-hook failure must not fail the committed write: {}",
+        take_last_error_message()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    write_native(
+        &native_uri,
+        append_batch,
+        WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri)
+    );
+}
+
+#[test]
+fn test_write_options_rejects_invalid_auto_cleanup_without_clamping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let bad_nanos = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 1_000_000_000,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &bad_nanos,
+        skip_auto_cleanup: false,
+    };
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let rc = unsafe {
+        lance_dataset_write_with_options(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &options,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("older_than_nanos"));
+    assert!(
+        stream.release.is_none(),
+        "the stream must be consumed on validation errors"
+    );
+
+    let bad_seconds = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: i64::MAX,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &bad_seconds,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &uri,
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("older_than_seconds"));
+
+    let negative = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: -1,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &negative,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &uri,
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(
+        rc, -1,
+        "negative older_than must be rejected by the native transaction builder"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) }.is_null(),
+        "failed writes must not leave a readable dataset"
+    );
+    let _ = take_last_error_message();
+}
+
+// ===========================================================================
+// lance_dataset_config / lance_dataset_update_config
+// ===========================================================================
+
+#[test]
+fn test_dataset_config_read_update_and_reopen_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_config").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_config")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 5,
+        older_than_seconds: 86_400,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams {
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 5,
+                older_than: chrono::TimeDelta::days(1),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri)
+    );
+
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    let updates = [
+        (c_str("custom.key"), Some(c_str("value"))),
+        (c_str("lance.auto_cleanup.interval"), Some(c_str("0"))),
+        (c_str("lance.auto_cleanup.older_than"), None),
+        (c_str(""), Some(c_str(""))),
+    ];
+    assert_eq!(
+        c_update_config_entries(c_ds, &updates),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let c_after_update = c_config_entries(c_ds);
+
+    // The snapshot must outlive the dataset handle it was copied from.
+    let snapshot = unsafe { lance_dataset_config(c_ds) };
+    assert!(!snapshot.is_null());
+    unsafe { lance_dataset_close(c_ds) };
+    let snapshot_count = unsafe { lance_dataset_config_count(snapshot) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    assert_eq!(snapshot_count as usize, c_after_update.len());
+    let snapshot_key = unsafe { lance_dataset_config_key_at(snapshot, 0) };
+    assert!(!snapshot_key.is_null());
+    let _ = unsafe { CStr::from_ptr(snapshot_key) };
+    unsafe { lance_dataset_config_close(snapshot) };
+
+    let reopened_entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(c_after_update, reopened_entries);
+
+    let mut native_ds = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+    lance_c::runtime::block_on(async {
+        native_ds
+            .update_config([
+                ("custom.key", Some("value")),
+                ("lance.auto_cleanup.interval", Some("0")),
+                ("lance.auto_cleanup.older_than", None),
+                ("", Some("")),
+            ])
+            .await
+    })
+    .unwrap();
+    drop(native_ds);
+    assert_eq!(reopened_entries, native_config_entries(&native_uri));
+    assert!(
+        reopened_entries
+            .iter()
+            .any(|(key, value)| key.is_empty() && value.is_empty())
+    );
+    assert!(
+        !reopened_entries
+            .iter()
+            .any(|(key, _)| key == "lance.auto_cleanup.older_than")
+    );
+
+    // Reopen the handle for the error-path checks, which must leave the
+    // committed config unchanged.
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    let version_before_errors = unsafe { lance_dataset_version(c_ds) };
+    let key = c_str("unchanged");
+    let value = c_str("value");
+    let keys = [key.as_ptr()];
+    let values = [value.as_ptr()];
+    assert_eq!(
+        unsafe { lance_dataset_update_config(ptr::null_mut(), keys.as_ptr(), values.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, ptr::null(), values.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, keys.as_ptr(), ptr::null(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    let null_key = [ptr::null()];
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, null_key.as_ptr(), values.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_version(c_ds) },
+        version_before_errors
+    );
+    unsafe { lance_dataset_close(c_ds) };
+}
+
+#[test]
+fn test_dataset_config_empty_update_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_config_empty")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_config_empty")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams::default(),
+    )
+    .unwrap();
+
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, ptr::null(), ptr::null(), 0) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(c_ds) };
+
+    let mut native_ds = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+    lance_c::runtime::block_on(async {
+        native_ds
+            .update_config([] as [(&str, Option<&str>); 0])
+            .await
+    })
+    .unwrap();
+    drop(native_ds);
+
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri)
+    );
 }
 
 // ===========================================================================

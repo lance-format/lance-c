@@ -196,6 +196,7 @@ typedef struct LanceRef      LanceRef;
 typedef struct LanceTag      LanceTag;
 typedef struct LanceTags     LanceTags;
 typedef struct LanceDataStatistics LanceDataStatistics;
+typedef struct LanceDatasetConfig LanceDatasetConfig;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
@@ -222,6 +223,61 @@ typedef struct LanceSessionCacheStats {
 } LanceSessionCacheStats;
 
 /**
+ * Cache selection for one session cache tier.
+ *
+ * Discriminants are ABI-stable. The `kind` field in
+ * LanceSessionCacheSpec is a fixed-width int32_t, not this enum type, so
+ * callers built with non-default enum sizing cannot mismatch the Rust ABI.
+ */
+typedef enum {
+    /* Use the native Lance default capacity for this tier. */
+    LANCE_SESSION_CACHE_SPEC_DEFAULT = 0,
+    /* Use the native default in-memory backend with an explicit capacity. */
+    LANCE_SESSION_CACHE_SPEC_SIZE = 1,
+    /* Build a backend from a backend URI. */
+    LANCE_SESSION_CACHE_SPEC_URI = 2,
+    /* Build a backend from a kind plus string options. */
+    LANCE_SESSION_CACHE_SPEC_CONFIG = 3,
+} LanceSessionCacheSpecKind;
+
+/**
+ * Description of one session cache tier.
+ *
+ * Only the field selected by `kind` is read:
+ *
+ *  - DEFAULT reads no additional fields.
+ *  - SIZE reads `size_bytes`. Zero is an explicit zero capacity, not DEFAULT.
+ *  - URI reads `backend_uri`.
+ *  - CONFIG reads `backend_kind`, then `option_count` entries from the
+ *    parallel `option_keys` and `option_values` arrays.
+ *
+ * All strings must be NUL-terminated UTF-8. `option_count` is an exact count,
+ * not a NULL-terminated sentinel: when it is non-zero, both option arrays must
+ * be non-NULL and each selected key/value must be non-NULL. Duplicate option
+ * keys are rejected. Unused fields are ignored.
+ *
+ * Every buffer is borrowed only for the duration of
+ * lance_session_new_with_cache_specs(). Backend construction happens before
+ * it returns, and the caller retains ownership of all buffers.
+ */
+typedef struct LanceSessionCacheSpec {
+    /* LanceSessionCacheSpecKind discriminant. */
+    int32_t     kind;
+    /* Explicit capacity for SIZE, in bytes. */
+    uint64_t    size_bytes;
+    /* Backend URI for URI, e.g. "moka://?capacity=1048576". */
+    const char* backend_uri;
+    /* Registry kind for CONFIG, e.g. "moka". */
+    const char* backend_kind;
+    /* Parallel option-key array for CONFIG. */
+    const char* const* option_keys;
+    /* Parallel option-value array for CONFIG. */
+    const char* const* option_values;
+    /* Number of entries in option_keys and option_values. */
+    size_t      option_count;
+} LanceSessionCacheSpec;
+
+/**
  * Create a session that can share metadata and index caches across datasets.
  *
  * Cache limits are specified in bytes. Pass 0 to request zero capacity.
@@ -230,6 +286,25 @@ typedef struct LanceSessionCacheStats {
 LanceSession* lance_session_new(
     uint64_t index_cache_size_bytes,
     uint64_t metadata_cache_size_bytes
+);
+
+/**
+ * Create a session with independent cache configuration for each tier.
+ *
+ * Each spec maps to the native Lance CacheSpec: DEFAULT uses the tier default,
+ * SIZE uses the native default in-memory backend with an explicit capacity,
+ * and URI/CONFIG build a backend through the native cache registry. Backend
+ * URI parsing, kind normalization, option validation, and unknown-kind errors
+ * come from Lance core.
+ *
+ * Both spec pointers must be non-NULL. The specs and all buffers they
+ * reference are borrowed only for this call.
+ *
+ * @return Session handle, or NULL on error
+ */
+LanceSession* lance_session_new_with_cache_specs(
+    const LanceSessionCacheSpec* index_cache,
+    const LanceSessionCacheSpec* metadata_cache
 );
 
 /**
@@ -246,6 +321,34 @@ void lance_session_close(LanceSession* session);
 int32_t lance_session_get_cache_stats(
     const LanceSession* session,
     LanceSessionCacheStats* out_stats
+);
+
+/**
+ * Copy the current deep size of the session to `out_size_bytes`.
+ *
+ * This walks live cache contents and includes retained session state. It is
+ * not an RSS measurement or a configured capacity limit. The output is
+ * written only on success.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_session_get_size_bytes(
+    const LanceSession* session,
+    uint64_t* out_size_bytes
+);
+
+/**
+ * Copy the approximate number of items in the session to `out_num_items`.
+ *
+ * This is the native explicitly approximate inspection value. It can differ
+ * from the exact cache entry counts and may change as cache maintenance runs.
+ * The output is written only on success.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_session_get_approx_num_items(
+    const LanceSession* session,
+    uint64_t* out_num_items
 );
 
 /* ─── Dataset lifecycle ─── */
@@ -310,6 +413,81 @@ uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
  * lance_last_error_code()).
  */
 uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
+
+/* ─── Dataset table and schema metadata ─── */
+
+/** How a metadata update applies to the existing map. */
+typedef enum {
+    /* Merge entries into the existing map. */
+    LANCE_METADATA_UPDATE_MERGE   = 0,
+    /* Replace the existing map with the entries that carry values. */
+    LANCE_METADATA_UPDATE_REPLACE = 1,
+} LanceMetadataUpdateMode;
+
+/**
+ * Return this snapshot's table metadata as a JSON object mapping keys to
+ * string values. Keys and values are JSON-escaped. An empty map is `{}`.
+ *
+ * Schema metadata is part of the Arrow schema returned by
+ * `lance_dataset_schema()` and is not duplicated here.
+ *
+ * Caller must free the returned string with `lance_free_string()`.
+ * Returns NULL on error.
+ */
+const char* lance_dataset_metadata_json(const LanceDataset* dataset);
+
+/**
+ * Merge or replace table metadata and return the complete updated map as a
+ * JSON object.
+ *
+ * `keys` and `values` are parallel arrays of length `count`.
+ * - `keys[i]` must be a non-NULL, NUL-terminated UTF-8 string.
+ * - `values[i] == NULL` removes `keys[i]`, matching the native `None` value.
+ *   It does not store an empty value.
+ * - An empty string value is a real value and is stored as `""`.
+ * - `keys` and `values` may be NULL only when `count == 0`.
+ *
+ * `mode` is explicit:
+ * - `LANCE_METADATA_UPDATE_MERGE` applies the entries to the existing map.
+ * - `LANCE_METADATA_UPDATE_REPLACE` replaces the entire map. With
+ *   `count == 0`, this clears the map; value-less entries are omitted.
+ *
+ * The native builder performs the commit. This mutates `dataset` in place;
+ * the same handle remains valid and sees the new version, while existing
+ * dataset snapshots and scanners keep their prior view. Key validation,
+ * version transitions, concurrent transaction behavior and error semantics
+ * follow the pinned Lance core.
+ *
+ * Caller must free the returned JSON string with `lance_free_string()`.
+ * Returns NULL on error. Commit and error semantics follow the native core.
+ */
+const char* lance_dataset_update_metadata_json(
+    LanceDataset* dataset,
+    const char* const* keys,
+    const char* const* values,
+    size_t count,
+    LanceMetadataUpdateMode mode
+);
+
+/**
+ * Merge or replace schema metadata and return the complete updated schema
+ * metadata map as a JSON object. Input and ownership rules match
+ * `lance_dataset_update_metadata_json`.
+ *
+ * This changes only schema metadata: dataset fields, fragments, table
+ * metadata and configuration are unchanged. Read the committed schema
+ * metadata through the Arrow schema returned by `lance_dataset_schema()`.
+ *
+ * Caller must free the returned JSON string with `lance_free_string()`.
+ * Returns NULL on error. Commit and error semantics follow the native core.
+ */
+const char* lance_dataset_update_schema_metadata_json(
+    LanceDataset* dataset,
+    const char* const* keys,
+    const char* const* values,
+    size_t count,
+    LanceMetadataUpdateMode mode
+);
 
 /* ─── Version history ─── */
 
@@ -768,6 +946,75 @@ uint64_t lance_data_statistics_bytes_on_disk_at(const LanceDataStatistics* stats
 
 /** Close and free a data statistics handle. Safe to call with NULL. */
 void lance_data_statistics_close(LanceDataStatistics* stats);
+
+/* ─── Dataset config ─── */
+
+/**
+ * Return a snapshot of the dataset's manifest config map.
+ *
+ * The snapshot owns copies of the keys and values, so it remains valid after
+ * the dataset handle is closed. Accessors borrow from the snapshot and remain
+ * valid until lance_dataset_config_close().
+ *
+ * Returns NULL on error (for example a NULL dataset handle).
+ *
+ * Keys and values are exposed as NUL-terminated C strings. A config entry
+ * containing an embedded NUL byte cannot be represented and fails the
+ * snapshot with LANCE_ERR_INTERNAL. Entry order is unspecified.
+ */
+LanceDatasetConfig* lance_dataset_config(const LanceDataset* dataset);
+
+/**
+ * Return the number of entries in the config snapshot. Returns 0 and sets
+ * LANCE_ERR_INVALID_ARGUMENT on a NULL handle. An empty config also yields 0
+ * with no error set, so check lance_last_error_code() to distinguish the two.
+ */
+uint64_t lance_dataset_config_count(const LanceDatasetConfig* config);
+
+/**
+ * Return the key at `index` (0 <= index < count). The pointer is borrowed from
+ * the snapshot. Returns NULL and sets LANCE_ERR_INVALID_ARGUMENT on a NULL
+ * handle or out-of-range index.
+ */
+const char* lance_dataset_config_key_at(
+    const LanceDatasetConfig* config,
+    size_t index
+);
+
+/**
+ * Return the value at `index` (0 <= index < count). The pointer is borrowed
+ * from the snapshot. Returns NULL and sets LANCE_ERR_INVALID_ARGUMENT on a
+ * NULL handle or out-of-range index.
+ */
+const char* lance_dataset_config_value_at(
+    const LanceDatasetConfig* config,
+    size_t index
+);
+
+/** Close and free a dataset config snapshot. Safe to call with NULL. */
+void lance_dataset_config_close(LanceDatasetConfig* config);
+
+/**
+ * Apply merge-style dataset config updates and commit a new manifest.
+ *
+ * `keys` and `values` are parallel arrays of length `num_entries`.
+ * A non-NULL `values[i]` upserts `keys[i]`; a NULL `values[i]` removes it.
+ * This maps directly to the native `Dataset::update_config` merge operation.
+ * An entry count of 0 is passed through as an empty native update.
+ *
+ * When `num_entries > 0`, both arrays must be non-NULL and every `keys[i]`
+ * must be a non-NULL C string. Empty keys and empty string values are passed
+ * through unchanged, matching native map semantics.
+ *
+ * On success the dataset handle points at the newly committed version.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_update_config(
+    LanceDataset* dataset,
+    const char* const* keys,
+    const char* const* values,
+    size_t num_entries
+);
 
 /**
  * Restore the dataset to an older version by committing a new manifest that
@@ -3450,11 +3697,13 @@ typedef enum {
  * Write an Arrow record batch stream to a Lance dataset at `uri`, committing
  * a manifest.
  *
- * A dataset created through this call records an auto-cleanup policy in its
- * manifest: every 20 committed versions, versions older than 14 days are
- * reclaimed automatically. Callers relying on lance_dataset_versions /
- * lance_dataset_restore for time travel should be aware that versions past
- * that horizon may no longer exist.
+ * This legacy entry point records the documented lance-c auto-cleanup policy
+ * in a newly created manifest: every 20 committed versions, versions older
+ * than 14 days are reclaimed automatically. Callers relying on
+ * lance_dataset_versions / lance_dataset_restore for time travel should be
+ * aware that versions past that horizon may no longer exist. Use
+ * lance_dataset_write_with_options to select native WriteParams defaults
+ * instead.
  *
  * @param uri          Dataset URI (file://, s3://, memory://, etc.). Must not
  *                     be NULL or an empty string.
@@ -3515,9 +3764,59 @@ typedef struct LanceWriteParams {
 } LanceWriteParams;
 
 /**
+ * Native auto-cleanup parameters for lance_dataset_write_with_options.
+ *
+ * `interval` is the number of committed versions between cleanup runs; 0 is a
+ * valid native value that considers cleanup on every commit. It is narrowed to
+ * the native usize type; values that do not fit return
+ * LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * `older_than_seconds` and `older_than_nanos` express the native
+ * chrono::TimeDelta retention window as
+ * `older_than_seconds + older_than_nanos / 1000000000`. Both fields carry the
+ * sign, and `older_than_nanos` preserves subsecond precision. It must be in
+ * [-999999999, 999999999], and the combined value must fit in the native
+ * TimeDelta range (about +/-292 million years). Negative durations are
+ * forwarded to Lance, which rejects them when it builds the write transaction
+ * because the persisted config uses std::time::Duration.
+ */
+typedef struct LanceAutoCleanupParams {
+    /* Committed versions between cleanup runs. 0 is valid. */
+    uint64_t interval;
+    /* Whole-second component of the retention window. */
+    int64_t  older_than_seconds;
+    /* Signed subsecond component, in nanoseconds. */
+    int32_t  older_than_nanos;
+} LanceAutoCleanupParams;
+
+/**
+ * Native write options for lance_dataset_write_with_options.
+ *
+ * Zero-initialize this struct to select native WriteParams::default():
+ * auto_cleanup = NULL (native None) and skip_auto_cleanup = false. The embedded
+ * `params` retains the zero-means-upstream-default mapping of LanceWriteParams.
+ *
+ * A non-NULL `auto_cleanup` selects native Some, including interval 0 or a
+ * zero-length retention window. `skip_auto_cleanup` affects only the current
+ * commit and never changes persisted configuration.
+ */
+typedef struct LanceWriteOptions {
+    /* Output-shape overrides. Zero-initialize to inherit upstream defaults. */
+    LanceWriteParams params;
+    /* Native WriteParams::auto_cleanup; NULL means None. */
+    const LanceAutoCleanupParams* auto_cleanup;
+    /* Native WriteParams::skip_auto_cleanup. */
+    bool skip_auto_cleanup;
+} LanceWriteOptions;
+
+/**
  * Same as lance_dataset_write but takes a LanceWriteParams for tuning the
  * output shape. Pass `params` = NULL to use defaults (equivalent to calling
  * lance_dataset_write directly).
+ *
+ * This legacy entry point keeps the documented 20-version / 14-day
+ * auto-cleanup policy. Use lance_dataset_write_with_options for native
+ * WriteParams defaults.
  *
  * @return 0 on success, -1 on error. See lance_dataset_write for the error
  *         code list; invalid `data_storage_version` also returns
@@ -3529,6 +3828,36 @@ int32_t lance_dataset_write_with_params(
     struct ArrowArrayStream* stream,
     int32_t mode,
     const LanceWriteParams* params,
+    const char* const* storage_opts,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Same as lance_dataset_write but selects native WriteParams defaults instead
+ * of the legacy 20-version / 14-day policy.
+ *
+ * Pass `options` = NULL to use a zero-initialized LanceWriteOptions, which is
+ * equivalent to WriteParams::default(): auto_cleanup = NULL (None) and
+ * skip_auto_cleanup = false.
+ *
+ * On an existing dataset, auto_cleanup is written only by CREATE; APPEND and
+ * OVERWRITE leave the persisted policy unchanged. An explicit NULL
+ * auto_cleanup on an existing manifest therefore does not delete stored
+ * cleanup configuration.
+ *
+ * The stream is consumed on every return path except a NULL `stream`.
+ * `out_dataset` follows the same contract as lance_dataset_write.
+ *
+ * @return 0 on success, -1 on error. Error codes match
+ *         lance_dataset_write. Invalid auto-cleanup values also return
+ *         LANCE_ERR_INVALID_ARGUMENT.
+ */
+int32_t lance_dataset_write_with_options(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceWriteOptions* options,
     const char* const* storage_opts,
     LanceDataset** out_dataset
 );

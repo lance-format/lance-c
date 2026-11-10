@@ -172,6 +172,156 @@ static void test_shared_session(const char *uri) {
            (unsigned long long)stats.metadata_cache_entries);
 }
 
+static uint64_t scan_filtered_with_index(
+    const LanceDataset *dataset,
+    const char *filter) {
+    LanceScanner *scanner = lance_scanner_new(dataset, NULL, filter);
+    ASSERT(scanner != NULL, "filtered scanner creation failed");
+    ASSERT(lance_scanner_set_use_scalar_index(scanner, true) == 0,
+           "enable scalar index failed");
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "filtered scanner stream creation failed");
+
+    uint64_t total = 0;
+    while (1) {
+        struct ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        ASSERT(stream.get_next(&stream, &array) == 0,
+               "filtered stream get_next failed");
+        if (array.release == NULL) break;
+        total += (uint64_t)array.length;
+        array.release(&array);
+    }
+    if (stream.release) stream.release(&stream);
+    lance_scanner_close(scanner);
+    return total;
+}
+
+static void test_session_cache_config(const char *uri) {
+    printf("  test_session_cache_config... ");
+
+    LanceSessionCacheSpec zero = {0};
+    zero.kind = LANCE_SESSION_CACHE_SPEC_SIZE;
+    zero.size_bytes = 0;
+
+    LanceSession *session = lance_session_new_with_cache_specs(&zero, &zero);
+    ASSERT(session != NULL, "zero-capacity session creation failed");
+
+    uint64_t initial_size = 0;
+    uint64_t approx_items = 1;
+    ASSERT(lance_session_get_size_bytes(session, &initial_size) == 0,
+           "initial session size failed");
+    ASSERT(lance_session_get_approx_num_items(session, &approx_items) == 0,
+           "initial approximate item count failed");
+    ASSERT(approx_items == 0, "new zero-capacity session should be empty");
+    ASSERT(initial_size > 0, "deep size should include session state");
+
+    LanceDataset *ds = lance_dataset_open_with_session(uri, NULL, 0, session);
+    ASSERT(ds != NULL, "zero-capacity shared-session open failed");
+    ASSERT(lance_dataset_fragment_count(ds) >= 2,
+           "session fixture must have multiple fragments");
+    ASSERT(lance_dataset_prewarm_index(ds, "id_idx") == 0,
+           "zero-capacity index prewarm failed");
+    ASSERT(scan_filtered_with_index(ds, "id >= 5 AND id < 8") == 3,
+           "zero-capacity indexed read returned wrong rows");
+
+    LanceSessionCacheStats stats;
+    memset(&stats, 0, sizeof(stats));
+    ASSERT(lance_session_get_cache_stats(session, &stats) == 0,
+           "zero-capacity cache stats failed");
+    ASSERT(stats.index_cache_entries == 0 &&
+           stats.index_cache_size_bytes == 0 &&
+           stats.metadata_cache_entries == 0 &&
+           stats.metadata_cache_size_bytes == 0,
+           "zero capacity must retain no cache entries");
+    ASSERT(lance_session_get_approx_num_items(session, &approx_items) == 0,
+           "zero-capacity approximate item count failed");
+    ASSERT(approx_items == 0, "zero capacity should report no items");
+    uint64_t final_size = 0;
+    ASSERT(lance_session_get_size_bytes(session, &final_size) == 0,
+           "final session size failed");
+    ASSERT(final_size == initial_size,
+           "zero-capacity reads must not grow session cache state");
+
+    lance_session_close(session);
+    ASSERT(scan_filtered_with_index(ds, "id >= 5 AND id < 8") == 3,
+           "dataset must keep working after session handle close");
+    lance_dataset_close(ds);
+
+    char index_uri[] = "moka://?capacity=67108864";
+    char backend_kind[] = "MOKA";
+    char option_key[] = "capacity";
+    char option_value[] = "33554432";
+    const char *option_keys[] = {option_key};
+    const char *option_values[] = {option_value};
+
+    LanceSessionCacheSpec index_spec = {0};
+    index_spec.kind = LANCE_SESSION_CACHE_SPEC_URI;
+    index_spec.backend_uri = index_uri;
+    LanceSessionCacheSpec metadata_spec = {0};
+    metadata_spec.kind = LANCE_SESSION_CACHE_SPEC_CONFIG;
+    metadata_spec.backend_kind = backend_kind;
+    metadata_spec.option_keys = option_keys;
+    metadata_spec.option_values = option_values;
+    metadata_spec.option_count = 1;
+
+    session = lance_session_new_with_cache_specs(&index_spec, &metadata_spec);
+    ASSERT(session != NULL, "Moka URI/config session creation failed");
+    ASSERT(lance_session_get_size_bytes(session, &initial_size) == 0,
+           "configured initial session size failed");
+
+    memset(index_uri, 'x', sizeof(index_uri) - 1);
+    memset(backend_kind, 'x', sizeof(backend_kind) - 1);
+    memset(option_key, 'x', sizeof(option_key) - 1);
+    memset(option_value, 'x', sizeof(option_value) - 1);
+
+    ds = lance_dataset_open_with_session(uri, NULL, 0, session);
+    ASSERT(ds != NULL, "Moka-configured shared-session open failed");
+    ASSERT(lance_dataset_prewarm_index(ds, "id_idx") == 0,
+           "Moka-configured index prewarm failed");
+    ASSERT(scan_filtered_with_index(ds, "id >= 5 AND id < 8") == 3,
+           "Moka-configured indexed read returned wrong rows");
+
+    memset(&stats, 0, sizeof(stats));
+    ASSERT(lance_session_get_cache_stats(session, &stats) == 0,
+           "Moka-configured cache stats failed");
+    ASSERT(stats.index_cache_entries > 0,
+           "Moka URI index cache should retain entries");
+    ASSERT(stats.metadata_cache_entries > 0,
+           "Moka config metadata cache should retain entries");
+    ASSERT(lance_session_get_approx_num_items(session, &approx_items) == 0,
+           "Moka-configured approximate item count failed");
+    ASSERT(approx_items > 0, "Moka-configured session should report items");
+    ASSERT(lance_session_get_size_bytes(session, &final_size) == 0,
+           "Moka-configured final session size failed");
+    ASSERT(final_size > initial_size,
+           "Moka-configured reads should be reflected in deep size");
+
+    lance_session_close(session);
+    ASSERT(scan_filtered_with_index(ds, "id >= 9") == 12,
+           "dataset must keep configured cache state after session close");
+    lance_dataset_close(ds);
+
+    LanceSessionCacheSpec invalid = {0};
+    invalid.kind = LANCE_SESSION_CACHE_SPEC_CONFIG;
+    invalid.backend_kind = "not a kind";
+    session = lance_session_new_with_cache_specs(&invalid, &zero);
+    ASSERT(session == NULL, "invalid backend kind must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid backend kind error code");
+    const char *message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "invalid character") != NULL,
+           "invalid backend kind should preserve the native error");
+    if (message) lance_free_string(message);
+
+    printf("index_entries=%llu, metadata_entries=%llu... OK\n",
+           (unsigned long long)stats.index_cache_entries,
+           (unsigned long long)stats.metadata_cache_entries);
+}
+
 static void test_scan(const char *uri) {
     printf("  test_scan... ");
 
@@ -995,6 +1145,139 @@ static void test_dataset_write_roundtrip(const char *src_uri, const char *dst_ur
     printf("OK\n");
 }
 
+/* Exercises the native write-options path and generic config read/update from
+ * a real C caller. The destination was created by the legacy writer, so its
+ * 20-version / 14-day policy must survive the append and be visible here. */
+static void test_write_options_and_config(const char *src_uri,
+                                          const char *write_uri) {
+    printf("  test_write_options_and_config... ");
+
+    LanceDataset *src = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(src != NULL, "open source failed");
+    LanceScanner *scanner = lance_scanner_new(src, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    int32_t rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    rc = stream.get_schema(&stream, &schema);
+    ASSERT(rc == 0, "get_schema from stream failed");
+
+    LanceAutoCleanupParams cleanup = {1, 0, 0};
+    LanceWriteOptions options;
+    memset(&options, 0, sizeof(options));
+    options.auto_cleanup = &cleanup;
+    options.skip_auto_cleanup = true;
+
+    LanceDataset *ds = NULL;
+    rc = lance_dataset_write_with_options(
+        write_uri, &schema, &stream, LANCE_WRITE_APPEND, &options, NULL, &ds);
+    if (schema.release) schema.release(&schema);
+    ASSERT(rc == 0, "lance_dataset_write_with_options append failed");
+    CHECK_OK();
+    ASSERT(ds != NULL, "out_dataset should be populated");
+    ASSERT(lance_dataset_count_rows(ds) > 0, "append should add rows");
+    CHECK_OK();
+
+    LanceDatasetConfig *config = lance_dataset_config(ds);
+    ASSERT(config != NULL, "config snapshot failed");
+    uint64_t config_count = lance_dataset_config_count(config);
+    CHECK_OK();
+    int saw_interval = 0;
+    int saw_older_than = 0;
+    for (uint64_t i = 0; i < config_count; i++) {
+        const char *key = lance_dataset_config_key_at(config, (size_t)i);
+        const char *value = lance_dataset_config_value_at(config, (size_t)i);
+        CHECK_OK();
+        ASSERT(key != NULL && value != NULL, "config entry must be non-NULL");
+        if (strcmp(key, "lance.auto_cleanup.interval") == 0) {
+            saw_interval = 1;
+            ASSERT(strcmp(value, "20") == 0,
+                   "legacy interval must survive native append");
+        } else if (strcmp(key, "lance.auto_cleanup.older_than") == 0) {
+            saw_older_than = 1;
+            ASSERT(strcmp(value, "14days") == 0,
+                   "legacy older_than must survive native append");
+        }
+    }
+    ASSERT(saw_interval && saw_older_than,
+           "legacy cleanup policy must remain persisted");
+    lance_dataset_config_close(config);
+
+    const char *keys[] = {"c_test.key", "lance.auto_cleanup.older_than"};
+    const char *values[] = {"value", NULL};
+    rc = lance_dataset_update_config(ds, keys, values, 2);
+    ASSERT(rc == 0, "config update failed");
+    CHECK_OK();
+    LanceDatasetConfig *after_update = lance_dataset_config(ds);
+    ASSERT(after_update != NULL, "post-update config snapshot failed");
+    uint64_t after_update_count = lance_dataset_config_count(after_update);
+    CHECK_OK();
+    lance_dataset_config_close(after_update);
+
+    /* A snapshot taken before close must remain usable after the dataset
+     * handle is gone. */
+    LanceDatasetConfig *snapshot = lance_dataset_config(ds);
+    ASSERT(snapshot != NULL, "post-update config snapshot failed");
+    lance_dataset_close(ds);
+    uint64_t snapshot_count = lance_dataset_config_count(snapshot);
+    CHECK_OK();
+    ASSERT(snapshot_count == after_update_count, "snapshot count mismatch");
+    const char *snapshot_key = lance_dataset_config_key_at(snapshot, 0);
+    const char *snapshot_value = lance_dataset_config_value_at(snapshot, 0);
+    CHECK_OK();
+    ASSERT(snapshot_key != NULL && snapshot_value != NULL,
+           "snapshot accessors must stay valid after dataset close");
+    lance_dataset_config_close(snapshot);
+
+    LanceDataset *reopened = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen failed");
+    config = lance_dataset_config(reopened);
+    ASSERT(config != NULL, "reopened config snapshot failed");
+    config_count = lance_dataset_config_count(config);
+    CHECK_OK();
+    int saw_custom = 0;
+    int saw_removed_older_than = 0;
+    for (uint64_t i = 0; i < config_count; i++) {
+        const char *key = lance_dataset_config_key_at(config, (size_t)i);
+        const char *value = lance_dataset_config_value_at(config, (size_t)i);
+        CHECK_OK();
+        ASSERT(key != NULL && value != NULL, "config entry must be non-NULL");
+        if (strcmp(key, "c_test.key") == 0) {
+            saw_custom = 1;
+            ASSERT(strcmp(value, "value") == 0, "custom config mismatch");
+        } else if (strcmp(key, "lance.auto_cleanup.older_than") == 0) {
+            saw_removed_older_than = 1;
+        }
+    }
+    ASSERT(saw_custom, "custom config must persist across reopen");
+    ASSERT(!saw_removed_older_than, "removed config must stay removed");
+    lance_dataset_config_close(config);
+
+    /* Error paths: NULL dataset and NULL arrays are rejected. */
+    rc = lance_dataset_update_config(NULL, keys, values, 2);
+    ASSERT(rc == -1, "NULL dataset must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+    const char *message = lance_last_error_message();
+    if (message) lance_free_string(message);
+    rc = lance_dataset_update_config(reopened, NULL, values, 2);
+    ASSERT(rc == -1, "NULL keys must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    lance_dataset_close(reopened);
+    lance_scanner_close(scanner);
+    lance_dataset_close(src);
+    printf("OK\n");
+}
+
 /* Exercises `lance_dataset_calculate_data_stats` on the freshly-written
  * (modern, v2+) dataset, where per-field on-disk sizes are populated. Runs
  * before the mutation tests reshape or empty the dataset. */
@@ -1051,6 +1334,122 @@ static void test_data_statistics(const char *write_uri) {
     lance_data_statistics_close(NULL); /* must be a safe no-op */
 
     printf("fields=%llu... OK\n", (unsigned long long)n);
+}
+
+/* Exercises native table/schema metadata reads and updates through the C API,
+ * including removal, empty values, replace/clear and reopen persistence. */
+static void test_dataset_metadata(const char *write_uri) {
+    printf("  test_dataset_metadata... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "metadata test dataset open failed");
+
+    uint64_t version_before = lance_dataset_version(ds);
+    CHECK_OK();
+
+    const char *initial = lance_dataset_metadata_json(ds);
+    ASSERT(initial != NULL, "initial metadata JSON must not be NULL");
+    ASSERT(strcmp(initial, "{}") == 0, "newly written dataset should have empty table metadata");
+    lance_free_string(initial);
+
+    const char *keys[] = {"owner", "empty", "remove"};
+    const char *values[] = {"c-consumer", "", "temporary"};
+    const char *updated = lance_dataset_update_metadata_json(
+        ds, keys, values, 3, LANCE_METADATA_UPDATE_MERGE);
+    ASSERT(updated != NULL, "table metadata merge failed");
+    ASSERT(strstr(updated, "\"owner\":\"c-consumer\"") != NULL,
+           "merged owner missing");
+    ASSERT(strstr(updated, "\"empty\":\"\"") != NULL,
+           "empty string must remain a real value");
+    lance_free_string(updated);
+
+    const char *delete_keys[] = {"remove"};
+    const char *delete_values[] = {NULL};
+    updated = lance_dataset_update_metadata_json(
+        ds, delete_keys, delete_values, 1, LANCE_METADATA_UPDATE_MERGE);
+    ASSERT(updated != NULL, "table metadata removal failed");
+    ASSERT(strstr(updated, "\"remove\"") == NULL,
+           "NULL value must remove the key");
+    lance_free_string(updated);
+
+    const char *schema_keys[] = {"schema-owner", "shared"};
+    const char *schema_values[] = {"c-consumer", "schema"};
+    const char *schema_updated = lance_dataset_update_schema_metadata_json(
+        ds, schema_keys, schema_values, 2, LANCE_METADATA_UPDATE_MERGE);
+    ASSERT(schema_updated != NULL, "schema metadata merge failed");
+    ASSERT(strstr(schema_updated, "\"schema-owner\":\"c-consumer\"") != NULL,
+           "updated schema metadata missing");
+    lance_free_string(schema_updated);
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0, "schema export failed");
+    ASSERT(schema.metadata != NULL, "Arrow schema must expose schema metadata");
+    if (schema.release) schema.release(&schema);
+
+    const char *table = lance_dataset_metadata_json(ds);
+    ASSERT(table != NULL, "table metadata read failed");
+    ASSERT(strstr(table, "\"schema-owner\"") == NULL,
+           "schema metadata update must not change table metadata");
+    lance_free_string(table);
+
+    const char *cleared = lance_dataset_update_metadata_json(
+        ds, NULL, NULL, 0, LANCE_METADATA_UPDATE_REPLACE);
+    ASSERT(cleared != NULL, "table metadata clear failed");
+    ASSERT(strcmp(cleared, "{}") == 0,
+           "empty replacement must clear the table metadata map");
+    lance_free_string(cleared);
+
+    const char *persist_keys[] = {"persist"};
+    const char *persist_values[] = {"yes"};
+    updated = lance_dataset_update_metadata_json(
+        ds, persist_keys, persist_values, 1, LANCE_METADATA_UPDATE_MERGE);
+    ASSERT(updated != NULL, "persistent table metadata update failed");
+    lance_free_string(updated);
+
+    schema_updated = lance_dataset_update_schema_metadata_json(
+        ds, NULL, NULL, 0, LANCE_METADATA_UPDATE_REPLACE);
+    ASSERT(schema_updated != NULL, "schema metadata clear failed");
+    ASSERT(strcmp(schema_updated, "{}") == 0,
+           "empty replacement must clear schema metadata");
+    lance_free_string(schema_updated);
+    ASSERT(lance_dataset_version(ds) > version_before,
+           "metadata updates must advance the dataset version");
+
+    /* Invalid inputs fail without changing the committed metadata. */
+    ASSERT(lance_dataset_metadata_json(NULL) == NULL,
+           "NULL dataset metadata read must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL dataset metadata read must return INVALID_ARGUMENT");
+    ASSERT(lance_dataset_update_metadata_json(
+               ds, NULL, persist_values, 1, LANCE_METADATA_UPDATE_MERGE) == NULL,
+           "NULL keys must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL keys must return INVALID_ARGUMENT");
+    ASSERT(lance_dataset_update_metadata_json(
+               ds, persist_keys, NULL, 1, LANCE_METADATA_UPDATE_MERGE) == NULL,
+           "NULL values array must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL values array must return INVALID_ARGUMENT");
+    ASSERT(lance_dataset_update_metadata_json(
+               ds, persist_keys, persist_values, 1,
+               (LanceMetadataUpdateMode)99) == NULL,
+           "invalid update mode must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid update mode must return INVALID_ARGUMENT");
+
+    lance_dataset_close(ds);
+
+    ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "metadata test reopen failed");
+    const char *reopened = lance_dataset_metadata_json(ds);
+    ASSERT(reopened != NULL, "reopened metadata read failed");
+    ASSERT(strstr(reopened, "\"persist\":\"yes\"") != NULL,
+           "table metadata must persist across reopen");
+    lance_free_string(reopened);
+    lance_dataset_close(ds);
+
+    printf("OK\n");
 }
 
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
@@ -2354,10 +2753,10 @@ static void test_fragment_snapshot(const char *uri) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 6) {
+    if (argc < 7) {
         fprintf(stderr,
-                "Usage: %s <dataset_uri> <write_uri> <blob_uri> "
-                "<ordering_uri> <fragment_uri>\n",
+                "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
+                "<session_uri> <fragment_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -2366,13 +2765,15 @@ int main(int argc, char **argv) {
     const char *write_uri = argv[2];
     const char *blob_uri = argv[3];
     const char *ordering_uri = argv[4];
-    const char *fragment_uri = argv[5];
+    const char *session_uri = argv[5];
+    const char *fragment_uri = argv[6];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
     test_materialization_and_fast_search(uri);
     test_open_and_metadata(uri);
     test_shared_session(uri);
+    test_session_cache_config(session_uri);
     test_scan(uri);
     test_distance_range(uri);
     test_scan_with_limit(uri);
@@ -2391,7 +2792,9 @@ int main(int argc, char **argv) {
     test_vector_models_and_reusable_segments(uri);
     test_commit_index_segments(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
+    test_dataset_metadata(write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);

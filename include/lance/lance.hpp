@@ -182,6 +182,11 @@ enum class WriteMode : int32_t {
     Overwrite = LANCE_WRITE_OVERWRITE,
 };
 
+enum class MetadataUpdateMode : int32_t {
+    Merge   = LANCE_METADATA_UPDATE_MERGE,
+    Replace = LANCE_METADATA_UPDATE_REPLACE,
+};
+
 enum class FtsCoverageMode : int32_t {
     Strict    = LANCE_FTS_COVERAGE_STRICT,
     IndexOnly = LANCE_FTS_COVERAGE_INDEX_ONLY,
@@ -260,6 +265,40 @@ struct WriteParams {
     bool                       enable_stable_row_ids = false;
 };
 
+/// Native auto-cleanup settings for `WriteOptions`.
+///
+/// `interval` is the number of committed versions between cleanup runs; 0 is
+/// valid and considers cleanup on every commit.
+///
+/// `older_than_seconds` and `older_than_nanos` express the native
+/// `chrono::TimeDelta` retention window as
+/// `older_than_seconds + older_than_nanos / 1000000000`. Both fields carry the
+/// sign; `older_than_nanos` must be in [-999999999, 999999999] and the combined
+/// value must fit in the native `TimeDelta` range (about +/-292 million years).
+/// Negative durations are rejected by Lance when the write transaction is
+/// built.
+struct AutoCleanupParams {
+    uint64_t interval = 0;
+    int64_t  older_than_seconds = 0;
+    int32_t  older_than_nanos = 0;
+};
+
+/// Native write settings for `Dataset::write_with_options`, which selects
+/// Rust's `WriteParams::default()`.
+///
+/// A default-constructed `WriteOptions` sets `auto_cleanup = std::nullopt`
+/// (native `None`) and `skip_auto_cleanup = false`. `params` retains the
+/// zero-means-upstream-default mapping of `WriteParams`.
+struct WriteOptions {
+    WriteParams                      params;
+    std::optional<AutoCleanupParams> auto_cleanup;
+    bool                             skip_auto_cleanup = false;
+};
+
+/// One native `Dataset::update_config` entry. `value == std::nullopt` removes
+/// the key; otherwise the value is upserted.
+using ConfigUpdate = std::pair<std::string, std::optional<std::string>>;
+
 // ─── Column alteration ───────────────────────────────────────────────────────
 
 /// A single alteration applied to one column by `Dataset::alter_columns`.
@@ -287,20 +326,135 @@ struct SqlColumn {
 
 // ─── Shared Session ──────────────────────────────────────────────────────────
 
+enum class SessionCacheSpecKind : int32_t {
+    Default = LANCE_SESSION_CACHE_SPEC_DEFAULT,
+    Size    = LANCE_SESSION_CACHE_SPEC_SIZE,
+    Uri     = LANCE_SESSION_CACHE_SPEC_URI,
+    Config  = LANCE_SESSION_CACHE_SPEC_CONFIG,
+};
+
+/// Cache selection for one session cache tier. `default_cache()` uses the
+/// native tier default; `with_size(0)` requests an explicit zero capacity.
+struct SessionCacheSpec {
+    SessionCacheSpecKind kind = SessionCacheSpecKind::Default;
+    uint64_t size_bytes = 0;
+    std::string backend_uri;
+    std::string backend_kind;
+    std::vector<std::pair<std::string, std::string>> backend_options;
+
+    static SessionCacheSpec default_cache() { return {}; }
+
+    static SessionCacheSpec with_size(uint64_t capacity_bytes) {
+        SessionCacheSpec spec;
+        spec.kind = SessionCacheSpecKind::Size;
+        spec.size_bytes = capacity_bytes;
+        return spec;
+    }
+
+    static SessionCacheSpec from_uri(std::string uri) {
+        SessionCacheSpec spec;
+        spec.kind = SessionCacheSpecKind::Uri;
+        spec.backend_uri = std::move(uri);
+        return spec;
+    }
+
+    static SessionCacheSpec from_config(
+        std::string backend_kind,
+        std::vector<std::pair<std::string, std::string>> backend_options = {}) {
+        SessionCacheSpec spec;
+        spec.kind = SessionCacheSpecKind::Config;
+        spec.backend_kind = std::move(backend_kind);
+        spec.backend_options = std::move(backend_options);
+        return spec;
+    }
+};
+
 class Session {
     Handle<LanceSession, lance_session_close> handle_;
 
+    static LanceSessionCacheSpec c_cache_spec(
+        const SessionCacheSpec& spec,
+        std::vector<const char*>& option_keys,
+        std::vector<const char*>& option_values) {
+        LanceSessionCacheSpec c_spec{};
+        c_spec.kind = static_cast<int32_t>(spec.kind);
+        switch (spec.kind) {
+            case SessionCacheSpecKind::Default:
+                break;
+            case SessionCacheSpecKind::Size:
+                c_spec.size_bytes = spec.size_bytes;
+                break;
+            case SessionCacheSpecKind::Uri:
+                c_spec.backend_uri = spec.backend_uri.c_str();
+                break;
+            case SessionCacheSpecKind::Config:
+                c_spec.backend_kind = spec.backend_kind.c_str();
+                option_keys.reserve(spec.backend_options.size());
+                option_values.reserve(spec.backend_options.size());
+                for (const auto& [key, value] : spec.backend_options) {
+                    option_keys.push_back(key.c_str());
+                    option_values.push_back(value.c_str());
+                }
+                if (!option_keys.empty()) {
+                    c_spec.option_keys = option_keys.data();
+                    c_spec.option_values = option_values.data();
+                    c_spec.option_count = option_keys.size();
+                }
+                break;
+        }
+        return c_spec;
+    }
+
+    static LanceSession* create(
+        const SessionCacheSpec& index_cache,
+        const SessionCacheSpec& metadata_cache) {
+        std::vector<const char*> index_keys;
+        std::vector<const char*> index_values;
+        std::vector<const char*> metadata_keys;
+        std::vector<const char*> metadata_values;
+        auto c_index =
+            c_cache_spec(index_cache, index_keys, index_values);
+        auto c_metadata =
+            c_cache_spec(metadata_cache, metadata_keys, metadata_values);
+        return lance_session_new_with_cache_specs(&c_index, &c_metadata);
+    }
+
 public:
-    Session(uint64_t index_cache_size_bytes, uint64_t metadata_cache_size_bytes)
-        : handle_(lance_session_new(index_cache_size_bytes, metadata_cache_size_bytes)) {
+    /// Configure each cache tier independently. The spec values and their
+    /// string buffers are consumed during construction.
+    Session(
+        const SessionCacheSpec& index_cache,
+        const SessionCacheSpec& metadata_cache)
+        : handle_(create(index_cache, metadata_cache)) {
         if (!handle_) check_error();
     }
+
+    Session(uint64_t index_cache_size_bytes, uint64_t metadata_cache_size_bytes)
+        : Session(
+              SessionCacheSpec::with_size(index_cache_size_bytes),
+              SessionCacheSpec::with_size(metadata_cache_size_bytes)) {}
 
     LanceSessionCacheStats cache_stats() const {
         LanceSessionCacheStats stats{};
         if (lance_session_get_cache_stats(handle_.get(), &stats) != 0)
             check_error();
         return stats;
+    }
+
+    /// Current deep size of the session in bytes. This is not an RSS limit.
+    uint64_t size_bytes() const {
+        uint64_t size = 0;
+        if (lance_session_get_size_bytes(handle_.get(), &size) != 0)
+            check_error();
+        return size;
+    }
+
+    /// Approximate number of items retained in both cache tiers.
+    uint64_t approx_num_items() const {
+        uint64_t count = 0;
+        if (lance_session_get_approx_num_items(handle_.get(), &count) != 0)
+            check_error();
+        return count;
     }
 
     const LanceSession* c_handle() const { return handle_.get(); }
@@ -723,74 +877,52 @@ class Dataset {
         }
     }
 
-public:
-    /// Open a dataset at the given URI. Pass `version` = 0 (the default) for
-    /// the latest, or a specific version id from `versions()` to check out
-    /// that version, e.g. `lance::Dataset::open("data.lance", {}, /*version=*/42)`.
-    static Dataset open(
-        const std::string& uri,
-        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
-        uint64_t version = 0) {
+    static std::string run_metadata_update_json(
+        LanceDataset* dataset,
+        const std::vector<std::pair<std::string, std::optional<std::string>>>& values,
+        MetadataUpdateMode mode,
+        bool schema_metadata) {
 
-        auto kv = to_c_key_values(storage_opts);
-        const char* const* opts_ptr =
-            storage_opts.empty() ? nullptr : kv.data();
+        std::vector<const char*> keys;
+        std::vector<const char*> raw_values;
+        keys.reserve(values.size());
+        raw_values.reserve(values.size());
+        for (const auto& [key, value] : values) {
+            keys.push_back(key.c_str());
+            raw_values.push_back(value ? value->c_str() : nullptr);
+        }
 
-        auto* ds = lance_dataset_open(uri.c_str(), opts_ptr, version);
-        if (!ds) check_error();
-        return Dataset(ds);
+        const char* json = schema_metadata
+            ? lance_dataset_update_schema_metadata_json(
+                  dataset, keys.data(), raw_values.data(), values.size(),
+                  static_cast<LanceMetadataUpdateMode>(mode))
+            : lance_dataset_update_metadata_json(
+                  dataset, keys.data(), raw_values.data(), values.size(),
+                  static_cast<LanceMetadataUpdateMode>(mode));
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
     }
 
-    /// Open a dataset with caches owned by `session`. The returned dataset
-    /// remains valid if the Session wrapper is destroyed first.
-    static Dataset open_with_session(
-        const Session& session,
-        const std::string& uri,
-        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
-        uint64_t version = 0) {
-
-        auto kv = to_c_key_values(storage_opts);
-        const char* const* opts_ptr =
-            storage_opts.empty() ? nullptr : kv.data();
-
-        auto* ds = lance_dataset_open_with_session(
-            uri.c_str(), opts_ptr, version, session.c_handle());
-        if (!ds) check_error();
-        return Dataset(ds);
-    }
-
-    /// Write an Arrow record batch stream to a Lance dataset and return the
-    /// open dataset at the committed version.
-    ///
-    /// The stream must be self-describing; its own schema is used. Treat the
-    /// stream as consumed once this call returns or throws — do not reuse it.
-    /// Throws lance::Error on failure (including if `stream` is null).
-    static Dataset write(
+    /// Shared write path. `native_options` selects the native-defaults entry
+    /// point; otherwise `legacy_params` selects the legacy 20/14 entry point.
+    static Dataset write_impl(
         const std::string& uri,
         ArrowArrayStream* stream,
         WriteMode mode,
-        const std::vector<std::pair<std::string, std::string>>& storage_opts = {}) {
-
-        return write(uri, stream, mode, WriteParams{}, storage_opts);
-    }
-
-    /// Same as the four-argument `write` but tunes the output via `params`.
-    /// Pass a default-constructed `WriteParams{}` to inherit upstream defaults.
-    static Dataset write(
-        const std::string& uri,
-        ArrowArrayStream* stream,
-        WriteMode mode,
-        const WriteParams& params,
-        const std::vector<std::pair<std::string, std::string>>& storage_opts = {}) {
+        const LanceWriteParams* legacy_params,
+        const LanceWriteOptions* native_options,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts) {
 
         if (stream == nullptr) {
             throw Error(LANCE_ERR_INVALID_ARGUMENT, "stream must not be null");
         }
 
-        // RAII guard for the stream. Until `lance_dataset_write_with_params`
-        // is called, any exception (failed `get_schema`, `std::bad_alloc`
-        // while building `kv`, etc.) must release the stream. After that call
-        // Rust owns it, so we `disarm()` immediately before invoking the C API.
+        // RAII guard for the stream. Until the selected write entry point is
+        // called, any exception (failed `get_schema`, `std::bad_alloc` while
+        // building `kv`, etc.) must release the stream. After that call Rust
+        // owns it, so we `disarm()` immediately before invoking the C API.
         struct StreamGuard {
             ArrowArrayStream* s;
             bool armed = true;
@@ -857,28 +989,35 @@ public:
         const char* const* opts_ptr =
             storage_opts.empty() ? nullptr : kv.data();
 
-        LanceWriteParams c_params = {};
-        c_params.max_rows_per_file    = params.max_rows_per_file;
-        c_params.max_rows_per_group   = params.max_rows_per_group;
-        c_params.max_bytes_per_file   = params.max_bytes_per_file;
-        c_params.data_storage_version =
-            params.data_storage_version ? params.data_storage_version->c_str() : nullptr;
-        c_params.enable_stable_row_ids = params.enable_stable_row_ids;
-
         // The C API consumes the stream on every return path, so disarm the
         // guard before calling. After this point the stream pointer is logically
         // owned by Rust and any C++-side exception must not re-release it.
         stream_guard.disarm();
 
         LanceDataset* out = nullptr;
-        int32_t rc = lance_dataset_write_with_params(
-            uri.c_str(),
-            &schema,
-            stream,
-            static_cast<int32_t>(mode),
-            &c_params,
-            opts_ptr,
-            &out);
+        int32_t rc;
+        const char* entry_point;
+        if (native_options) {
+            entry_point = "lance_dataset_write_with_options";
+            rc = lance_dataset_write_with_options(
+                uri.c_str(),
+                &schema,
+                stream,
+                static_cast<int32_t>(mode),
+                native_options,
+                opts_ptr,
+                &out);
+        } else {
+            entry_point = "lance_dataset_write_with_params";
+            rc = lance_dataset_write_with_params(
+                uri.c_str(),
+                &schema,
+                stream,
+                static_cast<int32_t>(mode),
+                legacy_params,
+                opts_ptr,
+                &out);
+        }
         if (rc != 0) check_error();
         // Defensive null guard: a conforming Rust impl never returns rc == 0
         // with `out == nullptr`, but constructing a Dataset around a null
@@ -887,9 +1026,127 @@ public:
         // thread-local code is `LANCE_OK` on this path (rc == 0).
         if (!out) {
             throw Error(LANCE_ERR_INTERNAL,
-                        "lance_dataset_write_with_params returned success with null out_dataset");
+                        std::string(entry_point) +
+                            " returned success with null out_dataset");
         }
         return Dataset(out);
+    }
+
+public:
+    /// Open a dataset at the given URI. Pass `version` = 0 (the default) for
+    /// the latest, or a specific version id from `versions()` to check out
+    /// that version, e.g. `lance::Dataset::open("data.lance", {}, /*version=*/42)`.
+    static Dataset open(
+        const std::string& uri,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        uint64_t version = 0) {
+
+        auto kv = to_c_key_values(storage_opts);
+        const char* const* opts_ptr =
+            storage_opts.empty() ? nullptr : kv.data();
+
+        auto* ds = lance_dataset_open(uri.c_str(), opts_ptr, version);
+        if (!ds) check_error();
+        return Dataset(ds);
+    }
+
+    /// Open a dataset with caches owned by `session`. The returned dataset
+    /// remains valid if the Session wrapper is destroyed first.
+    static Dataset open_with_session(
+        const Session& session,
+        const std::string& uri,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        uint64_t version = 0) {
+
+        auto kv = to_c_key_values(storage_opts);
+        const char* const* opts_ptr =
+            storage_opts.empty() ? nullptr : kv.data();
+
+        auto* ds = lance_dataset_open_with_session(
+            uri.c_str(), opts_ptr, version, session.c_handle());
+        if (!ds) check_error();
+        return Dataset(ds);
+    }
+
+    /// Write an Arrow record batch stream to a Lance dataset and return the
+    /// open dataset at the committed version.
+    ///
+    /// The stream must be self-describing; its own schema is used. Treat the
+    /// stream as consumed once this call returns or throws — do not reuse it.
+    /// Throws lance::Error on failure (including if `stream` is null).
+    static Dataset write(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {}) {
+
+        return write(uri, stream, mode, WriteParams{}, storage_opts);
+    }
+
+    /// Same as the four-argument `write` but tunes the output via `params`.
+    /// Pass a default-constructed `WriteParams{}` to inherit upstream defaults.
+    ///
+    /// This overload preserves the legacy lance-c 20-version / 14-day
+    /// auto-cleanup policy. Use `write_with_options` for native
+    /// `WriteParams::default()` semantics.
+    static Dataset write(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteParams& params,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {}) {
+
+        LanceWriteParams c_params = {};
+        c_params.max_rows_per_file    = params.max_rows_per_file;
+        c_params.max_rows_per_group   = params.max_rows_per_group;
+        c_params.max_bytes_per_file   = params.max_bytes_per_file;
+        c_params.data_storage_version =
+            params.data_storage_version ? params.data_storage_version->c_str() : nullptr;
+        c_params.enable_stable_row_ids = params.enable_stable_row_ids;
+
+        return write_impl(
+            uri, stream, mode, &c_params, nullptr, storage_opts);
+    }
+
+    /// Write using native `WriteParams::default()` semantics.
+    ///
+    /// A default-constructed `WriteOptions` sets `auto_cleanup =
+    /// std::nullopt` (native `None`) and `skip_auto_cleanup = false`.
+    /// `auto_cleanup` is persisted only by CREATE; APPEND and OVERWRITE leave
+    /// an existing dataset's policy unchanged. `skip_auto_cleanup` affects only
+    /// the current commit. Throws `lance::Error` on failure.
+    static Dataset write_with_options(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteOptions& options,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {}) {
+
+        LanceWriteParams c_params = {};
+        c_params.max_rows_per_file    = options.params.max_rows_per_file;
+        c_params.max_rows_per_group   = options.params.max_rows_per_group;
+        c_params.max_bytes_per_file   = options.params.max_bytes_per_file;
+        c_params.data_storage_version =
+            options.params.data_storage_version
+                ? options.params.data_storage_version->c_str()
+                : nullptr;
+        c_params.enable_stable_row_ids = options.params.enable_stable_row_ids;
+
+        LanceAutoCleanupParams c_cleanup = {};
+        LanceWriteOptions c_options = {};
+        c_options.params = c_params;
+        c_options.skip_auto_cleanup = options.skip_auto_cleanup;
+        if (options.auto_cleanup) {
+            c_cleanup.interval = options.auto_cleanup->interval;
+            c_cleanup.older_than_seconds =
+                options.auto_cleanup->older_than_seconds;
+            c_cleanup.older_than_nanos =
+                options.auto_cleanup->older_than_nanos;
+            c_options.auto_cleanup = &c_cleanup;
+        }
+
+        return write_impl(
+            uri, stream, mode, nullptr, &c_options, storage_opts);
     }
 
     /// Number of rows in the dataset.
@@ -913,6 +1170,40 @@ public:
         return v;
     }
 
+    /// Table metadata for this snapshot as a JSON object.
+    /// Schema metadata is available through `schema()` instead.
+    /// Throws lance::Error on failure.
+    std::string metadata_json() const {
+        const char* json = lance_dataset_metadata_json(handle_.get());
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
+    }
+
+    /// Merge or replace table metadata and return the complete updated map as
+    /// a JSON object. A `std::nullopt` value removes its key; an empty string
+    /// stores a real empty value. `MetadataUpdateMode::Replace` with an empty
+    /// vector clears the map. Mutates this dataset in place; existing
+    /// snapshots keep their prior view. Throws lance::Error on failure.
+    std::string update_metadata_json(
+        const std::vector<std::pair<std::string, std::optional<std::string>>>& values,
+        MetadataUpdateMode mode = MetadataUpdateMode::Merge) {
+        return run_metadata_update_json(
+            handle_.get(), values, mode, /*schema_metadata=*/false);
+    }
+
+    /// Merge or replace schema metadata and return the complete updated map as
+    /// a JSON object. Input semantics match `update_metadata_json`. Read the
+    /// committed schema metadata through `schema()`. Throws lance::Error on
+    /// failure.
+    std::string update_schema_metadata_json(
+        const std::vector<std::pair<std::string, std::optional<std::string>>>& values,
+        MetadataUpdateMode mode = MetadataUpdateMode::Merge) {
+        return run_metadata_update_json(
+            handle_.get(), values, mode, /*schema_metadata=*/true);
+    }
+
     /// Snapshot the dataset's version history, ordered by version id.
     /// Throws lance::Error on failure.
     std::vector<VersionInfo> versions() const {
@@ -934,6 +1225,56 @@ public:
             out.push_back(info);
         }
         return out;
+    }
+
+    /// Snapshot the dataset's manifest config map.
+    ///
+    /// The returned map owns copies of all keys and values. The snapshot is
+    /// independent of this handle. Entry order is unspecified. A config entry
+    /// containing an embedded NUL byte cannot be represented as a C string and
+    /// throws with LANCE_ERR_INTERNAL. Throws lance::Error on failure.
+    std::map<std::string, std::string> config() const {
+        auto* raw = lance_dataset_config(handle_.get());
+        if (!raw) check_error();
+        Handle<LanceDatasetConfig, lance_dataset_config_close> snap(raw);
+
+        uint64_t n = lance_dataset_config_count(snap.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::map<std::string, std::string> out;
+        for (uint64_t i = 0; i < n; i++) {
+            const char* key =
+                lance_dataset_config_key_at(snap.get(), static_cast<size_t>(i));
+            if (!key) check_error();
+            const char* value =
+                lance_dataset_config_value_at(snap.get(), static_cast<size_t>(i));
+            if (!value) check_error();
+            out.emplace(key, value);
+        }
+        return out;
+    }
+
+    /// Apply native merge-style config updates, committing a new manifest.
+    ///
+    /// `value == std::nullopt` removes the key; any string value (including an
+    /// empty one) upserts it. The handle points at the new version after a
+    /// successful call. Throws lance::Error on failure (NULL dataset, invalid
+    /// C strings, commit conflict, ...).
+    void update_config(const std::vector<ConfigUpdate>& updates) {
+        std::vector<const char*> keys;
+        std::vector<const char*> values;
+        keys.reserve(updates.size());
+        values.reserve(updates.size());
+        for (const auto& [key, value] : updates) {
+            keys.push_back(key.c_str());
+            values.push_back(value ? value->c_str() : nullptr);
+        }
+        const char* const* keys_ptr = updates.empty() ? nullptr : keys.data();
+        const char* const* values_ptr =
+            updates.empty() ? nullptr : values.data();
+        if (lance_dataset_update_config(
+                handle_.get(), keys_ptr, values_ptr, updates.size()) != 0) {
+            check_error();
+        }
     }
 
     /// Current version details, including native nanosecond timestamp and
