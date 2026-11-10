@@ -546,6 +546,82 @@ public:
     }
 };
 
+// ─── Read-only fragment snapshot ─────────────────────────────────────────────
+
+/// RAII handle over one fragment from a dataset snapshot. Native
+/// `FileFragment` owns an `Arc<Dataset>`, so this handle remains valid and
+/// keeps reading the same dataset version after the source Dataset is closed
+/// or mutated. Methods expose only read-only metadata and row counts.
+class Fragment {
+    Handle<LanceFragment, lance_fragment_close> handle_;
+
+public:
+    /// Adopt a handle from the C API; closed on destruction.
+    explicit Fragment(LanceFragment* fragment) : handle_(fragment) {}
+
+    Fragment(Fragment&&) noexcept = default;
+    Fragment& operator=(Fragment&&) noexcept = default;
+    Fragment(const Fragment&) = delete;
+    Fragment& operator=(const Fragment&) = delete;
+
+    /// Native fragment ID.
+    uint64_t id() const {
+        uint64_t value = lance_fragment_id(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Number of Native base data files; excludes overlays and the deletion file.
+    uint64_t data_file_count() const {
+        uint64_t value = lance_fragment_data_file_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Native `Fragment` metadata serialized as JSON. Includes base data
+    /// files, overlays, deletion-file metadata, row-id/version metadata, and
+    /// the optional physical_rows value.
+    std::string metadata_json() const {
+        const char* raw = lance_fragment_metadata_json(handle_.get());
+        if (!raw) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            raw, lance_free_string);
+        return std::string(raw);
+    }
+
+    /// Export the logical dataset schema through Arrow C Data Interface.
+    /// `out` is caller-owned; release it exactly once.
+    void schema(ArrowSchema* out) const {
+        if (lance_fragment_schema(handle_.get(), out) != 0) check_error();
+    }
+
+    /// Physical row count, including deleted rows. May perform data-file I/O.
+    uint64_t physical_rows() const {
+        uint64_t value = 0;
+        if (lance_fragment_physical_rows(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    /// Deleted-row count. May load the deletion vector.
+    uint64_t deleted_rows() const {
+        uint64_t value = 0;
+        if (lance_fragment_deleted_rows(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    /// Logical row count from Native count_rows(None).
+    uint64_t logical_rows() const {
+        uint64_t value = 0;
+        if (lance_fragment_logical_rows(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    const LanceFragment* c_handle() const { return handle_.get(); }
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -1410,6 +1486,16 @@ public:
                 check_error();
         }
         return ids;
+    }
+
+    /// Resolve a read-only fragment snapshot by ID. The returned handle stays
+    /// bound to this dataset version and remains valid after this Dataset is
+    /// destroyed. A missing ID throws LANCE_ERR_NOT_FOUND.
+    Fragment open_fragment(uint64_t fragment_id) const {
+        auto* fragment =
+            lance_dataset_open_fragment(handle_.get(), fragment_id);
+        if (!fragment) check_error();
+        return Fragment(fragment);
     }
 
     /// Create a vector index on a column.

@@ -6,7 +6,7 @@
 //! These tests call the `extern "C"` functions directly from Rust,
 //! validating the C API contract without needing a C compiler.
 
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
 use std::sync::Arc;
@@ -20,9 +20,9 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;
 use arrow_array::{
     Array, BinaryArray, Float32Array, Int32Array, LargeBinaryArray, RecordBatch, StringArray,
-    UInt32Array, UInt64Array,
+    StructArray, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
@@ -3210,6 +3210,77 @@ fn create_multi_fragment_dataset() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a two-fragment dataset with a nested struct schema. The two
+/// fragments hold ids 0..=3 and 10..=13. When `delete_rows` is true, one row
+/// from each fragment is deleted, producing deletion files at version 3;
+/// otherwise the dataset remains at the two-fragment version 2.
+fn create_fragment_snapshot_dataset(delete_rows: bool) -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("fragment_snapshot_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let profile_fields = Fields::from(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Float32, true),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("profile", DataType::Struct(profile_fields.clone()), true),
+    ]));
+    let make_batch = |ids: Vec<i32>, names: Vec<Option<&str>>, scores: Vec<Option<f32>>| {
+        let profiles = StructArray::new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(Float32Array::from(scores)),
+            ],
+            None,
+        );
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(profiles)],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        let first = make_batch(
+            vec![0, 1, 2, 3],
+            vec![Some("a"), Some("b"), None, Some("d")],
+            vec![Some(1.0), Some(2.0), Some(3.5), None],
+        );
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let second = make_batch(
+            vec![10, 11, 12, 13],
+            vec![Some("j"), None, Some("l"), Some("m")],
+            vec![Some(10.0), Some(11.0), None, Some(13.0)],
+        );
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        if delete_rows {
+            dataset.delete("id IN (1, 12)").await.unwrap();
+        }
+    });
+
+    (tmp, uri)
+}
+
 #[test]
 fn test_fragment_count() {
     let (_tmp, uri) = create_multi_fragment_dataset();
@@ -3275,6 +3346,351 @@ fn test_scanner_with_fragment_ids() {
     assert_eq!(total2, 5, "scanning second fragment should yield 5 rows");
 
     unsafe { lance_scanner_close(scanner2) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fragment_snapshot_metadata_schema_and_counts() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(true);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let count = unsafe { lance_dataset_fragment_count(ds) };
+    assert_eq!(count, 2);
+    let mut ids = vec![0_u64; count as usize];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+
+    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    for fragment_id in ids {
+        let native_fragment = native.get_fragment(fragment_id as usize).unwrap();
+        let fragment = unsafe { lance_dataset_open_fragment(ds, fragment_id) };
+        assert!(!fragment.is_null());
+        assert_eq!(unsafe { lance_fragment_id(fragment) }, fragment_id);
+        assert_eq!(
+            unsafe { lance_fragment_data_file_count(fragment) },
+            native_fragment.num_data_files() as u64
+        );
+        assert_eq!(unsafe { lance_fragment_data_file_count(fragment) }, 1);
+
+        let mut physical_rows = 0_u64;
+        assert_eq!(
+            unsafe { lance_fragment_physical_rows(fragment, &mut physical_rows) },
+            0
+        );
+        assert_eq!(physical_rows, 4);
+        assert_eq!(
+            physical_rows as usize,
+            lance_c::runtime::block_on(native_fragment.physical_rows()).unwrap()
+        );
+
+        let mut deleted_rows = 0_u64;
+        assert_eq!(
+            unsafe { lance_fragment_deleted_rows(fragment, &mut deleted_rows) },
+            0
+        );
+        assert_eq!(deleted_rows, 1);
+        assert_eq!(
+            deleted_rows as usize,
+            lance_c::runtime::block_on(native_fragment.count_deletions()).unwrap()
+        );
+
+        let mut logical_rows = 0_u64;
+        assert_eq!(
+            unsafe { lance_fragment_logical_rows(fragment, &mut logical_rows) },
+            0
+        );
+        assert_eq!(logical_rows, 3);
+        assert_eq!(
+            logical_rows as usize,
+            lance_c::runtime::block_on(native_fragment.count_rows(None)).unwrap()
+        );
+
+        let metadata_ptr = unsafe { lance_fragment_metadata_json(fragment) };
+        assert!(!metadata_ptr.is_null());
+        let metadata = unsafe { CStr::from_ptr(metadata_ptr) }.to_str().unwrap();
+        let actual_metadata: serde_json::Value = serde_json::from_str(metadata).unwrap();
+        let expected_metadata = serde_json::to_value(native_fragment.metadata()).unwrap();
+        assert_eq!(actual_metadata, expected_metadata);
+        assert_eq!(actual_metadata["id"].as_u64(), Some(fragment_id));
+        assert_eq!(actual_metadata["physical_rows"].as_u64(), Some(4));
+        assert_eq!(
+            actual_metadata["deletion_file"]["num_deleted_rows"].as_u64(),
+            Some(1)
+        );
+        let files = actual_metadata["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(".lance"))
+        );
+        unsafe { lance_free_string(metadata_ptr) };
+
+        let mut ffi_schema = FFI_ArrowSchema::empty();
+        assert_eq!(
+            unsafe { lance_fragment_schema(fragment, &mut ffi_schema) },
+            0
+        );
+        let actual_schema = Schema::try_from(&ffi_schema).unwrap();
+        let expected_schema: Schema = native_fragment.schema().into();
+        assert_eq!(actual_schema, expected_schema);
+        let profile = actual_schema.field_with_name("profile").unwrap();
+        let DataType::Struct(profile_fields) = profile.data_type() else {
+            panic!("profile must be a struct");
+        };
+        assert_eq!(
+            profile_fields
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["name", "score"]
+        );
+
+        unsafe { lance_fragment_close(fragment) };
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fragment_snapshot_survives_close_and_later_update() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+    let fragment = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    assert!(!fragment.is_null());
+
+    // Dropping the source handle must not invalidate the fragment snapshot.
+    unsafe { lance_dataset_close(ds) };
+    assert_eq!(unsafe { lance_fragment_id(fragment) }, ids[0]);
+    let mut physical_rows = 0_u64;
+    let mut deleted_rows = u64::MAX;
+    let mut logical_rows = 0_u64;
+    assert_eq!(
+        unsafe { lance_fragment_physical_rows(fragment, &mut physical_rows) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_fragment_deleted_rows(fragment, &mut deleted_rows) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_fragment_logical_rows(fragment, &mut logical_rows) },
+        0
+    );
+    assert_eq!((physical_rows, deleted_rows, logical_rows), (4, 0, 4));
+
+    // A later commit changes the latest snapshot; the held fragment must keep
+    // reading its original version instead of silently following the update.
+    let latest = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!latest.is_null());
+    let predicate = c_str("id = 1");
+    let mut num_deleted = 0_u64;
+    assert_eq!(
+        unsafe { lance_dataset_delete(latest, predicate.as_ptr(), &mut num_deleted) },
+        0
+    );
+    assert_eq!(num_deleted, 1);
+
+    physical_rows = 0;
+    deleted_rows = 1;
+    logical_rows = 0;
+    assert_eq!(
+        unsafe { lance_fragment_physical_rows(fragment, &mut physical_rows) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_fragment_deleted_rows(fragment, &mut deleted_rows) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_fragment_logical_rows(fragment, &mut logical_rows) },
+        0
+    );
+    assert_eq!((physical_rows, deleted_rows, logical_rows), (4, 0, 4));
+    let metadata_ptr = unsafe { lance_fragment_metadata_json(fragment) };
+    assert!(!metadata_ptr.is_null());
+    let metadata = unsafe { CStr::from_ptr(metadata_ptr) }.to_str().unwrap();
+    assert!(!metadata.contains("\"deletion_file\""));
+    unsafe { lance_free_string(metadata_ptr) };
+
+    let updated = unsafe { lance_dataset_open_fragment(latest, ids[0]) };
+    assert!(!updated.is_null());
+    deleted_rows = 0;
+    assert_eq!(
+        unsafe { lance_fragment_deleted_rows(updated, &mut deleted_rows) },
+        0
+    );
+    assert_eq!(deleted_rows, 1);
+
+    unsafe { lance_fragment_close(updated) };
+    unsafe { lance_fragment_close(fragment) };
+    unsafe { lance_dataset_close(latest) };
+}
+
+#[test]
+fn test_fragment_snapshot_errors() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(true);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    assert!(unsafe { lance_dataset_open_fragment(ptr::null(), 0) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("dataset must not be NULL"));
+
+    assert!(
+        unsafe { lance_dataset_open_fragment(ds, u64::MAX) }.is_null(),
+        "out-of-range fragment ID must fail"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    let message = take_last_error_message();
+    assert!(message.contains("fragment_id"));
+    assert!(message.contains(&u64::MAX.to_string()));
+
+    let mut ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+    let fragment = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    assert!(!fragment.is_null());
+
+    let mut rows = 123_u64;
+    assert_eq!(
+        unsafe { lance_fragment_physical_rows(fragment, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("out_rows must not be NULL"));
+    assert_eq!(rows, 123);
+    assert_eq!(
+        unsafe { lance_fragment_deleted_rows(ptr::null(), &mut rows) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("fragment must not be NULL"));
+
+    assert_eq!(unsafe { lance_fragment_id(ptr::null()) }, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("fragment must not be NULL"));
+    assert_eq!(unsafe { lance_fragment_data_file_count(ptr::null()) }, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("fragment must not be NULL"));
+    assert!(unsafe { lance_fragment_metadata_json(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("fragment must not be NULL"));
+
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_fragment_schema(fragment, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("out must not be NULL"));
+    assert_eq!(
+        unsafe { lance_fragment_schema(ptr::null(), &mut ffi_schema) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("fragment must not be NULL"));
+
+    unsafe { lance_fragment_close(fragment) };
+    unsafe { lance_dataset_close(ds) };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_uri = tmp
+        .path()
+        .join("empty_fragments")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let empty_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    lance_c::runtime::block_on(async {
+        let batches: Vec<arrow::error::Result<RecordBatch>> = vec![];
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(batches, empty_schema),
+            &empty_uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+    let empty_uri = c_str(&empty_uri);
+    let empty_ds = unsafe { lance_dataset_open(empty_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!empty_ds.is_null());
+    assert_eq!(unsafe { lance_dataset_fragment_count(empty_ds) }, 0);
+    assert!(
+        unsafe { lance_dataset_open_fragment(empty_ds, 0) }.is_null(),
+        "empty dataset has no fragment 0"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    unsafe { lance_dataset_close(empty_ds) };
+}
+
+#[test]
+fn test_fragment_historical_snapshot_matches_native() {
+    let uri = test_data_path("v0.27.1/pq_in_schema");
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut ids = [0_u64; 1];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+    let fragment = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    assert!(!fragment.is_null());
+
+    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let native_fragment = native.get_fragment(ids[0] as usize).unwrap();
+    let mut physical_rows = 0_u64;
+    assert_eq!(
+        unsafe { lance_fragment_physical_rows(fragment, &mut physical_rows) },
+        0
+    );
+    assert_eq!(physical_rows, 512);
+    assert_eq!(
+        physical_rows as usize,
+        lance_c::runtime::block_on(native_fragment.physical_rows()).unwrap()
+    );
+
+    let metadata_ptr = unsafe { lance_fragment_metadata_json(fragment) };
+    assert!(!metadata_ptr.is_null());
+    let metadata = unsafe { CStr::from_ptr(metadata_ptr) }.to_str().unwrap();
+    let actual: serde_json::Value = serde_json::from_str(metadata).unwrap();
+    let expected = serde_json::to_value(native_fragment.metadata()).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(actual["physical_rows"].as_u64(), Some(512));
+    assert_eq!(native_fragment.metadata().physical_rows, Some(512));
+    unsafe { lance_free_string(metadata_ptr) };
+
+    // The checked-in fixture carries a cached physical row count. Clearing
+    // only writer_version in memory forces the legacy branch that ignores the
+    // cache and reads the data file, proving the Native method mapped by the
+    // binding supports old manifests rather than relying on fast_* helpers.
+    let mut legacy = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    Arc::make_mut(&mut legacy.manifest).writer_version = None;
+    let legacy_fragment = legacy.get_fragment(ids[0] as usize).unwrap();
+    assert!(legacy_fragment.fast_physical_rows().is_err());
+    assert_eq!(
+        lance_c::runtime::block_on(legacy_fragment.physical_rows()).unwrap(),
+        512
+    );
+
+    unsafe { lance_fragment_close(fragment) };
     unsafe { lance_dataset_close(ds) };
 }
 

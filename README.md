@@ -55,7 +55,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 
 | Status | Component | Description |
 |--------|-----------|-------------|
-| [x] | Fragment-level access | Fragment enumeration, ID listing, scanner fragment filtering |
+| [x] | Fragment-level access | Fragment enumeration, ID listing, read-only metadata/schema/counts, scanner fragment filtering |
 | [x] | Compaction | Fragment consolidation via `lance_dataset_compact_files()` |
 | [x] | Statistics export | Per-field compressed on-disk size for query planning via `lance_dataset_calculate_data_stats()` |
 | [x] | Cloud storage | S3, GCS, Azure via storage options pass-through |
