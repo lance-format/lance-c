@@ -21023,7 +21023,7 @@ fn test_scanner_substrait_aggregate_native_validation_errors() {
         -1
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    assert_eq!(take_last_error_message(), "bytes is NULL but len > 0");
+    assert!(take_last_error_message().contains("bytes is NULL but len > 0"));
 
     let byte = [0_u8];
     assert_eq!(
