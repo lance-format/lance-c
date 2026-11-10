@@ -178,7 +178,7 @@ run_step 30-full-rust \
     cargo +1.94.0 test -j 8 -- --test-threads=4
 run_step 40-native-consumers \
     cargo +1.94.0 test -j 8 --test compile_and_run_test \
-    -- --ignored --test-threads=4
+    -- --ignored --nocapture --test-threads=4
 
 for test_name in \
     test_cleanup_selectors_explanation_owned_output_and_reexecution \
