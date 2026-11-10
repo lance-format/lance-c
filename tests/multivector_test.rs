@@ -711,6 +711,89 @@ fn multivector_window_preserves_unset_and_explicit_empty_projections() {
 }
 
 #[test]
+fn multivector_window_keeps_private_distance_out_of_wildcard_projection() {
+    let (_dir, uri) = fixture();
+    let datum = CString::new("vectors").unwrap();
+    let query = [1.0f32, 0., 0., 1.];
+    let wildcard = [("*", "*")];
+
+    unsafe {
+        let dataset = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!dataset.is_null());
+        for disable in [true, false] {
+            let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+            set_projection(scanner, &wildcard);
+            if disable {
+                assert_eq!(lance_scanner_disable_scoring_autoprojection(scanner), 0);
+            }
+            assert_eq!(
+                lance_scanner_nearest_multivector(
+                    scanner,
+                    datum.as_ptr(),
+                    query.as_ptr().cast(),
+                    2,
+                    2,
+                    LanceDataType::Float32 as i32,
+                    3,
+                ),
+                0
+            );
+            assert_eq!(lance_scanner_set_use_index(scanner, false), 0);
+            assert_eq!(lance_scanner_set_offset(scanner, 1), 0);
+            assert_eq!(lance_scanner_set_limit(scanner, 2), 0);
+            let (schema, batches) = collect_projected_batches(scanner);
+            lance_scanner_close(scanner);
+
+            let fields = schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                fields,
+                if disable {
+                    vec!["id", "vectors"]
+                } else {
+                    vec!["id", "vectors", "_distance"]
+                },
+                "disable={disable}"
+            );
+            let ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec![2, 3], "disable={disable}");
+            if !disable {
+                let distances = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column_by_name("_distance")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(distances, vec![6.0, 8.0]);
+            }
+        }
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
 fn indexed_refined_projection_window_uses_native_distance() {
     let rows = vec![
         vec![Some(1.), Some(0.)],
