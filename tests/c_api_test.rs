@@ -10765,9 +10765,13 @@ fn test_cleanup_relative_duration_and_unverified_candidates() {
     unsafe { lance_cleanup_explanation_close(explanation) };
 
     // Relative older-than cleanup calls the native convenience operation, so
-    // Lance core owns the cutoff. A zero window removes every non-current
-    // version; the recent unverified orphan remains protected by the default.
-    let relative = LanceCleanupOldVersionsOptions::default();
+    // Lance core owns the cutoff. A negative window beyond the i64-nanosecond
+    // range produces a future cutoff and removes every non-current version;
+    // the recent unverified orphan remains protected by the default.
+    let relative = LanceCleanupOldVersionsOptions {
+        older_than_seconds: -10_000_000_000,
+        ..LanceCleanupOldVersionsOptions::default()
+    };
     let mut stats = sentinel_cleanup_stats();
     assert_eq!(
         unsafe { lance_dataset_cleanup_old_versions(dataset, &relative, &mut stats,) },
