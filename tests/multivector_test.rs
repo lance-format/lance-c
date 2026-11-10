@@ -160,7 +160,6 @@ unsafe fn collect_projected(scanner: *mut LanceScanner) -> (Vec<String>, Vec<(i3
             ));
         }
     }
-    rows.sort_unstable_by_key(|row| row.0);
     (fields, rows)
 }
 
