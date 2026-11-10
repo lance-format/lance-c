@@ -51,7 +51,7 @@ fn take_schema(scanner: *const LanceScanner) -> Schema {
     );
     let schema = Schema::try_from(&ffi).unwrap();
     if let Some(release) = ffi.release {
-        release(&mut ffi);
+        unsafe { release(&mut ffi) };
     }
     schema
 }
@@ -98,7 +98,7 @@ fn fixture() -> (tempfile::TempDir, String) {
         let ranks = ids.iter().map(|id| Some(id * 2)).collect::<Vec<_>>();
         let values = ids
             .iter()
-            .flat_map(|id| [*id as f32, id as f32 + 1.0])
+            .flat_map(|id| [*id as f32, *id as f32 + 1.0])
             .collect::<Vec<_>>();
         let embeddings = FixedSizeListArray::try_new(
             Arc::new(Field::new("item", DataType::Float32, false)),
@@ -156,7 +156,7 @@ fn native_row_ids(uri: &str) -> HashMap<i32, u64> {
     lance_c::runtime::block_on(async {
         let dataset = Dataset::open(uri).await.unwrap();
         let mut scanner = dataset.scan();
-        scanner.project::<String>(&["id"]).unwrap();
+        scanner.project(&["id"]).unwrap();
         scanner.with_row_id();
         let mut stream = scanner.try_into_stream().await.unwrap();
         let mut rows = HashMap::new();
@@ -197,7 +197,7 @@ fn next_batch_rows(scanner: *mut LanceScanner) -> Option<Vec<(i32, Option<i32>)>
             );
             let data = unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap();
             if let Some(release) = ffi_schema.release {
-                release(&mut ffi_schema);
+                unsafe { release(&mut ffi_schema) };
             }
             let batch = RecordBatch::from(StructArray::from(data));
             let ids = batch
@@ -573,7 +573,7 @@ fn scanner_introspection_rejects_null_and_nonempty_output_slots() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert!(take_error_message().contains("empty ArrowSchema"));
     if let Some(release) = nonempty.release {
-        release(&mut nonempty);
+        unsafe { release(&mut nonempty) };
     }
 
     assert!(unsafe { lance_scanner_explain_plan(ptr::null(), false) }.is_null());
