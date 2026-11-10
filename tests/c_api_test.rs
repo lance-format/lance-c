@@ -4271,7 +4271,7 @@ fn test_dataset_field_metadata_semantics_errors_and_snapshots() {
     }];
     assert_field_invalid_argument(
         unsafe { lance_dataset_update_field_metadata(writer, invalid_kind.as_ptr(), 1) },
-        "field kind",
+        "field.kind",
     );
     assert_field_invalid_argument(
         update_field_metadata_via_c(
