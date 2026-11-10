@@ -178,11 +178,7 @@ fn materialization_fixture() -> (tempfile::TempDir, String) {
         Field::new("id", DataType::Int32, false),
         Field::new("category", DataType::Utf8, true),
         Field::new("wide", DataType::Utf8, true),
-        Field::new(
-            "payload",
-            DataType::Struct(payload_fields.clone()),
-            true,
-        ),
+        Field::new("payload", DataType::Struct(payload_fields.clone()), true),
     ]));
 
     let make_batch = |start: i32, count: i32| {
@@ -243,10 +239,7 @@ fn materialization_fixture() -> (tempfile::TempDir, String) {
             .enumerate()
         {
             Dataset::write(
-                arrow::record_batch::RecordBatchIterator::new(
-                    vec![Ok(batch)],
-                    schema.clone(),
-                ),
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
                 uri.to_str().unwrap(),
                 Some(WriteParams {
                     mode: if index == 0 {
@@ -282,7 +275,10 @@ fn c_materialization_scan(
     assert!(!scan.0.is_null());
 
     {
-        let columns = except_columns.iter().map(|name| c(name)).collect::<Vec<_>>();
+        let columns = except_columns
+            .iter()
+            .map(|name| c(name))
+            .collect::<Vec<_>>();
         let pointers = columns
             .iter()
             .map(|column| column.as_ptr())
@@ -515,11 +511,7 @@ fn fast_search_fixture() -> (tempfile::TempDir, String) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("category", DataType::Utf8, true),
-        Field::new(
-            "embedding",
-            DataType::FixedSizeList(item.clone(), 2),
-            false,
-        ),
+        Field::new("embedding", DataType::FixedSizeList(item.clone(), 2), false),
     ]));
 
     let make_batch = |ids: Vec<i32>, vector: impl Fn(i32) -> [f32; 2]| {
