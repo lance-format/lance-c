@@ -1485,6 +1485,25 @@ public:
         return *this;
     }
 
+    /// Configure native materialization for ordinary payload columns.
+    /// For ALL_EARLY_EXCEPT, names are resolved by Lance, including nested paths.
+    /// An empty list is an explicit empty exception list. See lance.h.
+    Scanner& materialization_style(
+        LanceMaterializationStyle style,
+        const std::vector<std::string>& early_except_columns = {}) {
+        std::vector<const char*> column_ptrs;
+        column_ptrs.reserve(early_except_columns.size());
+        for (const auto& column : early_except_columns) {
+            column_ptrs.push_back(column.c_str());
+        }
+        const char* const* columns =
+            column_ptrs.empty() ? nullptr : column_ptrs.data();
+        if (lance_scanner_set_materialization_style(
+                handle_.get(), style, columns, column_ptrs.size()) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Enable/disable row ID in output.
     Scanner& with_row_id(bool enable = true) {
         if (lance_scanner_with_row_id(handle_.get(), enable) != 0)
@@ -1742,6 +1761,12 @@ public:
     }
     Scanner& use_index(bool enable) {
         if (lance_scanner_set_use_index(handle_.get(), enable) != 0) check_error();
+        return *this;
+    }
+    /// Use native indexed-only fast search, which omits unindexed rows and
+    /// never enables a flat fallback. Disabled by default. See lance.h.
+    Scanner& fast_search(bool enable = true) {
+        if (lance_scanner_set_fast_search(handle_.get(), enable) != 0) check_error();
         return *this;
     }
     /// Apply scanner filters before ANN when enabled, or refine ANN candidates
