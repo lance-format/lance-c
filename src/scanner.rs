@@ -5409,6 +5409,31 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_scanner_rejects_planning_and_count_with_panic_code() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        poison(scanner);
+
+        let mut schema = FFI_ArrowSchema::empty();
+        assert_eq!(unsafe { lance_scanner_schema(scanner, &mut schema) }, -1);
+        assert_poison_error_pending();
+
+        assert!(unsafe { lance_scanner_explain_plan(scanner, false) }.is_null());
+        assert_poison_error_pending();
+        assert!(unsafe { lance_scanner_analyze_plan(scanner) }.is_null());
+        assert_poison_error_pending();
+        assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
+        assert_poison_error_pending();
+        assert!(unsafe { lance_scanner_analyze_count_plan(scanner) }.is_null());
+        assert_poison_error_pending();
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
     fn poisoned_scanner_next_returns_panic_code() {
         let (_tmp, uri) = create_test_dataset();
         let (dataset, scanner) = open_dataset_and_scanner(&uri);
