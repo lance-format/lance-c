@@ -70,6 +70,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
 | [x] | Row prefilter | `lance_scanner_set_row_addr_allowlist()` / `lance_scanner_set_row_addr_blocklist()` restrict scans, nearest-neighbor and full-text searches to (or exclude) a set of `_rowid`s before ranking |
 | [x] | Native ordering | `lance_scanner_set_order_by()` and C++ `Scanner::order_by()` sort by one or more columns with direction and NULL placement |
+| [x] | Expression projection | `lance_scanner_set_projection()` binds named SQL expressions, aliases and nested fields; `lance_scanner_disable_scoring_autoprojection()` controls automatic `_score` / `_distance` output |
 
 ## Scanner ordering
 
@@ -98,6 +99,41 @@ replacing the previous ordering. Multi-vector search is the one unsupported
 mode: `nearest_multivector()` always restores distance order for its result
 window, so combining it with a non-empty ordering fails when the scan starts
 instead of silently ignoring the ordering.
+
+## Scanner projection and scoring columns
+
+`lance_scanner_set_projection()` and the C++ `Scanner::project()` bind Lance's
+native `Scanner::project_with_transform()`:
+
+```cpp
+auto scanner = dataset.scan();
+scanner.project({
+    {"id_alias", "id"},
+    {"doubled", "id * 2"},
+    {"x", "metadata.location.x"},
+});
+```
+
+Entries preserve input order. `output_name` is the output field name and may be
+an alias; `expression` is a Lance SQL expression. The binder accepts stored
+columns, metadata columns, nested field paths and search-generated scoring
+columns. Pass `std::nullopt` or `lance_scanner_set_projection(scanner, NULL, 0)`
+to restore the unset projection and scan all dataset columns. An empty vector is
+an explicit empty projection. The arrays and strings are copied before the
+setter returns; invalid entries leave the previous projection unchanged. The
+older column-list argument to `lance_scanner_new()` keeps its escaped
+field-path behavior and is unchanged.
+
+By default, vector and full-text searches still append `_distance` or `_score`
+to an explicit projection, matching the published legacy behavior. Call
+`Scanner::disable_scoring_autoprojection()` or
+`lance_scanner_disable_scoring_autoprojection()` before starting the scan to
+include those columns only when the projection names them explicitly. The
+setting is one-way for that scanner.
+
+Multi-vector search keeps the hidden distance required for its final result
+window internally. It is removed from output when scoring autoprojection is
+disabled and the caller did not request `_distance`.
 
 ## Segment-scoped array label filters
 
@@ -266,10 +302,13 @@ scanner.nearest_batch("embedding", queries, 2, 2, 10)
 ```
 
 Here there are two queries of dimension two, each returning up to ten rows.
-The result includes the zero-based `query_index` (`int32`) and `_distance`,
-alongside the requested dataset columns. A batch of one query still includes
-`query_index`. Duplicate query vectors retain distinct indices; queries with no
-matching rows produce no result rows. Result row order is not part of the API contract.
+The result includes the zero-based `query_index` (`int32`) and, under the legacy
+scoring default, `_distance`, alongside the requested dataset columns. A batch
+of one query still includes `query_index`. After
+`disable_scoring_autoprojection()`, `_distance` appears only when named
+explicitly in the projection. Duplicate query vectors retain distinct indices;
+queries with no matching rows produce no result rows. Result row order is not
+part of the API contract.
 
 This differs from `nearest_multivector`: that API scores one logical query
 against a `List<FixedSizeList<...>>` column and returns one ranked result set.

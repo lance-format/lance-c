@@ -1406,6 +1406,12 @@ struct ColumnOrdering {
     LanceNullOrder null_order = LANCE_ORDER_NULLS_LAST;
 };
 
+/// One ordered scanner projection entry. `output_name` may be an alias.
+struct ProjectionColumn {
+    std::string output_name;
+    std::string expression;
+};
+
 class Scanner {
     Handle<LanceScanner, lance_scanner_close> handle_;
 
@@ -1493,6 +1499,40 @@ public:
     /// Configure whether file statistics may optimize the scan.
     Scanner& use_stats(bool use_stats = true) {
         if (lance_scanner_set_use_stats(handle_.get(), use_stats) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Clear the projection and scan all dataset columns (native unset).
+    Scanner& project(std::nullopt_t) {
+        if (lance_scanner_set_projection(handle_.get(), nullptr, 0) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Replace the projection with ordered output-name / SQL-expression pairs.
+    /// An empty vector is an explicit empty projection; use std::nullopt to
+    /// restore the unset projection. Strings are copied during this call.
+    Scanner& project(const std::vector<ProjectionColumn>& columns) {
+        std::vector<LanceProjectionColumn> native;
+        native.reserve(columns.size());
+        for (const auto& column : columns) {
+            native.push_back({
+                column.output_name.c_str(),
+                column.expression.c_str(),
+            });
+        }
+        LanceProjectionColumn explicit_empty = {};
+        const LanceProjectionColumn* data =
+            native.empty() ? &explicit_empty : native.data();
+        if (lance_scanner_set_projection(handle_.get(), data, native.size()) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Stop adding `_score` / `_distance` to explicit search projections.
+    Scanner& disable_scoring_autoprojection() {
+        if (lance_scanner_disable_scoring_autoprojection(handle_.get()) != 0)
             check_error();
         return *this;
     }

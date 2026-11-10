@@ -90,6 +90,82 @@ unsafe fn collect(scanner: *mut LanceScanner) -> Vec<(i32, f32)> {
         .collect()
 }
 
+fn set_projection(scanner: *mut LanceScanner, specs: &[(&str, &str)]) {
+    let names = specs
+        .iter()
+        .map(|(name, _)| CString::new(*name).unwrap())
+        .collect::<Vec<_>>();
+    let expressions = specs
+        .iter()
+        .map(|(_, expression)| CString::new(*expression).unwrap())
+        .collect::<Vec<_>>();
+    let columns = names
+        .iter()
+        .zip(&expressions)
+        .map(|(name, expression)| LanceProjectionColumn {
+            output_name: name.as_ptr(),
+            expression: expression.as_ptr(),
+        })
+        .collect::<Vec<_>>();
+    let explicit_empty = LanceProjectionColumn {
+        output_name: ptr::null(),
+        expression: ptr::null(),
+    };
+    let data = if columns.is_empty() {
+        &explicit_empty
+    } else {
+        columns.as_ptr()
+    };
+    let status = unsafe { lance_scanner_set_projection(scanner, data, columns.len()) };
+    if status != 0 {
+        panic!(
+            "{}",
+            unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()) }.to_string_lossy()
+        );
+    }
+}
+
+unsafe fn collect_projected(
+    scanner: *mut LanceScanner,
+) -> (Vec<String>, Vec<(i32, Option<f32>)>) {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let status = unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) };
+    if status != 0 {
+        panic!(
+            "{}",
+            unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()) }.to_string_lossy()
+        );
+    }
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let fields = reader
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column_by_name("id_alias")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let distances = batch
+            .column_by_name("_distance")
+            .map(|array| array.as_any().downcast_ref::<Float32Array>().unwrap());
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row),
+                distances.and_then(|values| (!values.is_null(row)).then(|| values.value(row))),
+            ));
+        }
+    }
+    rows.sort_unstable_by_key(|row| row.0);
+    (fields, rows)
+}
+
 #[test]
 fn multivector_search_scores_logical_rows_and_excludes_empty_and_null_rows() {
     let (_dir, uri) = fixture();
@@ -124,6 +200,65 @@ fn multivector_search_scores_logical_rows_and_excludes_empty_and_null_rows() {
             lance_scanner_close(scan);
         }
         lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn multivector_projection_keeps_the_internal_scoring_window() {
+    let (_dir, uri) = fixture();
+    let column = CString::new("vectors").unwrap();
+    let q = [1.0f32, 0., 0., 1.];
+    let alias = [("id_alias", "id")];
+    let explicit_distance = [("id_alias", "id"), ("_distance", "_distance")];
+
+    for (projection, disable, expect_distance) in [
+        (alias.as_slice(), false, true),
+        (alias.as_slice(), true, false),
+        (explicit_distance.as_slice(), true, true),
+    ] {
+        unsafe {
+            let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+            assert!(!ds.is_null());
+            let scan = lance_scanner_new(ds, ptr::null(), ptr::null());
+            set_projection(scan, projection);
+            if disable {
+                assert_eq!(lance_scanner_disable_scoring_autoprojection(scan), 0);
+            }
+            assert_eq!(
+                lance_scanner_nearest_multivector(
+                    scan,
+                    column.as_ptr(),
+                    q.as_ptr() as *const c_void,
+                    2,
+                    2,
+                    0,
+                    10
+                ),
+                0
+            );
+            assert_eq!(lance_scanner_set_use_index(scan, false), 0);
+            assert_eq!(lance_scanner_set_prefilter(scan, true), 0);
+
+            let (fields, rows) = collect_projected(scan);
+            assert_eq!(
+                fields.contains(&"_distance".to_string()),
+                expect_distance,
+                "projection={projection:?} disable={disable}"
+            );
+            let ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+            assert_eq!(ids, vec![1, 2, 3]);
+            if expect_distance {
+                assert_eq!(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                    vec![Some(0.0), Some(6.0), Some(8.0)]
+                );
+            } else {
+                assert!(rows.iter().all(|row| row.1.is_none()));
+            }
+
+            lance_scanner_close(scan);
+            lance_dataset_close(ds);
+        }
     }
 }
 

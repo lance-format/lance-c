@@ -510,6 +510,194 @@ fn expected_ordering_rows(ids: &[i32]) -> Vec<(i32, Option<String>, Option<i32>)
         .collect()
 }
 
+fn projection_specs(
+    specs: &[(&str, &str)],
+) -> (Vec<CString>, Vec<CString>, Vec<LanceProjectionColumn>) {
+    let names = specs
+        .iter()
+        .map(|(name, _)| CString::new(*name).unwrap())
+        .collect::<Vec<_>>();
+    let expressions = specs
+        .iter()
+        .map(|(_, expression)| CString::new(*expression).unwrap())
+        .collect::<Vec<_>>();
+    let columns = names
+        .iter()
+        .zip(&expressions)
+        .map(|(name, expression)| LanceProjectionColumn {
+            output_name: name.as_ptr(),
+            expression: expression.as_ptr(),
+        })
+        .collect();
+    (names, expressions, columns)
+}
+
+fn set_projection(scanner: *mut LanceScanner, specs: &[(&str, &str)]) -> i32 {
+    let (_names, _expressions, columns) = projection_specs(specs);
+    unsafe {
+        lance_scanner_set_projection(
+            scanner,
+            if columns.is_empty() {
+                std::ptr::NonNull::<LanceProjectionColumn>::dangling().as_ptr()
+            } else {
+                columns.as_ptr()
+            },
+            columns.len(),
+        )
+    }
+}
+
+/// Two-fragment projection fixture with nullable values and nested fields.
+fn create_projection_dataset() -> (tempfile::TempDir, String) {
+    use arrow_array::{ArrayRef, StructArray};
+    use arrow_schema::Fields;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("projection_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let point_fields = Fields::from(vec![
+        Field::new("x", DataType::Float32, true),
+        Field::new("y", DataType::Float32, true),
+    ]);
+    let location_field = Arc::new(Field::new(
+        "location",
+        DataType::Struct(point_fields.clone()),
+        true,
+    ));
+    let age_field = Arc::new(Field::new("age", DataType::Int32, true));
+    let meta_fields = Fields::from(vec![location_field.clone(), age_field.clone()]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Int32, true),
+        Field::new("meta", DataType::Struct(meta_fields.clone()), true),
+    ]));
+
+    let make_batch = |ids: Vec<i32>,
+                      values: Vec<Option<i32>>,
+                      xs: Vec<Option<f32>>,
+                      ys: Vec<f32>,
+                      ages: Vec<Option<i32>>| {
+        let location = StructArray::new(
+            point_fields.clone(),
+            vec![
+                Arc::new(Float32Array::from(xs)) as ArrayRef,
+                Arc::new(Float32Array::from(ys)) as ArrayRef,
+            ],
+            None,
+        );
+        let meta = StructArray::new(
+            meta_fields.clone(),
+            vec![
+                Arc::new(location) as ArrayRef,
+                Arc::new(Int32Array::from(ages)) as ArrayRef,
+            ],
+            None,
+        );
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+                Arc::new(meta),
+            ],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        let first = make_batch(
+            vec![0, 1, 2, 3],
+            vec![Some(10), None, Some(12), Some(13)],
+            vec![Some(0.0), Some(1.5), None, Some(3.0)],
+            vec![10.0, 11.0, 12.0, 13.0],
+            vec![Some(20), None, Some(22), Some(23)],
+        );
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let second = make_batch(
+            vec![4, 5, 6, 7],
+            vec![None, Some(15), Some(16), Some(17)],
+            vec![Some(4.0), Some(5.0), Some(6.5), None],
+            vec![14.0, 15.0, 16.0, 17.0],
+            vec![None, Some(25), Some(26), Some(27)],
+        );
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+    });
+
+    (tmp, uri)
+}
+
+fn projection_rows(batches: &[RecordBatch]) -> Vec<(i32, i32, Option<f32>, Option<i32>)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id_alias")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let doubled = batch
+            .column_by_name("doubled")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let xs = batch
+            .column_by_name("x")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let ages = batch
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row),
+                doubled.value(row),
+                (!xs.is_null(row)).then(|| xs.value(row)),
+                (!ages.is_null(row)).then(|| ages.value(row)),
+            ));
+        }
+    }
+    rows.sort_unstable_by_key(|row| row.0);
+    rows
+}
+
+fn schema_signature(schema: &Schema) -> Vec<(String, DataType, bool)> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            (
+                field.name().clone(),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+        })
+        .collect()
+}
+
 fn scan_ordering_rows(scanner: *mut LanceScanner) -> Vec<(i32, Option<String>, Option<i32>)> {
     let mut stream = FFI_ArrowArrayStream::empty();
     assert_eq!(
@@ -521,6 +709,20 @@ fn scan_ordering_rows(scanner: *mut LanceScanner) -> Vec<(i32, Option<String>, O
     let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
     let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
     ordering_rows(&batches)
+}
+
+fn collect_scanner(scanner: *mut LanceScanner) -> (arrow_schema::SchemaRef, Vec<RecordBatch>) {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let schema = reader.schema();
+    let batches = reader.map(|batch| batch.unwrap()).collect();
+    (schema, batches)
 }
 
 fn scan_ordering_ids(scanner: *mut LanceScanner) -> Vec<i32> {
@@ -1346,6 +1548,129 @@ fn test_scanner_order_by_with_batch_nearest() {
 }
 
 #[test]
+fn test_scanner_vector_projection_and_scoring_autoprojection() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 4, 2, false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let column = c_str("embedding");
+    let query = [0.0f32, 0.0];
+
+    let vector_rows = |schema: &Schema, batches: &[RecordBatch]| {
+        let id_name = if schema.field_with_name("id_alias").is_ok() {
+            "id_alias"
+        } else {
+            "id"
+        };
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name(id_name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let distances = batch
+                .column_by_name("_distance")
+                .map(|array| array.as_any().downcast_ref::<Float32Array>().unwrap());
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    ids.value(row),
+                    distances.and_then(|values| (!values.is_null(row)).then(|| values.value(row))),
+                ));
+            }
+        }
+        rows.sort_unstable_by_key(|row| row.0);
+        rows
+    };
+
+    let scan_c = |projection: Option<&[(&str, &str)]>, disable: bool| {
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+        assert!(!scanner.is_null());
+        if let Some(projection) = projection {
+            assert_eq!(
+                set_projection(scanner, projection),
+                0,
+                "{}",
+                take_last_error_message()
+            );
+        }
+        if disable {
+            assert_eq!(
+                unsafe { lance_scanner_disable_scoring_autoprojection(scanner) },
+                0
+            );
+        }
+        assert_eq!(
+            unsafe {
+                lance_scanner_nearest(
+                    scanner,
+                    column.as_ptr(),
+                    query.as_ptr().cast(),
+                    query.len(),
+                    LanceDataType::Float32 as i32,
+                    4,
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert_eq!(unsafe { lance_scanner_set_use_index(scanner, false) }, 0);
+        let result = collect_scanner(scanner);
+        unsafe { lance_scanner_close(scanner) };
+        result
+    };
+
+    let scan_native = |projection: Option<&[(&str, &str)]>, disable: bool| {
+        lance_c::runtime::block_on(async {
+            let dataset = Dataset::open(&uri).await.unwrap();
+            let mut scanner = dataset.scan();
+            if let Some(projection) = projection {
+                scanner.project_with_transform(projection).unwrap();
+            }
+            if disable {
+                scanner.disable_scoring_autoprojection();
+            }
+            let query = Float32Array::from(vec![0.0, 0.0]);
+            scanner.nearest("embedding", &query, 4).unwrap();
+            scanner.use_index(false);
+            let stream = scanner.try_into_stream().await.unwrap();
+            let schema = stream.schema();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            (schema, batches)
+        })
+    };
+
+    let alias = [("id_alias", "id")];
+    let explicit_distance = [("id_alias", "id"), ("_distance", "_distance")];
+    for (projection, disable, expect_distance) in [
+        (Some(alias.as_slice()), false, true),
+        (Some(alias.as_slice()), true, false),
+        (Some(explicit_distance.as_slice()), true, true),
+        (None, true, false),
+    ] {
+        let (c_schema, c_batches) = scan_c(projection, disable);
+        assert_eq!(
+            c_schema.field_with_name("_distance").is_ok(),
+            expect_distance,
+            "projection={projection:?} disable={disable}"
+        );
+        let (native_schema, native_batches) = scan_native(projection, disable);
+        assert_eq!(
+            schema_signature(c_schema.as_ref()),
+            schema_signature(native_schema.as_ref())
+        );
+        assert_eq!(
+            vector_rows(c_schema.as_ref(), &c_batches),
+            vector_rows(native_schema.as_ref(), &native_batches)
+        );
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_scanner_statistics_callback_with_next_multi_fragment() {
     let (_tmp, uri) = create_multi_fragment_dataset();
     let c_uri = c_str(&uri);
@@ -1751,6 +2076,255 @@ fn test_scanner_with_projection() {
     assert_eq!(schema.field(0).name(), "name");
 
     unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_expression_projection_matches_native() {
+    let (_tmp, uri) = create_projection_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let specs = [
+        ("id_alias", "id"),
+        ("doubled", "id * 2"),
+        ("x", "meta.location.x"),
+        ("age", "meta.age"),
+    ];
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        set_projection(scanner, &specs),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let c_schema = reader.schema();
+    let c_batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+    let c_rows = projection_rows(&c_batches);
+    assert_eq!(
+        c_rows,
+        vec![
+            (0, 0, Some(0.0), Some(20)),
+            (1, 2, Some(1.5), None),
+            (2, 4, None, Some(22)),
+            (3, 6, Some(3.0), Some(23)),
+            (4, 8, Some(4.0), None),
+            (5, 10, Some(5.0), Some(25)),
+            (6, 12, Some(6.5), Some(26)),
+            (7, 14, None, Some(27)),
+        ]
+    );
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+
+    let (native_schema, native_batches) = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.project_with_transform(&specs).unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        (schema, batches)
+    });
+    assert_eq!(
+        schema_signature(c_schema.as_ref()),
+        schema_signature(native_schema.as_ref())
+    );
+    assert_eq!(projection_rows(&native_batches), c_rows);
+}
+
+#[test]
+fn test_scanner_projection_setter_contract() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // The setter copies output names and expressions before returning.
+    let mut output_name = b"id_alias\0".to_vec();
+    let mut expression = b"id\0".to_vec();
+    let copied = [LanceProjectionColumn {
+        output_name: output_name.as_ptr().cast(),
+        expression: expression.as_ptr().cast(),
+    }];
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_projection(scanner, copied.as_ptr(), copied.len()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    output_name[0] = b'z';
+    expression[0] = b'v';
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(
+        schema_signature(reader.schema().as_ref()),
+        vec![("id_alias".to_string(), DataType::Int32, false)]
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    // Structural and core validation failures preserve the prior projection.
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(set_projection(scanner, &[("id_alias", "id")]), 0);
+    let null_output = [LanceProjectionColumn {
+        output_name: ptr::null(),
+        expression: c"id".as_ptr(),
+    }];
+    assert_eq!(
+        unsafe { lance_scanner_set_projection(scanner, null_output.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("output_name must not be NULL"));
+
+    let null_expression = [LanceProjectionColumn {
+        output_name: c"id_alias".as_ptr(),
+        expression: ptr::null(),
+    }];
+    assert_eq!(
+        unsafe { lance_scanner_set_projection(scanner, null_expression.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("expression must not be NULL"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_projection(scanner, ptr::null(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("columns is NULL but len > 0"));
+
+    assert_eq!(set_projection(scanner, &[("bad", "id +")]), -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(!take_last_error_message().is_empty());
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(
+        schema_signature(reader.schema().as_ref()),
+        vec![("id_alias".to_string(), DataType::Int32, false)]
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_projection(scanner, ptr::null(), 0) },
+        -1
+    );
+    assert!(take_last_error_message().contains("projection must be set before the scan starts"));
+    assert_eq!(
+        unsafe { lance_scanner_disable_scoring_autoprojection(scanner) },
+        -1
+    );
+    assert!(
+        take_last_error_message()
+            .contains("disable_scoring_autoprojection must be set before the scan starts")
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    // Unknown columns remain a native materialization error.
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        set_projection(scanner, &[("id_alias", "id"), ("bad", "missing + 1")]),
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("No field named missing"), "{message}");
+    unsafe { lance_scanner_close(scanner) };
+
+    // NULL clears to the unset projection; a non-NULL empty array is explicit empty.
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(set_projection(scanner, &[("id_alias", "id")]), 0);
+    assert_eq!(
+        unsafe { lance_scanner_set_projection(scanner, ptr::null(), 0) },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(
+        reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "name"]
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(set_projection(scanner, &[]), 0);
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(reader.schema().fields().len(), 0);
+    unsafe { lance_scanner_close(scanner) };
+
+    // The legacy column-list factory still distinguishes NULL from an
+    // explicitly empty NULL-terminated array.
+    let empty_columns = [ptr::null::<c_char>()];
+    let scanner = unsafe { lance_scanner_new(ds, empty_columns.as_ptr(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(reader.schema().fields().len(), 0);
+    unsafe { lance_scanner_close(scanner) };
+
+    assert_eq!(
+        unsafe { lance_scanner_set_projection(ptr::null_mut(), ptr::null(), 0) },
+        -1
+    );
+    assert!(take_last_error_message().contains("scanner is NULL"));
+    assert_eq!(
+        unsafe { lance_scanner_disable_scoring_autoprojection(ptr::null_mut()) },
+        -1
+    );
+    assert!(take_last_error_message().contains("scanner is NULL"));
+
     unsafe { lance_dataset_close(ds) };
 }
 
@@ -9989,6 +10563,139 @@ fn test_scanner_full_text_search() {
 }
 
 #[test]
+fn test_scanner_fts_projection_and_scoring_autoprojection() {
+    use lance_index::scalar::FullTextSearchQuery;
+
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("name");
+    let inverted_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::Inverted as i32,
+                inverted_params.as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let fts_rows = |schema: &Schema, batches: &[RecordBatch]| {
+        let id_name = if schema.field_with_name("id_alias").is_ok() {
+            "id_alias"
+        } else {
+            "id"
+        };
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name(id_name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let scores = batch
+                .column_by_name("_score")
+                .map(|array| array.as_any().downcast_ref::<Float32Array>().unwrap());
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    ids.value(row),
+                    scores.and_then(|values| (!values.is_null(row)).then(|| values.value(row))),
+                ));
+            }
+        }
+        rows.sort_unstable_by_key(|row| row.0);
+        rows
+    };
+
+    let scan_c = |projection: &[(&str, &str)], disable: bool| {
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+        assert_eq!(
+            set_projection(scanner, projection),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        if disable {
+            assert_eq!(
+                unsafe { lance_scanner_disable_scoring_autoprojection(scanner) },
+                0
+            );
+        }
+        let query = c_str("alice");
+        let columns = [column.as_ptr(), ptr::null()];
+        assert_eq!(
+            unsafe { lance_scanner_full_text_search(scanner, query.as_ptr(), columns.as_ptr(), 0) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let result = collect_scanner(scanner);
+        unsafe { lance_scanner_close(scanner) };
+        result
+    };
+
+    let scan_native = |projection: &[(&str, &str)], disable: bool| {
+        lance_c::runtime::block_on(async {
+            let dataset = Dataset::open(&uri).await.unwrap();
+            let mut scanner = dataset.scan();
+            scanner.project_with_transform(projection).unwrap();
+            if disable {
+                scanner.disable_scoring_autoprojection();
+            }
+            scanner
+                .full_text_search(
+                    FullTextSearchQuery::new("alice".to_string())
+                        .with_columns(&["name".to_string()])
+                        .unwrap(),
+                )
+                .unwrap();
+            let stream = scanner.try_into_stream().await.unwrap();
+            let schema = stream.schema();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            (schema, batches)
+        })
+    };
+
+    let projection = [("id_alias", "id"), ("name_alias", "name")];
+    let explicit_score = [
+        ("id_alias", "id"),
+        ("name_alias", "name"),
+        ("_score", "_score"),
+    ];
+    for (projection, disable, expect_score) in [
+        (projection.as_slice(), false, true),
+        (projection.as_slice(), true, false),
+        (explicit_score.as_slice(), true, true),
+    ] {
+        let (c_schema, c_batches) = scan_c(projection, disable);
+        assert_eq!(
+            c_schema.field_with_name("_score").is_ok(),
+            expect_score,
+            "disable={disable}"
+        );
+        let (native_schema, native_batches) = scan_native(projection, disable);
+        assert_eq!(
+            schema_signature(c_schema.as_ref()),
+            schema_signature(native_schema.as_ref())
+        );
+        assert_eq!(
+            fts_rows(c_schema.as_ref(), &c_batches),
+            fts_rows(native_schema.as_ref(), &native_batches)
+        );
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_fts_fuzzy() {
     let (_tmp, uri) = create_test_dataset();
     let uri_c = c_str(&uri);
@@ -10492,6 +11199,91 @@ fn test_prepared_fts_row_id_output_is_explicit() {
 
     unsafe { lance_fts_query_context_close(context) };
     unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_prepared_fts_expression_projection_and_scoring_control() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let column = c_str("name");
+    let query = c_str("alice");
+    let inverted_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::Inverted as i32,
+                inverted_params.as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let context = unsafe {
+        lance_dataset_prepare_fts_match_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!context.is_null(), "{}", take_last_error_message());
+
+    let scan = |projection: &[(&str, &str)], disable: bool| {
+        let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+        assert_eq!(
+            set_projection(scanner, projection),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        if disable {
+            assert_eq!(
+                unsafe { lance_scanner_disable_scoring_autoprojection(scanner) },
+                0
+            );
+        }
+        assert_eq!(
+            unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let (schema, batches) = collect_scanner(scanner);
+        unsafe { lance_scanner_close(scanner) };
+        (
+            schema,
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        )
+    };
+
+    let projection = [("id_alias", "id")];
+    let explicit_score = [("id_alias", "id"), ("_score", "_score")];
+
+    let (legacy_schema, legacy_rows) = scan(&projection, false);
+    assert!(legacy_schema.field_with_name("_score").is_ok());
+    assert!(legacy_rows > 0);
+
+    let (disabled_schema, disabled_rows) = scan(&projection, true);
+    assert!(disabled_schema.field_with_name("_score").is_err());
+    assert_eq!(disabled_rows, legacy_rows);
+
+    let (explicit_schema, explicit_rows) = scan(&explicit_score, true);
+    assert!(explicit_schema.field_with_name("_score").is_ok());
+    assert_eq!(explicit_rows, legacy_rows);
+
+    unsafe {
+        lance_fts_query_context_close(context);
+        lance_dataset_close(dataset);
+    };
 }
 
 #[test]
@@ -16783,6 +17575,74 @@ fn scalar_segment_ids_with_auto(
         lance_dataset_close(ds);
     }
     (ids, captured)
+}
+
+#[test]
+fn test_scalar_segment_scan_applies_expression_projection() {
+    let (_tmp, uri, uuids) =
+        create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    let uri = c_str(&uri);
+    let filter = c_str("key >= 0 AND id >= 1");
+    let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let scanner =
+        unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        set_projection(
+            scanner,
+            &[("id_alias", "id"), ("key_copy", "key + 0")],
+        ),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let fragments = [0u64];
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, fragments.as_ptr(), fragments.len()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_scalar_index_segment(scanner, uuids[0].as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let (schema, batches) = collect_scanner(scanner);
+    assert_eq!(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["id_alias", "key_copy"]
+    );
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id_alias")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let keys = batch
+            .column_by_name("key_copy")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((ids.value(row), keys.value(row)));
+        }
+    }
+    rows.sort_unstable();
+    assert_eq!(rows, vec![(1, 1), (2, 2), (3, 0)]);
+
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_dataset_close(dataset);
+    }
 }
 
 #[test]
