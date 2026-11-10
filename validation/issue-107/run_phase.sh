@@ -21,6 +21,7 @@ case "$phase" in
     focused-fast-search) command=(cargo "+$toolchain" test --locked --test scanner_materialization_fast_search_test fast_search_ -- --nocapture) ;;
     focused-unit) command=(cargo "+$toolchain" test --locked --lib scanner_materialization_and_fast_search_setters_preserve_state_on_errors -- --nocapture) ;;
     all-rust) command=(cargo "+$toolchain" test --locked) ;;
+    native) command=(cargo "+$toolchain" test --locked --test compile_and_run_test -- --ignored --test-threads=1 --nocapture) ;;
     c-consumer) command=(cargo "+$toolchain" test --locked --test compile_and_run_test -- --ignored --nocapture test_c_compilation_and_execution) ;;
     cpp-consumer) command=(cargo "+$toolchain" test --locked --test compile_and_run_test -- --ignored --nocapture test_cpp_compilation_and_execution) ;;
     *)

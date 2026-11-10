@@ -3,13 +3,14 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 set -uo pipefail
 
-if [ "$#" -ne 1 ]; then
-    echo "usage: $0 <run-directory>" >&2
+if [ "$#" -ne 2 ]; then
+    echo "usage: $0 <run-directory> <source-directory>" >&2
     exit 2
 fi
 
 run_dir=$1
-source_dir=$(git rev-parse --show-toplevel)
+source_dir=$2
+script_dir=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$run_dir"
 if [ -e "$run_dir/status" ]; then
     echo "refusing to overwrite an existing result" >&2
@@ -17,9 +18,9 @@ if [ -e "$run_dir/status" ]; then
 fi
 
 status=0
-for phase in fmt check clippy all-rust c-consumer cpp-consumer; do
+for phase in fmt check clippy all-rust native; do
     echo "Running $phase"
-    bash "$source_dir/validation/issue-107/run_phase.sh" "$phase" "$source_dir" "$run_dir/$phase"
+    bash "$script_dir/run_phase.sh" "$phase" "$source_dir" "$run_dir/$phase"
     status=$?
     echo "Finished $phase with status $status"
     if [ "$status" -ne 0 ]; then
