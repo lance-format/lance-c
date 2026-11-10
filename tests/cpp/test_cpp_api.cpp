@@ -2771,7 +2771,7 @@ static void test_scanner_substrait_aggregate(
 
     ArrowArrayStream stream;
     memset(&stream, 0, sizeof(stream));
-    scanner.to_arrow_stream(stream);
+    scanner.to_arrow_stream(&stream);
 
     ArrowSchema schema;
     memset(&schema, 0, sizeof(schema));
