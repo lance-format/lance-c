@@ -96,6 +96,7 @@ class IndexModel;
 class IndexSegmentBuilder;
 class IndexSegmentMetadata;
 class FtsQueryContext;
+class FtsQuery;
 
 // ─── Version history ─────────────────────────────────────────────────────────
 
@@ -131,6 +132,58 @@ enum class FtsCoverageMode : int32_t {
 enum class FtsMatchOperator : int32_t {
     Or  = LANCE_FTS_MATCH_OPERATOR_OR,
     And = LANCE_FTS_MATCH_OPERATOR_AND,
+};
+
+enum class FtsDocumentGranularity : int32_t {
+    Unspecified = LANCE_FTS_DOCUMENT_GRANULARITY_UNSPECIFIED,
+    Row         = LANCE_FTS_DOCUMENT_GRANULARITY_ROW,
+    ListElement = LANCE_FTS_DOCUMENT_GRANULARITY_LIST_ELEMENT,
+};
+
+enum class FtsOccur : int32_t {
+    Should  = LANCE_FTS_OCCUR_SHOULD,
+    Must    = LANCE_FTS_OCCUR_MUST,
+    MustNot = LANCE_FTS_OCCUR_MUST_NOT,
+};
+
+/// Options for FtsQuery::match(). `std::nullopt` represents the core AUTO
+/// setting. The Lance 14.0.2 dataset planner resolves AUTO to exact matching.
+/// The default `0` selects exact matching.
+struct FtsMatchOptions {
+    float boost = 1.0f;
+    std::optional<uint32_t> fuzziness = uint32_t{0};
+    uint64_t max_expansions = 50;
+    FtsMatchOperator match_operator = FtsMatchOperator::Or;
+    uint32_t prefix_length = 0;
+    FtsDocumentGranularity document_granularity =
+        FtsDocumentGranularity::Unspecified;
+};
+
+/// Options for FtsQuery::phrase().
+struct FtsPhraseOptions {
+    uint32_t slop = 0;
+    FtsDocumentGranularity document_granularity =
+        FtsDocumentGranularity::Unspecified;
+};
+
+/// Options for FtsQuery::multi_match(). `std::nullopt` uses the native default
+/// of 1.0 per column; a provided vector must contain one entry per column.
+struct FtsMultiMatchOptions {
+    std::optional<std::vector<float>> boosts;
+    FtsMatchOperator match_operator = FtsMatchOperator::Or;
+};
+
+/// Options for FtsQuery::combined_fields(). `std::nullopt` uses the native
+/// default of 1.0 per column; a provided vector must contain one entry per
+/// column.
+struct FtsCombinedFieldsOptions {
+    std::optional<std::vector<float>> boosts;
+    FtsMatchOperator match_operator = FtsMatchOperator::Or;
+};
+
+/// Options for FtsQuery::boost().
+struct FtsBoostOptions {
+    float negative_boost = 0.5f;
 };
 
 /// Tunable parameters for Dataset::write. Numeric fields default-out via 0;
@@ -211,6 +264,161 @@ public:
     FtsQueryContext& operator=(const FtsQueryContext&) = delete;
 
     const LanceFtsQueryContext* c_handle() const { return handle_.get(); }
+};
+
+// ─── Typed full-text query ───────────────────────────────────────────────────
+
+/// Immutable full-text query value. Composite factories copy their child
+/// values, and Scanner::full_text_search snapshots the tree, so handles may be
+/// destroyed before the scan runs.
+class FtsQuery {
+    Handle<LanceFtsQuery, lance_fts_query_close> handle_;
+
+    explicit FtsQuery(LanceFtsQuery* query) : handle_(query) {}
+
+    static void copy_boosts(
+        const std::optional<std::vector<float>>& boosts,
+        float& empty_boost,
+        const float*& data,
+        size_t& count) {
+        data = nullptr;
+        count = 0;
+        if (!boosts) return;
+        empty_boost = 0.0f;
+        data = boosts->empty() ? &empty_boost : boosts->data();
+        count = boosts->size();
+    }
+
+public:
+    FtsQuery(FtsQuery&&) noexcept = default;
+    FtsQuery& operator=(FtsQuery&&) noexcept = default;
+    FtsQuery(const FtsQuery&) = delete;
+    FtsQuery& operator=(const FtsQuery&) = delete;
+
+    /// Match query. A null `column` lets scan planning resolve the indexed
+    /// columns.
+    static FtsQuery match(
+        const std::string& terms,
+        std::optional<std::string> column = std::nullopt,
+        const FtsMatchOptions& options = {}) {
+        LanceFtsMatchOptions c_options{};
+        lance_fts_query_match_options_init(&c_options);
+        c_options.boost = options.boost;
+        c_options.fuzziness = options.fuzziness
+                                  ? static_cast<int64_t>(*options.fuzziness)
+                                  : -1;
+        c_options.max_expansions = options.max_expansions;
+        c_options.match_operator = static_cast<int32_t>(options.match_operator);
+        c_options.prefix_length = options.prefix_length;
+        c_options.document_granularity =
+            static_cast<int32_t>(options.document_granularity);
+
+        auto* query = lance_fts_query_match_new(
+            terms.c_str(), column ? column->c_str() : nullptr, &c_options);
+        if (!query) check_error();
+        return FtsQuery(query);
+    }
+
+    /// Phrase query. A null `column` lets scan planning resolve the indexed
+    /// columns.
+    static FtsQuery phrase(
+        const std::string& terms,
+        std::optional<std::string> column = std::nullopt,
+        const FtsPhraseOptions& options = {}) {
+        LanceFtsPhraseOptions c_options{};
+        lance_fts_query_phrase_options_init(&c_options);
+        c_options.slop = options.slop;
+        c_options.document_granularity =
+            static_cast<int32_t>(options.document_granularity);
+
+        auto* query = lance_fts_query_phrase_new(
+            terms.c_str(), column ? column->c_str() : nullptr, &c_options);
+        if (!query) check_error();
+        return FtsQuery(query);
+    }
+
+    /// Boolean query. An empty clause list is allowed here; scan planning
+    /// rejects a tree without a positive clause.
+    static FtsQuery boolean(
+        const std::vector<std::pair<FtsOccur, const FtsQuery*>>& clauses) {
+        std::vector<int32_t> occurs;
+        std::vector<const LanceFtsQuery*> queries;
+        occurs.reserve(clauses.size());
+        queries.reserve(clauses.size());
+        for (const auto& [occur, query] : clauses) {
+            occurs.push_back(static_cast<int32_t>(occur));
+            queries.push_back(query ? query->c_handle() : nullptr);
+        }
+
+        auto* result = lance_fts_query_boolean_new(
+            occurs.data(), queries.data(), clauses.size());
+        if (!result) check_error();
+        return FtsQuery(result);
+    }
+
+    /// Boost (boosting) query: the negative child's score is multiplied by
+    /// negative_boost and subtracted from the positive child's score.
+    static FtsQuery boost(
+        const FtsQuery& positive,
+        const FtsQuery& negative,
+        const FtsBoostOptions& options = {}) {
+        LanceFtsBoostOptions c_options{};
+        lance_fts_query_boost_options_init(&c_options);
+        c_options.negative_boost = options.negative_boost;
+
+        auto* query = lance_fts_query_boost_new(
+            positive.c_handle(), negative.c_handle(), &c_options);
+        if (!query) check_error();
+        return FtsQuery(query);
+    }
+
+    /// MultiMatch query: scores each field independently and keeps the maximum
+    /// field score.
+    static FtsQuery multi_match(
+        const std::string& terms,
+        const std::vector<std::string>& columns,
+        const FtsMultiMatchOptions& options = {}) {
+        std::vector<const char*> column_ptrs;
+        column_ptrs.reserve(columns.size());
+        for (const auto& column : columns) column_ptrs.push_back(column.c_str());
+
+        LanceFtsMultiMatchOptions c_options{};
+        lance_fts_query_multi_match_options_init(&c_options);
+        float empty_boost = 0.0f;
+        copy_boosts(options.boosts, empty_boost, c_options.boosts,
+                    c_options.boost_count);
+        c_options.match_operator = static_cast<int32_t>(options.match_operator);
+
+        auto* query = lance_fts_query_multi_match_new(
+            terms.c_str(), column_ptrs.data(), column_ptrs.size(), &c_options);
+        if (!query) check_error();
+        return FtsQuery(query);
+    }
+
+    /// CombinedFields (BM25F) query: blends term statistics across all target
+    /// columns.
+    static FtsQuery combined_fields(
+        const std::string& terms,
+        const std::vector<std::string>& columns,
+        const FtsCombinedFieldsOptions& options = {}) {
+        std::vector<const char*> column_ptrs;
+        column_ptrs.reserve(columns.size());
+        for (const auto& column : columns) column_ptrs.push_back(column.c_str());
+
+        LanceFtsCombinedFieldsOptions c_options{};
+        lance_fts_query_combined_fields_options_init(&c_options);
+        float empty_boost = 0.0f;
+        copy_boosts(options.boosts, empty_boost, c_options.boosts,
+                    c_options.boost_count);
+        c_options.match_operator = static_cast<int32_t>(options.match_operator);
+
+        auto* query = lance_fts_query_combined_fields_new(
+            terms.c_str(), column_ptrs.data(), column_ptrs.size(), &c_options);
+        if (!query) check_error();
+        return FtsQuery(query);
+    }
+
+    const LanceFtsQuery* c_handle() const { return handle_.get(); }
 };
 
 // ─── Blob file ───────────────────────────────────────────────────────────────
@@ -890,6 +1098,17 @@ public:
 
     /// Create a Scanner builder for this dataset.
     Scanner scan() const;
+
+    /// Create a Scanner builder with an explicit column projection and optional
+    /// primary SQL filter. An empty projection selects zero columns. A supplied
+    /// filter is forwarded verbatim, including an empty expression. Invalid
+    /// projections or filters are reported when the scanner is materialized.
+    Scanner scan(const std::vector<std::string>& columns,
+                 const std::optional<std::string>& filter = std::nullopt) const;
+
+    /// Create a Scanner builder for all columns, with an optional SQL filter.
+    Scanner scan(std::nullopt_t,
+                 const std::optional<std::string>& filter = std::nullopt) const;
 
     /// Compatibility wrapper for an OR Match query.
     [[deprecated("Use prepare_fts_match_query() to select the Match operator")]]
@@ -1573,6 +1792,25 @@ public:
         return *this;
     }
 
+    /// Configure native materialization for ordinary payload columns.
+    /// For ALL_EARLY_EXCEPT, names are resolved by Lance, including nested paths.
+    /// An empty list is an explicit empty exception list. See lance.h.
+    Scanner& materialization_style(
+        LanceMaterializationStyle style,
+        const std::vector<std::string>& early_except_columns = {}) {
+        std::vector<const char*> column_ptrs;
+        column_ptrs.reserve(early_except_columns.size());
+        for (const auto& column : early_except_columns) {
+            column_ptrs.push_back(column.c_str());
+        }
+        const char* const* columns =
+            column_ptrs.empty() ? nullptr : column_ptrs.data();
+        if (lance_scanner_set_materialization_style(
+                handle_.get(), style, columns, column_ptrs.size()) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Enable/disable row ID in output.
     Scanner& with_row_id(bool enable = true) {
         if (lance_scanner_with_row_id(handle_.get(), enable) != 0)
@@ -1832,6 +2070,14 @@ public:
         if (lance_scanner_set_use_index(handle_.get(), enable) != 0) check_error();
         return *this;
     }
+    /// Use native indexed-only fast search for vector queries, scalar-indexed
+    /// filters and full-text search. Index-backed paths can omit unindexed data.
+    /// Ordinary scans and non-indexable expressions follow native planning.
+    /// Disabled by default. See lance.h.
+    Scanner& fast_search(bool enable = true) {
+        if (lance_scanner_set_fast_search(handle_.get(), enable) != 0) check_error();
+        return *this;
+    }
     /// Apply scanner filters before ANN when enabled, or refine ANN candidates
     /// afterward when disabled; postfiltering may return fewer than k rows. This
     /// does not change the fragment search domain.
@@ -1853,6 +2099,14 @@ public:
             columns.empty() ? nullptr : col_ptrs.data();
         if (lance_scanner_full_text_search(handle_.get(), query.c_str(),
                                             cols_c, max_fuzzy_distance) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Attach an immutable typed FTS query. The scanner snapshots the tree, so
+    /// the query and its source handles may be destroyed after success.
+    Scanner& full_text_search(const FtsQuery& query) {
+        if (lance_scanner_set_fts_query(handle_.get(), query.c_handle()) != 0)
             check_error();
         return *this;
     }
@@ -1885,7 +2139,28 @@ public:
 };
 
 inline Scanner Dataset::scan() const {
-    auto* s = lance_scanner_new(handle_.get(), nullptr, nullptr);
+    return scan(std::nullopt);
+}
+
+inline Scanner Dataset::scan(const std::vector<std::string>& columns,
+                             const std::optional<std::string>& filter) const {
+    std::vector<const char*> col_ptrs;
+    col_ptrs.reserve(columns.size() + 1);
+    for (const auto& column : columns) col_ptrs.push_back(column.c_str());
+    col_ptrs.push_back(nullptr);
+
+    auto* s = lance_scanner_new(
+        handle_.get(),
+        col_ptrs.data(),
+        filter ? filter->c_str() : nullptr);
+    if (!s) check_error();
+    return Scanner(s);
+}
+
+inline Scanner Dataset::scan(std::nullopt_t,
+                             const std::optional<std::string>& filter) const {
+    auto* s = lance_scanner_new(handle_.get(), nullptr,
+                               filter ? filter->c_str() : nullptr);
     if (!s) check_error();
     return Scanner(s);
 }
