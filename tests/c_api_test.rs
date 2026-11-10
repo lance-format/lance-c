@@ -10373,7 +10373,7 @@ fn create_cleanup_fixture(
     (tmp, uri)
 }
 
-fn native_version_ids(uri: &str, branch: Option<&str>) -> Vec<u64> {
+fn native_cleanup_version_ids(uri: &str, branch: Option<&str>) -> Vec<u64> {
     lance_c::runtime::block_on(async {
         let mut dataset = Dataset::open(uri).await.unwrap();
         if let Some(branch) = branch {
@@ -10437,7 +10437,7 @@ fn test_cleanup_selectors_explanation_owned_output_and_reexecution() {
     let (tmp, uri) = create_cleanup_fixture("cleanup-selectors", 4, Some("id = 1"));
     let root = std::path::Path::new(&uri);
     let uri_c = c_str(&uri);
-    assert_eq!(native_version_ids(&uri, None), vec![1, 2, 3, 4, 5]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 2, 3, 4, 5]);
     assert_eq!(count_files_with_extension(root, "manifest"), 5);
 
     let mut policy = LanceCleanupPolicy::default();
@@ -10547,7 +10547,7 @@ fn test_cleanup_selectors_explanation_owned_output_and_reexecution() {
     assert_eq!(stats.failed_deletes, 0);
     unsafe { lance_dataset_close(dataset) };
 
-    assert_eq!(native_version_ids(&uri, None), vec![1, 3, 4, 5]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 3, 4, 5]);
     assert_eq!(count_files_with_extension(root, "manifest"), 4);
     let tag_version = lance_c::runtime::block_on(async {
         Dataset::open(&uri)
@@ -10588,7 +10588,7 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
     assert!(explanation.is_null());
     assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
     assert!(take_last_error_message().contains("tagged version"));
-    assert_eq!(native_version_ids(&uri, None), vec![1, 2, 3, 4, 5]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 2, 3, 4, 5]);
 
     // Retain-N uses the native asynchronous builder. Explicitly disabling the
     // tag error leaves the tagged version protected but continues cleanup.
@@ -10605,7 +10605,7 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
         take_last_error_message()
     );
     assert_eq!(stats.old_versions, 1);
-    assert_eq!(native_version_ids(&uri, None), vec![2, 3, 4, 5]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 3, 4, 5]);
 
     // Native retain-N validation.
     policy = LanceCleanupPolicy::default();
@@ -10628,7 +10628,7 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
     let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, ptr::null()) };
     assert!(explanation.is_null());
     assert!(take_last_error_message().contains("versions must not be empty when specified"));
-    assert_eq!(native_version_ids(&uri, None), vec![2, 3, 4, 5]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 3, 4, 5]);
 
     // before_version and retain_versions write the same native field, so the
     // binding rejects the ambiguous combination instead of choosing silently.
@@ -10661,7 +10661,7 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
     );
     assert_eq!(stats, sentinel_cleanup_stats());
     assert!(take_last_error_message().contains("delete_concurrency must be between 1"));
-    assert_eq!(native_version_ids(&uri, None), vec![2, 3, 4, 5]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 3, 4, 5]);
 
     let invalid_rate = LanceCleanupOperationOptions {
         has_delete_rate_limit: 1,
@@ -10692,7 +10692,7 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
     assert_eq!(stats.old_versions, 1);
     assert_eq!(stats.failed_deletes, 0);
     unsafe { lance_dataset_close(dataset) };
-    assert_eq!(native_version_ids(&uri, None), vec![2, 4, 5]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 4, 5]);
     assert_eq!(count_files_with_extension(root, "manifest"), 3);
     drop(tmp);
 }
@@ -10760,7 +10760,7 @@ fn test_cleanup_relative_duration_and_unverified_candidates() {
     );
     assert_eq!(stats.old_versions, 4);
     assert!(orphan.exists());
-    assert_eq!(native_version_ids(&uri, None), vec![5]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![5]);
     assert_eq!(count_files_with_extension(root, "manifest"), 1);
 
     let invalid_relative = LanceCleanupOldVersionsOptions {
@@ -10776,7 +10776,7 @@ fn test_cleanup_relative_duration_and_unverified_candidates() {
     );
     assert_eq!(invalid_stats, sentinel_cleanup_stats());
     assert!(take_last_error_message().contains("older_than_nanos=1000000000"));
-    assert_eq!(native_version_ids(&uri, None), vec![5]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![5]);
     unsafe { lance_dataset_close(dataset) };
     drop(tmp);
 }
@@ -10922,8 +10922,8 @@ fn test_cleanup_branch_cascade_and_copied_explanation() {
         .unwrap();
     });
 
-    assert_eq!(native_version_ids(&uri, None), vec![1, 2, 3, 4]);
-    assert_eq!(native_version_ids(&uri, Some("dev")), vec![2, 3]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 2, 3, 4]);
+    assert_eq!(native_cleanup_version_ids(&uri, Some("dev")), vec![2, 3]);
     let root = std::path::Path::new(&uri);
     let before_manifests = count_files_with_extension(root, "manifest");
 
@@ -10968,8 +10968,8 @@ fn test_cleanup_branch_cascade_and_copied_explanation() {
     );
     unsafe { lance_dataset_close(dataset) };
 
-    assert_eq!(native_version_ids(&uri, None), vec![4]);
-    assert_eq!(native_version_ids(&uri, Some("dev")), vec![3]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![4]);
+    assert_eq!(native_cleanup_version_ids(&uri, Some("dev")), vec![3]);
     assert_eq!(after_manifests, 2);
     drop(tmp);
 }
