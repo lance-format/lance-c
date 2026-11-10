@@ -1672,9 +1672,9 @@ unsafe fn parse_c_string_array_with_count(
 /// The style follows Lance's native `MaterializationStyle`. For
 /// `ALL_EARLY_EXCEPT`, `early_except_columns` contains column paths resolved by
 /// Lance's schema projection; an empty list means every column is early. The
-/// names are copied and resolved before this function returns. Invalid names,
-/// nested paths, and unsupported combinations are reported by Lance without
-/// changing the previous style. Must be set before the scan starts.
+/// names are copied and resolved before this function returns. Native
+/// schema-projection errors are returned without changing the previous style.
+/// Must be set before the scan starts.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_materialization_style(
     scanner: *mut LanceScanner,
