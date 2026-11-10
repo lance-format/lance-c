@@ -17,7 +17,7 @@ use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::scanner::{
     ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
-    RowAddrMask, RowAddrTreeMap,
+    MaterializationStyle, RowAddrMask, RowAddrTreeMap,
 };
 use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use lance_core::Result;
@@ -83,6 +83,34 @@ impl LanceApproxMode {
             Self::Fast => ApproxMode::Fast,
             Self::Normal => ApproxMode::Normal,
             Self::Accurate => ApproxMode::Accurate,
+        }
+    }
+}
+
+/// Materialization style for ordinary scanner payload columns, mirroring the
+/// C enum `LanceMaterializationStyle`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceMaterializationStyle {
+    Heuristic = 0,
+    AllLate = 1,
+    AllEarly = 2,
+    AllEarlyExcept = 3,
+}
+
+impl LanceMaterializationStyle {
+    fn from_i32(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Heuristic),
+            1 => Ok(Self::AllLate),
+            2 => Ok(Self::AllEarly),
+            3 => Ok(Self::AllEarlyExcept),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "materialization_style must be 0 (HEURISTIC), 1 (ALL_LATE), 2 (ALL_EARLY), or 3 (ALL_EARLY_EXCEPT), got {value}"
+                )
+                .into(),
+            )),
         }
     }
 }
@@ -155,6 +183,8 @@ pub struct LanceScanner {
     metric_override: Option<crate::index::LanceMetricType>,
     use_index: Option<bool>,
     prefilter: bool,
+    materialization_style: MaterializationStyle,
+    fast_search: bool,
     fts_query: Option<FullTextSearchQuery>,
     fts_context: Option<Arc<FtsQueryContextInner>>,
     fts_index_segments: Option<Vec<Uuid>>,
@@ -357,6 +387,8 @@ impl LanceScanner {
             metric_override: None,
             use_index: None,
             prefilter: false,
+            materialization_style: MaterializationStyle::Heuristic,
+            fast_search: false,
             fts_query: None,
             fts_context: None,
             fts_index_segments: None,
@@ -582,6 +614,12 @@ impl LanceScanner {
         if self.prefilter {
             scanner.prefilter(true);
         }
+        if self.fast_search {
+            // Pylance applies fast_search before nearest/use_index. Preserve that order:
+            // an explicit use_index=false remains effective and lets the native planner
+            // return its indexed-only outcome rather than silently falling back.
+            scanner.fast_search();
+        }
         if let Some(n) = &self.nearest {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
             scanner.distance_range(n.lower_bound, n.upper_bound);
@@ -640,6 +678,7 @@ impl LanceScanner {
             // This delayed builder call preserves the same fragment search domain.
             self.apply_fragment_filter(&mut scanner)?;
         }
+        scanner.materialization_style(self.materialization_style.clone());
         if let Some(fts) = &self.fts_query {
             scanner.full_text_search(fts.clone())?;
         }
@@ -773,10 +812,16 @@ impl PreparedScanner {
             selected_segments_have_current_fragments,
             distributed_fts.row_addr_mask.as_ref(),
         )?;
-        if rewritten.indexed_query_execs > 1
-            || rewritten.flat_match_query_execs > 1
-            || rewritten.indexed_query_execs + rewritten.flat_match_query_execs == 0
-            || (selected_segments_have_current_fragments && rewritten.indexed_query_execs != 1)
+        // Fast search may eliminate every FTS source. Projection and row-fetch
+        // nodes can still wrap EmptyExec, with no query node to rewrite.
+        let empty_sources_only = rewritten.indexed_query_execs == 0
+            && rewritten.flat_match_query_execs == 0
+            && fts_plan_has_only_empty_sources(plan.as_ref());
+        if !empty_sources_only
+            && (rewritten.indexed_query_execs > 1
+                || rewritten.flat_match_query_execs > 1
+                || rewritten.indexed_query_execs + rewritten.flat_match_query_execs == 0
+                || (selected_segments_have_current_fragments && rewritten.indexed_query_execs != 1))
         {
             return Err(lance_core::Error::internal(format!(
                 "unexpected prepared FTS plan for selected segments with current fragment coverage {selected_segments_have_current_fragments}: rewrote {} indexed FTS query node(s) and removed {} FlatMatchQueryExec node(s)",
@@ -792,6 +837,17 @@ impl PreparedScanner {
             },
         )?;
         Ok(DatasetRecordBatchStream::new(stream))
+    }
+}
+
+fn fts_plan_has_only_empty_sources(plan: &dyn ExecutionPlan) -> bool {
+    let children = plan.children();
+    if children.is_empty() {
+        plan.downcast_ref::<EmptyExec>().is_some()
+    } else {
+        children
+            .into_iter()
+            .all(|child| fts_plan_has_only_empty_sources(child.as_ref()))
     }
 }
 
@@ -1727,6 +1783,108 @@ unsafe fn scanner_set_blob_handling_inner(
         }
     };
     scanner.blob_handling = Some(parsed);
+    Ok(0)
+}
+
+unsafe fn parse_c_string_array_with_count(
+    values: *const *const c_char,
+    count: usize,
+    parameter_name: &str,
+) -> Result<Vec<String>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if values.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{parameter_name} is NULL but early_except_column_count is {count}").into(),
+        ));
+    }
+    if count > isize::MAX as usize / std::mem::size_of::<*const c_char>() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "early_except_column_count {count} exceeds the maximum addressable array length"
+            )
+            .into(),
+        ));
+    }
+
+    let entries = unsafe { std::slice::from_raw_parts(values, count) };
+    let mut columns = Vec::with_capacity(count);
+    for (index, entry) in entries.iter().copied().enumerate() {
+        let column = unsafe { helpers::parse_c_string(entry)? }.ok_or_else(|| {
+            lance_core::Error::invalid_input_source(
+                format!("{parameter_name}[{index}] is NULL").into(),
+            )
+        })?;
+        columns.push(column.to_string());
+    }
+    Ok(columns)
+}
+
+/// Configure when ordinary scanner payload columns are materialized.
+///
+/// The style follows Lance's native `MaterializationStyle`. For
+/// `ALL_EARLY_EXCEPT`, `early_except_columns` contains column paths resolved by
+/// Lance's schema projection; an empty list means every column is early. The
+/// names are copied and resolved before this function returns. Native
+/// schema-projection errors are returned without changing the previous style.
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_materialization_style(
+    scanner: *mut LanceScanner,
+    style: i32,
+    early_except_columns: *const *const c_char,
+    early_except_column_count: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_materialization_style_inner(
+            scanner,
+            style,
+            early_except_columns,
+            early_except_column_count,
+        )
+    })
+}
+
+unsafe fn scanner_set_materialization_style_inner(
+    scanner: *mut LanceScanner,
+    style: i32,
+    early_except_columns: *const *const c_char,
+    early_except_column_count: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("materialization_style")?;
+    let style = LanceMaterializationStyle::from_i32(style)?;
+    if style != LanceMaterializationStyle::AllEarlyExcept && early_except_column_count != 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "early_except_column_count must be 0 for materialization_style={style:?}, got {early_except_column_count}"
+            )
+            .into(),
+        ));
+    }
+    let materialization_style = match style {
+        LanceMaterializationStyle::AllEarlyExcept => {
+            let columns = unsafe {
+                parse_c_string_array_with_count(
+                    early_except_columns,
+                    early_except_column_count,
+                    "early_except_columns",
+                )
+            }?;
+            MaterializationStyle::all_early_except(&columns, s.dataset.schema())?
+        }
+        LanceMaterializationStyle::Heuristic => MaterializationStyle::Heuristic,
+        LanceMaterializationStyle::AllLate => MaterializationStyle::AllLate,
+        LanceMaterializationStyle::AllEarly => MaterializationStyle::AllEarly,
+    };
+    s.materialization_style = materialization_style;
     Ok(0)
 }
 
@@ -3172,6 +3330,40 @@ unsafe fn scanner_set_use_index_inner(scanner: *mut LanceScanner, enable: bool) 
     Ok(0)
 }
 
+/// Configure native indexed-only fast search.
+///
+/// This weak-consistency mode applies to vector queries, scalar-indexed filters
+/// and full-text search. Index-backed paths can omit unindexed data. Ordinary
+/// scans and non-indexable expressions follow native planning.
+///
+/// Lance's native `fast_search()` is applied before the nearest query and
+/// explicit `use_index` setting. For vector queries, unindexed fragments are
+/// omitted and the result is empty without a usable index, including when
+/// `use_index=false`. Disabling restores the default native behavior.
+/// Disabled by default. Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fast_search(
+    scanner: *mut LanceScanner,
+    enable: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fast_search_inner(scanner, enable)
+    })
+}
+
+unsafe fn scanner_set_fast_search_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("fast_search")?;
+    s.fast_search = enable;
+    Ok(0)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_prefilter(
     scanner: *mut LanceScanner,
@@ -4250,6 +4442,148 @@ mod tests {
             unsafe { &*scanner }.blob_handling,
             Some(BlobHandling::AllDescriptions)
         );
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn scanner_materialization_and_fast_search_setters_preserve_state_on_errors() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let name = CString::new("name").unwrap();
+        let missing = CString::new("missing").unwrap();
+        let name_id = unsafe { (*dataset).snapshot() }
+            .schema()
+            .field("name")
+            .unwrap()
+            .id as u32;
+
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::Heuristic
+        ));
+        assert!(!unsafe { &*scanner }.fast_search);
+
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    [name.as_ptr()].as_ptr(),
+                    1,
+                )
+            },
+            0
+        );
+        match &unsafe { &*scanner }.materialization_style {
+            MaterializationStyle::AllEarlyExcept(ids) => assert_eq!(ids, &vec![name_id]),
+            _ => panic!("unexpected materialization style"),
+        }
+
+        let empty: [*const c_char; 0] = [];
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    empty.as_ptr(),
+                    0,
+                )
+            },
+            0
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllEarlyExcept(ids) if ids.is_empty()
+        ));
+
+        // Invalid names, NULL entries, non-EXCEPT column lists, and unknown enum
+        // tags are rejected without replacing the accepted empty exception list.
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    [missing.as_ptr()].as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    [ptr::null()].as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllLate as i32,
+                    [name.as_ptr()].as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { lance_scanner_set_materialization_style(scanner, 99, ptr::null(), 0) },
+            -1
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllEarlyExcept(ids) if ids.is_empty()
+        ));
+
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllLate as i32,
+                    ptr::null(),
+                    0,
+                )
+            },
+            0
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllLate
+        ));
+
+        assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, true) }, 0);
+        assert!(unsafe { &*scanner }.fast_search);
+        assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, false) }, 0);
+        assert!(!unsafe { &*scanner }.fast_search);
+
+        let prepared = unsafe { &*scanner }.build_scanner().unwrap();
+        assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, true) }, -1);
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarly as i32,
+                    ptr::null(),
+                    0,
+                )
+            },
+            -1
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllLate
+        ));
+        assert!(!unsafe { &*scanner }.fast_search);
+        drop(prepared);
 
         unsafe {
             lance_scanner_close(scanner);

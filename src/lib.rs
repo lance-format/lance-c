@@ -32,6 +32,7 @@ mod dataset;
 mod delete;
 mod drop_columns;
 mod error;
+mod fragment;
 mod fragment_writer;
 mod fts_query;
 mod helpers;
@@ -65,6 +66,7 @@ pub use drop_columns::*;
 pub use error::{
     LanceErrorCode, lance_free_string, lance_last_error_code, lance_last_error_message,
 };
+pub use fragment::*;
 pub use fragment_writer::*;
 pub use fts_query::*;
 pub use index::*;
