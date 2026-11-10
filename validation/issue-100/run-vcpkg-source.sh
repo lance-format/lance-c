@@ -16,7 +16,7 @@ mkdir -p "${log_dir}"
 log="${log_dir}/vcpkg-source-${triplet}.log"
 
 set +e
-"${VCPKG_ROOT}/vcpkg" install lance-c \
+"${VCPKG_ROOT}/vcpkg" install "lance-c[from-source]" \
     --overlay-ports="${repo}/ports" \
     --triplet "${triplet}" \
     >"${log}" 2>&1
