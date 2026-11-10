@@ -812,10 +812,16 @@ impl PreparedScanner {
             selected_segments_have_current_fragments,
             distributed_fts.row_addr_mask.as_ref(),
         )?;
-        if rewritten.indexed_query_execs > 1
-            || rewritten.flat_match_query_execs > 1
-            || rewritten.indexed_query_execs + rewritten.flat_match_query_execs == 0
-            || (selected_segments_have_current_fragments && rewritten.indexed_query_execs != 1)
+        // Fast search may eliminate every FTS source. Projection and row-fetch
+        // nodes can still wrap EmptyExec, with no query node to rewrite.
+        let empty_sources_only = rewritten.indexed_query_execs == 0
+            && rewritten.flat_match_query_execs == 0
+            && fts_plan_has_only_empty_sources(plan.as_ref());
+        if !empty_sources_only
+            && (rewritten.indexed_query_execs > 1
+                || rewritten.flat_match_query_execs > 1
+                || rewritten.indexed_query_execs + rewritten.flat_match_query_execs == 0
+                || (selected_segments_have_current_fragments && rewritten.indexed_query_execs != 1))
         {
             return Err(lance_core::Error::internal(format!(
                 "unexpected prepared FTS plan for selected segments with current fragment coverage {selected_segments_have_current_fragments}: rewrote {} indexed FTS query node(s) and removed {} FlatMatchQueryExec node(s)",
@@ -831,6 +837,17 @@ impl PreparedScanner {
             },
         )?;
         Ok(DatasetRecordBatchStream::new(stream))
+    }
+}
+
+fn fts_plan_has_only_empty_sources(plan: &dyn ExecutionPlan) -> bool {
+    let children = plan.children();
+    if children.is_empty() {
+        plan.downcast_ref::<EmptyExec>().is_some()
+    } else {
+        children
+            .into_iter()
+            .all(|child| fts_plan_has_only_empty_sources(child.as_ref()))
     }
 }
 
