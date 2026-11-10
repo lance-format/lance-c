@@ -476,8 +476,9 @@ impl LanceScanner {
     }
 
     /// Validate an expression projection through the same native configuration
-    /// method the scan will use. Unknown columns and unsupported dynamic-only
-    /// projections remain materialization errors, as they are in Lance.
+    /// method the scan will use. Lance reports malformed expressions, duplicate
+    /// outputs, and schema-dependent expression resolution here; planning-only
+    /// errors remain materialization errors.
     fn validate_expression_projection(&self, columns: &[ProjectionExpression]) -> Result<()> {
         let mut scanner = self.dataset.scan();
         let native = columns

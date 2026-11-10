@@ -1265,9 +1265,10 @@ typedef struct LanceProjectionColumn {
  * Each expression may reference aliases, stored columns, metadata columns,
  * nested field paths, and query-generated scoring columns according to the
  * selected Lance version. Output order follows the input array. Lance parses
- * and validates expressions and duplicate output names during this call;
- * resolution against the scan schema and unsupported dynamic-only projections
- * are reported when the scan starts.
+ * and validates expressions, duplicate output names, and schema-dependent
+ * expression resolution during this call. Planning-only errors, such as an
+ * unsupported projection with no physical output column, are reported when the
+ * scan starts.
  *
  * Passing `columns == NULL` with `len == 0` clears the projection and restores
  * the native unset projection, which selects all dataset columns. Passing a

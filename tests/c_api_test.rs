@@ -2246,20 +2246,29 @@ fn test_scanner_projection_setter_contract() {
     );
     unsafe { lance_scanner_close(scanner) };
 
-    // Unknown columns remain a native materialization error.
+    // Schema-dependent expression resolution is a native configuration error
+    // and preserves the previous projection.
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(set_projection(scanner, &[("id_alias", "id")]), 0);
     assert_eq!(
         set_projection(scanner, &[("id_alias", "id"), ("bad", "missing + 1")]),
-        0
-    );
-    let mut stream = FFI_ArrowArrayStream::empty();
-    assert_eq!(
-        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
         -1
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     let message = take_last_error_message();
-    assert!(message.contains("No field named missing"), "{message}");
+    assert!(message.contains("missing"), "{message}");
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(
+        schema_signature(reader.schema().as_ref()),
+        vec![("id_alias".to_string(), DataType::Int32, false)]
+    );
     unsafe { lance_scanner_close(scanner) };
 
     // NULL clears to the unset projection; a non-NULL empty array is explicit empty.
