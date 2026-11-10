@@ -7,6 +7,7 @@ set -euo pipefail
 
 readonly BASE_COMMIT="6394be44faedf9589389fa4d5aed4bd55cdfd02d"
 readonly NATIVE_COMMIT="40f15ed1b71b66950961b175829fdf17a763f108"
+readonly RUNNER_COMMIT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse HEAD)"
 readonly RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 readonly EVIDENCE_ROOT="${EVIDENCE_ROOT:-/home/xuanwo/exec/lance-c-issue113/evidence}"
 readonly RUN_DIR="$EVIDENCE_ROOT/$RUN_ID"
@@ -23,12 +24,10 @@ STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 write_final() {
     local state="$1"
     local exit_code="$2"
-    local validation_commit
-    validation_commit="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || printf 'unknown')"
     local tmp="$RUN_DIR/final-status.json.tmp"
     printf '{"run_id":"%s","state":"%s","failed_step":"%s","exit":%d,"product_commit":"%s","product_tree":"%s","validation_commit":"%s","base_commit":"%s","native_commit":"%s","started_at":"%s","finished_at":"%s"}\n' \
         "$RUN_ID" "$state" "$FAILED_STEP" "$exit_code" \
-        "$PRODUCT_COMMIT" "$PRODUCT_TREE" "$validation_commit" \
+        "$PRODUCT_COMMIT" "$PRODUCT_TREE" "$RUNNER_COMMIT" \
         "$BASE_COMMIT" "$NATIVE_COMMIT" "$STARTED_AT" \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$tmp"
     mv "$tmp" "$RUN_DIR/final-status.json"
@@ -217,12 +216,12 @@ cleanup_markers="$(grep -F -o 'test_cleanup_and_lifecycle... OK' \
 [[ "$cleanup_markers" -ge 2 ]] \
     || fail "consumer_assertion" "C and C++ cleanup probes did not both execute"
 
-rust_tests="$(grep -c '^test .* \\.\\.\\. ok$' "$LOG_DIR/30-full-rust.log" || true)"
-consumer_tests="$(grep -c '^test .* \\.\\.\\. ok$' "$LOG_DIR/40-native-consumers.log" || true)"
+rust_tests="$(grep -c "^test .* \\.\\.\\. ok$" "$LOG_DIR/30-full-rust.log" || true)"
+consumer_tests="$(grep -c "^test .* \\.\\.\\. ok$" "$LOG_DIR/40-native-consumers.log" || true)"
 {
     printf 'product_commit=%s\n' "$PRODUCT_COMMIT"
     printf 'product_tree=%s\n' "$PRODUCT_TREE"
-    printf 'validation_commit=%s\n' "$(git -C "$REPO" rev-parse HEAD)"
+    printf 'validation_commit=%s\n' "$RUNNER_COMMIT"
     printf 'base_commit=%s\n' "$BASE_COMMIT"
     printf 'native_commit=%s\n' "$NATIVE_COMMIT"
     printf 'rust_tests_ok=%s\n' "$rust_tests"
