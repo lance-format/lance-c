@@ -40,9 +40,89 @@
         }                                                                      \
     } while (0)
 
+static const char *arrow_field_metadata_value(
+    const struct ArrowSchema *field,
+    const char *key,
+    size_t *value_len) {
+    if (field == NULL || field->metadata == NULL) return NULL;
+    const char *cursor = field->metadata;
+    int32_t pair_count = 0;
+    memcpy(&pair_count, cursor, sizeof(pair_count));
+    cursor += sizeof(pair_count);
+    for (int32_t i = 0; i < pair_count; ++i) {
+        int32_t key_len = 0;
+        memcpy(&key_len, cursor, sizeof(key_len));
+        cursor += sizeof(key_len);
+        const char *key_data = cursor;
+        cursor += key_len;
+        int32_t stored_value_len = 0;
+        memcpy(&stored_value_len, cursor, sizeof(stored_value_len));
+        cursor += sizeof(stored_value_len);
+        const char *value_data = cursor;
+        cursor += stored_value_len;
+        if (key_len == (int32_t)strlen(key) &&
+            memcmp(key_data, key, (size_t)key_len) == 0) {
+            if (value_len != NULL) *value_len = (size_t)stored_value_len;
+            return value_data;
+        }
+    }
+    return NULL;
+}
+
+static const struct ArrowSchema *arrow_field_at_path(
+    const struct ArrowSchema *schema,
+    const char *path) {
+    const struct ArrowSchema *field = schema;
+    const char *segment = path;
+    while (*segment != '\0') {
+        const char *dot = strchr(segment, '.');
+        size_t segment_len = dot == NULL ? strlen(segment) : (size_t)(dot - segment);
+        const struct ArrowSchema *child = NULL;
+        for (int64_t i = 0; i < field->n_children; ++i) {
+            const struct ArrowSchema *candidate = field->children[i];
+            if (candidate != NULL && candidate->name != NULL &&
+                strlen(candidate->name) == segment_len &&
+                memcmp(candidate->name, segment, segment_len) == 0) {
+                child = candidate;
+                break;
+            }
+        }
+        if (child == NULL) return NULL;
+        field = child;
+        if (dot == NULL) break;
+        segment = dot + 1;
+    }
+    return field;
+}
+
+static void assert_field_metadata(
+    const struct ArrowSchema *field,
+    const char *key,
+    const char *expected) {
+    size_t value_len = 0;
+    const char *value = arrow_field_metadata_value(field, key, &value_len);
+    ASSERT(value != NULL, "expected field metadata key");
+    ASSERT(value_len == strlen(expected), "field metadata value length mismatch");
+    ASSERT(memcmp(value, expected, value_len) == 0, "field metadata value mismatch");
+}
+
+static void assert_field_metadata_absent(
+    const struct ArrowSchema *field,
+    const char *key) {
+    if (arrow_field_metadata_value(field, key, NULL) != NULL) {
+        fprintf(stderr,
+                "unexpected field metadata: field=%s key=%s\n",
+                field != NULL && field->name != NULL ? field->name : "<null>",
+                key);
+    }
+    ASSERT(arrow_field_metadata_value(field, key, NULL) == NULL,
+           "field metadata key should be absent");
+}
+
 typedef struct {
     uint64_t calls;
     uint64_t bytes_read;
+    uint64_t indices_loaded;
     int invalid;
 } ScanStatisticsCapture;
 
@@ -68,6 +148,7 @@ static void capture_scan_statistics(
     }
     captured->calls += 1;
     captured->bytes_read = statistics->bytes_read;
+    captured->indices_loaded = statistics->indices_loaded;
 }
 
 typedef struct {
@@ -1027,6 +1108,212 @@ static void test_native_refs_and_tags(const char *uri) {
     printf("OK\n");
 }
 
+static void test_branch_lifecycle(const char *uri) {
+    printf("  test_branch_lifecycle... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    ASSERT(lance_dataset_version(ds) == 2, "fixture must have two versions");
+    ASSERT(lance_dataset_count_rows(ds) == 20, "fixture must have twenty rows");
+
+    const char *json = lance_dataset_branch_identifier_json(ds);
+    ASSERT(json != NULL, "main branch identifier JSON");
+    ASSERT(strcmp(json, "{\"version_mapping\":[]}") == 0,
+           "main branch identifier must have an empty mapping");
+    lance_free_string(json);
+
+    json = lance_dataset_branches_json(ds);
+    ASSERT(json != NULL, "initial branch list JSON");
+    ASSERT(strcmp(json, "{}") == 0, "fixture must start without branches");
+    lance_free_string(json);
+
+    LanceRef *version1 = lance_ref_version_number(1);
+    ASSERT(version1 != NULL, "version ref");
+    LanceDataset *parent =
+        lance_dataset_branch_create(ds, "c/parent", version1, NULL);
+    ASSERT(parent != NULL, "branch create");
+    lance_ref_close(version1);
+    ASSERT(lance_dataset_version(parent) == 1, "branch version");
+    ASSERT(lance_dataset_count_rows(parent) == 10, "branch row count");
+
+    LanceRef *child_ref = lance_ref_version_number(1);
+    LanceDataset *child = lance_dataset_branch_create(
+        parent, "c/parent/child", child_ref, NULL);
+    ASSERT(child != NULL, "child branch create");
+    lance_ref_close(child_ref);
+    ASSERT(lance_dataset_count_rows(child) == 10, "child branch row count");
+
+    const char *parent_json =
+        lance_dataset_branch_get_json(ds, "c/parent");
+    ASSERT(parent_json != NULL, "branch get JSON");
+    ASSERT(strstr(parent_json, "\"parentBranch\":null") != NULL,
+           "main-based branch has no parent branch");
+    ASSERT(strstr(parent_json, "\"parentVersion\":1") != NULL,
+           "branch parent version");
+    ASSERT(strstr(parent_json, "\"createAt\":") != NULL,
+           "branch createAt");
+    ASSERT(strstr(parent_json, "\"manifestSize\":") != NULL,
+           "branch manifestSize");
+    ASSERT(strstr(parent_json, "\"identifier\":{\"version_mapping\":") != NULL,
+           "branch identifier mapping");
+    ASSERT(strstr(parent_json, "\"metadata\":{}") != NULL,
+           "branch starts with empty metadata");
+    lance_free_string(parent_json);
+
+    const char *child_json =
+        lance_dataset_branch_get_json(ds, "c/parent/child");
+    ASSERT(child_json != NULL, "child branch get JSON");
+    ASSERT(strstr(child_json, "\"parentBranch\":\"c/parent\"") != NULL,
+           "child branch parent");
+    ASSERT(strstr(child_json, "\"parentVersion\":1") != NULL,
+           "child branch parent version");
+    lance_free_string(child_json);
+
+    const char *branches_json = lance_dataset_branches_json(ds);
+    ASSERT(branches_json != NULL, "branch list JSON");
+    ASSERT(strstr(branches_json, "\"c/parent\"") != NULL,
+           "branch list includes parent");
+    ASSERT(strstr(branches_json, "\"c/parent/child\"") != NULL,
+           "branch list includes child");
+
+    const char *metadata[] = {"owner", "c-api", "empty", "", NULL};
+    ASSERT(lance_dataset_branch_replace_metadata(
+               ds, "c/parent", metadata) == 0,
+           "branch metadata replace");
+    parent_json = lance_dataset_branch_get_json(ds, "c/parent");
+    ASSERT(parent_json != NULL, "branch metadata JSON");
+    ASSERT(strstr(parent_json, "\"owner\":\"c-api\"") != NULL,
+           "branch metadata owner");
+    ASSERT(strstr(parent_json, "\"empty\":\"\"") != NULL,
+           "branch metadata empty value");
+    lance_free_string(parent_json);
+
+    LanceDataset *parent_checkout =
+        lance_dataset_checkout_branch(ds, "c/parent");
+    LanceDataset *main_checkout =
+        lance_dataset_checkout_branch(ds, "main");
+    ASSERT(parent_checkout != NULL && main_checkout != NULL,
+           "branch checkout");
+    ASSERT(lance_dataset_version(parent_checkout) == 1 &&
+               lance_dataset_count_rows(parent_checkout) == 10,
+           "parent branch checkout snapshot");
+    ASSERT(lance_dataset_version(main_checkout) == 2 &&
+               lance_dataset_count_rows(main_checkout) == 20,
+           "main branch checkout");
+
+    LanceRef *reserved = lance_ref_version("main", true, 1);
+    ASSERT(lance_dataset_branch_create(ds, "main", reserved, NULL) == NULL,
+           "main is reserved for branch creation");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "create reserved main branch");
+    lance_ref_close(reserved);
+
+    LanceRef *duplicate = lance_ref_version_number(2);
+    ASSERT(lance_dataset_branch_create(ds, "c/parent", duplicate, NULL) == NULL,
+           "duplicate branch must fail");
+    ASSERT(lance_last_error_code() != LANCE_OK, "duplicate branch error");
+    const char *duplicate_message = lance_last_error_message();
+    if (duplicate_message) lance_free_string(duplicate_message);
+    lance_ref_close(duplicate);
+
+    ASSERT(lance_dataset_branch_delete(ds, "c/parent") == -1,
+           "parent with child must not delete");
+    expect_error(LANCE_ERR_COMMIT_CONFLICT, "delete parent branch");
+
+    /* JSON and checkout handles own their data. */
+    const char *owned_list = lance_dataset_branches_json(ds);
+    const char *owned_parent = lance_dataset_branch_get_json(ds, "c/parent");
+    ASSERT(owned_list != NULL && owned_parent != NULL, "owned branch JSON");
+    lance_dataset_close(ds);
+    ASSERT(strstr(owned_list, "\"c/parent\"") != NULL,
+           "branch list after source close");
+    ASSERT(strstr(owned_parent, "\"owner\":\"c-api\"") != NULL,
+           "branch JSON after source close");
+    ASSERT(lance_dataset_count_rows(parent_checkout) == 10,
+           "checkout after source close");
+    lance_free_string(owned_parent);
+    lance_free_string(owned_list);
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "reopen failed");
+    parent_json = lance_dataset_branch_get_json(ds, "c/parent");
+    ASSERT(parent_json != NULL, "persisted branch metadata");
+    ASSERT(strstr(parent_json, "\"owner\":\"c-api\"") != NULL,
+           "persisted branch metadata value");
+    lance_free_string(parent_json);
+
+    /* NULL or an empty array fully replaces metadata with an empty map. */
+    ASSERT(lance_dataset_branch_replace_metadata(ds, "c/parent", NULL) == 0,
+           "clear branch metadata");
+    parent_json = lance_dataset_branch_get_json(ds, "c/parent");
+    ASSERT(parent_json != NULL && strstr(parent_json, "\"owner\"") == NULL,
+           "cleared branch metadata");
+    lance_free_string(parent_json);
+
+    LanceRef *empty_options_ref = lance_ref_version_number(1);
+    const char *empty_options[] = {NULL};
+    LanceDataset *options_branch = lance_dataset_branch_create(
+        ds, "c/empty-options", empty_options_ref, empty_options);
+    ASSERT(options_branch != NULL, "explicit empty storage options");
+    lance_ref_close(empty_options_ref);
+    lance_dataset_close(options_branch);
+    ASSERT(lance_dataset_branch_delete(ds, "c/empty-options") == 0,
+           "delete explicit-options branch");
+
+    ASSERT(lance_dataset_branch_delete(ds, "c/parent/child") == 0,
+           "delete child branch");
+    ASSERT(lance_dataset_branch_delete(ds, "c/parent") == 0,
+           "delete parent branch after child");
+
+    LanceRef *tagged_ref = lance_ref_version_number(1);
+    LanceDataset *tagged =
+        lance_dataset_branch_create(ds, "c/tagged", tagged_ref, NULL);
+    ASSERT(tagged != NULL, "tagged branch create");
+    lance_ref_close(tagged_ref);
+    LanceRef *tag_target = lance_ref_version("c/tagged", true, 1);
+    ASSERT(lance_dataset_tag_create(ds, "c-branch-tag", tag_target) == 0,
+           "tag branch");
+    ASSERT(lance_dataset_branch_delete(ds, "c/tagged") == -1,
+           "tagged branch must not delete");
+    expect_error(LANCE_ERR_COMMIT_CONFLICT, "delete tagged branch");
+    ASSERT(lance_dataset_tag_delete(ds, "c-branch-tag") == 0,
+           "delete branch tag");
+    ASSERT(lance_dataset_branch_delete(ds, "c/tagged") == 0,
+           "delete tagged branch after tag");
+
+    json = lance_dataset_branches_json(ds);
+    ASSERT(json != NULL, "final branch list");
+    ASSERT(strcmp(json, "{}") == 0, "branch list must be empty");
+    lance_free_string(json);
+
+    ASSERT(lance_dataset_branch_get_json(ds, "missing") == NULL,
+           "missing branch get");
+    expect_error(LANCE_ERR_NOT_FOUND, "missing branch get");
+    ASSERT(lance_dataset_checkout_branch(ds, "missing") == NULL,
+           "missing branch checkout");
+    expect_error(LANCE_ERR_NOT_FOUND, "missing branch checkout");
+    ASSERT(lance_dataset_branch_delete(ds, "missing") == -1,
+           "missing branch delete");
+    expect_error(LANCE_ERR_NOT_FOUND, "missing branch delete");
+
+    ASSERT(lance_dataset_branches_json(NULL) == NULL,
+           "NULL branch list");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "NULL branch list");
+    ASSERT(lance_dataset_branch_identifier_json(NULL) == NULL,
+           "NULL branch identifier");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "NULL branch identifier");
+    ASSERT(branches_json != NULL, "keep branch JSON alive");
+    lance_free_string(branches_json);
+
+    lance_ref_close(tag_target);
+    lance_dataset_close(tagged);
+    lance_dataset_close(ds);
+    lance_dataset_close(main_checkout);
+    lance_dataset_close(parent_checkout);
+    lance_dataset_close(child);
+    lance_dataset_close(parent);
+    printf("OK\n");
+}
+
 /* Restore the dataset to its own current version — always commits a new
  * manifest (no skip-if-equal optimization) so the caller's "make `version`
  * the new latest" intent holds even under concurrent writers. */
@@ -1111,6 +1398,139 @@ static void test_dataset_write_roundtrip(const char *src_uri, const char *dst_ur
            (unsigned long long)src_rows, (unsigned long long)dst_rows);
 
     lance_dataset_close(dst);
+    lance_scanner_close(scanner);
+    lance_dataset_close(src);
+    printf("OK\n");
+}
+
+/* Exercises the native write-options path and generic config read/update from
+ * a real C caller. The destination was created by the legacy writer, so its
+ * 20-version / 14-day policy must survive the append and be visible here. */
+static void test_write_options_and_config(const char *src_uri,
+                                          const char *write_uri) {
+    printf("  test_write_options_and_config... ");
+
+    LanceDataset *src = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(src != NULL, "open source failed");
+    LanceScanner *scanner = lance_scanner_new(src, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    int32_t rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    rc = stream.get_schema(&stream, &schema);
+    ASSERT(rc == 0, "get_schema from stream failed");
+
+    LanceAutoCleanupParams cleanup = {1, 0, 0};
+    LanceWriteOptions options;
+    memset(&options, 0, sizeof(options));
+    options.auto_cleanup = &cleanup;
+    options.skip_auto_cleanup = true;
+
+    LanceDataset *ds = NULL;
+    rc = lance_dataset_write_with_options(
+        write_uri, &schema, &stream, LANCE_WRITE_APPEND, &options, NULL, &ds);
+    if (schema.release) schema.release(&schema);
+    ASSERT(rc == 0, "lance_dataset_write_with_options append failed");
+    CHECK_OK();
+    ASSERT(ds != NULL, "out_dataset should be populated");
+    ASSERT(lance_dataset_count_rows(ds) > 0, "append should add rows");
+    CHECK_OK();
+
+    LanceDatasetConfig *config = lance_dataset_config(ds);
+    ASSERT(config != NULL, "config snapshot failed");
+    uint64_t config_count = lance_dataset_config_count(config);
+    CHECK_OK();
+    int saw_interval = 0;
+    int saw_older_than = 0;
+    for (uint64_t i = 0; i < config_count; i++) {
+        const char *key = lance_dataset_config_key_at(config, (size_t)i);
+        const char *value = lance_dataset_config_value_at(config, (size_t)i);
+        CHECK_OK();
+        ASSERT(key != NULL && value != NULL, "config entry must be non-NULL");
+        if (strcmp(key, "lance.auto_cleanup.interval") == 0) {
+            saw_interval = 1;
+            ASSERT(strcmp(value, "20") == 0,
+                   "legacy interval must survive native append");
+        } else if (strcmp(key, "lance.auto_cleanup.older_than") == 0) {
+            saw_older_than = 1;
+            ASSERT(strcmp(value, "14days") == 0,
+                   "legacy older_than must survive native append");
+        }
+    }
+    ASSERT(saw_interval && saw_older_than,
+           "legacy cleanup policy must remain persisted");
+    lance_dataset_config_close(config);
+
+    const char *keys[] = {"c_test.key", "lance.auto_cleanup.older_than"};
+    const char *values[] = {"value", NULL};
+    rc = lance_dataset_update_config(ds, keys, values, 2);
+    ASSERT(rc == 0, "config update failed");
+    CHECK_OK();
+    LanceDatasetConfig *after_update = lance_dataset_config(ds);
+    ASSERT(after_update != NULL, "post-update config snapshot failed");
+    uint64_t after_update_count = lance_dataset_config_count(after_update);
+    CHECK_OK();
+    lance_dataset_config_close(after_update);
+
+    /* A snapshot taken before close must remain usable after the dataset
+     * handle is gone. */
+    LanceDatasetConfig *snapshot = lance_dataset_config(ds);
+    ASSERT(snapshot != NULL, "post-update config snapshot failed");
+    lance_dataset_close(ds);
+    uint64_t snapshot_count = lance_dataset_config_count(snapshot);
+    CHECK_OK();
+    ASSERT(snapshot_count == after_update_count, "snapshot count mismatch");
+    const char *snapshot_key = lance_dataset_config_key_at(snapshot, 0);
+    const char *snapshot_value = lance_dataset_config_value_at(snapshot, 0);
+    CHECK_OK();
+    ASSERT(snapshot_key != NULL && snapshot_value != NULL,
+           "snapshot accessors must stay valid after dataset close");
+    lance_dataset_config_close(snapshot);
+
+    LanceDataset *reopened = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen failed");
+    config = lance_dataset_config(reopened);
+    ASSERT(config != NULL, "reopened config snapshot failed");
+    config_count = lance_dataset_config_count(config);
+    CHECK_OK();
+    int saw_custom = 0;
+    int saw_removed_older_than = 0;
+    for (uint64_t i = 0; i < config_count; i++) {
+        const char *key = lance_dataset_config_key_at(config, (size_t)i);
+        const char *value = lance_dataset_config_value_at(config, (size_t)i);
+        CHECK_OK();
+        ASSERT(key != NULL && value != NULL, "config entry must be non-NULL");
+        if (strcmp(key, "c_test.key") == 0) {
+            saw_custom = 1;
+            ASSERT(strcmp(value, "value") == 0, "custom config mismatch");
+        } else if (strcmp(key, "lance.auto_cleanup.older_than") == 0) {
+            saw_removed_older_than = 1;
+        }
+    }
+    ASSERT(saw_custom, "custom config must persist across reopen");
+    ASSERT(!saw_removed_older_than, "removed config must stay removed");
+    lance_dataset_config_close(config);
+
+    /* Error paths: NULL dataset and NULL arrays are rejected. */
+    rc = lance_dataset_update_config(NULL, keys, values, 2);
+    ASSERT(rc == -1, "NULL dataset must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+    const char *message = lance_last_error_message();
+    if (message) lance_free_string(message);
+    rc = lance_dataset_update_config(reopened, NULL, values, 2);
+    ASSERT(rc == -1, "NULL keys must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    lance_dataset_close(reopened);
     lance_scanner_close(scanner);
     lance_dataset_close(src);
     printf("OK\n");
@@ -1290,6 +1710,273 @@ static void test_dataset_metadata(const char *write_uri) {
     printf("OK\n");
 }
 
+/* Exercises batched native field metadata updates plus schema/snapshot
+ * inspection through the C ABI. */
+static void test_dataset_field_metadata(const char *fragment_uri) {
+    printf("  test_dataset_field_metadata... ");
+
+    LanceDataset *ds = lance_dataset_open(fragment_uri, NULL, 0);
+    LanceDataset *old = lance_dataset_open(fragment_uri, NULL, 0);
+    ASSERT(ds != NULL && old != NULL, "field metadata dataset open failed");
+
+    uint64_t initial_version = lance_dataset_version(ds);
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(ds) == 2,
+           "nested fixture must have two fragments");
+    ASSERT(lance_dataset_count_rows(ds) == 6,
+           "nested fixture must retain its logical rows");
+
+    const char *storage_version = lance_dataset_data_storage_version(ds);
+    ASSERT(storage_version != NULL, "data storage version read failed");
+    ASSERT(strcmp(storage_version, "2.2") == 0,
+           "fragment fixture should use native 2.2 storage");
+    lance_free_string(storage_version);
+
+    bool stable = true;
+    ASSERT(lance_dataset_has_stable_row_ids(ds, &stable) == 0,
+           "stable row ID read failed");
+    ASSERT(!stable, "fragment fixture must not use stable row IDs");
+
+    size_t field_count = 0;
+    ASSERT(lance_dataset_field_id_count(ds, &field_count) == 0,
+           "field ID count failed");
+    ASSERT(field_count >= 4, "nested fixture should expose four fields");
+
+    LanceFieldReference id_path = {LANCE_FIELD_REFERENCE_PATH, 0, "id"};
+    LanceFieldReference name_path = {LANCE_FIELD_REFERENCE_PATH, 0, "profile.name"};
+    LanceFieldReference score_path = {LANCE_FIELD_REFERENCE_PATH, 0, "profile.score"};
+    int32_t id_id = 0;
+    int32_t name_id = 0;
+    int32_t score_id = 0;
+    ASSERT(lance_dataset_resolve_field_id(ds, &id_path, &id_id) == 0,
+           "resolve id path failed");
+    ASSERT(lance_dataset_resolve_field_id(ds, &name_path, &name_id) == 0,
+           "resolve nested name path failed");
+    ASSERT(lance_dataset_resolve_field_id(ds, &score_path, &score_id) == 0,
+           "resolve nested score path failed");
+
+    const char *nested_path = lance_dataset_field_path(ds, name_id);
+    ASSERT(nested_path != NULL, "nested field path read failed");
+    ASSERT(strcmp(nested_path, "profile.name") == 0,
+           "nested field path mismatch");
+    lance_free_string(nested_path);
+
+    int32_t listed_nested_id = 0;
+    ASSERT(lance_dataset_field_id_at(ds, field_count - 1, &listed_nested_id) == 0,
+           "field ID traversal failed");
+    const char *traversed_path = lance_dataset_field_path(ds, listed_nested_id);
+    ASSERT(traversed_path != NULL, "traversed field path failed");
+    lance_free_string(traversed_path);
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0, "initial schema export failed");
+    const struct ArrowSchema *profile_name =
+        arrow_field_at_path(&schema, "profile.name");
+    ASSERT(profile_name != NULL, "nested Arrow field missing");
+    ASSERT(arrow_field_metadata_value(profile_name, "nested", NULL) == NULL,
+           "initial field metadata should be empty");
+    if (schema.release) schema.release(&schema);
+
+    /* Invalid inputs and native field lookup errors must not advance the
+     * version or change committed metadata. */
+    const char *bad_key[] = {"key"};
+    const char *bad_value[] = {"value"};
+    LanceFieldMetadataUpdate bad_updates[] = {
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "id"}, bad_key, bad_value, 1,
+         LANCE_METADATA_UPDATE_MERGE},
+    };
+    ASSERT(lance_dataset_update_field_metadata(NULL, bad_updates, 1) == -1,
+           "NULL dataset update must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL dataset update must return INVALID_ARGUMENT");
+    ASSERT(lance_dataset_update_field_metadata(ds, NULL, 1) == -1,
+           "NULL updates must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL updates must return INVALID_ARGUMENT");
+    bad_updates[0].keys = NULL;
+    ASSERT(lance_dataset_update_field_metadata(ds, bad_updates, 1) == -1,
+           "NULL keys must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL keys must return INVALID_ARGUMENT");
+    bad_updates[0].keys = bad_key;
+    bad_updates[0].mode = (LanceMetadataUpdateMode)99;
+    ASSERT(lance_dataset_update_field_metadata(ds, bad_updates, 1) == -1,
+           "invalid field update mode must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid field update mode must return INVALID_ARGUMENT");
+    bad_updates[0].mode = LANCE_METADATA_UPDATE_MERGE;
+    bad_updates[0].field.field_id = 99999;
+    bad_updates[0].field.kind = LANCE_FIELD_REFERENCE_ID;
+    ASSERT(lance_dataset_update_field_metadata(ds, bad_updates, 1) == -1,
+           "unknown field ID must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "unknown field ID must return INVALID_ARGUMENT");
+    bad_updates[0].field.kind = LANCE_FIELD_REFERENCE_PATH;
+    bad_updates[0].field.path = "profile.missing";
+    ASSERT(lance_dataset_update_field_metadata(ds, bad_updates, 1) == -1,
+           "unknown field path must fail");
+    ASSERT(lance_last_error_code() != LANCE_OK,
+           "unknown field path must set an error");
+    const char *path_error = lance_last_error_message();
+    ASSERT(path_error != NULL && strstr(path_error, "profile.missing") != NULL,
+           "unknown field path error must identify the path");
+    if (path_error) lance_free_string(path_error);
+    ASSERT(lance_dataset_version(ds) == initial_version,
+           "rejected field updates must not commit");
+
+    const char *id_keys[] = {"owner", "empty", "remove"};
+    const char *id_values[] = {"c-consumer", "", "temporary"};
+    const char *name_keys[] = {"nested", "empty"};
+    const char *name_values[] = {"value", ""};
+    const char *score_keys[] = {"score", "remove"};
+    const char *score_values[] = {"1.5", NULL};
+    LanceFieldMetadataUpdate updates[] = {
+        {{LANCE_FIELD_REFERENCE_ID, id_id, NULL}, id_keys, id_values, 3,
+         LANCE_METADATA_UPDATE_MERGE},
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "profile.name"}, name_keys, name_values, 2,
+         LANCE_METADATA_UPDATE_REPLACE},
+        {{LANCE_FIELD_REFERENCE_ID, score_id, NULL}, score_keys, score_values, 2,
+         LANCE_METADATA_UPDATE_MERGE},
+    };
+    uint64_t version_before = lance_dataset_version(ds);
+    ASSERT(lance_dataset_update_field_metadata(ds, updates, 3) == 0,
+           "batched field update failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(ds) == version_before + 1,
+           "batched field updates must share one commit");
+
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0, "updated schema export failed");
+    const struct ArrowSchema *id_field = arrow_field_at_path(&schema, "id");
+    profile_name = arrow_field_at_path(&schema, "profile.name");
+    const struct ArrowSchema *score_field =
+        arrow_field_at_path(&schema, "profile.score");
+    ASSERT(id_field != NULL && profile_name != NULL && score_field != NULL,
+           "updated Arrow fields missing");
+    assert_field_metadata(id_field, "owner", "c-consumer");
+    assert_field_metadata(id_field, "empty", "");
+    assert_field_metadata(id_field, "remove", "temporary");
+    assert_field_metadata(profile_name, "nested", "value");
+    assert_field_metadata(profile_name, "empty", "");
+    assert_field_metadata(score_field, "score", "1.5");
+    assert_field_metadata_absent(score_field, "remove");
+    if (schema.release) schema.release(&schema);
+
+    /* The native builder stores updates by resolved field ID; the last update
+     * for `id` wins even though it is reached through another reference form. */
+    const char *root_keys[] = {"root"};
+    const char *first_values[] = {"first"};
+    const char *last_values[] = {"last"};
+    LanceFieldMetadataUpdate duplicate_updates[] = {
+        {{LANCE_FIELD_REFERENCE_ID, id_id, NULL}, root_keys, first_values, 1,
+         LANCE_METADATA_UPDATE_MERGE},
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "id"}, root_keys, last_values, 1,
+         LANCE_METADATA_UPDATE_REPLACE},
+    };
+    version_before = lance_dataset_version(ds);
+    ASSERT(lance_dataset_update_field_metadata(ds, duplicate_updates, 2) == 0,
+           "duplicate field update failed");
+    ASSERT(lance_dataset_version(ds) == version_before + 1,
+           "duplicate field updates must share one commit");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0,
+           "duplicate update schema export failed");
+    id_field = arrow_field_at_path(&schema, "id");
+    ASSERT(id_field != NULL, "duplicate update id field missing");
+    assert_field_metadata(id_field, "root", "last");
+    assert_field_metadata_absent(id_field, "owner");
+    if (schema.release) schema.release(&schema);
+
+    const char *temp_keys[] = {"remove", "empty"};
+    const char *temp_values[] = {"temporary", ""};
+    const char *remove_keys[] = {"remove"};
+    const char *remove_values[] = {NULL};
+    LanceFieldMetadataUpdate temp_update[] = {
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "id"}, temp_keys, temp_values, 2,
+         LANCE_METADATA_UPDATE_MERGE},
+    };
+    LanceFieldMetadataUpdate remove_update[] = {
+        {{LANCE_FIELD_REFERENCE_ID, id_id, NULL}, remove_keys, remove_values, 1,
+         LANCE_METADATA_UPDATE_MERGE},
+    };
+    ASSERT(lance_dataset_update_field_metadata(ds, temp_update, 1) == 0,
+           "temporary field metadata update failed");
+    ASSERT(lance_dataset_update_field_metadata(ds, remove_update, 1) == 0,
+           "field metadata removal failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0,
+           "removal schema export failed");
+    id_field = arrow_field_at_path(&schema, "id");
+    ASSERT(id_field != NULL, "removal id field missing");
+    assert_field_metadata(id_field, "root", "last");
+    assert_field_metadata(id_field, "empty", "");
+    assert_field_metadata_absent(id_field, "remove");
+    if (schema.release) schema.release(&schema);
+
+    LanceFieldMetadataUpdate clear_update[] = {
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "id"}, NULL, NULL, 0,
+         LANCE_METADATA_UPDATE_REPLACE},
+    };
+    ASSERT(lance_dataset_update_field_metadata(ds, clear_update, 1) == 0,
+           "empty field replacement failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0, "clear schema export failed");
+    id_field = arrow_field_at_path(&schema, "id");
+    ASSERT(id_field != NULL, "clear id field missing");
+    ASSERT(arrow_field_metadata_value(id_field, "root", NULL) == NULL,
+           "empty replacement must clear field metadata");
+    if (schema.release) schema.release(&schema);
+
+    ASSERT(lance_dataset_update_field_metadata(ds, NULL, 0) == 0,
+           "empty field update batch must succeed");
+    CHECK_OK();
+
+    const char *persist_keys[] = {"persist"};
+    const char *persist_values[] = {"yes"};
+    LanceFieldMetadataUpdate persist_updates[] = {
+        {{LANCE_FIELD_REFERENCE_ID, id_id, NULL}, persist_keys, persist_values, 1,
+         LANCE_METADATA_UPDATE_MERGE},
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "profile.name"}, persist_keys,
+         persist_values, 1, LANCE_METADATA_UPDATE_MERGE},
+    };
+    version_before = lance_dataset_version(ds);
+    ASSERT(lance_dataset_update_field_metadata(ds, persist_updates, 2) == 0,
+           "persistent field metadata update failed");
+    ASSERT(lance_dataset_version(ds) == version_before + 1,
+           "persistent field updates must share one commit");
+
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(old, &schema) == 0,
+           "old snapshot schema export failed");
+    id_field = arrow_field_at_path(&schema, "id");
+    ASSERT(id_field != NULL, "old snapshot id field missing");
+    ASSERT(arrow_field_metadata_value(id_field, "persist", NULL) == NULL,
+           "independent handle must keep its prior snapshot");
+    if (schema.release) schema.release(&schema);
+    ASSERT(lance_dataset_version(old) == initial_version,
+           "independent handle version must not advance");
+
+    lance_dataset_close(old);
+    lance_dataset_close(ds);
+
+    ds = lance_dataset_open(fragment_uri, NULL, 0);
+    ASSERT(ds != NULL, "field metadata reopen failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0,
+           "reopened schema export failed");
+    id_field = arrow_field_at_path(&schema, "id");
+    profile_name = arrow_field_at_path(&schema, "profile.name");
+    ASSERT(id_field != NULL && profile_name != NULL,
+           "reopened fields missing");
+    assert_field_metadata(id_field, "persist", "yes");
+    assert_field_metadata(profile_name, "persist", "yes");
+    if (schema.release) schema.release(&schema);
+    lance_dataset_close(ds);
+
+    printf("OK\n");
+}
+
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_update`. Must run before `test_delete`, which
  * empties the dataset. */
@@ -1464,8 +2151,8 @@ static void test_drop_columns(const char *write_uri) {
     int64_t fields_before = schema_before.n_children;
     if (schema_before.release) schema_before.release(&schema_before);
 
-    const char *cols[] = {"name", "embedding"};
-    rc = lance_dataset_drop_columns(ds, cols, 2);
+    const char *cols[] = {"name", "embedding", "score"};
+    rc = lance_dataset_drop_columns(ds, cols, 3);
     ASSERT(rc == 0, "drop_columns failed");
     uint64_t after_rows = lance_dataset_count_rows(ds);
     CHECK_OK();
@@ -1474,8 +2161,8 @@ static void test_drop_columns(const char *write_uri) {
     ASSERT(lance_dataset_version(ds) > v_before,
            "drop_columns must bump the version");
 
-    /* Schema field count must have decreased by exactly 2. The C-test
-     * fixture has 3 columns (`id`, `name`, `embedding`) — assert `fields_after == 1`
+    /* Schema field count must have decreased by exactly 3. The C-test
+     * fixture has 4 columns (`id`, `name`, `score`, `embedding`) — assert `fields_after == 1`
      * so this self-documents the post-drop expectation and trips if the
      * fixture ever grows additional columns. Release the exported
      * schema before any assertion so we never leak it on failure. */
@@ -1485,8 +2172,8 @@ static void test_drop_columns(const char *write_uri) {
     ASSERT(rc == 0, "schema export failed after drop");
     int64_t fields_after = schema_after.n_children;
     if (schema_after.release) schema_after.release(&schema_after);
-    ASSERT(fields_after == fields_before - 2,
-           "schema field count must decrease by 2 after drop");
+    ASSERT(fields_after == fields_before - 3,
+           "schema field count must decrease by 3 after drop");
     ASSERT(fields_after == 1,
            "C-test fixture should be left with `id` only after dropping columns");
 
@@ -2330,6 +3017,170 @@ static size_t collect_ordering_ids(
     return count;
 }
 
+static int compare_int32(const void *lhs, const void *rhs) {
+    int32_t left = *(const int32_t *)lhs;
+    int32_t right = *(const int32_t *)rhs;
+    return (left > right) - (left < right);
+}
+
+static void assert_ids_match(
+    const int32_t *actual,
+    size_t actual_count,
+    const int32_t *expected,
+    size_t expected_count) {
+    ASSERT(actual_count == expected_count, "indexed query row count mismatch");
+    int32_t sorted_actual[64];
+    int32_t sorted_expected[64];
+    ASSERT(actual_count <= 64, "indexed query result exceeds test capacity");
+    memcpy(sorted_actual, actual, actual_count * sizeof(int32_t));
+    memcpy(sorted_expected, expected, expected_count * sizeof(int32_t));
+    qsort(sorted_actual, actual_count, sizeof(int32_t), compare_int32);
+    qsort(sorted_expected, expected_count, sizeof(int32_t), compare_int32);
+    ASSERT(memcmp(sorted_actual, sorted_expected,
+                  actual_count * sizeof(int32_t)) == 0,
+           "indexed query ids mismatch");
+}
+
+/* Scan `id` through the C entry point and retain the execution statistics. */
+static size_t scan_ids_with_statistics(
+    const char *uri,
+    const char *filter,
+    int use_scalar_index,
+    int32_t *out,
+    size_t capacity,
+    ScanStatisticsCapture *captured) {
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "native scalar dataset open failed");
+    const char *columns[] = {"id", "name", "score", NULL};
+    LanceScanner *scanner = lance_scanner_new(ds, columns, filter);
+    ASSERT(scanner != NULL, "native scalar scanner creation failed");
+    ASSERT(lance_scanner_set_use_scalar_index(
+               scanner, use_scalar_index != 0) == 0,
+           "native scalar use_scalar_index setter failed");
+    memset(captured, 0, sizeof(*captured));
+    ASSERT(lance_scanner_set_statistics_callback(
+               scanner, capture_scan_statistics, captured) == 0,
+           "native scalar statistics callback registration failed");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "native scalar to_arrow_stream failed");
+    size_t count = collect_ordering_ids(&stream, out, capacity);
+    lance_scanner_close(scanner);
+    lance_dataset_close(ds);
+    return count;
+}
+
+static void check_native_scalar_query(
+    const char *uri,
+    const char *filter,
+    const int32_t *expected,
+    size_t expected_count) {
+    int32_t actual[64];
+    ScanStatisticsCapture stats;
+    size_t count =
+        scan_ids_with_statistics(uri, filter, 1, actual, 64, &stats);
+    assert_ids_match(actual, count, expected, expected_count);
+    ASSERT(stats.calls == 1, "native scalar statistics callback count mismatch");
+    ASSERT(stats.indices_loaded > 0,
+           "native scalar query must load an index");
+
+    count = scan_ids_with_statistics(uri, filter, 0, actual, 64, &stats);
+    assert_ids_match(actual, count, expected, expected_count);
+    ASSERT(stats.indices_loaded == 0,
+           "disabled scalar index must not load an index");
+}
+
+static void test_native_scalar_indexes(const char *uri) {
+    printf("  test_native_scalar_indexes... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "native scalar dataset open failed");
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "name", "c_name_ngram", LANCE_SCALAR_NGRAM, NULL, 0) == 0,
+           "C NGram index creation failed");
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "score", "c_score_zonemap", LANCE_SCALAR_ZONE_MAP,
+               "{\"rows_per_zone\":3,\"use_seeds\":false}", 0) == 0,
+           "C ZoneMap index creation failed");
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "id", "c_id_bloom", LANCE_SCALAR_BLOOM_FILTER,
+               "{\"number_of_items\":8,\"probability\":0.01}", 0) == 0,
+           "C BloomFilter index creation failed");
+
+    char *json = (char *)lance_dataset_index_list_json(ds);
+    ASSERT(json != NULL, "C index list failed");
+    ASSERT(strstr(json, "\"name\":\"c_name_ngram\"") != NULL &&
+               strstr(json, "\"type\":\"NGram\"") != NULL,
+           "C NGram index listing mismatch");
+    ASSERT(strstr(json, "\"name\":\"c_score_zonemap\"") != NULL &&
+               strstr(json, "\"type\":\"ZoneMap\"") != NULL,
+           "C ZoneMap index listing mismatch");
+    ASSERT(strstr(json, "\"name\":\"c_id_bloom\"") != NULL &&
+               strstr(json, "\"type\":\"BloomFilter\"") != NULL,
+           "C BloomFilter index listing mismatch");
+    lance_free_string(json);
+
+    uint64_t index_count = lance_dataset_index_count(ds);
+    CHECK_OK();
+
+    const int32_t alice[] = {1};
+    const int32_t none[] = {0};
+    const int32_t high_scores[] = {18, 19, 20};
+    const int32_t null_scores[] = {7, 16};
+    const int32_t id_thirteen[] = {13};
+    check_native_scalar_query(uri, "contains(name, 'ali')", alice, 1);
+    check_native_scalar_query(uri, "contains(name, 'zzz')", none, 0);
+    check_native_scalar_query(uri, "score >= 180", high_scores, 3);
+    check_native_scalar_query(uri, "score IS NULL", null_scores, 2);
+    check_native_scalar_query(uri, "id = 13", id_thirteen, 1);
+    check_native_scalar_query(uri, "id = 999", none, 0);
+
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "score", "c_score_zonemap", LANCE_SCALAR_ZONE_MAP,
+               "{\"rows_per_zone\":4,\"use_seeds\":false}", 1) == 0,
+           "C ZoneMap replacement failed");
+    ASSERT(lance_dataset_index_count(ds) == index_count,
+           "C ZoneMap replacement changed the index count");
+
+    const int32_t expected_after_replace[] = {13};
+    check_native_scalar_query(uri, "id = 13", expected_after_replace, 1);
+
+    ASSERT(lance_dataset_prewarm_index(ds, "c_name_ngram") == 0,
+           "C NGram prewarm failed");
+    ASSERT(lance_dataset_prewarm_index(ds, "c_score_zonemap") == 0,
+           "C ZoneMap prewarm failed");
+    ASSERT(lance_dataset_prewarm_index(ds, "c_id_bloom") == 0,
+           "C BloomFilter prewarm failed");
+
+    lance_dataset_close(ds);
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "C native scalar dataset reopen failed");
+    json = (char *)lance_dataset_index_list_json(ds);
+    ASSERT(json != NULL, "C reopened index list failed");
+    ASSERT(strstr(json, "\"name\":\"c_name_ngram\"") != NULL &&
+               strstr(json, "\"name\":\"c_score_zonemap\"") != NULL &&
+               strstr(json, "\"name\":\"c_id_bloom\"") != NULL,
+           "C native scalar indexes did not survive reopen");
+    lance_free_string(json);
+
+    ASSERT(lance_dataset_drop_index(ds, "c_name_ngram") == 0,
+           "C NGram drop failed");
+    ASSERT(lance_dataset_drop_index(ds, "c_score_zonemap") == 0,
+           "C ZoneMap drop failed");
+    ASSERT(lance_dataset_drop_index(ds, "c_id_bloom") == 0,
+           "C BloomFilter drop failed");
+    json = (char *)lance_dataset_index_list_json(ds);
+    ASSERT(json != NULL, "C final index list failed");
+    ASSERT(strstr(json, "c_name_ngram") == NULL &&
+               strstr(json, "c_score_zonemap") == NULL &&
+               strstr(json, "c_id_bloom") == NULL,
+           "C dropped native scalar indexes remain listed");
+    lance_free_string(json);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static void check_ordering(
     LanceScanner *scanner,
     const int32_t *expected,
@@ -2624,15 +3475,19 @@ int main(int argc, char **argv) {
     test_take_blobs(blob_uri);
     test_versions(uri);
     test_native_refs_and_tags(uri);
+    test_branch_lifecycle(uri);
     test_restore_to_current(uri);
     test_error_handling();
     test_index_segment_builder(uri);
     test_index_segment_builder_progress(uri);
     test_vector_models_and_reusable_segments(uri);
     test_commit_index_segments(uri);
+    test_native_scalar_indexes(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
     test_dataset_metadata(write_uri);
+    test_dataset_field_metadata(fragment_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);

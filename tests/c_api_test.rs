@@ -6,12 +6,12 @@
 //! These tests call the `extern "C"` functions directly from Rust,
 //! validating the C API contract without needing a C compiler.
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Barrier, Mutex};
 
 use arrow::ffi::from_ffi;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -25,7 +25,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Fields, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::dataset::refs::BranchContents;
 use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
+use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance::io::RecordBatchStream;
 use lance::session::{CacheSpec as NativeCacheSpec, Session as NativeSession};
 use lance_c::*;
@@ -4793,6 +4795,920 @@ fn test_dataset_metadata_invalid_inputs_preserve_state() {
     unsafe { lance_dataset_close(ds) };
 }
 
+#[derive(Clone, Copy)]
+enum TestFieldReference<'a> {
+    Id(i32),
+    Path(&'a str),
+}
+
+struct TestFieldUpdate<'a> {
+    field: TestFieldReference<'a>,
+    entries: Vec<(&'a str, Option<&'a str>)>,
+    mode: i32,
+}
+
+fn update_field_metadata_via_c(dataset: *mut LanceDataset, updates: &[TestFieldUpdate<'_>]) -> i32 {
+    let paths: Vec<Option<CString>> = updates
+        .iter()
+        .map(|update| match update.field {
+            TestFieldReference::Id(_) => None,
+            TestFieldReference::Path(path) => Some(c_str(path)),
+        })
+        .collect();
+    let key_strings: Vec<Vec<CString>> = updates
+        .iter()
+        .map(|update| update.entries.iter().map(|(key, _)| c_str(key)).collect())
+        .collect();
+    let value_strings: Vec<Vec<Option<CString>>> = updates
+        .iter()
+        .map(|update| {
+            update
+                .entries
+                .iter()
+                .map(|(_, value)| value.map(c_str))
+                .collect()
+        })
+        .collect();
+    let key_ptrs: Vec<Vec<*const c_char>> = key_strings
+        .iter()
+        .map(|keys| keys.iter().map(|key| key.as_ptr()).collect())
+        .collect();
+    let value_ptrs: Vec<Vec<*const c_char>> = value_strings
+        .iter()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+                .collect()
+        })
+        .collect();
+    let raw: Vec<LanceFieldMetadataUpdate> = updates
+        .iter()
+        .enumerate()
+        .map(|(index, update)| {
+            let field = match update.field {
+                TestFieldReference::Id(field_id) => LanceFieldReference {
+                    kind: 0,
+                    field_id,
+                    path: ptr::null(),
+                },
+                TestFieldReference::Path(_) => LanceFieldReference {
+                    kind: 1,
+                    field_id: 0,
+                    path: paths[index].as_ref().unwrap().as_ptr(),
+                },
+            };
+            LanceFieldMetadataUpdate {
+                field,
+                keys: key_ptrs[index].as_ptr(),
+                values: value_ptrs[index].as_ptr(),
+                count: update.entries.len(),
+                mode: update.mode,
+            }
+        })
+        .collect();
+
+    unsafe {
+        lance_dataset_update_field_metadata(
+            dataset,
+            if raw.is_empty() {
+                ptr::null()
+            } else {
+                raw.as_ptr()
+            },
+            raw.len(),
+        )
+    }
+}
+
+fn arrow_field_at_path<'a>(schema: &'a Schema, path: &str) -> &'a Field {
+    fn descend<'a>(field: &'a Field, segments: &[&str]) -> &'a Field {
+        let Some((name, remaining)) = segments.split_first() else {
+            return field;
+        };
+        let DataType::Struct(children) = field.data_type() else {
+            panic!("field '{}' is not a struct", field.name());
+        };
+        let child = children
+            .iter()
+            .find(|child| child.name() == *name)
+            .map(|child| child.as_ref())
+            .unwrap_or_else(|| panic!("missing nested field {name}"));
+        descend(child, remaining)
+    }
+
+    let segments = path.split('.').collect::<Vec<_>>();
+    let (first, remaining) = segments
+        .split_first()
+        .expect("field path must not be empty");
+    let field = schema
+        .field_with_name(first)
+        .unwrap_or_else(|_| panic!("missing field {first}"));
+    descend(field, remaining)
+}
+
+fn field_metadata_via_c(dataset: *const LanceDataset, path: &str) -> BTreeMap<String, String> {
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_dataset_schema(dataset, &mut ffi_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let schema = Schema::try_from(&ffi_schema).unwrap();
+    arrow_field_at_path(&schema, path)
+        .metadata()
+        .clone()
+        .into_iter()
+        .collect()
+}
+
+fn native_field_metadata(dataset: &Dataset, path: &str) -> BTreeMap<String, String> {
+    dataset
+        .schema()
+        .field(path)
+        .unwrap_or_else(|| panic!("missing native field {path}"))
+        .metadata
+        .clone()
+        .into_iter()
+        .collect()
+}
+
+fn field_ids_via_c(dataset: *const LanceDataset) -> Vec<i32> {
+    let mut count = 0;
+    assert_eq!(
+        unsafe { lance_dataset_field_id_count(dataset, &mut count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    (0..count)
+        .map(|index| {
+            let mut field_id = 0;
+            assert_eq!(
+                unsafe { lance_dataset_field_id_at(dataset, index, &mut field_id) },
+                0,
+                "{}",
+                take_last_error_message()
+            );
+            field_id
+        })
+        .collect()
+}
+
+fn resolve_field_id_via_c(
+    dataset: *const LanceDataset,
+    kind: i32,
+    field_id: i32,
+    path: &CString,
+) -> i32 {
+    let field = LanceFieldReference {
+        kind,
+        field_id,
+        path: if path.as_bytes().is_empty() {
+            ptr::null()
+        } else {
+            path.as_ptr()
+        },
+    };
+    let mut resolved = 0;
+    assert_eq!(
+        unsafe { lance_dataset_resolve_field_id(dataset, &field, &mut resolved) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    resolved
+}
+
+fn field_path_via_c(dataset: *const LanceDataset, field_id: i32) -> String {
+    let raw_path = unsafe { lance_dataset_field_path(dataset, field_id) };
+    assert!(!raw_path.is_null(), "{}", take_last_error_message());
+    let path = unsafe { CStr::from_ptr(raw_path) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    unsafe { lance_free_string(raw_path) };
+    path
+}
+
+fn data_storage_version_via_c(dataset: *const LanceDataset) -> String {
+    let raw_version = unsafe { lance_dataset_data_storage_version(dataset) };
+    assert!(!raw_version.is_null(), "{}", take_last_error_message());
+    let version = unsafe { CStr::from_ptr(raw_version) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    unsafe { lance_free_string(raw_version) };
+    version
+}
+
+fn stable_row_ids_via_c(dataset: *const LanceDataset) -> bool {
+    let mut stable = false;
+    assert_eq!(
+        unsafe { lance_dataset_has_stable_row_ids(dataset, &mut stable) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    stable
+}
+
+fn assert_field_error(rc: i32, expected_message: &str) {
+    assert_eq!(rc, -1);
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+    let message = take_last_error_message();
+    assert!(
+        message.contains(expected_message),
+        "expected error containing {expected_message:?}, got {message:?}"
+    );
+}
+
+fn assert_field_invalid_argument(rc: i32, expected_message: &str) {
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains(expected_message),
+        "expected error containing {expected_message:?}, got {message:?}"
+    );
+}
+
+#[test]
+fn test_dataset_field_metadata_batch_matches_native_builder() {
+    let (_c_tmp, c_uri) = create_fragment_snapshot_dataset(false);
+    let (_native_tmp, native_uri) = create_fragment_snapshot_dataset(false);
+    let c_uri_c = c_str(&c_uri);
+    let ds = unsafe { lance_dataset_open(c_uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let mut native = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+
+    let c_field_ids = field_ids_via_c(ds);
+    assert_eq!(c_field_ids, native.schema().field_ids());
+    let id_field_id = resolve_field_id_via_c(ds, 1, 0, &c_str("id"));
+    let name_field_id = resolve_field_id_via_c(ds, 1, 0, &c_str("profile.name"));
+    let score_field_id = resolve_field_id_via_c(ds, 1, 0, &c_str("profile.score"));
+    assert_eq!(id_field_id, native.schema().field("id").unwrap().id);
+    assert_eq!(
+        name_field_id,
+        native.schema().field("profile.name").unwrap().id
+    );
+    assert_eq!(
+        score_field_id,
+        native.schema().field("profile.score").unwrap().id
+    );
+
+    let seed = [
+        TestFieldUpdate {
+            field: TestFieldReference::Path("profile.name"),
+            entries: vec![("stale", Some("old")), ("empty", Some("old"))],
+            mode: LanceMetadataUpdateMode::Merge as i32,
+        },
+        TestFieldUpdate {
+            field: TestFieldReference::Id(score_field_id),
+            entries: vec![("score", Some("old")), ("remove", Some("old"))],
+            mode: LanceMetadataUpdateMode::Merge as i32,
+        },
+    ];
+    assert_eq!(
+        update_field_metadata_via_c(ds, &seed),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    lance_c::runtime::block_on(async {
+        native
+            .update_field_metadata()
+            .update("profile.name", [("stale", "old"), ("empty", "old")])
+            .unwrap()
+            .update(score_field_id, [("score", "old"), ("remove", "old")])
+            .unwrap()
+            .await
+            .unwrap();
+    });
+
+    assert_eq!(
+        update_metadata_via_c(
+            ds,
+            &[("empty", Some("")), ("table", Some("keep"))],
+            LanceMetadataUpdateMode::Merge,
+            false,
+        ),
+        serde_json::json!({"empty": "", "table": "keep"})
+    );
+    assert_eq!(
+        update_metadata_via_c(
+            ds,
+            &[("schema", Some("keep"))],
+            LanceMetadataUpdateMode::Merge,
+            true,
+        ),
+        serde_json::json!({"schema": "keep"})
+    );
+
+    let batch = [
+        TestFieldUpdate {
+            field: TestFieldReference::Id(id_field_id),
+            entries: vec![
+                ("root", Some("first")),
+                ("empty", Some("")),
+                ("remove", Some("temporary")),
+            ],
+            mode: LanceMetadataUpdateMode::Merge as i32,
+        },
+        TestFieldUpdate {
+            field: TestFieldReference::Path("profile.name"),
+            entries: vec![("nested", Some("value")), ("empty", Some(""))],
+            mode: LanceMetadataUpdateMode::Replace as i32,
+        },
+        TestFieldUpdate {
+            field: TestFieldReference::Id(score_field_id),
+            entries: vec![("score", Some("1.5")), ("remove", None)],
+            mode: LanceMetadataUpdateMode::Merge as i32,
+        },
+        TestFieldUpdate {
+            field: TestFieldReference::Path("id"),
+            entries: vec![("root", Some("last"))],
+            mode: LanceMetadataUpdateMode::Replace as i32,
+        },
+    ];
+    let version_before = unsafe { lance_dataset_version(ds) };
+    assert_eq!(
+        update_field_metadata_via_c(ds, &batch),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(ds) },
+        version_before + 1,
+        "all field updates must share one native commit"
+    );
+
+    lance_c::runtime::block_on(async {
+        native
+            .update_field_metadata()
+            .update(
+                id_field_id,
+                [("root", "first"), ("empty", ""), ("remove", "temporary")],
+            )
+            .unwrap()
+            .replace("profile.name", [("nested", "value"), ("empty", "")])
+            .unwrap()
+            .update(score_field_id, [("score", Some("1.5")), ("remove", None)])
+            .unwrap()
+            .replace("id", [("root", "last")])
+            .unwrap()
+            .await
+            .unwrap();
+    });
+
+    assert_eq!(
+        field_metadata_via_c(ds, "id"),
+        BTreeMap::from([("root".to_string(), "last".to_string())]),
+        "a later update of the same resolved field replaces the earlier builder entry"
+    );
+    assert_eq!(
+        field_metadata_via_c(ds, "profile.name"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("nested".to_string(), "value".to_string()),
+        ])
+    );
+    assert_eq!(
+        field_metadata_via_c(ds, "profile.score"),
+        BTreeMap::from([("score".to_string(), "1.5".to_string())])
+    );
+    for path in ["id", "profile.name", "profile.score"] {
+        assert_eq!(
+            field_metadata_via_c(ds, path),
+            native_field_metadata(&native, path),
+            "C field metadata for {path} must match the native builder result"
+        );
+    }
+
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(ds) }),
+        serde_json::json!({"empty": "", "table": "keep"}),
+        "field metadata must not change table metadata"
+    );
+    assert_eq!(
+        schema_metadata_via_c(ds),
+        BTreeMap::from([("schema".to_string(), "keep".to_string())]),
+        "field metadata must not change schema metadata"
+    );
+    assert_eq!(
+        native_metadata_map(&c_uri, false),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("table".to_string(), "keep".to_string()),
+        ])
+    );
+    assert_eq!(
+        native_metadata_map(&c_uri, true),
+        BTreeMap::from([("schema".to_string(), "keep".to_string())])
+    );
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 8);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_field_metadata_semantics_errors_and_snapshots() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(false);
+    let c_uri = c_str(&uri);
+    let writer = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let old = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!writer.is_null() && !old.is_null());
+
+    let initial_version = unsafe { lance_dataset_version(writer) };
+    assert_eq!(initial_version, 2);
+    let id_field_id = resolve_field_id_via_c(writer, 1, 0, &c_str("id"));
+    let name_field_id = resolve_field_id_via_c(writer, 1, 0, &c_str("profile.name"));
+    let score_field_id = resolve_field_id_via_c(writer, 1, 0, &c_str("profile.score"));
+
+    let key = c_str("key");
+    let value = c_str("value");
+    let keys = [key.as_ptr()];
+    let values = [value.as_ptr()];
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_update_field_metadata(ptr::null_mut(), ptr::null(), 0) },
+        "dataset must not be NULL",
+    );
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_update_field_metadata(writer, ptr::null(), 1) },
+        "updates must not be NULL",
+    );
+    let null_keys = [LanceFieldMetadataUpdate {
+        field: LanceFieldReference {
+            kind: 0,
+            field_id: id_field_id,
+            path: ptr::null(),
+        },
+        keys: ptr::null(),
+        values: values.as_ptr(),
+        count: 1,
+        mode: LanceMetadataUpdateMode::Merge as i32,
+    }];
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_update_field_metadata(writer, null_keys.as_ptr(), null_keys.len()) },
+        "keys must not be NULL",
+    );
+    let null_values = [LanceFieldMetadataUpdate {
+        field: LanceFieldReference {
+            kind: 0,
+            field_id: id_field_id,
+            path: ptr::null(),
+        },
+        keys: keys.as_ptr(),
+        values: ptr::null(),
+        count: 1,
+        mode: LanceMetadataUpdateMode::Merge as i32,
+    }];
+    assert_field_invalid_argument(
+        unsafe {
+            lance_dataset_update_field_metadata(writer, null_values.as_ptr(), null_values.len())
+        },
+        "values must not be NULL",
+    );
+    let null_path = [LanceFieldMetadataUpdate {
+        field: LanceFieldReference {
+            kind: 1,
+            field_id: 0,
+            path: ptr::null(),
+        },
+        keys: keys.as_ptr(),
+        values: values.as_ptr(),
+        count: 1,
+        mode: LanceMetadataUpdateMode::Merge as i32,
+    }];
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_update_field_metadata(writer, null_path.as_ptr(), 1) },
+        "path must not be NULL",
+    );
+    let invalid_kind = [LanceFieldMetadataUpdate {
+        field: LanceFieldReference {
+            kind: 99,
+            field_id: id_field_id,
+            path: ptr::null(),
+        },
+        keys: keys.as_ptr(),
+        values: values.as_ptr(),
+        count: 1,
+        mode: LanceMetadataUpdateMode::Merge as i32,
+    }];
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_update_field_metadata(writer, invalid_kind.as_ptr(), 1) },
+        "field.kind",
+    );
+    assert_field_invalid_argument(
+        update_field_metadata_via_c(
+            writer,
+            &[TestFieldUpdate {
+                field: TestFieldReference::Path("id"),
+                entries: vec![("key", Some("value"))],
+                mode: 99,
+            }],
+        ),
+        "metadata update mode",
+    );
+    assert_field_invalid_argument(
+        update_field_metadata_via_c(
+            writer,
+            &[TestFieldUpdate {
+                field: TestFieldReference::Id(99_999),
+                entries: vec![("key", Some("value"))],
+                mode: LanceMetadataUpdateMode::Merge as i32,
+            }],
+        ),
+        "99999",
+    );
+    assert_field_error(
+        update_field_metadata_via_c(
+            writer,
+            &[TestFieldUpdate {
+                field: TestFieldReference::Path("profile.missing"),
+                entries: vec![("key", Some("value"))],
+                mode: LanceMetadataUpdateMode::Merge as i32,
+            }],
+        ),
+        "profile.missing",
+    );
+    assert_eq!(unsafe { lance_dataset_version(writer) }, initial_version);
+    assert!(field_metadata_via_c(writer, "id").is_empty());
+    assert!(field_metadata_via_c(writer, "profile.name").is_empty());
+    assert!(field_metadata_via_c(writer, "profile.score").is_empty());
+
+    assert_eq!(
+        update_field_metadata_via_c(
+            writer,
+            &[
+                TestFieldUpdate {
+                    field: TestFieldReference::Path("id"),
+                    entries: vec![
+                        ("empty", Some("")),
+                        ("remove", Some("gone")),
+                        ("persist", Some("yes")),
+                    ],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Id(name_field_id),
+                    entries: vec![("nested", Some("one"))],
+                    mode: LanceMetadataUpdateMode::Replace as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Id(score_field_id),
+                    entries: vec![("score", Some("one"))],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+            ],
+        ),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 1
+    );
+    assert_eq!(
+        field_metadata_via_c(writer, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "yes".to_string()),
+            ("remove".to_string(), "gone".to_string()),
+        ])
+    );
+    assert!(field_metadata_via_c(old, "id").is_empty());
+    assert!(field_metadata_via_c(old, "profile.name").is_empty());
+
+    assert_eq!(
+        update_field_metadata_via_c(
+            writer,
+            &[
+                TestFieldUpdate {
+                    field: TestFieldReference::Id(id_field_id),
+                    entries: vec![("remove", None)],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Path("profile.name"),
+                    entries: vec![("extra", Some("two"))],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+            ],
+        ),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 2
+    );
+    assert_eq!(
+        field_metadata_via_c(writer, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "yes".to_string()),
+        ])
+    );
+    assert_eq!(
+        field_metadata_via_c(writer, "profile.name"),
+        BTreeMap::from([
+            ("extra".to_string(), "two".to_string()),
+            ("nested".to_string(), "one".to_string()),
+        ])
+    );
+
+    assert_eq!(
+        update_field_metadata_via_c(
+            writer,
+            &[
+                TestFieldUpdate {
+                    field: TestFieldReference::Id(name_field_id),
+                    entries: Vec::new(),
+                    mode: LanceMetadataUpdateMode::Replace as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Path("profile.score"),
+                    entries: Vec::new(),
+                    mode: LanceMetadataUpdateMode::Replace as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Id(id_field_id),
+                    entries: Vec::new(),
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+            ],
+        ),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 3
+    );
+    assert!(field_metadata_via_c(writer, "profile.name").is_empty());
+    assert!(field_metadata_via_c(writer, "profile.score").is_empty());
+    assert_eq!(
+        field_metadata_via_c(writer, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "yes".to_string()),
+        ]),
+        "zero entries in merge mode must not change field metadata"
+    );
+
+    assert_eq!(
+        update_field_metadata_via_c(writer, &[]),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        field_metadata_via_c(writer, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "yes".to_string()),
+        ])
+    );
+
+    let version_before_final = unsafe { lance_dataset_version(writer) };
+    assert_eq!(
+        update_field_metadata_via_c(
+            writer,
+            &[
+                TestFieldUpdate {
+                    field: TestFieldReference::Path("id"),
+                    entries: vec![("persist", Some("latest"))],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Path("profile.name"),
+                    entries: vec![("nested", Some("persist"))],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+            ],
+        ),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        version_before_final + 1
+    );
+
+    let historical =
+        unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), initial_version + 1) };
+    assert!(!historical.is_null());
+    assert_eq!(
+        field_metadata_via_c(historical, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "yes".to_string()),
+            ("remove".to_string(), "gone".to_string()),
+        ])
+    );
+    assert_eq!(
+        field_metadata_via_c(historical, "profile.name"),
+        BTreeMap::from([("nested".to_string(), "one".to_string())])
+    );
+    assert_eq!(
+        field_metadata_via_c(historical, "profile.score"),
+        BTreeMap::from([("score".to_string(), "one".to_string())])
+    );
+
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null());
+    assert_eq!(
+        field_metadata_via_c(reopened, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "latest".to_string()),
+        ])
+    );
+    assert_eq!(
+        field_metadata_via_c(reopened, "profile.name"),
+        BTreeMap::from([("nested".to_string(), "persist".to_string())])
+    );
+    assert!(field_metadata_via_c(reopened, "profile.score").is_empty());
+
+    unsafe {
+        lance_dataset_close(reopened);
+        lance_dataset_close(historical);
+        lance_dataset_close(old);
+        lance_dataset_close(writer);
+    }
+}
+
+#[test]
+fn test_dataset_snapshot_inspection_matches_native() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+
+    assert_eq!(
+        data_storage_version_via_c(ds),
+        native
+            .manifest()
+            .data_storage_format
+            .version
+            .to_manifest_string()
+    );
+    assert_eq!(
+        stable_row_ids_via_c(ds),
+        native.manifest().uses_stable_row_ids()
+    );
+    assert_eq!(field_ids_via_c(ds), native.schema().field_ids());
+
+    let nested_path = c_str("profile.name");
+    let nested_id = resolve_field_id_via_c(ds, 1, 0, &nested_path);
+    assert_eq!(nested_id, native.schema().field("profile.name").unwrap().id);
+    assert_eq!(
+        resolve_field_id_via_c(ds, 0, nested_id, &c_str("")),
+        nested_id
+    );
+    assert_eq!(field_path_via_c(ds, nested_id), "profile.name");
+    for field_id in field_ids_via_c(ds) {
+        assert_eq!(
+            field_path_via_c(ds, field_id),
+            native.schema().field_path_minimal(field_id).unwrap()
+        );
+    }
+
+    let stable = true;
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_has_stable_row_ids(ds, ptr::null_mut()) },
+        "out_has_stable_row_ids must not be NULL",
+    );
+    assert!(stable);
+    let count = usize::MAX;
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_field_id_count(ds, ptr::null_mut()) },
+        "out_count must not be NULL",
+    );
+    assert_eq!(count, usize::MAX);
+    let mut field_id = -123;
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_field_id_at(ds, 99_999, &mut field_id) },
+        "out of range",
+    );
+    assert_eq!(field_id, -123);
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_field_id_at(ds, 0, ptr::null_mut()) },
+        "out_field_id must not be NULL",
+    );
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_resolve_field_id(ds, ptr::null(), &mut field_id) },
+        "field must not be NULL",
+    );
+    assert_field_invalid_argument(
+        unsafe {
+            lance_dataset_resolve_field_id(
+                ds,
+                &LanceFieldReference {
+                    kind: 0,
+                    field_id: nested_id,
+                    path: ptr::null(),
+                },
+                ptr::null_mut(),
+            )
+        },
+        "out_field_id must not be NULL",
+    );
+    assert_field_error(
+        unsafe {
+            lance_dataset_resolve_field_id(
+                ds,
+                &LanceFieldReference {
+                    kind: 1,
+                    field_id: 0,
+                    path: c_str("profile.missing").as_ptr(),
+                },
+                &mut field_id,
+            )
+        },
+        "profile.missing",
+    );
+    assert_eq!(field_id, -123);
+    let unknown_path = unsafe { lance_dataset_field_path(ds, 99_999) };
+    assert!(unknown_path.is_null());
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+    let _ = take_last_error_message();
+
+    let historical = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 2) };
+    assert!(!historical.is_null());
+    assert_eq!(
+        data_storage_version_via_c(historical),
+        data_storage_version_via_c(ds)
+    );
+    assert_eq!(stable_row_ids_via_c(historical), stable_row_ids_via_c(ds));
+    assert_eq!(field_ids_via_c(historical), field_ids_via_c(ds));
+    unsafe {
+        lance_dataset_close(historical);
+        lance_dataset_close(ds);
+    }
+
+    let (_stable_tmp, stable_uri) = create_multi_fragment_vector_dataset(2, 8, 8, true);
+    let stable_c_uri = c_str(&stable_uri);
+    let stable_ds = unsafe { lance_dataset_open(stable_c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!stable_ds.is_null());
+    let native_stable = lance_c::runtime::block_on(Dataset::open(&stable_uri)).unwrap();
+    assert!(stable_row_ids_via_c(stable_ds));
+    assert_eq!(
+        data_storage_version_via_c(stable_ds),
+        native_stable
+            .manifest()
+            .data_storage_format
+            .version
+            .to_manifest_string()
+    );
+    assert_eq!(
+        field_ids_via_c(stable_ds),
+        native_stable.schema().field_ids()
+    );
+    unsafe { lance_dataset_close(stable_ds) };
+
+    let legacy_tmp = tempfile::tempdir().unwrap();
+    let legacy_uri = legacy_tmp
+        .path()
+        .join("legacy_inspection")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let legacy_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let legacy_batch = RecordBatch::try_new(
+        legacy_schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(legacy_batch)], legacy_schema),
+            &legacy_uri,
+            Some(lance::dataset::WriteParams {
+                data_storage_version: Some(lance_file::version::LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+    let legacy_c_uri = c_str(&legacy_uri);
+    let legacy_ds = unsafe { lance_dataset_open(legacy_c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!legacy_ds.is_null());
+    assert_eq!(data_storage_version_via_c(legacy_ds), "0.1");
+    assert!(!stable_row_ids_via_c(legacy_ds));
+    unsafe { lance_dataset_close(legacy_ds) };
+}
+
 #[test]
 fn test_scanner_with_fragment_ids() {
     let (_tmp, uri) = create_multi_fragment_dataset();
@@ -5727,6 +6643,74 @@ fn find_tag(tags: *const LanceTags, name: &str) -> *const LanceTag {
     ptr::null()
 }
 
+fn owned_c_string(value: *const c_char) -> String {
+    assert!(!value.is_null());
+    let owned = unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(value) };
+    owned
+}
+
+fn owned_json(value: *const c_char) -> serde_json::Value {
+    serde_json::from_str(&owned_c_string(value)).unwrap()
+}
+
+fn native_branch(uri: &str, name: &str) -> BranchContents {
+    lance_c::runtime::block_on(async {
+        Dataset::open(uri)
+            .await
+            .unwrap()
+            .branches()
+            .get(name)
+            .await
+            .unwrap()
+    })
+}
+
+fn assert_branch_json(json: &serde_json::Value, native: &BranchContents) {
+    assert_eq!(
+        json["parentBranch"].as_str(),
+        native.parent_branch.as_deref()
+    );
+    assert_eq!(
+        json["parentVersion"].as_u64().unwrap(),
+        native.parent_version
+    );
+    assert_eq!(json["createAt"].as_u64().unwrap(), native.create_at);
+    assert_eq!(
+        json["manifestSize"].as_u64().unwrap(),
+        native.manifest_size as u64
+    );
+
+    let mapping = json["identifier"]["version_mapping"]
+        .as_array()
+        .expect("BranchIdentifier.version_mapping must be a JSON array");
+    assert_eq!(
+        mapping.len(),
+        native.identifier.version_mapping.len(),
+        "native identifier mapping length"
+    );
+    for (actual, expected) in mapping.iter().zip(&native.identifier.version_mapping) {
+        let pair = actual.as_array().expect("version mapping entry");
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair[0].as_u64(), Some(expected.0));
+        assert_eq!(pair[1].as_str(), Some(expected.1.as_str()));
+    }
+
+    let metadata = json["metadata"]
+        .as_object()
+        .expect("BranchContents.metadata must be a JSON object");
+    assert_eq!(metadata.len(), native.metadata.len());
+    for (key, value) in &native.metadata {
+        assert_eq!(
+            metadata.get(key).and_then(|value| value.as_str()),
+            Some(value.as_str())
+        );
+    }
+}
+
 #[test]
 fn test_current_version_details_metadata_and_version_refs() {
     let (_tmp, uri) = create_two_version_dataset();
@@ -6270,6 +7254,643 @@ fn test_tag_optional_fields_match_native_defaults() {
     unsafe {
         lance_tag_close(branch_tag);
         lance_tag_close(tag);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_branch_create_ref_variants_checkout_and_json() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_version(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 7);
+
+    let main_identifier = owned_json(unsafe { lance_dataset_branch_identifier_json(ds) });
+    assert_eq!(main_identifier, serde_json::json!({"version_mapping": []}));
+    let initially_empty = owned_json(unsafe { lance_dataset_branches_json(ds) });
+    assert_eq!(initially_empty, serde_json::json!({}));
+
+    let tag_name = c_str("branch-source");
+    let tag_source = unsafe { lance_ref_version_number(1) };
+    assert_eq!(
+        unsafe { lance_dataset_tag_create(ds, tag_name.as_ptr(), tag_source) },
+        0
+    );
+    unsafe {
+        lance_ref_close(tag_source);
+    }
+
+    let parent_name = c_str("feature/parent");
+    let parent_ref = unsafe { lance_ref_version_number(1) };
+    let parent =
+        unsafe { lance_dataset_branch_create(ds, parent_name.as_ptr(), parent_ref, ptr::null()) };
+    assert!(!parent.is_null());
+    assert_eq!(unsafe { lance_dataset_version(parent) }, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(parent) }, 5);
+    unsafe {
+        lance_ref_close(parent_ref);
+    }
+
+    let child_name = c_str("feature/parent/child");
+    let child_ref = unsafe { lance_ref_version_number(1) };
+    let child =
+        unsafe { lance_dataset_branch_create(parent, child_name.as_ptr(), child_ref, ptr::null()) };
+    assert!(!child.is_null());
+    assert_eq!(unsafe { lance_dataset_version(child) }, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(child) }, 5);
+    unsafe {
+        lance_ref_close(child_ref);
+    }
+
+    let from_tag_name = c_str("from-tag");
+    let tag_ref = unsafe { lance_ref_tag(tag_name.as_ptr()) };
+    let from_tag =
+        unsafe { lance_dataset_branch_create(ds, from_tag_name.as_ptr(), tag_ref, ptr::null()) };
+    assert!(!from_tag.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(from_tag) }, 5);
+
+    let from_branch_name = c_str("from-branch");
+    let branch_ref = unsafe { lance_ref_version(parent_name.as_ptr(), true, 1) };
+    let from_branch = unsafe {
+        lance_dataset_branch_create(ds, from_branch_name.as_ptr(), branch_ref, ptr::null())
+    };
+    assert!(!from_branch.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(from_branch) }, 5);
+
+    let latest_name = c_str("latest-copy");
+    let latest_ref = unsafe { lance_ref_version(ptr::null(), false, 0) };
+    let latest =
+        unsafe { lance_dataset_branch_create(ds, latest_name.as_ptr(), latest_ref, ptr::null()) };
+    assert!(!latest.is_null());
+    assert_eq!(unsafe { lance_dataset_version(latest) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(latest) }, 7);
+    assert_eq!(unsafe { lance_dataset_version(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 7);
+
+    let native_parent = native_branch(&uri, "feature/parent");
+    let parent_json =
+        owned_json(unsafe { lance_dataset_branch_get_json(ds, parent_name.as_ptr()) });
+    assert_branch_json(&parent_json, &native_parent);
+    assert_eq!(parent_json["parentBranch"], serde_json::Value::Null);
+    assert_eq!(parent_json["parentVersion"], 1);
+
+    let tag_json = owned_json(unsafe { lance_dataset_branch_get_json(ds, from_tag_name.as_ptr()) });
+    assert_branch_json(&tag_json, &native_branch(&uri, "from-tag"));
+    assert_eq!(tag_json["parentBranch"], serde_json::Value::Null);
+    assert_eq!(tag_json["parentVersion"], 1);
+
+    let branch_json =
+        owned_json(unsafe { lance_dataset_branch_get_json(ds, from_branch_name.as_ptr()) });
+    assert_branch_json(&branch_json, &native_branch(&uri, "from-branch"));
+    assert_eq!(branch_json["parentBranch"], "feature/parent");
+    assert_eq!(branch_json["parentVersion"], 1);
+
+    let child_identifier = owned_json(unsafe { lance_dataset_branch_identifier_json(child) });
+    let native_child_identifier = lance_c::runtime::block_on(async {
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("feature/parent/child")
+            .await
+            .unwrap()
+            .branch_identifier()
+            .await
+            .unwrap()
+    });
+    assert_eq!(
+        child_identifier["version_mapping"]
+            .as_array()
+            .unwrap()
+            .len(),
+        native_child_identifier.version_mapping.len()
+    );
+
+    let native_branches = lance_c::runtime::block_on(async {
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+    });
+    let branches_json = owned_json(unsafe { lance_dataset_branches_json(ds) });
+    let branches = branches_json.as_object().unwrap();
+    assert_eq!(branches.len(), native_branches.len());
+    for (name, contents) in &native_branches {
+        assert_branch_json(&branches[name], contents);
+    }
+
+    let main_checkout = unsafe { lance_dataset_checkout_branch(ds, c_str("main").as_ptr()) };
+    let parent_checkout = unsafe { lance_dataset_checkout_branch(ds, parent_name.as_ptr()) };
+    assert!(!main_checkout.is_null());
+    assert!(!parent_checkout.is_null());
+    assert_eq!(unsafe { lance_dataset_version(main_checkout) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(main_checkout) }, 7);
+    assert_eq!(unsafe { lance_dataset_version(parent_checkout) }, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(parent_checkout) }, 5);
+
+    let reserved_ref = unsafe { lance_ref_version(c_str("main").as_ptr(), true, 1) };
+    let reserved = unsafe {
+        lance_dataset_branch_create(ds, c_str("main").as_ptr(), reserved_ref, ptr::null())
+    };
+    assert!(reserved.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe {
+        lance_ref_close(reserved_ref);
+    }
+
+    // Owned JSON survives closing the source; checkout and branch handles keep
+    // their own native snapshots.
+    let branches_after_close_ptr = unsafe { lance_dataset_branches_json(ds) };
+    let parent_after_close_ptr = unsafe { lance_dataset_branch_get_json(ds, parent_name.as_ptr()) };
+    let identifier_after_close_ptr = unsafe { lance_dataset_branch_identifier_json(parent) };
+    unsafe {
+        lance_dataset_close(ds);
+    }
+    let branches_after_close = owned_json(branches_after_close_ptr);
+    assert_eq!(branches_after_close.as_object().unwrap().len(), 5);
+    assert_branch_json(
+        &owned_json(parent_after_close_ptr),
+        &native_branch(&uri, "feature/parent"),
+    );
+    let branch_identifier = owned_json(identifier_after_close_ptr);
+    assert_eq!(
+        branch_identifier["version_mapping"]
+            .as_array()
+            .unwrap()
+            .len(),
+        native_parent.identifier.version_mapping.len()
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(main_checkout) }, 7);
+    assert_eq!(unsafe { lance_dataset_count_rows(parent) }, 5);
+
+    unsafe {
+        lance_dataset_close(from_tag);
+        lance_dataset_close(from_branch);
+        lance_dataset_close(latest);
+        lance_dataset_close(child);
+        lance_dataset_close(parent);
+        lance_dataset_close(parent_checkout);
+        lance_dataset_close(main_checkout);
+        lance_ref_close(branch_ref);
+        lance_ref_close(latest_ref);
+        lance_ref_close(tag_ref);
+    }
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    for name in [
+        "feature/parent/child",
+        "from-branch",
+        "feature/parent",
+        "from-tag",
+        "latest-copy",
+    ] {
+        let name = c_str(name);
+        assert_eq!(
+            unsafe { lance_dataset_branch_delete(ds, name.as_ptr()) },
+            0,
+            "delete branch {name:?}"
+        );
+    }
+    assert_eq!(
+        unsafe { lance_dataset_tag_delete(ds, tag_name.as_ptr()) },
+        0
+    );
+    let remaining = owned_json(unsafe { lance_dataset_branches_json(ds) });
+    assert_eq!(remaining, serde_json::json!({}));
+    unsafe {
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_branch_metadata_full_replace_persistence_and_options() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let latest_ref = unsafe { lance_ref_version(ptr::null(), false, 0) };
+    let meta_name = c_str("meta");
+    let meta =
+        unsafe { lance_dataset_branch_create(ds, meta_name.as_ptr(), latest_ref, ptr::null()) };
+    assert!(!meta.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(meta) }, 7);
+
+    let empty_storage = [ptr::null::<c_char>()];
+    let options_ref = unsafe { lance_ref_version_number(2) };
+    let options_name = c_str("explicit-empty-options");
+    let options = unsafe {
+        lance_dataset_branch_create(
+            ds,
+            options_name.as_ptr(),
+            options_ref,
+            empty_storage.as_ptr(),
+        )
+    };
+    assert!(!options.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(options) }, 7);
+
+    let owner_key = c_str("owner");
+    let owner_value = c_str("lance-c");
+    let empty_key = c_str("empty");
+    let empty_value = c_str("");
+    let metadata = [
+        owner_key.as_ptr(),
+        owner_value.as_ptr(),
+        empty_key.as_ptr(),
+        empty_value.as_ptr(),
+        ptr::null(),
+    ];
+    assert_eq!(
+        unsafe { lance_dataset_branch_replace_metadata(ds, meta_name.as_ptr(), metadata.as_ptr()) },
+        0
+    );
+
+    let meta_json = owned_json(unsafe { lance_dataset_branch_get_json(ds, meta_name.as_ptr()) });
+    let native_meta = native_branch(&uri, "meta");
+    assert_branch_json(&meta_json, &native_meta);
+    assert_eq!(meta_json["metadata"]["owner"], "lance-c");
+    assert_eq!(meta_json["metadata"]["empty"], "");
+
+    unsafe {
+        lance_dataset_close(ds);
+        lance_dataset_close(meta);
+        lance_dataset_close(options);
+        lance_ref_close(latest_ref);
+        lance_ref_close(options_ref);
+    }
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let persisted = owned_json(unsafe { lance_dataset_branch_get_json(ds, meta_name.as_ptr()) });
+    assert_eq!(persisted["metadata"]["owner"], "lance-c");
+    assert_eq!(persisted["metadata"]["empty"], "");
+
+    // Explicitly empty metadata is a full replacement, not a special delete.
+    let empty_metadata = [ptr::null::<c_char>()];
+    assert_eq!(
+        unsafe {
+            lance_dataset_branch_replace_metadata(ds, meta_name.as_ptr(), empty_metadata.as_ptr())
+        },
+        0
+    );
+    let odd_key = c_str("key");
+    let odd_metadata = [odd_key.as_ptr(), ptr::null()];
+    assert_eq!(
+        unsafe {
+            lance_dataset_branch_replace_metadata(ds, meta_name.as_ptr(), odd_metadata.as_ptr())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe {
+            lance_dataset_branch_replace_metadata(ds, c_str("missing").as_ptr(), ptr::null())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+
+    let duplicate_ref = unsafe { lance_ref_version_number(2) };
+    let duplicate =
+        unsafe { lance_dataset_branch_create(ds, meta_name.as_ptr(), duplicate_ref, ptr::null()) };
+    assert!(duplicate.is_null());
+    // The selected core rejects a reused branch name in its shallow-clone
+    // phase before BranchContents conflict detection.
+    assert_ne!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe {
+        lance_ref_close(duplicate_ref);
+    }
+    let after_duplicate =
+        owned_json(unsafe { lance_dataset_branch_get_json(ds, meta_name.as_ptr()) });
+    assert_eq!(after_duplicate["parentVersion"], 2);
+    assert_eq!(after_duplicate["metadata"], serde_json::json!({}));
+
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, options_name.as_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, meta_name.as_ptr()) },
+        0
+    );
+    unsafe {
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_branch_deletion_protections_and_zombie_recovery() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let parent_name = c_str("protected");
+    let parent_ref = unsafe { lance_ref_version_number(1) };
+    let parent =
+        unsafe { lance_dataset_branch_create(ds, parent_name.as_ptr(), parent_ref, ptr::null()) };
+    assert!(!parent.is_null());
+    let child_name = c_str("protected/child");
+    let child_ref = unsafe { lance_ref_version_number(1) };
+    let child =
+        unsafe { lance_dataset_branch_create(parent, child_name.as_ptr(), child_ref, ptr::null()) };
+    assert!(!child.is_null());
+
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, parent_name.as_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::CommitConflict);
+    unsafe {
+        lance_dataset_close(child);
+        lance_ref_close(child_ref);
+    }
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, child_name.as_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, parent_name.as_ptr()) },
+        0
+    );
+
+    let tagged_name = c_str("tagged");
+    let tagged_ref = unsafe { lance_ref_version_number(1) };
+    let tagged =
+        unsafe { lance_dataset_branch_create(ds, tagged_name.as_ptr(), tagged_ref, ptr::null()) };
+    assert!(!tagged.is_null());
+    let tag_name = c_str("branch-tag");
+    let tag_target = unsafe { lance_ref_version(tagged_name.as_ptr(), true, 1) };
+    assert_eq!(
+        unsafe { lance_dataset_tag_create(ds, tag_name.as_ptr(), tag_target) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, tagged_name.as_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::CommitConflict);
+    assert_eq!(
+        unsafe { lance_dataset_tag_delete(ds, tag_name.as_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, tagged_name.as_ptr()) },
+        0
+    );
+
+    let zombie_ref = unsafe { lance_ref_version_number(1) };
+    let zombie_name = c_str("zombie");
+    let zombie =
+        unsafe { lance_dataset_branch_create(ds, zombie_name.as_ptr(), zombie_ref, ptr::null()) };
+    assert!(!zombie.is_null());
+    unsafe {
+        lance_dataset_close(zombie);
+        lance_ref_close(zombie_ref);
+    }
+    let zombie_contents = std::path::Path::new(&uri).join("_refs/branches/zombie.json");
+    assert!(zombie_contents.exists());
+    std::fs::remove_file(&zombie_contents).unwrap();
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, zombie_name.as_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    assert_eq!(
+        unsafe { lance_dataset_branch_force_delete(ds, zombie_name.as_ptr()) },
+        0
+    );
+    assert!(!std::path::Path::new(&uri).join("tree/zombie").exists());
+    let branches = owned_json(unsafe { lance_dataset_branches_json(ds) });
+    assert!(branches.get("zombie").is_none());
+
+    unsafe {
+        lance_dataset_close(tagged);
+        lance_dataset_close(parent);
+        lance_ref_close(tag_target);
+        lance_ref_close(tagged_ref);
+        lance_ref_close(parent_ref);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_branch_concurrent_fixed_ref_and_commit() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let barrier = Arc::new(Barrier::new(3));
+
+    let branch_uri = uri.clone();
+    let branch_barrier = Arc::clone(&barrier);
+    let branch_thread = std::thread::spawn(move || {
+        branch_barrier.wait();
+        let c_uri = c_str(&branch_uri);
+        let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+        assert!(!ds.is_null());
+
+        let reference = unsafe { lance_ref_version(ptr::null(), true, 2) };
+        let name = c_str("concurrent/from-v2");
+        let branch =
+            unsafe { lance_dataset_branch_create(ds, name.as_ptr(), reference, ptr::null()) };
+        assert!(!branch.is_null());
+        let result = (unsafe { lance_dataset_version(branch) }, unsafe {
+            lance_dataset_count_rows(branch)
+        });
+        unsafe {
+            lance_dataset_close(branch);
+            lance_ref_close(reference);
+            lance_dataset_close(ds);
+        }
+        result
+    });
+
+    let commit_uri = uri.clone();
+    let commit_barrier = Arc::clone(&barrier);
+    let commit_thread = std::thread::spawn(move || {
+        commit_barrier.wait();
+        let c_uri = c_str(&commit_uri);
+        let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+        assert!(!ds.is_null());
+
+        let predicate = c_str("id = 1");
+        let mut deleted = 0;
+        let rc = unsafe { lance_dataset_delete(ds, predicate.as_ptr(), &mut deleted) };
+        unsafe {
+            lance_dataset_close(ds);
+        }
+        (rc, deleted)
+    });
+
+    barrier.wait();
+    let (branch_version, branch_rows) = branch_thread.join().unwrap();
+    let (delete_rc, deleted) = commit_thread.join().unwrap();
+    assert_eq!(delete_rc, 0);
+    assert_eq!(deleted, 1);
+
+    // An explicit ref version is a stable snapshot: the concurrent main
+    // commit changes main, not the branch source.
+    assert_eq!(branch_version, 2);
+    assert_eq!(branch_rows, 7);
+    let contents = native_branch(&uri, "concurrent/from-v2");
+    assert_eq!(contents.parent_branch, None);
+    assert_eq!(contents.parent_version, 2);
+
+    let (main_version, main_rows) = lance_c::runtime::block_on(async {
+        let main = Dataset::open(&uri).await.unwrap();
+        (main.version().version, main.count_rows(None).await.unwrap())
+    });
+    assert_eq!(main_version, 3);
+    assert_eq!(main_rows, 6);
+
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, c_str("concurrent/from-v2").as_ptr(),) },
+        0
+    );
+    unsafe {
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_branch_invalid_inputs_and_missing_references() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let version1 = unsafe { lance_ref_version_number(1) };
+    for name in ["main", "", "feature//child", "bad name", "a/../b"] {
+        let name = c_str(name);
+        let branch =
+            unsafe { lance_dataset_branch_create(ds, name.as_ptr(), version1, ptr::null()) };
+        assert!(branch.is_null(), "invalid branch name {name:?}");
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    }
+
+    let missing_version = unsafe { lance_ref_version_number(99) };
+    let missing_branch = unsafe {
+        lance_dataset_branch_create(
+            ds,
+            c_str("missing-version").as_ptr(),
+            missing_version,
+            ptr::null(),
+        )
+    };
+    assert!(missing_branch.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    unsafe {
+        lance_ref_close(missing_version);
+    }
+
+    let missing_tag = unsafe { lance_ref_tag(c_str("missing-tag").as_ptr()) };
+    let missing_tag_branch = unsafe {
+        lance_dataset_branch_create(ds, c_str("missing-tag").as_ptr(), missing_tag, ptr::null())
+    };
+    assert!(missing_tag_branch.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    unsafe {
+        lance_ref_close(missing_tag);
+    }
+
+    let odd_key = c_str("key");
+    let odd_storage = [odd_key.as_ptr(), ptr::null()];
+    let odd_branch = unsafe {
+        lance_dataset_branch_create(
+            ds,
+            c_str("odd-storage").as_ptr(),
+            version1,
+            odd_storage.as_ptr(),
+        )
+    };
+    assert!(odd_branch.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let invalid_utf8 = CString::new(vec![0xffu8]).unwrap();
+    assert!(unsafe { lance_dataset_branch_get_json(ds, invalid_utf8.as_ptr()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    assert!(unsafe { lance_dataset_branch_get_json(ds, c_str("missing").as_ptr()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    assert!(unsafe { lance_dataset_checkout_branch(ds, c_str("missing").as_ptr()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, c_str("missing").as_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    assert_eq!(
+        unsafe { lance_dataset_branch_force_delete(ds, c_str("missing").as_ptr()) },
+        0
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+
+    assert!(
+        unsafe {
+            lance_dataset_branch_create(ptr::null(), c_str("x").as_ptr(), version1, ptr::null())
+        }
+        .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        unsafe { lance_dataset_branch_create(ds, ptr::null(), version1, ptr::null()) }.is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        unsafe { lance_dataset_branch_create(ds, c_str("x").as_ptr(), ptr::null(), ptr::null()) }
+            .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_branches_json(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_branch_identifier_json(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_branch_get_json(ptr::null(), c_str("x").as_ptr()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_branch_get_json(ds, ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        unsafe { lance_dataset_checkout_branch(ptr::null(), c_str("main").as_ptr()) }.is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_checkout_branch(ds, ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ptr::null(), c_str("x").as_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_dataset_branch_force_delete(ds, ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe {
+            lance_dataset_branch_replace_metadata(ptr::null(), c_str("x").as_ptr(), ptr::null())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_dataset_branch_replace_metadata(ds, ptr::null(), ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe {
+        lance_ref_close(version1);
         lance_dataset_close(ds);
     }
 }
@@ -7363,6 +8984,592 @@ fn create_label_list_dataset() -> (tempfile::TempDir, String) {
     });
 
     (tmp, uri)
+}
+
+/// Create a three-fragment dataset with stable row IDs and nullable columns
+/// for the native NGram, ZoneMap and BloomFilter scalar-index families.
+fn create_native_scalar_index_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("native_scalar_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, true),
+        Field::new("score", DataType::Int32, true),
+        Field::new("rank", DataType::Int32, true),
+    ]));
+    let texts = vec![
+        Some("alpha cat"),
+        Some("beta catalog"),
+        Some("gamma"),
+        Some("cat scatter"),
+        None,
+        Some("rhino"),
+        Some("catalog"),
+        Some("bobcat"),
+        Some("rhino horn"),
+        Some("dog"),
+        Some("cat"),
+        Some("caterpillar"),
+        Some("elephant"),
+        Some("cat"),
+        Some("catalog"),
+        Some("scatter"),
+        Some("rhino"),
+        Some("dogma"),
+    ];
+    let mut scores = (0..18).map(|id| Some(id * 10)).collect::<Vec<_>>();
+    scores[7] = None;
+    scores[16] = None;
+    let mut ranks = (0..18).map(|id| Some(id % 5)).collect::<Vec<_>>();
+    ranks[4] = None;
+    ranks[13] = None;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..18)),
+            Arc::new(StringArray::from(texts)),
+            Arc::new(Int32Array::from(scores)),
+            Arc::new(Int32Array::from(ranks)),
+        ],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(lance::dataset::WriteParams {
+                max_rows_per_file: 6,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+    });
+
+    (tmp, uri)
+}
+
+fn scan_index_ids(
+    dataset: *const LanceDataset,
+    filter: &str,
+    use_scalar_index: bool,
+) -> (Vec<i32>, CapturedScanStatistics) {
+    let filter = c_str(filter);
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
+    assert!(!scanner.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(scanner, use_scalar_index) },
+        0
+    );
+
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut ids = Vec::new();
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let column = batch.column_by_name("id").expect("scan includes id");
+        ids.extend(
+            column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied(),
+        );
+    }
+    unsafe { lance_scanner_close(scanner) };
+    ids.sort_unstable();
+    (ids, captured)
+}
+
+#[test]
+fn test_native_scalar_index_families_create_query_and_lifecycle() {
+    let (_tmp, uri) = create_native_scalar_index_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 3);
+
+    let text = c_str("text");
+    let score = c_str("score");
+    let rank = c_str("rank");
+    let zone_params = c_str(r#"{"rows_per_zone":2,"use_seeds":false}"#);
+    let bloom_params = c_str(r#"{"number_of_items":8,"probability":0.01}"#);
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                text.as_ptr(),
+                c_str("text_ngram").as_ptr(),
+                LanceScalarIndexType::NGram as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                score.as_ptr(),
+                c_str("score_zonemap").as_ptr(),
+                LanceScalarIndexType::ZoneMap as i32,
+                zone_params.as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                rank.as_ptr(),
+                c_str("rank_bloom").as_ptr(),
+                LanceScalarIndexType::BloomFilter as i32,
+                bloom_params.as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 3);
+
+    let json_ptr = unsafe { lance_dataset_index_list_json(ds) };
+    assert!(!json_ptr.is_null(), "{}", take_last_error_message());
+    let json = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(json_ptr) };
+    let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let by_name = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| (entry["name"].as_str().unwrap(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    for (name, index_type, column) in [
+        ("text_ngram", "NGram", "text"),
+        ("score_zonemap", "ZoneMap", "score"),
+        ("rank_bloom", "BloomFilter", "rank"),
+    ] {
+        let entry = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing index {name}: {json}"));
+        assert_eq!(entry["type"], index_type, "{json}");
+        assert_eq!(entry["columns"], serde_json::json!([column]), "{json}");
+    }
+
+    let segments_ptr = unsafe { lance_dataset_index_segments_json(ds) };
+    assert!(!segments_ptr.is_null(), "{}", take_last_error_message());
+    let segments = unsafe { std::ffi::CStr::from_ptr(segments_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(segments_ptr) };
+    let segments: serde_json::Value = serde_json::from_str(&segments).unwrap();
+    let by_name = segments
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| (entry["name"].as_str().unwrap(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    for (name, index_type) in [
+        ("text_ngram", "NGram"),
+        ("score_zonemap", "ZoneMap"),
+        ("rank_bloom", "BloomFilter"),
+    ] {
+        let entry = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing segment {name}: {segments}"));
+        assert_eq!(entry["type"], index_type, "{segments}");
+        assert_eq!(entry["fragment_ids"], serde_json::json!([0, 1, 2]));
+    }
+
+    unsafe { lance_dataset_close(ds) };
+
+    let assert_indexed = |filter: &str, expected: &[i32]| {
+        let query_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+        assert!(!query_ds.is_null(), "{}", take_last_error_message());
+        let (indexed, stats) = scan_index_ids(query_ds, filter, true);
+        assert_eq!(indexed.as_slice(), expected, "indexed filter: {filter}");
+        assert!(
+            stats.indices_loaded > 0,
+            "filter must load a scalar index: {filter}"
+        );
+        let (unindexed, unindexed_stats) = scan_index_ids(query_ds, filter, false);
+        assert_eq!(unindexed.as_slice(), expected, "unindexed filter: {filter}");
+        assert_eq!(
+            unindexed_stats.indices_loaded, 0,
+            "disabled scalar index must not load an index: {filter}"
+        );
+        unsafe { lance_dataset_close(query_ds) };
+    };
+
+    assert_indexed(
+        "contains(text, 'cat')",
+        &[0, 1, 3, 6, 7, 10, 11, 13, 14, 15],
+    );
+    // `scatter` and `bobcat` contain the `cat` trigram but do not start with
+    // it, so the exact recheck must remove those NGram candidates.
+    assert_indexed("text LIKE 'cat%'", &[3, 6, 10, 11, 13, 14]);
+    assert_indexed("contains(text, 'zzzz')", &[]);
+
+    assert_indexed("score >= 100", &[10, 11, 12, 13, 14, 15, 17]);
+    assert_indexed("score = 90", &[9]);
+    assert_indexed("score = 999", &[]);
+    assert_indexed("score IS NULL", &[7, 16]);
+
+    assert_indexed("rank = 3", &[3, 8]);
+    assert_indexed("rank IN (1, 4)", &[1, 6, 9, 11, 14, 16]);
+    assert_indexed("rank = 42", &[]);
+    assert_indexed("rank IS NULL", &[4, 13]);
+
+    let prewarm_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!prewarm_ds.is_null(), "{}", take_last_error_message());
+    for name in ["text_ngram", "score_zonemap", "rank_bloom"] {
+        assert_eq!(
+            unsafe { lance_dataset_prewarm_index(prewarm_ds, c_str(name).as_ptr()) },
+            0,
+            "prewarm {name}: {}",
+            take_last_error_message()
+        );
+    }
+    unsafe { lance_dataset_close(prewarm_ds) };
+
+    let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    let (ids, stats) = scan_index_ids(reopened, "score = 90", true);
+    assert_eq!(ids, vec![9]);
+    assert!(stats.indices_loaded > 0);
+    let (ids, stats) = scan_index_ids(reopened, "rank = 3", true);
+    assert_eq!(ids, vec![3, 8]);
+    assert!(stats.indices_loaded > 0);
+    let (ids, stats) = scan_index_ids(reopened, "contains(text, 'cat')", true);
+    assert_eq!(ids, vec![0, 1, 3, 6, 7, 10, 11, 13, 14, 15]);
+    assert!(stats.indices_loaded > 0);
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                reopened,
+                score.as_ptr(),
+                c_str("score_zonemap").as_ptr(),
+                LanceScalarIndexType::ZoneMap as i32,
+                c_str(r#"{"rows_per_zone":4,"use_seeds":false}"#).as_ptr(),
+                true,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(reopened) }, 3);
+    let json_ptr = unsafe { lance_dataset_index_list_json(reopened) };
+    assert!(!json_ptr.is_null(), "{}", take_last_error_message());
+    let json = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(json_ptr) };
+    let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["name"].as_str() == Some("score_zonemap"))
+            .count(),
+        1,
+        "{json}"
+    );
+
+    for name in ["text_ngram", "score_zonemap", "rank_bloom"] {
+        assert_eq!(
+            unsafe { lance_dataset_drop_index(reopened, c_str(name).as_ptr()) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+    }
+    assert_eq!(unsafe { lance_dataset_index_count(reopened) }, 0);
+    unsafe { lance_dataset_close(reopened) };
+}
+
+#[test]
+fn test_native_scalar_index_segment_metadata_types() {
+    let (_tmp, uri) = create_native_scalar_index_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let fragment_id = 0_u32;
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &fragment_id,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let zone_params = c_str(r#"{"rows_per_zone":2,"use_seeds":false}"#);
+    let bloom_params = c_str(r#"{"number_of_items":8,"probability":0.01}"#);
+
+    for (column, index_type, params, expected_type, details_suffix) in [
+        (
+            "text",
+            LanceScalarIndexType::NGram,
+            ptr::null(),
+            5,
+            "NGramIndexDetails",
+        ),
+        (
+            "score",
+            LanceScalarIndexType::ZoneMap,
+            zone_params.as_ptr(),
+            6,
+            "ZoneMapIndexDetails",
+        ),
+        (
+            "rank",
+            LanceScalarIndexType::BloomFilter,
+            bloom_params.as_ptr(),
+            7,
+            "BloomFilterIndexDetails",
+        ),
+    ] {
+        let column = c_str(column);
+        let builder = unsafe {
+            lance_index_segment_builder_new_scalar(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                index_type as i32,
+                params,
+                &options,
+            )
+        };
+        assert!(!builder.is_null(), "{}", take_last_error_message());
+        let mut bytes = ptr::null_mut();
+        let mut len = 0_usize;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len)
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let mut metadata = ptr::null_mut();
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+            0
+        );
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_index_type(metadata) },
+            expected_type
+        );
+        let type_url = unsafe {
+            std::ffi::CStr::from_ptr(lance_index_segment_metadata_index_details_type_url(
+                metadata,
+            ))
+            .to_str()
+            .unwrap()
+        };
+        assert!(
+            type_url.ends_with(details_suffix),
+            "{details_suffix}: {type_url}"
+        );
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_fragment_count(metadata) },
+            1
+        );
+        let mut actual_fragment = u32::MAX;
+        let mut written = 0_usize;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_metadata_fragment_ids(
+                    metadata,
+                    &mut actual_fragment,
+                    1,
+                    &mut written,
+                )
+            },
+            0
+        );
+        assert_eq!(written, 1);
+        assert_eq!(actual_fragment, fragment_id);
+        unsafe {
+            lance_index_segment_metadata_free(metadata);
+            lance_free_bytes(bytes);
+            lance_index_segment_builder_free(builder);
+        }
+    }
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_native_scalar_index_native_parameter_and_type_validation() {
+    let (_tmp, uri) = create_native_scalar_index_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    let score = c_str("score");
+    let rank = c_str("rank");
+    let id = c_str("id");
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            score.as_ptr(),
+            c_str("bad_zonemap").as_ptr(),
+            LanceScalarIndexType::ZoneMap as i32,
+            c_str(r#"{"rows_per_zone":0,"use_seeds":false}"#).as_ptr(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("zone capacity must be greater than zero"),
+        "{message}"
+    );
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            rank.as_ptr(),
+            c_str("bad_bloom").as_ptr(),
+            LanceScalarIndexType::BloomFilter as i32,
+            c_str(r#"{"number_of_items":8,"probability":1.0}"#).as_ptr(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("Failed to build SBBF") || message.contains("InvalidFpp"),
+        "{message}"
+    );
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            id.as_ptr(),
+            c_str("bad_ngram").as_ptr(),
+            LanceScalarIndexType::NGram as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("Utf8"), "{message}");
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            id.as_ptr(),
+            c_str("bad_type").as_ptr(),
+            8,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("invalid scalar index type: 8"));
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ptr::null_mut(),
+            id.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::ZoneMap as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("dataset and column must not be NULL"));
+
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 0);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_native_zonemap_use_seeds_param() {
+    let (_tmp, uri) = create_native_scalar_index_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    let score = c_str("score");
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                score.as_ptr(),
+                c_str("score_zonemap_seeds").as_ptr(),
+                LanceScalarIndexType::ZoneMap as i32,
+                c_str(r#"{"rows_per_zone":2,"use_seeds":true}"#).as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+
+    let query_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!query_ds.is_null(), "{}", take_last_error_message());
+    let (ids, stats) = scan_index_ids(query_ds, "score >= 100", true);
+    assert_eq!(ids, vec![10, 11, 12, 13, 14, 15, 17]);
+    assert!(stats.indices_loaded > 0);
+    unsafe { lance_dataset_close(query_ds) };
 }
 
 #[test]
@@ -16928,6 +19135,140 @@ fn default_write_params() -> LanceWriteParams {
     }
 }
 
+fn write_with_native_options(
+    uri: &str,
+    batch: RecordBatch,
+    mode: LanceWriteMode,
+    options: *const LanceWriteOptions,
+) -> i32 {
+    let c_uri = c_str(uri);
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(batch);
+    unsafe {
+        lance_dataset_write_with_options(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            mode as i32,
+            options,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    }
+}
+
+fn write_native(uri: &str, batch: RecordBatch, params: WriteParams) -> lance::Result<Dataset> {
+    let schema = batch.schema();
+    lance_c::runtime::block_on(Dataset::write(
+        arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(params),
+    ))
+}
+
+fn c_config_entries(dataset: *const LanceDataset) -> Vec<(String, String)> {
+    let config = unsafe { lance_dataset_config(dataset) };
+    assert!(
+        !config.is_null(),
+        "config snapshot failed: {}",
+        take_last_error_message()
+    );
+    let count = unsafe { lance_dataset_config_count(config) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut entries = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let key = unsafe { lance_dataset_config_key_at(config, i) };
+        assert!(!key.is_null(), "config key {i} was NULL");
+        let value = unsafe { lance_dataset_config_value_at(config, i) };
+        assert!(!value.is_null(), "config value {i} was NULL");
+        entries.push((
+            unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned(),
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        ));
+    }
+    unsafe { lance_dataset_config_close(config) };
+    entries.sort();
+    entries
+}
+
+fn c_config_entries_for_uri(uri: &str) -> Vec<(String, String)> {
+    let c_uri = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(
+        !dataset.is_null(),
+        "open failed: {}",
+        take_last_error_message()
+    );
+    let entries = c_config_entries(dataset);
+    unsafe { lance_dataset_close(dataset) };
+    entries
+}
+
+fn native_config_entries(uri: &str) -> Vec<(String, String)> {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let mut entries: Vec<_> = dataset
+        .config()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn c_dataset_observation(uri: &str) -> (u64, u64, u64) {
+    let c_uri = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(
+        !dataset.is_null(),
+        "open failed: {}",
+        take_last_error_message()
+    );
+    let observation = (
+        unsafe { lance_dataset_version(dataset) },
+        unsafe { lance_dataset_count_rows(dataset) },
+        unsafe { lance_dataset_fragment_count(dataset) },
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    unsafe { lance_dataset_close(dataset) };
+    observation
+}
+
+fn native_dataset_observation(uri: &str) -> (u64, u64, u64) {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let rows = lance_c::runtime::block_on(dataset.count_rows(None)).unwrap() as u64;
+    (
+        dataset.version().version,
+        rows,
+        dataset.count_fragments() as u64,
+    )
+}
+
+fn native_version_ids(uri: &str) -> Vec<u64> {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let mut ids: Vec<_> = lance_c::runtime::block_on(dataset.versions())
+        .unwrap()
+        .into_iter()
+        .map(|version| version.version)
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn c_update_config_entries(
+    dataset: *mut LanceDataset,
+    entries: &[(CString, Option<CString>)],
+) -> i32 {
+    let keys: Vec<*const c_char> = entries.iter().map(|(key, _)| key.as_ptr()).collect();
+    let values: Vec<*const c_char> = entries
+        .iter()
+        .map(|(_, value)| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+        .collect();
+    unsafe { lance_dataset_update_config(dataset, keys.as_ptr(), values.as_ptr(), entries.len()) }
+}
+
 /// Build a larger batch than the minimal test batch so `max_rows_per_file`
 /// has enough rows to exercise multi-file output.
 fn large_write_batch(n: i32) -> RecordBatch {
@@ -17213,6 +19554,825 @@ fn test_write_with_params_stable_row_ids_accepted() {
         )
     };
     assert_eq!(rc, 0);
+}
+
+// ===========================================================================
+// lance_dataset_write_with_options / native auto-cleanup
+// ===========================================================================
+
+#[test]
+fn test_write_options_null_uses_native_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_default").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_default")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+
+    let native = write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams::default(),
+    )
+    .unwrap();
+
+    let c_entries = c_config_entries_for_uri(&c_uri);
+    let native_entries = native_config_entries(&native_uri);
+    assert_eq!(c_entries, native_entries);
+    assert!(
+        !c_entries
+            .iter()
+            .any(|(key, _)| key.starts_with("lance.auto_cleanup.")),
+        "NULL options must select native auto_cleanup=None: {c_entries:?}"
+    );
+    assert_eq!(native.version().version, 1);
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+}
+
+#[test]
+fn test_write_options_create_auto_cleanup_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_cleanup").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_cleanup")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 0,
+        older_than_seconds: 5,
+        older_than_nanos: 250_000_123,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+
+    let older_than = chrono::TimeDelta::try_seconds(5)
+        .unwrap()
+        .checked_add(&chrono::TimeDelta::nanoseconds(250_000_123))
+        .unwrap();
+    let native = write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams {
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 0,
+                older_than,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(native.version().version, 1);
+
+    let entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(entries, native_config_entries(&native_uri));
+    assert_eq!(
+        entries
+            .iter()
+            .find(|(key, _)| key == "lance.auto_cleanup.interval")
+            .map(|(_, value)| value.as_str()),
+        Some("0"),
+        "interval 0 must remain an explicit native policy"
+    );
+
+    // Reopen both to prove the config is persisted, not only visible on the
+    // writer's returned snapshot.
+    assert_eq!(entries, c_config_entries_for_uri(&c_uri));
+    assert_eq!(entries, native_config_entries(&native_uri));
+}
+
+#[test]
+fn test_write_options_existing_dataset_keeps_persisted_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_existing").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_existing")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let initial_cleanup = LanceAutoCleanupParams {
+        interval: 7,
+        older_than_seconds: 93_600,
+        older_than_nanos: 0,
+    };
+    let initial_params = LanceWriteParams {
+        max_rows_per_file: 2,
+        ..default_write_params()
+    };
+    let initial_options = LanceWriteOptions {
+        params: initial_params,
+        auto_cleanup: &initial_cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3, 4, 5], vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        LanceWriteMode::Create,
+        &initial_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3, 4, 5], vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        WriteParams {
+            max_rows_per_file: 2,
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 7,
+                older_than: chrono::TimeDelta::try_seconds(93_600).unwrap(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let initial_entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(initial_entries, native_config_entries(&native_uri));
+    let initial_observation = c_dataset_observation(&c_uri);
+    assert!(
+        initial_observation.2 > 1,
+        "fixture must produce multiple fragments, got {initial_observation:?}"
+    );
+    assert_eq!(initial_observation, native_dataset_observation(&native_uri));
+
+    let append_cleanup = LanceAutoCleanupParams {
+        interval: 0,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let append_options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: &append_cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![6, 7, 8, 9], vec![6.0, 7.0, 8.0, 9.0]),
+        LanceWriteMode::Append,
+        &append_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![6, 7, 8, 9], vec![6.0, 7.0, 8.0, 9.0]),
+        WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            max_rows_per_file: 2,
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 0,
+                older_than: chrono::TimeDelta::zero(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri),
+        "APPEND must not rewrite the persisted cleanup policy"
+    );
+    assert_eq!(c_config_entries_for_uri(&c_uri), initial_entries);
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+
+    let overwrite_options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: ptr::null(),
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![10, 11, 12], vec![10.0, 11.0, 12.0]),
+        LanceWriteMode::Overwrite,
+        &overwrite_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![10, 11, 12], vec![10.0, 11.0, 12.0]),
+        WriteParams {
+            mode: lance::dataset::WriteMode::Overwrite,
+            max_rows_per_file: 2,
+            auto_cleanup: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let overwritten_entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(overwritten_entries, native_config_entries(&native_uri));
+    assert_eq!(
+        overwritten_entries, initial_entries,
+        "OVERWRITE with None must not delete persisted cleanup config"
+    );
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+}
+
+fn run_auto_cleanup_sequence(uri: &str, via_c: bool, skip_auto_cleanup: bool) -> Vec<u64> {
+    let cleanup = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let initial_options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let first_batch = write_batch(vec![1, 2, 3, 4], vec![1.0, 2.0, 3.0, 4.0]);
+    if via_c {
+        let rc =
+            write_with_native_options(uri, first_batch, LanceWriteMode::Create, &initial_options);
+        assert_eq!(rc, 0, "{}", take_last_error_message());
+    } else {
+        write_native(
+            uri,
+            first_batch,
+            WriteParams {
+                max_rows_per_file: 2,
+                auto_cleanup: Some(AutoCleanupParams {
+                    interval: 1,
+                    older_than: chrono::TimeDelta::zero(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    for rows in [vec![5, 6], vec![7, 8], vec![9, 10]] {
+        let values: Vec<f32> = rows.iter().map(|row| *row as f32).collect();
+        let batch = write_batch(rows, values);
+        if via_c {
+            let append_options = LanceWriteOptions {
+                params: default_write_params(),
+                auto_cleanup: ptr::null(),
+                skip_auto_cleanup,
+            };
+            let rc = write_with_native_options(uri, batch, LanceWriteMode::Append, &append_options);
+            assert_eq!(rc, 0, "{}", take_last_error_message());
+        } else {
+            write_native(
+                uri,
+                batch,
+                WriteParams {
+                    mode: lance::dataset::WriteMode::Append,
+                    skip_auto_cleanup,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+    }
+    native_version_ids(uri)
+}
+
+#[test]
+fn test_write_options_skip_auto_cleanup_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_cleanup_run")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_cleanup_run")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let c_skip_uri = tmp
+        .path()
+        .join("c_cleanup_skip")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_skip_uri = tmp
+        .path()
+        .join("native_cleanup_skip")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let c_versions = run_auto_cleanup_sequence(&c_uri, true, false);
+    let native_versions = run_auto_cleanup_sequence(&native_uri, false, false);
+    assert_eq!(c_versions, native_versions);
+    assert!(
+        c_versions.len() < 4,
+        "auto-cleanup should have removed an old version: {c_versions:?}"
+    );
+
+    let c_skip_versions = run_auto_cleanup_sequence(&c_skip_uri, true, true);
+    let native_skip_versions = run_auto_cleanup_sequence(&native_skip_uri, false, true);
+    assert_eq!(c_skip_versions, native_skip_versions);
+    assert_eq!(
+        c_skip_versions,
+        vec![1, 2, 3, 4],
+        "skip_auto_cleanup must preserve every version"
+    );
+}
+
+#[test]
+fn test_write_options_auto_cleanup_retains_tagged_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_cleanup_tag")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3, 4], vec![1.0, 2.0, 3.0, 4.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+
+    let tagged = lance_c::runtime::block_on(Dataset::open(&c_uri)).unwrap();
+    lance_c::runtime::block_on(tagged.tags().create("keep_v1", 1u64)).unwrap();
+    drop(tagged);
+
+    for (ids, values) in [
+        (vec![5, 6], vec![5.0, 6.0]),
+        (vec![7, 8], vec![7.0, 8.0]),
+        (vec![9, 10], vec![9.0, 10.0]),
+    ] {
+        let append_options = LanceWriteOptions {
+            params: default_write_params(),
+            auto_cleanup: ptr::null(),
+            skip_auto_cleanup: false,
+        };
+        let rc = write_with_native_options(
+            &c_uri,
+            write_batch(ids, values),
+            LanceWriteMode::Append,
+            &append_options,
+        );
+        assert_eq!(rc, 0, "{}", take_last_error_message());
+    }
+
+    let versions = native_version_ids(&c_uri);
+    assert!(
+        versions.contains(&1),
+        "tagged version 1 must survive auto-cleanup: {versions:?}"
+    );
+    let dataset = lance_c::runtime::block_on(Dataset::open(&c_uri)).unwrap();
+    assert!(
+        lance_c::runtime::block_on(dataset.checkout_version(1)).is_ok(),
+        "tagged version 1 must remain readable"
+    );
+}
+
+#[test]
+fn test_write_options_cleanup_hook_failure_keeps_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_cleanup_fail")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_cleanup_fail")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let create_batch = write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]);
+    let rc = write_with_native_options(
+        &c_uri,
+        create_batch.clone(),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        create_batch,
+        WriteParams {
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 1,
+                older_than: chrono::TimeDelta::zero(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    let entries = [(c_str("lance.auto_cleanup.interval"), Some(c_str("invalid")))];
+    assert_eq!(
+        c_update_config_entries(c_ds, &entries),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(c_ds) };
+
+    let mut native_ds = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+    lance_c::runtime::block_on(async {
+        native_ds
+            .update_config([("lance.auto_cleanup.interval", "invalid")])
+            .await
+    })
+    .unwrap();
+    drop(native_ds);
+
+    let append_batch = write_batch(vec![4, 5], vec![4.0, 5.0]);
+    let append_options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: ptr::null(),
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        append_batch.clone(),
+        LanceWriteMode::Append,
+        &append_options,
+    );
+    assert_eq!(
+        rc,
+        0,
+        "cleanup-hook failure must not fail the committed write: {}",
+        take_last_error_message()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    write_native(
+        &native_uri,
+        append_batch,
+        WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri)
+    );
+}
+
+#[test]
+fn test_write_options_rejects_invalid_auto_cleanup_without_clamping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let bad_nanos = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 1_000_000_000,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &bad_nanos,
+        skip_auto_cleanup: false,
+    };
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let rc = unsafe {
+        lance_dataset_write_with_options(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &options,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("older_than_nanos"));
+    assert!(
+        stream.release.is_none(),
+        "the stream must be consumed on validation errors"
+    );
+
+    let bad_seconds = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: i64::MAX,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &bad_seconds,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &uri,
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("older_than_seconds"));
+
+    let negative = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: -1,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &negative,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &uri,
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(
+        rc, -1,
+        "negative older_than must be rejected by the native transaction builder"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) }.is_null(),
+        "failed writes must not leave a readable dataset"
+    );
+    let _ = take_last_error_message();
+}
+
+// ===========================================================================
+// lance_dataset_config / lance_dataset_update_config
+// ===========================================================================
+
+#[test]
+fn test_dataset_config_read_update_and_reopen_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_config").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_config")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 5,
+        older_than_seconds: 86_400,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams {
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 5,
+                older_than: chrono::TimeDelta::days(1),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri)
+    );
+
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    let updates = [
+        (c_str("custom.key"), Some(c_str("value"))),
+        (c_str("lance.auto_cleanup.interval"), Some(c_str("0"))),
+        (c_str("lance.auto_cleanup.older_than"), None),
+        (c_str(""), Some(c_str(""))),
+    ];
+    assert_eq!(
+        c_update_config_entries(c_ds, &updates),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let c_after_update = c_config_entries(c_ds);
+
+    // The snapshot must outlive the dataset handle it was copied from.
+    let snapshot = unsafe { lance_dataset_config(c_ds) };
+    assert!(!snapshot.is_null());
+    unsafe { lance_dataset_close(c_ds) };
+    let snapshot_count = unsafe { lance_dataset_config_count(snapshot) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    assert_eq!(snapshot_count as usize, c_after_update.len());
+    let snapshot_key = unsafe { lance_dataset_config_key_at(snapshot, 0) };
+    assert!(!snapshot_key.is_null());
+    let _ = unsafe { CStr::from_ptr(snapshot_key) };
+    unsafe { lance_dataset_config_close(snapshot) };
+
+    let reopened_entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(c_after_update, reopened_entries);
+
+    let mut native_ds = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+    lance_c::runtime::block_on(async {
+        native_ds
+            .update_config([
+                ("custom.key", Some("value")),
+                ("lance.auto_cleanup.interval", Some("0")),
+                ("lance.auto_cleanup.older_than", None),
+                ("", Some("")),
+            ])
+            .await
+    })
+    .unwrap();
+    drop(native_ds);
+    assert_eq!(reopened_entries, native_config_entries(&native_uri));
+    assert!(
+        reopened_entries
+            .iter()
+            .any(|(key, value)| key.is_empty() && value.is_empty())
+    );
+    assert!(
+        !reopened_entries
+            .iter()
+            .any(|(key, _)| key == "lance.auto_cleanup.older_than")
+    );
+
+    // Reopen the handle for the error-path checks, which must leave the
+    // committed config unchanged.
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    let version_before_errors = unsafe { lance_dataset_version(c_ds) };
+    let key = c_str("unchanged");
+    let value = c_str("value");
+    let keys = [key.as_ptr()];
+    let values = [value.as_ptr()];
+    assert_eq!(
+        unsafe { lance_dataset_update_config(ptr::null_mut(), keys.as_ptr(), values.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, ptr::null(), values.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, keys.as_ptr(), ptr::null(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    let null_key = [ptr::null()];
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, null_key.as_ptr(), values.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_version(c_ds) },
+        version_before_errors
+    );
+    unsafe { lance_dataset_close(c_ds) };
+}
+
+#[test]
+fn test_dataset_config_empty_update_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_config_empty")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_config_empty")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams::default(),
+    )
+    .unwrap();
+
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, ptr::null(), ptr::null(), 0) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(c_ds) };
+
+    let mut native_ds = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+    lance_c::runtime::block_on(async {
+        native_ds
+            .update_config([] as [(&str, Option<&str>); 0])
+            .await
+    })
+    .unwrap();
+    drop(native_ds);
+
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri)
+    );
 }
 
 // ===========================================================================
@@ -22452,6 +25612,30 @@ fn test_scalar_segment_text_indices_still_fall_back() {
                     })
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn test_scalar_segment_zonemap_and_bloom_filter_fall_back() {
+    for (kind, predicate, expected) in [
+        (lance_index::IndexType::ZoneMap, "key >= 0", vec![1, 2, 3]),
+        (lance_index::IndexType::BloomFilter, "key = 0", vec![3]),
+    ] {
+        for stable in [false, true] {
+            let (_tmp, uri, uuids) =
+                create_scalar_segment_fixture_with_options(kind, stable, None, &[&[0], &[1, 2]]);
+            let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], predicate, None, 0);
+            assert_eq!(ids, expected, "{kind:?}, stable={stable}, {predicate}");
+            assert!(stats.metrics.iter().any(|(name, _, value)| {
+                name == "scalar_segment_fallback_index_type" && *value == 1
+            }));
+            assert!(
+                !stats
+                    .metrics
+                    .iter()
+                    .any(|(name, _, value)| { name == "scalar_segments_searched" && *value != 0 })
+            );
         }
     }
 }

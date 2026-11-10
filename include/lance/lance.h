@@ -134,10 +134,13 @@ typedef enum {
 } LanceVectorIndexType;
 
 typedef enum {
-    LANCE_SCALAR_BTREE      = 1,
-    LANCE_SCALAR_BITMAP     = 2,
-    LANCE_SCALAR_LABEL_LIST = 3,
-    LANCE_SCALAR_INVERTED   = 4,
+    LANCE_SCALAR_BTREE        = 1,
+    LANCE_SCALAR_BITMAP       = 2,
+    LANCE_SCALAR_LABEL_LIST   = 3,
+    LANCE_SCALAR_INVERTED     = 4,
+    LANCE_SCALAR_NGRAM        = 5,
+    LANCE_SCALAR_ZONE_MAP     = 6,
+    LANCE_SCALAR_BLOOM_FILTER = 7,
 } LanceScalarIndexType;
 
 typedef enum {
@@ -196,6 +199,7 @@ typedef struct LanceRef      LanceRef;
 typedef struct LanceTag      LanceTag;
 typedef struct LanceTags     LanceTags;
 typedef struct LanceDataStatistics LanceDataStatistics;
+typedef struct LanceDatasetConfig LanceDatasetConfig;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
@@ -504,6 +508,132 @@ const char* lance_dataset_update_schema_metadata_json(
     LanceMetadataUpdateMode mode
 );
 
+/** Selects a field by numeric ID or by Lance field path. */
+typedef enum {
+    LANCE_FIELD_REFERENCE_ID   = 0,
+    LANCE_FIELD_REFERENCE_PATH = 1,
+} LanceFieldReferenceKind;
+
+/**
+ * A field reference for `lance_dataset_update_field_metadata` and
+ * `lance_dataset_resolve_field_id`.
+ *
+ * For `LANCE_FIELD_REFERENCE_ID`, `field_id` is used and `path` is ignored.
+ * For `LANCE_FIELD_REFERENCE_PATH`, `path` must be a non-NULL, NUL-terminated
+ * UTF-8 Lance field path (for example `profile.name`) and `field_id` is
+ * ignored.
+ */
+typedef struct LanceFieldReference {
+    LanceFieldReferenceKind kind;
+    int32_t field_id;
+    const char* path;
+} LanceFieldReference;
+
+/**
+ * One field's metadata update in a batch.
+ *
+ * `keys` and `values` are parallel arrays of length `count`. A NULL value
+ * removes its key; an empty string remains a real empty value. `mode` is
+ * applied independently to this field. `keys` and `values` may be NULL only
+ * when `count == 0`.
+ */
+typedef struct LanceFieldMetadataUpdate {
+    LanceFieldReference field;
+    const char* const* keys;
+    const char* const* values;
+    size_t count;
+    LanceMetadataUpdateMode mode;
+} LanceFieldMetadataUpdate;
+
+/**
+ * Apply a batch of field metadata updates and commit one native operation.
+ *
+ * Each `updates[i]` is resolved against the dataset's current schema when the
+ * call starts. A batch may mix field references, merge/replace modes and
+ * fields. If the same field is referenced more than once, the native builder's
+ * last update wins.
+ *
+ * The input array, keys, values and paths are borrowed only for this call and
+ * are copied before the native asynchronous operation starts. The native
+ * builder performs the commit and validation. The same dataset handle sees the
+ * new version; existing snapshots, scanners and independent handles keep their
+ * prior view. Read the resulting field metadata through the Arrow schema
+ * returned by `lance_dataset_schema()`.
+ *
+ * Returns 0 on success, -1 on error. Input, field lookup, validation and commit
+ * errors follow the native Lance core.
+ */
+int32_t lance_dataset_update_field_metadata(
+    LanceDataset* dataset,
+    const LanceFieldMetadataUpdate* updates,
+    size_t update_count
+);
+
+/**
+ * Return the current snapshot's canonical Lance data-storage version string
+ * (for example `"2.2"`). The value is the native manifest file-format version.
+ *
+ * Caller must free the returned string with `lance_free_string()`.
+ * Returns NULL on error.
+ */
+const char* lance_dataset_data_storage_version(const LanceDataset* dataset);
+
+/**
+ * Report whether the current snapshot uses stable row IDs.
+ * On success writes `*out_has_stable_row_ids` and returns 0; on error returns
+ * -1 and leaves the output untouched.
+ */
+int32_t lance_dataset_has_stable_row_ids(
+    const LanceDataset* dataset,
+    bool* out_has_stable_row_ids
+);
+
+/**
+ * Return the number of field IDs in the current snapshot's schema. IDs are
+ * available in native pre-order traversal through `lance_dataset_field_id_at`.
+ * On success writes `*out_count` and returns 0; on error returns -1 and leaves
+ * the output untouched.
+ */
+int32_t lance_dataset_field_id_count(
+    const LanceDataset* dataset,
+    size_t* out_count
+);
+
+/**
+ * Return the field ID at `index` in native pre-order traversal. Index 0 is the
+ * first top-level field; nested children follow their parent.
+ * On success writes `*out_field_id` and returns 0; on error returns -1 and
+ * leaves the output untouched.
+ */
+int32_t lance_dataset_field_id_at(
+    const LanceDataset* dataset,
+    size_t index,
+    int32_t* out_field_id
+);
+
+/**
+ * Resolve a field reference by ID or path against the current snapshot.
+ * Native `FieldRef` validation supplies the error for an unknown ID or path.
+ * On success writes `*out_field_id` and returns 0; on error returns -1 and
+ * leaves the output untouched.
+ */
+int32_t lance_dataset_resolve_field_id(
+    const LanceDataset* dataset,
+    const LanceFieldReference* field,
+    int32_t* out_field_id
+);
+
+/**
+ * Return the native minimal Lance field path for `field_id` in the current
+ * schema. The path round-trips through Lance field-path parsing and includes
+ * nested fields. Caller must free the returned string with
+ * `lance_free_string()`. Returns NULL on error, including an unknown ID.
+ */
+const char* lance_dataset_field_path(
+    const LanceDataset* dataset,
+    int32_t field_id
+);
+
 /* ─── Version history ─── */
 
 /**
@@ -659,6 +789,129 @@ void lance_ref_close(LanceRef* reference);
 LanceDataset* lance_dataset_checkout_ref(
     const LanceDataset* dataset,
     const LanceRef* reference
+);
+
+/* ─── Branches ─── */
+
+/**
+ * Create a branch from a native ref.
+ *
+ * `branch_name` must be UTF-8. `reference` must be an existing LanceRef.
+ * Branch-name validation, reference resolution and duplicate detection are
+ * performed by Lance's `Dataset::create_branch`. Reusing an existing branch
+ * name may fail in the native shallow-clone phase instead of reaching the
+ * BranchContents conflict check; that native error is passed through rather
+ * than replaced with a synthesized conflict.
+ *
+ * `storage_opts` is NULL-terminated key-value pairs, or NULL. NULL passes
+ * `None` to native, so the source dataset's store params are used. A non-NULL
+ * array, including an immediately NULL-terminated empty array, passes explicit
+ * object-store params.
+ *
+ * Native creation is a non-atomic shallow clone followed by a BranchContents
+ * write. If creation stops after the clone, a branch dataset without
+ * BranchContents may remain. Retrying the same name may then fail; use
+ * lance_dataset_branch_force_delete() to remove that zombie dataset.
+ *
+ * The returned dataset owns an independent snapshot and remains usable after
+ * the source dataset or reference is closed.
+ * @return new dataset handle, or NULL on error
+ */
+LanceDataset* lance_dataset_branch_create(
+    const LanceDataset* dataset,
+    const char* branch_name,
+    const LanceRef* reference,
+    const char* const* storage_opts
+);
+
+/**
+ * Check out the latest version of a branch as an independent dataset.
+ *
+ * "main" selects the default branch. The returned handle remains usable after
+ * the source dataset is closed.
+ * @return new dataset handle, or NULL on error
+ */
+LanceDataset* lance_dataset_checkout_branch(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Serialize all branches as a JSON object keyed by branch name.
+ *
+ * The value is Lance's native `HashMap<String, BranchContents>` serde output.
+ * Each value has the selected core's BranchContents shape, including
+ * `parentBranch`, `identifier.version_mapping`, `parentVersion`, `createAt`
+ * (Unix seconds), `manifestSize` and `metadata`. Map enumeration order is not
+ * promised. The caller owns the string and frees it with
+ * lance_free_string().
+ * @return JSON string, or NULL on error
+ */
+const char* lance_dataset_branches_json(const LanceDataset* dataset);
+
+/**
+ * Serialize one native BranchContents as JSON.
+ *
+ * The object follows the selected core's BranchContents serde shape. The
+ * caller owns the string and frees it with lance_free_string().
+ * @return JSON string, or NULL on error (including LANCE_ERR_NOT_FOUND)
+ */
+const char* lance_dataset_branch_get_json(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Serialize the current dataset's native BranchIdentifier as JSON.
+ *
+ * The object follows the selected core's BranchIdentifier serde shape:
+ * `{"version_mapping":[[version,uuid],...]}`. For the main branch this is
+ * empty. The caller owns the string and frees it with lance_free_string().
+ * @return JSON string, or NULL on error
+ */
+const char* lance_dataset_branch_identifier_json(const LanceDataset* dataset);
+
+/**
+ * Delete a branch.
+ *
+ * Native checks reject a branch referenced by a child branch or by any tag
+ * with LANCE_ERR_COMMIT_CONFLICT. A missing BranchContents produces
+ * LANCE_ERR_NOT_FOUND. The branch dataset directories are cleaned up by the
+ * native implementation.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_branch_delete(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Delete a branch, bypassing only a missing BranchContents.
+ *
+ * This is the native recovery path for a branch dataset left without
+ * BranchContents by the non-atomic creation sequence. Child-branch and tag
+ * reference checks still apply and surface as LANCE_ERR_COMMIT_CONFLICT.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_branch_force_delete(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Replace all metadata entries on an existing branch.
+ *
+ * `metadata` is NULL-terminated key-value pairs ["key","value",NULL]. NULL or
+ * an empty array means an empty native map. This is a full replacement of
+ * BranchContents.metadata, not a merge or a special NULL-delete operation.
+ * Other branch fields are preserved. An unknown branch surfaces as
+ * LANCE_ERR_NOT_FOUND.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_branch_replace_metadata(
+    const LanceDataset* dataset,
+    const char* branch_name,
+    const char* const* metadata
 );
 
 /* ─── Tags ─── */
@@ -838,6 +1091,75 @@ uint64_t lance_data_statistics_bytes_on_disk_at(const LanceDataStatistics* stats
 
 /** Close and free a data statistics handle. Safe to call with NULL. */
 void lance_data_statistics_close(LanceDataStatistics* stats);
+
+/* ─── Dataset config ─── */
+
+/**
+ * Return a snapshot of the dataset's manifest config map.
+ *
+ * The snapshot owns copies of the keys and values, so it remains valid after
+ * the dataset handle is closed. Accessors borrow from the snapshot and remain
+ * valid until lance_dataset_config_close().
+ *
+ * Returns NULL on error (for example a NULL dataset handle).
+ *
+ * Keys and values are exposed as NUL-terminated C strings. A config entry
+ * containing an embedded NUL byte cannot be represented and fails the
+ * snapshot with LANCE_ERR_INTERNAL. Entry order is unspecified.
+ */
+LanceDatasetConfig* lance_dataset_config(const LanceDataset* dataset);
+
+/**
+ * Return the number of entries in the config snapshot. Returns 0 and sets
+ * LANCE_ERR_INVALID_ARGUMENT on a NULL handle. An empty config also yields 0
+ * with no error set, so check lance_last_error_code() to distinguish the two.
+ */
+uint64_t lance_dataset_config_count(const LanceDatasetConfig* config);
+
+/**
+ * Return the key at `index` (0 <= index < count). The pointer is borrowed from
+ * the snapshot. Returns NULL and sets LANCE_ERR_INVALID_ARGUMENT on a NULL
+ * handle or out-of-range index.
+ */
+const char* lance_dataset_config_key_at(
+    const LanceDatasetConfig* config,
+    size_t index
+);
+
+/**
+ * Return the value at `index` (0 <= index < count). The pointer is borrowed
+ * from the snapshot. Returns NULL and sets LANCE_ERR_INVALID_ARGUMENT on a
+ * NULL handle or out-of-range index.
+ */
+const char* lance_dataset_config_value_at(
+    const LanceDatasetConfig* config,
+    size_t index
+);
+
+/** Close and free a dataset config snapshot. Safe to call with NULL. */
+void lance_dataset_config_close(LanceDatasetConfig* config);
+
+/**
+ * Apply merge-style dataset config updates and commit a new manifest.
+ *
+ * `keys` and `values` are parallel arrays of length `num_entries`.
+ * A non-NULL `values[i]` upserts `keys[i]`; a NULL `values[i]` removes it.
+ * This maps directly to the native `Dataset::update_config` merge operation.
+ * An entry count of 0 is passed through as an empty native update.
+ *
+ * When `num_entries > 0`, both arrays must be non-NULL and every `keys[i]`
+ * must be a non-NULL C string. Empty keys and empty string values are passed
+ * through unchanged, matching native map semantics.
+ *
+ * On success the dataset handle points at the newly committed version.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_update_config(
+    LanceDataset* dataset,
+    const char* const* keys,
+    const char* const* values,
+    size_t num_entries
+);
 
 /**
  * Restore the dataset to an older version by committing a new manifest that
@@ -2515,7 +2837,11 @@ int32_t lance_dataset_create_vector_index(
 
 /**
  * Create a scalar index on a column.
- * @param params_json Optional JSON params string (e.g. inverted tokenizer config), or NULL.
+ * @param params_json Optional JSON params forwarded unchanged to the native
+ *                    Lance scalar-index plugin, or NULL for plugin defaults.
+ *                    Plugin field names and validation apply; for example
+ *                    ZoneMap uses `rows_per_zone`/`use_seeds` and BloomFilter
+ *                    uses `number_of_items`/`probability`.
  * @return 0 on success, -1 on error.
  */
 int32_t lance_dataset_create_scalar_index(
@@ -3673,11 +3999,13 @@ typedef enum {
  * Write an Arrow record batch stream to a Lance dataset at `uri`, committing
  * a manifest.
  *
- * A dataset created through this call records an auto-cleanup policy in its
- * manifest: every 20 committed versions, versions older than 14 days are
- * reclaimed automatically. Callers relying on lance_dataset_versions /
- * lance_dataset_restore for time travel should be aware that versions past
- * that horizon may no longer exist.
+ * This legacy entry point records the documented lance-c auto-cleanup policy
+ * in a newly created manifest: every 20 committed versions, versions older
+ * than 14 days are reclaimed automatically. Callers relying on
+ * lance_dataset_versions / lance_dataset_restore for time travel should be
+ * aware that versions past that horizon may no longer exist. Use
+ * lance_dataset_write_with_options to select native WriteParams defaults
+ * instead.
  *
  * @param uri          Dataset URI (file://, s3://, memory://, etc.). Must not
  *                     be NULL or an empty string.
@@ -3738,9 +4066,59 @@ typedef struct LanceWriteParams {
 } LanceWriteParams;
 
 /**
+ * Native auto-cleanup parameters for lance_dataset_write_with_options.
+ *
+ * `interval` is the number of committed versions between cleanup runs; 0 is a
+ * valid native value that considers cleanup on every commit. It is narrowed to
+ * the native usize type; values that do not fit return
+ * LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * `older_than_seconds` and `older_than_nanos` express the native
+ * chrono::TimeDelta retention window as
+ * `older_than_seconds + older_than_nanos / 1000000000`. Both fields carry the
+ * sign, and `older_than_nanos` preserves subsecond precision. It must be in
+ * [-999999999, 999999999], and the combined value must fit in the native
+ * TimeDelta range (about +/-292 million years). Negative durations are
+ * forwarded to Lance, which rejects them when it builds the write transaction
+ * because the persisted config uses std::time::Duration.
+ */
+typedef struct LanceAutoCleanupParams {
+    /* Committed versions between cleanup runs. 0 is valid. */
+    uint64_t interval;
+    /* Whole-second component of the retention window. */
+    int64_t  older_than_seconds;
+    /* Signed subsecond component, in nanoseconds. */
+    int32_t  older_than_nanos;
+} LanceAutoCleanupParams;
+
+/**
+ * Native write options for lance_dataset_write_with_options.
+ *
+ * Zero-initialize this struct to select native WriteParams::default():
+ * auto_cleanup = NULL (native None) and skip_auto_cleanup = false. The embedded
+ * `params` retains the zero-means-upstream-default mapping of LanceWriteParams.
+ *
+ * A non-NULL `auto_cleanup` selects native Some, including interval 0 or a
+ * zero-length retention window. `skip_auto_cleanup` affects only the current
+ * commit and never changes persisted configuration.
+ */
+typedef struct LanceWriteOptions {
+    /* Output-shape overrides. Zero-initialize to inherit upstream defaults. */
+    LanceWriteParams params;
+    /* Native WriteParams::auto_cleanup; NULL means None. */
+    const LanceAutoCleanupParams* auto_cleanup;
+    /* Native WriteParams::skip_auto_cleanup. */
+    bool skip_auto_cleanup;
+} LanceWriteOptions;
+
+/**
  * Same as lance_dataset_write but takes a LanceWriteParams for tuning the
  * output shape. Pass `params` = NULL to use defaults (equivalent to calling
  * lance_dataset_write directly).
+ *
+ * This legacy entry point keeps the documented 20-version / 14-day
+ * auto-cleanup policy. Use lance_dataset_write_with_options for native
+ * WriteParams defaults.
  *
  * @return 0 on success, -1 on error. See lance_dataset_write for the error
  *         code list; invalid `data_storage_version` also returns
@@ -3752,6 +4130,36 @@ int32_t lance_dataset_write_with_params(
     struct ArrowArrayStream* stream,
     int32_t mode,
     const LanceWriteParams* params,
+    const char* const* storage_opts,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Same as lance_dataset_write but selects native WriteParams defaults instead
+ * of the legacy 20-version / 14-day policy.
+ *
+ * Pass `options` = NULL to use a zero-initialized LanceWriteOptions, which is
+ * equivalent to WriteParams::default(): auto_cleanup = NULL (None) and
+ * skip_auto_cleanup = false.
+ *
+ * On an existing dataset, auto_cleanup is written only by CREATE; APPEND and
+ * OVERWRITE leave the persisted policy unchanged. An explicit NULL
+ * auto_cleanup on an existing manifest therefore does not delete stored
+ * cleanup configuration.
+ *
+ * The stream is consumed on every return path except a NULL `stream`.
+ * `out_dataset` follows the same contract as lance_dataset_write.
+ *
+ * @return 0 on success, -1 on error. Error codes match
+ *         lance_dataset_write. Invalid auto-cleanup values also return
+ *         LANCE_ERR_INVALID_ARGUMENT.
+ */
+int32_t lance_dataset_write_with_options(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceWriteOptions* options,
     const char* const* storage_opts,
     LanceDataset** out_dataset
 );

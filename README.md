@@ -34,7 +34,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Vector search | Nearest-neighbor via scanner with metric/k/nprobes |
 | [x] | Full-text search | FTS queries through scanner interface |
 | [x] | Vector index creation | IVF_PQ, IVF_FLAT, IVF_SQ, HNSW variants |
-| [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List indexes |
+| [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List, NGram, ZoneMap, BloomFilter indexes |
 | [x] | Index management | List and drop index operations |
 | [x] | Distributed index build | Train shared IVF/PQ models, build uncommitted fragment-scoped segments, and exchange protobuf metadata |
 | [x] | C++ wrappers | `create_vector_index()` and `create_scalar_index()` methods |
@@ -49,7 +49,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Update operations | Expression-based row updates via `lance_dataset_update()` |
 | [x] | Merge-insert | Upsert via configurable when-matched / when-not-matched policies with `lance_dataset_merge_insert()` |
 | [x] | Schema evolution | Add columns via SQL / all-null / `ArrowArrayStream` with `lance_dataset_add_columns_*()`, drop via `lance_dataset_drop_columns()`, rename / retype / set nullability via `lance_dataset_alter_columns()` |
-| [x] | Version management | Version details/metadata, lightweight refs, native ref checkout, tag CRUD/metadata, rollback, and numeric-version open |
+| [x] | Version management | Version details/metadata, lightweight refs, native ref checkout, tag and branch lifecycle, rollback, and numeric-version open |
 
 ### Phase 4: Advanced Features
 
@@ -66,7 +66,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | Status | Component | Description |
 |--------|-----------|-------------|
 | [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
-| [x] | Dataset metadata | Version/count accessors plus JSON table metadata reads and native merge/replace updates for table and schema metadata |
+| [x] | Dataset metadata | Table/schema/field metadata updates plus native storage-version, stable-row-ID and field-ID inspection |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
 | [x] | Row prefilter | `lance_scanner_set_row_addr_allowlist()` / `lance_scanner_set_row_addr_blocklist()` restrict scans, nearest-neighbor and full-text searches to (or exclude) a set of `_rowid`s before ranking |
 | [x] | Native ordering | `lance_scanner_set_order_by()` and C++ `Scanner::order_by()` sort by one or more columns with direction and NULL placement |
@@ -110,6 +110,30 @@ prior view. Table and schema maps are independent.
 The exported Arrow schema is still the schema metadata read path. Use
 `lance_dataset_schema()` or `Dataset::schema()` to inspect the committed schema
 metadata; no duplicate C-side metadata cache is maintained.
+
+Field metadata uses one native batch and one commit. Each entry selects a field
+by ID or path and carries its own merge or replace mode:
+
+```cpp
+auto id = ds.resolve_field_id(lance::FieldReference::by_path("id"));
+ds.update_field_metadata({
+    {lance::FieldReference::by_id(id),
+     {{"owner", std::string("c++")}, {"empty", std::string("")}},
+     lance::MetadataUpdateMode::Merge},
+    {lance::FieldReference::by_path("profile.name"),
+     {{"nested", std::string("value")}},
+     lance::MetadataUpdateMode::Replace},
+});
+```
+
+A NULL value removes a key, an empty string remains a real value, and duplicate
+references to the same resolved field follow the native builder's
+last-update-wins behavior. Read field metadata through the Arrow schema's field
+metadata. `lance_dataset_data_storage_version()`,
+`lance_dataset_has_stable_row_ids()`, `lance_dataset_field_id_count()` /
+`lance_dataset_field_id_at()`, `lance_dataset_resolve_field_id()` and
+`lance_dataset_field_path()` expose the current native snapshot; the C++
+wrappers provide the corresponding `Dataset` methods.
 
 ## Scanner ordering
 
@@ -676,6 +700,35 @@ nanosecond precision; the existing millisecond version accessor is unchanged.
 Nanosecond accessors report an error when a timestamp does not fit i64
 nanoseconds. Snapshot creation and millisecond reads retain the native range.
 There is no C-side timestamp/asof selector.
+
+Branches use the public Lance 14.0.2 branch lifecycle:
+
+```cpp
+auto branch = source.create_branch(
+    "feature/next", lance::Ref::version(
+        std::optional<std::string>("main"), std::optional<uint64_t>(2)));
+auto checked_out = source.checkout_branch("feature/next");
+branch.replace_branch_metadata("feature/next", {{"owner", "team"}});
+auto branches = source.branches_json();
+auto contents = source.get_branch_json("feature/next");
+auto identifier = branch.branch_identifier_json();
+```
+
+`lance_dataset_branch_create()` accepts the source dataset's store params when
+its storage-options pointer is `NULL`; a non-`NULL`, empty array requests
+explicit empty object-store params. Native creation is a non-atomic shallow
+clone followed by a `BranchContents` write. If creation leaves a branch
+dataset without `BranchContents`, use `lance_dataset_branch_force_delete()` to
+remove it. Normal deletion still rejects branches referenced by a child branch
+or a tag. Reusing an existing branch name may fail in the native shallow-clone
+phase rather than reaching the `BranchContents` conflict check.
+
+Branch JSON is the selected Lance core's serde representation, not a new C
+metadata model. The list is an object keyed by branch name; each
+`BranchContents` includes `parentBranch`, `identifier.version_mapping`,
+`parentVersion`, `createAt` in Unix seconds, `manifestSize`, and `metadata`.
+Map enumeration order is unspecified. Branch metadata replacement writes the
+whole native map, so an empty map clears all entries.
 
 ## Releasing
 
