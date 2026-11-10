@@ -567,7 +567,7 @@ impl LanceScanner {
             ));
         }
         if let Some(mask) = &row_addr_mask {
-            scanner.with_row_addr_prefilter(RowAddrMask::clone(mask));
+            scanner.with_row_id_prefilter(RowAddrMask::clone(mask));
         }
         if self.prefilter {
             scanner.prefilter(true);
