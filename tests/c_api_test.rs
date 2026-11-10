@@ -10905,7 +10905,14 @@ fn test_cleanup_branch_cascade_and_copied_explanation() {
         let mut main = Dataset::write(
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
             &uri,
-            None,
+            Some(WriteParams {
+                auto_cleanup: Some(AutoCleanupParams {
+                    interval: 1,
+                    older_than: chrono::TimeDelta::zero(),
+                }),
+                skip_auto_cleanup: true,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
@@ -10913,7 +10920,10 @@ fn test_cleanup_branch_cascade_and_copied_explanation() {
             let batch = cleanup_fixture_batch(schema.clone(), fragment * 4, 4);
             main.append(
                 arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-                None,
+                Some(WriteParams {
+                    skip_auto_cleanup: true,
+                    ..Default::default()
+                }),
             )
             .await
             .unwrap();
@@ -10926,40 +10936,27 @@ fn test_cleanup_branch_cascade_and_copied_explanation() {
                     vec![Ok(branch_batch)],
                     schema.clone(),
                 ),
-                None,
+                Some(WriteParams {
+                    skip_auto_cleanup: true,
+                    ..Default::default()
+                }),
             )
             .await
             .unwrap();
         let main_batch = cleanup_fixture_batch(schema.clone(), 200, 4);
         main.append(
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(main_batch)], schema),
-            None,
+            Some(WriteParams {
+                skip_auto_cleanup: true,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
-        main.update_config([
-            ("lance.auto_cleanup.interval", Some("1")),
-            ("lance.auto_cleanup.retain_versions", Some("1")),
-        ])
-        .await
-        .unwrap();
-        let mut branch = Dataset::open(&uri)
-            .await
-            .unwrap()
-            .checkout_branch("dev")
-            .await
-            .unwrap();
-        branch
-            .update_config([
-                ("lance.auto_cleanup.interval", Some("1")),
-                ("lance.auto_cleanup.retain_versions", Some("1")),
-            ])
-            .await
-            .unwrap();
     });
 
-    assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 2, 3, 4, 5]);
-    assert_eq!(native_cleanup_version_ids(&uri, Some("dev")), vec![2, 3, 4]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 2, 3, 4]);
+    assert_eq!(native_cleanup_version_ids(&uri, Some("dev")), vec![2, 3]);
     let root = std::path::Path::new(&uri);
     let before_manifests = count_files_with_extension(root, "manifest");
 
@@ -10981,7 +10978,7 @@ fn test_cleanup_branch_cascade_and_copied_explanation() {
     let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, &operation) };
     assert!(!explanation.is_null(), "{}", take_last_error_message());
     let captured = capture_cleanup_explanation(explanation);
-    assert_eq!(captured.read_version, 5);
+    assert_eq!(captured.read_version, 4);
     assert_eq!(captured.referenced_branches.len(), 1);
     assert_eq!(captured.referenced_branches[0].name, "dev");
     // The native BranchIdentifier records the parent version this branch
@@ -11010,8 +11007,8 @@ fn test_cleanup_branch_cascade_and_copied_explanation() {
 
     // Cascade cleanup uses the referenced branch's own manifest config. The
     // parent manifest that anchors the branch's remaining lineage is retained.
-    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 5]);
-    assert_eq!(native_cleanup_version_ids(&uri, Some("dev")), vec![4]);
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 4]);
+    assert_eq!(native_cleanup_version_ids(&uri, Some("dev")), vec![3]);
     assert_eq!(after_manifests, 3);
     drop(tmp);
 }
