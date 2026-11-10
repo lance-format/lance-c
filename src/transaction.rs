@@ -286,7 +286,7 @@ unsafe fn transaction_property_count_inner(
     Ok(0)
 }
 
-fn property_at<'a>(transaction: &'a LanceTransaction, index: usize) -> Result<(&'a str, &'a str)> {
+fn property_at(transaction: &LanceTransaction, index: usize) -> Result<(&str, &str)> {
     let properties = transaction
         .inner
         .transaction_properties
