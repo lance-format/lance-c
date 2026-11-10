@@ -3268,10 +3268,10 @@ fn update_metadata_via_c(
 ) -> serde_json::Value {
     let keys: Vec<CString> = entries.iter().map(|(key, _)| c_str(key)).collect();
     let values: Vec<Option<CString>> = entries.iter().map(|(_, value)| value.map(c_str)).collect();
-    let key_ptrs: Vec<*const c_char> = keys.iter().map(CString::as_ptr).collect();
+    let key_ptrs: Vec<*const c_char> = keys.iter().map(|key| key.as_ptr()).collect();
     let value_ptrs: Vec<*const c_char> = values
         .iter()
-        .map(|value| value.as_ref().map_or(ptr::null(), CString::as_ptr))
+        .map(|value| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
         .collect();
 
     let json = unsafe {
@@ -3504,13 +3504,13 @@ fn test_dataset_metadata_reopen_and_snapshot_identity() {
     assert_eq!(initial_version, 2);
     update_metadata_via_c(
         writer,
-        &[("persist", "yes")],
+        &[("persist", Some("yes"))],
         LanceMetadataUpdateMode::Merge,
         false,
     );
     update_metadata_via_c(
         writer,
-        &[("persist-schema", "yes")],
+        &[("persist-schema", Some("yes"))],
         LanceMetadataUpdateMode::Merge,
         true,
     );
