@@ -1584,17 +1584,8 @@ unsafe fn metadata_index_type_inner(metadata: *const LanceIndexSegmentMetadata) 
         .as_ref()
         .ok_or_else(|| invalid_input("index metadata does not contain index_details"))?;
     let type_url = details.type_url.as_str();
-    if type_url.ends_with("BTreeIndexDetails") {
-        return Ok(1);
-    }
-    if type_url.ends_with("BitmapIndexDetails") {
-        return Ok(2);
-    }
-    if type_url.ends_with("LabelListIndexDetails") {
-        return Ok(3);
-    }
-    if type_url.ends_with("InvertedIndexDetails") {
-        return Ok(4);
+    if let Some(scalar_type) = LanceScalarIndexType::from_details_type_url(type_url) {
+        return Ok(scalar_type as i32);
     }
     if type_url.ends_with("VectorIndexDetails") {
         use lance_index::pb::vector_index_details::Compression;

@@ -122,6 +122,7 @@ static void assert_field_metadata_absent(
 typedef struct {
     uint64_t calls;
     uint64_t bytes_read;
+    uint64_t indices_loaded;
     int invalid;
 } ScanStatisticsCapture;
 
@@ -147,6 +148,7 @@ static void capture_scan_statistics(
     }
     captured->calls += 1;
     captured->bytes_read = statistics->bytes_read;
+    captured->indices_loaded = statistics->indices_loaded;
 }
 
 typedef struct {
@@ -2028,8 +2030,8 @@ static void test_drop_columns(const char *write_uri) {
     int64_t fields_before = schema_before.n_children;
     if (schema_before.release) schema_before.release(&schema_before);
 
-    const char *cols[] = {"name", "embedding"};
-    rc = lance_dataset_drop_columns(ds, cols, 2);
+    const char *cols[] = {"name", "embedding", "score"};
+    rc = lance_dataset_drop_columns(ds, cols, 3);
     ASSERT(rc == 0, "drop_columns failed");
     uint64_t after_rows = lance_dataset_count_rows(ds);
     CHECK_OK();
@@ -2038,8 +2040,8 @@ static void test_drop_columns(const char *write_uri) {
     ASSERT(lance_dataset_version(ds) > v_before,
            "drop_columns must bump the version");
 
-    /* Schema field count must have decreased by exactly 2. The C-test
-     * fixture has 3 columns (`id`, `name`, `embedding`) — assert `fields_after == 1`
+    /* Schema field count must have decreased by exactly 3. The C-test
+     * fixture has 4 columns (`id`, `name`, `score`, `embedding`) — assert `fields_after == 1`
      * so this self-documents the post-drop expectation and trips if the
      * fixture ever grows additional columns. Release the exported
      * schema before any assertion so we never leak it on failure. */
@@ -2049,8 +2051,8 @@ static void test_drop_columns(const char *write_uri) {
     ASSERT(rc == 0, "schema export failed after drop");
     int64_t fields_after = schema_after.n_children;
     if (schema_after.release) schema_after.release(&schema_after);
-    ASSERT(fields_after == fields_before - 2,
-           "schema field count must decrease by 2 after drop");
+    ASSERT(fields_after == fields_before - 3,
+           "schema field count must decrease by 3 after drop");
     ASSERT(fields_after == 1,
            "C-test fixture should be left with `id` only after dropping columns");
 
@@ -2894,6 +2896,170 @@ static size_t collect_ordering_ids(
     return count;
 }
 
+static int compare_int32(const void *lhs, const void *rhs) {
+    int32_t left = *(const int32_t *)lhs;
+    int32_t right = *(const int32_t *)rhs;
+    return (left > right) - (left < right);
+}
+
+static void assert_ids_match(
+    const int32_t *actual,
+    size_t actual_count,
+    const int32_t *expected,
+    size_t expected_count) {
+    ASSERT(actual_count == expected_count, "indexed query row count mismatch");
+    int32_t sorted_actual[64];
+    int32_t sorted_expected[64];
+    ASSERT(actual_count <= 64, "indexed query result exceeds test capacity");
+    memcpy(sorted_actual, actual, actual_count * sizeof(int32_t));
+    memcpy(sorted_expected, expected, expected_count * sizeof(int32_t));
+    qsort(sorted_actual, actual_count, sizeof(int32_t), compare_int32);
+    qsort(sorted_expected, expected_count, sizeof(int32_t), compare_int32);
+    ASSERT(memcmp(sorted_actual, sorted_expected,
+                  actual_count * sizeof(int32_t)) == 0,
+           "indexed query ids mismatch");
+}
+
+/* Scan `id` through the C entry point and retain the execution statistics. */
+static size_t scan_ids_with_statistics(
+    const char *uri,
+    const char *filter,
+    int use_scalar_index,
+    int32_t *out,
+    size_t capacity,
+    ScanStatisticsCapture *captured) {
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "native scalar dataset open failed");
+    const char *columns[] = {"id", "name", "score", NULL};
+    LanceScanner *scanner = lance_scanner_new(ds, columns, filter);
+    ASSERT(scanner != NULL, "native scalar scanner creation failed");
+    ASSERT(lance_scanner_set_use_scalar_index(
+               scanner, use_scalar_index != 0) == 0,
+           "native scalar use_scalar_index setter failed");
+    memset(captured, 0, sizeof(*captured));
+    ASSERT(lance_scanner_set_statistics_callback(
+               scanner, capture_scan_statistics, captured) == 0,
+           "native scalar statistics callback registration failed");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "native scalar to_arrow_stream failed");
+    size_t count = collect_ordering_ids(&stream, out, capacity);
+    lance_scanner_close(scanner);
+    lance_dataset_close(ds);
+    return count;
+}
+
+static void check_native_scalar_query(
+    const char *uri,
+    const char *filter,
+    const int32_t *expected,
+    size_t expected_count) {
+    int32_t actual[64];
+    ScanStatisticsCapture stats;
+    size_t count =
+        scan_ids_with_statistics(uri, filter, 1, actual, 64, &stats);
+    assert_ids_match(actual, count, expected, expected_count);
+    ASSERT(stats.calls == 1, "native scalar statistics callback count mismatch");
+    ASSERT(stats.indices_loaded > 0,
+           "native scalar query must load an index");
+
+    count = scan_ids_with_statistics(uri, filter, 0, actual, 64, &stats);
+    assert_ids_match(actual, count, expected, expected_count);
+    ASSERT(stats.indices_loaded == 0,
+           "disabled scalar index must not load an index");
+}
+
+static void test_native_scalar_indexes(const char *uri) {
+    printf("  test_native_scalar_indexes... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "native scalar dataset open failed");
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "name", "c_name_ngram", LANCE_SCALAR_NGRAM, NULL, 0) == 0,
+           "C NGram index creation failed");
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "score", "c_score_zonemap", LANCE_SCALAR_ZONE_MAP,
+               "{\"rows_per_zone\":3,\"use_seeds\":false}", 0) == 0,
+           "C ZoneMap index creation failed");
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "id", "c_id_bloom", LANCE_SCALAR_BLOOM_FILTER,
+               "{\"number_of_items\":8,\"probability\":0.01}", 0) == 0,
+           "C BloomFilter index creation failed");
+
+    char *json = (char *)lance_dataset_index_list_json(ds);
+    ASSERT(json != NULL, "C index list failed");
+    ASSERT(strstr(json, "\"name\":\"c_name_ngram\"") != NULL &&
+               strstr(json, "\"type\":\"NGram\"") != NULL,
+           "C NGram index listing mismatch");
+    ASSERT(strstr(json, "\"name\":\"c_score_zonemap\"") != NULL &&
+               strstr(json, "\"type\":\"ZoneMap\"") != NULL,
+           "C ZoneMap index listing mismatch");
+    ASSERT(strstr(json, "\"name\":\"c_id_bloom\"") != NULL &&
+               strstr(json, "\"type\":\"BloomFilter\"") != NULL,
+           "C BloomFilter index listing mismatch");
+    lance_free_string(json);
+
+    uint64_t index_count = lance_dataset_index_count(ds);
+    CHECK_OK();
+
+    const int32_t alice[] = {1};
+    const int32_t none[] = {0};
+    const int32_t high_scores[] = {18, 19, 20};
+    const int32_t null_scores[] = {7, 16};
+    const int32_t id_thirteen[] = {13};
+    check_native_scalar_query(uri, "contains(name, 'ali')", alice, 1);
+    check_native_scalar_query(uri, "contains(name, 'zzz')", none, 0);
+    check_native_scalar_query(uri, "score >= 180", high_scores, 3);
+    check_native_scalar_query(uri, "score IS NULL", null_scores, 2);
+    check_native_scalar_query(uri, "id = 13", id_thirteen, 1);
+    check_native_scalar_query(uri, "id = 999", none, 0);
+
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "score", "c_score_zonemap", LANCE_SCALAR_ZONE_MAP,
+               "{\"rows_per_zone\":4,\"use_seeds\":false}", 1) == 0,
+           "C ZoneMap replacement failed");
+    ASSERT(lance_dataset_index_count(ds) == index_count,
+           "C ZoneMap replacement changed the index count");
+
+    const int32_t expected_after_replace[] = {13};
+    check_native_scalar_query(uri, "id = 13", expected_after_replace, 1);
+
+    ASSERT(lance_dataset_prewarm_index(ds, "c_name_ngram") == 0,
+           "C NGram prewarm failed");
+    ASSERT(lance_dataset_prewarm_index(ds, "c_score_zonemap") == 0,
+           "C ZoneMap prewarm failed");
+    ASSERT(lance_dataset_prewarm_index(ds, "c_id_bloom") == 0,
+           "C BloomFilter prewarm failed");
+
+    lance_dataset_close(ds);
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "C native scalar dataset reopen failed");
+    json = (char *)lance_dataset_index_list_json(ds);
+    ASSERT(json != NULL, "C reopened index list failed");
+    ASSERT(strstr(json, "\"name\":\"c_name_ngram\"") != NULL &&
+               strstr(json, "\"name\":\"c_score_zonemap\"") != NULL &&
+               strstr(json, "\"name\":\"c_id_bloom\"") != NULL,
+           "C native scalar indexes did not survive reopen");
+    lance_free_string(json);
+
+    ASSERT(lance_dataset_drop_index(ds, "c_name_ngram") == 0,
+           "C NGram drop failed");
+    ASSERT(lance_dataset_drop_index(ds, "c_score_zonemap") == 0,
+           "C ZoneMap drop failed");
+    ASSERT(lance_dataset_drop_index(ds, "c_id_bloom") == 0,
+           "C BloomFilter drop failed");
+    json = (char *)lance_dataset_index_list_json(ds);
+    ASSERT(json != NULL, "C final index list failed");
+    ASSERT(strstr(json, "c_name_ngram") == NULL &&
+               strstr(json, "c_score_zonemap") == NULL &&
+               strstr(json, "c_id_bloom") == NULL,
+           "C dropped native scalar indexes remain listed");
+    lance_free_string(json);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static void check_ordering(
     LanceScanner *scanner,
     const int32_t *expected,
@@ -3194,6 +3360,7 @@ int main(int argc, char **argv) {
     test_index_segment_builder_progress(uri);
     test_vector_models_and_reusable_segments(uri);
     test_commit_index_segments(uri);
+    test_native_scalar_indexes(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);

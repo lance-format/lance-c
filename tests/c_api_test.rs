@@ -8962,6 +8962,592 @@ fn create_label_list_dataset() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a three-fragment dataset with stable row IDs and nullable columns
+/// for the native NGram, ZoneMap and BloomFilter scalar-index families.
+fn create_native_scalar_index_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("native_scalar_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, true),
+        Field::new("score", DataType::Int32, true),
+        Field::new("rank", DataType::Int32, true),
+    ]));
+    let texts = vec![
+        Some("alpha cat"),
+        Some("beta catalog"),
+        Some("gamma"),
+        Some("cat scatter"),
+        None,
+        Some("rhino"),
+        Some("catalog"),
+        Some("bobcat"),
+        Some("rhino horn"),
+        Some("dog"),
+        Some("cat"),
+        Some("caterpillar"),
+        Some("elephant"),
+        Some("cat"),
+        Some("catalog"),
+        Some("scatter"),
+        Some("rhino"),
+        Some("dogma"),
+    ];
+    let mut scores = (0..18).map(|id| Some(id * 10)).collect::<Vec<_>>();
+    scores[7] = None;
+    scores[16] = None;
+    let mut ranks = (0..18).map(|id| Some(id % 5)).collect::<Vec<_>>();
+    ranks[4] = None;
+    ranks[13] = None;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..18)),
+            Arc::new(StringArray::from(texts)),
+            Arc::new(Int32Array::from(scores)),
+            Arc::new(Int32Array::from(ranks)),
+        ],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(lance::dataset::WriteParams {
+                max_rows_per_file: 6,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+    });
+
+    (tmp, uri)
+}
+
+fn scan_index_ids(
+    dataset: *const LanceDataset,
+    filter: &str,
+    use_scalar_index: bool,
+) -> (Vec<i32>, CapturedScanStatistics) {
+    let filter = c_str(filter);
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
+    assert!(!scanner.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(scanner, use_scalar_index) },
+        0
+    );
+
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut ids = Vec::new();
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let column = batch.column_by_name("id").expect("scan includes id");
+        ids.extend(
+            column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied(),
+        );
+    }
+    unsafe { lance_scanner_close(scanner) };
+    ids.sort_unstable();
+    (ids, captured)
+}
+
+#[test]
+fn test_native_scalar_index_families_create_query_and_lifecycle() {
+    let (_tmp, uri) = create_native_scalar_index_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 3);
+
+    let text = c_str("text");
+    let score = c_str("score");
+    let rank = c_str("rank");
+    let zone_params = c_str(r#"{"rows_per_zone":2,"use_seeds":false}"#);
+    let bloom_params = c_str(r#"{"number_of_items":8,"probability":0.01}"#);
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                text.as_ptr(),
+                c_str("text_ngram").as_ptr(),
+                LanceScalarIndexType::NGram as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                score.as_ptr(),
+                c_str("score_zonemap").as_ptr(),
+                LanceScalarIndexType::ZoneMap as i32,
+                zone_params.as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                rank.as_ptr(),
+                c_str("rank_bloom").as_ptr(),
+                LanceScalarIndexType::BloomFilter as i32,
+                bloom_params.as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 3);
+
+    let json_ptr = unsafe { lance_dataset_index_list_json(ds) };
+    assert!(!json_ptr.is_null(), "{}", take_last_error_message());
+    let json = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(json_ptr) };
+    let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let by_name = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| (entry["name"].as_str().unwrap(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    for (name, index_type, column) in [
+        ("text_ngram", "NGram", "text"),
+        ("score_zonemap", "ZoneMap", "score"),
+        ("rank_bloom", "BloomFilter", "rank"),
+    ] {
+        let entry = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing index {name}: {json}"));
+        assert_eq!(entry["type"], index_type, "{json}");
+        assert_eq!(entry["columns"], serde_json::json!([column]), "{json}");
+    }
+
+    let segments_ptr = unsafe { lance_dataset_index_segments_json(ds) };
+    assert!(!segments_ptr.is_null(), "{}", take_last_error_message());
+    let segments = unsafe { std::ffi::CStr::from_ptr(segments_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(segments_ptr) };
+    let segments: serde_json::Value = serde_json::from_str(&segments).unwrap();
+    let by_name = segments
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| (entry["name"].as_str().unwrap(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    for (name, index_type) in [
+        ("text_ngram", "NGram"),
+        ("score_zonemap", "ZoneMap"),
+        ("rank_bloom", "BloomFilter"),
+    ] {
+        let entry = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing segment {name}: {segments}"));
+        assert_eq!(entry["type"], index_type, "{segments}");
+        assert_eq!(entry["fragment_ids"], serde_json::json!([0, 1, 2]));
+    }
+
+    unsafe { lance_dataset_close(ds) };
+
+    let assert_indexed = |filter: &str, expected: &[i32]| {
+        let query_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+        assert!(!query_ds.is_null(), "{}", take_last_error_message());
+        let (indexed, stats) = scan_index_ids(query_ds, filter, true);
+        assert_eq!(indexed.as_slice(), expected, "indexed filter: {filter}");
+        assert!(
+            stats.indices_loaded > 0,
+            "filter must load a scalar index: {filter}"
+        );
+        let (unindexed, unindexed_stats) = scan_index_ids(query_ds, filter, false);
+        assert_eq!(unindexed.as_slice(), expected, "unindexed filter: {filter}");
+        assert_eq!(
+            unindexed_stats.indices_loaded, 0,
+            "disabled scalar index must not load an index: {filter}"
+        );
+        unsafe { lance_dataset_close(query_ds) };
+    };
+
+    assert_indexed(
+        "contains(text, 'cat')",
+        &[0, 1, 3, 6, 7, 10, 11, 13, 14, 15],
+    );
+    // `scatter` and `bobcat` contain the `cat` trigram but do not start with
+    // it, so the exact recheck must remove those NGram candidates.
+    assert_indexed("text LIKE 'cat%'", &[3, 6, 10, 11, 13, 14]);
+    assert_indexed("contains(text, 'zzzz')", &[]);
+
+    assert_indexed("score >= 100", &[10, 11, 12, 13, 14, 15, 17]);
+    assert_indexed("score = 90", &[9]);
+    assert_indexed("score = 999", &[]);
+    assert_indexed("score IS NULL", &[7, 16]);
+
+    assert_indexed("rank = 3", &[3, 8]);
+    assert_indexed("rank IN (1, 4)", &[1, 6, 9, 11, 14, 16]);
+    assert_indexed("rank = 42", &[]);
+    assert_indexed("rank IS NULL", &[4, 13]);
+
+    let prewarm_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!prewarm_ds.is_null(), "{}", take_last_error_message());
+    for name in ["text_ngram", "score_zonemap", "rank_bloom"] {
+        assert_eq!(
+            unsafe { lance_dataset_prewarm_index(prewarm_ds, c_str(name).as_ptr()) },
+            0,
+            "prewarm {name}: {}",
+            take_last_error_message()
+        );
+    }
+    unsafe { lance_dataset_close(prewarm_ds) };
+
+    let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    let (ids, stats) = scan_index_ids(reopened, "score = 90", true);
+    assert_eq!(ids, vec![9]);
+    assert!(stats.indices_loaded > 0);
+    let (ids, stats) = scan_index_ids(reopened, "rank = 3", true);
+    assert_eq!(ids, vec![3, 8]);
+    assert!(stats.indices_loaded > 0);
+    let (ids, stats) = scan_index_ids(reopened, "contains(text, 'cat')", true);
+    assert_eq!(ids, vec![0, 1, 3, 6, 7, 10, 11, 13, 14, 15]);
+    assert!(stats.indices_loaded > 0);
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                reopened,
+                score.as_ptr(),
+                c_str("score_zonemap").as_ptr(),
+                LanceScalarIndexType::ZoneMap as i32,
+                c_str(r#"{"rows_per_zone":4,"use_seeds":false}"#).as_ptr(),
+                true,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(reopened) }, 3);
+    let json_ptr = unsafe { lance_dataset_index_list_json(reopened) };
+    assert!(!json_ptr.is_null(), "{}", take_last_error_message());
+    let json = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(json_ptr) };
+    let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["name"].as_str() == Some("score_zonemap"))
+            .count(),
+        1,
+        "{json}"
+    );
+
+    for name in ["text_ngram", "score_zonemap", "rank_bloom"] {
+        assert_eq!(
+            unsafe { lance_dataset_drop_index(reopened, c_str(name).as_ptr()) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+    }
+    assert_eq!(unsafe { lance_dataset_index_count(reopened) }, 0);
+    unsafe { lance_dataset_close(reopened) };
+}
+
+#[test]
+fn test_native_scalar_index_segment_metadata_types() {
+    let (_tmp, uri) = create_native_scalar_index_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let fragment_id = 0_u32;
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &fragment_id,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let zone_params = c_str(r#"{"rows_per_zone":2,"use_seeds":false}"#);
+    let bloom_params = c_str(r#"{"number_of_items":8,"probability":0.01}"#);
+
+    for (column, index_type, params, expected_type, details_suffix) in [
+        (
+            "text",
+            LanceScalarIndexType::NGram,
+            ptr::null(),
+            5,
+            "NGramIndexDetails",
+        ),
+        (
+            "score",
+            LanceScalarIndexType::ZoneMap,
+            zone_params.as_ptr(),
+            6,
+            "ZoneMapIndexDetails",
+        ),
+        (
+            "rank",
+            LanceScalarIndexType::BloomFilter,
+            bloom_params.as_ptr(),
+            7,
+            "BloomFilterIndexDetails",
+        ),
+    ] {
+        let column = c_str(column);
+        let builder = unsafe {
+            lance_index_segment_builder_new_scalar(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                index_type as i32,
+                params,
+                &options,
+            )
+        };
+        assert!(!builder.is_null(), "{}", take_last_error_message());
+        let mut bytes = ptr::null_mut();
+        let mut len = 0_usize;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len)
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let mut metadata = ptr::null_mut();
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+            0
+        );
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_index_type(metadata) },
+            expected_type
+        );
+        let type_url = unsafe {
+            std::ffi::CStr::from_ptr(lance_index_segment_metadata_index_details_type_url(
+                metadata,
+            ))
+            .to_str()
+            .unwrap()
+        };
+        assert!(
+            type_url.ends_with(details_suffix),
+            "{details_suffix}: {type_url}"
+        );
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_fragment_count(metadata) },
+            1
+        );
+        let mut actual_fragment = u32::MAX;
+        let mut written = 0_usize;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_metadata_fragment_ids(
+                    metadata,
+                    &mut actual_fragment,
+                    1,
+                    &mut written,
+                )
+            },
+            0
+        );
+        assert_eq!(written, 1);
+        assert_eq!(actual_fragment, fragment_id);
+        unsafe {
+            lance_index_segment_metadata_free(metadata);
+            lance_free_bytes(bytes);
+            lance_index_segment_builder_free(builder);
+        }
+    }
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_native_scalar_index_native_parameter_and_type_validation() {
+    let (_tmp, uri) = create_native_scalar_index_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    let score = c_str("score");
+    let rank = c_str("rank");
+    let id = c_str("id");
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            score.as_ptr(),
+            c_str("bad_zonemap").as_ptr(),
+            LanceScalarIndexType::ZoneMap as i32,
+            c_str(r#"{"rows_per_zone":0,"use_seeds":false}"#).as_ptr(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("zone capacity must be greater than zero"),
+        "{message}"
+    );
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            rank.as_ptr(),
+            c_str("bad_bloom").as_ptr(),
+            LanceScalarIndexType::BloomFilter as i32,
+            c_str(r#"{"number_of_items":8,"probability":1.0}"#).as_ptr(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("Failed to build SBBF") || message.contains("InvalidFpp"),
+        "{message}"
+    );
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            id.as_ptr(),
+            c_str("bad_ngram").as_ptr(),
+            LanceScalarIndexType::NGram as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("Utf8"), "{message}");
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            id.as_ptr(),
+            c_str("bad_type").as_ptr(),
+            8,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("invalid scalar index type: 8"));
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ptr::null_mut(),
+            id.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::ZoneMap as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("dataset and column must not be NULL"));
+
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 0);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_native_zonemap_use_seeds_param() {
+    let (_tmp, uri) = create_native_scalar_index_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    let score = c_str("score");
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                score.as_ptr(),
+                c_str("score_zonemap_seeds").as_ptr(),
+                LanceScalarIndexType::ZoneMap as i32,
+                c_str(r#"{"rows_per_zone":2,"use_seeds":true}"#).as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+
+    let query_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!query_ds.is_null(), "{}", take_last_error_message());
+    let (ids, stats) = scan_index_ids(query_ds, "score >= 100", true);
+    assert_eq!(ids, vec![10, 11, 12, 13, 14, 15, 17]);
+    assert!(stats.indices_loaded > 0);
+    unsafe { lance_dataset_close(query_ds) };
+}
+
 #[test]
 fn test_create_scalar_index_bitmap() {
     let (_tmp, uri) = create_test_dataset();
@@ -24801,6 +25387,30 @@ fn test_scalar_segment_text_indices_still_fall_back() {
                     })
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn test_scalar_segment_zonemap_and_bloom_filter_fall_back() {
+    for (kind, predicate, expected) in [
+        (lance_index::IndexType::ZoneMap, "key >= 0", vec![1, 2, 3]),
+        (lance_index::IndexType::BloomFilter, "key = 0", vec![3]),
+    ] {
+        for stable in [false, true] {
+            let (_tmp, uri, uuids) =
+                create_scalar_segment_fixture_with_options(kind, stable, None, &[&[0], &[1, 2]]);
+            let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], predicate, None, 0);
+            assert_eq!(ids, expected, "{kind:?}, stable={stable}, {predicate}");
+            assert!(stats.metrics.iter().any(|(name, _, value)| {
+                name == "scalar_segment_fallback_index_type" && *value == 1
+            }));
+            assert!(
+                !stats
+                    .metrics
+                    .iter()
+                    .any(|(name, _, value)| { name == "scalar_segments_searched" && *value != 0 })
+            );
         }
     }
 }

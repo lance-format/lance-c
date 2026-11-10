@@ -114,6 +114,7 @@ static void assert_field_metadata_absent(
 struct ScanStatisticsCapture {
     uint64_t calls = 0;
     uint64_t bytes_read = 0;
+    uint64_t indices_loaded = 0;
     bool invalid = false;
 };
 
@@ -128,6 +129,7 @@ static void capture_scan_statistics(
     }
     captured->calls += 1;
     captured->bytes_read = statistics->bytes_read;
+    captured->indices_loaded = statistics->indices_loaded;
 }
 
 struct AsyncScanCapture {
@@ -461,7 +463,7 @@ static void test_scanner_projection_filter(const std::string& uri) {
         memset(&stream, 0, sizeof(stream));
         scanner.to_arrow_stream(&stream);
         assert_scan_schema(stream, {
-            {"id", "i"}, {"name", "u"}, {"embedding", nullptr},
+            {"id", "i"}, {"name", "u"}, {"score", "i"}, {"embedding", nullptr},
         });
         assert(drain_scan_rows(stream) == ds.count_rows());
     }
@@ -499,7 +501,7 @@ static void test_scanner_projection_filter(const std::string& uri) {
         memset(&stream, 0, sizeof(stream));
         scanner.to_arrow_stream(&stream);
         assert_scan_schema(stream, {
-            {"id", "i"}, {"name", "u"}, {"embedding", nullptr},
+            {"id", "i"}, {"name", "u"}, {"score", "i"}, {"embedding", nullptr},
         });
         assert(drain_scan_rows(stream) == 1);
     }
@@ -2005,7 +2007,7 @@ static void test_alter_columns(const std::string& dst_uri) {
 }
 
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
-// exercises `Dataset::drop_columns`. Drops `name` and `embedding` so the
+// exercises `Dataset::drop_columns`. Drops `name`, `embedding` and `score` so the
 // dataset is left with `id` only; subsequent tests (`compact_files`, `delete_rows`)
 // do not reference any dropped column. Must run after `test_update` /
 // `test_merge_insert`.
@@ -2016,7 +2018,7 @@ static void test_drop_columns(const std::string& dst_uri) {
     uint64_t before_rows = ds.count_rows();
     uint64_t v_before = ds.version();
 
-    ds.drop_columns({"name", "embedding"});
+    ds.drop_columns({"name", "embedding", "score"});
     assert(ds.count_rows() == before_rows
            && "metadata-only drop must preserve row count");
     assert(ds.version() > v_before
@@ -2584,6 +2586,93 @@ static void test_scanner_order_by(const std::string& uri) {
     PASS();
 }
 
+static std::vector<int32_t> scan_filtered_ids(
+    const std::string& uri,
+    const std::string& filter,
+    bool use_scalar_index,
+    ScanStatisticsCapture& captured) {
+    auto ds = lance::Dataset::open(uri);
+    auto scanner = ds.scan({"id", "name", "score"}, filter);
+    captured = ScanStatisticsCapture{};
+    scanner.use_scalar_index(use_scalar_index)
+        .statistics_callback(capture_scan_statistics, &captured);
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    auto ids = collect_ordering_ids(stream);
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+static void test_native_scalar_indexes(const std::string& uri) {
+    TEST(test_native_scalar_indexes);
+
+    auto ds = lance::Dataset::open(uri);
+    ds.create_scalar_index("name", LANCE_SCALAR_NGRAM, "cpp_name_ngram");
+    ds.create_scalar_index(
+        "score", LANCE_SCALAR_ZONE_MAP, "cpp_score_zonemap",
+        R"({"rows_per_zone":3,"use_seeds":false})");
+    ds.create_scalar_index(
+        "id", LANCE_SCALAR_BLOOM_FILTER, "cpp_id_bloom",
+        R"({"number_of_items":8,"probability":0.01})");
+
+    auto json = ds.list_indices_json();
+    assert(json.find("\"name\":\"cpp_name_ngram\"") != std::string::npos);
+    assert(json.find("\"type\":\"NGram\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_score_zonemap\"") != std::string::npos);
+    assert(json.find("\"type\":\"ZoneMap\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_id_bloom\"") != std::string::npos);
+    assert(json.find("\"type\":\"BloomFilter\"") != std::string::npos);
+
+    const uint64_t index_count = ds.index_count();
+    auto query_ds = lance::Dataset::open(uri);
+    auto assert_indexed = [&](const std::string& filter,
+                              const std::vector<int32_t>& expected) {
+        ScanStatisticsCapture stats;
+        assert(scan_filtered_ids(uri, filter, true, stats) == expected);
+        assert(stats.calls == 1);
+        assert(stats.indices_loaded > 0);
+        ScanStatisticsCapture unindexed_stats;
+        assert(scan_filtered_ids(uri, filter, false, unindexed_stats) == expected);
+        assert(unindexed_stats.indices_loaded == 0);
+    };
+
+    assert_indexed("contains(name, 'ali')", {1});
+    assert_indexed("contains(name, 'zzz')", {});
+    assert_indexed("score >= 180", {18, 19, 20});
+    assert_indexed("score IS NULL", {7, 16});
+    assert_indexed("id = 13", {13});
+    assert_indexed("id = 999", {});
+
+    query_ds.create_scalar_index(
+        "score", LANCE_SCALAR_ZONE_MAP, "cpp_score_zonemap",
+        R"({"rows_per_zone":4,"use_seeds":false})", true);
+    assert(query_ds.index_count() == index_count);
+    assert_indexed("id = 13", {13});
+
+    query_ds.prewarm_index("cpp_name_ngram");
+    query_ds.prewarm_index("cpp_score_zonemap");
+    query_ds.prewarm_index("cpp_id_bloom");
+
+    {
+        auto reopened = lance::Dataset::open(uri);
+        json = reopened.list_indices_json();
+        assert(json.find("\"name\":\"cpp_name_ngram\"") != std::string::npos);
+        assert(json.find("\"name\":\"cpp_score_zonemap\"") != std::string::npos);
+        assert(json.find("\"name\":\"cpp_id_bloom\"") != std::string::npos);
+
+        reopened.drop_index("cpp_name_ngram");
+        reopened.drop_index("cpp_score_zonemap");
+        reopened.drop_index("cpp_id_bloom");
+        json = reopened.list_indices_json();
+        assert(json.find("cpp_name_ngram") == std::string::npos);
+        assert(json.find("cpp_score_zonemap") == std::string::npos);
+        assert(json.find("cpp_id_bloom") == std::string::npos);
+    }
+
+    PASS();
+}
+
 static const ArrowSchema* find_schema_child(
     const ArrowSchema& schema,
     const char* name) {
@@ -2721,6 +2810,7 @@ int main(int argc, char** argv) {
     test_restore_to_current(uri);
     test_error_exception(uri);
     test_index_lifecycle(uri);
+    test_native_scalar_indexes(uri);
     test_batch_nearest(uri);
     test_scanner_materialization_fast_search(uri);
     test_nearest_smoke(uri);
