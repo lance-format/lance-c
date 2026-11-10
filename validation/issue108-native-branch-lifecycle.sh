@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_DIR=${1:?usage: issue108-native-branch-lifecycle.sh <run-dir>}
+RUN_DIR=${1:?usage: issue108-native-branch-lifecycle.sh <run-dir> [source-dir]}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+REPO_ROOT=$(cd -- "${2:-$SCRIPT_DIR/..}" && pwd)
 mkdir -p "$RUN_DIR"
 
 export CARGO_BUILD_JOBS=8
@@ -20,6 +20,7 @@ cd "$REPO_ROOT"
 {
     printf 'hostname=%s\n' "$(hostname)"
     printf 'pwd=%s\n' "$PWD"
+    printf 'source_root=%s\n' "$REPO_ROOT"
     printf 'head=%s\n' "$(git rev-parse HEAD)"
     printf 'tree=%s\n' "$(git rev-parse 'HEAD^{tree}')"
     printf 'cargo=%s\n' "$(cargo +1.94.0 --version)"
