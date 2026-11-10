@@ -3972,6 +3972,117 @@ fn test_native_ref_variants_checkout_and_old_handles() {
 }
 
 #[test]
+fn test_version_snapshots_preserve_out_of_range_timestamps() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let future = chrono::DateTime::parse_from_rfc3339("2263-01-01T00:00:00.123456789Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(future.timestamp_nanos_opt().is_none());
+
+    lance_c::runtime::block_on(async {
+        let native = Dataset::open(&uri).await.unwrap();
+        let mut manifest = native.manifest().clone();
+        manifest.set_timestamp(
+            future.timestamp() as u128 * 1_000_000_000
+                + u128::from(future.timestamp_subsec_nanos()),
+        );
+        let (store, _) = lance_io::object_store::ObjectStore::from_uri(&uri)
+            .await
+            .unwrap();
+        lance_table::io::commit::write_manifest_file_to_path(
+            &store,
+            &mut manifest,
+            None,
+            &native.manifest_location().path,
+            None,
+        )
+        .await
+        .unwrap();
+        let reopened = Dataset::open(&uri).await.unwrap();
+        assert_eq!(reopened.version().timestamp, future);
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 7);
+    });
+
+    let ds = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let versions = unsafe { lance_dataset_versions(ds) };
+    assert!(!versions.is_null(), "native-valid timestamps must remain listable");
+    assert_eq!(unsafe { lance_versions_count(versions) }, 2);
+    assert_eq!(unsafe { lance_versions_id_at(versions, 1) }, 2);
+    assert_eq!(
+        unsafe { lance_versions_timestamp_ms_at(versions, 1) },
+        future.timestamp_millis()
+    );
+    let current = unsafe { lance_dataset_current_version(ds) };
+    assert!(!current.is_null());
+    unsafe { lance_dataset_close(ds) };
+
+    let listed = unsafe { lance_versions_at(versions, 1) };
+    for snapshot in [current.cast_const(), listed] {
+        assert!(!snapshot.is_null());
+        assert_eq!(unsafe { lance_version_timestamp_ns(snapshot) }, 0);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert_eq!(unsafe { lance_version_id(snapshot) }, 2);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+        assert_eq!(version_metadata(snapshot).get("total_rows").unwrap(), "7");
+    }
+    assert_eq!(
+        unsafe { lance_versions_timestamp_ms_at(versions, 1) },
+        future.timestamp_millis()
+    );
+    unsafe {
+        lance_version_close(current);
+        lance_versions_close(versions);
+    }
+}
+
+#[test]
+fn test_tag_snapshots_preserve_out_of_range_timestamps() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let tag_dir = std::path::Path::new(&uri).join("_refs/tags");
+    std::fs::create_dir_all(&tag_dir).unwrap();
+    std::fs::write(
+        tag_dir.join("wide-time.json"),
+        r#"{"branch":null,"version":2,"manifestSize":123,"createdAt":"2263-01-01T00:00:00.123456789Z","updatedAt":"1600-01-01T00:00:00Z","metadata":{"purpose":"time-range"}}"#,
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        let native = Dataset::open(&uri).await.unwrap();
+        let tag = native.tags().get("wide-time").await.unwrap();
+        assert!(tag.created_at.unwrap().timestamp_nanos_opt().is_none());
+        assert!(tag.updated_at.unwrap().timestamp_nanos_opt().is_none());
+    });
+
+    let ds = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let tags = unsafe { lance_dataset_tags(ds) };
+    assert!(!tags.is_null());
+    assert_eq!(unsafe { lance_tags_count(tags) }, 1);
+    let tag = unsafe { lance_dataset_tag_get(ds, c_str("wide-time").as_ptr()) };
+    assert!(!tag.is_null());
+    unsafe { lance_dataset_close(ds) };
+
+    let listed = unsafe { lance_tags_at(tags, 0) };
+    for snapshot in [tag.cast_const(), listed] {
+        assert!(!snapshot.is_null());
+        let mut timestamp = 77;
+        assert_eq!(unsafe { lance_tag_created_at_ns(snapshot, &mut timestamp) }, -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert_eq!(timestamp, 77);
+        assert_eq!(unsafe { lance_tag_updated_at_ns(snapshot, &mut timestamp) }, -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert_eq!(timestamp, 77);
+        assert_eq!(unsafe { lance_tag_version(snapshot) }, 2);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+        assert_eq!(unsafe { lance_tag_metadata_count(snapshot) }, 1);
+    }
+    unsafe {
+        lance_tag_close(tag);
+        lance_tags_close(tags);
+    }
+}
+
+#[test]
 fn test_tag_lifecycle_metadata_conflicts_and_persistence() {
     let (_tmp, uri) = create_two_version_dataset();
     let c_uri = c_str(&uri);
