@@ -2039,7 +2039,7 @@ static size_t scan_ids_with_statistics(
     ScanStatisticsCapture *captured) {
     LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
     ASSERT(ds != NULL, "native scalar dataset open failed");
-    const char *columns[] = {"id", "name", NULL};
+    const char *columns[] = {"id", "name", "score", NULL};
     LanceScanner *scanner = lance_scanner_new(ds, columns, filter);
     ASSERT(scanner != NULL, "native scalar scanner creation failed");
     ASSERT(lance_scanner_set_use_scalar_index(
@@ -2088,11 +2088,11 @@ static void test_native_scalar_indexes(const char *uri) {
                ds, "name", "c_name_ngram", LANCE_SCALAR_NGRAM, NULL, 0) == 0,
            "C NGram index creation failed");
     ASSERT(lance_dataset_create_scalar_index(
-               ds, "id", "c_id_zonemap", LANCE_SCALAR_ZONE_MAP,
+               ds, "score", "c_score_zonemap", LANCE_SCALAR_ZONE_MAP,
                "{\"rows_per_zone\":3,\"use_seeds\":false}", 0) == 0,
            "C ZoneMap index creation failed");
     ASSERT(lance_dataset_create_scalar_index(
-               ds, "name", "c_name_bloom", LANCE_SCALAR_BLOOM_FILTER,
+               ds, "id", "c_id_bloom", LANCE_SCALAR_BLOOM_FILTER,
                "{\"number_of_items\":8,\"probability\":0.01}", 0) == 0,
            "C BloomFilter index creation failed");
 
@@ -2101,10 +2101,10 @@ static void test_native_scalar_indexes(const char *uri) {
     ASSERT(strstr(json, "\"name\":\"c_name_ngram\"") != NULL &&
                strstr(json, "\"type\":\"NGram\"") != NULL,
            "C NGram index listing mismatch");
-    ASSERT(strstr(json, "\"name\":\"c_id_zonemap\"") != NULL &&
+    ASSERT(strstr(json, "\"name\":\"c_score_zonemap\"") != NULL &&
                strstr(json, "\"type\":\"ZoneMap\"") != NULL,
            "C ZoneMap index listing mismatch");
-    ASSERT(strstr(json, "\"name\":\"c_name_bloom\"") != NULL &&
+    ASSERT(strstr(json, "\"name\":\"c_id_bloom\"") != NULL &&
                strstr(json, "\"type\":\"BloomFilter\"") != NULL,
            "C BloomFilter index listing mismatch");
     lance_free_string(json);
@@ -2114,17 +2114,18 @@ static void test_native_scalar_indexes(const char *uri) {
 
     const int32_t alice[] = {1};
     const int32_t none[] = {0};
-    const int32_t high_ids[] = {18, 19, 20};
+    const int32_t high_scores[] = {18, 19, 20};
+    const int32_t null_scores[] = {7, 16};
     const int32_t id_thirteen[] = {13};
     check_native_scalar_query(uri, "contains(name, 'ali')", alice, 1);
     check_native_scalar_query(uri, "contains(name, 'zzz')", none, 0);
-    check_native_scalar_query(uri, "id >= 18", high_ids, 3);
+    check_native_scalar_query(uri, "score >= 180", high_scores, 3);
+    check_native_scalar_query(uri, "score IS NULL", null_scores, 2);
     check_native_scalar_query(uri, "id = 13", id_thirteen, 1);
-    check_native_scalar_query(uri, "name = 'alice'", alice, 1);
-    check_native_scalar_query(uri, "name = 'zzz'", none, 0);
+    check_native_scalar_query(uri, "id = 999", none, 0);
 
     ASSERT(lance_dataset_create_scalar_index(
-               ds, "id", "c_id_zonemap", LANCE_SCALAR_ZONE_MAP,
+               ds, "score", "c_score_zonemap", LANCE_SCALAR_ZONE_MAP,
                "{\"rows_per_zone\":4,\"use_seeds\":false}", 1) == 0,
            "C ZoneMap replacement failed");
     ASSERT(lance_dataset_index_count(ds) == index_count,
@@ -2135,9 +2136,9 @@ static void test_native_scalar_indexes(const char *uri) {
 
     ASSERT(lance_dataset_prewarm_index(ds, "c_name_ngram") == 0,
            "C NGram prewarm failed");
-    ASSERT(lance_dataset_prewarm_index(ds, "c_id_zonemap") == 0,
+    ASSERT(lance_dataset_prewarm_index(ds, "c_score_zonemap") == 0,
            "C ZoneMap prewarm failed");
-    ASSERT(lance_dataset_prewarm_index(ds, "c_name_bloom") == 0,
+    ASSERT(lance_dataset_prewarm_index(ds, "c_id_bloom") == 0,
            "C BloomFilter prewarm failed");
 
     lance_dataset_close(ds);
@@ -2146,22 +2147,22 @@ static void test_native_scalar_indexes(const char *uri) {
     json = (char *)lance_dataset_index_list_json(ds);
     ASSERT(json != NULL, "C reopened index list failed");
     ASSERT(strstr(json, "\"name\":\"c_name_ngram\"") != NULL &&
-               strstr(json, "\"name\":\"c_id_zonemap\"") != NULL &&
-               strstr(json, "\"name\":\"c_name_bloom\"") != NULL,
+               strstr(json, "\"name\":\"c_score_zonemap\"") != NULL &&
+               strstr(json, "\"name\":\"c_id_bloom\"") != NULL,
            "C native scalar indexes did not survive reopen");
     lance_free_string(json);
 
     ASSERT(lance_dataset_drop_index(ds, "c_name_ngram") == 0,
            "C NGram drop failed");
-    ASSERT(lance_dataset_drop_index(ds, "c_id_zonemap") == 0,
+    ASSERT(lance_dataset_drop_index(ds, "c_score_zonemap") == 0,
            "C ZoneMap drop failed");
-    ASSERT(lance_dataset_drop_index(ds, "c_name_bloom") == 0,
+    ASSERT(lance_dataset_drop_index(ds, "c_id_bloom") == 0,
            "C BloomFilter drop failed");
     json = (char *)lance_dataset_index_list_json(ds);
     ASSERT(json != NULL, "C final index list failed");
     ASSERT(strstr(json, "c_name_ngram") == NULL &&
-               strstr(json, "c_id_zonemap") == NULL &&
-               strstr(json, "c_name_bloom") == NULL,
+               strstr(json, "c_score_zonemap") == NULL &&
+               strstr(json, "c_id_bloom") == NULL,
            "C dropped native scalar indexes remain listed");
     lance_free_string(json);
     lance_dataset_close(ds);

@@ -68,6 +68,7 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Int32, true),
         Field::new(
             "embedding",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 8),
@@ -77,6 +78,16 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
 
     let make_batch = |start: i32, names: Vec<&str>| {
         let ids: Vec<i32> = (start..start + names.len() as i32).collect();
+        let scores = ids
+            .iter()
+            .map(|id| {
+                if *id == 7 || *id == 16 {
+                    None
+                } else {
+                    Some(id * 10)
+                }
+            })
+            .collect::<Vec<_>>();
         let values = Float32Array::from_iter_values(
             ids.iter()
                 .flat_map(|id| (0..8).map(move |component| *id as f32 * 0.1 + component as f32)),
@@ -93,6 +104,7 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
             vec![
                 Arc::new(Int32Array::from(ids)),
                 Arc::new(StringArray::from(names)),
+                Arc::new(Int32Array::from(scores)),
                 Arc::new(vectors),
             ],
         )
