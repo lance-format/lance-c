@@ -2119,6 +2119,70 @@ static const ArrowSchema* find_schema_child(
     return nullptr;
 }
 
+static void test_scanner_introspection(const std::string& uri) {
+    TEST(test_scanner_introspection);
+
+    auto ds = lance::Dataset::open(uri);
+    assert(ds.count_rows() == 20);
+    assert(ds.count_rows("id >= 11") == 10);
+
+    bool caught = false;
+    try {
+        (void)ds.count_rows(std::string());
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+
+    auto scanner = ds.scan(std::nullopt, "id >= 11");
+    scanner.project({
+        {"id_alias", "id"},
+        {"next_id", "id + 1"},
+    });
+    ArrowSchema schema{};
+    scanner.schema(&schema);
+    assert(schema.n_children == 2);
+    assert(find_schema_child(schema, "id_alias"));
+    assert(find_schema_child(schema, "next_id"));
+    if (schema.release) schema.release(&schema);
+
+    uint64_t count = scanner.count_rows();
+    assert(count == 10);
+    assert(scanner.count_rows() == count);
+    assert(!scanner.explain_plan().empty());
+    assert(scanner.analyze_plan().find("AggregateExec") == std::string::npos);
+    assert(scanner.analyze_count_plan().find("AggregateExec") !=
+           std::string::npos);
+
+    scanner.batch_size(2);
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    ArrowSchema stream_schema{};
+    assert(stream.get_schema(&stream, &stream_schema) == 0);
+    assert(find_schema_child(stream_schema, "id_alias"));
+    assert(find_schema_child(stream_schema, "next_id"));
+    if (stream_schema.release) stream_schema.release(&stream_schema);
+    assert(drain_scan_rows(stream) == count);
+
+    auto limited = ds.scan();
+    limited.limit(0);
+    caught = false;
+    try {
+        (void)limited.count_rows();
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        assert(std::string(error.what()).find(
+                   "Cannot use limit/offset with aggregate") !=
+               std::string::npos);
+    }
+    assert(caught);
+
+    PASS();
+}
+
 static void test_fragment_snapshots(const std::string& uri) {
     TEST(test_fragment_snapshots);
 
@@ -2229,6 +2293,7 @@ int main(int argc, char** argv) {
     test_scanner_projection_filter(uri);
     test_scanner_projection(uri);
     test_scanner_order_by(ordering_uri);
+    test_scanner_introspection(uri);
     test_fragment_snapshots(fragment_uri);
     test_scanner_row_addr_lists(uri);
     test_distance_range(uri);

@@ -2155,7 +2155,13 @@ class Scanner {
     Handle<LanceScanner, lance_scanner_close> handle_;
 
     static std::string take_owned_string(const char* raw) {
-        if (!raw) check_error();
+        if (!raw) {
+            if (lance_last_error_code() == LANCE_OK) {
+                throw Error(LANCE_ERR_INTERNAL,
+                            "scanner plan API returned NULL without an error");
+            }
+            check_error();
+        }
         std::unique_ptr<const char, void (*)(const char*)> guard(
             raw, lance_free_string);
         return std::string(raw);
@@ -2501,10 +2507,9 @@ public:
         return take_owned_string(lance_scanner_analyze_plan(handle_.get()));
     }
 
-    /// Execute the native COUNT(*) plan for this scanner.
-    /// Native aggregate planning rejects configured limit/offset/ordering.
-    /// Returns 0 on error; check the lance error code or use C++ exception
-    /// propagation through a stream operation.
+    /// Execute the native COUNT(*) plan for this scanner. Native aggregate
+    /// planning rejects configured limit/offset/ordering. Throws lance::Error
+    /// on failure.
     uint64_t count_rows() const {
         uint64_t count = lance_scanner_count_rows(handle_.get());
         if (lance_last_error_code() != LANCE_OK) check_error();

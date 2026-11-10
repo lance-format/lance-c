@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_array::Int64Array;
 use arrow_schema::SchemaRef;
@@ -964,9 +965,11 @@ impl PreparedScanner {
             return Ok(PreparedPlan {
                 plan,
                 batch_size,
-                stats_callback: (operation == ScannerOperation::Scan)
-                    .then_some(configured.stats_callback)
-                    .flatten(),
+                stats_callback: if operation == ScannerOperation::Scan {
+                    configured.stats_callback
+                } else {
+                    None
+                },
             });
         }
 
@@ -994,9 +997,11 @@ impl PreparedScanner {
             return Ok(PreparedPlan {
                 plan,
                 batch_size,
-                stats_callback: (operation == ScannerOperation::Scan)
-                    .then_some(scan_statistics_callback)
-                    .flatten(),
+                stats_callback: if operation == ScannerOperation::Scan {
+                    scan_statistics_callback
+                } else {
+                    None
+                },
             });
         }
 
@@ -1009,9 +1014,11 @@ impl PreparedScanner {
             return Ok(PreparedPlan {
                 plan,
                 batch_size: distributed_fts.batch_size,
-                stats_callback: (operation == ScannerOperation::Scan)
-                    .then_some(distributed_fts.scan_statistics_callback)
-                    .flatten(),
+                stats_callback: if operation == ScannerOperation::Scan {
+                    distributed_fts.scan_statistics_callback
+                } else {
+                    None
+                },
             });
         }
 
@@ -1022,9 +1029,11 @@ impl PreparedScanner {
         Ok(PreparedPlan {
             plan: scanner.create_plan().await?,
             batch_size,
-            stats_callback: (operation == ScannerOperation::Scan)
-                .then_some(scan_statistics_callback)
-                .flatten(),
+            stats_callback: if operation == ScannerOperation::Scan {
+                scan_statistics_callback
+            } else {
+                None
+            },
         })
     }
 
@@ -1492,11 +1501,8 @@ macro_rules! scanner_poison_check {
     };
 }
 
-/// Run a scanner configuration call through the common FFI guard and poison
-/// the handle if that call catches a panic. Regular Lance errors remain
-/// recoverable and do not poison the builder.
-macro_rules! scanner_ffi_try {
-    ($scanner:expr, $body:expr $(,)?) => {{
+macro_rules! scanner_ffi_try_value {
+    ($scanner:expr, $errval:expr, $body:expr $(,)?) => {{
         let scanner_ptr = $scanner;
         ffi_guard_with(
             || $body,
@@ -1506,10 +1512,19 @@ macro_rules! scanner_ffi_try {
                         .poison_flag()
                         .store(true, Ordering::SeqCst);
                 }
-                -1
+                $errval
             },
         )
     }};
+}
+
+/// Run a scanner configuration call through the common FFI guard and poison
+/// the handle if that call catches a panic. Regular Lance errors remain
+/// recoverable and do not poison the builder.
+macro_rules! scanner_ffi_try {
+    ($scanner:expr, $body:expr $(,)?) => {
+        scanner_ffi_try_value!($scanner, -1, $body)
+    };
 }
 
 /// Enable bounded runtime BTree selection for an explicitly scoped scalar segment scan.
@@ -2777,7 +2792,7 @@ pub unsafe extern "C" fn lance_scanner_explain_plan(
     verbose: bool,
 ) -> *const c_char {
     scanner_poison_check!(scanner, ptr::null());
-    scanner_ffi_try!(scanner, unsafe {
+    scanner_ffi_try_value!(scanner, ptr::null(), unsafe {
         scanner_plan_string_inner(scanner, ScannerPlanString::Explain(verbose))
     })
 }
@@ -2792,7 +2807,7 @@ pub unsafe extern "C" fn lance_scanner_explain_plan(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_analyze_plan(scanner: *const LanceScanner) -> *const c_char {
     scanner_poison_check!(scanner, ptr::null());
-    scanner_ffi_try!(scanner, unsafe {
+    scanner_ffi_try_value!(scanner, ptr::null(), unsafe {
         scanner_plan_string_inner(scanner, ScannerPlanString::Analyze)
     })
 }
@@ -2807,7 +2822,7 @@ pub unsafe extern "C" fn lance_scanner_analyze_plan(scanner: *const LanceScanner
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_count_rows(scanner: *const LanceScanner) -> u64 {
     scanner_poison_check!(scanner, 0);
-    scanner_ffi_try!(scanner, unsafe { scanner_count_rows_inner(scanner) })
+    scanner_ffi_try_value!(scanner, 0, unsafe { scanner_count_rows_inner(scanner) })
 }
 
 unsafe fn scanner_count_rows_inner(scanner: *const LanceScanner) -> Result<u64> {
@@ -2830,7 +2845,7 @@ pub unsafe extern "C" fn lance_scanner_analyze_count_plan(
     scanner: *const LanceScanner,
 ) -> *const c_char {
     scanner_poison_check!(scanner, ptr::null());
-    scanner_ffi_try!(scanner, unsafe {
+    scanner_ffi_try_value!(scanner, ptr::null(), unsafe {
         scanner_plan_string_inner(scanner, ScannerPlanString::AnalyzeCount)
     })
 }
@@ -5152,7 +5167,10 @@ mod tests {
         assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, false) }, 0);
         assert!(!unsafe { &*scanner }.fast_search);
 
-        let prepared = unsafe { &*scanner }.build_scanner().unwrap();
+        let mut batch = ptr::null_mut();
+        assert_eq!(unsafe { lance_scanner_next(scanner, &mut batch) }, 0);
+        assert!(!batch.is_null());
+        unsafe { crate::batch::lance_batch_free(batch) };
         assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, true) }, -1);
         assert_eq!(
             unsafe {
@@ -5170,7 +5188,6 @@ mod tests {
             MaterializationStyle::AllLate
         ));
         assert!(!unsafe { &*scanner }.fast_search);
-        drop(prepared);
 
         unsafe {
             lance_scanner_close(scanner);
