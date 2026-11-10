@@ -311,6 +311,81 @@ uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
  */
 uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
 
+/* ─── Dataset table and schema metadata ─── */
+
+/** How a metadata update applies to the existing map. */
+typedef enum {
+    /* Merge entries into the existing map. */
+    LANCE_METADATA_UPDATE_MERGE   = 0,
+    /* Replace the existing map with the entries that carry values. */
+    LANCE_METADATA_UPDATE_REPLACE = 1,
+} LanceMetadataUpdateMode;
+
+/**
+ * Return this snapshot's table metadata as a JSON object mapping keys to
+ * string values. Keys and values are JSON-escaped. An empty map is `{}`.
+ *
+ * Schema metadata is part of the Arrow schema returned by
+ * `lance_dataset_schema()` and is not duplicated here.
+ *
+ * Caller must free the returned string with `lance_free_string()`.
+ * Returns NULL on error.
+ */
+const char* lance_dataset_metadata_json(const LanceDataset* dataset);
+
+/**
+ * Merge or replace table metadata and return the complete updated map as a
+ * JSON object.
+ *
+ * `keys` and `values` are parallel arrays of length `count`.
+ * - `keys[i]` must be a non-NULL, NUL-terminated UTF-8 string.
+ * - `values[i] == NULL` removes `keys[i]`, matching the native `None` value.
+ *   It does not store an empty value.
+ * - An empty string value is a real value and is stored as `""`.
+ * - `keys` and `values` may be NULL only when `count == 0`.
+ *
+ * `mode` is explicit:
+ * - `LANCE_METADATA_UPDATE_MERGE` applies the entries to the existing map.
+ * - `LANCE_METADATA_UPDATE_REPLACE` replaces the entire map. With
+ *   `count == 0`, this clears the map; value-less entries are omitted.
+ *
+ * The native builder performs the commit. This mutates `dataset` in place;
+ * the same handle remains valid and sees the new version, while existing
+ * dataset snapshots and scanners keep their prior view. Key validation,
+ * version transitions, concurrent transaction behavior and error semantics
+ * follow the pinned Lance core.
+ *
+ * Caller must free the returned JSON string with `lance_free_string()`.
+ * Returns NULL on error. Commit and error semantics follow the native core.
+ */
+const char* lance_dataset_update_metadata_json(
+    LanceDataset* dataset,
+    const char* const* keys,
+    const char* const* values,
+    size_t count,
+    LanceMetadataUpdateMode mode
+);
+
+/**
+ * Merge or replace schema metadata and return the complete updated schema
+ * metadata map as a JSON object. Input and ownership rules match
+ * `lance_dataset_update_metadata_json`.
+ *
+ * This changes only schema metadata: dataset fields, fragments, table
+ * metadata and configuration are unchanged. Read the committed schema
+ * metadata through the Arrow schema returned by `lance_dataset_schema()`.
+ *
+ * Caller must free the returned JSON string with `lance_free_string()`.
+ * Returns NULL on error. Commit and error semantics follow the native core.
+ */
+const char* lance_dataset_update_schema_metadata_json(
+    LanceDataset* dataset,
+    const char* const* keys,
+    const char* const* values,
+    size_t count,
+    LanceMetadataUpdateMode mode
+);
+
 /* ─── Version history ─── */
 
 /**

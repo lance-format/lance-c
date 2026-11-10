@@ -66,10 +66,49 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | Status | Component | Description |
 |--------|-----------|-------------|
 | [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
-| [x] | Dataset metadata | `lance_dataset_version()`, `lance_dataset_count_rows()`, `lance_dataset_latest_version()` |
+| [x] | Dataset metadata | Version/count accessors plus JSON table metadata reads and native merge/replace updates for table and schema metadata |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
 | [x] | Row prefilter | `lance_scanner_set_row_addr_allowlist()` / `lance_scanner_set_row_addr_blocklist()` restrict scans, nearest-neighbor and full-text searches to (or exclude) a set of `_rowid`s before ranking |
 | [x] | Native ordering | `lance_scanner_set_order_by()` and C++ `Scanner::order_by()` sort by one or more columns with direction and NULL placement |
+
+## Dataset metadata
+
+Table metadata is available through `lance_dataset_metadata_json()` or
+`Dataset::metadata_json()`. Updates return the complete post-commit map:
+
+```c
+const char* keys[] = {"owner", "retired", "empty"};
+const char* values[] = {"c-consumer", NULL, ""};
+const char* updated = lance_dataset_update_metadata_json(
+    dataset, keys, values, 3, LANCE_METADATA_UPDATE_MERGE);
+if (!updated) {
+    /* Check lance_last_error_code()/message. */
+}
+lance_free_string(updated);
+```
+
+```cpp
+ds.update_metadata_json({
+    {"owner", std::string("c++")},
+    {"retired", std::nullopt},
+    {"empty", std::string("")},
+}, lance::MetadataUpdateMode::Merge);
+
+ds.update_schema_metadata_json({
+    {"schema-owner", std::string("c++")},
+});
+```
+
+A NULL value removes the key. An empty string remains a real empty value.
+`LANCE_METADATA_UPDATE_REPLACE` / `MetadataUpdateMode::Replace` replaces the
+whole map; an empty update in replace mode clears it. Updates mutate the same
+dataset handle under Lance's native snapshot and commit semantics: the handle
+sees the new version, while existing dataset snapshots and scanners keep their
+prior view. Table and schema maps are independent.
+
+The exported Arrow schema is still the schema metadata read path. Use
+`lance_dataset_schema()` or `Dataset::schema()` to inspect the committed schema
+metadata; no duplicate C-side metadata cache is maintained.
 
 ## Scanner ordering
 
