@@ -59,12 +59,6 @@ case "$mode" in
             -- --ignored --nocapture
         )
         ;;
-    test-*)
-        cmd=(
-            cargo +1.94.0 test --test "${mode#test-}" -j 8
-            -- --test-threads=4
-        )
-        ;;
     test-filter)
         if (( $# != 3 )); then
             echo "test-filter requires an integration file and test name" >&2
@@ -73,6 +67,12 @@ case "$mode" in
         label="test-filter-$2-$3"
         cmd=(
             cargo +1.94.0 test --test "$2" -j 8 "$3"
+            -- --test-threads=4
+        )
+        ;;
+    test-*)
+        cmd=(
+            cargo +1.94.0 test --test "${mode#test-}" -j 8
             -- --test-threads=4
         )
         ;;
