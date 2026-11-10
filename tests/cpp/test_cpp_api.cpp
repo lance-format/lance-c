@@ -1993,10 +1993,6 @@ static void test_native_scalar_indexes(const std::string& uri) {
         "name", LANCE_SCALAR_BLOOM_FILTER, "cpp_name_bloom",
         R"({"number_of_items":8,"probability":0.01})");
 
-    ds.prewarm_index("cpp_name_ngram");
-    ds.prewarm_index("cpp_id_zonemap");
-    ds.prewarm_index("cpp_name_bloom");
-
     auto json = ds.list_indices_json();
     assert(json.find("\"name\":\"cpp_name_ngram\"") != std::string::npos);
     assert(json.find("\"type\":\"NGram\"") != std::string::npos);
@@ -2006,18 +2002,19 @@ static void test_native_scalar_indexes(const std::string& uri) {
     assert(json.find("\"type\":\"BloomFilter\"") != std::string::npos);
 
     const uint64_t index_count = ds.index_count();
+    auto query_ds = lance::Dataset::open(uri);
     auto assert_indexed = [&](const std::string& filter,
                               const std::vector<int32_t>& expected,
                               bool require_comparisons = true) {
         ScanStatisticsCapture stats;
-        assert(scan_filtered_ids(ds, filter, true, stats) == expected);
+        assert(scan_filtered_ids(query_ds, filter, true, stats) == expected);
         assert(stats.calls == 1);
         assert(stats.indices_loaded > 0);
         if (require_comparisons) {
             assert(stats.index_comparisons > 0);
         }
         ScanStatisticsCapture unindexed_stats;
-        assert(scan_filtered_ids(ds, filter, false, unindexed_stats) == expected);
+        assert(scan_filtered_ids(query_ds, filter, false, unindexed_stats) == expected);
         assert(unindexed_stats.indices_loaded == 0);
     };
 
@@ -2028,11 +2025,15 @@ static void test_native_scalar_indexes(const std::string& uri) {
     assert_indexed("name = 'alice'", {1});
     assert_indexed("name = 'zzz'", {});
 
-    ds.create_scalar_index(
+    query_ds.create_scalar_index(
         "id", LANCE_SCALAR_ZONE_MAP, "cpp_id_zonemap",
         R"({"rows_per_zone":4,"use_seeds":false})", true);
-    assert(ds.index_count() == index_count);
+    assert(query_ds.index_count() == index_count);
     assert_indexed("id = 13", {13});
+
+    query_ds.prewarm_index("cpp_name_ngram");
+    query_ds.prewarm_index("cpp_id_zonemap");
+    query_ds.prewarm_index("cpp_name_bloom");
 
     {
         auto reopened = lance::Dataset::open(uri);

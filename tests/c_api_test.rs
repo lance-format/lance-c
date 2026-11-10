@@ -6582,17 +6582,12 @@ fn test_native_scalar_index_families_create_query_and_lifecycle() {
         assert_eq!(entry["fragment_ids"], serde_json::json!([0, 1, 2]));
     }
 
-    for name in ["text_ngram", "score_zonemap", "rank_bloom"] {
-        assert_eq!(
-            unsafe { lance_dataset_prewarm_index(ds, c_str(name).as_ptr()) },
-            0,
-            "prewarm {name}: {}",
-            take_last_error_message()
-        );
-    }
+    unsafe { lance_dataset_close(ds) };
+    let query_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!query_ds.is_null(), "{}", take_last_error_message());
 
     let assert_indexed = |filter: &str, expected: &[i32], require_comparisons: bool| {
-        let (indexed, stats) = scan_index_ids(ds, filter, true);
+        let (indexed, stats) = scan_index_ids(query_ds, filter, true);
         assert_eq!(indexed.as_slice(), expected, "indexed filter: {filter}");
         assert!(
             stats.indices_loaded > 0,
@@ -6604,7 +6599,7 @@ fn test_native_scalar_index_families_create_query_and_lifecycle() {
                 "filter must compare indexed values: {filter}"
             );
         }
-        let (unindexed, unindexed_stats) = scan_index_ids(ds, filter, false);
+        let (unindexed, unindexed_stats) = scan_index_ids(query_ds, filter, false);
         assert_eq!(unindexed.as_slice(), expected, "unindexed filter: {filter}");
         assert_eq!(
             unindexed_stats.indices_loaded, 0,
@@ -6622,11 +6617,7 @@ fn test_native_scalar_index_families_create_query_and_lifecycle() {
     assert_indexed("text LIKE 'cat%'", &[3, 6, 10, 11, 13, 14], true);
     assert_indexed("contains(text, 'zzzz')", &[], false);
 
-    assert_indexed(
-        "score >= 100",
-        &[10, 11, 12, 13, 14, 15, 17],
-        true,
-    );
+    assert_indexed("score >= 100", &[10, 11, 12, 13, 14, 15, 17], true);
     assert_indexed("score = 90", &[9], true);
     assert_indexed("score = 999", &[], true);
     assert_indexed("score IS NULL", &[7, 16], false);
@@ -6636,7 +6627,16 @@ fn test_native_scalar_index_families_create_query_and_lifecycle() {
     assert_indexed("rank = 42", &[], true);
     assert_indexed("rank IS NULL", &[4, 13], false);
 
-    unsafe { lance_dataset_close(ds) };
+    for name in ["text_ngram", "score_zonemap", "rank_bloom"] {
+        assert_eq!(
+            unsafe { lance_dataset_prewarm_index(query_ds, c_str(name).as_ptr()) },
+            0,
+            "prewarm {name}: {}",
+            take_last_error_message()
+        );
+    }
+    unsafe { lance_dataset_close(query_ds) };
+
     let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!reopened.is_null(), "{}", take_last_error_message());
     let (ids, stats) = scan_index_ids(reopened, "score = 90", true);
@@ -21354,32 +21354,23 @@ fn test_scalar_segment_text_indices_still_fall_back() {
 #[test]
 fn test_scalar_segment_zonemap_and_bloom_filter_fall_back() {
     for (kind, predicate, expected) in [
-        (
-            lance_index::IndexType::ZoneMap,
-            "key >= 0",
-            vec![1, 2, 3],
-        ),
-        (
-            lance_index::IndexType::BloomFilter,
-            "key = 0",
-            vec![3],
-        ),
+        (lance_index::IndexType::ZoneMap, "key >= 0", vec![1, 2, 3]),
+        (lance_index::IndexType::BloomFilter, "key = 0", vec![3]),
     ] {
         for stable in [false, true] {
-            let (_tmp, uri, uuids) = create_scalar_segment_fixture_with_options(
-                kind,
-                stable,
-                None,
-                &[&[0], &[1, 2]],
-            );
+            let (_tmp, uri, uuids) =
+                create_scalar_segment_fixture_with_options(kind, stable, None, &[&[0], &[1, 2]]);
             let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], predicate, None, 0);
             assert_eq!(ids, expected, "{kind:?}, stable={stable}, {predicate}");
             assert!(stats.metrics.iter().any(|(name, _, value)| {
                 name == "scalar_segment_fallback_index_type" && *value == 1
             }));
-            assert!(!stats.metrics.iter().any(|(name, _, value)| {
-                name == "scalar_segments_searched" && *value != 0
-            }));
+            assert!(
+                !stats
+                    .metrics
+                    .iter()
+                    .any(|(name, _, value)| { name == "scalar_segments_searched" && *value != 0 })
+            );
         }
     }
 }

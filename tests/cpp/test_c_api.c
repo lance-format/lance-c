@@ -2041,7 +2041,7 @@ static size_t scan_ids_with_statistics(
     ScanStatisticsCapture *captured) {
     LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
     ASSERT(ds != NULL, "native scalar dataset open failed");
-    const char *columns[] = {"id", NULL};
+    const char *columns[] = {"id", "name", NULL};
     LanceScanner *scanner = lance_scanner_new(ds, columns, filter);
     ASSERT(scanner != NULL, "native scalar scanner creation failed");
     ASSERT(lance_scanner_set_use_scalar_index(
@@ -2103,13 +2103,6 @@ static void test_native_scalar_indexes(const char *uri) {
                "{\"number_of_items\":8,\"probability\":0.01}", 0) == 0,
            "C BloomFilter index creation failed");
 
-    ASSERT(lance_dataset_prewarm_index(ds, "c_name_ngram") == 0,
-           "C NGram prewarm failed");
-    ASSERT(lance_dataset_prewarm_index(ds, "c_id_zonemap") == 0,
-           "C ZoneMap prewarm failed");
-    ASSERT(lance_dataset_prewarm_index(ds, "c_name_bloom") == 0,
-           "C BloomFilter prewarm failed");
-
     char *json = (char *)lance_dataset_index_list_json(ds);
     ASSERT(json != NULL, "C index list failed");
     ASSERT(strstr(json, "\"name\":\"c_name_ngram\"") != NULL &&
@@ -2146,6 +2139,13 @@ static void test_native_scalar_indexes(const char *uri) {
 
     const int32_t expected_after_replace[] = {13};
     check_native_scalar_query(uri, "id = 13", expected_after_replace, 1, 1);
+
+    ASSERT(lance_dataset_prewarm_index(ds, "c_name_ngram") == 0,
+           "C NGram prewarm failed");
+    ASSERT(lance_dataset_prewarm_index(ds, "c_id_zonemap") == 0,
+           "C ZoneMap prewarm failed");
+    ASSERT(lance_dataset_prewarm_index(ds, "c_name_bloom") == 0,
+           "C BloomFilter prewarm failed");
 
     lance_dataset_close(ds);
     ds = lance_dataset_open(uri, NULL, 0);
