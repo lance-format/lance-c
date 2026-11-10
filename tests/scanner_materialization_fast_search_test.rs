@@ -428,7 +428,7 @@ fn materialization_rejections_preserve_state_and_lifecycle() {
             0,
         )
     });
-    let missing = c("payload.missing");
+    let missing = c("missing");
     assert_eq!(
         unsafe {
             lance_scanner_set_materialization_style(
