@@ -517,7 +517,9 @@ pub(crate) unsafe fn parse_storage_version(
     let value = unsafe { helpers::parse_c_string(ptr)? }
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            lance_core::Error::invalid_input_source(format!("{field} must not be an empty string"))
+            lance_core::Error::invalid_input_source(
+                format!("{field} must not be an empty string").into(),
+            )
         })?;
     let version = LanceFileVersion::from_str(value).map_err(|error| {
         lance_core::Error::invalid_input_source(

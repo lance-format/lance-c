@@ -19300,6 +19300,56 @@ fn test_native_transaction_protobuf_boundaries() {
     use lance_table::format::pb;
     use prost::Message;
 
+    let tagged_message = pb::Transaction {
+        read_version: 9,
+        uuid: "tagged-append".to_string(),
+        operation: Some(pb::transaction::Operation::Append(
+            pb::transaction::Append {
+                fragments: Vec::new(),
+            },
+        )),
+        tag: "release-9".to_string(),
+        transaction_properties: std::collections::HashMap::from([(
+            "engine".to_string(),
+            "native".to_string(),
+        )]),
+    };
+    let tagged_bytes = tagged_message.encode_to_vec();
+    let tagged = transaction_from_proto_bytes(&tagged_bytes);
+    assert_eq!(native_transaction_read_version(tagged), 9);
+    assert_eq!(native_transaction_uuid(tagged), "tagged-append");
+    assert_eq!(
+        native_transaction_tag(tagged),
+        Some("release-9".to_string())
+    );
+    let (has_properties, properties) = native_transaction_properties(tagged);
+    assert!(has_properties);
+    assert_eq!(properties.get("engine").map(String::as_str), Some("native"));
+    let tagged_operation = native_transaction_operation(tagged);
+    assert_eq!(
+        native_operation_kind(tagged_operation),
+        LanceOperationKind::Append
+    );
+    assert_eq!(native_operation_fragment_count(tagged_operation), 0);
+    unsafe { lance_operation_close(tagged_operation) };
+
+    let tagged_roundtrip = transaction_from_proto_bytes(&transaction_proto_bytes(tagged));
+    assert_eq!(
+        native_transaction_tag(tagged_roundtrip),
+        Some("release-9".to_string())
+    );
+    assert_eq!(
+        native_transaction_properties(tagged_roundtrip)
+            .1
+            .get("engine")
+            .map(String::as_str),
+        Some("native")
+    );
+    unsafe {
+        lance_transaction_close(tagged_roundtrip);
+        lance_transaction_close(tagged);
+    }
+
     let message = pb::Transaction {
         read_version: 17,
         uuid: "future-operation".to_string(),

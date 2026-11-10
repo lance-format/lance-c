@@ -237,7 +237,7 @@ static void test_detached_conflict_and_errors(const std::string& source_uri,
 
     bool empty_proto_rejected = false;
     try {
-        auto invalid = lance::Transaction::from_proto({});
+        auto invalid = lance::Transaction::from_proto(std::vector<uint8_t>{});
         (void)invalid;
     } catch (const lance::Error& error) {
         empty_proto_rejected = true;

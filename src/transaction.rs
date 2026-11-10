@@ -75,9 +75,6 @@ fn operation_kind(operation: &Operation) -> LanceOperationKind {
         Operation::Clone { .. } => LanceOperationKind::Clone,
         Operation::UpdateBases { .. } => LanceOperationKind::UpdateBases,
         Operation::Unknown { .. } => LanceOperationKind::Unknown,
-        // `Operation` is non-exhaustive. A variant added by a newer core has
-        // no stable binding kind and is represented as Unknown.
-        _ => LanceOperationKind::Unknown,
     }
 }
 
@@ -304,10 +301,13 @@ fn property_at<'a>(transaction: &'a LanceTransaction, index: usize) -> Result<(&
         .nth(index)
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .ok_or_else(|| {
-            lance_core::Error::invalid_input_source(format!(
-                "property index {index} is out of range for {} properties",
-                properties.len()
-            ))
+            lance_core::Error::invalid_input_source(
+                format!(
+                    "property index {index} is out of range for {} properties",
+                    properties.len()
+                )
+                .into(),
+            )
         })
 }
 
@@ -599,9 +599,9 @@ unsafe fn transaction_from_proto_inner(
         ));
     }
     if bytes.is_null() {
-        return Err(lance_core::Error::invalid_input_source(format!(
-            "bytes must not be NULL when len = {len}"
-        )));
+        return Err(lance_core::Error::invalid_input_source(
+            format!("bytes must not be NULL when len = {len}").into(),
+        ));
     }
     let message = pb::Transaction::decode(unsafe { std::slice::from_raw_parts(bytes, len) })
         .map_err(|error| {

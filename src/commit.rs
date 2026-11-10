@@ -236,6 +236,7 @@ fn writer_params_from_ffi(
 /// is unchanged, and any data files already written remain uncommitted; Lance
 /// exposes no binding-side rollback or cleanup policy for them.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn lance_dataset_write_uncommitted_stream(
     uri: *const c_char,
     schema: *const FFI_ArrowSchema,
@@ -413,6 +414,7 @@ unsafe fn transaction_commit_inner(
 /// and the actual merged transaction are independently owned and are written
 /// only on success. Both output pointers are required.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn lance_transaction_commit_batch(
     uri: *const c_char,
     transactions: *const *const LanceTransaction,
@@ -457,9 +459,10 @@ unsafe fn transaction_commit_batch_inner(
         ));
     }
     if transaction_count > 0 && transactions.is_null() {
-        return Err(lance_core::Error::invalid_input_source(format!(
-            "transactions must not be NULL when transaction_count = {transaction_count}"
-        )));
+        return Err(lance_core::Error::invalid_input_source(
+            format!("transactions must not be NULL when transaction_count = {transaction_count}")
+                .into(),
+        ));
     }
     let uri = unsafe { helpers::parse_c_string(uri)? }
         .filter(|uri| !uri.is_empty())
