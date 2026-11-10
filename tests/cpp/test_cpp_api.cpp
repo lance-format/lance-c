@@ -1391,6 +1391,116 @@ static void test_batch_nearest(const std::string& uri) {
     PASS();
 }
 
+static uint64_t count_scanner_rows(lance::Scanner& scanner) {
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    uint64_t total = 0;
+    while (true) {
+        ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        assert(stream.get_next(&stream, &array) == 0);
+        if (!array.release) break;
+        total += static_cast<uint64_t>(array.length);
+        array.release(&array);
+    }
+    if (stream.release) stream.release(&stream);
+    return total;
+}
+
+static void test_scanner_materialization_fast_search(const std::string& uri) {
+    TEST(test_scanner_materialization_fast_search);
+
+    auto ds = lance::Dataset::open(uri);
+    const LanceMaterializationStyle styles[] = {
+        LANCE_MATERIALIZATION_STYLE_HEURISTIC,
+        LANCE_MATERIALIZATION_STYLE_ALL_LATE,
+        LANCE_MATERIALIZATION_STYLE_ALL_EARLY,
+    };
+    for (auto style : styles) {
+        auto scanner = ds.scan();
+        scanner.materialization_style(style)
+               .additional_sql_filter("id >= 18");
+        assert(count_scanner_rows(scanner) == 3);
+    }
+
+    {
+        auto scanner = ds.scan();
+        scanner.materialization_style(
+                   LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT,
+                   std::vector<std::string>{"name"})
+               .additional_sql_filter("id >= 18");
+        assert(count_scanner_rows(scanner) == 3);
+    }
+    {
+        auto scanner = ds.scan();
+        scanner.materialization_style(
+                   LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT)
+               .additional_sql_filter("id >= 18");
+        assert(count_scanner_rows(scanner) == 3);
+    }
+
+    bool caught = false;
+    try {
+        ds.scan().materialization_style(
+            LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT,
+            std::vector<std::string>{"missing"});
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    assert(caught);
+
+    float query[8];
+    for (int i = 0; i < 8; ++i) query[i] = 0.1f + static_cast<float>(i);
+    {
+        auto scanner = ds.scan();
+        scanner.nearest("embedding", query, 8, 5);
+        assert(count_scanner_rows(scanner) == 5);
+    }
+    {
+        auto scanner = ds.scan();
+        scanner.nearest("embedding", query, 8, 5).fast_search(true);
+        assert(count_scanner_rows(scanner) == 0);
+    }
+    {
+        auto scanner = ds.scan();
+        scanner.nearest("embedding", query, 8, 5)
+               .fast_search(true)
+               .use_index(false);
+        assert(count_scanner_rows(scanner) == 0);
+    }
+    {
+        auto scanner = ds.scan();
+        scanner.nearest("embedding", query, 8, 5)
+               .fast_search(true)
+               .fast_search(false);
+        assert(count_scanner_rows(scanner) == 5);
+    }
+
+    auto scanner = ds.scan();
+    scanner.nearest("embedding", query, 8, 5);
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    caught = false;
+    try {
+        scanner.fast_search(true);
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    assert(caught);
+    caught = false;
+    try {
+        scanner.materialization_style(LANCE_MATERIALIZATION_STYLE_ALL_EARLY);
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    assert(caught);
+    if (stream.release) stream.release(&stream);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
@@ -1419,6 +1529,7 @@ int main(int argc, char** argv) {
     test_error_exception(uri);
     test_index_lifecycle(uri);
     test_batch_nearest(uri);
+    test_scanner_materialization_fast_search(uri);
     test_nearest_smoke(uri);
     test_multivector_rejects_flat_column(uri);
     test_index_segments_smoke(uri);
