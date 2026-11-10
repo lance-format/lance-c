@@ -6,6 +6,14 @@ EVIDENCE_DIR=${2:?evidence directory}
 EXPECTED_HEAD=${3:?expected product commit}
 
 mkdir -p "$EVIDENCE_DIR"
+overall_exit="$EVIDENCE_DIR/runner.exit"
+record_runner_exit() {
+    local code=$?
+    printf '%s\n' "$code" >"$overall_exit.tmp"
+    mv "$overall_exit.tmp" "$overall_exit"
+}
+trap record_runner_exit EXIT
+
 actual_head=$(git -C "$PRODUCT_DIR" rev-parse HEAD)
 if [[ "$actual_head" != "$EXPECTED_HEAD" ]]; then
     printf 'product HEAD mismatch: expected %s, got %s\n' "$EXPECTED_HEAD" "$actual_head" >&2
