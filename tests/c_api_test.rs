@@ -6574,10 +6574,10 @@ fn test_native_scalar_index_families_create_query_and_lifecycle() {
     }
 
     unsafe { lance_dataset_close(ds) };
-    let query_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
-    assert!(!query_ds.is_null(), "{}", take_last_error_message());
 
     let assert_indexed = |filter: &str, expected: &[i32]| {
+        let query_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+        assert!(!query_ds.is_null(), "{}", take_last_error_message());
         let (indexed, stats) = scan_index_ids(query_ds, filter, true);
         assert_eq!(indexed.as_slice(), expected, "indexed filter: {filter}");
         assert!(
@@ -6590,6 +6590,7 @@ fn test_native_scalar_index_families_create_query_and_lifecycle() {
             unindexed_stats.indices_loaded, 0,
             "disabled scalar index must not load an index: {filter}"
         );
+        unsafe { lance_dataset_close(query_ds) };
     };
 
     assert_indexed(
@@ -6611,15 +6612,17 @@ fn test_native_scalar_index_families_create_query_and_lifecycle() {
     assert_indexed("rank = 42", &[]);
     assert_indexed("rank IS NULL", &[4, 13]);
 
+    let prewarm_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!prewarm_ds.is_null(), "{}", take_last_error_message());
     for name in ["text_ngram", "score_zonemap", "rank_bloom"] {
         assert_eq!(
-            unsafe { lance_dataset_prewarm_index(query_ds, c_str(name).as_ptr()) },
+            unsafe { lance_dataset_prewarm_index(prewarm_ds, c_str(name).as_ptr()) },
             0,
             "prewarm {name}: {}",
             take_last_error_message()
         );
     }
-    unsafe { lance_dataset_close(query_ds) };
+    unsafe { lance_dataset_close(prewarm_ds) };
 
     let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!reopened.is_null(), "{}", take_last_error_message());

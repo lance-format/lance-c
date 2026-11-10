@@ -1963,10 +1963,11 @@ static void test_scanner_order_by(const std::string& uri) {
 }
 
 static std::vector<int32_t> scan_filtered_ids(
-    lance::Dataset& ds,
+    const std::string& uri,
     const std::string& filter,
     bool use_scalar_index,
     ScanStatisticsCapture& captured) {
+    auto ds = lance::Dataset::open(uri);
     auto scanner = ds.scan({"id", "name", "score"}, filter);
     captured = ScanStatisticsCapture{};
     scanner.use_scalar_index(use_scalar_index)
@@ -2004,11 +2005,11 @@ static void test_native_scalar_indexes(const std::string& uri) {
     auto assert_indexed = [&](const std::string& filter,
                               const std::vector<int32_t>& expected) {
         ScanStatisticsCapture stats;
-        assert(scan_filtered_ids(query_ds, filter, true, stats) == expected);
+        assert(scan_filtered_ids(uri, filter, true, stats) == expected);
         assert(stats.calls == 1);
         assert(stats.indices_loaded > 0);
         ScanStatisticsCapture unindexed_stats;
-        assert(scan_filtered_ids(query_ds, filter, false, unindexed_stats) == expected);
+        assert(scan_filtered_ids(uri, filter, false, unindexed_stats) == expected);
         assert(unindexed_stats.indices_loaded == 0);
     };
 
