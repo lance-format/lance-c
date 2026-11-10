@@ -1446,7 +1446,7 @@ static void test_dataset_field_metadata(const std::string& uri) {
         lance::FieldMetadataUpdate{
             lance::FieldReference::by_path("id"),
             MetadataUpdates{{"root", std::string("last")}},
-            lance::MetadataUpdateMode::Merge,
+            lance::MetadataUpdateMode::Replace,
         },
     });
     memset(&schema, 0, sizeof(schema));

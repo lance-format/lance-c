@@ -4100,7 +4100,7 @@ fn test_dataset_field_metadata_batch_matches_native_builder() {
         TestFieldUpdate {
             field: TestFieldReference::Path("id"),
             entries: vec![("root", Some("last"))],
-            mode: LanceMetadataUpdateMode::Merge as i32,
+            mode: LanceMetadataUpdateMode::Replace as i32,
         },
     ];
     let version_before = unsafe { lance_dataset_version(ds) };
@@ -4128,7 +4128,7 @@ fn test_dataset_field_metadata_batch_matches_native_builder() {
             .unwrap()
             .update(score_field_id, [("score", Some("1.5")), ("remove", None)])
             .unwrap()
-            .update("id", [("root", "last")])
+            .replace("id", [("root", "last")])
             .unwrap()
             .await
             .unwrap();
