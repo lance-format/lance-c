@@ -47,6 +47,12 @@ use crate::runtime::{RT, block_on};
 use crate::scalar_segment::PreparedScalarSegment;
 use crate::stream_guard::GuardedReader;
 
+const DISTANCE_COLUMN: &str = "_distance";
+/// Prefix for the binding-private column that carries the native distance
+/// through the caller's final projection. Projection expressions may rename or
+/// transform `_distance`, so the result window cannot rank on the output name.
+const MULTIVECTOR_WINDOW_DISTANCE_COLUMN: &str = "_lance_c_multivector_distance";
+
 /// Data type tag for query vectors, mirroring the C enum `LanceDataType`.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,12 +177,14 @@ enum ProjectionSelection {
 }
 
 impl ProjectionSelection {
-    fn includes_output(&self, name: &str) -> bool {
+    fn conflicts_with_output(&self, name: &str) -> bool {
         match self {
-            Self::Columns(columns) => columns.iter().any(|column| column.as_str() == name),
+            Self::Columns(columns) => columns
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case(name)),
             Self::Expressions(columns) => columns
                 .iter()
-                .any(|column| column.output_name.as_str() == name),
+                .any(|column| column.output_name.eq_ignore_ascii_case(name)),
         }
     }
 }
@@ -464,25 +472,45 @@ impl LanceScanner {
         Ok(())
     }
 
-    fn projection_includes_output(&self, name: &str) -> bool {
-        self.projection
-            .as_ref()
-            .is_some_and(|projection| projection.includes_output(name))
+    /// Pick an output name for the native distance that cannot collide with a
+    /// stored field, a projected output, or wildcard expansion of the stored
+    /// schema. The name is binding-private and removed after the result window.
+    fn multi_vector_window_distance_column(&self) -> String {
+        let mut name = MULTIVECTOR_WINDOW_DISTANCE_COLUMN.to_string();
+        let mut suffix = 0usize;
+        loop {
+            let stored = self
+                .dataset
+                .schema()
+                .fields
+                .iter()
+                .any(|field| field.name.eq_ignore_ascii_case(&name));
+            let projected = self
+                .projection
+                .as_ref()
+                .is_some_and(|projection| projection.conflicts_with_output(&name));
+            if !stored && !projected {
+                return name;
+            }
+            suffix += 1;
+            name = format!("{MULTIVECTOR_WINDOW_DISTANCE_COLUMN}_{suffix}");
+        }
     }
 
     /// Apply the configured projection to the native scanner.
     ///
-    /// `include_hidden_distance` is only used by the multi-vector adapter, which
-    /// needs `_distance` for its final result window even when scoring
-    /// autoprojection is disabled and the user did not request that column.
+    /// `window_distance_column` is only used by the multi-vector adapter. It
+    /// adds the native distance as an extra output so the final result window
+    /// can rank on it even when the caller's projection renames or transforms
+    /// `_distance`.
     fn apply_projection(
         &self,
         scanner: &mut lance::dataset::scanner::Scanner,
-        include_hidden_distance: bool,
+        window_distance_column: Option<&str>,
     ) -> Result<()> {
         match &self.projection {
             None => {}
-            Some(ProjectionSelection::Columns(columns)) if !include_hidden_distance => {
+            Some(ProjectionSelection::Columns(columns)) if window_distance_column.is_none() => {
                 scanner.project(columns)?;
             }
             Some(ProjectionSelection::Columns(columns)) => {
@@ -490,7 +518,9 @@ impl LanceScanner {
                     .iter()
                     .map(|column| (column.as_str(), escape_field_path_for_project(column)))
                     .collect::<Vec<_>>();
-                native.push(("_distance", "_distance".to_string()));
+                if let Some(distance_column) = window_distance_column {
+                    native.push((distance_column, DISTANCE_COLUMN.to_string()));
+                }
                 scanner.project_with_transform(&native)?;
             }
             Some(ProjectionSelection::Expressions(columns)) => {
@@ -498,8 +528,8 @@ impl LanceScanner {
                     .iter()
                     .map(|column| (column.output_name.as_str(), column.expression.as_str()))
                     .collect::<Vec<_>>();
-                if include_hidden_distance {
-                    native.push(("_distance", "_distance"));
+                if let Some(distance_column) = window_distance_column {
+                    native.push((distance_column, DISTANCE_COLUMN));
                 }
                 scanner.project_with_transform(&native)?;
             }
@@ -601,17 +631,14 @@ impl LanceScanner {
             .nearest
             .as_ref()
             .is_some_and(|query| query.mode == NearestMode::MultiVector);
-        // The multi-vector window sorts on `_distance` after the final
-        // projection. When scoring autoprojection is disabled, keep a hidden
-        // distance column through that window and remove it afterwards unless
-        // the caller explicitly projected it.
-        let hidden_multi_vector_distance = multi_vector
-            && self.disable_scoring_autoprojection
-            && !self.projection_includes_output("_distance");
-        self.apply_projection(&mut scanner, hidden_multi_vector_distance)?;
-        if self.disable_scoring_autoprojection
-            && !(hidden_multi_vector_distance && self.projection.is_none())
-        {
+        // The multi-vector window must rank on the native distance after the
+        // final projection. Projections can rename or transform `_distance`,
+        // so carry a binding-private copy whenever a projection is configured.
+        let private_multi_vector_distance = multi_vector && self.projection.is_some();
+        let window_distance_column =
+            private_multi_vector_distance.then(|| self.multi_vector_window_distance_column());
+        self.apply_projection(&mut scanner, window_distance_column.as_deref())?;
+        if self.disable_scoring_autoprojection && !(multi_vector && self.projection.is_none()) {
             scanner.disable_scoring_autoprojection();
         }
         if let Some(handling) = &self.blob_handling {
@@ -841,11 +868,14 @@ impl LanceScanner {
         Ok(PreparedScanner {
             scanner,
             distributed_fts,
-            multi_vector_window: multi_vector.then_some((
-                self.offset.unwrap_or(0) as usize,
-                self.limit.map(|n| n as usize),
-            )),
-            strip_hidden_multi_vector_distance: hidden_multi_vector_distance,
+            multi_vector_window: multi_vector.then_some(MultiVectorWindow {
+                offset: self.offset.unwrap_or(0) as usize,
+                limit: self.limit.map(|n| n as usize),
+                distance_column: window_distance_column
+                    .unwrap_or_else(|| DISTANCE_COLUMN.to_string()),
+                drop_distance_column: private_multi_vector_distance
+                    || (self.projection.is_none() && self.disable_scoring_autoprojection),
+            }),
             batch_size: self.batch_size,
             scan_statistics_callback: self.scan_statistics_callback.clone(),
             scalar_segment,
@@ -867,11 +897,20 @@ struct PreparedFtsExecution {
 struct PreparedScanner {
     scanner: lance::dataset::scanner::Scanner,
     distributed_fts: Option<PreparedFtsExecution>,
-    multi_vector_window: Option<(usize, Option<usize>)>,
-    strip_hidden_multi_vector_distance: bool,
+    multi_vector_window: Option<MultiVectorWindow>,
     batch_size: Option<usize>,
     scan_statistics_callback: Option<ExecutionStatsCallback>,
     scalar_segment: Option<PreparedScalarSegment>,
+}
+
+struct MultiVectorWindow {
+    offset: usize,
+    limit: Option<usize>,
+    /// Column holding the native distance before any caller projection
+    /// expression is applied.
+    distance_column: String,
+    /// Whether `distance_column` is binding-private and must not be returned.
+    drop_distance_column: bool,
 }
 
 impl PreparedScanner {
@@ -883,11 +922,16 @@ impl PreparedScanner {
                 .try_into_stream()
                 .await;
         }
-        if let Some((offset, limit)) = self.multi_vector_window {
+        if let Some(window) = self.multi_vector_window {
             let plan = crate::multivector::rewrite(self.scanner.create_plan().await?)?;
-            let plan = crate::multivector::apply_result_window(plan, offset, limit)?;
-            let plan = if self.strip_hidden_multi_vector_distance {
-                drop_column_from_plan(plan, "_distance")?
+            let plan = crate::multivector::apply_result_window(
+                plan,
+                window.offset,
+                window.limit,
+                &window.distance_column,
+            )?;
+            let plan = if window.drop_distance_column {
+                drop_column_from_plan(plan, &window.distance_column)?
             } else {
                 plan
             };
