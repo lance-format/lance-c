@@ -2,7 +2,8 @@
 set -euo pipefail
 
 RUN_DIR=${1:?usage: issue108-native-branch-lifecycle.sh <run-dir>}
-REPO_ROOT=$(git rev-parse --show-toplevel)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 mkdir -p "$RUN_DIR"
 
 export CARGO_BUILD_JOBS=8
