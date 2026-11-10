@@ -172,6 +172,156 @@ static void test_shared_session(const char *uri) {
            (unsigned long long)stats.metadata_cache_entries);
 }
 
+static uint64_t scan_filtered_with_index(
+    const LanceDataset *dataset,
+    const char *filter) {
+    LanceScanner *scanner = lance_scanner_new(dataset, NULL, filter);
+    ASSERT(scanner != NULL, "filtered scanner creation failed");
+    ASSERT(lance_scanner_set_use_scalar_index(scanner, true) == 0,
+           "enable scalar index failed");
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "filtered scanner stream creation failed");
+
+    uint64_t total = 0;
+    while (1) {
+        struct ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        ASSERT(stream.get_next(&stream, &array) == 0,
+               "filtered stream get_next failed");
+        if (array.release == NULL) break;
+        total += (uint64_t)array.length;
+        array.release(&array);
+    }
+    if (stream.release) stream.release(&stream);
+    lance_scanner_close(scanner);
+    return total;
+}
+
+static void test_session_cache_config(const char *uri) {
+    printf("  test_session_cache_config... ");
+
+    LanceSessionCacheSpec zero = {0};
+    zero.kind = LANCE_SESSION_CACHE_SPEC_SIZE;
+    zero.size_bytes = 0;
+
+    LanceSession *session = lance_session_new_with_cache_specs(&zero, &zero);
+    ASSERT(session != NULL, "zero-capacity session creation failed");
+
+    uint64_t initial_size = 0;
+    uint64_t approx_items = 1;
+    ASSERT(lance_session_get_size_bytes(session, &initial_size) == 0,
+           "initial session size failed");
+    ASSERT(lance_session_get_approx_num_items(session, &approx_items) == 0,
+           "initial approximate item count failed");
+    ASSERT(approx_items == 0, "new zero-capacity session should be empty");
+    ASSERT(initial_size > 0, "deep size should include session state");
+
+    LanceDataset *ds = lance_dataset_open_with_session(uri, NULL, 0, session);
+    ASSERT(ds != NULL, "zero-capacity shared-session open failed");
+    ASSERT(lance_dataset_fragment_count(ds) >= 2,
+           "session fixture must have multiple fragments");
+    ASSERT(lance_dataset_prewarm_index(ds, "id_idx") == 0,
+           "zero-capacity index prewarm failed");
+    ASSERT(scan_filtered_with_index(ds, "id >= 5 AND id < 8") == 3,
+           "zero-capacity indexed read returned wrong rows");
+
+    LanceSessionCacheStats stats;
+    memset(&stats, 0, sizeof(stats));
+    ASSERT(lance_session_get_cache_stats(session, &stats) == 0,
+           "zero-capacity cache stats failed");
+    ASSERT(stats.index_cache_entries == 0 &&
+           stats.index_cache_size_bytes == 0 &&
+           stats.metadata_cache_entries == 0 &&
+           stats.metadata_cache_size_bytes == 0,
+           "zero capacity must retain no cache entries");
+    ASSERT(lance_session_get_approx_num_items(session, &approx_items) == 0,
+           "zero-capacity approximate item count failed");
+    ASSERT(approx_items == 0, "zero capacity should report no items");
+    uint64_t final_size = 0;
+    ASSERT(lance_session_get_size_bytes(session, &final_size) == 0,
+           "final session size failed");
+    ASSERT(final_size == initial_size,
+           "zero-capacity reads must not grow session cache state");
+
+    lance_session_close(session);
+    ASSERT(scan_filtered_with_index(ds, "id >= 5 AND id < 8") == 3,
+           "dataset must keep working after session handle close");
+    lance_dataset_close(ds);
+
+    char index_uri[] = "moka://?capacity=67108864";
+    char backend_kind[] = "MOKA";
+    char option_key[] = "capacity";
+    char option_value[] = "33554432";
+    const char *option_keys[] = {option_key};
+    const char *option_values[] = {option_value};
+
+    LanceSessionCacheSpec index_spec = {0};
+    index_spec.kind = LANCE_SESSION_CACHE_SPEC_URI;
+    index_spec.backend_uri = index_uri;
+    LanceSessionCacheSpec metadata_spec = {0};
+    metadata_spec.kind = LANCE_SESSION_CACHE_SPEC_CONFIG;
+    metadata_spec.backend_kind = backend_kind;
+    metadata_spec.option_keys = option_keys;
+    metadata_spec.option_values = option_values;
+    metadata_spec.option_count = 1;
+
+    session = lance_session_new_with_cache_specs(&index_spec, &metadata_spec);
+    ASSERT(session != NULL, "Moka URI/config session creation failed");
+    ASSERT(lance_session_get_size_bytes(session, &initial_size) == 0,
+           "configured initial session size failed");
+
+    memset(index_uri, 'x', sizeof(index_uri) - 1);
+    memset(backend_kind, 'x', sizeof(backend_kind) - 1);
+    memset(option_key, 'x', sizeof(option_key) - 1);
+    memset(option_value, 'x', sizeof(option_value) - 1);
+
+    ds = lance_dataset_open_with_session(uri, NULL, 0, session);
+    ASSERT(ds != NULL, "Moka-configured shared-session open failed");
+    ASSERT(lance_dataset_prewarm_index(ds, "id_idx") == 0,
+           "Moka-configured index prewarm failed");
+    ASSERT(scan_filtered_with_index(ds, "id >= 5 AND id < 8") == 3,
+           "Moka-configured indexed read returned wrong rows");
+
+    memset(&stats, 0, sizeof(stats));
+    ASSERT(lance_session_get_cache_stats(session, &stats) == 0,
+           "Moka-configured cache stats failed");
+    ASSERT(stats.index_cache_entries > 0,
+           "Moka URI index cache should retain entries");
+    ASSERT(stats.metadata_cache_entries > 0,
+           "Moka config metadata cache should retain entries");
+    ASSERT(lance_session_get_approx_num_items(session, &approx_items) == 0,
+           "Moka-configured approximate item count failed");
+    ASSERT(approx_items > 0, "Moka-configured session should report items");
+    ASSERT(lance_session_get_size_bytes(session, &final_size) == 0,
+           "Moka-configured final session size failed");
+    ASSERT(final_size > initial_size,
+           "Moka-configured reads should be reflected in deep size");
+
+    lance_session_close(session);
+    ASSERT(scan_filtered_with_index(ds, "id >= 9") == 12,
+           "dataset must keep configured cache state after session close");
+    lance_dataset_close(ds);
+
+    LanceSessionCacheSpec invalid = {0};
+    invalid.kind = LANCE_SESSION_CACHE_SPEC_CONFIG;
+    invalid.backend_kind = "not a kind";
+    session = lance_session_new_with_cache_specs(&invalid, &zero);
+    ASSERT(session == NULL, "invalid backend kind must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid backend kind error code");
+    const char *message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "invalid character") != NULL,
+           "invalid backend kind should preserve the native error");
+    if (message) lance_free_string(message);
+
+    printf("index_entries=%llu, metadata_entries=%llu... OK\n",
+           (unsigned long long)stats.index_cache_entries,
+           (unsigned long long)stats.metadata_cache_entries);
+}
+
 static void test_scan(const char *uri) {
     printf("  test_scan... ");
 
@@ -2397,10 +2547,10 @@ static void test_fragment_snapshot(const char *uri) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 6) {
+    if (argc < 7) {
         fprintf(stderr,
-                "Usage: %s <dataset_uri> <write_uri> <blob_uri> "
-                "<ordering_uri> <fragment_uri>\n",
+                "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
+                "<session_uri> <fragment_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -2409,13 +2559,15 @@ int main(int argc, char **argv) {
     const char *write_uri = argv[2];
     const char *blob_uri = argv[3];
     const char *ordering_uri = argv[4];
-    const char *fragment_uri = argv[5];
+    const char *session_uri = argv[5];
+    const char *fragment_uri = argv[6];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
     test_materialization_and_fast_search(uri);
     test_open_and_metadata(uri);
     test_shared_session(uri);
+    test_session_cache_config(session_uri);
     test_scan(uri);
     test_distance_range(uri);
     test_scan_with_limit(uri);
