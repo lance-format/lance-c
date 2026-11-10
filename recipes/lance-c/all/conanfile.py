@@ -6,7 +6,7 @@ import os
 from conan import ConanFile
 from conan.errors import ConanException, ConanInvalidConfiguration
 from conan.tools.cmake import CMake, CMakeToolchain, cmake_layout
-from conan.tools.files import copy, get, remove, rmdir
+from conan.tools.files import copy, get, rm, rmdir
 
 required_conan_version = ">=2.0"
 
@@ -130,10 +130,10 @@ class LanceCConan(ConanFile):
 
         libdir = os.path.join(self.package_folder, "lib")
         if self.options.shared:
-            remove(self, "*.a", libdir)
+            rm(self, "*.a", libdir)
         else:
-            remove(self, "*.so*", libdir)
-            remove(self, "*.dylib", libdir)
+            rm(self, "*.so*", libdir)
+            rm(self, "*.dylib", libdir)
 
     def package_info(self):
         self.cpp_info.set_property("cmake_file_name", "LanceC")
