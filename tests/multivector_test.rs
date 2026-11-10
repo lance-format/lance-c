@@ -125,9 +125,7 @@ fn set_projection(scanner: *mut LanceScanner, specs: &[(&str, &str)]) {
     }
 }
 
-unsafe fn collect_projected(
-    scanner: *mut LanceScanner,
-) -> (Vec<String>, Vec<(i32, Option<f32>)>) {
+unsafe fn collect_projected(scanner: *mut LanceScanner) -> (Vec<String>, Vec<(i32, Option<f32>)>) {
     let mut stream = FFI_ArrowArrayStream::empty();
     let status = unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) };
     if status != 0 {

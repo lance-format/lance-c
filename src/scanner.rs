@@ -1922,9 +1922,7 @@ pub unsafe extern "C" fn lance_scanner_disable_scoring_autoprojection(
     })
 }
 
-unsafe fn scanner_disable_scoring_autoprojection_inner(
-    scanner: *mut LanceScanner,
-) -> Result<i32> {
+unsafe fn scanner_disable_scoring_autoprojection_inner(scanner: *mut LanceScanner) -> Result<i32> {
     if scanner.is_null() {
         return Err(lance_core::Error::invalid_input_source(
             "scanner is NULL".into(),

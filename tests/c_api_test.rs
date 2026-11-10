@@ -17579,20 +17579,15 @@ fn scalar_segment_ids_with_auto(
 
 #[test]
 fn test_scalar_segment_scan_applies_expression_projection() {
-    let (_tmp, uri, uuids) =
-        create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
     let uri = c_str(&uri);
     let filter = c_str("key >= 0 AND id >= 1");
     let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
     assert!(!dataset.is_null());
-    let scanner =
-        unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
     assert!(!scanner.is_null());
     assert_eq!(
-        set_projection(
-            scanner,
-            &[("id_alias", "id"), ("key_copy", "key + 0")],
-        ),
+        set_projection(scanner, &[("id_alias", "id"), ("key_copy", "key + 0")],),
         0,
         "{}",
         take_last_error_message()
