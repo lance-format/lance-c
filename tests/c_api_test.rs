@@ -26,6 +26,7 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
+use lance::io::RecordBatchStream;
 use lance_c::*;
 
 /// Helper: create a test dataset in a temp directory and return its path.
@@ -633,7 +634,7 @@ fn create_projection_dataset() -> (tempfile::TempDir, String) {
         let mut dataset = Dataset::open(&uri).await.unwrap();
         dataset
             .append(
-                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
                 None,
             )
             .await

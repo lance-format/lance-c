@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow::record_batch::RecordBatchIterator;
+use arrow::record_batch::{RecordBatchIterator, RecordBatchReader};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
