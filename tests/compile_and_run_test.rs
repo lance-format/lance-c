@@ -27,6 +27,11 @@ use lance_file::version::LanceFileVersion;
 
 use std::ffi::CString;
 
+#[path = "support/substrait_aggregate.rs"]
+mod substrait_aggregate;
+
+use substrait_aggregate::{AggregateKind, aggregate_plan};
+
 /// Build the lance-c cdylib and return the path to the shared library and include dir.
 fn build_lance_c() -> (PathBuf, PathBuf) {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -606,6 +611,7 @@ fn run_test_binary(
     fragment_uri: &str,
     fragment_read_uri: &str,
     cleanup_uri: &str,
+    aggregate_plan_path: &Path,
 ) {
     let output = Command::new(binary)
         .arg(dataset_uri)
@@ -616,6 +622,7 @@ fn run_test_binary(
         .arg(fragment_uri)
         .arg(fragment_read_uri)
         .arg(cleanup_uri)
+        .arg(aggregate_plan_path)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -635,6 +642,23 @@ fn run_test_binary(
         stdout,
         stderr
     );
+}
+
+fn write_ordering_aggregate_plan(directory: &Path) -> PathBuf {
+    let path = directory.join("ordering-aggregate.plan");
+    let bytes = aggregate_plan(
+        &[],
+        &[
+            AggregateKind::CountStar,
+            AggregateKind::Sum(0),
+            AggregateKind::Sum(2),
+            AggregateKind::Min(0),
+            AggregateKind::Max(0),
+        ],
+        &["rows", "id_sum", "rank_sum", "min_id", "max_id"],
+    );
+    std::fs::write(&path, bytes).unwrap();
+    path
 }
 
 fn run_test_binary_with_dataset(binary: &Path, dataset_uri: &str) {
@@ -685,6 +709,7 @@ fn test_c_compilation_and_execution() {
         compile_c_test(&source, &binary, &include_dir, &lib_path),
         "C test compilation failed"
     );
+    let aggregate_plan_path = write_ordering_aggregate_plan(build_dir.path());
 
     run_test_binary(
         &binary,
@@ -696,6 +721,7 @@ fn test_c_compilation_and_execution() {
         &fragment_uri,
         &fragment_read_uri,
         &cleanup_uri,
+        &aggregate_plan_path,
     );
 }
 
@@ -728,6 +754,7 @@ fn test_cpp_compilation_and_execution() {
         compile_cpp_test(&source, &binary, &include_dir, &lib_path),
         "C++ test compilation failed"
     );
+    let aggregate_plan_path = write_ordering_aggregate_plan(build_dir.path());
 
     run_test_binary(
         &binary,
@@ -739,6 +766,7 @@ fn test_cpp_compilation_and_execution() {
         &fragment_uri,
         &fragment_read_uri,
         &cleanup_uri,
+        &aggregate_plan_path,
     );
 }
 

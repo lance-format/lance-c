@@ -8,7 +8,8 @@
  * Tests the RAII wrappers, exception handling, and builder pattern.
  *
  * Usage: test_cpp_api <dataset_uri> <write_uri> <blob_uri> <ordering_uri>
- *                     <session_uri> <fragment_uri> <cleanup_uri>
+ *                     <session_uri> <fragment_uri> <fragment_read_uri>
+ *                     <cleanup_uri> <aggregate_plan_path>
  */
 
 #include "lance/lance.hpp"
@@ -18,6 +19,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -2739,6 +2741,96 @@ static void test_scanner_order_by(const std::string& uri) {
     PASS();
 }
 
+static std::vector<uint8_t> read_file_bytes(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    assert(file.good());
+    std::streamoff size = file.tellg();
+    assert(size >= 0);
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    file.seekg(0, std::ios::beg);
+    if (!bytes.empty()) {
+        file.read(
+            reinterpret_cast<char*>(bytes.data()),
+            static_cast<std::streamsize>(size));
+        assert(file.good());
+    }
+    return bytes;
+}
+
+static void test_scanner_substrait_aggregate(
+    const std::string& uri,
+    const std::string& plan_path) {
+    TEST(test_scanner_substrait_aggregate);
+
+    auto ds = lance::Dataset::open(uri);
+    auto scanner = ds.scan();
+    auto bytes = read_file_bytes(plan_path);
+    scanner.substrait_aggregate(bytes);
+    std::fill(bytes.begin(), bytes.end(), 0);
+    bytes.clear();
+
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(stream);
+
+    ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    assert(stream.get_schema(&stream, &schema) == 0);
+    assert(schema.n_children == 5);
+    const char* expected_names[] = {
+        "rows", "id_sum", "rank_sum", "min_id", "max_id",
+    };
+    const char* expected_formats[] = {"l", "l", "l", "i", "i"};
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        assert(std::string(schema.children[i]->name) == expected_names[i]);
+        assert(std::string(schema.children[i]->format) == expected_formats[i]);
+    }
+    assert(schema.release != nullptr);
+    schema.release(&schema);
+
+    ArrowArray array;
+    memset(&array, 0, sizeof(array));
+    assert(stream.get_next(&stream, &array) == 0);
+    assert(array.release != nullptr);
+    assert(array.length == 1);
+    assert(array.n_children == 5);
+    const auto* rows = static_cast<const int64_t*>(
+        array.children[0]->buffers[1]) + array.children[0]->offset;
+    const auto* id_sum = static_cast<const int64_t*>(
+        array.children[1]->buffers[1]) + array.children[1]->offset;
+    const auto* rank_sum = static_cast<const int64_t*>(
+        array.children[2]->buffers[1]) + array.children[2]->offset;
+    const auto* min_id = static_cast<const int32_t*>(
+        array.children[3]->buffers[1]) + array.children[3]->offset;
+    const auto* max_id = static_cast<const int32_t*>(
+        array.children[4]->buffers[1]) + array.children[4]->offset;
+    assert(rows[0] == 12);
+    assert(id_sum[0] == 66);
+    assert(rank_sum[0] == 15);
+    assert(min_id[0] == 0);
+    assert(max_id[0] == 11);
+    array.release(&array);
+
+    memset(&array, 0, sizeof(array));
+    assert(stream.get_next(&stream, &array) == 0);
+    assert(array.release == nullptr);
+    if (stream.release) stream.release(&stream);
+
+    bool caught = false;
+    try {
+        scanner.substrait_aggregate(std::vector<uint8_t>{0});
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        assert(std::string(error.what()).find(
+                   "substrait_aggregate must be set before") !=
+               std::string::npos);
+    }
+    assert(caught);
+
+    PASS();
+}
+
 static std::vector<int32_t> scan_filtered_ids(
     const std::string& uri,
     const std::string& filter,
@@ -3135,10 +3227,11 @@ static void test_fragment_read_operations(const std::string& uri) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 9) {
+    if (argc < 10) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
-                "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri>\n",
+                "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri> "
+                "<aggregate_plan_path>\n",
                 argv[0]);
         return 1;
     }
@@ -3151,6 +3244,7 @@ int main(int argc, char** argv) {
     std::string fragment_uri(argv[6]);
     std::string fragment_read_uri(argv[7]);
     std::string cleanup_uri(argv[8]);
+    std::string aggregate_plan_path(argv[9]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -3161,6 +3255,7 @@ int main(int argc, char** argv) {
     test_scanner_projection_filter(uri);
     test_scanner_projection(uri);
     test_scanner_order_by(ordering_uri);
+    test_scanner_substrait_aggregate(ordering_uri, aggregate_plan_path);
     test_scanner_introspection(uri);
     test_fragment_snapshots(fragment_uri);
     test_fragment_read_operations(fragment_read_uri);

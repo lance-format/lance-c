@@ -15,6 +15,11 @@ use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance_c::*;
 
+#[path = "support/substrait_aggregate.rs"]
+mod substrait_aggregate;
+
+use substrait_aggregate::{AggregateKind, Cell, aggregate_plan, cells};
+
 fn c(s: &str) -> CString {
     CString::new(s).unwrap()
 }
@@ -151,6 +156,16 @@ fn read(scan: &Scan) -> Vec<(i32, i32, f32)> {
     result
 }
 
+fn read_aggregate(scan: &Scan) -> Vec<Vec<Cell>> {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    ok(unsafe { lance_scanner_to_arrow_stream(scan.0, &mut stream) });
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let batches = reader
+        .map(|batch| batch.unwrap())
+        .collect::<Vec<RecordBatch>>();
+    cells(&batches)
+}
+
 fn set_projection(scan: &Scan, projection: &[(&str, &str)]) {
     let names = projection
         .iter()
@@ -214,6 +229,35 @@ fn batch_nearest_flat_preserves_independent_queries_and_copies_input() {
         ok(unsafe { lance_scanner_set_strict_batch_size(scan.0, true) });
         assert_eq!(read(&scan), want);
     }
+}
+
+#[test]
+fn batch_nearest_and_flat_nearest_compose_with_substrait_aggregate() {
+    let (_dir, uri) = fixture();
+    let data = Data::open(&uri);
+    let bytes = aggregate_plan(
+        &[],
+        &[AggregateKind::CountStar, AggregateKind::Sum(0)],
+        &["rows", "id_sum"],
+    );
+
+    let scan = data.scan();
+    configure(&scan, &[2.25, 1.], 4);
+    ok(unsafe { lance_scanner_set_use_index(scan.0, false) });
+    ok(unsafe { lance_scanner_set_substrait_aggregate(scan.0, bytes.as_ptr(), bytes.len()) });
+    assert_eq!(
+        read_aggregate(&scan),
+        vec![vec![Cell::Int(4), Cell::Int(10)]]
+    );
+
+    let scan = data.scan();
+    configure(&scan, &[2.25, 1., 100.25, 1.], 3);
+    ok(unsafe { lance_scanner_set_use_index(scan.0, false) });
+    ok(unsafe { lance_scanner_set_substrait_aggregate(scan.0, bytes.as_ptr(), bytes.len()) });
+    assert_eq!(
+        read_aggregate(&scan),
+        vec![vec![Cell::Int(6), Cell::Int(306)]]
+    );
 }
 
 #[test]
