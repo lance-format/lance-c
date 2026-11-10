@@ -640,7 +640,9 @@ public:
     /// Snapshot the dataset's manifest config map.
     ///
     /// The returned map owns copies of all keys and values. The snapshot is
-    /// independent of this handle. Throws lance::Error on failure.
+    /// independent of this handle. Entry order is unspecified. A config entry
+    /// containing an embedded NUL byte cannot be represented as a C string and
+    /// throws with LANCE_ERR_INTERNAL. Throws lance::Error on failure.
     std::map<std::string, std::string> config() const {
         auto* raw = lance_dataset_config(handle_.get());
         if (!raw) check_error();

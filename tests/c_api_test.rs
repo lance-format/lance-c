@@ -12293,6 +12293,65 @@ fn test_dataset_config_read_update_and_reopen_matches_native() {
     unsafe { lance_dataset_close(c_ds) };
 }
 
+#[test]
+fn test_dataset_config_empty_update_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_config_empty")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_config_empty")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams::default(),
+    )
+    .unwrap();
+
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, ptr::null(), ptr::null(), 0) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(c_ds) };
+
+    let mut native_ds = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+    lance_c::runtime::block_on(async {
+        native_ds
+            .update_config([] as [(&str, Option<&str>); 0])
+            .await
+    })
+    .unwrap();
+    drop(native_ds);
+
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri)
+    );
+}
+
 // ===========================================================================
 // lance_dataset_delete
 // ===========================================================================

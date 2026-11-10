@@ -394,12 +394,17 @@ typedef struct LanceDatasetConfig LanceDatasetConfig;
  * Return a snapshot of the dataset's manifest config map.
  *
  * Returns NULL on error (for example a NULL dataset handle).
+ *
+ * Keys and values are exposed as NUL-terminated C strings. A config entry
+ * containing an embedded NUL byte cannot be represented and fails the
+ * snapshot with LANCE_ERR_INTERNAL. Entry order is unspecified.
  */
 LanceDatasetConfig* lance_dataset_config(const LanceDataset* dataset);
 
 /**
  * Return the number of entries in the config snapshot. Returns 0 and sets
- * LANCE_ERR_INVALID_ARGUMENT on a NULL handle.
+ * LANCE_ERR_INVALID_ARGUMENT on a NULL handle. An empty config also yields 0
+ * with no error set, so check lance_last_error_code() to distinguish the two.
  */
 uint64_t lance_dataset_config_count(const LanceDatasetConfig* config);
 
@@ -2684,7 +2689,9 @@ typedef struct LanceWriteParams {
  * Native auto-cleanup parameters for lance_dataset_write_with_options.
  *
  * `interval` is the number of committed versions between cleanup runs; 0 is a
- * valid native value that considers cleanup on every commit.
+ * valid native value that considers cleanup on every commit. It is narrowed to
+ * the native usize type; values that do not fit return
+ * LANCE_ERR_INVALID_ARGUMENT.
  *
  * `older_than_seconds` and `older_than_nanos` express the native
  * chrono::TimeDelta retention window as

@@ -28,7 +28,9 @@ struct ConfigEntry {
 ///
 /// The snapshot owns copies of the keys and values, so it remains valid after
 /// the dataset handle is closed. Free it with `lance_dataset_config_close`.
-/// Returns NULL on error.
+/// Entry order is unspecified. Keys and values are exposed as NUL-terminated C
+/// strings; an entry containing an embedded NUL byte fails the snapshot with
+/// `LANCE_ERR_INTERNAL`. Returns NULL on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_config(
     dataset: *const LanceDataset,
@@ -64,7 +66,9 @@ unsafe fn config_inner(dataset: *const LanceDataset) -> Result<*mut LanceDataset
 /// Return the number of config entries in the snapshot.
 ///
 /// Clears the thread-local error on success. Returns 0 and sets
-/// `LANCE_ERR_INVALID_ARGUMENT` on a NULL handle.
+/// `LANCE_ERR_INVALID_ARGUMENT` on a NULL handle. An empty config also yields
+/// 0 with no error set, so check `lance_last_error_code()` to distinguish the
+/// two.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_config_count(config: *const LanceDatasetConfig) -> u64 {
     ffi_try!(unsafe { config_count_inner(config) }, 0)

@@ -899,6 +899,9 @@ static void test_dataset_write_roundtrip(const std::string& src_uri,
 
     uint64_t dst_rows = dst.count_rows();
     assert(dst_rows == src_rows);
+    auto config = dst.config();
+    assert(config.at("lance.auto_cleanup.interval") == "20");
+    assert(config.at("lance.auto_cleanup.older_than") == "14days");
     printf("src=%llu, dst=%llu... ",
            (unsigned long long)src_rows, (unsigned long long)dst_rows);
 
