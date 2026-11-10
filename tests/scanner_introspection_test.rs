@@ -25,14 +25,18 @@ fn c_str(value: &str) -> CString {
 fn take_error_message() -> String {
     let raw = lance_last_error_message();
     assert!(!raw.is_null(), "error code must carry a message");
-    let message = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+    let message = unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
     unsafe { lance_free_string(raw) };
     message
 }
 
 fn take_owned_string(raw: *const c_char) -> String {
     assert!(!raw.is_null(), "{}", take_error_message());
-    let value = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+    let value = unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
     unsafe { lance_free_string(raw) };
     value
 }
@@ -301,9 +305,7 @@ fn scanner_schema_count_and_plan_strings_match_native_oracles() {
     let native = lance_c::runtime::block_on(async {
         let snapshot = Dataset::open(&uri).await.unwrap();
         let mut scanner = snapshot.scan();
-        scanner
-            .project_with_transform(&projection)
-            .unwrap();
+        scanner.project_with_transform(&projection).unwrap();
         scanner.filter(filter).unwrap();
         let selected = snapshot
             .get_fragments()
@@ -347,7 +349,9 @@ fn scanner_schema_count_and_plan_strings_match_native_oracles() {
         take_error_message()
     );
     assert_eq!(
-        unsafe { lance_scanner_set_row_addr_allowlist(scanner, allow_ids.as_ptr(), allow_ids.len()) },
+        unsafe {
+            lance_scanner_set_row_addr_allowlist(scanner, allow_ids.as_ptr(), allow_ids.len())
+        },
         0,
         "{}",
         take_error_message()
@@ -371,12 +375,18 @@ fn scanner_schema_count_and_plan_strings_match_native_oracles() {
             .collect::<Vec<_>>(),
         vec!["id_alias", "rank_alias"]
     );
-    assert_eq!(schema_signature(&take_schema(scanner)), schema_signature(&schema));
+    assert_eq!(
+        schema_signature(&take_schema(scanner)),
+        schema_signature(&schema)
+    );
 
     let count = unsafe { lance_scanner_count_rows(scanner) };
     assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
     assert_eq!(count, native.1);
-    assert_eq!(count, 4, "fragment, filter, allow and block scopes must all apply");
+    assert_eq!(
+        count, 4,
+        "fragment, filter, allow and block scopes must all apply"
+    );
     assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, count);
 
     let c_explain = take_owned_string(unsafe { lance_scanner_explain_plan(scanner, false) });
@@ -456,10 +466,7 @@ fn scanner_count_preserves_native_aggregate_planning_errors() {
         direction: LanceOrderDirection::Ascending as i32,
         null_order: LanceNullOrder::NullsLast as i32,
     };
-    assert_eq!(
-        unsafe { lance_scanner_set_order_by(scanner, &empty, 0) },
-        0
-    );
+    assert_eq!(unsafe { lance_scanner_set_order_by(scanner, &empty, 0) }, 0);
     let native_count = lance_c::runtime::block_on(async {
         let mut native_scanner = native.scan();
         native_scanner.order_by(Some(Vec::new())).unwrap();
@@ -562,10 +569,7 @@ fn scanner_introspection_rejects_null_and_nonempty_output_slots() {
     assert!(take_error_message().contains("scanner and out must not be NULL"));
 
     let mut nonempty = FFI_ArrowSchema::try_from(&Field::new("x", DataType::Int32, true)).unwrap();
-    assert_eq!(
-        unsafe { lance_scanner_schema(scanner, &mut nonempty) },
-        -1
-    );
+    assert_eq!(unsafe { lance_scanner_schema(scanner, &mut nonempty) }, -1);
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert!(take_error_message().contains("empty ArrowSchema"));
     if let Some(release) = nonempty.release {
@@ -630,7 +634,10 @@ fn vector_and_batch_schema_count_match_native() {
     );
     assert_eq!(unsafe { lance_scanner_set_use_index(scanner, false) }, 0);
     assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, true) }, 0);
-    assert_eq!(schema_signature(&take_schema(scanner)), schema_signature(&native.0));
+    assert_eq!(
+        schema_signature(&take_schema(scanner)),
+        schema_signature(&native.0)
+    );
     assert!(take_schema(scanner).field_with_name("_distance").is_ok());
     assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, native.1);
     assert_eq!(native.1, 3);
