@@ -19,6 +19,7 @@ set +e
 "${VCPKG_ROOT}/vcpkg" install "lance-c[from-source]" \
     --overlay-ports="${repo}/ports" \
     --triplet "${triplet}" \
+    --recurse \
     >"${log}" 2>&1
 status=$?
 set -e
