@@ -340,12 +340,12 @@ unsafe fn versions_inner(dataset: *const LanceDataset) -> Result<*mut LanceVersi
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_versions_count(versions: *const LanceVersions) -> u64 {
     ffi_try!(
-        (|| -> Result<u64> {
+        {
             if versions.is_null() {
                 return Err(invalid("versions must not be NULL"));
             }
             Ok(unsafe { &*versions }.entries.len() as u64)
-        })(),
+        },
         0
     )
 }
@@ -358,9 +358,10 @@ pub unsafe extern "C" fn lance_versions_at(
     index: usize,
 ) -> *const LanceVersion {
     ffi_try!(
-        (|| -> Result<*const LanceVersion> {
-            Ok(unsafe { version_entry_at(versions, index)? as *const LanceVersion })
-        })(),
+        {
+            let version = unsafe { version_entry_at(versions, index)? };
+            Ok(version as *const LanceVersion)
+        },
         std::ptr::null()
     )
 }
@@ -421,12 +422,12 @@ unsafe fn version_refs_inner(dataset: *const LanceDataset) -> Result<*mut LanceV
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_version_refs_count(refs: *const LanceVersionRefs) -> u64 {
     ffi_try!(
-        (|| -> Result<u64> {
+        {
             if refs.is_null() {
                 return Err(invalid("version refs must not be NULL"));
             }
             Ok(unsafe { &*refs }.entries.len() as u64)
-        })(),
+        },
         0
     )
 }
@@ -438,7 +439,7 @@ pub unsafe extern "C" fn lance_version_refs_id_at(
     index: usize,
 ) -> u64 {
     ffi_try!(
-        (|| -> Result<u64> {
+        {
             if refs.is_null() {
                 return Err(invalid("version refs must not be NULL"));
             }
@@ -449,7 +450,7 @@ pub unsafe extern "C" fn lance_version_refs_id_at(
                     refs.entries.len()
                 ))
             })
-        })(),
+        },
         0
     )
 }
@@ -472,11 +473,9 @@ pub unsafe extern "C" fn lance_version_refs_close(refs: *mut LanceVersionRefs) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_ref_version_number(version: u64) -> *mut LanceRef {
     ffi_try!(
-        (|| -> Result<*mut LanceRef> {
-            Ok(Box::into_raw(Box::new(LanceRef {
-                reference: Ref::from(version),
-            })))
-        })(),
+        Ok::<_, lance_core::Error>(Box::into_raw(Box::new(LanceRef {
+            reference: Ref::from(version),
+        }))),
         null
     )
 }
@@ -515,12 +514,12 @@ unsafe fn ref_version_inner(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_ref_tag(tag_name: *const c_char) -> *mut LanceRef {
     ffi_try!(
-        (|| -> Result<*mut LanceRef> {
+        {
             let tag_name = required_c_string(tag_name, "tag_name")?;
             Ok(Box::into_raw(Box::new(LanceRef {
                 reference: Ref::from(tag_name),
             })))
-        })(),
+        },
         null
     )
 }
@@ -582,12 +581,12 @@ unsafe fn tags_inner(dataset: *const LanceDataset) -> Result<*mut LanceTags> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_tags_count(tags: *const LanceTags) -> u64 {
     ffi_try!(
-        (|| -> Result<u64> {
+        {
             if tags.is_null() {
                 return Err(invalid("tags must not be NULL"));
             }
             Ok(unsafe { &*tags }.entries.len() as u64)
-        })(),
+        },
         0
     )
 }
@@ -597,9 +596,10 @@ pub unsafe extern "C" fn lance_tags_count(tags: *const LanceTags) -> u64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_tags_at(tags: *const LanceTags, index: usize) -> *const LanceTag {
     ffi_try!(
-        (|| -> Result<*const LanceTag> {
-            Ok(unsafe { tags_entry_at(tags, index)? as *const LanceTag })
-        })(),
+        {
+            let tag = unsafe { tags_entry_at(tags, index)? };
+            Ok(tag as *const LanceTag)
+        },
         std::ptr::null()
     )
 }
