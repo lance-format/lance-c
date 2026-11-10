@@ -10062,6 +10062,20 @@ fn test_typed_fts_query_matches_native_semantics() {
     );
     unsafe { lance_fts_query_close(multi_boosted) };
 
+    let mut multi_and_options = initialized_multi_match_options();
+    multi_and_options.match_operator = LanceFtsMatchOperator::And as i32;
+    let multi_and = typed_multi_match("alpha beta", &["title", "body"], &multi_and_options);
+    let multi_and_native =
+        native_multi_match_query("alpha beta", &["title", "body"], &multi_and_options);
+    let multi_and_scores = collect_typed_query_scores(dataset, multi_and, None, None, None);
+    assert_eq!(sorted_score_ids(&multi_and_scores), vec![1, 3]);
+    assert_scores_match(
+        "AND multi match",
+        &multi_and_scores,
+        &collect_native_fts_scores(&uri, multi_and_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(multi_and) };
+
     let combined_options = initialized_combined_fields_options();
     let combined = typed_combined_fields("rust", &["title", "body"], &combined_options);
     let combined_native =
@@ -10095,6 +10109,21 @@ fn test_typed_fts_query_matches_native_semantics() {
         &collect_native_fts_scores(&uri, combined_weighted_native.clone(), None),
     );
     unsafe { lance_fts_query_close(combined_weighted) };
+
+    let mut combined_and_options = initialized_combined_fields_options();
+    combined_and_options.match_operator = LanceFtsMatchOperator::And as i32;
+    let combined_and =
+        typed_combined_fields("alpha beta", &["title", "body"], &combined_and_options);
+    let combined_and_native =
+        native_combined_fields_query("alpha beta", &["title", "body"], &combined_and_options);
+    let combined_and_scores = collect_typed_query_scores(dataset, combined_and, None, None, None);
+    assert_eq!(sorted_score_ids(&combined_and_scores), vec![1, 3]);
+    assert_scores_match(
+        "AND combined fields",
+        &combined_and_scores,
+        &collect_native_fts_scores(&uri, combined_and_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(combined_and) };
 
     let combined_child = typed_combined_fields(
         "rust",
