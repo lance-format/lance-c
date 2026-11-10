@@ -38,6 +38,7 @@ use lance_index::scalar::inverted::query::{
     Operator, PhraseQuery,
 };
 use lance_index::scalar::minhash_lsh::MinHashQuery as NativeMinHashQuery;
+use lance_select::{RowAddrMask as NativeRowAddrMask, RowAddrTreeMap as NativeRowAddrTreeMap};
 
 /// Helper: create a test dataset in a temp directory and return its path.
 fn create_test_dataset() -> (tempfile::TempDir, String) {
@@ -9794,6 +9795,37 @@ where
     })
 }
 
+fn native_minhash_error<F>(
+    uri: &str,
+    column: &str,
+    text: &str,
+    limit: Option<i64>,
+    configure: F,
+) -> String
+where
+    F: FnOnce(&Dataset, &mut lance::dataset::scanner::Scanner),
+{
+    let uri = uri.to_string();
+    let column = column.to_string();
+    let text = text.to_string();
+    lance_c::runtime::block_on(async move {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .minhash_search(NativeMinHashQuery::new(text, column))
+            .unwrap();
+        if let Some(limit) = limit {
+            scanner.limit(Some(limit), None).unwrap();
+        }
+        configure(&dataset, &mut scanner);
+        scanner.project(&["id"]).unwrap();
+        match scanner.try_into_batch().await {
+            Ok(_) => panic!("expected native MinHash search to fail"),
+            Err(error) => error.to_string(),
+        }
+    })
+}
+
 fn collect_minhash_hits(scanner: *mut LanceScanner) -> (SchemaRef, Vec<(i32, f32)>) {
     let (schema, batches) = collect_scanner(scanner);
     let mut hits = Vec::new();
@@ -10685,6 +10717,12 @@ fn test_minhash_search_partial_coverage_filters_masks_and_projection() {
     assert_eq!(unsafe { lance_scanner_set_limit(scanner, 1) }, 0);
     let (_, masked_hits) = collect_minhash_hits(scanner);
     assert_eq!(masked_hits, vec![(13, 0.0)]);
+    let native_masked = native_minhash_hits(&uri, MINHASH_BASE, 1, None, |_, scan| {
+        let allowed = NativeRowAddrTreeMap::from_iter([append_row_13]);
+        let blocked = NativeRowAddrTreeMap::from_iter([append_row_12]);
+        scan.with_row_id_prefilter(NativeRowAddrMask::from_allowed(allowed).also_block(blocked));
+    });
+    assert_minhash_hits_match(&masked_hits, &native_masked);
     unsafe { lance_scanner_close(scanner) };
 
     let mut fragment_ids = vec![0_u64; 4];
@@ -10904,6 +10942,18 @@ fn test_minhash_search_validation_copy_and_native_errors() {
         take_last_error_message().contains("column to search"),
         "empty column must fail during native query construction"
     );
+    let native_message = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .minhash_search(NativeMinHashQuery::new(MINHASH_BASE, ""))
+            .unwrap_err()
+            .to_string()
+    });
+    assert!(
+        native_message.contains("column to search"),
+        "{native_message}"
+    );
     unsafe { lance_scanner_close(scanner) };
 
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
@@ -10923,6 +10973,28 @@ fn test_minhash_search_validation_copy_and_native_errors() {
     assert!(
         take_last_error_message().contains("requires a limit"),
         "native MinHash limit validation must be preserved"
+    );
+    let native_message = native_minhash_error(&uri, "text", MINHASH_BASE, None, |_, _| {});
+    assert!(
+        native_message.contains("requires a limit"),
+        "{native_message}"
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 3) }, 0);
+    assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("Cannot use limit/offset with aggregate"),
+        "MinHash count must preserve native aggregate planning"
     );
     unsafe { lance_scanner_close(scanner) };
 
@@ -10945,6 +11017,11 @@ fn test_minhash_search_validation_copy_and_native_errors() {
     assert!(
         message.contains("No MinHash LSH index found for column id"),
         "{message}"
+    );
+    let native_message = native_minhash_error(&uri, "id", MINHASH_BASE, Some(3), |_, _| {});
+    assert!(
+        native_message.contains("No MinHash LSH index found for column id"),
+        "{native_message}"
     );
     unsafe { lance_scanner_close(scanner) };
 
@@ -10991,6 +11068,14 @@ fn test_minhash_search_validation_copy_and_native_errors() {
         message.contains("Cannot combine a MinHash search"),
         "{message}"
     );
+    let native_message = native_minhash_error(&uri, "text", MINHASH_BASE, Some(3), |_, scan| {
+        scan.full_text_search(FullTextSearchQuery::new("fox".to_string()))
+            .unwrap();
+    });
+    assert!(
+        native_message.contains("Cannot combine a MinHash search"),
+        "{native_message}"
+    );
     unsafe { lance_scanner_close(scanner) };
 
     lance_c::runtime::block_on(async {
@@ -11022,6 +11107,11 @@ fn test_minhash_search_validation_copy_and_native_errors() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     let message = take_last_error_message();
     assert!(message.contains("deleted rows"), "{message}");
+    let native_message = native_minhash_error(&uri, "text", MINHASH_BASE, Some(3), |_, scan| {
+        scan.with_row_id();
+        scan.include_deleted_rows();
+    });
+    assert!(native_message.contains("deleted rows"), "{native_message}");
     unsafe { lance_scanner_close(scanner) };
 
     assert_eq!(
@@ -11040,7 +11130,7 @@ fn test_minhash_search_validation_copy_and_native_errors() {
         take_last_error_message()
     );
     let mut segment_uuid = [0_u8; 16];
-    let mut segment_count = 0_usize;
+    let mut segment_count = 0_u64;
     assert_eq!(
         unsafe {
             lance_dataset_index_segments(
