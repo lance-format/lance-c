@@ -14513,6 +14513,37 @@ fn collect_context_fts_scores(
     scores
 }
 
+fn collect_context_fts_count(
+    dataset: *const LanceDataset,
+    context: *const LanceFtsQueryContext,
+    segment_uuids: Option<&[[u8; 16]]>,
+) -> u64 {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    if let Some(segment_uuids) = segment_uuids {
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_fts_index_segments(
+                    scanner,
+                    segment_uuids.as_ptr().cast::<u8>(),
+                    segment_uuids.len(),
+                )
+            },
+            0
+        );
+    }
+    let count = unsafe { lance_scanner_count_rows(scanner) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    unsafe { lance_scanner_close(scanner) };
+    count
+}
+
 fn load_fts_segment_uuids(uri: &str, column: &str) -> Vec<[u8; 16]> {
     use lance::index::DatasetIndexExt;
     use lance_index::IndexCriteria;
@@ -15336,14 +15367,21 @@ fn test_prepared_fts_global_scorer_is_shared_across_segment_splits() {
 
     let full_scores = collect_context_fts_scores(dataset, context, None);
     assert_eq!(full_scores.len(), 3);
+    let full_count = collect_context_fts_count(dataset, context, None);
+    assert_eq!(full_count, full_scores.len() as u64);
     let mut split_scores = std::collections::HashMap::new();
+    let mut split_count = 0;
     for segment_uuid in &segment_uuids {
-        for (id, score) in
-            collect_context_fts_scores(dataset, context, Some(std::slice::from_ref(segment_uuid)))
-        {
+        let segment = std::slice::from_ref(segment_uuid);
+        let scores = collect_context_fts_scores(dataset, context, Some(segment));
+        let count = collect_context_fts_count(dataset, context, Some(segment));
+        assert_eq!(count, scores.len() as u64);
+        split_count += count;
+        for (id, score) in scores {
             assert!(split_scores.insert(id, score).is_none());
         }
     }
+    assert_eq!(split_count, full_count);
     assert_eq!(split_scores.len(), full_scores.len());
     for (id, expected_score) in full_scores {
         let actual_score = split_scores.get(&id).unwrap();

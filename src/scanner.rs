@@ -5159,7 +5159,10 @@ mod tests {
         assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, false) }, 0);
         assert!(!unsafe { &*scanner }.fast_search);
 
-        let prepared = unsafe { &*scanner }.build_scanner().unwrap();
+        let mut batch = ptr::null_mut();
+        assert_eq!(unsafe { lance_scanner_next(scanner, &mut batch) }, 0);
+        assert!(!batch.is_null());
+        unsafe { crate::batch::lance_batch_free(batch) };
         assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, true) }, -1);
         assert_eq!(
             unsafe {
@@ -5177,7 +5180,6 @@ mod tests {
             MaterializationStyle::AllLate
         ));
         assert!(!unsafe { &*scanner }.fast_search);
-        drop(prepared);
 
         unsafe {
             lance_scanner_close(scanner);
