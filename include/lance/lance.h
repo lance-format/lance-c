@@ -408,6 +408,22 @@ uint64_t lance_dataset_version(const LanceDataset* dataset);
 uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
 
 /**
+ * Return the number of rows matching an optional SQL filter.
+ *
+ * `filter == NULL` maps to native `Dataset::count_rows(None)` and uses the
+ * metadata fast path. A non-NULL `filter`, including `""`, maps to
+ * `Dataset::count_rows(Some(filter))` and therefore follows native SQL filter
+ * parsing and error semantics.
+ *
+ * Returns 0 on error; an empty match also returns 0, so check
+ * lance_last_error_code().
+ */
+uint64_t lance_dataset_count_rows_filtered(
+    const LanceDataset* dataset,
+    const char* filter
+);
+
+/**
  * Return the latest version ID (I/O), or 0 on error (check
  * lance_last_error_code()).
  */
@@ -2206,6 +2222,95 @@ int32_t lance_scanner_set_statistics_callback(
  * callbacks, because close must wait for that callback to return.
  */
 void lance_scanner_close(LanceScanner* scanner);
+
+/* ─── Scanner planning, introspection and count ─── */
+
+/**
+ * Export the configured scanner output schema.
+ *
+ * Schemas come from the native plan for the actual configured execution path,
+ * including projections, scoring columns, multi-vector and prepared FTS
+ * transformations, and scalar-segment setup. A binding-private multi-vector
+ * distance column is removed before export.
+ *
+ * This is planning-only: it does not start iteration or advance any stream
+ * already owned by or exported from this scanner. Configuration setters remain
+ * usable afterward. Read-only index metadata and scalar-segment candidate work
+ * required to construct the configured plan may still perform I/O.
+ *
+ * `out` must be non-NULL and point to an empty ArrowSchema whose `release`
+ * callback is NULL. On success the caller must invoke `out->release(out)`
+ * exactly once.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_schema(
+    const LanceScanner* scanner,
+    struct ArrowSchema* out
+);
+
+/**
+ * Explain the configured scanner plan without executing it.
+ *
+ * `verbose` selects native DataFusion tree formatting. The plan includes the
+ * same transformations used by a stream from this configuration.
+ *
+ * This does not start iteration or advance any stream already owned by or
+ * exported from this scanner, and the scanner remains configurable afterward.
+ * Read-only index metadata and scalar-segment candidate work required to
+ * construct the configured plan may still perform I/O.
+ *
+ * The returned string is owned by the caller and must be freed with
+ * lance_free_string(). Returns NULL on error.
+ */
+const char* lance_scanner_explain_plan(
+    const LanceScanner* scanner,
+    bool verbose
+);
+
+/**
+ * Execute the configured scanner plan and return its native runtime analysis.
+ *
+ * This executes the same plan a stream from this configuration would use,
+ * including scalar-segment, multi-vector, and prepared FTS transformations.
+ * It does not consume or advance any existing stream. The scanner remains
+ * configurable afterward.
+ *
+ * The returned string is owned by the caller and must be freed with
+ * lance_free_string(). Returns NULL on error.
+ */
+const char* lance_scanner_analyze_plan(const LanceScanner* scanner);
+
+/**
+ * Count rows matched by the configured scanner.
+ *
+ * This applies the native `COUNT(*)` aggregate to the configured scanner plan
+ * and executes that count plan. It does not count batches from a stream.
+ * Native aggregate planning rejects any configured limit, offset, or ordering.
+ * Count execution uses the native count operation's execution options; the
+ * registered scan-statistics callback is not invoked for this separate count
+ * operation.
+ *
+ * This does not start normal scanner iteration or advance an existing stream,
+ * and the scanner remains configurable afterward.
+ *
+ * Returns 0 on error; an empty match also returns 0, so check
+ * lance_last_error_code().
+ */
+uint64_t lance_scanner_count_rows(const LanceScanner* scanner);
+
+/**
+ * Execute and format the configured native `COUNT(*)` plan.
+ *
+ * This analyzes the plan used by `lance_scanner_count_rows`, not the ordinary
+ * scan plan. It obeys the same aggregate planning constraints and does not
+ * invoke the registered scan-statistics callback. The scanner remains
+ * configurable afterward.
+ *
+ * The returned string is owned by the caller and must be freed with
+ * lance_free_string(). Returns NULL on error.
+ */
+const char* lance_scanner_analyze_count_plan(const LanceScanner* scanner);
 
 /* ─── Sync scan: ArrowArrayStream ─── */
 

@@ -33,6 +33,11 @@ pub(crate) struct PreparedScalarSegment {
     pub callback: Option<ExecutionStatsCallback>,
 }
 
+pub(crate) struct ConfiguredScalarSegment {
+    pub scanner: Scanner,
+    pub stats_callback: Option<ExecutionStatsCallback>,
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::invalid_input_source(message.into().into())
 }
@@ -129,7 +134,7 @@ impl ScalarIndexLoader for SegmentIndexLoader<'_> {
 }
 
 impl PreparedScalarSegment {
-    pub async fn configure(self, mut reader: Scanner) -> Result<Scanner> {
+    pub async fn configure(self, mut reader: Scanner) -> Result<ConfiguredScalarSegment> {
         // Never let either candidate reads or fallback re-enter a global index search.
         reader.use_scalar_index(false);
         let mut stats = ExecutionSummaryCounts::default();
@@ -167,10 +172,10 @@ impl PreparedScalarSegment {
                 _ => *stats.all_counts.entry(name.to_string()).or_default() += count.value(),
             }
         }
-        if let Some(callback) = self.callback {
+        let stats_callback = if let Some(callback) = self.callback {
             // Preserve the callback's once-per-successfully-exhausted-stream contract.
             // Candidate work is not part of the underlying reader's plan metrics.
-            reader.scan_stats_callback(Arc::new(move |read| {
+            let combined = Arc::new(move |read: &ExecutionSummaryCounts| {
                 let mut combined = read.clone();
                 combined.iops += stats.iops;
                 combined.requests += stats.requests;
@@ -185,9 +190,16 @@ impl PreparedScalarSegment {
                     *combined.all_times.entry(name.clone()).or_default() += value;
                 }
                 callback(&combined);
-            }));
-        }
-        Ok(reader)
+            });
+            reader.scan_stats_callback(combined.clone());
+            Some(combined)
+        } else {
+            None
+        };
+        Ok(ConfiguredScalarSegment {
+            scanner: reader,
+            stats_callback,
+        })
     }
 
     async fn configure_candidates(

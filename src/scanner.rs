@@ -3,7 +3,7 @@
 
 //! Scanner C API: builder, sync iteration, async scan, poll-based iteration.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::pin::Pin;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,20 +11,25 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow_array::Int64Array;
 use arrow_schema::SchemaRef;
 use datafusion::physical_expr::expressions;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{
     ExecutionPlan, empty::EmptyExec, projection::ProjectionExec as DFProjectionExec,
 };
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::scanner::{
-    ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
-    MaterializationStyle, RowAddrMask, RowAddrTreeMap,
+    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
+    ExecutionSummaryCounts, MaterializationStyle, RowAddrMask, RowAddrTreeMap,
 };
 use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use lance_core::Result;
 use lance_core::datatypes::{BlobHandling, escape_field_path_for_project};
+use lance_datafusion::exec::{
+    LanceExecutionOptions, analyze_plan as analyze_execution_plan, execute_plan,
+};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::ApproxMode;
 use lance_io::stream::RecordBatchStream;
@@ -472,6 +477,10 @@ impl LanceScanner {
         Ok(())
     }
 
+    fn begin_scan(&self) {
+        self.scan_started.store(true, Ordering::Release);
+    }
+
     /// Pick an output name for the native distance that cannot collide with a
     /// stored field, a projected output, or wildcard expansion of the stored
     /// schema. The name is binding-private and removed after the result window.
@@ -614,6 +623,7 @@ impl LanceScanner {
 
     /// Build the underlying Scanner and open a stream.
     fn materialize_stream(&mut self) -> Result<()> {
+        self.begin_scan();
         let prepared_scanner = self.build_scanner()?;
         let stream = block_on(prepared_scanner.try_into_stream())?;
         self.schema = Some(stream.schema());
@@ -623,7 +633,14 @@ impl LanceScanner {
 
     /// Build a Scanner (without materializing) and return it.
     fn build_scanner(&self) -> Result<PreparedScanner> {
-        self.scan_started.store(true, Ordering::Release);
+        self.build_scanner_for(ScannerOperation::Scan)
+    }
+
+    fn build_count_scanner(&self) -> Result<PreparedScanner> {
+        self.build_scanner_for(ScannerOperation::Count)
+    }
+
+    fn build_scanner_for(&self, operation: ScannerOperation) -> Result<PreparedScanner> {
         let mut scanner = self.dataset.scan();
         // Both batch and multi-vector inputs are matrices, but only multi-vector
         // queries may use the custom row-level scoring and global result window.
@@ -644,7 +661,8 @@ impl LanceScanner {
         if let Some(handling) = &self.blob_handling {
             scanner.blob_handling(handling.clone());
         }
-        if multi_vector
+        if operation == ScannerOperation::Scan
+            && multi_vector
             && self
                 .order_by
                 .as_ref()
@@ -666,7 +684,7 @@ impl LanceScanner {
         }
         if self.limit.is_some() || self.offset.is_some() {
             scanner.limit(self.limit, self.offset)?;
-            if multi_vector {
+            if multi_vector && operation == ScannerOperation::Scan {
                 // Retain Lance's window validation, but defer truncation until the final sort.
                 scanner.limit(None, None)?;
             }
@@ -913,89 +931,226 @@ struct MultiVectorWindow {
     drop_distance_column: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScannerOperation {
+    Scan,
+    Count,
+}
+
+struct PreparedPlan {
+    plan: Arc<dyn ExecutionPlan>,
+    batch_size: Option<usize>,
+    stats_callback: Option<ExecutionStatsCallback>,
+}
+
 impl PreparedScanner {
-    async fn try_into_stream(self) -> Result<DatasetRecordBatchStream> {
-        if let Some(scalar_segment) = self.scalar_segment {
-            return scalar_segment
-                .configure(self.scanner)
-                .await?
-                .try_into_stream()
-                .await;
-        }
-        if let Some(window) = self.multi_vector_window {
-            let plan = crate::multivector::rewrite(self.scanner.create_plan().await?)?;
-            let plan = crate::multivector::apply_result_window(
+    async fn create_plan(self, operation: ScannerOperation) -> Result<PreparedPlan> {
+        let PreparedScanner {
+            scanner,
+            distributed_fts,
+            multi_vector_window,
+            batch_size,
+            scan_statistics_callback,
+            scalar_segment,
+        } = self;
+
+        if let Some(scalar_segment) = scalar_segment {
+            let configured = scalar_segment.configure(scanner).await?;
+            let mut scanner = configured.scanner;
+            if operation == ScannerOperation::Count {
+                add_count_aggregate(&mut scanner)?;
+            }
+            let plan = scanner.create_plan().await?;
+            return Ok(PreparedPlan {
                 plan,
-                window.offset,
-                window.limit,
-                &window.distance_column,
-            )?;
-            let plan = if window.drop_distance_column {
-                drop_column_from_plan(plan, &window.distance_column)?
+                batch_size,
+                stats_callback: (operation == ScannerOperation::Scan)
+                    .then_some(configured.stats_callback)
+                    .flatten(),
+            });
+        }
+
+        if let Some(window) = multi_vector_window {
+            let mut scanner = scanner;
+            if operation == ScannerOperation::Count {
+                add_count_aggregate(&mut scanner)?;
+            }
+            let plan = crate::multivector::rewrite(scanner.create_plan().await?)?;
+            let plan = if operation == ScannerOperation::Scan {
+                let plan = crate::multivector::apply_result_window(
+                    plan,
+                    window.offset,
+                    window.limit,
+                    &window.distance_column,
+                )?;
+                if window.drop_distance_column {
+                    drop_column_from_plan(plan, &window.distance_column)?
+                } else {
+                    plan
+                }
             } else {
                 plan
             };
-            let stream = lance_datafusion::exec::execute_plan(
+            return Ok(PreparedPlan {
                 plan,
-                lance_datafusion::exec::LanceExecutionOptions {
-                    batch_size: self.batch_size,
-                    execution_stats_callback: self.scan_statistics_callback,
-                    ..Default::default()
-                },
-            )?;
-            return Ok(DatasetRecordBatchStream::new(stream));
+                batch_size,
+                stats_callback: (operation == ScannerOperation::Scan)
+                    .then_some(scan_statistics_callback)
+                    .flatten(),
+            });
         }
-        let Some(distributed_fts) = self.distributed_fts else {
-            return self.scanner.try_into_stream().await;
-        };
-        let selected_fragments = selected_current_fts_fragments(
-            &distributed_fts.context.dataset,
-            &distributed_fts.segments,
-        )?;
-        let selected_segments_have_current_fragments = !selected_fragments.is_empty();
-        let mut scanner = self.scanner;
-        if distributed_fts.scope_prefilter_to_fts_segments
-            && selected_segments_have_current_fragments
-        {
-            // The scanner is already split by the selected FTS segment(s). Applying the same
-            // fragment scope before plan creation lets Lance restrict scalar-index segment loads
-            // for the TVF prefilter without changing unfiltered FTS scans.
-            scanner.with_fragments(selected_fragments);
-        }
-        let plan = scanner.create_plan().await?;
-        let (plan, rewritten) = rewrite_prepared_fts_plan(
-            plan,
-            &distributed_fts.segments,
-            &distributed_fts.context.prepared,
-            selected_segments_have_current_fragments,
-            distributed_fts.row_addr_mask.as_ref(),
-        )?;
-        // Fast search may eliminate every FTS source. Projection and row-fetch
-        // nodes can still wrap EmptyExec, with no query node to rewrite.
-        let empty_sources_only = rewritten.indexed_query_execs == 0
-            && rewritten.flat_match_query_execs == 0
-            && fts_plan_has_only_empty_sources(plan.as_ref());
-        if !empty_sources_only
-            && (rewritten.indexed_query_execs > 1
-                || rewritten.flat_match_query_execs > 1
-                || rewritten.indexed_query_execs + rewritten.flat_match_query_execs == 0
-                || (selected_segments_have_current_fragments && rewritten.indexed_query_execs != 1))
-        {
-            return Err(lance_core::Error::internal(format!(
-                "unexpected prepared FTS plan for selected segments with current fragment coverage {selected_segments_have_current_fragments}: rewrote {} indexed FTS query node(s) and removed {} FlatMatchQueryExec node(s)",
-                rewritten.indexed_query_execs, rewritten.flat_match_query_execs
-            )));
-        }
-        let stream = lance_datafusion::exec::execute_plan(
-            plan,
-            lance_datafusion::exec::LanceExecutionOptions {
+
+        if let Some(distributed_fts) = distributed_fts {
+            let mut scanner = scanner;
+            if operation == ScannerOperation::Count {
+                add_count_aggregate(&mut scanner)?;
+            }
+            let plan = build_prepared_fts_plan(scanner, &distributed_fts).await?;
+            return Ok(PreparedPlan {
+                plan,
                 batch_size: distributed_fts.batch_size,
-                execution_stats_callback: distributed_fts.scan_statistics_callback,
+                stats_callback: (operation == ScannerOperation::Scan)
+                    .then_some(distributed_fts.scan_statistics_callback)
+                    .flatten(),
+            });
+        }
+
+        let mut scanner = scanner;
+        if operation == ScannerOperation::Count {
+            add_count_aggregate(&mut scanner)?;
+        }
+        Ok(PreparedPlan {
+            plan: scanner.create_plan().await?,
+            batch_size,
+            stats_callback: (operation == ScannerOperation::Scan)
+                .then_some(scan_statistics_callback)
+                .flatten(),
+        })
+    }
+
+    async fn try_into_stream(self) -> Result<DatasetRecordBatchStream> {
+        let prepared = self.create_plan(ScannerOperation::Scan).await?;
+        let stream = execute_plan(
+            prepared.plan,
+            LanceExecutionOptions {
+                batch_size: prepared.batch_size,
+                execution_stats_callback: prepared.stats_callback,
                 ..Default::default()
             },
         )?;
         Ok(DatasetRecordBatchStream::new(stream))
     }
+
+    async fn schema(self) -> Result<SchemaRef> {
+        Ok(self
+            .create_plan(ScannerOperation::Scan)
+            .await?
+            .plan
+            .schema())
+    }
+
+    async fn explain_plan(self, verbose: bool) -> Result<String> {
+        let plan = self.create_plan(ScannerOperation::Scan).await?.plan;
+        Ok(format!(
+            "{}",
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(verbose)
+        ))
+    }
+
+    async fn analyze_plan(self) -> Result<String> {
+        let prepared = self.create_plan(ScannerOperation::Scan).await?;
+        analyze_execution_plan(
+            prepared.plan,
+            LanceExecutionOptions {
+                batch_size: prepared.batch_size,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn count_rows(self) -> Result<u64> {
+        let prepared = self.create_plan(ScannerOperation::Count).await?;
+        count_plan_rows(prepared.plan).await
+    }
+
+    async fn analyze_count_plan(self) -> Result<String> {
+        let prepared = self.create_plan(ScannerOperation::Count).await?;
+        analyze_execution_plan(
+            prepared.plan,
+            LanceExecutionOptions {
+                batch_size: prepared.batch_size,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+}
+
+fn add_count_aggregate(scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
+    scanner.aggregate(AggregateExpr::builder().count_star().build())?;
+    Ok(())
+}
+
+async fn count_plan_rows(plan: Arc<dyn ExecutionPlan>) -> Result<u64> {
+    let mut stream = execute_plan(plan, LanceExecutionOptions::default())?;
+    if let Some(first_batch) = stream.next().await {
+        let batch = first_batch?;
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input(
+                    "Count plan did not return an Int64Array".to_string(),
+                )
+            })?;
+        Ok(array.value(0) as u64)
+    } else {
+        Ok(0)
+    }
+}
+
+async fn build_prepared_fts_plan(
+    mut scanner: lance::dataset::scanner::Scanner,
+    distributed_fts: &PreparedFtsExecution,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let selected_fragments = selected_current_fts_fragments(
+        &distributed_fts.context.dataset,
+        &distributed_fts.segments,
+    )?;
+    let selected_segments_have_current_fragments = !selected_fragments.is_empty();
+    if distributed_fts.scope_prefilter_to_fts_segments && selected_segments_have_current_fragments {
+        // The scanner is already split by the selected FTS segment(s). Applying the same
+        // fragment scope before plan creation lets Lance restrict scalar-index segment loads
+        // for the TVF prefilter without changing unfiltered FTS scans.
+        scanner.with_fragments(selected_fragments);
+    }
+    let plan = scanner.create_plan().await?;
+    let (plan, rewritten) = rewrite_prepared_fts_plan(
+        plan,
+        &distributed_fts.segments,
+        &distributed_fts.context.prepared,
+        selected_segments_have_current_fragments,
+        distributed_fts.row_addr_mask.as_ref(),
+    )?;
+    // Fast search may eliminate every FTS source. Projection and row-fetch
+    // nodes can still wrap EmptyExec, with no query node to rewrite.
+    let empty_sources_only = rewritten.indexed_query_execs == 0
+        && rewritten.flat_match_query_execs == 0
+        && fts_plan_has_only_empty_sources(plan.as_ref());
+    if !empty_sources_only
+        && (rewritten.indexed_query_execs > 1
+            || rewritten.flat_match_query_execs > 1
+            || rewritten.indexed_query_execs + rewritten.flat_match_query_execs == 0
+            || (selected_segments_have_current_fragments && rewritten.indexed_query_execs != 1))
+    {
+        return Err(lance_core::Error::internal(format!(
+            "unexpected prepared FTS plan for selected segments with current fragment coverage {selected_segments_have_current_fragments}: rewrote {} indexed FTS query node(s) and removed {} FlatMatchQueryExec node(s)",
+            rewritten.indexed_query_execs, rewritten.flat_match_query_execs
+        )));
+    }
+    Ok(plan)
 }
 
 fn drop_column_from_plan(
@@ -2573,6 +2728,149 @@ pub unsafe extern "C" fn lance_scanner_close(scanner: *mut LanceScanner) {
     }
 }
 
+/// Export the configured scanner output schema without starting a scan.
+///
+/// `out` must point to an empty ArrowSchema (release callback NULL). Planning
+/// may perform read-only index metadata and candidate work required by the
+/// configured execution path, but it never advances a scanner-owned or
+/// exported stream. The scanner remains configurable after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_schema(
+    scanner: *const LanceScanner,
+    out: *mut FFI_ArrowSchema,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe { scanner_schema_inner(scanner, out) })
+}
+
+unsafe fn scanner_schema_inner(
+    scanner: *const LanceScanner,
+    out: *mut FFI_ArrowSchema,
+) -> Result<i32> {
+    if scanner.is_null() || out.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner and out must not be NULL".into(),
+        ));
+    }
+    if unsafe { &*out }.release.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out must be an empty ArrowSchema (release callback must be NULL)".into(),
+        ));
+    }
+    let scanner = unsafe { &*scanner };
+    let schema = block_on(scanner.build_scanner()?.schema())?;
+    let ffi_schema = FFI_ArrowSchema::try_from(schema.as_ref())?;
+    unsafe {
+        ptr::write_unaligned(out, ffi_schema);
+    }
+    Ok(0)
+}
+
+/// Explain the configured scanner plan without executing it.
+///
+/// `verbose` selects the native DataFusion tree formatting. The returned
+/// string is owned by the caller and must be freed with `lance_free_string()`.
+/// Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_explain_plan(
+    scanner: *const LanceScanner,
+    verbose: bool,
+) -> *const c_char {
+    scanner_poison_check!(scanner, ptr::null());
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_plan_string_inner(scanner, ScannerPlanString::Explain(verbose))
+    })
+}
+
+/// Execute and format the configured scanner plan with native runtime metrics.
+///
+/// This executes the same plan a scan from this configuration would use,
+/// including binding-required scalar-segment, multi-vector, and prepared FTS
+/// transformations. It does not consume or advance any existing stream. The
+/// returned string is owned by the caller and must be freed with
+/// `lance_free_string()`. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_analyze_plan(
+    scanner: *const LanceScanner,
+) -> *const c_char {
+    scanner_poison_check!(scanner, ptr::null());
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_plan_string_inner(scanner, ScannerPlanString::Analyze)
+    })
+}
+
+/// Count rows matched by the configured scanner.
+///
+/// This applies the native `COUNT(*)` aggregate to the configured scanner
+/// plan and executes that count plan. Planning rejects any configured limit,
+/// offset, or ordering with the native aggregate error. It does not count
+/// batches from a stream. Returns 0 on error; an empty match also returns 0,
+/// so check `lance_last_error_code()`. The scanner remains configurable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_count_rows(scanner: *const LanceScanner) -> u64 {
+    scanner_poison_check!(scanner, 0);
+    scanner_ffi_try!(scanner, unsafe { scanner_count_rows_inner(scanner) })
+}
+
+unsafe fn scanner_count_rows_inner(scanner: *const LanceScanner) -> Result<u64> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &*scanner };
+    block_on(scanner.build_count_scanner()?.count_rows())
+}
+
+/// Execute and format the configured native `COUNT(*)` plan.
+///
+/// This is the plan used by `lance_scanner_count_rows`, not the ordinary scan
+/// plan. The returned string is owned by the caller and must be freed with
+/// `lance_free_string()`. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_analyze_count_plan(
+    scanner: *const LanceScanner,
+) -> *const c_char {
+    scanner_poison_check!(scanner, ptr::null());
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_plan_string_inner(scanner, ScannerPlanString::AnalyzeCount)
+    })
+}
+
+enum ScannerPlanString {
+    Explain(bool),
+    Analyze,
+    AnalyzeCount,
+}
+
+unsafe fn scanner_plan_string_inner(
+    scanner: *const LanceScanner,
+    operation: ScannerPlanString,
+) -> Result<*const c_char> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &*scanner };
+    let value = match operation {
+        ScannerPlanString::Explain(verbose) => {
+            block_on(scanner.build_scanner()?.explain_plan(verbose))?
+        }
+        ScannerPlanString::Analyze => block_on(scanner.build_scanner()?.analyze_plan())?,
+        ScannerPlanString::AnalyzeCount => {
+            block_on(scanner.build_count_scanner()?.analyze_count_plan())?
+        }
+    };
+    CString::new(value)
+        .map(|value| value.into_raw() as *const c_char)
+        .map_err(|error| {
+            lance_core::Error::internal(format!(
+                "scanner plan output contains an embedded NUL: {error}"
+            ))
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Sync stream: ArrowArrayStream export
 // ---------------------------------------------------------------------------
@@ -2645,6 +2943,7 @@ unsafe fn scanner_to_arrow_stream_inner(
     s: &LanceScanner,
     out: *mut FFI_ArrowArrayStream,
 ) -> Result<i32> {
+    s.begin_scan();
     let built_scanner = s.build_scanner()?;
     let stream = block_on(built_scanner.try_into_stream())?;
     let schema = stream.schema();
@@ -2888,6 +3187,7 @@ unsafe fn scan_async_setup(
         return;
     }
 
+    s.begin_scan();
     let built_scanner = match s.build_scanner() {
         Ok(sc) => sc,
         Err(err) => {
