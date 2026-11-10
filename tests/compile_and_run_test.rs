@@ -335,37 +335,60 @@ fn create_fragment_dataset_on_disk() -> (tempfile::TempDir, String) {
         Field::new("name", DataType::Utf8, true),
         Field::new("score", DataType::Float32, true),
     ]);
+    let mut json_metadata = std::collections::HashMap::new();
+    json_metadata.insert(
+        "ARROW:extension:name".to_string(),
+        "arrow.json".to_string(),
+    );
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("profile", DataType::Struct(profile_fields.clone()), true),
+        Field::new("meta", DataType::Utf8, true).with_metadata(json_metadata),
     ]));
 
-    let make_batch = |ids: Vec<i32>, names: Vec<Option<&str>>, scores: Vec<Option<f32>>| {
-        let profiles = StructArray::new(
-            profile_fields.clone(),
-            vec![
-                Arc::new(StringArray::from(names)),
-                Arc::new(Float32Array::from(scores)),
-            ],
-            None,
-        );
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(ids)), Arc::new(profiles)],
-        )
-        .unwrap()
-    };
+    let make_batch =
+        |ids: Vec<i32>,
+         names: Vec<Option<&str>>,
+         scores: Vec<Option<f32>>,
+         meta: Vec<Option<&str>>| {
+            let profiles = StructArray::new(
+                profile_fields.clone(),
+                vec![
+                    Arc::new(StringArray::from(names)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+                None,
+            );
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(profiles),
+                    Arc::new(StringArray::from(meta)),
+                ],
+            )
+            .unwrap()
+        };
 
     lance_c::runtime::block_on(async {
         let first = make_batch(
             vec![0, 1, 2, 3],
             vec![Some("a"), Some("b"), None, Some("d")],
             vec![Some(1.0), Some(2.0), Some(3.5), None],
+            vec![
+                Some(r#"{"v":0}"#),
+                Some(r#"{"v":1}"#),
+                None,
+                Some(r#"{"v":3}"#),
+            ],
         );
         Dataset::write(
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
             &uri,
-            None,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
@@ -374,6 +397,12 @@ fn create_fragment_dataset_on_disk() -> (tempfile::TempDir, String) {
             vec![10, 11, 12, 13],
             vec![Some("j"), None, Some("l"), Some("m")],
             vec![Some(10.0), Some(11.0), None, Some(13.0)],
+            vec![
+                Some(r#"{"v":10}"#),
+                None,
+                Some(r#"{"v":12}"#),
+                Some(r#"{"v":13}"#),
+            ],
         );
         let mut dataset = Dataset::open(&uri).await.unwrap();
         dataset

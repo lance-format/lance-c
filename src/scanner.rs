@@ -15,6 +15,7 @@ use arrow_schema::SchemaRef;
 use datafusion::physical_plan::{ExecutionPlan, empty::EmptyExec};
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
+use lance::dataset::fragment::FileFragment;
 use lance::dataset::scanner::{
     ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
     MaterializationStyle, RowAddrMask, RowAddrTreeMap,
@@ -400,6 +401,16 @@ impl LanceScanner {
             stream: None,
             schema: None,
         }
+    }
+
+    /// Create a scanner whose initial selection is one native fragment.
+    ///
+    /// `FileFragment::scan` starts from the fragment's owned dataset snapshot
+    /// and selects that fragment's metadata over the ordinary scanner path.
+    pub(crate) fn from_fragment(fragment: &FileFragment) -> Self {
+        let mut scanner = Self::new(Arc::new(fragment.dataset().clone()));
+        scanner.fragment_ids = Some(vec![fragment.id() as u64]);
+        scanner
     }
 
     /// Whether a panic was caught in an earlier stateful operation on this

@@ -12,13 +12,18 @@ use std::ffi::{CString, c_char};
 use std::ptr;
 
 use arrow::ffi::FFI_ArrowSchema;
+use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment;
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
+use crate::helpers;
 use crate::runtime::block_on;
+use crate::scanner::LanceScanner;
+use crate::stream_guard::guarded_ffi_stream_from_reader;
 
 /// Opaque handle to one read-only fragment from a dataset snapshot.
 pub struct LanceFragment {
@@ -259,6 +264,135 @@ unsafe fn fragment_logical_rows_inner(
     unsafe { require_row_output(fragment, out_rows) }?;
     let fragment = unsafe { &*fragment };
     let rows = block_on(fragment.inner.count_rows(None))?;
+    unsafe {
+        ptr::write_unaligned(out_rows, rows as u64);
+    }
+    Ok(0)
+}
+
+/// Start a scanner over this fragment's owned dataset snapshot.
+///
+/// This is the binding for `FileFragment::scan`. The returned scanner follows
+/// the ordinary scanner lifecycle and configuration rules, with the fragment
+/// selected as its initial scan scope.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_fragment_scan(
+    fragment: *const LanceFragment,
+) -> *mut LanceScanner {
+    ffi_try!(unsafe { fragment_scan_inner(fragment) }, null)
+}
+
+unsafe fn fragment_scan_inner(fragment: *const LanceFragment) -> Result<*mut LanceScanner> {
+    let fragment = unsafe { fragment_ref(fragment) }?;
+    Ok(Box::into_raw(Box::new(LanceScanner::from_fragment(
+        &fragment.inner,
+    ))))
+}
+
+fn fragment_take_projection(
+    fragment: &LanceFragment,
+    columns: Option<&[String]>,
+) -> Result<LanceSchema> {
+    let schema = fragment.inner.dataset().schema();
+    match columns {
+        Some(columns) => schema.project(columns).map_err(|error| {
+            Error::invalid_input(format!(
+                "invalid columns {columns:?} for fragment {}: {error}",
+                fragment.inner.id()
+            ))
+        }),
+        None => Ok(schema.clone()),
+    }
+}
+
+/// Take fragment-local logical rows by index.
+///
+/// `indices` address logical rows in this fragment after deletion vectors are
+/// resolved. They are not dataset `_rowid` values or physical row addresses.
+/// Native `FileFragment::take` preserves input order and duplicates and returns
+/// an error for an out-of-range logical index.
+///
+/// `columns` is a NULL-terminated array. NULL selects the fragment's full
+/// logical schema. A non-NULL array whose first entry is NULL is an explicit
+/// empty projection. `indices` may be NULL only when `num_indices` is zero.
+/// On success `out` receives a caller-owned Arrow stream that remains valid
+/// after the fragment and source dataset handles are closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_fragment_take(
+    fragment: *const LanceFragment,
+    indices: *const u32,
+    num_indices: usize,
+    columns: *const *const c_char,
+    out: *mut FFI_ArrowArrayStream,
+) -> i32 {
+    ffi_try!(
+        unsafe { fragment_take_inner(fragment, indices, num_indices, columns, out) },
+        neg
+    )
+}
+
+unsafe fn fragment_take_inner(
+    fragment: *const LanceFragment,
+    indices: *const u32,
+    num_indices: usize,
+    columns: *const *const c_char,
+    out: *mut FFI_ArrowArrayStream,
+) -> Result<i32> {
+    let fragment = unsafe { fragment_ref(fragment) }?;
+    if out.is_null() {
+        return Err(Error::invalid_input_source("out must not be NULL".into()));
+    }
+    if num_indices > 0 && indices.is_null() {
+        return Err(Error::invalid_input_source(
+            format!("indices must not be NULL when num_indices = {num_indices}").into(),
+        ));
+    }
+
+    let indices = if num_indices == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(indices, num_indices) }
+    };
+    let columns = unsafe { helpers::parse_c_string_array(columns)? };
+    let projection = fragment_take_projection(fragment, columns.as_deref())?;
+
+    let batch = block_on(fragment.inner.take(indices, &projection))?;
+    let schema = batch.schema();
+    let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let ffi_stream = guarded_ffi_stream_from_reader(reader)?;
+    unsafe {
+        ptr::write_unaligned(out, ffi_stream);
+    }
+    Ok(0)
+}
+
+/// Count this fragment's rows, optionally applying a native SQL filter.
+///
+/// NULL calls `FileFragment::count_rows(None)`, which uses the native physical
+/// row and deletion counts. A non-NULL string, including an empty string, is
+/// passed as `Some(filter)` without binding-side pruning. Native errors are
+/// propagated and `out_rows` is written only on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_fragment_count_rows(
+    fragment: *const LanceFragment,
+    filter: *const c_char,
+    out_rows: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { fragment_count_rows_inner(fragment, filter, out_rows) },
+        neg
+    )
+}
+
+unsafe fn fragment_count_rows_inner(
+    fragment: *const LanceFragment,
+    filter: *const c_char,
+    out_rows: *mut u64,
+) -> Result<i32> {
+    unsafe { require_row_output(fragment, out_rows) }?;
+    let fragment = unsafe { &*fragment };
+    let filter = unsafe { helpers::parse_c_string(filter)? }.map(str::to_string);
+    let rows = block_on(fragment.inner.count_rows(filter))?;
     unsafe {
         ptr::write_unaligned(out_rows, rows as u64);
     }

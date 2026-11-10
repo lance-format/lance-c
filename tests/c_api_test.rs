@@ -4567,6 +4567,593 @@ fn test_fragment_historical_snapshot_matches_native() {
     unsafe { lance_dataset_close(ds) };
 }
 
+/// Two-fragment stable-row-id dataset with nested and JSON columns. The first
+/// fragment deletes logical row 1 (`id = 1`); the second deletes logical row 2
+/// (`id = 12`), so equal fragment-local indices map to different rows.
+fn create_fragment_read_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("fragment_read_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let profile_fields = Fields::from(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Float32, true),
+    ]);
+    let mut json_metadata = std::collections::HashMap::new();
+    json_metadata.insert(
+        "ARROW:extension:name".to_string(),
+        "arrow.json".to_string(),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("profile", DataType::Struct(profile_fields.clone()), true),
+        Field::new("meta", DataType::Utf8, true).with_metadata(json_metadata),
+    ]));
+    let make_batch = |ids: Vec<i32>,
+                      names: Vec<Option<&str>>,
+                      scores: Vec<Option<f32>>,
+                      meta: Vec<Option<&str>>| {
+        let profiles = StructArray::new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(Float32Array::from(scores)),
+            ],
+            None,
+        );
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(profiles),
+                Arc::new(StringArray::from(meta)),
+            ],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        let first = make_batch(
+            vec![0, 1, 2, 3],
+            vec![Some("a"), Some("b"), None, Some("d")],
+            vec![Some(1.0), Some(2.0), Some(3.5), None],
+            vec![
+                Some(r#"{"v":0}"#),
+                Some(r#"{"v":1}"#),
+                None,
+                Some(r#"{"v":3}"#),
+            ],
+        );
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            Some(lance::dataset::WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let second = make_batch(
+            vec![10, 11, 12, 13],
+            vec![Some("j"), None, Some("l"), Some("m")],
+            vec![Some(10.0), Some(11.0), None, Some(13.0)],
+            vec![
+                Some(r#"{"v":10}"#),
+                None,
+                Some(r#"{"v":12}"#),
+                Some(r#"{"v":13}"#),
+            ],
+        );
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
+            &uri,
+            Some(lance::dataset::WriteParams {
+                mode: lance::dataset::WriteMode::Append,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset.delete("id IN (1, 12)").await.unwrap();
+    });
+
+    (tmp, uri)
+}
+
+fn fragment_projection(
+    fragment: &lance::dataset::fragment::FileFragment,
+    columns: Option<&[String]>,
+) -> lance_core::datatypes::Schema {
+    let schema = fragment.dataset().schema();
+    match columns {
+        Some(columns) => schema.project(columns).unwrap(),
+        None => schema.clone(),
+    }
+}
+
+fn read_take_stream(mut stream: FFI_ArrowArrayStream) -> (Schema, Vec<RecordBatch>) {
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let schema = reader.schema().as_ref().clone();
+    let batches = reader.map(|batch| batch.unwrap()).collect();
+    (schema, batches)
+}
+
+fn take_fragment_via_c(
+    fragment: *const LanceFragment,
+    indices: Option<&[u32]>,
+    columns: Option<&[CString]>,
+) -> (Schema, Vec<RecordBatch>) {
+    let index_ptr = indices.map_or(ptr::null(), |indices| indices.as_ptr());
+    let num_indices = indices.map_or(0, <[u32]>::len);
+    let column_ptrs = columns.map(|columns| {
+        let mut pointers = columns
+            .iter()
+            .map(|column| column.as_ptr())
+            .collect::<Vec<_>>();
+        pointers.push(ptr::null());
+        pointers
+    });
+    let columns_ptr = column_ptrs
+        .as_ref()
+        .map_or(ptr::null(), |columns| columns.as_ptr());
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe {
+            lance_fragment_take(
+                fragment,
+                index_ptr,
+                num_indices,
+                columns_ptr,
+                &mut stream,
+            )
+        },
+        0,
+        "fragment take failed: {}",
+        take_last_error_message()
+    );
+    read_take_stream(stream)
+}
+
+fn fragment_id_values(batches: &[RecordBatch]) -> Vec<i32> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+#[test]
+fn test_fragment_take_matches_native_projection_and_logical_order() {
+    let (_tmp, uri) = create_fragment_read_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let mut ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+    let fragment = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    assert!(!fragment.is_null());
+    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let native_fragment = native.get_fragment(ids[0] as usize).unwrap();
+
+    let indices = [2_u32, 0, 2];
+    let (schema, batches) = take_fragment_via_c(fragment, Some(&indices), None);
+    let native_batch = lance_c::runtime::block_on(native_fragment.take(
+        &indices,
+        &fragment_projection(&native_fragment, None),
+    ))
+    .unwrap();
+    assert_eq!(schema, *native_batch.schema());
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0], native_batch);
+    assert_eq!(fragment_id_values(&batches), vec![3, 0, 3]);
+    let names = batches[0]
+        .column_by_name("profile")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        (0..names.len())
+            .map(|row| (!names.is_null(row)).then(|| names.value(row)))
+            .collect::<Vec<_>>(),
+        vec![Some("d"), Some("a"), Some("d")]
+    );
+    let meta = batches[0]
+        .schema()
+        .field_with_name("meta")
+        .unwrap()
+        .metadata()
+        .get("ARROW:extension:name")
+        .map(String::as_str);
+    assert_eq!(meta, Some("arrow.json"));
+
+    let columns = [c_str("id"), c_str("profile.name"), c_str("meta")];
+    let column_names = columns
+        .iter()
+        .map(|column| column.to_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let (nested_schema, nested_batches) =
+        take_fragment_via_c(fragment, Some(&indices), Some(columns.as_slice()));
+    let native_nested = lance_c::runtime::block_on(native_fragment.take(
+        &indices,
+        &fragment_projection(&native_fragment, Some(&column_names)),
+    ))
+    .unwrap();
+    assert_eq!(nested_schema, *native_nested.schema());
+    assert_eq!(nested_batches.len(), 1);
+    assert_eq!(nested_batches[0], native_nested);
+    assert_eq!(nested_schema.fields().len(), 3);
+    let DataType::Struct(profile_fields) = nested_schema.field(1).data_type() else {
+        panic!("profile projection must remain a struct");
+    };
+    assert_eq!(
+        profile_fields
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["name"]
+    );
+    assert_eq!(fragment_id_values(&nested_batches), vec![3, 0, 3]);
+
+    let empty_indices: Option<&[u32]> = None;
+    let (empty_schema, empty_batches) =
+        take_fragment_via_c(fragment, empty_indices, None);
+    let native_empty = lance_c::runtime::block_on(
+        native_fragment.take(&[], &fragment_projection(&native_fragment, None)),
+    )
+    .unwrap();
+    assert_eq!(empty_schema, *native_empty.schema());
+    assert_eq!(
+        empty_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        0
+    );
+
+    let one_index = [0_u32];
+    let no_columns: [CString; 0] = [];
+    let (empty_projection_schema, empty_projection_batches) =
+        take_fragment_via_c(fragment, Some(&one_index), Some(no_columns.as_slice()));
+    let native_empty_projection = lance_c::runtime::block_on(native_fragment.take(
+        &one_index,
+        &fragment_projection(&native_fragment, Some(&[])),
+    ))
+    .unwrap();
+    assert_eq!(
+        empty_projection_schema,
+        *native_empty_projection.schema()
+    );
+    assert!(empty_projection_schema.fields().is_empty());
+    assert_eq!(empty_projection_batches.len(), 1);
+    assert_eq!(empty_projection_batches[0], native_empty_projection);
+
+    unsafe { lance_fragment_close(fragment) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fragment_take_uses_deletion_aware_local_indices_and_errors() {
+    let (_tmp, uri) = create_fragment_read_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let mut ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+
+    let first = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    let second = unsafe { lance_dataset_open_fragment(ds, ids[1]) };
+    assert!(!first.is_null() && !second.is_null());
+    let local_index = [1_u32];
+    let (_, first_rows) = take_fragment_via_c(first, Some(&local_index), None);
+    let (_, second_rows) = take_fragment_via_c(second, Some(&local_index), None);
+    assert_eq!(fragment_id_values(&first_rows), vec![2]);
+    assert_eq!(fragment_id_values(&second_rows), vec![11]);
+
+    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let native_first = native.get_fragment(ids[0] as usize).unwrap();
+    let out_of_range = [3_u32];
+    let native_error = lance_c::runtime::block_on(native_first.take(
+        &out_of_range,
+        &fragment_projection(&native_first, None),
+    ))
+    .unwrap_err();
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe {
+            lance_fragment_take(
+                first,
+                out_of_range.as_ptr(),
+                out_of_range.len(),
+                ptr::null(),
+                &mut stream,
+            )
+        },
+        -1
+    );
+    assert!(stream.release.is_none(), "failed take must not initialize out");
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains(&native_error.to_string()),
+        "C error {message:?} must preserve native error {native_error}"
+    );
+
+    let mut untouched = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe {
+            lance_fragment_take(
+                first,
+                ptr::null(),
+                1,
+                ptr::null(),
+                &mut untouched,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("indices must not be NULL"));
+    assert!(untouched.release.is_none());
+
+    let bad_column = CString::new([0xFF_u8, 0xFE]).unwrap();
+    assert_eq!(
+        unsafe {
+            lance_fragment_take(
+                first,
+                local_index.as_ptr(),
+                local_index.len(),
+                [bad_column.as_ptr(), ptr::null()].as_ptr(),
+                &mut untouched,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(untouched.release.is_none());
+
+    let missing_column = [c_str("profile.missing")];
+    assert_eq!(
+        unsafe {
+            lance_fragment_take(
+                first,
+                local_index.as_ptr(),
+                local_index.len(),
+                [missing_column[0].as_ptr(), ptr::null()].as_ptr(),
+                &mut untouched,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("profile.missing"));
+    assert!(untouched.release.is_none());
+
+    unsafe { lance_fragment_close(first) };
+    unsafe { lance_fragment_close(second) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fragment_count_rows_matches_native_filters() {
+    let (_tmp, uri) = create_fragment_read_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let mut ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+    let fragment = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    assert!(!fragment.is_null());
+    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let native_fragment = native.get_fragment(ids[0] as usize).unwrap();
+
+    let mut rows = u64::MAX;
+    assert_eq!(
+        unsafe { lance_fragment_count_rows(fragment, ptr::null(), &mut rows) },
+        0
+    );
+    assert_eq!(rows, 3);
+    assert_eq!(
+        rows as usize,
+        lance_c::runtime::block_on(native_fragment.count_rows(None)).unwrap()
+    );
+
+    let filter = c_str("id >= 2");
+    rows = u64::MAX;
+    assert_eq!(
+        unsafe { lance_fragment_count_rows(fragment, filter.as_ptr(), &mut rows) },
+        0
+    );
+    assert_eq!(rows, 2);
+    assert_eq!(
+        rows as usize,
+        lance_c::runtime::block_on(native_fragment.count_rows(Some("id >= 2".to_string())))
+            .unwrap()
+    );
+
+    let empty_filter = c_str("");
+    let native_empty = lance_c::runtime::block_on(
+        native_fragment.count_rows(Some(String::new())),
+    )
+    .unwrap_err();
+    rows = 77;
+    assert_eq!(
+        unsafe { lance_fragment_count_rows(fragment, empty_filter.as_ptr(), &mut rows) },
+        -1
+    );
+    assert_eq!(rows, 77, "failed count must not write out_rows");
+    let message = take_last_error_message();
+    assert!(
+        message.contains(&native_empty.to_string()),
+        "C error {message:?} must preserve native error {native_empty}"
+    );
+
+    let bad_filter = CString::new([0xFF_u8, 0xFE]).unwrap();
+    assert_eq!(
+        unsafe { lance_fragment_count_rows(fragment, bad_filter.as_ptr(), &mut rows) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(rows, 77);
+
+    assert_eq!(
+        unsafe { lance_fragment_count_rows(fragment, ptr::null(), ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_fragment_count_rows(ptr::null(), ptr::null(), &mut rows) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_fragment_close(fragment) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fragment_scan_uses_normal_scanner_and_owned_snapshot() {
+    let (_tmp, uri) = create_fragment_read_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let mut ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+    let fragment = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    assert!(!fragment.is_null());
+    let scanner = unsafe { lance_fragment_scan(fragment) };
+    assert!(!scanner.is_null());
+
+    unsafe { lance_fragment_close(fragment) };
+    unsafe { lance_dataset_close(ds) };
+    let batches = scan_all_rows_from_scanner(scanner);
+    assert_eq!(fragment_id_values(&batches), vec![0, 2, 3]);
+    assert_eq!(batches[0].num_columns(), 3);
+    let names = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["id", "profile", "meta"]);
+    unsafe { lance_scanner_close(scanner) };
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let fragment = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    let scanner = unsafe { lance_fragment_scan(fragment) };
+    assert!(!scanner.is_null());
+    let filter = c_str("id >= 2");
+    assert_eq!(
+        unsafe { lance_scanner_additional_sql_filter(scanner, filter.as_ptr()) },
+        0
+    );
+    let order_name = CString::new("id").unwrap();
+    let order = [LanceColumnOrdering {
+        column_name: order_name.as_ptr(),
+        direction: LanceOrderDirection::Descending as i32,
+        null_order: LanceNullOrder::NullsLast as i32,
+    }];
+    assert_eq!(
+        unsafe { lance_scanner_set_order_by(scanner, order.as_ptr(), order.len()) },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 1) }, 0);
+    let controlled = scan_all_rows_from_scanner(scanner);
+    assert_eq!(fragment_id_values(&controlled), vec![3]);
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_fragment_scan(fragment) };
+    assert!(!scanner.is_null());
+    let missing_name = CString::new("missing").unwrap();
+    let missing = [LanceColumnOrdering {
+        column_name: missing_name.as_ptr(),
+        direction: LanceOrderDirection::Ascending as i32,
+        null_order: LanceNullOrder::NullsLast as i32,
+    }];
+    assert_eq!(
+        unsafe { lance_scanner_set_order_by(scanner, missing.as_ptr(), missing.len()) },
+        0,
+        "missing order column is validated when iteration starts"
+    );
+    let mut batch: *mut LanceBatch = ptr::null_mut();
+    assert_eq!(unsafe { lance_scanner_next(scanner, &mut batch) }, -1);
+    assert!(batch.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("missing"));
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+
+    // The held fragment and scanner retain the version-3 snapshot after the
+    // latest dataset commits another deletion.
+    let latest = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!latest.is_null());
+    let delete_zero = c_str("id = 0");
+    let mut deleted = 0_u64;
+    assert_eq!(
+        unsafe { lance_dataset_delete(latest, delete_zero.as_ptr(), &mut deleted) },
+        0
+    );
+    assert_eq!(deleted, 1);
+    let scanner = unsafe { lance_fragment_scan(fragment) };
+    assert!(!scanner.is_null());
+    let mut take_stream = FFI_ArrowArrayStream::empty();
+    let one = [0_u32];
+    assert_eq!(
+        unsafe {
+            lance_fragment_take(
+                fragment,
+                one.as_ptr(),
+                one.len(),
+                ptr::null(),
+                &mut take_stream,
+            )
+        },
+        0
+    );
+    unsafe { lance_fragment_close(fragment) };
+    unsafe { lance_dataset_close(latest) };
+
+    let old_rows = scan_all_rows_from_scanner(scanner);
+    assert_eq!(fragment_id_values(&old_rows), vec![0, 2, 3]);
+    let (_, old_take) = read_take_stream(take_stream);
+    assert_eq!(fragment_id_values(&old_take), vec![0]);
+    unsafe { lance_scanner_close(scanner) };
+}
+
 /// Helper: scan all rows from a scanner using batch iteration, returning RecordBatches.
 fn scan_all_rows_from_scanner(scanner: *mut LanceScanner) -> Vec<RecordBatch> {
     let mut batches = Vec::new();
