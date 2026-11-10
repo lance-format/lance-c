@@ -4196,7 +4196,7 @@ fn test_index_segments_json_unknown_coverage() {
     let (_tmp, uri) = create_many_small_fragments(2);
     let expected_version = 3_u64;
     lance_c::runtime::block_on(async {
-        let dataset = Dataset::open(&uri).await.unwrap();
+        let mut dataset = Dataset::open(&uri).await.unwrap();
         assert_eq!(dataset.version().version, expected_version - 1);
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
         let mut segment = dataset
