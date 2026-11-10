@@ -3144,7 +3144,8 @@ public:
 
     /// Generate exact candidates from one BTree/Bitmap/LabelList segment.
     /// fragment_ids is required and defines the complete read/fallback domain. See lance.h.
-    /// Requires live rows only: include_deleted_rows(true) is rejected at stream creation.
+    /// Requires live rows only: vector/MinHash/FTS queries and
+    /// include_deleted_rows(true) are rejected at stream creation.
     /// use_scalar_index(false) selects the scoped fallback without searching the segment.
     Scanner& scalar_index_segment(const std::array<uint8_t, 16>& segment_uuid) {
         if (lance_scanner_set_scalar_index_segment(handle_.get(), segment_uuid.data()) != 0)
@@ -3413,17 +3414,18 @@ public:
         if (lance_scanner_set_use_index(handle_.get(), enable) != 0) check_error();
         return *this;
     }
-    /// Use native indexed-only fast search for vector queries, scalar-indexed
-    /// filters and full-text search. Index-backed paths can omit unindexed data.
-    /// Ordinary scans and non-indexable expressions follow native planning.
-    /// Disabled by default. See lance.h.
+    /// Use native indexed-only fast search for vector, scalar-filtered,
+    /// full-text and MinHash queries. Index-backed paths can omit unindexed
+    /// data. Ordinary scans and non-indexable expressions follow native
+    /// planning. Disabled by default. See lance.h.
     Scanner& fast_search(bool enable = true) {
         if (lance_scanner_set_fast_search(handle_.get(), enable) != 0) check_error();
         return *this;
     }
-    /// Apply scanner filters before ANN when enabled, or refine ANN candidates
-    /// afterward when disabled; postfiltering may return fewer than k rows. This
-    /// does not change the fragment search domain.
+    /// Apply scanner filters before vector/MinHash ranking when enabled, or
+    /// refine ranked candidates afterward when disabled; postfiltering may
+    /// return fewer than the configured limit. This does not change the fragment
+    /// search domain.
     Scanner& prefilter(bool enable) {
         if (lance_scanner_set_prefilter(handle_.get(), enable) != 0) check_error();
         return *this;
@@ -3450,6 +3452,16 @@ public:
     /// the query and its source handles may be destroyed after success.
     Scanner& full_text_search(const FtsQuery& query) {
         if (lance_scanner_set_fts_query(handle_.get(), query.c_handle()) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Native MinHash LSH text-similarity search. `column` must have a MinHash
+    /// LSH scalar index and the scanner must have a limit. Results are ordered
+    /// by native `_distance` (1 - estimated Jaccard similarity).
+    Scanner& minhash_search(const std::string& column, const std::string& text) {
+        if (lance_scanner_set_minhash_query(handle_.get(), column.c_str(),
+                                            text.c_str()) != 0)
             check_error();
         return *this;
     }

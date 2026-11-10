@@ -37,6 +37,7 @@ pub enum LanceScalarIndexType {
     NGram = 5,
     ZoneMap = 6,
     BloomFilter = 7,
+    MinHashLsh = 8,
 }
 
 impl LanceScalarIndexType {
@@ -49,6 +50,7 @@ impl LanceScalarIndexType {
             5 => Ok(Self::NGram),
             6 => Ok(Self::ZoneMap),
             7 => Ok(Self::BloomFilter),
+            8 => Ok(Self::MinHashLsh),
             _ => Err(lance_core::Error::invalid_input_source(
                 format!("invalid scalar index type: {}", v).into(),
             )),
@@ -65,6 +67,7 @@ impl LanceScalarIndexType {
             "NGramIndexDetails" => Some(Self::NGram),
             "ZoneMapIndexDetails" => Some(Self::ZoneMap),
             "BloomFilterIndexDetails" => Some(Self::BloomFilter),
+            "MinHashLshIndexDetails" => Some(Self::MinHashLsh),
             _ => None,
         }
     }
@@ -78,6 +81,7 @@ impl LanceScalarIndexType {
             Self::NGram => BuiltinIndexType::NGram,
             Self::ZoneMap => BuiltinIndexType::ZoneMap,
             Self::BloomFilter => BuiltinIndexType::BloomFilter,
+            Self::MinHashLsh => BuiltinIndexType::MinHashLsh,
         }
     }
 
@@ -90,6 +94,7 @@ impl LanceScalarIndexType {
             Self::NGram => IndexType::NGram,
             Self::ZoneMap => IndexType::ZoneMap,
             Self::BloomFilter => IndexType::BloomFilter,
+            Self::MinHashLsh => IndexType::MinHashLsh,
         }
     }
 }
