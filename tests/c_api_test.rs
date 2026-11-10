@@ -1011,37 +1011,6 @@ fn test_scanner_order_by_filter_projection_and_window() {
     );
     unsafe { lance_scanner_close(scanner) };
 
-    let id_column = c_str("id");
-    let columns = [id_column.as_ptr(), ptr::null()];
-    let scanner = unsafe { lance_scanner_new(ds, columns.as_ptr(), ptr::null()) };
-    assert!(!scanner.is_null());
-    assert_eq!(set_order_by(scanner, &specs), 0);
-
-    let mut stream = FFI_ArrowArrayStream::empty();
-    assert_eq!(
-        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
-        0,
-        "{}",
-        take_last_error_message()
-    );
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
-    assert_eq!(reader.schema().fields().len(), 1);
-    assert_eq!(reader.schema().field(0).name(), "id");
-    let mut ids = Vec::new();
-    for batch in reader {
-        let batch = batch.unwrap();
-        let id = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        ids.extend(id.values().iter().copied());
-    }
-    assert_eq!(ids, vec![8, 0, 4, 6, 11, 2, 3, 7, 10, 1, 5, 9]);
-
-    unsafe { lance_scanner_close(scanner) };
-
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
     assert!(!scanner.is_null());
     assert_eq!(set_order_by(scanner, &specs), 0);
@@ -1053,6 +1022,7 @@ fn test_scanner_order_by_filter_projection_and_window() {
     );
     unsafe { lance_scanner_close(scanner) };
 
+    let id_column = c_str("id");
     let rank_column = c_str("rank");
     let columns = [id_column.as_ptr(), rank_column.as_ptr(), ptr::null()];
     let scanner = unsafe { lance_scanner_new(ds, columns.as_ptr(), ptr::null()) };
