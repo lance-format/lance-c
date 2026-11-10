@@ -49,7 +49,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Update operations | Expression-based row updates via `lance_dataset_update()` |
 | [x] | Merge-insert | Upsert via configurable when-matched / when-not-matched policies with `lance_dataset_merge_insert()` |
 | [x] | Schema evolution | Add columns via SQL / all-null / `ArrowArrayStream` with `lance_dataset_add_columns_*()`, drop via `lance_dataset_drop_columns()`, rename / retype / set nullability via `lance_dataset_alter_columns()` |
-| [x] | Version management | Version details/metadata, lightweight refs, native ref checkout, tag CRUD/metadata, rollback, and numeric-version open |
+| [x] | Version management | Version details/metadata, lightweight refs, native ref checkout, tag and branch lifecycle, rollback, and numeric-version open |
 
 ### Phase 4: Advanced Features
 
@@ -676,6 +676,35 @@ nanosecond precision; the existing millisecond version accessor is unchanged.
 Nanosecond accessors report an error when a timestamp does not fit i64
 nanoseconds. Snapshot creation and millisecond reads retain the native range.
 There is no C-side timestamp/asof selector.
+
+Branches use the public Lance 14.0.2 branch lifecycle:
+
+```cpp
+auto branch = source.create_branch(
+    "feature/next", lance::Ref::version(
+        std::optional<std::string>("main"), std::optional<uint64_t>(2)));
+auto checked_out = source.checkout_branch("feature/next");
+branch.replace_branch_metadata("feature/next", {{"owner", "team"}});
+auto branches = source.branches_json();
+auto contents = source.get_branch_json("feature/next");
+auto identifier = branch.branch_identifier_json();
+```
+
+`lance_dataset_branch_create()` accepts the source dataset's store params when
+its storage-options pointer is `NULL`; a non-`NULL`, empty array requests
+explicit empty object-store params. Native creation is a non-atomic shallow
+clone followed by a `BranchContents` write. If creation leaves a branch
+dataset without `BranchContents`, use `lance_dataset_branch_force_delete()` to
+remove it. Normal deletion still rejects branches referenced by a child branch
+or a tag. Reusing an existing branch name may fail in the native shallow-clone
+phase rather than reaching the `BranchContents` conflict check.
+
+Branch JSON is the selected Lance core's serde representation, not a new C
+metadata model. The list is an object keyed by branch name; each
+`BranchContents` includes `parentBranch`, `identifier.version_mapping`,
+`parentVersion`, `createAt` in Unix seconds, `manifestSize`, and `metadata`.
+Map enumeration order is unspecified. Branch metadata replacement writes the
+whole native map, so an empty map clears all entries.
 
 ## Releasing
 

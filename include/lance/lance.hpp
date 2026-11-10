@@ -1335,6 +1335,99 @@ public:
         return Dataset(out);
     }
 
+    /// Create a native branch from `reference`.
+    ///
+    /// `storage_opts == std::nullopt` uses the source dataset's native store
+    /// params. An explicitly empty vector passes explicit empty object-store
+    /// params. Native branch creation is a non-atomic shallow clone followed by
+    /// a BranchContents write; see the C API documentation for zombie recovery.
+    Dataset create_branch(
+        const std::string& branch_name,
+        const Ref& reference,
+        std::optional<std::vector<std::pair<std::string, std::string>>> storage_opts =
+            std::nullopt) const {
+        std::vector<const char*> kv;
+        const char* const* storage_opts_ptr = nullptr;
+        if (storage_opts.has_value()) {
+            kv = to_c_key_values(*storage_opts);
+            storage_opts_ptr = kv.data();
+        }
+        auto* out = lance_dataset_branch_create(
+            handle_.get(),
+            branch_name.c_str(),
+            reference.c_handle(),
+            storage_opts_ptr);
+        if (!out) check_error();
+        return Dataset(out);
+    }
+
+    /// Check out the latest version of a branch as an independent dataset.
+    /// Pass "main" for the default branch.
+    Dataset checkout_branch(const std::string& branch_name) const {
+        auto* out =
+            lance_dataset_checkout_branch(handle_.get(), branch_name.c_str());
+        if (!out) check_error();
+        return Dataset(out);
+    }
+
+    /// JSON object keyed by branch name. Values are native BranchContents
+    /// serde objects; map order is unspecified.
+    std::string branches_json() const {
+        const char* json = lance_dataset_branches_json(handle_.get());
+        if (!json) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            json, lance_free_string);
+        return std::string(json);
+    }
+
+    /// JSON object for one native BranchContents value.
+    std::string get_branch_json(const std::string& branch_name) const {
+        const char* json =
+            lance_dataset_branch_get_json(handle_.get(), branch_name.c_str());
+        if (!json) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            json, lance_free_string);
+        return std::string(json);
+    }
+
+    /// JSON object for this dataset snapshot's native BranchIdentifier.
+    std::string branch_identifier_json() const {
+        const char* json =
+            lance_dataset_branch_identifier_json(handle_.get());
+        if (!json) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            json, lance_free_string);
+        return std::string(json);
+    }
+
+    /// Delete a branch. Child-branch and tag references surface as
+    /// LANCE_ERR_COMMIT_CONFLICT.
+    void delete_branch(const std::string& branch_name) const {
+        if (lance_dataset_branch_delete(
+                handle_.get(), branch_name.c_str()) != 0)
+            check_error();
+    }
+
+    /// Delete a branch while bypassing only a missing BranchContents. Native
+    /// child-branch and tag reference checks still apply.
+    void force_delete_branch(const std::string& branch_name) const {
+        if (lance_dataset_branch_force_delete(
+                handle_.get(), branch_name.c_str()) != 0)
+            check_error();
+    }
+
+    /// Replace all metadata entries on a branch. An empty vector writes an
+    /// empty map; this is not a merge or NULL-delete operation.
+    void replace_branch_metadata(
+        const std::string& branch_name,
+        const std::vector<std::pair<std::string, std::string>>& metadata) const {
+        auto kv = to_c_key_values(metadata);
+        const char* const* metadata_ptr = metadata.empty() ? nullptr : kv.data();
+        if (lance_dataset_branch_replace_metadata(
+                handle_.get(), branch_name.c_str(), metadata_ptr) != 0)
+            check_error();
+    }
+
     /// Snapshot all tags. Entry order is unspecified.
     std::vector<TagInfo> tags() const {
         auto* raw = lance_dataset_tags(handle_.get());

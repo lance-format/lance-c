@@ -9,9 +9,8 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Barrier, Mutex};
 
 use arrow::ffi::from_ffi;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -25,6 +24,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Fields, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::dataset::refs::BranchContents;
 use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
 use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance::io::RecordBatchStream;
@@ -5704,6 +5704,74 @@ fn find_tag(tags: *const LanceTags, name: &str) -> *const LanceTag {
     ptr::null()
 }
 
+fn owned_c_string(value: *const c_char) -> String {
+    assert!(!value.is_null());
+    let owned = unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(value) };
+    owned
+}
+
+fn owned_json(value: *const c_char) -> serde_json::Value {
+    serde_json::from_str(&owned_c_string(value)).unwrap()
+}
+
+fn native_branch(uri: &str, name: &str) -> BranchContents {
+    lance_c::runtime::block_on(async {
+        Dataset::open(uri)
+            .await
+            .unwrap()
+            .branches()
+            .get(name)
+            .await
+            .unwrap()
+    })
+}
+
+fn assert_branch_json(json: &serde_json::Value, native: &BranchContents) {
+    assert_eq!(
+        json["parentBranch"].as_str(),
+        native.parent_branch.as_deref()
+    );
+    assert_eq!(
+        json["parentVersion"].as_u64().unwrap(),
+        native.parent_version
+    );
+    assert_eq!(json["createAt"].as_u64().unwrap(), native.create_at);
+    assert_eq!(
+        json["manifestSize"].as_u64().unwrap(),
+        native.manifest_size as u64
+    );
+
+    let mapping = json["identifier"]["version_mapping"]
+        .as_array()
+        .expect("BranchIdentifier.version_mapping must be a JSON array");
+    assert_eq!(
+        mapping.len(),
+        native.identifier.version_mapping.len(),
+        "native identifier mapping length"
+    );
+    for (actual, expected) in mapping.iter().zip(&native.identifier.version_mapping) {
+        let pair = actual.as_array().expect("version mapping entry");
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair[0].as_u64(), Some(expected.0));
+        assert_eq!(pair[1].as_str(), Some(expected.1.as_str()));
+    }
+
+    let metadata = json["metadata"]
+        .as_object()
+        .expect("BranchContents.metadata must be a JSON object");
+    assert_eq!(metadata.len(), native.metadata.len());
+    for (key, value) in &native.metadata {
+        assert_eq!(
+            metadata.get(key).and_then(|value| value.as_str()),
+            Some(value.as_str())
+        );
+    }
+}
+
 #[test]
 fn test_current_version_details_metadata_and_version_refs() {
     let (_tmp, uri) = create_two_version_dataset();
@@ -6247,6 +6315,643 @@ fn test_tag_optional_fields_match_native_defaults() {
     unsafe {
         lance_tag_close(branch_tag);
         lance_tag_close(tag);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_branch_create_ref_variants_checkout_and_json() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_version(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 7);
+
+    let main_identifier = owned_json(unsafe { lance_dataset_branch_identifier_json(ds) });
+    assert_eq!(main_identifier, serde_json::json!({"version_mapping": []}));
+    let initially_empty = owned_json(unsafe { lance_dataset_branches_json(ds) });
+    assert_eq!(initially_empty, serde_json::json!({}));
+
+    let tag_name = c_str("branch-source");
+    let tag_source = unsafe { lance_ref_version_number(1) };
+    assert_eq!(
+        unsafe { lance_dataset_tag_create(ds, tag_name.as_ptr(), tag_source) },
+        0
+    );
+    unsafe {
+        lance_ref_close(tag_source);
+    }
+
+    let parent_name = c_str("feature/parent");
+    let parent_ref = unsafe { lance_ref_version_number(1) };
+    let parent =
+        unsafe { lance_dataset_branch_create(ds, parent_name.as_ptr(), parent_ref, ptr::null()) };
+    assert!(!parent.is_null());
+    assert_eq!(unsafe { lance_dataset_version(parent) }, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(parent) }, 5);
+    unsafe {
+        lance_ref_close(parent_ref);
+    }
+
+    let child_name = c_str("feature/parent/child");
+    let child_ref = unsafe { lance_ref_version_number(1) };
+    let child =
+        unsafe { lance_dataset_branch_create(parent, child_name.as_ptr(), child_ref, ptr::null()) };
+    assert!(!child.is_null());
+    assert_eq!(unsafe { lance_dataset_version(child) }, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(child) }, 5);
+    unsafe {
+        lance_ref_close(child_ref);
+    }
+
+    let from_tag_name = c_str("from-tag");
+    let tag_ref = unsafe { lance_ref_tag(tag_name.as_ptr()) };
+    let from_tag =
+        unsafe { lance_dataset_branch_create(ds, from_tag_name.as_ptr(), tag_ref, ptr::null()) };
+    assert!(!from_tag.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(from_tag) }, 5);
+
+    let from_branch_name = c_str("from-branch");
+    let branch_ref = unsafe { lance_ref_version(parent_name.as_ptr(), true, 1) };
+    let from_branch = unsafe {
+        lance_dataset_branch_create(ds, from_branch_name.as_ptr(), branch_ref, ptr::null())
+    };
+    assert!(!from_branch.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(from_branch) }, 5);
+
+    let latest_name = c_str("latest-copy");
+    let latest_ref = unsafe { lance_ref_version(ptr::null(), false, 0) };
+    let latest =
+        unsafe { lance_dataset_branch_create(ds, latest_name.as_ptr(), latest_ref, ptr::null()) };
+    assert!(!latest.is_null());
+    assert_eq!(unsafe { lance_dataset_version(latest) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(latest) }, 7);
+    assert_eq!(unsafe { lance_dataset_version(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 7);
+
+    let native_parent = native_branch(&uri, "feature/parent");
+    let parent_json =
+        owned_json(unsafe { lance_dataset_branch_get_json(ds, parent_name.as_ptr()) });
+    assert_branch_json(&parent_json, &native_parent);
+    assert_eq!(parent_json["parentBranch"], serde_json::Value::Null);
+    assert_eq!(parent_json["parentVersion"], 1);
+
+    let tag_json = owned_json(unsafe { lance_dataset_branch_get_json(ds, from_tag_name.as_ptr()) });
+    assert_branch_json(&tag_json, &native_branch(&uri, "from-tag"));
+    assert_eq!(tag_json["parentBranch"], serde_json::Value::Null);
+    assert_eq!(tag_json["parentVersion"], 1);
+
+    let branch_json =
+        owned_json(unsafe { lance_dataset_branch_get_json(ds, from_branch_name.as_ptr()) });
+    assert_branch_json(&branch_json, &native_branch(&uri, "from-branch"));
+    assert_eq!(branch_json["parentBranch"], "feature/parent");
+    assert_eq!(branch_json["parentVersion"], 1);
+
+    let child_identifier = owned_json(unsafe { lance_dataset_branch_identifier_json(child) });
+    let native_child_identifier = lance_c::runtime::block_on(async {
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("feature/parent/child")
+            .await
+            .unwrap()
+            .branch_identifier()
+            .await
+            .unwrap()
+    });
+    assert_eq!(
+        child_identifier["version_mapping"]
+            .as_array()
+            .unwrap()
+            .len(),
+        native_child_identifier.version_mapping.len()
+    );
+
+    let native_branches = lance_c::runtime::block_on(async {
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+    });
+    let branches_json = owned_json(unsafe { lance_dataset_branches_json(ds) });
+    let branches = branches_json.as_object().unwrap();
+    assert_eq!(branches.len(), native_branches.len());
+    for (name, contents) in &native_branches {
+        assert_branch_json(&branches[name], contents);
+    }
+
+    let main_checkout = unsafe { lance_dataset_checkout_branch(ds, c_str("main").as_ptr()) };
+    let parent_checkout = unsafe { lance_dataset_checkout_branch(ds, parent_name.as_ptr()) };
+    assert!(!main_checkout.is_null());
+    assert!(!parent_checkout.is_null());
+    assert_eq!(unsafe { lance_dataset_version(main_checkout) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(main_checkout) }, 7);
+    assert_eq!(unsafe { lance_dataset_version(parent_checkout) }, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(parent_checkout) }, 5);
+
+    let reserved_ref = unsafe { lance_ref_version(c_str("main").as_ptr(), true, 1) };
+    let reserved = unsafe {
+        lance_dataset_branch_create(ds, c_str("main").as_ptr(), reserved_ref, ptr::null())
+    };
+    assert!(reserved.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe {
+        lance_ref_close(reserved_ref);
+    }
+
+    // Owned JSON survives closing the source; checkout and branch handles keep
+    // their own native snapshots.
+    let branches_after_close_ptr = unsafe { lance_dataset_branches_json(ds) };
+    let parent_after_close_ptr = unsafe { lance_dataset_branch_get_json(ds, parent_name.as_ptr()) };
+    let identifier_after_close_ptr = unsafe { lance_dataset_branch_identifier_json(parent) };
+    unsafe {
+        lance_dataset_close(ds);
+    }
+    let branches_after_close = owned_json(branches_after_close_ptr);
+    assert_eq!(branches_after_close.as_object().unwrap().len(), 5);
+    assert_branch_json(
+        &owned_json(parent_after_close_ptr),
+        &native_branch(&uri, "feature/parent"),
+    );
+    let branch_identifier = owned_json(identifier_after_close_ptr);
+    assert_eq!(
+        branch_identifier["version_mapping"]
+            .as_array()
+            .unwrap()
+            .len(),
+        native_parent.identifier.version_mapping.len()
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(main_checkout) }, 7);
+    assert_eq!(unsafe { lance_dataset_count_rows(parent) }, 5);
+
+    unsafe {
+        lance_dataset_close(from_tag);
+        lance_dataset_close(from_branch);
+        lance_dataset_close(latest);
+        lance_dataset_close(child);
+        lance_dataset_close(parent);
+        lance_dataset_close(parent_checkout);
+        lance_dataset_close(main_checkout);
+        lance_ref_close(branch_ref);
+        lance_ref_close(latest_ref);
+        lance_ref_close(tag_ref);
+    }
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    for name in [
+        "feature/parent/child",
+        "from-branch",
+        "feature/parent",
+        "from-tag",
+        "latest-copy",
+    ] {
+        let name = c_str(name);
+        assert_eq!(
+            unsafe { lance_dataset_branch_delete(ds, name.as_ptr()) },
+            0,
+            "delete branch {name:?}"
+        );
+    }
+    assert_eq!(
+        unsafe { lance_dataset_tag_delete(ds, tag_name.as_ptr()) },
+        0
+    );
+    let remaining = owned_json(unsafe { lance_dataset_branches_json(ds) });
+    assert_eq!(remaining, serde_json::json!({}));
+    unsafe {
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_branch_metadata_full_replace_persistence_and_options() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let latest_ref = unsafe { lance_ref_version(ptr::null(), false, 0) };
+    let meta_name = c_str("meta");
+    let meta =
+        unsafe { lance_dataset_branch_create(ds, meta_name.as_ptr(), latest_ref, ptr::null()) };
+    assert!(!meta.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(meta) }, 7);
+
+    let empty_storage = [ptr::null::<c_char>()];
+    let options_ref = unsafe { lance_ref_version_number(2) };
+    let options_name = c_str("explicit-empty-options");
+    let options = unsafe {
+        lance_dataset_branch_create(
+            ds,
+            options_name.as_ptr(),
+            options_ref,
+            empty_storage.as_ptr(),
+        )
+    };
+    assert!(!options.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(options) }, 7);
+
+    let owner_key = c_str("owner");
+    let owner_value = c_str("lance-c");
+    let empty_key = c_str("empty");
+    let empty_value = c_str("");
+    let metadata = [
+        owner_key.as_ptr(),
+        owner_value.as_ptr(),
+        empty_key.as_ptr(),
+        empty_value.as_ptr(),
+        ptr::null(),
+    ];
+    assert_eq!(
+        unsafe { lance_dataset_branch_replace_metadata(ds, meta_name.as_ptr(), metadata.as_ptr()) },
+        0
+    );
+
+    let meta_json = owned_json(unsafe { lance_dataset_branch_get_json(ds, meta_name.as_ptr()) });
+    let native_meta = native_branch(&uri, "meta");
+    assert_branch_json(&meta_json, &native_meta);
+    assert_eq!(meta_json["metadata"]["owner"], "lance-c");
+    assert_eq!(meta_json["metadata"]["empty"], "");
+
+    unsafe {
+        lance_dataset_close(ds);
+        lance_dataset_close(meta);
+        lance_dataset_close(options);
+        lance_ref_close(latest_ref);
+        lance_ref_close(options_ref);
+    }
+
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let persisted = owned_json(unsafe { lance_dataset_branch_get_json(ds, meta_name.as_ptr()) });
+    assert_eq!(persisted["metadata"]["owner"], "lance-c");
+    assert_eq!(persisted["metadata"]["empty"], "");
+
+    // Explicitly empty metadata is a full replacement, not a special delete.
+    let empty_metadata = [ptr::null::<c_char>()];
+    assert_eq!(
+        unsafe {
+            lance_dataset_branch_replace_metadata(ds, meta_name.as_ptr(), empty_metadata.as_ptr())
+        },
+        0
+    );
+    let odd_key = c_str("key");
+    let odd_metadata = [odd_key.as_ptr(), ptr::null()];
+    assert_eq!(
+        unsafe {
+            lance_dataset_branch_replace_metadata(ds, meta_name.as_ptr(), odd_metadata.as_ptr())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe {
+            lance_dataset_branch_replace_metadata(ds, c_str("missing").as_ptr(), ptr::null())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+
+    let duplicate_ref = unsafe { lance_ref_version_number(2) };
+    let duplicate =
+        unsafe { lance_dataset_branch_create(ds, meta_name.as_ptr(), duplicate_ref, ptr::null()) };
+    assert!(duplicate.is_null());
+    // The selected core rejects a reused branch name in its shallow-clone
+    // phase before BranchContents conflict detection.
+    assert_ne!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe {
+        lance_ref_close(duplicate_ref);
+    }
+    let after_duplicate =
+        owned_json(unsafe { lance_dataset_branch_get_json(ds, meta_name.as_ptr()) });
+    assert_eq!(after_duplicate["parentVersion"], 2);
+    assert_eq!(after_duplicate["metadata"], serde_json::json!({}));
+
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, options_name.as_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, meta_name.as_ptr()) },
+        0
+    );
+    unsafe {
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_branch_deletion_protections_and_zombie_recovery() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let parent_name = c_str("protected");
+    let parent_ref = unsafe { lance_ref_version_number(1) };
+    let parent =
+        unsafe { lance_dataset_branch_create(ds, parent_name.as_ptr(), parent_ref, ptr::null()) };
+    assert!(!parent.is_null());
+    let child_name = c_str("protected/child");
+    let child_ref = unsafe { lance_ref_version_number(1) };
+    let child =
+        unsafe { lance_dataset_branch_create(parent, child_name.as_ptr(), child_ref, ptr::null()) };
+    assert!(!child.is_null());
+
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, parent_name.as_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::CommitConflict);
+    unsafe {
+        lance_dataset_close(child);
+        lance_ref_close(child_ref);
+    }
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, child_name.as_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, parent_name.as_ptr()) },
+        0
+    );
+
+    let tagged_name = c_str("tagged");
+    let tagged_ref = unsafe { lance_ref_version_number(1) };
+    let tagged =
+        unsafe { lance_dataset_branch_create(ds, tagged_name.as_ptr(), tagged_ref, ptr::null()) };
+    assert!(!tagged.is_null());
+    let tag_name = c_str("branch-tag");
+    let tag_target = unsafe { lance_ref_version(tagged_name.as_ptr(), true, 1) };
+    assert_eq!(
+        unsafe { lance_dataset_tag_create(ds, tag_name.as_ptr(), tag_target) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, tagged_name.as_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::CommitConflict);
+    assert_eq!(
+        unsafe { lance_dataset_tag_delete(ds, tag_name.as_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, tagged_name.as_ptr()) },
+        0
+    );
+
+    let zombie_ref = unsafe { lance_ref_version_number(1) };
+    let zombie_name = c_str("zombie");
+    let zombie =
+        unsafe { lance_dataset_branch_create(ds, zombie_name.as_ptr(), zombie_ref, ptr::null()) };
+    assert!(!zombie.is_null());
+    unsafe {
+        lance_dataset_close(zombie);
+        lance_ref_close(zombie_ref);
+    }
+    let zombie_contents = std::path::Path::new(&uri).join("_refs/branches/zombie.json");
+    assert!(zombie_contents.exists());
+    std::fs::remove_file(&zombie_contents).unwrap();
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, zombie_name.as_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    assert_eq!(
+        unsafe { lance_dataset_branch_force_delete(ds, zombie_name.as_ptr()) },
+        0
+    );
+    assert!(!std::path::Path::new(&uri).join("tree/zombie").exists());
+    let branches = owned_json(unsafe { lance_dataset_branches_json(ds) });
+    assert!(branches.get("zombie").is_none());
+
+    unsafe {
+        lance_dataset_close(tagged);
+        lance_dataset_close(parent);
+        lance_ref_close(tag_target);
+        lance_ref_close(tagged_ref);
+        lance_ref_close(parent_ref);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_branch_concurrent_fixed_ref_and_commit() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let barrier = Arc::new(Barrier::new(3));
+
+    let branch_uri = uri.clone();
+    let branch_barrier = Arc::clone(&barrier);
+    let branch_thread = std::thread::spawn(move || {
+        branch_barrier.wait();
+        let c_uri = c_str(&branch_uri);
+        let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+        assert!(!ds.is_null());
+
+        let reference = unsafe { lance_ref_version(ptr::null(), true, 2) };
+        let name = c_str("concurrent/from-v2");
+        let branch =
+            unsafe { lance_dataset_branch_create(ds, name.as_ptr(), reference, ptr::null()) };
+        assert!(!branch.is_null());
+        let result = (unsafe { lance_dataset_version(branch) }, unsafe {
+            lance_dataset_count_rows(branch)
+        });
+        unsafe {
+            lance_dataset_close(branch);
+            lance_ref_close(reference);
+            lance_dataset_close(ds);
+        }
+        result
+    });
+
+    let commit_uri = uri.clone();
+    let commit_barrier = Arc::clone(&barrier);
+    let commit_thread = std::thread::spawn(move || {
+        commit_barrier.wait();
+        let c_uri = c_str(&commit_uri);
+        let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+        assert!(!ds.is_null());
+
+        let predicate = c_str("id = 1");
+        let mut deleted = 0;
+        let rc = unsafe { lance_dataset_delete(ds, predicate.as_ptr(), &mut deleted) };
+        unsafe {
+            lance_dataset_close(ds);
+        }
+        (rc, deleted)
+    });
+
+    barrier.wait();
+    let (branch_version, branch_rows) = branch_thread.join().unwrap();
+    let (delete_rc, deleted) = commit_thread.join().unwrap();
+    assert_eq!(delete_rc, 0);
+    assert_eq!(deleted, 1);
+
+    // An explicit ref version is a stable snapshot: the concurrent main
+    // commit changes main, not the branch source.
+    assert_eq!(branch_version, 2);
+    assert_eq!(branch_rows, 7);
+    let contents = native_branch(&uri, "concurrent/from-v2");
+    assert_eq!(contents.parent_branch, None);
+    assert_eq!(contents.parent_version, 2);
+
+    let (main_version, main_rows) = lance_c::runtime::block_on(async {
+        let main = Dataset::open(&uri).await.unwrap();
+        (main.version().version, main.count_rows(None).await.unwrap())
+    });
+    assert_eq!(main_version, 3);
+    assert_eq!(main_rows, 6);
+
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, c_str("concurrent/from-v2").as_ptr(),) },
+        0
+    );
+    unsafe {
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_branch_invalid_inputs_and_missing_references() {
+    let (_tmp, uri) = create_two_version_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let version1 = unsafe { lance_ref_version_number(1) };
+    for name in ["main", "", "feature//child", "bad name", "a/../b"] {
+        let name = c_str(name);
+        let branch =
+            unsafe { lance_dataset_branch_create(ds, name.as_ptr(), version1, ptr::null()) };
+        assert!(branch.is_null(), "invalid branch name {name:?}");
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    }
+
+    let missing_version = unsafe { lance_ref_version_number(99) };
+    let missing_branch = unsafe {
+        lance_dataset_branch_create(
+            ds,
+            c_str("missing-version").as_ptr(),
+            missing_version,
+            ptr::null(),
+        )
+    };
+    assert!(missing_branch.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    unsafe {
+        lance_ref_close(missing_version);
+    }
+
+    let missing_tag = unsafe { lance_ref_tag(c_str("missing-tag").as_ptr()) };
+    let missing_tag_branch = unsafe {
+        lance_dataset_branch_create(ds, c_str("missing-tag").as_ptr(), missing_tag, ptr::null())
+    };
+    assert!(missing_tag_branch.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    unsafe {
+        lance_ref_close(missing_tag);
+    }
+
+    let odd_key = c_str("key");
+    let odd_storage = [odd_key.as_ptr(), ptr::null()];
+    let odd_branch = unsafe {
+        lance_dataset_branch_create(
+            ds,
+            c_str("odd-storage").as_ptr(),
+            version1,
+            odd_storage.as_ptr(),
+        )
+    };
+    assert!(odd_branch.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let invalid_utf8 = CString::new(vec![0xffu8]).unwrap();
+    assert!(unsafe { lance_dataset_branch_get_json(ds, invalid_utf8.as_ptr()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    assert!(unsafe { lance_dataset_branch_get_json(ds, c_str("missing").as_ptr()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    assert!(unsafe { lance_dataset_checkout_branch(ds, c_str("missing").as_ptr()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ds, c_str("missing").as_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    assert_eq!(
+        unsafe { lance_dataset_branch_force_delete(ds, c_str("missing").as_ptr()) },
+        0
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+
+    assert!(
+        unsafe {
+            lance_dataset_branch_create(ptr::null(), c_str("x").as_ptr(), version1, ptr::null())
+        }
+        .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        unsafe { lance_dataset_branch_create(ds, ptr::null(), version1, ptr::null()) }.is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        unsafe { lance_dataset_branch_create(ds, c_str("x").as_ptr(), ptr::null(), ptr::null()) }
+            .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_branches_json(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_branch_identifier_json(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_branch_get_json(ptr::null(), c_str("x").as_ptr()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_branch_get_json(ds, ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        unsafe { lance_dataset_checkout_branch(ptr::null(), c_str("main").as_ptr()) }.is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_dataset_checkout_branch(ds, ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_dataset_branch_delete(ptr::null(), c_str("x").as_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_dataset_branch_force_delete(ds, ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe {
+            lance_dataset_branch_replace_metadata(ptr::null(), c_str("x").as_ptr(), ptr::null())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_dataset_branch_replace_metadata(ds, ptr::null(), ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe {
+        lance_ref_close(version1);
         lance_dataset_close(ds);
     }
 }
