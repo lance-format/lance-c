@@ -2397,7 +2397,7 @@ static void test_fragment_snapshot(const char *uri) {
            "nested score field missing");
     const struct ArrowSchema *meta = find_schema_child(&schema, "meta");
     ASSERT(meta != NULL, "JSON meta field missing");
-    ASSERT(meta->format != NULL && strcmp(meta->format, "z") == 0,
+    ASSERT(meta->format != NULL && strcmp(meta->format, "Z") == 0,
            "fragment schema must retain native JSONB storage");
     if (schema.release) schema.release(&schema);
 

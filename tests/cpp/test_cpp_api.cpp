@@ -2117,7 +2117,7 @@ static void test_fragment_snapshots(const std::string& uri) {
     assert(find_schema_child(*profile, "score"));
     const ArrowSchema* meta = find_schema_child(schema, "meta");
     assert(meta);
-    assert(meta->format && strcmp(meta->format, "z") == 0);
+    assert(meta->format && strcmp(meta->format, "Z") == 0);
     if (schema.release) schema.release(&schema);
 
     bool caught = false;
