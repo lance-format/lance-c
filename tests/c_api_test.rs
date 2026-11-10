@@ -20326,7 +20326,38 @@ fn test_native_transaction_protobuf_boundaries() {
     assert_eq!(output_len, usize::MAX);
     unsafe { lance_transaction_close(transaction) };
 
-    assert!(unsafe { lance_transaction_from_proto(ptr::null(), 0) }.is_null());
+    let native_empty = lance::dataset::transaction::Transaction::try_from(
+        pb::Transaction::decode(&[][..]).unwrap(),
+    )
+    .unwrap();
+    let storage = [0u8];
+    for bytes in [ptr::null(), storage.as_ptr()] {
+        let empty = unsafe { lance_transaction_from_proto(bytes, 0) };
+        assert!(!empty.is_null());
+        assert_eq!(
+            native_transaction_read_version(empty),
+            native_empty.read_version
+        );
+        assert_eq!(native_transaction_uuid(empty), native_empty.uuid);
+        let operation = native_transaction_operation(empty);
+        assert_eq!(
+            native_operation_kind(operation),
+            LanceOperationKind::Unknown
+        );
+        unsafe {
+            lance_operation_close(operation);
+            lance_transaction_close(empty);
+        }
+    }
+    assert!(
+        unsafe {
+            lance_transaction_from_proto(
+                ptr::NonNull::<u8>::dangling().as_ptr(),
+                isize::MAX as usize + 1,
+            )
+        }
+        .is_null()
+    );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert!(unsafe { lance_transaction_from_proto(ptr::null(), 1) }.is_null());
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);

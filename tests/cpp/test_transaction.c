@@ -375,10 +375,11 @@ static void test_validation(const char *base) {
     char uri[4096];
     snprintf(uri, sizeof(uri), "%s/c_txn_validation", base);
 
-    ASSERT(lance_transaction_from_proto(NULL, 0) == NULL,
-           "empty protobuf must fail");
-    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
-           "empty protobuf error code");
+    LanceTransaction *empty = lance_transaction_from_proto(NULL, 0);
+    ASSERT(empty != NULL, "empty protobuf decodes to a native default transaction");
+    ASSERT(transaction_operation_kind(empty) == LANCE_OPERATION_UNKNOWN,
+           "default transaction has an Unknown operation");
+    lance_transaction_close(empty);
     const uint8_t malformed[] = {0xFF};
     ASSERT(lance_transaction_from_proto(malformed, sizeof(malformed)) == NULL,
            "malformed protobuf must fail");

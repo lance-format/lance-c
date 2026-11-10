@@ -235,15 +235,10 @@ static void test_detached_conflict_and_errors(const std::string& source_uri,
     }
     CHECK(conflicted);
 
-    bool empty_proto_rejected = false;
-    try {
-        auto invalid = lance::Transaction::from_proto(std::vector<uint8_t>{});
-        (void)invalid;
-    } catch (const lance::Error& error) {
-        empty_proto_rejected = true;
-        CHECK(error.code == LANCE_ERR_INVALID_ARGUMENT);
-    }
-    CHECK(empty_proto_rejected);
+    auto empty = lance::Transaction::from_proto(std::vector<uint8_t>{});
+    CHECK(empty.read_version() == 0);
+    CHECK(empty.uuid().empty());
+    CHECK(empty.operation().kind() == lance::OperationKind::Unknown);
 
     std::printf("C++ detached/conflict/errors OK\n");
 }

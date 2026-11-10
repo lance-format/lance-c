@@ -574,9 +574,9 @@ unsafe fn transaction_to_proto_inner(
 /// Parse a transaction with the native protobuf conversion.
 ///
 /// `bytes` must contain one complete protobuf `Transaction` message and must
-/// not be NULL when `len` is non-zero. Empty byte input is rejected because no
-/// message is present. The returned handle owns native state and must be
-/// closed with `lance_transaction_close()`. Returns NULL on error.
+/// not be NULL when `len` is non-zero. Empty input decodes to the native default
+/// transaction with an Unknown operation. The returned handle owns native state
+/// and must be closed with `lance_transaction_close()`. Returns NULL on error.
 ///
 /// The native decoder drops unknown protobuf oneof variants, which become
 /// `Operation::Unknown`. That value can be inspected but cannot be serialized
@@ -593,22 +593,32 @@ unsafe fn transaction_from_proto_inner(
     bytes: *const u8,
     len: usize,
 ) -> Result<*mut LanceTransaction> {
-    if len == 0 {
+    if len > isize::MAX as usize {
         return Err(lance_core::Error::invalid_input_source(
-            "transaction protobuf bytes must not be empty".into(),
+            format!(
+                "len={len} exceeds the maximum Rust slice length {}",
+                isize::MAX
+            )
+            .into(),
         ));
     }
-    if bytes.is_null() {
+    if bytes.is_null() && len > 0 {
         return Err(lance_core::Error::invalid_input_source(
             format!("bytes must not be NULL when len = {len}").into(),
         ));
     }
-    let message = pb::Transaction::decode(unsafe { std::slice::from_raw_parts(bytes, len) })
-        .map_err(|error| {
-            lance_core::Error::invalid_input_source(
-                format!("invalid transaction protobuf: {error}").into(),
-            )
-        })?;
+    let bytes = if len == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the caller provides `len` readable bytes, and the checks
+        // above establish non-NULL storage and a representable slice length.
+        unsafe { std::slice::from_raw_parts(bytes, len) }
+    };
+    let message = pb::Transaction::decode(bytes).map_err(|error| {
+        lance_core::Error::invalid_input_source(
+            format!("invalid transaction protobuf: {error}").into(),
+        )
+    })?;
     let transaction = Transaction::try_from(message)?;
     Ok(Box::into_raw(Box::new(LanceTransaction {
         inner: transaction,

@@ -4822,8 +4822,9 @@ int32_t lance_transaction_to_proto(
  * Parse one complete protobuf Transaction through the selected core's native
  * conversion.
  *
- * Empty input is rejected because no message is present. NULL bytes with a
- * non-zero length is invalid. Unknown protobuf oneof variants become
+ * Empty input decodes to the native default transaction with an Unknown
+ * operation. NULL bytes with a non-zero length is invalid. The length must
+ * fit a Rust slice (at most PTRDIFF_MAX). Unknown protobuf oneof variants become
  * Operation::Unknown: they can be inspected but cannot be serialized again or
  * committed. The returned handle must be closed exactly once. Returns NULL on
  * error.
