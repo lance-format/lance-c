@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "lance-c",
-  "version": "0.1.0",
+  "version": "0.1.9",
   "description": "C/C++ bindings for the Lance columnar data format",
   "homepage": "https://github.com/lance-format/lance-c",
   "license": "Apache-2.0",
@@ -14,7 +14,17 @@
   ],
   "features": {
     "from-source": {
-      "description": "Build from source via cargo (requires Rust toolchain on host instead of downloading prebuilt)"
+      "description": "Build from the tagged source archive via cargo (requires Rust, CMake, and protoc on the host instead of downloading a prebuilt)",
+      "dependencies": [
+        {
+          "name": "protobuf",
+          "host": true
+        },
+        {
+          "name": "vcpkg-cmake",
+          "host": true
+        }
+      ]
     }
   }
 }
