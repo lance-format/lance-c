@@ -4745,13 +4745,20 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
 
     let indices = [2_u32, 0, 2];
     let (schema, batches) = take_fragment_via_c(fragment, Some(&indices), None);
-    let native_batch = lance_c::runtime::block_on(
-        native_fragment.take(&indices, &fragment_projection(&native_fragment, None)),
+    let native_indices = [0_u32, 2];
+    let native_unique = lance_c::runtime::block_on(native_fragment.take(
+        &native_indices,
+        &fragment_projection(&native_fragment, None),
+    ))
+    .unwrap();
+    let expected_reordered = arrow::compute::take::take_record_batch(
+        &native_unique,
+        &UInt32Array::from(vec![1_u32, 0, 1]),
     )
     .unwrap();
-    assert_eq!(schema, *native_batch.schema());
+    assert_eq!(schema, *native_unique.schema());
     assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0], native_batch);
+    assert_eq!(batches[0], expected_reordered);
     assert_eq!(fragment_id_values(&batches), vec![3, 0, 3]);
     let names = batches[0]
         .column_by_name("profile")
@@ -4786,14 +4793,19 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
         .collect::<Vec<_>>();
     let (nested_schema, nested_batches) =
         take_fragment_via_c(fragment, Some(&indices), Some(columns.as_slice()));
-    let native_nested = lance_c::runtime::block_on(native_fragment.take(
-        &indices,
+    let native_nested_unique = lance_c::runtime::block_on(native_fragment.take(
+        &native_indices,
         &fragment_projection(&native_fragment, Some(&column_names)),
     ))
     .unwrap();
-    assert_eq!(nested_schema, *native_nested.schema());
+    let expected_nested_reordered = arrow::compute::take::take_record_batch(
+        &native_nested_unique,
+        &UInt32Array::from(vec![1_u32, 0, 1]),
+    )
+    .unwrap();
+    assert_eq!(nested_schema, *native_nested_unique.schema());
     assert_eq!(nested_batches.len(), 1);
-    assert_eq!(nested_batches[0], native_nested);
+    assert_eq!(nested_batches[0], expected_nested_reordered);
     assert_eq!(nested_schema.fields().len(), 3);
     let DataType::Struct(profile_fields) = nested_schema.field(1).data_type() else {
         panic!("profile projection must remain a struct");
@@ -4917,7 +4929,7 @@ fn test_fragment_take_uses_deletion_aware_local_indices_and_errors() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert!(untouched.release.is_none());
 
-    let missing_column = [c_str("profile.missing")];
+    let missing_column = [c_str("missing")];
     assert_eq!(
         unsafe {
             lance_fragment_take(
@@ -4932,7 +4944,7 @@ fn test_fragment_take_uses_deletion_aware_local_indices_and_errors() {
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     let message = take_last_error_message();
-    assert!(message.contains("profile.missing"));
+    assert!(message.contains("missing"));
     assert!(untouched.release.is_none());
 
     unsafe { lance_fragment_close(first) };

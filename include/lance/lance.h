@@ -1436,13 +1436,18 @@ LanceScanner* lance_fragment_scan(const LanceFragment* fragment);
  *
  * Indices address logical rows in this fragment after deletion vectors are
  * resolved. They are not dataset `_rowid` values or physical row addresses.
- * Native `FileFragment::take` preserves input order and duplicates. An index
- * outside the fragment's logical row range is an error.
+ * The binding preserves input order and duplicates. An index outside the
+ * fragment's logical row range returns the native range error. Lance 14.0.2's
+ * v2 decoder requires strictly increasing indices, so the binding calls native
+ * `FileFragment::take` with the sorted unique set and restores the requested
+ * order and duplicates over that native result. Deletion resolution, range
+ * validation, projection and JSON conversion remain in native take.
  *
  * `columns` is a NULL-terminated array of UTF-8 column paths:
  * - NULL selects the fragment's full logical schema.
  * - A non-NULL array whose first entry is NULL is an explicit empty
- *   projection. Unknown columns and non-UTF-8 names are errors.
+ *   projection. Missing top-level columns and non-UTF-8 names are errors;
+ *   nested paths follow Native `Schema::project` semantics.
  * `indices` may be NULL only when `num_indices` is zero.
  *
  * On success `out` is initialized in caller-owned storage and must have its
