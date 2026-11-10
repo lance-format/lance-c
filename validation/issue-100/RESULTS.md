@@ -6,7 +6,7 @@ Tested revision: `438fa5534a0c0d087fe48470cb285d445b40f165`
 
 Base revision: `a51ab47a9c814a746cb1714c99fad93dd3a188b8`
 
-Execution host: `Ubuntu-2404-noble-amd64-base` (Ubuntu 24.04, x86_64, 32 cores). All
+Execution host: `nier` (Ubuntu 24.04, x86_64, 32 cores). All
 compilation and consumer execution ran there. The worktree was clean apart from
 generated Conan test-package presets, which were removed after the run.
 
