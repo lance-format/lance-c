@@ -6,7 +6,6 @@
 //! Index creation mutates the dataset under an exclusive write lock; existing
 //! scanners that already cloned the inner Arc keep their snapshot view.
 
-use std::collections::HashMap;
 use std::ffi::{CString, c_char};
 use std::future::Future;
 use std::sync::Arc;
@@ -18,6 +17,7 @@ use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_table::format::IndexMetadata;
+use prost::Message;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -458,8 +458,8 @@ unsafe fn index_list_json_inner(dataset: *const LanceDataset) -> Result<*const c
         .unwrap_or(std::ptr::null()))
 }
 
-/// JSON array describing every non-system physical index segment. Caller must
-/// free with lance_free_string().
+/// JSON array describing non-system physical index segments visible to core.
+/// Caller must free with lance_free_string().
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_index_segments_json(
     dataset: *const LanceDataset,
@@ -477,31 +477,9 @@ unsafe fn index_segments_json_inner(dataset: *const LanceDataset) -> Result<*con
     let snap = ds.snapshot();
     let indices = block_on(snap.load_indices())?;
 
-    // describe_indices reconstructs logical index descriptions and rejects a
-    // non-system index whose fragment bitmap is unknown. The segment listing
-    // must still expose that metadata, so use the existing descriptions only
-    // when every segment has known coverage.
-    let type_by_name = if indices
-        .iter()
-        .filter(|index| !lance_index::is_system_index(index))
-        .any(|index| index.fragment_bitmap.is_none())
-    {
-        HashMap::new()
-    } else {
-        block_on(snap.describe_indices(None))?
-            .iter()
-            .map(|description| {
-                (
-                    description.name().to_string(),
-                    description.index_type().to_string(),
-                )
-            })
-            .collect()
-    };
-
     let schema = snap.schema();
-    let json = serialize_index_segments_json(&indices, &type_by_name, |field_id| {
-        schema.field_by_id(field_id).map(|field| field.name.clone())
+    let json = serialize_index_segments_json(&indices, |field_id| {
+        schema.field_path_minimal(field_id).ok()
     })?;
     CString::new(json)
         .map(|value| value.into_raw() as *const c_char)
@@ -512,21 +490,56 @@ unsafe fn index_segments_json_inner(dataset: *const LanceDataset) -> Result<*con
         })
 }
 
-fn serialized_index_type(index: &IndexMetadata, type_by_name: &HashMap<String, String>) -> String {
-    type_by_name.get(&index.name).cloned().unwrap_or_else(|| {
-        index
-            .index_details
-            .as_ref()
-            .map(|details| {
-                lance_index::registry::display_type_from_url(details.type_url.as_str()).to_string()
+fn serialized_index_type(index: &IndexMetadata) -> String {
+    let Some(details) = &index.index_details else {
+        // Core descriptions recognize pre-details vector indices by this file.
+        return if index.files.as_ref().is_some_and(|files| {
+            files
+                .iter()
+                .any(|file| file.path == lance_index::INDEX_FILE_NAME)
+        }) {
+            "Vector"
+        } else {
+            "Unknown"
+        }
+        .to_string();
+    };
+    let details = lance::index::scalar::IndexDetails(Arc::clone(details));
+    if details.is_vector() {
+        // Describe the stored protobuf independently of coverage, using core's
+        // vector description format. Core's formatter is crate-private.
+        if details.0.value.is_empty() {
+            return "Vector".to_string();
+        }
+        let Ok(vector) = lance_index::pb::VectorIndexDetails::decode(details.0.value.as_slice())
+        else {
+            return "Vector".to_string();
+        };
+        use lance_index::pb::vector_index_details::Compression;
+        let compression = match vector.compression {
+            None | Some(Compression::Flat(_)) => "FLAT",
+            Some(Compression::Pq(_)) => "PQ",
+            Some(Compression::Sq(_)) => "SQ",
+            Some(Compression::Rq(_)) => "RQ",
+        };
+        let prefix = if vector.hnsw_index_config.is_some() {
+            "IVF_HNSW_"
+        } else {
+            "IVF_"
+        };
+        format!("{prefix}{compression}")
+    } else {
+        details
+            .get_plugin()
+            .map(|plugin| plugin.name().to_string())
+            .unwrap_or_else(|_| {
+                lance_index::registry::display_type_from_url(&details.0.type_url).to_string()
             })
-            .unwrap_or_else(|| "Unknown".to_string())
-    })
+    }
 }
 
 fn serialize_index_segments_json(
     indices: &[IndexMetadata],
-    type_by_name: &HashMap<String, String>,
     field_name: impl Fn(i32) -> Option<String>,
 ) -> Result<String> {
     let entries = indices
@@ -534,7 +547,7 @@ fn serialize_index_segments_json(
         .filter(|index| !lance_index::is_system_index(index))
         .map(|index| {
             let columns = index
-                .fields
+                .keyed_fields()
                 .iter()
                 .filter_map(|field_id| field_name(*field_id))
                 .collect::<Vec<_>>();
@@ -546,7 +559,7 @@ fn serialize_index_segments_json(
                 "name": index.name,
                 "uuid": index.uuid.to_string(),
                 "columns": columns,
-                "type": serialized_index_type(index, type_by_name),
+                "type": serialized_index_type(index),
                 "dataset_version": index.dataset_version,
                 "index_version": index.index_version,
                 "fragment_ids": fragment_ids,

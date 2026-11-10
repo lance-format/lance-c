@@ -2128,11 +2128,10 @@ uint64_t lance_dataset_index_count(const LanceDataset* dataset);
 const char* lance_dataset_index_list_json(const LanceDataset* dataset);
 
 /**
- * JSON array describing every non-system physical index segment.
+ * JSON array describing non-system physical index segments visible to the
+ * Rust core for this dataset snapshot. Core compatibility filtering applies.
  *
- * Unlike lance_dataset_index_list_json(), this listing has one entry per
- * physical segment rather than one best-effort logical index description. Each
- * entry contains `name`, `uuid`, `columns`, `type`, `dataset_version`,
+ * Each entry contains `name`, `uuid`, `columns`, `type`, `dataset_version`,
  * `index_version`, and `fragment_ids`.
  *
  * `index_version` is the physical index format version recorded in the
