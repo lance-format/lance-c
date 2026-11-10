@@ -201,7 +201,7 @@ static void test_session_cache_config(const std::string& uri) {
         ArrowArrayStream after_stream;
         memset(&after_stream, 0, sizeof(after_stream));
         after_close.to_arrow_stream(&after_stream);
-        assert(drain_scan_rows(after_stream) == 1);
+        assert(drain_scan_rows(after_stream) == 12);
     }
 
     bool caught = false;

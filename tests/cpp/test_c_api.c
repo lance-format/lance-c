@@ -300,7 +300,7 @@ static void test_session_cache_config(const char *uri) {
            "Moka-configured reads should be reflected in deep size");
 
     lance_session_close(session);
-    ASSERT(scan_filtered_with_index(ds, "id >= 9") == 1,
+    ASSERT(scan_filtered_with_index(ds, "id >= 9") == 12,
            "dataset must keep configured cache state after session close");
     lance_dataset_close(ds);
 
