@@ -106,6 +106,52 @@ pub struct LanceWriteParams {
     pub enable_stable_row_ids: bool,
 }
 
+/// Native automatic-cleanup parameters for `lance_dataset_write_with_options`.
+///
+/// `interval` is the number of committed versions between cleanup runs; `0`
+/// is a valid native value that considers cleanup on every commit.
+///
+/// `older_than_seconds` and `older_than_nanos` together express the native
+/// `chrono::TimeDelta` retention window as
+/// `older_than_seconds + older_than_nanos / 1_000_000_000`. Both fields carry
+/// the sign, and the nanosecond component preserves the native precision.
+/// `older_than_nanos` must be in `[-999_999_999, 999_999_999]`, and the
+/// combined value must fit in `chrono::TimeDelta` (about +/-292 million
+/// years). Negative durations are forwarded to Lance, which rejects them when
+/// it builds the write transaction because the persisted config uses
+/// `std::time::Duration`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceAutoCleanupParams {
+    /// Number of committed versions between cleanup runs. `0` is valid.
+    pub interval: u64,
+    /// Whole-second component of the retention window.
+    pub older_than_seconds: i64,
+    /// Signed subsecond component of the retention window, in nanoseconds.
+    pub older_than_nanos: i32,
+}
+
+/// Native write options for `lance_dataset_write_with_options`.
+///
+/// Zero-initialize this struct to select `WriteParams::default()`:
+/// `auto_cleanup = None` and `skip_auto_cleanup = false`. The embedded
+/// `params` keeps the zero-means-upstream-default mapping documented on
+/// `LanceWriteParams`.
+///
+/// A NULL `auto_cleanup` selects native `None`; a non-NULL pointer selects
+/// `Some`, including an explicit `interval = 0` or a zero-length retention
+/// window. `skip_auto_cleanup` affects only the current commit and never
+/// changes persisted configuration.
+#[repr(C)]
+pub struct LanceWriteOptions {
+    /// Output-shape overrides. Zero-initialize to inherit upstream defaults.
+    pub params: LanceWriteParams,
+    /// Native `WriteParams::auto_cleanup`; NULL means `None`.
+    pub auto_cleanup: *const LanceAutoCleanupParams,
+    /// Native `WriteParams::skip_auto_cleanup`.
+    pub skip_auto_cleanup: bool,
+}
+
 /// Write an Arrow record batch stream to a Lance dataset at `uri`, committing a manifest.
 ///
 /// - `uri`: Dataset URI (`file://`, `s3://`, `memory://`, ...). Must not be NULL or empty.
@@ -121,6 +167,9 @@ pub struct LanceWriteParams {
 ///   `*out_dataset` is untouched — do not read or free it.
 ///
 /// Equivalent to `lance_dataset_write_with_params(..., params = NULL, ...)`.
+/// This legacy entry point records the documented 20-version / 14-day
+/// auto-cleanup policy. Use `lance_dataset_write_with_options` for native
+/// `WriteParams` defaults.
 ///
 /// Returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
@@ -145,6 +194,8 @@ pub unsafe extern "C" fn lance_dataset_write(
                 stream,
                 mode,
                 std::ptr::null(),
+                std::ptr::null(),
+                true,
                 storage_opts,
                 out_dataset,
             )
@@ -155,6 +206,10 @@ pub unsafe extern "C" fn lance_dataset_write(
 
 /// Same as `lance_dataset_write` but takes a `LanceWriteParams` for tuning the
 /// output shape. Pass `params = NULL` to use upstream defaults.
+///
+/// This legacy entry point records the documented 20-version / 14-day
+/// auto-cleanup policy. Use `lance_dataset_write_with_options` for native
+/// `WriteParams` defaults.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_write_with_params(
     uri: *const c_char,
@@ -167,7 +222,58 @@ pub unsafe extern "C" fn lance_dataset_write_with_params(
 ) -> i32 {
     ffi_try!(
         unsafe {
-            write_dataset_inner(uri, schema, stream, mode, params, storage_opts, out_dataset)
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                params,
+                std::ptr::null(),
+                true,
+                storage_opts,
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Same as `lance_dataset_write` but selects native `WriteParams` defaults
+/// and optional auto-cleanup settings. Pass `options = NULL` to use a
+/// zero-initialized `LanceWriteOptions`, which is equivalent to
+/// `WriteParams::default()`: `auto_cleanup = None`, `skip_auto_cleanup =
+/// false`.
+///
+/// On an existing dataset, `auto_cleanup` is written only by CREATE;
+/// APPEND and OVERWRITE leave the persisted policy unchanged. An explicit
+/// `auto_cleanup = None` on an existing manifest therefore does not delete
+/// stored cleanup configuration.
+///
+/// The stream is consumed on every return path except a NULL `stream`.
+/// `out_dataset` follows the same contract as `lance_dataset_write`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_write_with_options(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    options: *const LanceWriteOptions,
+    storage_opts: *const *const c_char,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                std::ptr::null(),
+                options,
+                false,
+                storage_opts,
+                out_dataset,
+            )
         },
         neg
     )
@@ -179,6 +285,8 @@ unsafe fn write_dataset_inner(
     stream: *mut FFI_ArrowArrayStream,
     mode: i32,
     params: *const LanceWriteParams,
+    options: *const LanceWriteOptions,
+    legacy_auto_cleanup: bool,
     storage_opts: *const *const c_char,
     out_dataset: *mut *mut LanceDataset,
 ) -> Result<i32> {
@@ -255,26 +363,39 @@ unsafe fn write_dataset_inner(
     let mut write_params = WriteParams {
         mode: mode.into(),
         store_params,
-        // Lance 9.1 changed the upstream default to `auto_cleanup: None`.
-        // lance-c exposes neither cleanup configuration nor an explicit
-        // cleanup operation, so losing the reclamation path would silently
-        // accumulate versions for datasets created through the C writer.
-        // Pin the pre-9.1 policy (every 20 versions, older than 14 days)
-        // explicitly rather than via `AutoCleanupParams::default()`, so a
-        // future upstream default change cannot silently shift C-visible
-        // behavior.
-        auto_cleanup: Some(AutoCleanupParams {
-            interval: 20,
-            older_than: TimeDelta::days(14),
-        }),
         ..WriteParams::default()
     };
-    if !params.is_null() {
+    if !options.is_null() {
+        // SAFETY: `options` is non-NULL (checked above) and the caller
+        // guarantees it points to a properly-initialized `LanceWriteOptions`
+        // valid for the duration of this call. The borrow ends before any
+        // await point because `apply_write_params` and the auto-cleanup
+        // conversion are synchronous.
+        let options = unsafe { &*options };
+        unsafe { apply_write_params(&mut write_params, &options.params)? };
+        if !options.auto_cleanup.is_null() {
+            // SAFETY: the caller guarantees a non-NULL `auto_cleanup` points
+            // to a valid `LanceAutoCleanupParams` for this call. We copy the
+            // native values before entering async work.
+            write_params.auto_cleanup =
+                Some(unsafe { auto_cleanup_from_ffi(&*options.auto_cleanup)? });
+        }
+        write_params.skip_auto_cleanup = options.skip_auto_cleanup;
+    } else if !params.is_null() {
         // SAFETY: `params` is non-NULL (checked above) and the caller
         // guarantees it points to a properly-initialized `LanceWriteParams`
         // valid for the duration of this call. We borrow by shared reference
         // and only read; the borrow is consumed before any await point.
         unsafe { apply_write_params(&mut write_params, &*params)? };
+    }
+    if legacy_auto_cleanup {
+        // Lance 9.1 changed the upstream default to `auto_cleanup: None`.
+        // The long-standing C entry points still expose the pre-9.1 policy
+        // (every 20 versions, older than 14 days) so datasets created through
+        // them keep their reclamation path. Pin the values explicitly rather
+        // than via `AutoCleanupParams::default()`, so a future upstream
+        // default change cannot silently shift C-visible behavior.
+        write_params.auto_cleanup = Some(legacy_auto_cleanup_params());
     }
 
     let dataset = block_on(Dataset::write(reader, uri_str, Some(write_params)))?;
@@ -293,6 +414,58 @@ unsafe fn write_dataset_inner(
     }
 
     Ok(0)
+}
+
+/// The documented legacy lance-c cleanup policy.
+fn legacy_auto_cleanup_params() -> AutoCleanupParams {
+    AutoCleanupParams {
+        interval: 20,
+        older_than: TimeDelta::days(14),
+    }
+}
+
+/// Convert the C representation into native `AutoCleanupParams`.
+///
+/// The nanosecond component must be already normalized to the native
+/// `TimeDelta` subsecond range. Out-of-range values and durations outside
+/// `chrono::TimeDelta` are rejected with context instead of being clamped.
+fn auto_cleanup_from_ffi(raw: &LanceAutoCleanupParams) -> Result<AutoCleanupParams> {
+    const MAX_NANOS: i32 = 999_999_999;
+    if raw.older_than_nanos < -MAX_NANOS || raw.older_than_nanos > MAX_NANOS {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "auto_cleanup.older_than_nanos={} must be in [-{MAX_NANOS}, {MAX_NANOS}]",
+                raw.older_than_nanos
+            )
+            .into(),
+        ));
+    }
+
+    let interval = u64_to_usize(raw.interval, "auto_cleanup.interval")?;
+    let seconds = TimeDelta::try_seconds(raw.older_than_seconds).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "auto_cleanup.older_than_seconds={} is outside chrono::TimeDelta range",
+                raw.older_than_seconds
+            )
+            .into(),
+        )
+    })?;
+    let nanos = TimeDelta::nanoseconds(i64::from(raw.older_than_nanos));
+    let older_than = seconds.checked_add(&nanos).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "auto_cleanup older_than ({} seconds + {} nanoseconds) is outside chrono::TimeDelta range",
+                raw.older_than_seconds, raw.older_than_nanos
+            )
+            .into(),
+        )
+    })?;
+
+    Ok(AutoCleanupParams {
+        interval,
+        older_than,
+    })
 }
 
 /// Apply caller-provided overrides onto an `lance::WriteParams`. Zero / NULL

@@ -905,6 +905,62 @@ static void test_dataset_write_roundtrip(const std::string& src_uri,
     PASS();
 }
 
+static void test_write_options_and_config(const std::string& src_uri,
+                                          const std::string& dst_uri) {
+    TEST(test_write_options_and_config);
+
+    const std::string uri = dst_uri + "_native_options";
+    auto src = lance::Dataset::open(src_uri);
+    const uint64_t src_rows = src.count_rows();
+
+    {
+        auto scanner = src.scan();
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+
+        lance::WriteOptions options;
+        auto ds = lance::Dataset::write(
+            uri, &stream, lance::WriteMode::Create, options);
+        assert(ds.count_rows() == src_rows);
+        auto config = ds.config();
+        assert(config.find("lance.auto_cleanup.interval") == config.end());
+        assert(config.find("lance.auto_cleanup.older_than") == config.end());
+    }
+
+    {
+        auto scanner = src.scan();
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+
+        lance::WriteOptions options;
+        options.params.max_rows_per_file = 2;
+        options.auto_cleanup = lance::AutoCleanupParams{0, 0, 0};
+        options.skip_auto_cleanup = true;
+        auto ds = lance::Dataset::write(
+            uri, &stream, lance::WriteMode::Append, options);
+        assert(ds.count_rows() == src_rows * 2);
+        auto config = ds.config();
+        assert(config.find("lance.auto_cleanup.interval") == config.end());
+
+        ds.update_config({
+            lance::ConfigUpdate{"cpp.key", std::string("value")},
+            lance::ConfigUpdate{"cpp.removed", std::nullopt},
+        });
+        auto updated = ds.config();
+        assert(updated.at("cpp.key") == "value");
+        assert(updated.find("cpp.removed") == updated.end());
+    }
+
+    auto reopened = lance::Dataset::open(uri);
+    auto config = reopened.config();
+    assert(config.at("cpp.key") == "value");
+    assert(config.find("lance.auto_cleanup.interval") == config.end());
+
+    PASS();
+}
+
 // Exercises `Dataset::calculate_data_stats` on the freshly-written (modern,
 // v2+) dataset, where per-field on-disk sizes are populated. Runs before the
 // mutation tests reshape or empty the dataset.
@@ -1428,6 +1484,7 @@ int main(int argc, char** argv) {
     test_commit_index_segments(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
