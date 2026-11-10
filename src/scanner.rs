@@ -2790,9 +2790,7 @@ pub unsafe extern "C" fn lance_scanner_explain_plan(
 /// returned string is owned by the caller and must be freed with
 /// `lance_free_string()`. Returns NULL on error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lance_scanner_analyze_plan(
-    scanner: *const LanceScanner,
-) -> *const c_char {
+pub unsafe extern "C" fn lance_scanner_analyze_plan(scanner: *const LanceScanner) -> *const c_char {
     scanner_poison_check!(scanner, ptr::null());
     scanner_ffi_try!(scanner, unsafe {
         scanner_plan_string_inner(scanner, ScannerPlanString::Analyze)
