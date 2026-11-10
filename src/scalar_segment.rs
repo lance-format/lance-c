@@ -33,6 +33,11 @@ pub(crate) struct PreparedScalarSegment {
     pub callback: Option<ExecutionStatsCallback>,
 }
 
+pub(crate) struct ConfiguredScalarSegment {
+    pub scanner: Scanner,
+    pub stats_callback: Option<ExecutionStatsCallback>,
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::invalid_input_source(message.into().into())
 }
@@ -129,7 +134,7 @@ impl ScalarIndexLoader for SegmentIndexLoader<'_> {
 }
 
 impl PreparedScalarSegment {
-    pub async fn configure(self, mut reader: Scanner) -> Result<Scanner> {
+    pub async fn configure(self, mut reader: Scanner) -> Result<ConfiguredScalarSegment> {
         // Never let either candidate reads or fallback re-enter a global index search.
         reader.use_scalar_index(false);
         let mut stats = ExecutionSummaryCounts::default();
@@ -167,27 +172,35 @@ impl PreparedScalarSegment {
                 _ => *stats.all_counts.entry(name.to_string()).or_default() += count.value(),
             }
         }
-        if let Some(callback) = self.callback {
+        let stats_callback = if let Some(callback) = self.callback {
             // Preserve the callback's once-per-successfully-exhausted-stream contract.
             // Candidate work is not part of the underlying reader's plan metrics.
-            reader.scan_stats_callback(Arc::new(move |read| {
-                let mut combined = read.clone();
-                combined.iops += stats.iops;
-                combined.requests += stats.requests;
-                combined.bytes_read += stats.bytes_read;
-                combined.indices_loaded += stats.indices_loaded;
-                combined.parts_loaded += stats.parts_loaded;
-                combined.index_comparisons += stats.index_comparisons;
-                for (name, value) in &stats.all_counts {
-                    *combined.all_counts.entry(name.clone()).or_default() += value;
-                }
-                for (name, value) in &stats.all_times {
-                    *combined.all_times.entry(name.clone()).or_default() += value;
-                }
-                callback(&combined);
-            }));
-        }
-        Ok(reader)
+            let combined: ExecutionStatsCallback =
+                Arc::new(move |read: &ExecutionSummaryCounts| {
+                    let mut combined = read.clone();
+                    combined.iops += stats.iops;
+                    combined.requests += stats.requests;
+                    combined.bytes_read += stats.bytes_read;
+                    combined.indices_loaded += stats.indices_loaded;
+                    combined.parts_loaded += stats.parts_loaded;
+                    combined.index_comparisons += stats.index_comparisons;
+                    for (name, value) in &stats.all_counts {
+                        *combined.all_counts.entry(name.clone()).or_default() += value;
+                    }
+                    for (name, value) in &stats.all_times {
+                        *combined.all_times.entry(name.clone()).or_default() += value;
+                    }
+                    callback(&combined);
+                });
+            reader.scan_stats_callback(combined.clone());
+            Some(combined)
+        } else {
+            None
+        };
+        Ok(ConfiguredScalarSegment {
+            scanner: reader,
+            stats_callback,
+        })
     }
 
     async fn configure_candidates(
