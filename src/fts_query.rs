@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Process-local, immutable FTS query context shared by segment-scoped scans.
+//! Immutable FTS query values and process-local prepared query contexts.
 
 use std::collections::HashSet;
 use std::ffi::c_char;
