@@ -20,6 +20,7 @@ set(LANCE_C_SHA512_SOURCE                    "0262e1df6dddb9caac5bd375af6f0bf286
 # a second full cargo build while keeping the imported target configuration-
 # independent.
 set(VCPKG_BUILD_TYPE release)
+set(VCPKG_POLICY_MISMATCHED_NUMBER_OF_BINARIES enabled)
 
 if("from-source" IN_LIST FEATURES)
     # Source build via cargo. The Rust toolchain stays a documented host
