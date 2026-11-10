@@ -965,9 +965,11 @@ impl PreparedScanner {
             return Ok(PreparedPlan {
                 plan,
                 batch_size,
-                stats_callback: (operation == ScannerOperation::Scan)
-                    .then_some(configured.stats_callback)
-                    .flatten(),
+                stats_callback: if operation == ScannerOperation::Scan {
+                    configured.stats_callback
+                } else {
+                    None
+                },
             });
         }
 
@@ -995,9 +997,11 @@ impl PreparedScanner {
             return Ok(PreparedPlan {
                 plan,
                 batch_size,
-                stats_callback: (operation == ScannerOperation::Scan)
-                    .then_some(scan_statistics_callback)
-                    .flatten(),
+                stats_callback: if operation == ScannerOperation::Scan {
+                    scan_statistics_callback
+                } else {
+                    None
+                },
             });
         }
 
@@ -1010,9 +1014,11 @@ impl PreparedScanner {
             return Ok(PreparedPlan {
                 plan,
                 batch_size: distributed_fts.batch_size,
-                stats_callback: (operation == ScannerOperation::Scan)
-                    .then_some(distributed_fts.scan_statistics_callback)
-                    .flatten(),
+                stats_callback: if operation == ScannerOperation::Scan {
+                    distributed_fts.scan_statistics_callback
+                } else {
+                    None
+                },
             });
         }
 
@@ -1023,9 +1029,11 @@ impl PreparedScanner {
         Ok(PreparedPlan {
             plan: scanner.create_plan().await?,
             batch_size,
-            stats_callback: (operation == ScannerOperation::Scan)
-                .then_some(scan_statistics_callback)
-                .flatten(),
+            stats_callback: if operation == ScannerOperation::Scan {
+                scan_statistics_callback
+            } else {
+                None
+            },
         })
     }
 
