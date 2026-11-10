@@ -69,6 +69,35 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Dataset metadata | `lance_dataset_version()`, `lance_dataset_count_rows()`, `lance_dataset_latest_version()` |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
 | [x] | Row prefilter | `lance_scanner_set_row_addr_allowlist()` / `lance_scanner_set_row_addr_blocklist()` restrict scans, nearest-neighbor and full-text searches to (or exclude) a set of `_rowid`s before ranking |
+| [x] | Native ordering | `lance_scanner_set_order_by()` and C++ `Scanner::order_by()` sort by one or more columns with direction and NULL placement |
+
+## Scanner ordering
+
+Use `lance_scanner_set_order_by()` or the fluent C++ `Scanner::order_by()` to
+apply Lance's native `Scanner::order_by` behavior:
+
+```cpp
+auto scanner = dataset.scan();
+scanner.order_by({
+    {"category", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+    {"score", LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_FIRST},
+    {"id", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+});
+```
+
+Tie ordering must be explicit when rows can compare equal; the binding does not
+add a row-id or stable-order tie-breaker. Lance validates referenced columns
+when the scan starts. With limit/offset, Lance sorts all rows before applying
+the window. With nearest or full-text search, Lance sorts the rows selected by
+the query.
+
+Pass `std::nullopt` or `lance_scanner_set_order_by(scanner, NULL, 0)` to clear
+the ordering. An explicit empty vector is the native empty ordering and has the
+same scan effect. Invalid enum values or a NULL column name are rejected without
+replacing the previous ordering. Multi-vector search is the one unsupported
+mode: `nearest_multivector()` always restores distance order for its result
+window, so combining it with a non-empty ordering fails when the scan starts
+instead of silently ignoring the ordering.
 
 ## Segment-scoped array label filters
 

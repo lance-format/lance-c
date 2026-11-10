@@ -128,6 +128,46 @@ fn multivector_search_scores_logical_rows_and_excludes_empty_and_null_rows() {
 }
 
 #[test]
+fn multivector_rejects_order_by_instead_of_ignoring_it() {
+    let (_dir, uri) = fixture();
+    let column = CString::new("vectors").unwrap();
+    let q = [1.0f32, 0., 0., 1.];
+    let ordering = LanceColumnOrdering {
+        column_name: c"id".as_ptr(),
+        direction: LanceOrderDirection::Ascending as i32,
+        null_order: LanceNullOrder::NullsLast as i32,
+    };
+    unsafe {
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!ds.is_null());
+        let scan = lance_scanner_new(ds, ptr::null(), ptr::null());
+        assert_eq!(lance_scanner_set_order_by(scan, &ordering, 1), 0);
+        assert_eq!(
+            lance_scanner_nearest_multivector(
+                scan,
+                column.as_ptr(),
+                q.as_ptr() as *const c_void,
+                2,
+                1,
+                0,
+                10
+            ),
+            0
+        );
+        assert_eq!(lance_scanner_set_use_index(scan, false), 0);
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(lance_scanner_to_arrow_stream(scan, &mut stream), -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned();
+        assert!(message.contains("order_by is not supported with nearest_multivector"));
+        lance_scanner_close(scan);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
 fn multivector_rejects_invalid_shape_and_preserves_previous_query() {
     let (_dir, uri) = fixture();
     let column = CString::new("vectors").unwrap();
