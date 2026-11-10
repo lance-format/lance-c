@@ -14,7 +14,7 @@ use datafusion_substrait::substrait::proto::{
     aggregate_function::AggregationInvocation,
     aggregate_rel::{Grouping, Measure},
     expression::{
-        FieldReference, RexType,
+        FieldReference, ReferenceSegment, RexType,
         field_reference::{ReferenceType, RootReference, RootType},
         reference_segment::{self, StructField},
     },
@@ -59,16 +59,14 @@ impl AggregateKind {
 fn field_reference(column: i32) -> Expression {
     Expression {
         rex_type: Some(RexType::Selection(Box::new(FieldReference {
-            reference_type: Some(ReferenceType::DirectReference(
-                reference_segment::ReferenceSegment {
-                    reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
-                        StructField {
-                            field: column,
-                            child: None,
-                        },
-                    ))),
-                },
-            )),
+            reference_type: Some(ReferenceType::DirectReference(ReferenceSegment {
+                reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
+                    StructField {
+                        field: column,
+                        child: None,
+                    },
+                ))),
+            })),
             root_type: Some(RootType::RootReference(RootReference {})),
         }))),
     }

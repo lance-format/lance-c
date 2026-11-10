@@ -20587,10 +20587,10 @@ fn native_aggregate_error(uri: &str, bytes: &[u8]) -> String {
     lance_c::runtime::block_on(async {
         let dataset = Dataset::open(uri).await.unwrap();
         let mut scanner = dataset.scan();
-        scanner
-            .aggregate(NativeAggregateExpr::substrait(bytes.to_vec()))
-            .unwrap_err()
-            .to_string()
+        match scanner.aggregate(NativeAggregateExpr::substrait(bytes.to_vec())) {
+            Ok(_) => panic!("invalid Substrait aggregate unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        }
     })
 }
 
