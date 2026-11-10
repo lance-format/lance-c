@@ -468,6 +468,126 @@ LanceDataset* lance_dataset_checkout_ref(
     const LanceRef* reference
 );
 
+/* ─── Branches ─── */
+
+/**
+ * Create a branch from a native ref.
+ *
+ * `branch_name` must be UTF-8. `reference` must be an existing LanceRef.
+ * Branch-name validation, reference resolution and duplicate detection are
+ * performed by Lance's `Dataset::create_branch`.
+ *
+ * `storage_opts` is NULL-terminated key-value pairs, or NULL. NULL passes
+ * `None` to native, so the source dataset's store params are used. A non-NULL
+ * array, including an immediately NULL-terminated empty array, passes explicit
+ * object-store params.
+ *
+ * Native creation is a non-atomic shallow clone followed by a BranchContents
+ * write. If creation stops after the clone, a branch dataset without
+ * BranchContents may remain. Retrying the same name may then fail; use
+ * lance_dataset_branch_force_delete() to remove that zombie dataset.
+ *
+ * The returned dataset owns an independent snapshot and remains usable after
+ * the source dataset or reference is closed.
+ * @return new dataset handle, or NULL on error
+ */
+LanceDataset* lance_dataset_branch_create(
+    const LanceDataset* dataset,
+    const char* branch_name,
+    const LanceRef* reference,
+    const char* const* storage_opts
+);
+
+/**
+ * Check out the latest version of a branch as an independent dataset.
+ *
+ * "main" selects the default branch. The returned handle remains usable after
+ * the source dataset is closed.
+ * @return new dataset handle, or NULL on error
+ */
+LanceDataset* lance_dataset_checkout_branch(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Serialize all branches as a JSON object keyed by branch name.
+ *
+ * The value is Lance's native `HashMap<String, BranchContents>` serde output.
+ * Each value has the selected core's BranchContents shape, including
+ * `parentBranch`, `identifier.version_mapping`, `parentVersion`, `createAt`
+ * (Unix seconds), `manifestSize` and `metadata`. Map enumeration order is not
+ * promised. The caller owns the string and frees it with
+ * lance_free_string().
+ * @return JSON string, or NULL on error
+ */
+const char* lance_dataset_branches_json(const LanceDataset* dataset);
+
+/**
+ * Serialize one native BranchContents as JSON.
+ *
+ * The object follows the selected core's BranchContents serde shape. The
+ * caller owns the string and frees it with lance_free_string().
+ * @return JSON string, or NULL on error (including LANCE_ERR_NOT_FOUND)
+ */
+const char* lance_dataset_branch_get_json(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Serialize the current dataset's native BranchIdentifier as JSON.
+ *
+ * The object follows the selected core's BranchIdentifier serde shape:
+ * `{"version_mapping":[[version,uuid],...]}`. For the main branch this is
+ * empty. The caller owns the string and frees it with lance_free_string().
+ * @return JSON string, or NULL on error
+ */
+const char* lance_dataset_branch_identifier_json(const LanceDataset* dataset);
+
+/**
+ * Delete a branch.
+ *
+ * Native checks reject a branch referenced by a child branch or by any tag
+ * with LANCE_ERR_COMMIT_CONFLICT. A missing BranchContents produces
+ * LANCE_ERR_NOT_FOUND. The branch dataset directories are cleaned up by the
+ * native implementation.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_branch_delete(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Delete a branch, bypassing only a missing BranchContents.
+ *
+ * This is the native recovery path for a branch dataset left without
+ * BranchContents by the non-atomic creation sequence. Child-branch and tag
+ * reference checks still apply and surface as LANCE_ERR_COMMIT_CONFLICT.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_branch_force_delete(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Replace all metadata entries on an existing branch.
+ *
+ * `metadata` is NULL-terminated key-value pairs ["key","value",NULL]. NULL or
+ * an empty array means an empty native map. This is a full replacement of
+ * BranchContents.metadata, not a merge or a special NULL-delete operation.
+ * Other branch fields are preserved. An unknown branch surfaces as
+ * LANCE_ERR_NOT_FOUND.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_branch_replace_metadata(
+    const LanceDataset* dataset,
+    const char* branch_name,
+    const char* const* metadata
+);
+
 /* ─── Tags ─── */
 
 /**

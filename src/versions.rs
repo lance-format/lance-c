@@ -15,6 +15,7 @@ use lance::Dataset;
 use lance::dataset::Version;
 use lance::dataset::refs::{Ref, TagContents};
 use lance_core::Result;
+use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
@@ -112,6 +113,19 @@ fn invalid(message: impl Into<String>) -> lance_core::Error {
 
 fn c_string(value: String, context: &str) -> Result<CString> {
     CString::new(value).map_err(|_| invalid(format!("{context} contains an embedded NUL byte")))
+}
+
+fn owned_json(json: serde_json::Result<String>, context: &str) -> Result<*const c_char> {
+    let json = json.map_err(|error| {
+        lance_core::Error::internal(format!("failed to serialize {context}: {error}"))
+    })?;
+    CString::new(json)
+        .map(|json| json.into_raw() as *const c_char)
+        .map_err(|error| {
+            lance_core::Error::internal(format!(
+                "{context} JSON contains an embedded NUL byte: {error}"
+            ))
+        })
 }
 
 fn timestamp_ns(timestamp: &DateTime<Utc>, context: &str) -> Result<i64> {
@@ -221,6 +235,21 @@ unsafe fn reference_at<'a>(reference: *const LanceRef) -> Result<&'a Ref> {
     }
     let reference = unsafe { &*reference };
     Ok(&reference.reference)
+}
+
+unsafe fn optional_object_store_params(
+    storage_opts: *const *const c_char,
+) -> Result<Option<ObjectStoreParams>> {
+    if storage_opts.is_null() {
+        return Ok(None);
+    }
+    let options = unsafe { helpers::parse_storage_options(storage_opts)? };
+    Ok(Some(ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            options,
+        ))),
+        ..ObjectStoreParams::default()
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +579,188 @@ unsafe fn checkout_ref_inner(
     Ok(Box::into_raw(Box::new(LanceDataset {
         inner: RwLock::new(Arc::new(checked_out)),
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Native branch lifecycle
+// ---------------------------------------------------------------------------
+
+/// Create a branch from a native ref.
+///
+/// Native `Dataset::create_branch` performs a shallow clone followed by a
+/// `BranchContents` write. Those phases are not atomic. `storage_opts == NULL`
+/// passes `None` so native falls back to the source dataset's store params;
+/// a non-NULL array, including an immediately NULL-terminated empty array,
+/// passes explicit `ObjectStoreParams`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_branch_create(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+    reference: *const LanceRef,
+    storage_opts: *const *const c_char,
+) -> *mut LanceDataset {
+    ffi_try!(
+        unsafe { branch_create_inner(dataset, branch_name, reference, storage_opts) },
+        null
+    )
+}
+
+unsafe fn branch_create_inner(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+    reference: *const LanceRef,
+    storage_opts: *const *const c_char,
+) -> Result<*mut LanceDataset> {
+    if dataset.is_null() {
+        return Err(invalid("dataset must not be NULL"));
+    }
+    let branch_name = required_c_string(branch_name, "branch_name")?;
+    let reference = unsafe { reference_at(reference)? }.clone();
+    let store_params = unsafe { optional_object_store_params(storage_opts)? };
+    let dataset = unsafe { &*dataset };
+    let created = dataset.with_mut(|source| {
+        block_on(source.create_branch(branch_name, reference, store_params))
+    })?;
+    Ok(Box::into_raw(Box::new(LanceDataset {
+        inner: RwLock::new(Arc::new(created)),
+    })))
+}
+
+/// Check out the latest version of a branch as an independently owned dataset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_checkout_branch(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+) -> *mut LanceDataset {
+    ffi_try!(unsafe { checkout_branch_inner(dataset, branch_name) }, null)
+}
+
+unsafe fn checkout_branch_inner(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+) -> Result<*mut LanceDataset> {
+    let branch_name = required_c_string(branch_name, "branch_name")?;
+    let dataset = dataset_snapshot(dataset)?;
+    let checked_out = block_on(dataset.checkout_branch(branch_name))?;
+    Ok(Box::into_raw(Box::new(LanceDataset {
+        inner: RwLock::new(Arc::new(checked_out)),
+    })))
+}
+
+/// Serialize the native branch map as JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_branches_json(
+    dataset: *const LanceDataset,
+) -> *const c_char {
+    ffi_try!(unsafe { branches_json_inner(dataset) }, null)
+}
+
+unsafe fn branches_json_inner(dataset: *const LanceDataset) -> Result<*const c_char> {
+    let dataset = dataset_snapshot(dataset)?;
+    let branches = block_on(dataset.list_branches())?;
+    owned_json(serde_json::to_string(&branches), "branch list")
+}
+
+/// Serialize one native `BranchContents` as JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_branch_get_json(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+) -> *const c_char {
+    ffi_try!(unsafe { branch_get_json_inner(dataset, branch_name) }, null)
+}
+
+unsafe fn branch_get_json_inner(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+) -> Result<*const c_char> {
+    let branch_name = required_c_string(branch_name, "branch_name")?;
+    let dataset = dataset_snapshot(dataset)?;
+    let contents = block_on(dataset.branches().get(branch_name))?;
+    owned_json(
+        serde_json::to_string(&contents),
+        &format!("branch {branch_name}"),
+    )
+}
+
+/// Serialize the current dataset's native `BranchIdentifier` as JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_branch_identifier_json(
+    dataset: *const LanceDataset,
+) -> *const c_char {
+    ffi_try!(unsafe { branch_identifier_json_inner(dataset) }, null)
+}
+
+unsafe fn branch_identifier_json_inner(dataset: *const LanceDataset) -> Result<*const c_char> {
+    let dataset = dataset_snapshot(dataset)?;
+    let identifier = block_on(dataset.branch_identifier())?;
+    owned_json(
+        serde_json::to_string(&identifier),
+        "current branch identifier",
+    )
+}
+
+/// Delete a branch using native reference-protection semantics.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_branch_delete(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+) -> i32 {
+    ffi_try!(unsafe { branch_delete_inner(dataset, branch_name, false) }, neg)
+}
+
+/// Delete a branch, bypassing only a missing `BranchContents`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_branch_force_delete(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+) -> i32 {
+    ffi_try!(unsafe { branch_delete_inner(dataset, branch_name, true) }, neg)
+}
+
+unsafe fn branch_delete_inner(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+    force: bool,
+) -> Result<i32> {
+    if dataset.is_null() {
+        return Err(invalid("dataset must not be NULL"));
+    }
+    let branch_name = required_c_string(branch_name, "branch_name")?;
+    let dataset = unsafe { &*dataset };
+    dataset.with_mut(|source| {
+        if force {
+            block_on(source.force_delete_branch(branch_name))
+        } else {
+            block_on(source.delete_branch(branch_name))
+        }
+    })?;
+    Ok(0)
+}
+
+/// Replace all metadata entries on an existing branch.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_branch_replace_metadata(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+    metadata: *const *const c_char,
+) -> i32 {
+    ffi_try!(
+        unsafe { branch_replace_metadata_inner(dataset, branch_name, metadata) },
+        neg
+    )
+}
+
+unsafe fn branch_replace_metadata_inner(
+    dataset: *const LanceDataset,
+    branch_name: *const c_char,
+    metadata: *const *const c_char,
+) -> Result<i32> {
+    let branch_name = required_c_string(branch_name, "branch_name")?;
+    let metadata = unsafe { helpers::parse_c_string_map(metadata, "branch metadata")? };
+    let dataset = dataset_snapshot(dataset)?;
+    block_on(dataset.branches().replace_metadata(branch_name, metadata))?;
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
