@@ -13,16 +13,20 @@
 
 #include "lance/lance.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -184,6 +188,125 @@ static void capture_build_progress(
     else if (event != LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS)
         captured->invalid = true;
     captured->events += 1;
+}
+
+struct TrackedFileRow {
+    int64_t version;
+    std::string base_uri;
+    std::string path;
+    std::string file_type;
+};
+
+struct PhysicalFileRow {
+    std::string base_uri;
+    std::string path;
+    int64_t size_bytes;
+    int64_t last_modified;
+};
+
+static std::string string_array_value(
+    const ArrowArray* array,
+    int64_t row) {
+    const auto* offsets = static_cast<const int32_t*>(array->buffers[1]);
+    const int32_t begin = offsets[row];
+    const int32_t end = offsets[row + 1];
+    return std::string(
+        static_cast<const char*>(array->buffers[2]) + begin,
+        static_cast<size_t>(end - begin));
+}
+
+static std::string dictionary_string_value(
+    const ArrowArray* array,
+    int64_t row,
+    size_t key_width) {
+    assert(array->dictionary != nullptr);
+    int64_t value_index = 0;
+    if (key_width == 4) {
+        int32_t key = 0;
+        memcpy(&key, static_cast<const char*>(array->buffers[1]) + row * 4, 4);
+        value_index = key;
+    } else {
+        int8_t key = 0;
+        memcpy(&key, static_cast<const char*>(array->buffers[1]) + row, 1);
+        value_index = key;
+    }
+    assert(value_index >= 0);
+    return string_array_value(array->dictionary, value_index);
+}
+
+static std::vector<TrackedFileRow> read_tracked_files(
+    lance::ArrowStream& stream) {
+    ArrowSchema schema = {};
+    assert(stream->get_schema(stream.get(), &schema) == 0);
+    assert(schema.n_children == 4);
+    assert(std::string(schema.children[0]->name) == "version");
+    assert(std::string(schema.children[1]->name) == "base_uri");
+    assert(std::string(schema.children[2]->name) == "path");
+    assert(std::string(schema.children[3]->name) == "type");
+    assert(std::string(schema.children[0]->format) == "l");
+    assert(std::string(schema.children[1]->format) == "i");
+    assert(schema.children[1]->dictionary != nullptr);
+    assert(std::string(schema.children[2]->format) == "u");
+    assert(std::string(schema.children[3]->format) == "c");
+    assert(schema.children[3]->dictionary != nullptr);
+    schema.release(&schema);
+
+    std::vector<TrackedFileRow> rows;
+    while (true) {
+        ArrowArray batch = {};
+        assert(stream->get_next(stream.get(), &batch) == 0);
+        if (batch.release == nullptr) break;
+        assert(batch.n_children == 4);
+        const auto* versions =
+            static_cast<const int64_t*>(batch.children[0]->buffers[1]);
+        for (int64_t row = 0; row < batch.length; ++row) {
+            rows.push_back(TrackedFileRow{
+                versions[row],
+                dictionary_string_value(batch.children[1], row, 4),
+                string_array_value(batch.children[2], row),
+                dictionary_string_value(batch.children[3], row, 1),
+            });
+        }
+        batch.release(&batch);
+    }
+    return rows;
+}
+
+static std::vector<PhysicalFileRow> read_all_files(
+    lance::ArrowStream& stream) {
+    ArrowSchema schema = {};
+    assert(stream->get_schema(stream.get(), &schema) == 0);
+    assert(schema.n_children == 4);
+    assert(std::string(schema.children[0]->name) == "base_uri");
+    assert(schema.children[0]->dictionary != nullptr);
+    assert(std::string(schema.children[1]->name) == "path");
+    assert(std::string(schema.children[2]->name) == "size_bytes");
+    assert(std::string(schema.children[2]->format) == "l");
+    assert(std::string(schema.children[3]->name) == "last_modified");
+    assert(std::string(schema.children[3]->format).rfind("tsu:", 0) == 0);
+    schema.release(&schema);
+
+    std::vector<PhysicalFileRow> rows;
+    while (true) {
+        ArrowArray batch = {};
+        assert(stream->get_next(stream.get(), &batch) == 0);
+        if (batch.release == nullptr) break;
+        assert(batch.n_children == 4);
+        const auto* sizes =
+            static_cast<const int64_t*>(batch.children[2]->buffers[1]);
+        const auto* timestamps =
+            static_cast<const int64_t*>(batch.children[3]->buffers[1]);
+        for (int64_t row = 0; row < batch.length; ++row) {
+            rows.push_back(PhysicalFileRow{
+                dictionary_string_value(batch.children[0], row, 4),
+                string_array_value(batch.children[1], row),
+                sizes[row],
+                timestamps[row],
+            });
+        }
+        batch.release(&batch);
+    }
+    return rows;
 }
 
 static void test_dataset_open(const std::string& uri) {
@@ -1606,6 +1729,258 @@ static void test_data_statistics(const std::string& dst_uri) {
     assert(total > 0 && "modern storage should report non-zero on-disk size");
     printf("fields=%zu... ", stats.size());
 
+    PASS();
+}
+
+static void test_config_replacement(const std::string& uri) {
+    TEST(test_config_replacement);
+
+    auto ds = lance::Dataset::open(uri);
+    auto old = lance::Dataset::open(uri);
+    const uint64_t before = ds.version();
+    const uint64_t old_version = old.version();
+    assert(ds.config().at("fixture.key") == "fixture-value");
+
+    auto merged = ds.update_config_json(
+        {
+            {"fixture.key", std::string("updated")},
+            {"fixture.remove", std::nullopt},
+            {"fixture.empty", std::string("")},
+            {"dup", std::string("first")},
+            {"dup", std::string("second")},
+            {"", std::string("")},
+        },
+        lance::MetadataUpdateMode::Merge);
+    assert(merged.find("\"fixture.key\":\"updated\"") != std::string::npos);
+    assert(merged.find("\"fixture.remove\"") == std::string::npos);
+    assert(merged.find("\"fixture.empty\":\"\"") != std::string::npos);
+    assert(merged.find("\"dup\":\"second\"") != std::string::npos);
+    assert(merged.find("\"\":\"\"") != std::string::npos);
+    assert(ds.version() == before + 1);
+    assert(old.version() == old_version);
+    assert(old.config().at("fixture.key") == "fixture-value");
+
+    auto historical = lance::Dataset::open(uri, {}, before);
+    assert(historical.config().at("fixture.key") == "fixture-value");
+
+    auto replaced = ds.update_config_json(
+        {
+            {"a", std::string("1")},
+            {"b", std::string("")},
+            {"gone", std::nullopt},
+        },
+        lance::MetadataUpdateMode::Replace);
+    assert(replaced == "{\"a\":\"1\",\"b\":\"\"}");
+    auto cleared =
+        ds.update_config_json({}, lance::MetadataUpdateMode::Replace);
+    assert(cleared == "{}");
+    assert(ds.config().empty());
+
+    auto reopened = lance::Dataset::open(uri);
+    assert(reopened.config().empty());
+    PASS();
+}
+
+static void test_base_paths_and_add(
+    const std::string& uri,
+    const std::string& alternate_uri) {
+    TEST(test_base_paths_and_add);
+
+    auto ds = lance::Dataset::open(uri);
+    auto old = lance::Dataset::open(uri);
+    const uint64_t before = ds.version();
+    const uint64_t old_version = old.version();
+    auto json = ds.base_paths_json();
+    assert(json.find("\"0\"") != std::string::npos);
+    assert(json.find("\"7\"") != std::string::npos);
+    assert(json.find(alternate_uri) != std::string::npos);
+    assert(json.find("\"name\":\"alt-root\"") != std::string::npos);
+    assert(json.find("\"is_dataset_root\":false") != std::string::npos);
+
+    const std::string auto_path = uri + "_cpp_added_auto";
+    const std::string named_path = uri + "_cpp_added_named";
+    const std::string none_path = uri + "_cpp_none_props";
+    const std::string empty_path = uri + "_cpp_empty_props";
+    lance::AddBasesOptions options;
+    options.transaction_properties =
+        std::vector<std::pair<std::string, std::string>>{
+            {"fixture.tx", "cpp-add-bases"},
+        };
+    ds.add_bases(
+        {
+            lance::BasePath{0, auto_path, std::string("auto"), false},
+            lance::BasePath{42, named_path, std::string(""), true},
+        },
+        options);
+    assert(ds.version() == before + 1);
+    assert(old.version() == old_version);
+    json = ds.base_paths_json();
+    assert(json.find("\"id\":1") != std::string::npos);
+    assert(json.find("\"id\":42") != std::string::npos);
+    assert(json.find("\"name\":\"auto\"") != std::string::npos);
+    assert(json.find("\"name\":\"\"") != std::string::npos);
+    assert(json.find(auto_path) != std::string::npos);
+    assert(json.find(named_path) != std::string::npos);
+
+    ds.add_bases(
+        {lance::BasePath{0, none_path, std::string("none-props"), false}});
+    lance::AddBasesOptions empty_options;
+    empty_options.transaction_properties =
+        std::vector<std::pair<std::string, std::string>>{};
+    ds.add_bases(
+        {lance::BasePath{0, empty_path, std::string("empty-props"), false}},
+        empty_options);
+
+    const uint64_t stable_version = ds.version();
+    bool caught = false;
+    try {
+        ds.add_bases({});
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+
+    caught = false;
+    try {
+        ds.add_bases(
+            {lance::BasePath{0, alternate_uri, std::string("duplicate"), false}});
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        assert(std::string(error.what()).find("Conflict detected") !=
+               std::string::npos);
+    }
+    assert(caught);
+    assert(ds.version() == stable_version);
+    PASS();
+}
+
+struct ProgressLifetime {
+    std::atomic<int>* destroyed;
+    explicit ProgressLifetime(std::atomic<int>* counter)
+        : destroyed(counter) {}
+    ~ProgressLifetime() {
+        destroyed->fetch_add(1, std::memory_order_seq_cst);
+    }
+};
+
+static void wait_for_expired(
+    const std::weak_ptr<ProgressLifetime>& weak) {
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        if (weak.expired()) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(false && "progress capture was not released");
+}
+
+static void test_file_stream_ownership(
+    const std::string& uri,
+    const std::string& alternate_uri) {
+    TEST(test_file_stream_ownership);
+
+    uint64_t latest = 0;
+    lance::ArrowStream tracked;
+    {
+        auto ds = lance::Dataset::open(uri);
+        latest = ds.version();
+        tracked = ds.tracked_files_stream();
+    }
+    auto tracked_rows = read_tracked_files(tracked);
+    assert(!tracked_rows.empty());
+    std::set<std::string> types;
+    uint64_t manifest_rows = 0;
+    bool saw_alt_data = false;
+    for (const auto& row : tracked_rows) {
+        types.insert(row.file_type);
+        if (row.file_type == "manifest") manifest_rows += 1;
+        if (row.file_type == "data file" && row.base_uri == alternate_uri) {
+            saw_alt_data = true;
+        }
+        assert(row.path != "untracked.txt");
+    }
+    assert(types.count("manifest") == 1);
+    assert(types.count("data file") == 1);
+    assert(types.count("deletion file") == 1);
+    assert(types.count("transaction file") == 1);
+    assert(types.count("index file") == 1);
+    assert(saw_alt_data);
+    assert(manifest_rows > 0);
+
+    {
+        auto ds = lance::Dataset::open(uri);
+        auto min_stream = ds.tracked_files_stream(latest);
+        for (const auto& row : read_tracked_files(min_stream)) {
+            assert(row.version == static_cast<int64_t>(latest));
+        }
+    }
+
+    std::atomic<int> destroyed{0};
+    std::weak_ptr<ProgressLifetime> weak;
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> last_processed{0};
+    std::atomic<uint64_t> last_total{0};
+    {
+        auto lifetime = std::make_shared<ProgressLifetime>(&destroyed);
+        weak = lifetime;
+        lance::ArrowStream progress_stream;
+        {
+            auto ds = lance::Dataset::open(uri);
+            progress_stream = ds.tracked_files_stream(
+                std::nullopt,
+                [lifetime, &calls, &last_processed, &last_total](
+                    uint64_t processed,
+                    std::optional<uint64_t> total) {
+                    calls.fetch_add(1, std::memory_order_seq_cst);
+                    last_processed.store(processed, std::memory_order_seq_cst);
+                    if (total) {
+                        last_total.store(*total, std::memory_order_seq_cst);
+                    }
+                });
+        }
+        assert(read_tracked_files(progress_stream).size() == tracked_rows.size());
+        progress_stream.reset();
+        lifetime.reset();
+    }
+    wait_for_expired(weak);
+    assert(destroyed.load() == 1);
+    assert(calls.load() == manifest_rows);
+    assert(last_processed.load() == manifest_rows);
+    assert(last_total.load() == manifest_rows);
+
+    std::atomic<int> early_destroyed{0};
+    std::weak_ptr<ProgressLifetime> early_weak;
+    {
+        auto lifetime = std::make_shared<ProgressLifetime>(&early_destroyed);
+        early_weak = lifetime;
+        {
+            auto ds = lance::Dataset::open(uri);
+            auto early = ds.tracked_files_stream(
+                std::nullopt,
+                [lifetime](uint64_t, std::optional<uint64_t>) {});
+        }
+        lifetime.reset();
+    }
+    wait_for_expired(early_weak);
+    assert(early_destroyed.load() == 1);
+
+    lance::ArrowStream all;
+    {
+        auto ds = lance::Dataset::open(uri);
+        all = ds.all_files_stream();
+    }
+    auto all_rows = read_all_files(all);
+    assert(!all_rows.empty());
+    bool saw_untracked = false;
+    for (const auto& row : all_rows) {
+        assert(row.base_uri == uri);
+        if (row.path == "untracked.txt") {
+            saw_untracked = true;
+            assert(row.size_bytes == 23);
+            assert(row.last_modified > 0);
+        }
+    }
+    assert(saw_untracked);
     PASS();
 }
 
@@ -3135,10 +3510,11 @@ static void test_fragment_read_operations(const std::string& uri) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 9) {
+    if (argc < 11) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
-                "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri>\n",
+                "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri> "
+                "<config_base_uri> <alternate_base_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -3151,6 +3527,8 @@ int main(int argc, char** argv) {
     std::string fragment_uri(argv[6]);
     std::string fragment_read_uri(argv[7]);
     std::string cleanup_uri(argv[8]);
+    std::string config_base_uri(argv[9]);
+    std::string alternate_base_uri(argv[10]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -3192,6 +3570,9 @@ int main(int argc, char** argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
+    test_config_replacement(config_base_uri);
+    test_base_paths_and_add(config_base_uri, alternate_base_uri);
+    test_file_stream_ownership(config_base_uri, alternate_base_uri);
     test_cleanup_and_lifecycle(cleanup_uri);
     test_dataset_metadata(write_uri);
     test_dataset_field_metadata(fragment_uri);

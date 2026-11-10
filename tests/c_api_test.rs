@@ -6,25 +6,30 @@
 //! These tests call the `extern "C"` functions directly from Rust,
 //! validating the C API contract without needing a C compiler.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use arrow::ffi::from_ffi;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;
+use arrow_array::types::{Int8Type, Int32Type};
 use arrow_array::{
-    Array, BinaryArray, Float32Array, Int32Array, LargeBinaryArray, RecordBatch, StringArray,
-    StructArray, UInt32Array, UInt64Array,
+    Array, BinaryArray, DictionaryArray, Float32Array, Int32Array, Int64Array, LargeBinaryArray,
+    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::dataset::files::TrackedFilesOptions as NativeTrackedFilesOptions;
 use lance::dataset::refs::BranchContents;
 use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
 use lance::dataset::{AutoCleanupParams, WriteParams};
@@ -37,6 +42,8 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur,
     Operator, PhraseQuery,
 };
+
+use common::create_config_base_files_fixture;
 
 /// Helper: create a test dataset in a temp directory and return its path.
 fn create_test_dataset() -> (tempfile::TempDir, String) {
@@ -189,6 +196,206 @@ unsafe extern "C" fn capture_scan_statistics_atomically(
         return;
     }
     captured.calls.fetch_add(1, AtomicOrdering::SeqCst);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TrackedFileRow {
+    version: i64,
+    base_uri: String,
+    path: String,
+    file_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PhysicalFileRow {
+    base_uri: String,
+    path: String,
+    size_bytes: i64,
+    last_modified: i64,
+}
+
+fn dictionary_string_value(array: &dyn Array, row: usize) -> String {
+    if let Some(dictionary) = array.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+        let values = dictionary
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        return values
+            .value(dictionary.keys().value(row) as usize)
+            .to_owned();
+    }
+    if let Some(dictionary) = array.as_any().downcast_ref::<DictionaryArray<Int8Type>>() {
+        let values = dictionary
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        return values
+            .value(dictionary.keys().value(row) as usize)
+            .to_owned();
+    }
+    panic!("expected an Int32 or Int8 string dictionary");
+}
+
+fn tracked_file_rows(batches: &[RecordBatch]) -> Vec<TrackedFileRow> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let versions = batch
+            .column_by_name("version")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let base_uris = batch.column_by_name("base_uri").unwrap();
+        let paths = batch
+            .column_by_name("path")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let file_types = batch.column_by_name("type").unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push(TrackedFileRow {
+                version: versions.value(row),
+                base_uri: dictionary_string_value(base_uris.as_ref(), row),
+                path: paths.value(row).to_owned(),
+                file_type: dictionary_string_value(file_types.as_ref(), row),
+            });
+        }
+    }
+    rows.sort();
+    rows
+}
+
+fn physical_file_rows(batches: &[RecordBatch]) -> Vec<PhysicalFileRow> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let base_uris = batch.column_by_name("base_uri").unwrap();
+        let paths = batch
+            .column_by_name("path")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let sizes = batch
+            .column_by_name("size_bytes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let timestamps = batch
+            .column_by_name("last_modified")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push(PhysicalFileRow {
+                base_uri: dictionary_string_value(base_uris.as_ref(), row),
+                path: paths.value(row).to_owned(),
+                size_bytes: sizes.value(row),
+                last_modified: timestamps.value(row),
+            });
+        }
+    }
+    rows.sort();
+    rows
+}
+
+fn c_stream_batches(mut stream: FFI_ArrowArrayStream) -> (Schema, Vec<RecordBatch>) {
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let schema = reader.schema().as_ref().clone();
+    let batches = reader.map(Result::unwrap).collect();
+    (schema, batches)
+}
+
+#[derive(Default)]
+struct TrackedProgressState {
+    events: Mutex<Vec<(u64, Option<u64>)>>,
+    releases: Mutex<usize>,
+    release_cv: Condvar,
+}
+
+struct TrackedProgressContext {
+    state: Arc<TrackedProgressState>,
+}
+
+unsafe extern "C" fn record_tracked_progress(
+    callback_ctx: *mut c_void,
+    manifests_processed: u64,
+    manifests_total: *const u64,
+) {
+    let context = unsafe { &*callback_ctx.cast::<TrackedProgressContext>() };
+    let total = if manifests_total.is_null() {
+        None
+    } else {
+        Some(unsafe { *manifests_total })
+    };
+    context
+        .state
+        .events
+        .lock()
+        .unwrap()
+        .push((manifests_processed, total));
+}
+
+unsafe extern "C" fn release_tracked_progress(callback_ctx: *mut c_void) {
+    let context = unsafe { Box::from_raw(callback_ctx.cast::<TrackedProgressContext>()) };
+    *context.state.releases.lock().unwrap() += 1;
+    context.state.release_cv.notify_all();
+}
+
+fn wait_for_progress_release(state: &TrackedProgressState) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut releases = state.releases.lock().unwrap();
+    while *releases == 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "progress context was not released");
+        let (guard, timeout) = state.release_cv.wait_timeout(releases, remaining).unwrap();
+        releases = guard;
+        assert!(
+            !timeout.timed_out() || *releases > 0,
+            "progress context was not released before timeout"
+        );
+    }
+    assert_eq!(
+        *releases, 1,
+        "progress context must be released exactly once"
+    );
+}
+
+struct BlockingProgressState {
+    entered: Mutex<bool>,
+    entered_cv: Condvar,
+    allow_return: Mutex<bool>,
+    allow_return_cv: Condvar,
+    releases: Mutex<usize>,
+    release_cv: Condvar,
+}
+
+struct BlockingProgressContext {
+    state: Arc<BlockingProgressState>,
+}
+
+unsafe extern "C" fn block_tracked_progress(
+    callback_ctx: *mut c_void,
+    _manifests_processed: u64,
+    _manifests_total: *const u64,
+) {
+    let context = unsafe { &*callback_ctx.cast::<BlockingProgressContext>() };
+    *context.state.entered.lock().unwrap() = true;
+    context.state.entered_cv.notify_all();
+    let mut allow_return = context.state.allow_return.lock().unwrap();
+    while !*allow_return {
+        allow_return = context.state.allow_return_cv.wait(allow_return).unwrap();
+    }
+}
+
+unsafe extern "C" fn release_blocking_progress(callback_ctx: *mut c_void) {
+    let context = unsafe { Box::from_raw(callback_ctx.cast::<BlockingProgressContext>()) };
+    *context.state.releases.lock().unwrap() += 1;
+    context.state.release_cv.notify_all();
 }
 
 // ─── Index build progress capture fixture ───
@@ -20696,6 +20903,43 @@ fn c_update_config_entries(
     unsafe { lance_dataset_update_config(dataset, keys.as_ptr(), values.as_ptr(), entries.len()) }
 }
 
+fn c_update_config_json(
+    dataset: *mut LanceDataset,
+    entries: &[(CString, Option<CString>)],
+    mode: LanceMetadataUpdateMode,
+) -> String {
+    let keys: Vec<*const c_char> = entries.iter().map(|(key, _)| key.as_ptr()).collect();
+    let values: Vec<*const c_char> = entries
+        .iter()
+        .map(|(_, value)| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+        .collect();
+    let json = unsafe {
+        lance_dataset_update_config_json(
+            dataset,
+            keys.as_ptr(),
+            values.as_ptr(),
+            entries.len(),
+            mode as i32,
+        )
+    };
+    assert!(!json.is_null(), "{}", take_last_error_message());
+    take_c_owned_string(json)
+}
+
+fn take_c_owned_string(ptr: *const c_char) -> String {
+    assert!(!ptr.is_null());
+    let value = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_owned();
+    unsafe { lance_free_string(ptr) };
+    value
+}
+
+fn c_base_paths_json(dataset: *const LanceDataset) -> BTreeMap<u32, serde_json::Value> {
+    let json = unsafe { lance_dataset_base_paths_json(dataset) };
+    assert!(!json.is_null(), "{}", take_last_error_message());
+    let json = take_c_owned_string(json);
+    serde_json::from_str(&json).unwrap()
+}
+
 /// Build a larger batch than the minimal test batch so `max_rows_per_file`
 /// has enough rows to exercise multi-file output.
 fn large_write_batch(n: i32) -> RecordBatch {
@@ -21800,6 +22044,646 @@ fn test_dataset_config_empty_update_matches_native() {
         c_config_entries_for_uri(&c_uri),
         native_config_entries(&native_uri)
     );
+}
+
+#[test]
+fn test_dataset_config_replace_clear_and_json_result() {
+    let fixture = create_config_base_files_fixture();
+    let c_uri = c_str(&fixture.uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let old_dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!old_dataset.is_null());
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let old_version = unsafe { lance_dataset_version(old_dataset) };
+
+    let merge_entries = [
+        (c_str("fixture.key"), Some(c_str("updated"))),
+        (c_str("fixture.remove"), None),
+        (c_str("fixture.empty"), Some(c_str(""))),
+        (c_str("added"), Some(c_str("one"))),
+        (c_str("dup"), Some(c_str("first"))),
+        (c_str("dup"), Some(c_str("second"))),
+        (c_str(""), Some(c_str(""))),
+    ];
+    let merged = c_update_config_json(dataset, &merge_entries, LanceMetadataUpdateMode::Merge);
+    let merged: BTreeMap<String, String> = serde_json::from_str(&merged).unwrap();
+    assert_eq!(
+        merged.get("fixture.key").map(String::as_str),
+        Some("updated")
+    );
+    assert!(!merged.contains_key("fixture.remove"));
+    assert_eq!(merged.get("fixture.empty").map(String::as_str), Some(""));
+    assert_eq!(merged.get("added").map(String::as_str), Some("one"));
+    assert_eq!(merged.get("dup").map(String::as_str), Some("second"));
+    assert_eq!(merged.get("").map(String::as_str), Some(""));
+    let version_after_merge = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(version_after_merge, version_before + 1);
+
+    assert_eq!(unsafe { lance_dataset_version(old_dataset) }, old_version);
+    let old_config: BTreeMap<_, _> = c_config_entries(old_dataset).into_iter().collect();
+    assert_eq!(
+        old_config.get("fixture.key").map(String::as_str),
+        Some("fixture-value")
+    );
+    assert_eq!(
+        old_config.get("fixture.remove").map(String::as_str),
+        Some("present")
+    );
+    unsafe { lance_dataset_close(old_dataset) };
+
+    let historical = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), version_before) };
+    assert!(!historical.is_null(), "{}", take_last_error_message());
+    let historical_config: BTreeMap<_, _> = c_config_entries(historical).into_iter().collect();
+    assert_eq!(
+        historical_config.get("fixture.key").map(String::as_str),
+        Some("fixture-value")
+    );
+    unsafe { lance_dataset_close(historical) };
+
+    let replace_entries = [
+        (c_str("a"), Some(c_str("1"))),
+        (c_str("b"), Some(c_str(""))),
+        (c_str("gone"), None),
+    ];
+    let replaced =
+        c_update_config_json(dataset, &replace_entries, LanceMetadataUpdateMode::Replace);
+    assert_eq!(replaced, r#"{"a":"1","b":""}"#);
+
+    let cleared = c_update_config_json(dataset, &[], LanceMetadataUpdateMode::Replace);
+    assert_eq!(cleared, "{}");
+    assert!(c_config_entries(dataset).is_empty());
+    unsafe { lance_dataset_close(dataset) };
+
+    assert!(c_config_entries_for_uri(&fixture.uri).is_empty());
+
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let version = unsafe { lance_dataset_version(dataset) };
+    let key = c_str("unchanged");
+    let value = c_str("value");
+    let keys = [key.as_ptr()];
+    let values = [value.as_ptr()];
+    let invalid_mode =
+        unsafe { lance_dataset_update_config_json(dataset, keys.as_ptr(), values.as_ptr(), 1, 7) };
+    assert!(invalid_mode.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    let invalid_arrays = unsafe {
+        lance_dataset_update_config_json(
+            dataset,
+            ptr::null(),
+            values.as_ptr(),
+            1,
+            LanceMetadataUpdateMode::Merge as i32,
+        )
+    };
+    assert!(invalid_arrays.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version);
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_dataset_base_paths_and_add_bases_match_native() {
+    let fixture = create_config_base_files_fixture();
+    let c_uri = c_str(&fixture.uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let old_dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!old_dataset.is_null());
+    let old_version = unsafe { lance_dataset_version(old_dataset) };
+    let version_before = unsafe { lance_dataset_version(dataset) };
+
+    let before = c_base_paths_json(dataset);
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[&0]["id"], serde_json::json!(0));
+    assert_eq!(
+        before[&0]["path"],
+        serde_json::json!(fixture.source_uri.as_str())
+    );
+    assert_eq!(before[&0]["name"], serde_json::Value::Null);
+    assert_eq!(before[&0]["is_dataset_root"], serde_json::json!(true));
+    assert_eq!(before[&7]["id"], serde_json::json!(7));
+    assert_eq!(
+        before[&7]["path"],
+        serde_json::json!(fixture.alternate_base_uri.as_str())
+    );
+    assert_eq!(before[&7]["name"], serde_json::json!("alt-root"));
+    assert_eq!(before[&7]["is_dataset_root"], serde_json::json!(false));
+
+    let auto_path = c_str(&format!("{}_added_auto", fixture.uri));
+    let named_path = c_str(&format!("{}_added_named", fixture.uri));
+    let auto_name = c_str("auto");
+    let empty_name = c_str("");
+    let bases = [
+        LanceBasePath {
+            id: 0,
+            path: auto_path.as_ptr(),
+            name: auto_name.as_ptr(),
+            is_dataset_root: false,
+        },
+        LanceBasePath {
+            id: 42,
+            path: named_path.as_ptr(),
+            name: empty_name.as_ptr(),
+            is_dataset_root: true,
+        },
+    ];
+    let transaction_key = c_str("fixture.tx");
+    let transaction_value = c_str("add-bases");
+    let transaction_keys = [transaction_key.as_ptr()];
+    let transaction_values = [transaction_value.as_ptr()];
+    let transaction_properties = LanceTransactionProperties {
+        keys: transaction_keys.as_ptr(),
+        values: transaction_values.as_ptr(),
+        count: 1,
+    };
+    let rc = unsafe {
+        lance_dataset_add_bases(
+            dataset,
+            bases.as_ptr(),
+            bases.len(),
+            &transaction_properties,
+        )
+    };
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let version_after_add = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(version_after_add, version_before + 1);
+    assert_eq!(unsafe { lance_dataset_version(old_dataset) }, old_version);
+    assert_eq!(c_base_paths_json(old_dataset), before);
+
+    let after = c_base_paths_json(dataset);
+    assert_eq!(after[&1]["id"], serde_json::json!(1));
+    assert_eq!(
+        after[&1]["path"],
+        serde_json::json!(auto_path.to_str().unwrap())
+    );
+    assert_eq!(after[&1]["name"], serde_json::json!("auto"));
+    assert_eq!(after[&1]["is_dataset_root"], serde_json::json!(false));
+    assert_eq!(after[&42]["id"], serde_json::json!(42));
+    assert_eq!(
+        after[&42]["path"],
+        serde_json::json!(named_path.to_str().unwrap())
+    );
+    assert_eq!(after[&42]["name"], serde_json::json!(""));
+    assert_eq!(after[&42]["is_dataset_root"], serde_json::json!(true));
+
+    let native = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
+    assert_eq!(native.manifest().base_paths.len(), after.len());
+    for (id, base) in &native.manifest().base_paths {
+        let entry = &after[id];
+        assert_eq!(entry["id"], serde_json::json!(base.id));
+        assert_eq!(entry["path"], serde_json::json!(base.path.as_str()));
+        assert_eq!(
+            entry["is_dataset_root"],
+            serde_json::json!(base.is_dataset_root)
+        );
+        match &base.name {
+            Some(name) => assert_eq!(entry["name"], serde_json::json!(name.as_str())),
+            None => assert_eq!(entry["name"], serde_json::Value::Null),
+        }
+    }
+    let transaction =
+        lance_c::runtime::block_on(native.read_transaction_by_version(version_after_add))
+            .unwrap()
+            .expect("add-bases transaction must exist");
+    assert_eq!(
+        transaction
+            .transaction_properties
+            .as_ref()
+            .and_then(|properties| properties.get("fixture.tx"))
+            .map(String::as_str),
+        Some("add-bases")
+    );
+
+    let none_path = c_str(&format!("{}_none_properties", fixture.uri));
+    let none_name = c_str("none-properties");
+    let none_base = [LanceBasePath {
+        id: 0,
+        path: none_path.as_ptr(),
+        name: none_name.as_ptr(),
+        is_dataset_root: false,
+    }];
+    assert_eq!(
+        unsafe {
+            lance_dataset_add_bases(dataset, none_base.as_ptr(), none_base.len(), ptr::null())
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let empty_path = c_str(&format!("{}_empty_properties", fixture.uri));
+    let empty_properties_name = c_str("empty-properties");
+    let empty_base = [LanceBasePath {
+        id: 0,
+        path: empty_path.as_ptr(),
+        name: empty_properties_name.as_ptr(),
+        is_dataset_root: false,
+    }];
+    let empty_properties = LanceTransactionProperties {
+        keys: ptr::null(),
+        values: ptr::null(),
+        count: 0,
+    };
+    assert_eq!(
+        unsafe {
+            lance_dataset_add_bases(
+                dataset,
+                empty_base.as_ptr(),
+                empty_base.len(),
+                &empty_properties,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let version = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        unsafe { lance_dataset_add_bases(dataset, ptr::null(), 0, ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_add_bases(dataset, ptr::null(), 1, ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    let missing_path = [LanceBasePath {
+        id: 3,
+        path: ptr::null(),
+        name: ptr::null(),
+        is_dataset_root: false,
+    }];
+    assert_eq!(
+        unsafe { lance_dataset_add_bases(dataset, missing_path.as_ptr(), 1, ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+
+    let alternate_path = c_str(&fixture.alternate_base_uri);
+    let duplicate_path_name = c_str("duplicate-path");
+    let duplicate_path_base = [LanceBasePath {
+        id: 0,
+        path: alternate_path.as_ptr(),
+        name: duplicate_path_name.as_ptr(),
+        is_dataset_root: false,
+    }];
+    let rc = unsafe {
+        lance_dataset_add_bases(
+            dataset,
+            duplicate_path_base.as_ptr(),
+            duplicate_path_base.len(),
+            ptr::null(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("Conflict detected"), "{message}");
+
+    let duplicate_name = c_str(&format!("{}_duplicate_name", fixture.uri));
+    let duplicate_name_value = c_str("alt-root");
+    let duplicate_name_base = [LanceBasePath {
+        id: 0,
+        path: duplicate_name.as_ptr(),
+        name: duplicate_name_value.as_ptr(),
+        is_dataset_root: false,
+    }];
+    let rc = unsafe {
+        lance_dataset_add_bases(
+            dataset,
+            duplicate_name_base.as_ptr(),
+            duplicate_name_base.len(),
+            ptr::null(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("Conflict detected"), "{message}");
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version);
+
+    unsafe {
+        lance_dataset_close(old_dataset);
+        lance_dataset_close(dataset);
+    }
+
+    let (_simple_tmp, simple_uri) = create_test_dataset();
+    let simple_uri = c_str(&simple_uri);
+    let simple = unsafe { lance_dataset_open(simple_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!simple.is_null());
+    let unnamed_path = c_str(&format!("{}_unnamed", simple_uri.to_str().unwrap()));
+    let unnamed_base = [LanceBasePath {
+        id: 0,
+        path: unnamed_path.as_ptr(),
+        name: ptr::null(),
+        is_dataset_root: false,
+    }];
+    assert_eq!(
+        unsafe { lance_dataset_add_bases(simple, unnamed_base.as_ptr(), 1, ptr::null()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let unnamed = c_base_paths_json(simple);
+    assert_eq!(unnamed.len(), 1);
+    let unnamed = unnamed.values().next().unwrap();
+    assert_eq!(unnamed["name"], serde_json::Value::Null);
+    assert_eq!(
+        unnamed["path"],
+        serde_json::json!(unnamed_path.to_str().unwrap())
+    );
+    unsafe {
+        lance_dataset_close(simple);
+    }
+}
+
+#[test]
+fn test_dataset_file_enumeration_matches_native_and_owns_progress_context() {
+    let fixture = create_config_base_files_fixture();
+    let native = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
+    let manifest_count = lance_c::runtime::block_on(native.count_versions()).unwrap();
+    let latest_version = native.version().version;
+
+    let c_uri = c_str(&fixture.uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let mut tracked_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_dataset_tracked_files_stream(dataset, ptr::null(), &mut tracked_stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+    let (tracked_schema, tracked_batches) = c_stream_batches(tracked_stream);
+
+    let native_tracked_stream = lance_c::runtime::block_on(native.tracked_files());
+    let native_tracked_schema = native_tracked_stream.schema();
+    let native_tracked_batches =
+        lance_c::runtime::block_on(native_tracked_stream.try_collect::<Vec<_>>()).unwrap();
+    assert_eq!(
+        tracked_schema.as_ref(),
+        native_tracked_schema.as_ref(),
+        "tracked-files schema must be the native schema"
+    );
+    let tracked_rows = tracked_file_rows(&tracked_batches);
+    assert_eq!(
+        tracked_rows,
+        tracked_file_rows(&native_tracked_batches),
+        "tracked-files values must match the native stream"
+    );
+    let file_types: std::collections::BTreeSet<_> = tracked_rows
+        .iter()
+        .map(|row| row.file_type.as_str())
+        .collect();
+    for expected in [
+        "manifest",
+        "data file",
+        "deletion file",
+        "transaction file",
+        "index file",
+    ] {
+        assert!(file_types.contains(expected), "missing {expected}");
+    }
+    assert!(
+        tracked_rows
+            .iter()
+            .any(|row| row.base_uri == fixture.alternate_base_uri && row.file_type == "data file"),
+        "tracked files must resolve the alternate base"
+    );
+    assert!(
+        tracked_rows.iter().all(|row| row.path != "untracked.txt"),
+        "untracked physical files must not appear in tracked-files"
+    );
+
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let options = LanceTrackedFilesOptions {
+        has_min_version: 1,
+        min_version: latest_version,
+        progress: ptr::null(),
+    };
+    let mut min_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_dataset_tracked_files_stream(dataset, &options, &mut min_stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+    let (_, min_batches) = c_stream_batches(min_stream);
+    let min_rows = tracked_file_rows(&min_batches);
+    assert!(!min_rows.is_empty());
+    assert!(
+        min_rows
+            .iter()
+            .all(|row| row.version == latest_version as i64)
+    );
+    let native_min_stream = lance_c::runtime::block_on(native.tracked_files_with_options(
+        NativeTrackedFilesOptions {
+            min_version: Some(latest_version),
+            progress: None,
+        },
+    ));
+    let native_min_batches =
+        lance_c::runtime::block_on(native_min_stream.try_collect::<Vec<_>>()).unwrap();
+    assert_eq!(min_rows, tracked_file_rows(&native_min_batches));
+
+    let all_native = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let mut all_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_dataset_all_files_stream(dataset, &mut all_stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+    let (all_schema, all_batches) = c_stream_batches(all_stream);
+    let native_all_stream = lance_c::runtime::block_on(all_native.all_files());
+    let native_all_schema = native_all_stream.schema();
+    let native_all_batches =
+        lance_c::runtime::block_on(native_all_stream.try_collect::<Vec<_>>()).unwrap();
+    assert_eq!(
+        all_schema.as_ref(),
+        native_all_schema.as_ref(),
+        "all-files schema must be the native schema"
+    );
+    let all_rows = physical_file_rows(&all_batches);
+    assert_eq!(
+        all_rows,
+        physical_file_rows(&native_all_batches),
+        "all-files values must match the native stream"
+    );
+    assert!(
+        all_rows.iter().all(|row| row.base_uri == fixture.uri),
+        "all_files must list only the primary root"
+    );
+    let untracked = all_rows
+        .iter()
+        .find(|row| row.path == "untracked.txt")
+        .expect("untracked physical file must be listed");
+    assert_eq!(untracked.size_bytes, 23);
+    assert!(untracked.last_modified > 0);
+
+    let progress_state = Arc::new(TrackedProgressState::default());
+    let progress_context = Box::new(TrackedProgressContext {
+        state: Arc::clone(&progress_state),
+    });
+    let progress_context = Box::into_raw(progress_context);
+    let progress = LanceTrackedFilesProgress {
+        callback: Some(record_tracked_progress),
+        release: Some(release_tracked_progress),
+        callback_ctx: progress_context.cast(),
+    };
+    let options = LanceTrackedFilesOptions {
+        has_min_version: 0,
+        min_version: 0,
+        progress: &progress,
+    };
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let mut progress_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_dataset_tracked_files_stream(dataset, &options, &mut progress_stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+    let (_, progress_batches) = c_stream_batches(progress_stream);
+    assert_eq!(
+        tracked_file_rows(&progress_batches),
+        tracked_file_rows(&native_tracked_batches)
+    );
+    wait_for_progress_release(&progress_state);
+    let events = progress_state.events.lock().unwrap();
+    assert_eq!(events.len(), manifest_count as usize);
+    assert_eq!(
+        events.last().copied(),
+        Some((manifest_count, Some(manifest_count)))
+    );
+    drop(events);
+
+    let blocking_state = Arc::new(BlockingProgressState {
+        entered: Mutex::new(false),
+        entered_cv: Condvar::new(),
+        allow_return: Mutex::new(false),
+        allow_return_cv: Condvar::new(),
+        releases: Mutex::new(0),
+        release_cv: Condvar::new(),
+    });
+    let blocking_context = Box::new(BlockingProgressContext {
+        state: Arc::clone(&blocking_state),
+    });
+    let blocking_context = Box::into_raw(blocking_context);
+    let blocking_progress = LanceTrackedFilesProgress {
+        callback: Some(block_tracked_progress),
+        release: Some(release_blocking_progress),
+        callback_ctx: blocking_context.cast(),
+    };
+    let options = LanceTrackedFilesOptions {
+        has_min_version: 0,
+        min_version: 0,
+        progress: &blocking_progress,
+    };
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let mut blocking_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_dataset_tracked_files_stream(dataset, &options, &mut blocking_stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut entered = blocking_state.entered.lock().unwrap();
+    while !*entered {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "progress callback did not start");
+        let (guard, timeout) = blocking_state
+            .entered_cv
+            .wait_timeout(entered, remaining)
+            .unwrap();
+        entered = guard;
+        assert!(
+            !timeout.timed_out() || *entered,
+            "progress callback did not start before timeout"
+        );
+    }
+    drop(entered);
+
+    unsafe {
+        if let Some(release) = blocking_stream.release {
+            release(&mut blocking_stream);
+        }
+    }
+    assert_eq!(
+        *blocking_state.releases.lock().unwrap(),
+        0,
+        "stream release must not free an in-flight callback context"
+    );
+    *blocking_state.allow_return.lock().unwrap() = true;
+    blocking_state.allow_return_cv.notify_all();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut releases = blocking_state.releases.lock().unwrap();
+    while *releases == 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "blocked progress context not released"
+        );
+        let (guard, timeout) = blocking_state
+            .release_cv
+            .wait_timeout(releases, remaining)
+            .unwrap();
+        releases = guard;
+        assert!(
+            !timeout.timed_out() || *releases > 0,
+            "blocked progress context not released before timeout"
+        );
+    }
+    assert_eq!(*releases, 1);
+    drop(releases);
+
+    let factory_state = Arc::new(TrackedProgressState::default());
+    let factory_context = Box::new(TrackedProgressContext {
+        state: Arc::clone(&factory_state),
+    });
+    let factory_context = Box::into_raw(factory_context);
+    let factory_progress = LanceTrackedFilesProgress {
+        callback: Some(record_tracked_progress),
+        release: Some(release_tracked_progress),
+        callback_ctx: factory_context.cast(),
+    };
+    let options = LanceTrackedFilesOptions {
+        has_min_version: 0,
+        min_version: 0,
+        progress: &factory_progress,
+    };
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_tracked_files_stream(dataset, &options, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    wait_for_progress_release(&factory_state);
+    unsafe { lance_dataset_close(dataset) };
 }
 
 // ===========================================================================

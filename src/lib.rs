@@ -23,6 +23,7 @@ compile_error!(
 mod add_columns;
 mod alter_columns;
 mod async_dispatcher;
+mod base_paths;
 mod batch;
 mod blob;
 mod cleanup;
@@ -33,6 +34,7 @@ mod dataset;
 mod delete;
 mod drop_columns;
 mod error;
+mod files;
 mod fragment;
 mod fragment_writer;
 mod fts_query;
@@ -57,6 +59,7 @@ mod writer;
 // Re-export all extern "C" symbols so they appear in the cdylib.
 pub use add_columns::*;
 pub use alter_columns::*;
+pub use base_paths::*;
 pub use batch::*;
 pub use blob::*;
 pub use cleanup::*;
@@ -69,6 +72,7 @@ pub use drop_columns::*;
 pub use error::{
     LanceErrorCode, lance_free_string, lance_last_error_code, lance_last_error_message,
 };
+pub use files::*;
 pub use fragment::*;
 pub use fragment_writer::*;
 pub use fts_query::*;

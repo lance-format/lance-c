@@ -19,6 +19,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -90,6 +91,58 @@ public:
         return p;
     }
     explicit operator bool() const { return ptr_ != nullptr; }
+};
+
+/// Move-only owner of an Arrow C Data Interface stream.
+///
+/// The wrapped stream's `release` callback is invoked exactly once, either
+/// explicitly with `reset()` or from the destructor. Moving transfers
+/// ownership and leaves the source empty.
+class ArrowStream {
+    ArrowArrayStream stream_{};
+    bool active_ = false;
+
+public:
+    ArrowStream() noexcept = default;
+
+    explicit ArrowStream(ArrowArrayStream stream) noexcept
+        : stream_(stream), active_(stream.release != nullptr) {}
+
+    ~ArrowStream() { reset(); }
+
+    ArrowStream(const ArrowStream&) = delete;
+    ArrowStream& operator=(const ArrowStream&) = delete;
+
+    ArrowStream(ArrowStream&& other) noexcept
+        : stream_(other.stream_), active_(other.active_) {
+        other.stream_ = {};
+        other.active_ = false;
+    }
+
+    ArrowStream& operator=(ArrowStream&& other) noexcept {
+        if (this != &other) {
+            reset();
+            stream_ = other.stream_;
+            active_ = other.active_;
+            other.stream_ = {};
+            other.active_ = false;
+        }
+        return *this;
+    }
+
+    void reset() noexcept {
+        if (active_ && stream_.release) {
+            stream_.release(&stream_);
+        }
+        stream_ = {};
+        active_ = false;
+    }
+
+    ArrowArrayStream* get() noexcept { return &stream_; }
+    const ArrowArrayStream* get() const noexcept { return &stream_; }
+    ArrowArrayStream* operator->() noexcept { return &stream_; }
+    const ArrowArrayStream* operator->() const noexcept { return &stream_; }
+    explicit operator bool() const noexcept { return active_; }
 };
 
 // ─── Forward Declarations ────────────────────────────────────────────────────
@@ -435,6 +488,33 @@ struct WriteOptions {
 /// One native `Dataset::update_config` entry. `value == std::nullopt` removes
 /// the key; otherwise the value is upserted.
 using ConfigUpdate = std::pair<std::string, std::optional<std::string>>;
+
+/// One native `BasePath` for `Dataset::add_bases`.
+///
+/// `id == 0` requests native allocation. `name == std::nullopt` maps to native
+/// `None`; an engaged empty string is an explicit empty name.
+struct BasePath {
+    uint32_t id = 0;
+    std::string path;
+    std::optional<std::string> name;
+    bool is_dataset_root = false;
+};
+
+/// Optional native transaction properties for one base registration.
+///
+/// `std::nullopt` maps to native `None`; an engaged empty vector maps to
+/// native `Some(empty map)`.
+struct AddBasesOptions {
+    std::optional<std::vector<std::pair<std::string, std::string>>>
+        transaction_properties;
+};
+
+/// Owned progress callback for tracked-file enumeration. `manifests_total` is
+/// unset until native progress has a known total. The callback must not throw;
+/// it runs on a native background task.
+using TrackedFilesProgressCallback = std::function<void(
+    uint64_t manifests_processed,
+    std::optional<uint64_t> manifests_total)>;
 
 // ─── Column alteration ───────────────────────────────────────────────────────
 
@@ -1260,6 +1340,35 @@ class Dataset {
         }
     }
 
+    struct TrackedFilesProgressCapture {
+        TrackedFilesProgressCallback callback;
+    };
+
+    static void tracked_files_progress_trampoline(
+        void* callback_ctx,
+        uint64_t manifests_processed,
+        const uint64_t* manifests_total) noexcept {
+        auto* capture =
+            static_cast<TrackedFilesProgressCapture*>(callback_ctx);
+        std::optional<uint64_t> total;
+        if (manifests_total != nullptr) {
+            total = *manifests_total;
+        }
+        capture->callback(manifests_processed, total);
+    }
+
+    static void tracked_files_progress_release(
+        void* callback_ctx) noexcept {
+        delete static_cast<TrackedFilesProgressCapture*>(callback_ctx);
+    }
+
+    static std::string take_owned_string(const char* raw) {
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
 
     /// Shared write path. `native_options` selects the native-defaults entry
     /// point; otherwise `legacy_params` selects the legacy 20/14 entry point.
@@ -1689,13 +1798,17 @@ public:
         return out;
     }
 
-    /// Apply native merge-style config updates, committing a new manifest.
+    /// Merge or replace config and return the complete updated map as JSON.
     ///
     /// `value == std::nullopt` removes the key; any string value (including an
-    /// empty one) upserts it. The handle points at the new version after a
-    /// successful call. Throws lance::Error on failure (NULL dataset, invalid
-    /// C strings, commit conflict, ...).
-    void update_config(const std::vector<ConfigUpdate>& updates) {
+    /// empty one) upserts it. `MetadataUpdateMode::Replace` with an empty
+    /// vector clears the map. Duplicate keys follow the native builder's
+    /// last-write-wins behavior. The handle points at the new version after a
+    /// successful call; existing snapshots retain their prior view.
+    /// Throws lance::Error on failure.
+    std::string update_config_json(
+        const std::vector<ConfigUpdate>& updates,
+        MetadataUpdateMode mode = MetadataUpdateMode::Merge) {
         std::vector<const char*> keys;
         std::vector<const char*> values;
         keys.reserve(updates.size());
@@ -1704,13 +1817,116 @@ public:
             keys.push_back(key.c_str());
             values.push_back(value ? value->c_str() : nullptr);
         }
-        const char* const* keys_ptr = updates.empty() ? nullptr : keys.data();
-        const char* const* values_ptr =
-            updates.empty() ? nullptr : values.data();
-        if (lance_dataset_update_config(
-                handle_.get(), keys_ptr, values_ptr, updates.size()) != 0) {
+        const char* json = lance_dataset_update_config_json(
+            handle_.get(),
+            updates.empty() ? nullptr : keys.data(),
+            updates.empty() ? nullptr : values.data(),
+            updates.size(),
+            static_cast<LanceMetadataUpdateMode>(mode));
+        return take_owned_string(json);
+    }
+
+    /// Apply native merge-style config updates, committing a new manifest.
+    /// Existing callers keep the original void-returning contract.
+    void update_config(const std::vector<ConfigUpdate>& updates) {
+        (void)update_config_json(updates, MetadataUpdateMode::Merge);
+    }
+
+    /// Snapshot native base paths as JSON keyed by decimal ID. Each value has
+    /// `id`, `name`, `path` and `is_dataset_root`. Throws lance::Error on
+    /// failure.
+    std::string base_paths_json() const {
+        return take_owned_string(lance_dataset_base_paths_json(handle_.get()));
+    }
+
+    /// Register native base paths in one add-bases transaction.
+    ///
+    /// `id == 0` requests native allocation. `name == std::nullopt` maps to
+    /// native `None`; an engaged empty string is preserved. An empty `bases`
+    /// vector is rejected. Transaction properties distinguish native `None`
+    /// (unset optional) from `Some(empty map)` (engaged empty vector). Native
+    /// duplicate/conflict validation and ID allocation remain authoritative.
+    /// Throws lance::Error on failure.
+    void add_bases(
+        const std::vector<BasePath>& bases,
+        const AddBasesOptions& options = {}) {
+        std::vector<LanceBasePath> raw;
+        raw.reserve(bases.size());
+        for (const auto& base : bases) {
+            raw.push_back(LanceBasePath{
+                base.id,
+                base.path.c_str(),
+                base.name ? base.name->c_str() : nullptr,
+                base.is_dataset_root,
+            });
+        }
+
+        std::vector<const char*> property_keys;
+        std::vector<const char*> property_values;
+        LanceTransactionProperties properties{};
+        const LanceTransactionProperties* properties_ptr = nullptr;
+        if (options.transaction_properties) {
+            const auto& entries = *options.transaction_properties;
+            property_keys.reserve(entries.size());
+            property_values.reserve(entries.size());
+            for (const auto& [key, value] : entries) {
+                property_keys.push_back(key.c_str());
+                property_values.push_back(value.c_str());
+            }
+            properties.keys = property_keys.data();
+            properties.values = property_values.data();
+            properties.count = entries.size();
+            properties_ptr = &properties;
+        }
+
+        if (lance_dataset_add_bases(
+                handle_.get(),
+                raw.data(),
+                raw.size(),
+                properties_ptr) != 0) {
             check_error();
         }
+    }
+
+    /// Export the native tracked-files stream. The returned owner releases the
+    /// stream exactly once. The optional progress callback's capture is owned
+    /// until the native emitter releases it, which can follow stream cleanup.
+    ArrowStream tracked_files_stream(
+        std::optional<uint64_t> min_version = std::nullopt,
+        TrackedFilesProgressCallback progress = {}) const {
+        LanceTrackedFilesOptions options{};
+        if (min_version) {
+            options.has_min_version = 1;
+            options.min_version = *min_version;
+        }
+
+        TrackedFilesProgressCapture* capture = nullptr;
+        LanceTrackedFilesProgress raw_progress{};
+        if (progress) {
+            capture = new TrackedFilesProgressCapture{std::move(progress)};
+            raw_progress.callback = tracked_files_progress_trampoline;
+            raw_progress.release = tracked_files_progress_release;
+            raw_progress.callback_ctx = capture;
+            options.progress = &raw_progress;
+        }
+
+        ArrowArrayStream raw{};
+        if (lance_dataset_tracked_files_stream(
+                handle_.get(), &options, &raw) != 0) {
+            check_error();
+        }
+        return ArrowStream(raw);
+    }
+
+    /// Export the native physical-file stream for the primary dataset root.
+    /// The returned owner releases the stream exactly once. Throws
+    /// lance::Error on failure.
+    ArrowStream all_files_stream() const {
+        ArrowArrayStream raw{};
+        if (lance_dataset_all_files_stream(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ArrowStream(raw);
     }
 
     /// Current version details, including native nanosecond timestamp and

@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* SPDX-FileCopyrightText: Copyright The Lance Authors */
 
+#define _POSIX_C_SOURCE 200809L
+
 /**
  * @file test_c_api.c
  * @brief C compilation and functional test for lance.h
@@ -9,13 +11,16 @@
  * lance.h is valid C and the API works end-to-end.
  *
  * Usage: test_c_api <dataset_uri> <write_uri> <blob_uri> <ordering_uri>
- *                    <session_uri> <fragment_uri> <cleanup_uri>
+ *                    <session_uri> <fragment_uri> <fragment_read_uri>
+ *                    <cleanup_uri> <config_base_uri> <alternate_base_uri>
  */
 
 #include "lance/lance.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Arrow C Data Interface flag bits — mirror arrow_schema/arrow_c_data_interface.h
  * so we don't depend on the full Arrow header just to read schema flags. */
@@ -633,6 +638,150 @@ static uint64_t count_stream_rows(struct ArrowArrayStream *stream) {
     }
     if (stream->release) stream->release(stream);
     return total_rows;
+}
+
+static int json_contains(const char *json, const char *needle) {
+    return json != NULL && strstr(json, needle) != NULL;
+}
+
+static int config_has_value(
+    const LanceDataset *dataset,
+    const char *key,
+    const char *value) {
+    LanceDatasetConfig *config = lance_dataset_config(dataset);
+    ASSERT(config != NULL, "config snapshot failed");
+    uint64_t count = lance_dataset_config_count(config);
+    CHECK_OK();
+    int found = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        const char *candidate_key =
+            lance_dataset_config_key_at(config, (size_t)i);
+        const char *candidate_value =
+            lance_dataset_config_value_at(config, (size_t)i);
+        CHECK_OK();
+        if (strcmp(candidate_key, key) == 0) {
+            found = strcmp(candidate_value, value) == 0;
+            break;
+        }
+    }
+    lance_dataset_config_close(config);
+    return found;
+}
+
+static int config_has_key(const LanceDataset *dataset, const char *key) {
+    LanceDatasetConfig *config = lance_dataset_config(dataset);
+    ASSERT(config != NULL, "config snapshot failed");
+    uint64_t count = lance_dataset_config_count(config);
+    CHECK_OK();
+    int found = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        const char *candidate_key =
+            lance_dataset_config_key_at(config, (size_t)i);
+        CHECK_OK();
+        if (strcmp(candidate_key, key) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    lance_dataset_config_close(config);
+    return found;
+}
+
+static int string_array_equals(
+    const struct ArrowArray *array,
+    int64_t row,
+    const char *expected) {
+    const int32_t *offsets = (const int32_t *)array->buffers[1];
+    int32_t begin = offsets[row];
+    int32_t end = offsets[row + 1];
+    size_t length = (size_t)(end - begin);
+    return length == strlen(expected) &&
+           memcmp((const char *)array->buffers[2] + begin, expected, length) == 0;
+}
+
+static int dictionary_string_equals(
+    const struct ArrowArray *array,
+    int64_t row,
+    int key_width,
+    const char *expected) {
+    ASSERT(array->dictionary != NULL, "dictionary values are required");
+    int64_t value_index = 0;
+    if (key_width == 4) {
+        int32_t key = 0;
+        memcpy(&key, (const char *)array->buffers[1] + row * 4, 4);
+        value_index = key;
+    } else {
+        int8_t key = 0;
+        memcpy(&key, (const char *)array->buffers[1] + row, 1);
+        value_index = key;
+    }
+    ASSERT(value_index >= 0, "dictionary key must be non-negative");
+    return string_array_equals(array->dictionary, value_index, expected);
+}
+
+static void wait_released(atomic_int *released) {
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        if (atomic_load_explicit(released, memory_order_seq_cst) > 0) {
+            return;
+        }
+        struct timespec delay = {0, 1000000};
+        nanosleep(&delay, NULL);
+    }
+    ASSERT(0, "progress context release timed out");
+}
+
+typedef struct {
+    atomic_int calls;
+    atomic_int released;
+    atomic_ullong last_processed;
+    atomic_ullong last_total;
+    atomic_int has_total;
+} TrackedProgressCapture;
+
+typedef struct {
+    TrackedProgressCapture *capture;
+} TrackedProgressContext;
+
+static void capture_tracked_progress(
+    void *callback_ctx,
+    uint64_t manifests_processed,
+    const uint64_t *manifests_total) {
+    ASSERT(callback_ctx != NULL, "progress context must be non-NULL");
+    TrackedProgressContext *context =
+        (TrackedProgressContext *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &context->capture->calls, 1, memory_order_seq_cst);
+    atomic_store_explicit(
+        &context->capture->last_processed,
+        manifests_processed,
+        memory_order_seq_cst);
+    if (manifests_total != NULL) {
+        atomic_store_explicit(
+            &context->capture->has_total, 1, memory_order_seq_cst);
+        atomic_store_explicit(
+            &context->capture->last_total,
+            *manifests_total,
+            memory_order_seq_cst);
+    }
+}
+
+static void release_tracked_progress(void *callback_ctx) {
+    ASSERT(callback_ctx != NULL, "progress release context must be non-NULL");
+    TrackedProgressContext *context =
+        (TrackedProgressContext *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &context->capture->released, 1, memory_order_seq_cst);
+    free(context);
+}
+
+static TrackedProgressContext *new_tracked_progress(
+    TrackedProgressCapture *capture) {
+    memset(capture, 0, sizeof(*capture));
+    TrackedProgressContext *context =
+        (TrackedProgressContext *)malloc(sizeof(*context));
+    ASSERT(context != NULL, "allocate progress context");
+    context->capture = capture;
+    return context;
 }
 
 static void test_scanner_projection(const char *uri) {
@@ -1597,6 +1746,488 @@ static void test_data_statistics(const char *write_uri) {
     lance_data_statistics_close(NULL); /* must be a safe no-op */
 
     printf("fields=%llu... OK\n", (unsigned long long)n);
+}
+
+static void test_config_replacement(const char *uri) {
+    printf("  test_config_replacement... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "config replace fixture open failed");
+    LanceDataset *old = lance_dataset_open(uri, NULL, 0);
+    ASSERT(old != NULL, "old config fixture open failed");
+    uint64_t before_version = lance_dataset_version(ds);
+    CHECK_OK();
+    uint64_t old_version = lance_dataset_version(old);
+    CHECK_OK();
+    ASSERT(config_has_value(ds, "fixture.key", "fixture-value"),
+           "fixture config key missing");
+    ASSERT(config_has_value(ds, "fixture.remove", "present"),
+           "fixture removable config missing");
+
+    const char *merge_keys[] = {
+        "fixture.key", "fixture.remove", "fixture.empty",
+        "dup", "dup", "", "added",
+    };
+    const char *merge_values[] = {
+        "updated", NULL, "", "first", "second", "", "one",
+    };
+    const char *merged = lance_dataset_update_config_json(
+        ds,
+        merge_keys,
+        merge_values,
+        sizeof(merge_keys) / sizeof(merge_keys[0]),
+        LANCE_METADATA_UPDATE_MERGE);
+    ASSERT(merged != NULL, "config merge JSON failed");
+    CHECK_OK();
+    ASSERT(json_contains(merged, "\"fixture.key\":\"updated\""),
+           "merge must update existing key");
+    ASSERT(!json_contains(merged, "\"fixture.remove\""),
+           "NULL merge value must remove key");
+    ASSERT(json_contains(merged, "\"fixture.empty\":\"\""),
+           "empty string must remain a value");
+    ASSERT(json_contains(merged, "\"dup\":\"second\""),
+           "duplicate key must follow native last-write-wins");
+    ASSERT(json_contains(merged, "\"\":\"\""),
+           "empty key and value must round trip");
+    lance_free_string(merged);
+
+    ASSERT(lance_dataset_version(ds) == before_version + 1,
+           "merge must commit one version");
+    ASSERT(lance_dataset_version(old) == old_version,
+           "old handle must retain its snapshot");
+    ASSERT(config_has_value(old, "fixture.key", "fixture-value"),
+           "old handle config must remain unchanged");
+
+    LanceDataset *historical = lance_dataset_open(uri, NULL, before_version);
+    ASSERT(historical != NULL, "historical config version open failed");
+    ASSERT(config_has_value(historical, "fixture.key", "fixture-value"),
+           "historical version config must remain unchanged");
+    lance_dataset_close(historical);
+
+    const char *replace_keys[] = {"a", "b", "gone"};
+    const char *replace_values[] = {"1", "", NULL};
+    const char *replaced = lance_dataset_update_config_json(
+        ds,
+        replace_keys,
+        replace_values,
+        3,
+        LANCE_METADATA_UPDATE_REPLACE);
+    ASSERT(replaced != NULL, "config replace JSON failed");
+    CHECK_OK();
+    ASSERT(strcmp(replaced, "{\"a\":\"1\",\"b\":\"\"}") == 0,
+           "replace must return the complete map");
+    lance_free_string(replaced);
+
+    const char *cleared = lance_dataset_update_config_json(
+        ds, NULL, NULL, 0, LANCE_METADATA_UPDATE_REPLACE);
+    ASSERT(cleared != NULL, "config clear JSON failed");
+    CHECK_OK();
+    ASSERT(strcmp(cleared, "{}") == 0, "empty replace must clear config");
+    lance_free_string(cleared);
+    ASSERT(!config_has_key(ds, "fixture.key"), "clear must remove prior keys");
+
+    const char *bad = lance_dataset_update_config_json(
+        ds, replace_keys, replace_values, 3, 7);
+    ASSERT(bad == NULL, "invalid config update mode must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid mode error code");
+    const char *message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    lance_dataset_close(old);
+    lance_dataset_close(ds);
+
+    LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopened config fixture failed");
+    ASSERT(!config_has_key(reopened, "a"), "cleared config must persist");
+    lance_dataset_close(reopened);
+    printf("OK\n");
+}
+
+static void test_base_paths_and_add(const char *uri, const char *alternate_uri) {
+    printf("  test_base_paths_and_add... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "base path fixture open failed");
+    LanceDataset *old = lance_dataset_open(uri, NULL, 0);
+    ASSERT(old != NULL, "old base path fixture open failed");
+    uint64_t old_version = lance_dataset_version(old);
+    CHECK_OK();
+    uint64_t before_version = lance_dataset_version(ds);
+    CHECK_OK();
+
+    const char *json = lance_dataset_base_paths_json(ds);
+    ASSERT(json != NULL, "base path snapshot failed");
+    CHECK_OK();
+    ASSERT(json_contains(json, "\"0\""), "base ID 0 must be listed");
+    ASSERT(json_contains(json, "\"7\""), "alternate base ID must be listed");
+    ASSERT(json_contains(json, alternate_uri),
+           "alternate base path must be listed");
+    ASSERT(json_contains(json, "\"name\":\"alt-root\""),
+           "alternate base name must be listed");
+    ASSERT(json_contains(json, "\"is_dataset_root\":false"),
+           "alternate root flag must be listed");
+    lance_free_string(json);
+
+    char auto_path[4096];
+    char named_path[4096];
+    char none_path[4096];
+    char empty_path[4096];
+    ASSERT(snprintf(auto_path, sizeof(auto_path), "%s_added_auto", uri) <
+               (int)sizeof(auto_path),
+           "auto base path fits");
+    ASSERT(snprintf(named_path, sizeof(named_path), "%s_added_named", uri) <
+               (int)sizeof(named_path),
+           "named base path fits");
+    ASSERT(snprintf(none_path, sizeof(none_path), "%s_none_props", uri) <
+               (int)sizeof(none_path),
+           "none base path fits");
+    ASSERT(snprintf(empty_path, sizeof(empty_path), "%s_empty_props", uri) <
+               (int)sizeof(empty_path),
+           "empty base path fits");
+
+    LanceBasePath bases[] = {
+        {0, auto_path, "auto", false},
+        {42, named_path, "", true},
+    };
+    const char *property_keys[] = {"fixture.tx"};
+    const char *property_values[] = {"add-bases"};
+    LanceTransactionProperties properties = {
+        property_keys, property_values, 1,
+    };
+    int32_t rc = lance_dataset_add_bases(ds, bases, 2, &properties);
+    ASSERT(rc == 0, "base path add failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(ds) == before_version + 1,
+           "base add must commit one version");
+    ASSERT(lance_dataset_version(old) == old_version,
+           "old handle must retain base paths");
+
+    json = lance_dataset_base_paths_json(ds);
+    ASSERT(json != NULL, "post-add base snapshot failed");
+    CHECK_OK();
+    ASSERT(json_contains(json, "\"id\":1"),
+           "zero ID must receive native allocation");
+    ASSERT(json_contains(json, "\"id\":42"),
+           "explicit base ID must persist");
+    ASSERT(json_contains(json, "\"name\":\"auto\""),
+           "optional base name must persist");
+    ASSERT(json_contains(json, "\"name\":\"\""),
+           "explicit empty base name must persist");
+    ASSERT(json_contains(json, auto_path), "allocated base path must persist");
+    ASSERT(json_contains(json, named_path), "named base path must persist");
+    lance_free_string(json);
+
+    LanceBasePath none_bases[] = {{0, none_path, "none-props", false}};
+    ASSERT(lance_dataset_add_bases(ds, none_bases, 1, NULL) == 0,
+           "None transaction properties must be accepted");
+    CHECK_OK();
+
+    LanceBasePath empty_bases[] = {{0, empty_path, "empty-props", false}};
+    LanceTransactionProperties empty_properties = {NULL, NULL, 0};
+    ASSERT(lance_dataset_add_bases(
+               ds, empty_bases, 1, &empty_properties) == 0,
+           "explicit empty transaction properties must be accepted");
+    CHECK_OK();
+
+    uint64_t stable_version = lance_dataset_version(ds);
+    CHECK_OK();
+    ASSERT(lance_dataset_add_bases(ds, NULL, 0, NULL) == -1,
+           "empty base registration must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "empty base registration error code");
+    const char *message = lance_last_error_message();
+    if (message) lance_free_string(message);
+    ASSERT(lance_dataset_add_bases(ds, NULL, 1, NULL) == -1,
+           "NULL base array must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL base array error code");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    LanceBasePath missing_path = {3, NULL, NULL, false};
+    ASSERT(lance_dataset_add_bases(ds, &missing_path, 1, NULL) == -1,
+           "NULL base path must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL base path error code");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    LanceBasePath duplicate_path = {0, alternate_uri, "duplicate-path", false};
+    ASSERT(lance_dataset_add_bases(ds, &duplicate_path, 1, NULL) == -1,
+           "duplicate base path must fail natively");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "duplicate base path error code");
+    message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "Conflict detected") != NULL,
+           "duplicate base path must preserve native error");
+    if (message) lance_free_string(message);
+
+    char duplicate_name_path[4096];
+    ASSERT(snprintf(
+               duplicate_name_path,
+               sizeof(duplicate_name_path),
+               "%s_duplicate_name",
+               uri) < (int)sizeof(duplicate_name_path),
+           "duplicate name path fits");
+    LanceBasePath duplicate_name = {
+        0, duplicate_name_path, "alt-root", false,
+    };
+    ASSERT(lance_dataset_add_bases(ds, &duplicate_name, 1, NULL) == -1,
+           "duplicate base name must fail natively");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "duplicate base name error code");
+    message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "Conflict detected") != NULL,
+           "duplicate base name must preserve native error");
+    if (message) lance_free_string(message);
+    ASSERT(lance_dataset_version(ds) == stable_version,
+           "failed registrations must not commit");
+
+    lance_dataset_close(old);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+static void test_file_enumeration(const char *uri, const char *alternate_uri) {
+    printf("  test_file_enumeration... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "file enumeration fixture open failed");
+    uint64_t latest = lance_dataset_version(ds);
+    CHECK_OK();
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_tracked_files_stream(ds, NULL, &stream) == 0,
+           "tracked-files stream failed");
+    CHECK_OK();
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0,
+           "tracked-files get_schema failed");
+    ASSERT(schema.n_children == 4, "tracked-files field count");
+    ASSERT(strcmp(schema.children[0]->name, "version") == 0,
+           "tracked version field");
+    ASSERT(strcmp(schema.children[1]->name, "base_uri") == 0,
+           "tracked base_uri field");
+    ASSERT(strcmp(schema.children[2]->name, "path") == 0,
+           "tracked path field");
+    ASSERT(strcmp(schema.children[3]->name, "type") == 0,
+           "tracked type field");
+    ASSERT(strcmp(schema.children[0]->format, "l") == 0,
+           "tracked version is Int64");
+    ASSERT(strcmp(schema.children[1]->format, "i") == 0 &&
+               schema.children[1]->dictionary != NULL,
+           "tracked base_uri is Int32 dictionary");
+    ASSERT(strcmp(schema.children[2]->format, "u") == 0,
+           "tracked path is Utf8");
+    ASSERT(strcmp(schema.children[3]->format, "c") == 0 &&
+               schema.children[3]->dictionary != NULL,
+           "tracked type is Int8 dictionary");
+    schema.release(&schema);
+
+    int saw_manifest = 0;
+    int saw_data = 0;
+    int saw_deletion = 0;
+    int saw_transaction = 0;
+    int saw_index = 0;
+    int saw_alt_data = 0;
+    int saw_untracked = 0;
+    int saw_old_version = 0;
+    uint64_t manifest_rows = 0;
+    while (1) {
+        struct ArrowArray batch;
+        memset(&batch, 0, sizeof(batch));
+        ASSERT(stream.get_next(&stream, &batch) == 0,
+               "tracked-files get_next failed");
+        if (batch.release == NULL) break;
+        for (int64_t row = 0; row < batch.length; ++row) {
+            int64_t version = 0;
+            memcpy(
+                &version,
+                (const char *)batch.children[0]->buffers[1] + row * 8,
+                8);
+            if (version < (int64_t)latest) saw_old_version = 1;
+            if (dictionary_string_equals(batch.children[1], row, 4, alternate_uri)) {
+                if (dictionary_string_equals(
+                        batch.children[3], row, 1, "data file")) {
+                    saw_alt_data = 1;
+                }
+            }
+            if (string_array_equals(batch.children[2], row, "untracked.txt")) {
+                saw_untracked = 1;
+            }
+            if (dictionary_string_equals(
+                    batch.children[3], row, 1, "manifest")) {
+                saw_manifest = 1;
+                manifest_rows += 1;
+            } else if (dictionary_string_equals(
+                           batch.children[3], row, 1, "data file")) {
+                saw_data = 1;
+            } else if (dictionary_string_equals(
+                           batch.children[3], row, 1, "deletion file")) {
+                saw_deletion = 1;
+            } else if (dictionary_string_equals(
+                           batch.children[3], row, 1, "transaction file")) {
+                saw_transaction = 1;
+            } else if (dictionary_string_equals(
+                           batch.children[3], row, 1, "index file")) {
+                saw_index = 1;
+            }
+        }
+        batch.release(&batch);
+    }
+    if (stream.release) stream.release(&stream);
+    ASSERT(saw_manifest && saw_data && saw_deletion && saw_transaction &&
+               saw_index,
+           "tracked-files must include every native file type");
+    ASSERT(saw_alt_data, "tracked-files must resolve alternate base data");
+    ASSERT(!saw_untracked, "untracked file must not be tracked");
+    ASSERT(saw_old_version, "unfiltered tracked-files must include history");
+
+    LanceTrackedFilesOptions options = {0};
+    options.has_min_version = 1;
+    options.min_version = latest;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_tracked_files_stream(ds, &options, &stream) == 0,
+           "tracked-files min-version stream failed");
+    CHECK_OK();
+    uint64_t min_rows = count_stream_rows(&stream);
+    ASSERT(min_rows > 0, "min-version stream must include latest manifest");
+
+    TrackedProgressCapture capture;
+    TrackedProgressContext *context = new_tracked_progress(&capture);
+    LanceTrackedFilesProgress progress = {
+        capture_tracked_progress,
+        release_tracked_progress,
+        context,
+    };
+    memset(&options, 0, sizeof(options));
+    options.progress = &progress;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_tracked_files_stream(ds, &options, &stream) == 0,
+           "tracked-files progress stream failed");
+    CHECK_OK();
+    lance_dataset_close(ds);
+    uint64_t all_tracked_rows = count_stream_rows(&stream);
+    ASSERT(all_tracked_rows > 0, "stream must outlive dataset close");
+    wait_released(&capture.released);
+    ASSERT(atomic_load(&capture.released) == 1,
+           "progress context must be released once");
+    ASSERT(manifest_rows > 0, "tracked output must include manifests");
+    ASSERT(atomic_load(&capture.calls) == (int)manifest_rows,
+           "each manifest must report progress");
+    ASSERT(atomic_load(&capture.last_processed) == manifest_rows,
+           "last progress must process every manifest");
+    ASSERT(atomic_load(&capture.has_total) == 1 &&
+               atomic_load(&capture.last_total) == manifest_rows,
+           "final progress must report the native total");
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "early-close fixture reopen failed");
+    TrackedProgressCapture early_capture;
+    TrackedProgressContext *early_context = new_tracked_progress(&early_capture);
+    LanceTrackedFilesProgress early_progress = {
+        capture_tracked_progress,
+        release_tracked_progress,
+        early_context,
+    };
+    memset(&options, 0, sizeof(options));
+    options.progress = &early_progress;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_tracked_files_stream(ds, &options, &stream) == 0,
+           "early-close progress stream failed");
+    CHECK_OK();
+    if (stream.release) stream.release(&stream);
+    wait_released(&early_capture.released);
+    ASSERT(atomic_load(&early_capture.released) == 1,
+           "early close must release progress context once");
+
+    TrackedProgressCapture factory_capture;
+    TrackedProgressContext *factory_context =
+        new_tracked_progress(&factory_capture);
+    LanceTrackedFilesProgress factory_progress = {
+        capture_tracked_progress,
+        release_tracked_progress,
+        factory_context,
+    };
+    memset(&options, 0, sizeof(options));
+    options.progress = &factory_progress;
+    ASSERT(lance_dataset_tracked_files_stream(ds, &options, NULL) == -1,
+           "NULL output must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL output error code");
+    const char *message = lance_last_error_message();
+    if (message) lance_free_string(message);
+    wait_released(&factory_capture.released);
+    ASSERT(atomic_load(&factory_capture.released) == 1,
+           "factory error must release progress context once");
+    lance_dataset_close(ds);
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "all-files fixture reopen failed");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_all_files_stream(ds, &stream) == 0,
+           "all-files stream failed");
+    CHECK_OK();
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0,
+           "all-files get_schema failed");
+    ASSERT(schema.n_children == 4, "all-files field count");
+    ASSERT(strcmp(schema.children[0]->name, "base_uri") == 0 &&
+               schema.children[0]->dictionary != NULL,
+           "all-files base_uri schema");
+    ASSERT(strcmp(schema.children[1]->name, "path") == 0,
+           "all-files path schema");
+    ASSERT(strcmp(schema.children[2]->name, "size_bytes") == 0 &&
+               strcmp(schema.children[2]->format, "l") == 0,
+           "all-files size schema");
+    ASSERT(strcmp(schema.children[3]->name, "last_modified") == 0 &&
+               strncmp(schema.children[3]->format, "tsu:", 4) == 0,
+           "all-files timestamp schema");
+    schema.release(&schema);
+    lance_dataset_close(ds);
+
+    int saw_untracked_physical = 0;
+    uint64_t physical_rows = 0;
+    while (1) {
+        struct ArrowArray batch;
+        memset(&batch, 0, sizeof(batch));
+        ASSERT(stream.get_next(&stream, &batch) == 0,
+               "all-files get_next failed");
+        if (batch.release == NULL) break;
+        for (int64_t row = 0; row < batch.length; ++row) {
+            physical_rows += 1;
+            ASSERT(dictionary_string_equals(
+                       batch.children[0], row, 4, uri),
+                   "all-files must use the primary base URI");
+            if (string_array_equals(batch.children[1], row, "untracked.txt")) {
+                int64_t size = 0;
+                int64_t modified = 0;
+                memcpy(
+                    &size,
+                    (const char *)batch.children[2]->buffers[1] + row * 8,
+                    8);
+                memcpy(
+                    &modified,
+                    (const char *)batch.children[3]->buffers[1] + row * 8,
+                    8);
+                ASSERT(size == 23, "untracked file size");
+                ASSERT(modified > 0, "physical timestamp must be populated");
+                saw_untracked_physical = 1;
+            }
+        }
+        batch.release(&batch);
+    }
+    if (stream.release) stream.release(&stream);
+    ASSERT(physical_rows > 0, "all-files must list physical files");
+    ASSERT(saw_untracked_physical,
+           "all-files must include controlled untracked file");
+    printf("tracked=%llu, physical=%llu... OK\n",
+           (unsigned long long)all_tracked_rows,
+           (unsigned long long)physical_rows);
 }
 
 /* Exercises native manual cleanup, explanation snapshots, validation and
@@ -3868,10 +4499,13 @@ static void test_fragment_read_operations(const char *uri) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 9) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    if (argc < 11) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
-                "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri>\n",
+                "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri> "
+                "<config_base_uri> <alternate_base_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -3884,6 +4518,8 @@ int main(int argc, char **argv) {
     const char *fragment_uri = argv[6];
     const char *fragment_read_uri = argv[7];
     const char *cleanup_uri = argv[8];
+    const char *config_base_uri = argv[9];
+    const char *alternate_base_uri = argv[10];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
@@ -3915,6 +4551,9 @@ int main(int argc, char **argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
+    test_config_replacement(config_base_uri);
+    test_base_paths_and_add(config_base_uri, alternate_base_uri);
+    test_file_enumeration(config_base_uri, alternate_base_uri);
     test_cleanup_and_lifecycle(cleanup_uri);
     test_dataset_metadata(write_uri);
     test_dataset_field_metadata(fragment_uri);

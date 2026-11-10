@@ -12,6 +12,8 @@
 //! This validates that lance.h and lance.hpp are valid C/C++ and that
 //! the API works end-to-end from a real C/C++ caller.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -25,6 +27,7 @@ use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
 
+use common::create_config_base_files_fixture;
 use std::ffi::CString;
 
 /// Build the lance-c cdylib and return the path to the shared library and include dir.
@@ -593,8 +596,9 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
 
 /// Run a compiled test binary with the source dataset URI, a destination URI
 /// for the write test, the Blob v2 and ordering datasets, the indexed session
-/// cache dataset, separate non-stable/stable fragment-deletion datasets and the
-/// cleanup fixture. The destination path must not pre-exist.
+/// cache dataset, separate non-stable/stable fragment-deletion datasets, the
+/// cleanup fixture and the config/base/file fixture. The destination path must
+/// not pre-exist.
 #[allow(clippy::too_many_arguments)]
 fn run_test_binary(
     binary: &Path,
@@ -606,6 +610,7 @@ fn run_test_binary(
     fragment_uri: &str,
     fragment_read_uri: &str,
     cleanup_uri: &str,
+    config_base_files: &common::ConfigBaseFilesFixture,
 ) {
     let output = Command::new(binary)
         .arg(dataset_uri)
@@ -616,6 +621,8 @@ fn run_test_binary(
         .arg(fragment_uri)
         .arg(fragment_read_uri)
         .arg(cleanup_uri)
+        .arg(&config_base_files.uri)
+        .arg(&config_base_files.alternate_base_uri)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -673,6 +680,7 @@ fn test_c_compilation_and_execution() {
     let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk(false);
     let (_fragment_read_tmp, fragment_read_uri) = create_fragment_dataset_on_disk(true);
     let (_cleanup_tmp, cleanup_uri) = create_cleanup_dataset_on_disk();
+    let config_base_files = create_config_base_files_fixture();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -696,6 +704,7 @@ fn test_c_compilation_and_execution() {
         &fragment_uri,
         &fragment_read_uri,
         &cleanup_uri,
+        &config_base_files,
     );
 }
 
@@ -716,6 +725,7 @@ fn test_cpp_compilation_and_execution() {
     let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk(false);
     let (_fragment_read_tmp, fragment_read_uri) = create_fragment_dataset_on_disk(true);
     let (_cleanup_tmp, cleanup_uri) = create_cleanup_dataset_on_disk();
+    let config_base_files = create_config_base_files_fixture();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -739,6 +749,7 @@ fn test_cpp_compilation_and_execution() {
         &fragment_uri,
         &fragment_read_uri,
         &cleanup_uri,
+        &config_base_files,
     );
 }
 

@@ -33,7 +33,7 @@ pub enum LanceMetadataUpdateMode {
 }
 
 impl LanceMetadataUpdateMode {
-    fn from_raw(raw: i32) -> Result<Self> {
+    pub(crate) fn from_raw(raw: i32) -> Result<Self> {
         match raw {
             0 => Ok(Self::Merge),
             1 => Ok(Self::Replace),
@@ -445,7 +445,7 @@ unsafe fn parse_field_reference(
     }
 }
 
-unsafe fn parse_metadata_entries(
+pub(crate) unsafe fn parse_metadata_entries(
     keys: *const *const c_char,
     values: *const *const c_char,
     count: usize,
@@ -478,7 +478,7 @@ unsafe fn parse_metadata_entries(
     Ok(entries)
 }
 
-fn owned_c_string(value: String, context: &str) -> Result<*const c_char> {
+pub(crate) fn owned_c_string(value: String, context: &str) -> Result<*const c_char> {
     CString::new(value)
         .map(|value| value.into_raw() as *const c_char)
         .map_err(|_| {
@@ -486,7 +486,7 @@ fn owned_c_string(value: String, context: &str) -> Result<*const c_char> {
         })
 }
 
-fn serialize_metadata_map(metadata: &HashMap<String, String>) -> Result<*const c_char> {
+pub(crate) fn serialize_metadata_map(metadata: &HashMap<String, String>) -> Result<*const c_char> {
     let sorted = metadata
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))

@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Dataset config C API: read the manifest config map and apply the native
-//! merge-style upsert/removal operation.
+//! Dataset config C API: read the manifest config map and apply native
+//! merge/replace operations.
 
+use std::collections::HashMap;
 use std::ffi::{CString, c_char};
+use std::future::IntoFuture;
 
-use lance::dataset::transaction::UpdateMapEntry;
 use lance_core::Result;
 
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
-use crate::helpers;
+use crate::metadata::{LanceMetadataUpdateMode, parse_metadata_entries, serialize_metadata_map};
 use crate::runtime::block_on;
 
 /// Opaque snapshot of a dataset's manifest config map.
@@ -174,38 +175,66 @@ unsafe fn update_config_inner(
             "dataset must not be NULL".into(),
         ));
     }
-    if num_entries > 0 && (keys.is_null() || values.is_null()) {
+    let entries = unsafe { parse_metadata_entries(keys, values, num_entries) }?;
+    apply_config_update(dataset, entries, LanceMetadataUpdateMode::Merge)?;
+    Ok(0)
+}
+
+/// Merge or replace dataset config and return the complete updated map as a
+/// JSON object.
+///
+/// Input and ownership rules match `lance_dataset_update_metadata_json`.
+/// `LANCE_METADATA_UPDATE_REPLACE` with `count == 0` clears the config map.
+/// The native builder commits one transaction and returns its complete map.
+///
+/// Caller must free the returned JSON string with `lance_free_string()`.
+/// Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_update_config_json(
+    dataset: *mut LanceDataset,
+    keys: *const *const c_char,
+    values: *const *const c_char,
+    count: usize,
+    mode: i32,
+) -> *const c_char {
+    ffi_try!(
+        unsafe { update_config_json_inner(dataset, keys, values, count, mode) },
+        null
+    )
+}
+
+unsafe fn update_config_json_inner(
+    dataset: *mut LanceDataset,
+    keys: *const *const c_char,
+    values: *const *const c_char,
+    count: usize,
+    mode: i32,
+) -> Result<*const c_char> {
+    if dataset.is_null() {
         return Err(lance_core::Error::invalid_input_source(
-            "keys and values must not be NULL when num_entries > 0".into(),
+            "dataset must not be NULL".into(),
         ));
     }
+    let mode = LanceMetadataUpdateMode::from_raw(mode)?;
+    let entries = unsafe { parse_metadata_entries(keys, values, count) }?;
+    let updated = apply_config_update(dataset, entries, mode)?;
+    serialize_metadata_map(&updated)
+}
 
-    let mut entries = Vec::with_capacity(num_entries);
-    for i in 0..num_entries {
-        // SAFETY: the caller guarantees both arrays have at least
-        // `num_entries` entries when `num_entries > 0`.
-        let key_ptr = unsafe { *keys.add(i) };
-        let key = unsafe { helpers::parse_c_string(key_ptr)? }.ok_or_else(|| {
-            lance_core::Error::invalid_input_source(format!("keys[{i}] must not be NULL").into())
-        })?;
-        // SAFETY: see the guarantee on `keys` above; each value entry may be
-        // NULL to request removal.
-        let value_ptr = unsafe { *values.add(i) };
-        let value = unsafe { helpers::parse_c_string(value_ptr)? };
-        entries.push(UpdateMapEntry {
-            key: key.to_string(),
-            value: value.map(str::to_owned),
-        });
-    }
-
-    let ds = unsafe { &*dataset };
-    ds.with_mut(|d| {
-        block_on(async move {
-            d.update_config(entries).await?;
-            Ok::<(), lance_core::Error>(())
-        })
-    })?;
-    Ok(0)
+fn apply_config_update(
+    dataset: *mut LanceDataset,
+    entries: Vec<(String, Option<String>)>,
+    mode: LanceMetadataUpdateMode,
+) -> Result<HashMap<String, String>> {
+    let dataset = unsafe { &*dataset };
+    dataset.with_mut(|dataset: &mut lance::Dataset| {
+        let builder = dataset.update_config(entries);
+        let builder = match mode {
+            LanceMetadataUpdateMode::Merge => builder,
+            LanceMetadataUpdateMode::Replace => builder.replace(),
+        };
+        block_on(builder.into_future())
+    })
 }
 
 /// Borrow the entry at `index` from the snapshot.
