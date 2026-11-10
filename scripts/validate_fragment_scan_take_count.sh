@@ -12,6 +12,7 @@ cd "$ROOT"
 mkdir -p "$EVIDENCE_DIR/logs"
 : >"$EVIDENCE_DIR/commands.log"
 : >"$EVIDENCE_DIR/runner.log"
+rm -f "$EVIDENCE_DIR/status" "$EVIDENCE_DIR/summary"
 exec > >(tee -a "$EVIDENCE_DIR/runner.log") 2>&1
 
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -134,12 +135,12 @@ rg -q 'All C tests passed!' "$EVIDENCE_DIR/logs/21-c-cpp-consumers.log" \
     || fail "C consumer completion marker is missing"
 rg -q 'All C++ tests passed!' "$EVIDENCE_DIR/logs/21-c-cpp-consumers.log" \
     || fail "C++ consumer completion marker is missing"
-fragment_markers="$(rg -o 'test_fragment_read_operations\\.\\.\\. OK' "$EVIDENCE_DIR/logs/21-c-cpp-consumers.log" | wc -l)"
+fragment_markers="$(rg -o 'test_fragment_read_operations\.\.\. OK' "$EVIDENCE_DIR/logs/21-c-cpp-consumers.log" | wc -l)"
 [[ "$fragment_markers" -ge 2 ]] \
     || fail "C and C++ fragment read probes did not both execute"
 
-rust_tests="$(rg -c '^test .* \\.\\.\\. ok$' "$EVIDENCE_DIR/logs/20-full-rust.log")"
-ignored_tests="$(rg -c '^test .* \\.\\.\\. ok$' "$EVIDENCE_DIR/logs/21-c-cpp-consumers.log")"
+rust_tests="$(rg -c '^test .* \.\.\. ok$' "$EVIDENCE_DIR/logs/20-full-rust.log")"
+ignored_tests="$(rg -c '^test .* \.\.\. ok$' "$EVIDENCE_DIR/logs/21-c-cpp-consumers.log")"
 {
     printf 'product_commit=%s\n' "$PRODUCT_COMMIT"
     printf 'validation_commit=%s\n' "$(git rev-parse HEAD)"
