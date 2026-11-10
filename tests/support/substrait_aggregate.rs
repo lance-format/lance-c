@@ -9,8 +9,8 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use datafusion_substrait::substrait::proto::{
-    AggregateFunction, AggregateRel, Expression, FetchRel, FunctionArgument, Plan, PlanRel, Rel,
-    RelRoot, Version,
+    AggregateFunction, AggregateRel, Expression, FunctionArgument, Plan, PlanRel, Rel, RelRoot,
+    Version,
     aggregate_function::AggregationInvocation,
     aggregate_rel::{Grouping, Measure},
     expression::{
@@ -182,7 +182,7 @@ pub fn non_aggregate_plan() -> Vec<u8> {
             rel_type: Some(
                 datafusion_substrait::substrait::proto::plan_rel::RelType::Root(RelRoot {
                     input: Some(Rel {
-                        rel_type: Some(RelType::Fetch(Box::new(FetchRel::default()))),
+                        rel_type: Some(RelType::Fetch(Box::default())),
                     }),
                     names: vec![],
                 }),
