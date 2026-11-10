@@ -871,7 +871,7 @@ fn fast_search_uses_only_indexed_fragments_and_matches_direct_native_queries() {
                 row_ids: None,
                 fragment_ids: Some(UNINDEXED_FRAGMENT),
             },
-            vec![64],
+            vec![64, 200, 201],
         ),
         (
             "unindexed-fragment-fast",
