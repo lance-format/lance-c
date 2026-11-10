@@ -303,9 +303,7 @@ static void test_scanner_projection_filter(const std::string& uri) {
         ArrowArrayStream stream;
         memset(&stream, 0, sizeof(stream));
         scanner.to_arrow_stream(&stream);
-        assert_scan_schema(stream, {
-            {"id", "i"}, {"name", "u"}, {"embedding", nullptr},
-        });
+        assert_scan_schema(stream, {});
         assert(drain_scan_rows(stream) == ds.count_rows());
     }
 
@@ -328,7 +326,7 @@ static void test_scanner_projection_filter(const std::string& uri) {
     }
 
     {
-        auto scanner = ds.scan({}, "id = 13");
+        auto scanner = ds.scan(std::nullopt, "id = 13");
         ArrowArrayStream stream;
         memset(&stream, 0, sizeof(stream));
         scanner.to_arrow_stream(&stream);
@@ -339,8 +337,16 @@ static void test_scanner_projection_filter(const std::string& uri) {
     }
 
     {
-        auto scanner =
-            ds.scan({"id"}, "NOT A VALID >>> FILTER ???");
+        auto scanner = ds.scan({}, "id = 13");
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        assert_scan_schema(stream, {});
+        assert(drain_scan_rows(stream) == 1);
+    }
+
+    for (const std::string filter : {"", "NOT A VALID >>> FILTER ???"}) {
+        auto scanner = ds.scan({"id"}, filter);
         ArrowArrayStream stream;
         memset(&stream, 0, sizeof(stream));
         bool caught = false;

@@ -891,12 +891,16 @@ public:
     /// Create a Scanner builder for this dataset.
     Scanner scan() const;
 
-    /// Create a Scanner builder with a column projection and primary SQL
-    /// filter. An empty `columns` selects every column, and an empty `filter`
-    /// disables filtering; both are forwarded to the C API as NULL. Invalid
+    /// Create a Scanner builder with an explicit column projection and optional
+    /// primary SQL filter. An empty projection selects zero columns. A supplied
+    /// filter is forwarded verbatim, including an empty expression. Invalid
     /// projections or filters are reported when the scanner is materialized.
     Scanner scan(const std::vector<std::string>& columns,
-                 const std::string& filter = "") const;
+                 const std::optional<std::string>& filter = std::nullopt) const;
+
+    /// Create a Scanner builder for all columns, with an optional SQL filter.
+    Scanner scan(std::nullopt_t,
+                 const std::optional<std::string>& filter = std::nullopt) const;
 
     /// Compatibility wrapper for an OR Match query.
     [[deprecated("Use prepare_fts_match_query() to select the Match operator")]]
@@ -1804,11 +1808,11 @@ public:
 };
 
 inline Scanner Dataset::scan() const {
-    return scan({}, "");
+    return scan(std::nullopt);
 }
 
 inline Scanner Dataset::scan(const std::vector<std::string>& columns,
-                             const std::string& filter) const {
+                             const std::optional<std::string>& filter) const {
     std::vector<const char*> col_ptrs;
     col_ptrs.reserve(columns.size() + 1);
     for (const auto& column : columns) col_ptrs.push_back(column.c_str());
@@ -1816,8 +1820,16 @@ inline Scanner Dataset::scan(const std::vector<std::string>& columns,
 
     auto* s = lance_scanner_new(
         handle_.get(),
-        columns.empty() ? nullptr : col_ptrs.data(),
-        filter.empty() ? nullptr : filter.c_str());
+        col_ptrs.data(),
+        filter ? filter->c_str() : nullptr);
+    if (!s) check_error();
+    return Scanner(s);
+}
+
+inline Scanner Dataset::scan(std::nullopt_t,
+                             const std::optional<std::string>& filter) const {
+    auto* s = lance_scanner_new(handle_.get(), nullptr,
+                               filter ? filter->c_str() : nullptr);
     if (!s) check_error();
     return Scanner(s);
 }
