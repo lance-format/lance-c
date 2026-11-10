@@ -723,7 +723,9 @@ fn scanner_introspection_schema(scanner: *const LanceScanner) -> Schema {
 
 fn take_scanner_string(raw: *const c_char) -> String {
     assert!(!raw.is_null(), "{}", take_last_error_message());
-    let value = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+    let value = unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
     unsafe { lance_free_string(raw) };
     value
 }
@@ -14975,11 +14977,7 @@ fn test_prepared_fts_expression_projection_and_scoring_control() {
         );
         assert_eq!(
             unsafe {
-                lance_scanner_set_row_addr_allowlist(
-                    scanner,
-                    allow_ids.as_ptr(),
-                    allow_ids.len(),
-                )
+                lance_scanner_set_row_addr_allowlist(scanner, allow_ids.as_ptr(), allow_ids.len())
             },
             0,
             "{}",
@@ -14992,9 +14990,8 @@ fn test_prepared_fts_expression_projection_and_scoring_control() {
         );
         let count = unsafe { lance_scanner_count_rows(scanner) };
         assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
-        let analyze_count = take_scanner_string(unsafe {
-            lance_scanner_analyze_count_plan(scanner)
-        });
+        let analyze_count =
+            take_scanner_string(unsafe { lance_scanner_analyze_count_plan(scanner) });
         assert!(analyze_count.contains("AggregateExec"), "{analyze_count}");
         assert_eq!(
             unsafe { lance_scanner_set_batch_size(scanner, 2) },
@@ -15233,17 +15230,14 @@ fn test_prepared_fts_index_only_empty_segment_returns_empty_shard() {
                 schema_signature(&scanner_introspection_schema(scanner)),
                 schema_signature(&introspected_schema)
             );
-            let explain = take_scanner_string(unsafe {
-                lance_scanner_explain_plan(scanner, true)
-            });
+            let explain = take_scanner_string(unsafe { lance_scanner_explain_plan(scanner, true) });
             assert!(!explain.is_empty());
             assert!(explain.contains("EmptyExec"), "{explain}");
             assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
             assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
             assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
-            let analyze_count = take_scanner_string(unsafe {
-                lance_scanner_analyze_count_plan(scanner)
-            });
+            let analyze_count =
+                take_scanner_string(unsafe { lance_scanner_analyze_count_plan(scanner) });
             assert!(analyze_count.contains("AggregateExec"), "{analyze_count}");
             assert_eq!(
                 unsafe { lance_scanner_set_batch_size(scanner, 2) },
@@ -21490,13 +21484,15 @@ fn test_scalar_segment_introspection_and_count_use_configured_scope() {
         assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, count);
         assert_eq!(captured.calls, 0, "count must not invoke stream statistics");
 
-        let analyze_count = take_scanner_string(unsafe {
-            lance_scanner_analyze_count_plan(scanner)
-        });
+        let analyze_count =
+            take_scanner_string(unsafe { lance_scanner_analyze_count_plan(scanner) });
         assert!(analyze_count.contains("AggregateExec"), "{analyze_count}");
         let analyze = take_scanner_string(unsafe { lance_scanner_analyze_plan(scanner) });
         assert!(!analyze.is_empty());
-        assert_eq!(captured.calls, 0, "analyze must not invoke stream statistics");
+        assert_eq!(
+            captured.calls, 0,
+            "analyze must not invoke stream statistics"
+        );
 
         assert_eq!(
             unsafe { lance_scanner_set_batch_size(scanner, 1) },

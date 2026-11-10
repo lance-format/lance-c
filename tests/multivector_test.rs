@@ -679,10 +679,7 @@ fn multivector_introspection_and_count_follow_the_rewritten_plan() {
         );
 
         let (stream_schema, batches) = collect_projected_batches(scanner);
-        assert_eq!(
-            schema_signature(&stream_schema),
-            schema_signature(&schema)
-        );
+        assert_eq!(schema_signature(&stream_schema), schema_signature(&schema));
         assert_eq!(
             count,
             batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64
