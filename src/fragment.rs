@@ -128,12 +128,14 @@ unsafe fn metadata_json_inner(fragment: *const LanceFragment) -> Result<*const c
             fragment.inner.id()
         ))
     })?;
-    CString::new(json).map(CString::into_raw).map_err(|error| {
-        Error::internal(format!(
-            "fragment {} metadata JSON contains an embedded NUL: {error}",
-            fragment.inner.id()
-        ))
-    })
+    CString::new(json)
+        .map(|value| value.into_raw() as *const c_char)
+        .map_err(|error| {
+            Error::internal(format!(
+                "fragment {} metadata JSON contains an embedded NUL: {error}",
+                fragment.inner.id()
+            ))
+        })
 }
 
 /// Export the fragment's logical dataset schema via Arrow C Data Interface.
