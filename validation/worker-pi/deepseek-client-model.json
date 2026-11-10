@@ -1,0 +1,26 @@
+{
+  "contextWindow": 1000000,
+  "cost": {
+    "cacheRead": 0.003,
+    "cacheWrite": 0,
+    "input": 0.15,
+    "output": 0.6
+  },
+  "id": "group/deepseek",
+  "input": [
+    "text",
+    "image"
+  ],
+  "maxTokens": 384000,
+  "name": "DeepSeek V4.1 Flash \u00b7 routing group",
+  "reasoning": true,
+  "thinkingLevelMap": {
+    "high": "high",
+    "low": "low",
+    "max": "max",
+    "medium": null,
+    "minimal": null,
+    "off": null,
+    "xhigh": null
+  }
+}
