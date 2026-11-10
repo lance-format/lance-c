@@ -29,6 +29,8 @@ lance-file = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b
 lance-index = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-io = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-linalg = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+# Direct to name `NullableIndexExprResult` in the segment-scoped
+# `ScalarIndexLoader` adapter; already in the graph transitively via lance-index.
 lance-select = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-table = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-datafusion = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
