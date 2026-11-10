@@ -941,6 +941,139 @@ static void test_dataset_write_roundtrip(const char *src_uri, const char *dst_ur
     printf("OK\n");
 }
 
+/* Exercises the native write-options path and generic config read/update from
+ * a real C caller. The destination was created by the legacy writer, so its
+ * 20-version / 14-day policy must survive the append and be visible here. */
+static void test_write_options_and_config(const char *src_uri,
+                                          const char *write_uri) {
+    printf("  test_write_options_and_config... ");
+
+    LanceDataset *src = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(src != NULL, "open source failed");
+    LanceScanner *scanner = lance_scanner_new(src, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    int32_t rc = lance_scanner_to_arrow_stream(scanner, &stream);
+    ASSERT(rc == 0, "to_arrow_stream failed");
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    rc = stream.get_schema(&stream, &schema);
+    ASSERT(rc == 0, "get_schema from stream failed");
+
+    LanceAutoCleanupParams cleanup = {1, 0, 0};
+    LanceWriteOptions options;
+    memset(&options, 0, sizeof(options));
+    options.auto_cleanup = &cleanup;
+    options.skip_auto_cleanup = true;
+
+    LanceDataset *ds = NULL;
+    rc = lance_dataset_write_with_options(
+        write_uri, &schema, &stream, LANCE_WRITE_APPEND, &options, NULL, &ds);
+    if (schema.release) schema.release(&schema);
+    ASSERT(rc == 0, "lance_dataset_write_with_options append failed");
+    CHECK_OK();
+    ASSERT(ds != NULL, "out_dataset should be populated");
+    ASSERT(lance_dataset_count_rows(ds) > 0, "append should add rows");
+    CHECK_OK();
+
+    LanceDatasetConfig *config = lance_dataset_config(ds);
+    ASSERT(config != NULL, "config snapshot failed");
+    uint64_t config_count = lance_dataset_config_count(config);
+    CHECK_OK();
+    int saw_interval = 0;
+    int saw_older_than = 0;
+    for (uint64_t i = 0; i < config_count; i++) {
+        const char *key = lance_dataset_config_key_at(config, (size_t)i);
+        const char *value = lance_dataset_config_value_at(config, (size_t)i);
+        CHECK_OK();
+        ASSERT(key != NULL && value != NULL, "config entry must be non-NULL");
+        if (strcmp(key, "lance.auto_cleanup.interval") == 0) {
+            saw_interval = 1;
+            ASSERT(strcmp(value, "20") == 0,
+                   "legacy interval must survive native append");
+        } else if (strcmp(key, "lance.auto_cleanup.older_than") == 0) {
+            saw_older_than = 1;
+            ASSERT(strcmp(value, "14days") == 0,
+                   "legacy older_than must survive native append");
+        }
+    }
+    ASSERT(saw_interval && saw_older_than,
+           "legacy cleanup policy must remain persisted");
+    lance_dataset_config_close(config);
+
+    const char *keys[] = {"c_test.key", "lance.auto_cleanup.older_than"};
+    const char *values[] = {"value", NULL};
+    rc = lance_dataset_update_config(ds, keys, values, 2);
+    ASSERT(rc == 0, "config update failed");
+    CHECK_OK();
+    LanceDatasetConfig *after_update = lance_dataset_config(ds);
+    ASSERT(after_update != NULL, "post-update config snapshot failed");
+    uint64_t after_update_count = lance_dataset_config_count(after_update);
+    CHECK_OK();
+    lance_dataset_config_close(after_update);
+
+    /* A snapshot taken before close must remain usable after the dataset
+     * handle is gone. */
+    LanceDatasetConfig *snapshot = lance_dataset_config(ds);
+    ASSERT(snapshot != NULL, "post-update config snapshot failed");
+    lance_dataset_close(ds);
+    uint64_t snapshot_count = lance_dataset_config_count(snapshot);
+    CHECK_OK();
+    ASSERT(snapshot_count == after_update_count, "snapshot count mismatch");
+    const char *snapshot_key = lance_dataset_config_key_at(snapshot, 0);
+    const char *snapshot_value = lance_dataset_config_value_at(snapshot, 0);
+    CHECK_OK();
+    ASSERT(snapshot_key != NULL && snapshot_value != NULL,
+           "snapshot accessors must stay valid after dataset close");
+    lance_dataset_config_close(snapshot);
+
+    LanceDataset *reopened = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen failed");
+    config = lance_dataset_config(reopened);
+    ASSERT(config != NULL, "reopened config snapshot failed");
+    config_count = lance_dataset_config_count(config);
+    CHECK_OK();
+    int saw_custom = 0;
+    int saw_removed_older_than = 0;
+    for (uint64_t i = 0; i < config_count; i++) {
+        const char *key = lance_dataset_config_key_at(config, (size_t)i);
+        const char *value = lance_dataset_config_value_at(config, (size_t)i);
+        CHECK_OK();
+        ASSERT(key != NULL && value != NULL, "config entry must be non-NULL");
+        if (strcmp(key, "c_test.key") == 0) {
+            saw_custom = 1;
+            ASSERT(strcmp(value, "value") == 0, "custom config mismatch");
+        } else if (strcmp(key, "lance.auto_cleanup.older_than") == 0) {
+            saw_removed_older_than = 1;
+        }
+    }
+    ASSERT(saw_custom, "custom config must persist across reopen");
+    ASSERT(!saw_removed_older_than, "removed config must stay removed");
+    lance_dataset_config_close(config);
+
+    /* Error paths: NULL dataset and NULL arrays are rejected. */
+    rc = lance_dataset_update_config(NULL, keys, values, 2);
+    ASSERT(rc == -1, "NULL dataset must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+    const char *message = lance_last_error_message();
+    if (message) lance_free_string(message);
+    rc = lance_dataset_update_config(reopened, NULL, values, 2);
+    ASSERT(rc == -1, "NULL keys must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    lance_dataset_close(reopened);
+    lance_scanner_close(scanner);
+    lance_dataset_close(src);
+    printf("OK\n");
+}
+
 /* Exercises `lance_dataset_calculate_data_stats` on the freshly-written
  * (modern, v2+) dataset, where per-field on-disk sizes are populated. Runs
  * before the mutation tests reshape or empty the dataset. */
@@ -2619,6 +2752,7 @@ int main(int argc, char **argv) {
     test_commit_index_segments(uri);
     test_native_scalar_indexes(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
     test_dataset_metadata(write_uri);
     test_update(write_uri);

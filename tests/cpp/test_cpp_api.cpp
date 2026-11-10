@@ -1244,13 +1244,73 @@ static void test_dataset_write_roundtrip(const std::string& src_uri,
     memset(&stream, 0, sizeof(stream));
     scanner.to_arrow_stream(&stream);
 
+    // The existing five-argument call must accept brace-initialized defaults.
     auto dst = lance::Dataset::write(
-        dst_uri, &stream, lance::WriteMode::Create);
+        dst_uri, &stream, lance::WriteMode::Create, {}, {});
 
     uint64_t dst_rows = dst.count_rows();
     assert(dst_rows == src_rows);
+    auto config = dst.config();
+    assert(config.at("lance.auto_cleanup.interval") == "20");
+    assert(config.at("lance.auto_cleanup.older_than") == "14days");
     printf("src=%llu, dst=%llu... ",
            (unsigned long long)src_rows, (unsigned long long)dst_rows);
+
+    PASS();
+}
+
+static void test_write_options_and_config(const std::string& src_uri,
+                                          const std::string& dst_uri) {
+    TEST(test_write_options_and_config);
+
+    const std::string uri = dst_uri + "_native_options";
+    auto src = lance::Dataset::open(src_uri);
+    const uint64_t src_rows = src.count_rows();
+
+    {
+        auto scanner = src.scan();
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+
+        lance::WriteOptions options;
+        auto ds = lance::Dataset::write_with_options(
+            uri, &stream, lance::WriteMode::Create, options);
+        assert(ds.count_rows() == src_rows);
+        auto config = ds.config();
+        assert(config.find("lance.auto_cleanup.interval") == config.end());
+        assert(config.find("lance.auto_cleanup.older_than") == config.end());
+    }
+
+    {
+        auto scanner = src.scan();
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+
+        lance::WriteOptions options;
+        options.params.max_rows_per_file = 2;
+        options.auto_cleanup = lance::AutoCleanupParams{0, 0, 0};
+        options.skip_auto_cleanup = true;
+        auto ds = lance::Dataset::write_with_options(
+            uri, &stream, lance::WriteMode::Append, options);
+        assert(ds.count_rows() == src_rows * 2);
+        auto config = ds.config();
+        assert(config.find("lance.auto_cleanup.interval") == config.end());
+
+        ds.update_config({
+            lance::ConfigUpdate{"cpp.key", std::string("value")},
+            lance::ConfigUpdate{"cpp.removed", std::nullopt},
+        });
+        auto updated = ds.config();
+        assert(updated.at("cpp.key") == "value");
+        assert(updated.find("cpp.removed") == updated.end());
+    }
+
+    auto reopened = lance::Dataset::open(uri);
+    auto config = reopened.config();
+    assert(config.at("cpp.key") == "value");
+    assert(config.find("lance.auto_cleanup.interval") == config.end());
 
     PASS();
 }
@@ -2283,6 +2343,7 @@ int main(int argc, char** argv) {
     test_commit_index_segments(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
     test_dataset_metadata(write_uri);
     test_update(write_uri);
