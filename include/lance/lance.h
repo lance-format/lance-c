@@ -2803,6 +2803,41 @@ int32_t lance_scanner_set_substrait_filter(
 );
 
 /**
+ * Set a Substrait aggregate on the scanner.
+ *
+ * `bytes` must point to a serialized Substrait `Plan` whose first relation is
+ * an `AggregateRel`, either directly or through a `RelRoot`. This is a Plan,
+ * not the `ExtendedExpression` accepted by
+ * lance_scanner_set_substrait_filter(). Field references use positions in the
+ * dataset schema, not projection positions. Group columns and measures follow
+ * the native planner; `RelRoot.names` supplies output aliases in group-then-
+ * measure order.
+ *
+ * The plan is validated immediately against the dataset schema using a
+ * temporary native scanner. A failed replacement retains the previous
+ * aggregate. Malformed protobuf bytes report the native I/O error; valid
+ * non-aggregate plans and invalid field references report the native invalid-
+ * argument errors. Empty bytes are passed to native plan validation.
+ *
+ * The bytes are copied. NULL is accepted only when `len` is zero. The setter
+ * must be called before the scan starts. Planning observes the configured
+ * projection, filter, fragments, masks, FTS, vector search, batch size, and
+ * native limit/offset/ordering. Native aggregate validation rejects explicit
+ * limit, offset, or non-empty ordering. Count and analyze-count replace this
+ * aggregate with native `COUNT(*)`; schema, explain, analyze, and ordinary scan
+ * streams use it.
+ *
+ * @param bytes  Serialized Substrait `Plan` bytes (NULL only when len is zero)
+ * @param len    Length of the byte buffer
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_set_substrait_aggregate(
+    LanceScanner* scanner,
+    const uint8_t* bytes,
+    size_t len
+);
+
+/**
  * Add an SQL filter that is combined with the selected primary filter using
  * AND. The primary filter is the Substrait filter when set, otherwise it is
  * the SQL filter passed to `lance_scanner_new`. Multiple additional SQL

@@ -203,6 +203,7 @@ pub struct LanceScanner {
     disable_scoring_autoprojection: bool,
     filter: Option<String>,
     substrait_filter: Option<Vec<u8>>,
+    substrait_aggregate: Option<Vec<u8>>,
     additional_sql_filters: Vec<String>,
     blob_handling: Option<BlobHandling>,
     limit: Option<i64>,
@@ -410,6 +411,7 @@ impl LanceScanner {
             disable_scoring_autoprojection: false,
             filter: None,
             substrait_filter: None,
+            substrait_aggregate: None,
             additional_sql_filters: Vec::new(),
             blob_handling: None,
             limit: None,
@@ -660,10 +662,13 @@ impl LanceScanner {
             .nearest
             .as_ref()
             .is_some_and(|query| query.mode == NearestMode::MultiVector);
+        let has_aggregate =
+            operation == ScannerOperation::Scan && self.substrait_aggregate.is_some();
         // The multi-vector window must rank on the native distance after the
         // final projection. Projections can rename or transform `_distance`,
         // so carry a binding-private copy whenever a projection is configured.
-        let private_multi_vector_distance = multi_vector && self.projection.is_some();
+        let private_multi_vector_distance =
+            multi_vector && self.projection.is_some() && !has_aggregate;
         let window_distance_column =
             private_multi_vector_distance.then(|| self.multi_vector_window_distance_column());
         self.apply_projection(&mut scanner, window_distance_column.as_deref())?;
@@ -675,6 +680,7 @@ impl LanceScanner {
         }
         if operation == ScannerOperation::Scan
             && multi_vector
+            && !has_aggregate
             && self
                 .order_by
                 .as_ref()
@@ -696,7 +702,7 @@ impl LanceScanner {
         }
         if self.limit.is_some() || self.offset.is_some() {
             scanner.limit(self.limit, self.offset)?;
-            if multi_vector && operation == ScannerOperation::Scan {
+            if multi_vector && operation == ScannerOperation::Scan && !has_aggregate {
                 // Retain Lance's window validation, but defer truncation until the final sort.
                 scanner.limit(None, None)?;
             }
@@ -892,20 +898,30 @@ impl LanceScanner {
         } else {
             None
         };
+        if operation == ScannerOperation::Scan
+            && let Some(bytes) = &self.substrait_aggregate
+        {
+            scanner.aggregate(AggregateExpr::substrait(bytes.clone()))?;
+        }
         if let Some(callback) = &self.scan_statistics_callback {
             scanner.scan_stats_callback(callback.clone());
         }
-        Ok(PreparedScanner {
-            scanner,
-            distributed_fts,
-            multi_vector_window: multi_vector.then_some(MultiVectorWindow {
+        let multi_vector_window = (multi_vector
+            && operation == ScannerOperation::Scan
+            && !has_aggregate)
+            .then(|| MultiVectorWindow {
                 offset: self.offset.unwrap_or(0) as usize,
                 limit: self.limit.map(|n| n as usize),
                 distance_column: window_distance_column
                     .unwrap_or_else(|| DISTANCE_COLUMN.to_string()),
                 drop_distance_column: private_multi_vector_distance
                     || (self.projection.is_none() && self.disable_scoring_autoprojection),
-            }),
+            });
+        Ok(PreparedScanner {
+            scanner,
+            distributed_fts,
+            multi_vector,
+            multi_vector_window,
             batch_size: self.batch_size,
             scan_statistics_callback: self.scan_statistics_callback.clone(),
             scalar_segment,
@@ -927,6 +943,7 @@ struct PreparedFtsExecution {
 struct PreparedScanner {
     scanner: lance::dataset::scanner::Scanner,
     distributed_fts: Option<PreparedFtsExecution>,
+    multi_vector: bool,
     multi_vector_window: Option<MultiVectorWindow>,
     batch_size: Option<usize>,
     scan_statistics_callback: Option<ExecutionStatsCallback>,
@@ -960,6 +977,7 @@ impl PreparedScanner {
         let PreparedScanner {
             scanner,
             distributed_fts,
+            multi_vector,
             multi_vector_window,
             batch_size,
             scan_statistics_callback,
@@ -984,13 +1002,13 @@ impl PreparedScanner {
             });
         }
 
-        if let Some(window) = multi_vector_window {
+        if multi_vector {
             let mut scanner = scanner;
             if operation == ScannerOperation::Count {
                 add_count_aggregate(&mut scanner)?;
             }
             let plan = crate::multivector::rewrite(scanner.create_plan().await?)?;
-            let plan = if operation == ScannerOperation::Scan {
+            let plan = if let Some(window) = multi_vector_window {
                 let plan = crate::multivector::apply_result_window(
                     plan,
                     window.offset,
@@ -2615,6 +2633,67 @@ unsafe fn scanner_set_substrait_filter_inner(
     let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
     let s = unsafe { &mut *scanner };
     s.substrait_filter = Some(slice.to_vec());
+    Ok(0)
+}
+
+/// Set a Substrait aggregate plan on the scanner.
+///
+/// `bytes` must point to a serialized Substrait `Plan` whose first relation is
+/// an `AggregateRel`, either directly or through a `RelRoot`. Field references
+/// use positions in the dataset schema. The plan is validated immediately
+/// against the dataset schema on a temporary native scanner, and the previous
+/// aggregate is retained when validation fails.
+///
+/// - `scanner`: An open `LanceScanner*`.
+/// - `bytes`: Pointer to serialized Substrait `Plan` bytes. NULL is accepted
+///   only when `len` is zero, in which case the empty byte string reaches
+///   native plan validation. The bytes are copied into the scanner.
+/// - `len`: Length of the byte buffer.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_substrait_aggregate(
+    scanner: *mut LanceScanner,
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_substrait_aggregate_inner(scanner, bytes, len)
+    })
+}
+
+unsafe fn scanner_set_substrait_aggregate_inner(
+    scanner: *mut LanceScanner,
+    bytes: *const u8,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("substrait_aggregate")?;
+    if len > isize::MAX as usize {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("substrait aggregate len {len} exceeds isize::MAX").into(),
+        ));
+    }
+    if bytes.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "bytes is NULL but len > 0".into(),
+        ));
+    }
+    let slice = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, len) }
+    };
+    let bytes = slice.to_vec();
+    let mut validation_scanner = s.dataset.scan();
+    validation_scanner.aggregate(AggregateExpr::substrait(bytes.clone()))?;
+    s.substrait_aggregate = Some(bytes);
     Ok(0)
 }
 
@@ -5403,6 +5482,10 @@ mod tests {
         assert_poison_error_pending();
 
         let rc = unsafe { lance_scanner_disable_scoring_autoprojection(scanner) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        let rc = unsafe { lance_scanner_set_substrait_aggregate(scanner, ptr::null(), 0) };
         assert_eq!(rc, -1);
         assert_poison_error_pending();
 

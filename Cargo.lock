@@ -3704,6 +3704,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
+ "datafusion-substrait",
  "futures",
  "half",
  "lance",

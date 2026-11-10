@@ -69,6 +69,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
 | [x] | Dataset metadata | Table/schema/field metadata updates plus native storage-version, stable-row-ID and field-ID inspection |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
+| [x] | Substrait aggregation | `lance_scanner_set_substrait_aggregate()` accepts a serialized Substrait `Plan`; group/measure semantics, aliases, validation, and aggregate output come from the native planner |
 | [x] | Row prefilter | `lance_scanner_set_row_addr_allowlist()` / `lance_scanner_set_row_addr_blocklist()` restrict scans, nearest-neighbor and full-text searches to (or exclude) a set of `_rowid`s before ranking |
 | [x] | Native ordering | `lance_scanner_set_order_by()` and C++ `Scanner::order_by()` sort by one or more columns with direction and NULL placement |
 | [x] | Expression projection | `lance_scanner_set_projection()` binds named SQL expressions, aliases and nested fields; `lance_scanner_disable_scoring_autoprojection()` controls automatic `_score` / `_distance` output |
