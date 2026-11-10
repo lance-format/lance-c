@@ -4288,7 +4288,7 @@ fn test_index_segments_json_empty_coverage() {
     assert_eq!(entries[0]["columns"], serde_json::json!(["name"]));
     assert_eq!(entries[0]["type"], "Inverted");
     assert_eq!(entries[0]["dataset_version"], expected_dataset_version);
-    assert_eq!(entries[0]["index_version"], 0);
+    assert_eq!(entries[0]["index_version"], 2);
     assert_eq!(entries[0]["fragment_ids"], serde_json::json!([]));
 
     unsafe { lance_dataset_close(ds) };
