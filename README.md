@@ -320,9 +320,12 @@ unsupported triples, opt into a source build with the `from-source` feature:
 vcpkg install 'lance-c[from-source]'  # requires Rust toolchain
 ```
 
-Prebuilt v0.1.9 archives cover Linux x86_64/aarch64 and macOS arm64. Intel
-macOS has no prebuilt asset in this release, so use `lance-c[from-source]`
-there. Source builds also require CMake and `protoc` on the build host.
+Prebuilt v0.1.9 archives cover Linux x86_64/aarch64 and macOS arm64. The Linux
+x86_64 mapping uses the Debian 12 build, which lowers its libc requirement to
+the Debian 12 baseline; the arm64 mapping still uses the standard release
+archive. Intel macOS has no prebuilt asset in this release, so use
+`lance-c[from-source]` there. Source builds also require CMake and `protoc` on
+the build host.
 
 ### Conan
 

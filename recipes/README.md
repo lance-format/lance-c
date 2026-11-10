@@ -13,3 +13,7 @@ x86_64/aarch64 or macOS arm64. Test both linkage modes with
 `-o shared=True` and `-o shared=False`. Intel macOS has no prebuilt archive in
 this release; use `-o lance-c/*:from_source=True`, which builds the v0.1.9
 source tag and requires Rust, CMake, and `protoc`.
+
+The Linux x86_64 entry uses the Debian 12 archive to keep the lower Debian 12
+libc floor. The arm64 entry remains on the standard release archive until its
+exact floor is verified.

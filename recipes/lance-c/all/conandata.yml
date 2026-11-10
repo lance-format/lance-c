@@ -1,8 +1,8 @@
 sources:
   "0.1.9":
     "Linux-x86_64":
-      url: "https://github.com/lance-format/lance-c/releases/download/v0.1.9/lance-c-v0.1.9-x86_64-unknown-linux-gnu.tar.xz"
-      sha256: "4ced4f4954096506ba130bd9f6bae2d18d1afc440dcb24439c3a1f8efa97f6c5"
+      url: "https://github.com/lance-format/lance-c/releases/download/v0.1.9/lance-c-v0.1.9-x86_64-unknown-linux-gnu-debian12.tar.xz"
+      sha256: "51e8175efe3420149039525524b803878c1054dc2cd881a92295a27301b780aa"
     "Linux-armv8":
       url: "https://github.com/lance-format/lance-c/releases/download/v0.1.9/lance-c-v0.1.9-aarch64-unknown-linux-gnu.tar.xz"
       sha256: "fb48f848c128f12b209a4b6dd12bf7fa547434eba1483326a9c39b645bb142bd"
