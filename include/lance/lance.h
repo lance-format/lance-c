@@ -2432,8 +2432,10 @@ typedef struct LanceFtsMatchOptions {
     /** Score multiplier; native default 1.0. Scan planning requires finite,
      *  non-negative values. */
     float boost;
-    /** -1 selects automatic fuzziness; 0 is an exact match. Other values are
-     *  explicit edit distances in [0, UINT32_MAX]. Native default 0. */
+    /** -1 represents the core AUTO setting. The Lance 14.0.2 dataset planner
+     *  resolves AUTO to exact matching. Other values are explicit edit
+     *  distances in [0, UINT32_MAX], with 0 selecting exact matching.
+     *  Native default 0. */
     int64_t fuzziness;
     /** Final fuzzy vocabulary budget for this Match leaf. Native default 50. */
     uint64_t max_expansions;

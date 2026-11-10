@@ -206,8 +206,9 @@ impl From<LanceFtsOccur> for Occur {
 pub struct LanceFtsMatchOptions {
     /// Finite, non-negative score multiplier validated at scan planning.
     pub boost: f32,
-    /// `-1` selects automatic fuzziness; other values are explicit edit
-    /// distances in `[0, u32::MAX]`.
+    /// `-1` represents the core AUTO setting. The Lance 14.0.2 dataset
+    /// planner resolves AUTO to exact matching. Other values are explicit
+    /// edit distances in `[0, u32::MAX]`, with `0` selecting exact matching.
     pub fuzziness: i64,
     /// Final fuzzy vocabulary budget for this Match leaf.
     pub max_expansions: u64,

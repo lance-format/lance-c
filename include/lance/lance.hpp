@@ -146,8 +146,9 @@ enum class FtsOccur : int32_t {
     MustNot = LANCE_FTS_OCCUR_MUST_NOT,
 };
 
-/// Options for FtsQuery::match(). `std::nullopt` fuzziness selects the core's
-/// automatic rule; the default `0` is an exact match.
+/// Options for FtsQuery::match(). `std::nullopt` represents the core AUTO
+/// setting. The Lance 14.0.2 dataset planner resolves AUTO to exact matching.
+/// The default `0` selects exact matching.
 struct FtsMatchOptions {
     float boost = 1.0f;
     std::optional<uint32_t> fuzziness = uint32_t{0};
