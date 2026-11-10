@@ -243,6 +243,37 @@ unsafe fn dataset_count_rows_inner(dataset: *const LanceDataset) -> Result<u64> 
     Ok(block_on(ds.snapshot().count_rows(None))? as u64)
 }
 
+/// Count rows matching an optional SQL filter.
+///
+/// `filter == NULL` maps to native `Dataset::count_rows(None)` and uses the
+/// metadata fast path. A non-NULL pointer, including an empty string, maps to
+/// `Some(filter)`. Returns 0 on error; an empty match also returns 0, so check
+/// `lance_last_error_code()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_count_rows_filtered(
+    dataset: *const LanceDataset,
+    filter: *const c_char,
+) -> u64 {
+    ffi_try!(
+        unsafe { dataset_count_rows_filtered_inner(dataset, filter) },
+        0
+    )
+}
+
+unsafe fn dataset_count_rows_filtered_inner(
+    dataset: *const LanceDataset,
+    filter: *const c_char,
+) -> Result<u64> {
+    if dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
+    }
+    let ds = unsafe { &*dataset };
+    let filter = unsafe { helpers::parse_c_string(filter) }?.map(str::to_owned);
+    Ok(block_on(ds.snapshot().count_rows(filter))? as u64)
+}
+
 /// Return the latest version ID of the dataset.
 /// Returns 0 on error — check `lance_last_error_code()`.
 #[unsafe(no_mangle)]
