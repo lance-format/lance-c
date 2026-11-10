@@ -23,7 +23,9 @@ use arrow_array::{
     UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
 use lance::Dataset;
+use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
 use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance_c::*;
 
@@ -347,6 +349,269 @@ fn scan_all_rows(ds: *const LanceDataset) -> Vec<RecordBatch> {
     batches
 }
 
+/// Two-fragment ordering fixture with nullable, duplicated sort keys.
+///
+/// `id` is unique and provides the explicit tie-breaker; `category` and `rank`
+/// carry NULLs and duplicates across both fragments.
+fn create_ordering_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ordering_ds").to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, true),
+        Field::new("rank", DataType::Int32, true),
+    ]));
+
+    let make_batch = |ids: Vec<i32>, groups: &[Option<&str>], ranks: &[Option<i32>]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(groups.to_vec())),
+                Arc::new(Int32Array::from(ranks.to_vec())),
+            ],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        let first = make_batch(
+            vec![0, 1, 2, 3, 4, 5],
+            &[
+                Some("b"),
+                Some("b"),
+                Some("a"),
+                Some("a"),
+                Some("b"),
+                Some("a"),
+            ],
+            &[Some(2), None, Some(1), Some(1), Some(2), None],
+        );
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let second = make_batch(
+            vec![6, 7, 8, 9, 10, 11],
+            &[Some("b"), Some("a"), None, Some("b"), Some("a"), None],
+            &[Some(2), Some(1), Some(3), None, Some(1), Some(2)],
+        );
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+    });
+
+    (tmp, uri)
+}
+
+fn ordering_specs(
+    specs: &[(&str, LanceOrderDirection, LanceNullOrder)],
+) -> (Vec<CString>, Vec<LanceColumnOrdering>) {
+    let names = specs
+        .iter()
+        .map(|(name, ..)| CString::new(*name).unwrap())
+        .collect::<Vec<_>>();
+    let orderings = specs
+        .iter()
+        .zip(&names)
+        .map(|((_, direction, null_order), name)| LanceColumnOrdering {
+            column_name: name.as_ptr(),
+            direction: *direction as i32,
+            null_order: *null_order as i32,
+        })
+        .collect();
+    (names, orderings)
+}
+
+fn set_order_by(
+    scanner: *mut LanceScanner,
+    specs: &[(&str, LanceOrderDirection, LanceNullOrder)],
+) -> i32 {
+    let (_names, orderings) = ordering_specs(specs);
+    unsafe {
+        lance_scanner_set_order_by(
+            scanner,
+            if orderings.is_empty() {
+                std::ptr::NonNull::<LanceColumnOrdering>::dangling().as_ptr()
+            } else {
+                orderings.as_ptr()
+            },
+            orderings.len(),
+        )
+    }
+}
+
+fn ordering_rows(batches: &[RecordBatch]) -> Vec<(i32, Option<String>, Option<i32>)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let groups = batch
+            .column_by_name("category")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ranks = batch
+            .column_by_name("rank")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row),
+                (!groups.is_null(row)).then(|| groups.value(row).to_owned()),
+                (!ranks.is_null(row)).then(|| ranks.value(row)),
+            ));
+        }
+    }
+    rows
+}
+
+fn ordering_fixture_rows() -> Vec<(i32, Option<String>, Option<i32>)> {
+    vec![
+        (0, Some("b".into()), Some(2)),
+        (1, Some("b".into()), None),
+        (2, Some("a".into()), Some(1)),
+        (3, Some("a".into()), Some(1)),
+        (4, Some("b".into()), Some(2)),
+        (5, Some("a".into()), None),
+        (6, Some("b".into()), Some(2)),
+        (7, Some("a".into()), Some(1)),
+        (8, None, Some(3)),
+        (9, Some("b".into()), None),
+        (10, Some("a".into()), Some(1)),
+        (11, None, Some(2)),
+    ]
+}
+
+fn expected_ordering_rows(ids: &[i32]) -> Vec<(i32, Option<String>, Option<i32>)> {
+    let fixture = ordering_fixture_rows();
+    ids.iter()
+        .map(|id| {
+            fixture
+                .iter()
+                .find(|row| row.0 == *id)
+                .unwrap_or_else(|| panic!("missing fixture id {id}"))
+                .clone()
+        })
+        .collect()
+}
+
+fn scan_ordering_rows(scanner: *mut LanceScanner) -> Vec<(i32, Option<String>, Option<i32>)> {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+    ordering_rows(&batches)
+}
+
+fn scan_ordering_ids(scanner: *mut LanceScanner) -> Vec<i32> {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let mut ids = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let column = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        ids.extend(column.values().iter().copied());
+    }
+    ids
+}
+
+fn ordering_row_ids(dataset: *const LanceDataset) -> std::collections::HashMap<i32, u64> {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(unsafe { lance_scanner_with_row_id(scanner, true) }, 0);
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let mut ids = std::collections::HashMap::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let id = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let row_id = batch
+            .column_by_name("_rowid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            ids.insert(id.value(row), row_id.value(row));
+        }
+    }
+    unsafe { lance_scanner_close(scanner) };
+    ids
+}
+
+fn native_ordering_rows(
+    uri: &str,
+    orderings: Vec<NativeColumnOrdering>,
+    filter: Option<&str>,
+    columns: Option<Vec<&str>>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Vec<(i32, Option<String>, Option<i32>)> {
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        if let Some(columns) = columns {
+            scanner.project(&columns).unwrap();
+        }
+        if let Some(filter) = filter {
+            scanner.filter(filter).unwrap();
+        }
+        if limit.is_some() || offset.is_some() {
+            scanner.limit(limit, offset).unwrap();
+        }
+        scanner.order_by(Some(orderings)).unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        ordering_rows(&batches)
+    })
+}
+
+type OrderingSpec<'a> = (&'a str, LanceOrderDirection, LanceNullOrder);
+type OrderingCase<'a> = (Vec<OrderingSpec<'a>>, Vec<i32>);
+
 // ---------------------------------------------------------------------------
 // Dataset tests
 // ---------------------------------------------------------------------------
@@ -570,6 +835,514 @@ fn test_scanner_to_arrow_stream() {
     assert_eq!(total_rows, 5);
 
     unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_order_by_single_and_multi_key() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let cases: Vec<OrderingCase<'_>> = vec![
+        (
+            vec![
+                (
+                    "rank",
+                    LanceOrderDirection::Ascending,
+                    LanceNullOrder::NullsLast,
+                ),
+                (
+                    "id",
+                    LanceOrderDirection::Ascending,
+                    LanceNullOrder::NullsLast,
+                ),
+            ],
+            vec![2, 3, 7, 10, 0, 4, 6, 11, 8, 1, 5, 9],
+        ),
+        (
+            vec![
+                (
+                    "rank",
+                    LanceOrderDirection::Descending,
+                    LanceNullOrder::NullsFirst,
+                ),
+                (
+                    "id",
+                    LanceOrderDirection::Ascending,
+                    LanceNullOrder::NullsLast,
+                ),
+            ],
+            vec![1, 5, 9, 8, 0, 4, 6, 11, 2, 3, 7, 10],
+        ),
+        (
+            vec![
+                (
+                    "category",
+                    LanceOrderDirection::Ascending,
+                    LanceNullOrder::NullsLast,
+                ),
+                (
+                    "id",
+                    LanceOrderDirection::Descending,
+                    LanceNullOrder::NullsLast,
+                ),
+            ],
+            vec![10, 7, 5, 3, 2, 9, 6, 4, 1, 0, 11, 8],
+        ),
+        (
+            vec![
+                (
+                    "category",
+                    LanceOrderDirection::Descending,
+                    LanceNullOrder::NullsFirst,
+                ),
+                (
+                    "rank",
+                    LanceOrderDirection::Ascending,
+                    LanceNullOrder::NullsLast,
+                ),
+                (
+                    "id",
+                    LanceOrderDirection::Ascending,
+                    LanceNullOrder::NullsLast,
+                ),
+            ],
+            vec![11, 8, 0, 4, 6, 1, 9, 2, 3, 7, 10, 5],
+        ),
+    ];
+
+    for (specs, expected_ids) in cases {
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+        assert!(!scanner.is_null());
+        assert_eq!(
+            set_order_by(scanner, &specs),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert_eq!(
+            scan_ordering_rows(scanner),
+            expected_ordering_rows(&expected_ids),
+            "ordering {specs:?}"
+        );
+        unsafe { lance_scanner_close(scanner) };
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_order_by_matches_native_rust() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let specs = vec![
+        (
+            "category",
+            LanceOrderDirection::Descending,
+            LanceNullOrder::NullsFirst,
+        ),
+        (
+            "rank",
+            LanceOrderDirection::Ascending,
+            LanceNullOrder::NullsLast,
+        ),
+        (
+            "id",
+            LanceOrderDirection::Descending,
+            LanceNullOrder::NullsLast,
+        ),
+    ];
+    let native_orderings = specs
+        .iter()
+        .map(
+            |(column_name, direction, null_order)| NativeColumnOrdering {
+                ascending: *direction == LanceOrderDirection::Ascending,
+                nulls_first: *null_order == LanceNullOrder::NullsFirst,
+                column_name: (*column_name).to_string(),
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(set_order_by(scanner, &specs), 0);
+    let c_rows = scan_ordering_rows(scanner);
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+
+    let native_rows = native_ordering_rows(&uri, native_orderings, None, None, None, None);
+    assert_eq!(c_rows, native_rows);
+    assert_eq!(
+        c_rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+        vec![11, 8, 6, 4, 0, 9, 1, 10, 7, 3, 2, 5]
+    );
+}
+
+#[test]
+fn test_scanner_order_by_filter_projection_and_window() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let filter = c_str("id >= 3 AND category IS NOT NULL");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), filter.as_ptr()) };
+    assert!(!scanner.is_null());
+    let specs = [
+        (
+            "rank",
+            LanceOrderDirection::Descending,
+            LanceNullOrder::NullsLast,
+        ),
+        (
+            "id",
+            LanceOrderDirection::Ascending,
+            LanceNullOrder::NullsLast,
+        ),
+    ];
+    assert_eq!(set_order_by(scanner, &specs), 0);
+    assert_eq!(
+        scan_ordering_rows(scanner),
+        expected_ordering_rows(&[4, 6, 3, 7, 10, 5, 9])
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(set_order_by(scanner, &specs), 0);
+    assert_eq!(unsafe { lance_scanner_set_offset(scanner, 2) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 5) }, 0);
+    assert_eq!(
+        scan_ordering_rows(scanner),
+        expected_ordering_rows(&[4, 6, 11, 2, 3])
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let id_column = c_str("id");
+    let rank_column = c_str("rank");
+    let columns = [id_column.as_ptr(), rank_column.as_ptr(), ptr::null()];
+    let scanner = unsafe { lance_scanner_new(ds, columns.as_ptr(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(set_order_by(scanner, &specs), 0);
+    assert_eq!(unsafe { lance_scanner_set_offset(scanner, 2) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 5) }, 0);
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(reader.schema().fields().len(), 2);
+    let mut ids = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let id = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        ids.extend(id.values().iter().copied());
+    }
+    assert_eq!(ids, vec![4, 6, 11, 2, 3]);
+    unsafe { lance_scanner_close(scanner) };
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_order_by_row_id_masks() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let row_ids = ordering_row_ids(ds);
+
+    let allow = [0, 3, 5, 6, 9, 11]
+        .into_iter()
+        .map(|id| row_ids[&id])
+        .collect::<Vec<_>>();
+    let allow_specs = [
+        (
+            "rank",
+            LanceOrderDirection::Ascending,
+            LanceNullOrder::NullsLast,
+        ),
+        (
+            "id",
+            LanceOrderDirection::Ascending,
+            LanceNullOrder::NullsLast,
+        ),
+    ];
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_row_addr_allowlist(scanner, allow.as_ptr(), allow.len()) },
+        0
+    );
+    assert_eq!(set_order_by(scanner, &allow_specs), 0);
+    assert_eq!(
+        scan_ordering_rows(scanner),
+        expected_ordering_rows(&[3, 0, 6, 11, 5, 9])
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let block = [0, 2, 5, 8]
+        .into_iter()
+        .map(|id| row_ids[&id])
+        .collect::<Vec<_>>();
+    let block_specs = [
+        (
+            "rank",
+            LanceOrderDirection::Descending,
+            LanceNullOrder::NullsFirst,
+        ),
+        (
+            "id",
+            LanceOrderDirection::Ascending,
+            LanceNullOrder::NullsLast,
+        ),
+    ];
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_row_addr_blocklist(scanner, block.as_ptr(), block.len()) },
+        0
+    );
+    assert_eq!(set_order_by(scanner, &block_specs), 0);
+    assert_eq!(
+        scan_ordering_rows(scanner),
+        expected_ordering_rows(&[1, 9, 4, 6, 11, 3, 7, 10])
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_order_by_setter_contract_and_missing_column() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let valid_specs = [
+        (
+            "rank",
+            LanceOrderDirection::Descending,
+            LanceNullOrder::NullsFirst,
+        ),
+        (
+            "id",
+            LanceOrderDirection::Ascending,
+            LanceNullOrder::NullsLast,
+        ),
+    ];
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(set_order_by(scanner, &valid_specs), 0);
+
+    let bad_direction = [LanceColumnOrdering {
+        column_name: c"rank".as_ptr(),
+        direction: 2,
+        null_order: LanceNullOrder::NullsLast as i32,
+    }];
+    assert_eq!(
+        unsafe { lance_scanner_set_order_by(scanner, bad_direction.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("order_by direction"));
+
+    let bad_null_order = [LanceColumnOrdering {
+        column_name: c"rank".as_ptr(),
+        direction: LanceOrderDirection::Ascending as i32,
+        null_order: 2,
+    }];
+    assert_eq!(
+        unsafe { lance_scanner_set_order_by(scanner, bad_null_order.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("order_by null_order"));
+
+    let null_name = [LanceColumnOrdering {
+        column_name: ptr::null(),
+        direction: LanceOrderDirection::Ascending as i32,
+        null_order: LanceNullOrder::NullsLast as i32,
+    }];
+    assert_eq!(
+        unsafe { lance_scanner_set_order_by(scanner, null_name.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("column_name must not be NULL"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_order_by(scanner, ptr::null(), 1,) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("orderings is NULL but len > 0"));
+
+    // None of the rejected calls replaced the valid ordering.
+    assert_eq!(
+        scan_ordering_rows(scanner),
+        expected_ordering_rows(&[1, 5, 9, 8, 0, 4, 6, 11, 2, 3, 7, 10])
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let no_order_scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let no_order_rows = scan_ordering_rows(no_order_scanner);
+    unsafe { lance_scanner_close(no_order_scanner) };
+
+    for clear_with_empty in [false, true] {
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+        assert_eq!(set_order_by(scanner, &valid_specs), 0);
+        let clear = if clear_with_empty {
+            unsafe {
+                lance_scanner_set_order_by(
+                    scanner,
+                    ptr::NonNull::<LanceColumnOrdering>::dangling().as_ptr(),
+                    0,
+                )
+            }
+        } else {
+            unsafe { lance_scanner_set_order_by(scanner, ptr::null(), 0) }
+        };
+        assert_eq!(clear, 0);
+        assert_eq!(scan_ordering_rows(scanner), no_order_rows);
+        unsafe { lance_scanner_close(scanner) };
+    }
+
+    let ascending_specs = [
+        (
+            "rank",
+            LanceOrderDirection::Ascending,
+            LanceNullOrder::NullsLast,
+        ),
+        (
+            "id",
+            LanceOrderDirection::Ascending,
+            LanceNullOrder::NullsLast,
+        ),
+    ];
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(set_order_by(scanner, &valid_specs), 0);
+    assert_eq!(set_order_by(scanner, &ascending_specs), 0);
+    assert_eq!(
+        scan_ordering_rows(scanner),
+        expected_ordering_rows(&[2, 3, 7, 10, 0, 4, 6, 11, 8, 1, 5, 9])
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    drop(reader);
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_order_by(
+                scanner,
+                ptr::NonNull::<LanceColumnOrdering>::dangling().as_ptr(),
+                0,
+            )
+        },
+        -1
+    );
+    assert!(take_last_error_message().contains("order_by must be set before the scan starts"));
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        set_order_by(
+            scanner,
+            &[(
+                "missing",
+                LanceOrderDirection::Ascending,
+                LanceNullOrder::NullsLast
+            )]
+        ),
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("Column missing not found"), "{message}");
+    unsafe { lance_scanner_close(scanner) };
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_order_by_with_batch_nearest() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 4, 2, false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let column = c_str("embedding");
+    let queries = [0.0f32, 0.0, 100.0, 100.0];
+
+    let make_scanner = || {
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+        assert!(!scanner.is_null());
+        assert_eq!(
+            unsafe {
+                lance_scanner_nearest_batch(
+                    scanner,
+                    column.as_ptr(),
+                    queries.as_ptr().cast(),
+                    2,
+                    2,
+                    LanceDataType::Float32 as i32,
+                    2,
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert_eq!(unsafe { lance_scanner_set_use_index(scanner, false) }, 0);
+        scanner
+    };
+
+    let unordered = make_scanner();
+    let unordered_ids = scan_ordering_ids(unordered);
+    assert_eq!(unordered_ids.len(), 4);
+    unsafe { lance_scanner_close(unordered) };
+
+    let ordered = make_scanner();
+    assert_eq!(
+        set_order_by(
+            ordered,
+            &[(
+                "id",
+                LanceOrderDirection::Descending,
+                LanceNullOrder::NullsLast,
+            )],
+        ),
+        0
+    );
+    let ordered_ids = scan_ordering_ids(ordered);
+    unsafe { lance_scanner_close(ordered) };
+
+    let mut expected = unordered_ids;
+    expected.sort_unstable_by(|left, right| right.cmp(left));
+    assert_eq!(ordered_ids, expected);
+
     unsafe { lance_dataset_close(ds) };
 }
 
@@ -9180,6 +9953,98 @@ fn test_prepared_fts_match_phrase_and_legacy_compatibility() {
     assert!(message.contains("slop must be non-negative"), "{message}");
 
     unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_prepared_fts_order_by_is_applied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("prepared_fts_order_by")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(StringArray::from(vec![
+                "quick one",
+                "quick two",
+                "slow one",
+                "quick three",
+                "quick four",
+            ])),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let uri_c = c_str(&uri);
+    let column = c_str("text");
+    let query = c_str("quick");
+    let index_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::Inverted as i32,
+                index_params.as_ptr(),
+                false,
+            )
+        },
+        0
+    );
+    let context = unsafe {
+        lance_dataset_prepare_fts_match_query(
+            dataset,
+            column.as_ptr(),
+            query.as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!context.is_null(), "{}", take_last_error_message());
+
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+        0
+    );
+    assert_eq!(
+        set_order_by(
+            scanner,
+            &[(
+                "id",
+                LanceOrderDirection::Descending,
+                LanceNullOrder::NullsLast,
+            )],
+        ),
+        0
+    );
+    assert_eq!(scan_ordering_ids(scanner), vec![5, 4, 2, 1]);
+
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_fts_query_context_close(context);
+        lance_dataset_close(dataset);
+    }
 }
 
 #[test]

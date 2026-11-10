@@ -1647,15 +1647,180 @@ static void test_batch_nearest(const char *uri) {
     check_batch_nearest_results(&stream);
 }
 
+/* Collect the `id` column from an ordering stream. Returns the row count and
+ * stores up to `capacity` ids in `out`. */
+static size_t collect_ordering_ids(
+    struct ArrowArrayStream *stream,
+    int32_t *out,
+    size_t capacity) {
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream->get_schema(stream, &schema) == 0, "ordering schema");
+    int id_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (strcmp(schema.children[i]->name, "id") == 0) {
+            id_column = (int)i;
+        }
+    }
+    ASSERT(id_column >= 0, "ordering output must contain id");
+    ASSERT(strcmp(schema.children[id_column]->format, "i") == 0,
+           "ordering id must be int32");
+    if (schema.release) schema.release(&schema);
+
+    size_t count = 0;
+    while (1) {
+        struct ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        ASSERT(stream->get_next(stream, &array) == 0, "ordering get_next");
+        if (array.release == NULL) break;
+        const struct ArrowArray *ids = array.children[id_column];
+        const int32_t *values = (const int32_t *)ids->buffers[1];
+        for (int64_t i = 0; i < array.length; ++i) {
+            ASSERT(count < capacity, "ordering output exceeds capacity");
+            out[count++] = values[ids->offset + i];
+        }
+        array.release(&array);
+    }
+    if (stream->release) stream->release(stream);
+    return count;
+}
+
+static void check_ordering(
+    LanceScanner *scanner,
+    const int32_t *expected,
+    size_t expected_count) {
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "ordering stream failed");
+    int32_t actual[32];
+    size_t count = collect_ordering_ids(&stream, actual, 32);
+    ASSERT(count == expected_count, "ordering row count mismatch");
+    ASSERT(memcmp(actual, expected, expected_count * sizeof(int32_t)) == 0,
+           "ordering ids mismatch");
+}
+
+static void test_scanner_order_by(const char *uri) {
+    printf("  test_scanner_order_by... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "ordering dataset open failed");
+    const int32_t expected[] = {1, 5, 9, 8, 0, 4, 6, 11, 2, 3, 7, 10};
+    LanceColumnOrdering ordering[] = {
+        {"rank", LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_FIRST},
+        {"id", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+    };
+
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "ordering scanner");
+    ASSERT(lance_scanner_set_order_by(scanner, ordering, 2) == 0,
+           "set order by");
+    check_ordering(scanner, expected, 12);
+    lance_scanner_close(scanner);
+
+    /* Invalid raw enum values and NULL names retain the previous ordering. */
+    scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "ordering scanner");
+    ASSERT(lance_scanner_set_order_by(scanner, ordering, 2) == 0,
+           "set order by");
+    LanceColumnOrdering invalid = {
+        "rank", 7, LANCE_ORDER_NULLS_LAST,
+    };
+    ASSERT(lance_scanner_set_order_by(scanner, &invalid, 1) == -1,
+           "invalid direction must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid direction code");
+    invalid.direction = LANCE_ORDER_ASCENDING;
+    invalid.null_order = 7;
+    ASSERT(lance_scanner_set_order_by(scanner, &invalid, 1) == -1,
+           "invalid null order must fail");
+    invalid.null_order = LANCE_ORDER_NULLS_LAST;
+    invalid.column_name = NULL;
+    ASSERT(lance_scanner_set_order_by(scanner, &invalid, 1) == -1,
+           "NULL column name must fail");
+    check_ordering(scanner, expected, 12);
+    lance_scanner_close(scanner);
+
+    /* The setter copies the caller's column string. */
+    char column_name[8];
+    strcpy(column_name, "rank");
+    LanceColumnOrdering copied[] = {
+        {column_name, LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_FIRST},
+        {"id", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+    };
+    scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "ordering scanner");
+    ASSERT(lance_scanner_set_order_by(scanner, copied, 2) == 0,
+           "set copied order by");
+    strcpy(column_name, "junk");
+    check_ordering(scanner, expected, 12);
+    lance_scanner_close(scanner);
+
+    /* NULL resets to the same rows as a fresh, unordered scanner. */
+    int32_t baseline[32];
+    scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "ordering scanner");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "baseline stream");
+    size_t baseline_count =
+        collect_ordering_ids(&stream, baseline, 32);
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "ordering scanner");
+    ASSERT(lance_scanner_set_order_by(scanner, ordering, 2) == 0,
+           "set order by");
+    ASSERT(lance_scanner_set_order_by(scanner, NULL, 0) == 0,
+           "clear order by");
+    check_ordering(scanner, baseline, baseline_count);
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "ordering scanner");
+    ASSERT(lance_scanner_set_order_by(scanner, ordering, 2) == 0,
+           "set order by");
+    ASSERT(lance_scanner_set_order_by(scanner, &invalid, 0) == 0,
+           "explicit empty order by");
+    check_ordering(scanner, baseline, baseline_count);
+    lance_scanner_close(scanner);
+
+    /* Missing columns are a native materialization error. */
+    scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "ordering scanner");
+    LanceColumnOrdering missing = {
+        "missing", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST,
+    };
+    ASSERT(lance_scanner_set_order_by(scanner, &missing, 1) == 0,
+           "set missing order column");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == -1,
+           "missing order column must fail at materialization");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "missing order column code");
+    const char *message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "missing") != NULL,
+           "missing order column message");
+    if (message) lance_free_string(message);
+    lance_scanner_close(scanner);
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
+    if (argc < 5) {
+        fprintf(stderr,
+                "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri>\n",
+                argv[0]);
         return 1;
     }
 
     const char *uri = argv[1];
     const char *write_uri = argv[2];
     const char *blob_uri = argv[3];
+    const char *ordering_uri = argv[4];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
@@ -1665,6 +1830,7 @@ int main(int argc, char **argv) {
     test_distance_range(uri);
     test_scan_with_limit(uri);
     test_scan_with_row_addr_lists(uri);
+    test_scanner_order_by(ordering_uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_versions(uri);
