@@ -1259,6 +1259,17 @@ public:
         return n;
     }
 
+    /// Number of rows matching `filter` through native
+    /// `Dataset::count_rows(Some(filter))`. An empty string is an explicit
+    /// filter, not the unfiltered metadata fast path; use count_rows() for
+    /// native `None`.
+    uint64_t count_rows(const std::string& filter) const {
+        uint64_t n =
+            lance_dataset_count_rows_filtered(handle_.get(), filter.c_str());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return n;
+    }
+
     /// Version of this dataset snapshot.
     uint64_t version() const {
         uint64_t v = lance_dataset_version(handle_.get());
@@ -2567,6 +2578,19 @@ struct ProjectionColumn {
 class Scanner {
     Handle<LanceScanner, lance_scanner_close> handle_;
 
+    static std::string take_owned_string(const char* raw) {
+        if (!raw) {
+            if (lance_last_error_code() == LANCE_OK) {
+                throw Error(LANCE_ERR_INTERNAL,
+                            "scanner plan API returned NULL without an error");
+            }
+            check_error();
+        }
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            raw, lance_free_string);
+        return std::string(raw);
+    }
+
 public:
     friend class Fragment;
 
@@ -2887,6 +2911,41 @@ public:
     /// (typed vector overload).
     Scanner& index_segments(const std::vector<std::array<uint8_t, 16>>& uuids) {
         return index_segments(reinterpret_cast<const uint8_t*>(uuids.data()), uuids.size());
+    }
+
+    /// Export the configured output schema from its actual native plan.
+    /// Planning-only; does not start iteration or advance an existing stream.
+    /// `out` is caller-owned; release it exactly once on success.
+    void schema(ArrowSchema* out) const {
+        if (lance_scanner_schema(handle_.get(), out) != 0)
+            check_error();
+    }
+
+    /// Explain the configured native plan without executing it.
+    std::string explain_plan(bool verbose = false) const {
+        return take_owned_string(
+            lance_scanner_explain_plan(handle_.get(), verbose));
+    }
+
+    /// Execute and format the configured native plan with runtime metrics.
+    /// Does not consume or advance an existing stream.
+    std::string analyze_plan() const {
+        return take_owned_string(lance_scanner_analyze_plan(handle_.get()));
+    }
+
+    /// Execute the native COUNT(*) plan for this scanner. Native aggregate
+    /// planning rejects configured limit/offset/ordering. Throws lance::Error
+    /// on failure.
+    uint64_t count_rows() const {
+        uint64_t count = lance_scanner_count_rows(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    /// Execute and format the native COUNT(*) plan, not the ordinary plan.
+    std::string analyze_count_plan() const {
+        return take_owned_string(
+            lance_scanner_analyze_count_plan(handle_.get()));
     }
 
     /// Materialize an independent ArrowArrayStream (blocking). The scanner remains valid.

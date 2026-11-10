@@ -495,6 +495,127 @@ static void test_scan_with_limit(const char *uri) {
     printf("OK\n");
 }
 
+static uint64_t count_stream_rows(struct ArrowArrayStream *stream);
+
+static void test_scanner_introspection(const char *uri) {
+    printf("  test_scanner_introspection... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "dataset open failed");
+    CHECK_OK();
+    uint64_t all_rows = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(all_rows == 20, "fixture row count");
+    ASSERT(lance_dataset_count_rows_filtered(ds, NULL) == all_rows,
+           "NULL filter must use the native None fast path");
+    CHECK_OK();
+
+    const char *filter = "id >= 11";
+    ASSERT(lance_dataset_count_rows_filtered(ds, filter) == 10,
+           "filtered dataset count");
+    CHECK_OK();
+    const char *empty_filter = "";
+    ASSERT(lance_dataset_count_rows_filtered(ds, empty_filter) == 0,
+           "empty filter must be an explicit Some input");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "empty dataset filter must fail");
+    const char *error = lance_last_error_message();
+    ASSERT(error != NULL && error[0] != '\0', "empty filter error message");
+    if (error) lance_free_string(error);
+
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, filter);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    CHECK_OK();
+    LanceProjectionColumn projection[] = {
+        {"id_alias", "id"},
+        {"next_id", "id + 1"},
+    };
+    ASSERT(lance_scanner_set_projection(scanner, projection, 2) == 0,
+           "scanner expression projection");
+    CHECK_OK();
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_scanner_schema(scanner, &schema) == 0,
+           "scanner schema planning");
+    CHECK_OK();
+    ASSERT(schema.n_children == 2, "scanner schema field count");
+    int saw_id = 0;
+    int saw_next = 0;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        const char *name = schema.children[i]->name;
+        if (name && strcmp(name, "id_alias") == 0) saw_id = 1;
+        if (name && strcmp(name, "next_id") == 0) saw_next = 1;
+    }
+    ASSERT(saw_id && saw_next, "scanner schema projected fields");
+    if (schema.release) schema.release(&schema);
+
+    uint64_t count = lance_scanner_count_rows(scanner);
+    CHECK_OK();
+    ASSERT(count == 10, "scanner native count");
+    ASSERT(lance_scanner_count_rows(scanner) == count,
+           "scanner count must be repeatable");
+    CHECK_OK();
+
+    const char *explain = lance_scanner_explain_plan(scanner, false);
+    ASSERT(explain != NULL && explain[0] != '\0', "scanner explain");
+    lance_free_string(explain);
+    CHECK_OK();
+    const char *analyze = lance_scanner_analyze_plan(scanner);
+    ASSERT(analyze != NULL && strstr(analyze, "AggregateExec") == NULL,
+           "normal analyze must not use the count plan");
+    lance_free_string(analyze);
+    CHECK_OK();
+    const char *analyze_count = lance_scanner_analyze_count_plan(scanner);
+    ASSERT(analyze_count != NULL &&
+               strstr(analyze_count, "AggregateExec") != NULL,
+           "analyze count plan must contain the native aggregate");
+    lance_free_string(analyze_count);
+    CHECK_OK();
+
+    ASSERT(lance_scanner_set_batch_size(scanner, 2) == 0,
+           "planning must leave scanner configuration editable");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "scanner stream after inspection");
+    CHECK_OK();
+    ASSERT(count_stream_rows(&stream) == count,
+           "scanner count must match the configured stream");
+    lance_scanner_close(scanner);
+
+    LanceScanner *limited = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(limited != NULL, "limited scanner");
+    ASSERT(lance_scanner_set_limit(limited, 0) == 0, "zero limit setter");
+    ASSERT(lance_scanner_count_rows(limited) == 0,
+           "native aggregate must reject a zero limit");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "aggregate limit error code");
+    error = lance_last_error_message();
+    ASSERT(error != NULL &&
+               strstr(error, "Cannot use limit/offset with aggregate") != NULL,
+           "aggregate limit error message");
+    if (error) lance_free_string(error);
+    lance_scanner_close(limited);
+
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_scanner_schema(NULL, &schema) == -1,
+           "NULL scanner schema must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL scanner schema error code");
+    error = lance_last_error_message();
+    if (error) lance_free_string(error);
+    ASSERT(lance_scanner_count_rows(NULL) == 0,
+           "NULL scanner count must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL scanner count error code");
+    error = lance_last_error_message();
+    if (error) lance_free_string(error);
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static uint64_t count_stream_rows(struct ArrowArrayStream *stream) {
     uint64_t total_rows = 0;
     while (1) {
@@ -3561,6 +3682,7 @@ int main(int argc, char **argv) {
     test_scanner_projection(uri);
     test_distance_range(uri);
     test_scan_with_limit(uri);
+    test_scanner_introspection(uri);
     test_scan_with_row_addr_lists(uri);
     test_scanner_order_by(ordering_uri);
     test_fragment_snapshot(fragment_uri);
