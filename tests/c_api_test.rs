@@ -11112,14 +11112,6 @@ fn default_write_params() -> LanceWriteParams {
     }
 }
 
-fn default_write_options() -> LanceWriteOptions {
-    LanceWriteOptions {
-        params: default_write_params(),
-        auto_cleanup: ptr::null(),
-        skip_auto_cleanup: false,
-    }
-}
-
 fn write_with_native_options(
     uri: &str,
     batch: RecordBatch,
@@ -12252,7 +12244,7 @@ fn test_dataset_config_read_update_and_reopen_matches_native() {
     assert!(
         reopened_entries
             .iter()
-            .any(|(key, value)| key == "" && value == "")
+            .any(|(key, value)| key.is_empty() && value.is_empty())
     );
     assert!(
         !reopened_entries
