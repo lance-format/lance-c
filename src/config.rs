@@ -141,8 +141,8 @@ pub unsafe extern "C" fn lance_dataset_config_close(config: *mut LanceDatasetCon
 ///
 /// `keys` and `values` are parallel arrays of length `num_entries`. A non-NULL
 /// `values[i]` upserts `keys[i]`; a NULL `values[i]` removes `keys[i]`. This
-/// maps directly to `Dataset::update_config` with merge semantics. An entry
-/// with `num_entries == 0` is passed through as an empty native update.
+/// maps directly to `Dataset::update_config` with merge semantics. A
+/// `num_entries == 0` call is passed through as an empty native update.
 ///
 /// When `num_entries > 0`, both arrays must be non-NULL and every `keys[i]`
 /// must be a non-NULL C string. Empty keys and empty string values are passed

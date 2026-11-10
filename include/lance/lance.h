@@ -382,16 +382,11 @@ void lance_data_statistics_close(LanceDataStatistics* stats);
 /* ─── Dataset config ─── */
 
 /**
- * Snapshot of a dataset's manifest config map.
- *
- * Returned by lance_dataset_config(); accessors borrow from the snapshot and
- * remain valid until lance_dataset_config_close(). The snapshot owns copies of
- * the keys and values, so it remains valid after the dataset handle is closed.
- */
-typedef struct LanceDatasetConfig LanceDatasetConfig;
-
-/**
  * Return a snapshot of the dataset's manifest config map.
+ *
+ * The snapshot owns copies of the keys and values, so it remains valid after
+ * the dataset handle is closed. Accessors borrow from the snapshot and remain
+ * valid until lance_dataset_config_close().
  *
  * Returns NULL on error (for example a NULL dataset handle).
  *

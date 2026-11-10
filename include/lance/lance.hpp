@@ -175,9 +175,9 @@ struct AutoCleanupParams {
 /// (native `None`) and `skip_auto_cleanup = false`. `params` retains the
 /// zero-means-upstream-default mapping of `WriteParams`.
 struct WriteOptions {
-    WriteParams                        params;
-    std::optional<AutoCleanupParams>   auto_cleanup;
-    bool                               skip_auto_cleanup = false;
+    WriteParams                      params;
+    std::optional<AutoCleanupParams> auto_cleanup;
+    bool                             skip_auto_cleanup = false;
 };
 
 /// One native `Dataset::update_config` entry. `value == std::nullopt` removes
