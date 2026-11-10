@@ -21,6 +21,7 @@ use lance_datafusion::utils::MetricsExt;
 use lance_index::IndexType;
 use lance_index::scalar::expression::{PlannerIndexExt, ScalarIndexExpr, ScalarIndexLoader};
 use lance_index::scalar::{MetricsCollector, ScalarIndex};
+use lance_select::NullableIndexExprResult;
 use uuid::Uuid;
 
 pub(crate) struct PreparedScalarSegment {
@@ -92,6 +93,7 @@ pub(crate) fn scoped_expression(
 }
 
 struct SegmentIndexLoader<'a> {
+    dataset: &'a Dataset,
     index: Arc<dyn ScalarIndex>,
     index_name: &'a str,
     column: &'a str,
@@ -113,6 +115,16 @@ impl ScalarIndexLoader for SegmentIndexLoader<'_> {
         // Reuse the one physical segment; a dataset loader would search every
         // segment of the logical index and violate the caller's restriction.
         Ok(self.index.clone())
+    }
+
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        // v14 BTree segments report physical row addresses. Delegate the
+        // stable-row-id translation to Lance so the mask stays in `_rowid`
+        // space before boolean composition and scanner installation.
+        self.dataset.row_addr_result_to_row_ids(result).await
     }
 }
 
@@ -355,12 +367,9 @@ impl PreparedScalarSegment {
         ) {
             return Ok(Some("index_type"));
         }
-        // External masks use _rowid, not necessarily physical row addresses.
-        if index.results_are_row_addresses() && self.dataset.manifest.uses_stable_row_ids() {
-            return Ok(Some("row_id_domain"));
-        }
         let started = Instant::now();
         let loader = SegmentIndexLoader {
+            dataset: self.dataset.as_ref(),
             index,
             index_name: &index_meta.name,
             column: &field.name,

@@ -3714,6 +3714,7 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-linalg",
+ "lance-select",
  "lance-table",
  "libc",
  "log",
