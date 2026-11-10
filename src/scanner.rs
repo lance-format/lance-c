@@ -17,8 +17,7 @@ use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::scanner::{
     ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
-    MaterializationStyle,
-    RowAddrMask, RowAddrTreeMap,
+    MaterializationStyle, RowAddrMask, RowAddrTreeMap,
 };
 use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use lance_core::Result;
