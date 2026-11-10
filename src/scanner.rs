@@ -36,8 +36,8 @@ use crate::error::{
     panic_payload_message, set_lance_error, set_last_error, swallow_unwind,
 };
 use crate::fts_query::{
-    FtsQueryContextInner, LanceFtsQueryContext, PreparedFtsQuery, clone_context,
-    parse_segment_uuids,
+    FtsQueryContextInner, LanceFtsQuery, LanceFtsQueryContext, PreparedFtsQuery, clone_context,
+    clone_query, parse_segment_uuids,
 };
 use crate::helpers;
 use crate::runtime::{RT, block_on};
@@ -3703,6 +3703,50 @@ unsafe fn fts_inner(
     }
 
     s.fts_query = Some(fts);
+    Ok(0)
+}
+
+/// Attach an immutable typed full-text query tree to this scanner.
+///
+/// The scanner snapshots the query value, so the query handle and every source
+/// child handle may be closed after this function returns successfully.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`). This is
+/// mutually exclusive with nearest search and prepared FTS query contexts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fts_query(
+    scanner: *mut LanceScanner,
+    query: *const LanceFtsQuery,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fts_query_inner(scanner, query)
+    })
+}
+
+unsafe fn scanner_set_fts_query_inner(
+    scanner: *mut LanceScanner,
+    query: *const LanceFtsQuery,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner must not be NULL".into(),
+        ));
+    }
+    let query = unsafe { clone_query(query)? };
+    let scanner = unsafe { &mut *scanner };
+    if scanner.nearest.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot attach a typed FTS query after nearest; they are mutually exclusive".into(),
+        ));
+    }
+    if scanner.fts_context.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot attach a typed FTS query after an FTS query context; the context already owns the query"
+                .into(),
+        ));
+    }
+    scanner.fts_query = Some(FullTextSearchQuery::new_query(query));
     Ok(0)
 }
 

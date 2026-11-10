@@ -27,6 +27,12 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
 use lance_c::*;
+use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::DocumentGranularity;
+use lance_index::scalar::inverted::query::{
+    BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur,
+    Operator, PhraseQuery,
+};
 
 /// Helper: create a test dataset in a temp directory and return its path.
 fn create_test_dataset() -> (tempfile::TempDir, String) {
@@ -10028,6 +10034,1490 @@ fn test_fts_fuzzy() {
 
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
+}
+
+fn create_typed_fts_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("typed_fts_dataset")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("title", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, false),
+        Field::new("category", DataType::Utf8, false),
+    ]));
+
+    let make_batch =
+        |ids: Vec<i32>, titles: Vec<&str>, bodies: Vec<&str>, categories: Vec<&str>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(titles)),
+                    Arc::new(StringArray::from(bodies)),
+                    Arc::new(StringArray::from(categories)),
+                ],
+            )
+            .unwrap()
+        };
+    let first = make_batch(
+        vec![1, 2, 3, 4],
+        vec!["alpha beta", "alpha", "alpha beta", "beta gamma"],
+        vec!["gamma rust", "delta rust", "gamma", "alpha"],
+        vec!["a", "b", "a", "b"],
+    );
+    let second = make_batch(
+        vec![5, 6, 7, 8, 9, 10],
+        vec!["rust rust", "rust", "lance", "delta", "rusty", "bust"],
+        vec![
+            "lance",
+            "rust rust rust",
+            "database",
+            "alpha",
+            "suffix",
+            "prefix",
+        ],
+        vec!["a", "b", "a", "b", "a", "b"],
+    );
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap()
+        .append(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let params = c_str(r#"{"base_tokenizer":"simple","language":"English","with_position":true}"#);
+    for column in ["title", "body"] {
+        let column = c_str(column);
+        assert_eq!(
+            unsafe {
+                lance_dataset_create_scalar_index(
+                    dataset,
+                    column.as_ptr(),
+                    ptr::null(),
+                    LanceScalarIndexType::Inverted as i32,
+                    params.as_ptr(),
+                    false,
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+    }
+    unsafe { lance_dataset_close(dataset) };
+
+    (tmp, uri)
+}
+
+fn initialized_match_options() -> LanceFtsMatchOptions {
+    let mut options = std::mem::MaybeUninit::<LanceFtsMatchOptions>::uninit();
+    unsafe { lance_fts_query_match_options_init(options.as_mut_ptr()) };
+    unsafe { options.assume_init() }
+}
+
+fn initialized_phrase_options() -> LanceFtsPhraseOptions {
+    let mut options = std::mem::MaybeUninit::<LanceFtsPhraseOptions>::uninit();
+    unsafe { lance_fts_query_phrase_options_init(options.as_mut_ptr()) };
+    unsafe { options.assume_init() }
+}
+
+fn initialized_multi_match_options() -> LanceFtsMultiMatchOptions {
+    let mut options = std::mem::MaybeUninit::<LanceFtsMultiMatchOptions>::uninit();
+    unsafe { lance_fts_query_multi_match_options_init(options.as_mut_ptr()) };
+    unsafe { options.assume_init() }
+}
+
+fn initialized_combined_fields_options() -> LanceFtsCombinedFieldsOptions {
+    let mut options = std::mem::MaybeUninit::<LanceFtsCombinedFieldsOptions>::uninit();
+    unsafe { lance_fts_query_combined_fields_options_init(options.as_mut_ptr()) };
+    unsafe { options.assume_init() }
+}
+
+fn initialized_boost_options() -> LanceFtsBoostOptions {
+    let mut options = std::mem::MaybeUninit::<LanceFtsBoostOptions>::uninit();
+    unsafe { lance_fts_query_boost_options_init(options.as_mut_ptr()) };
+    unsafe { options.assume_init() }
+}
+
+fn typed_match(
+    terms: &str,
+    column: Option<&str>,
+    options: &LanceFtsMatchOptions,
+) -> *mut LanceFtsQuery {
+    let terms = c_str(terms);
+    let column = column.map(c_str);
+    let query = unsafe {
+        lance_fts_query_match_new(
+            terms.as_ptr(),
+            column.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
+            options,
+        )
+    };
+    assert!(!query.is_null(), "{}", take_last_error_message());
+    query
+}
+
+fn typed_phrase(
+    terms: &str,
+    column: Option<&str>,
+    options: &LanceFtsPhraseOptions,
+) -> *mut LanceFtsQuery {
+    let terms = c_str(terms);
+    let column = column.map(c_str);
+    let query = unsafe {
+        lance_fts_query_phrase_new(
+            terms.as_ptr(),
+            column.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
+            options,
+        )
+    };
+    assert!(!query.is_null(), "{}", take_last_error_message());
+    query
+}
+
+fn typed_multi_match(
+    terms: &str,
+    columns: &[&str],
+    options: &LanceFtsMultiMatchOptions,
+) -> *mut LanceFtsQuery {
+    let terms = c_str(terms);
+    let columns = columns
+        .iter()
+        .map(|column| c_str(column))
+        .collect::<Vec<_>>();
+    let column_ptrs = columns
+        .iter()
+        .map(|column| column.as_ptr())
+        .collect::<Vec<_>>();
+    let query = unsafe {
+        lance_fts_query_multi_match_new(
+            terms.as_ptr(),
+            column_ptrs.as_ptr(),
+            column_ptrs.len(),
+            options,
+        )
+    };
+    assert!(!query.is_null(), "{}", take_last_error_message());
+    query
+}
+
+fn typed_combined_fields(
+    terms: &str,
+    columns: &[&str],
+    options: &LanceFtsCombinedFieldsOptions,
+) -> *mut LanceFtsQuery {
+    let terms = c_str(terms);
+    let columns = columns
+        .iter()
+        .map(|column| c_str(column))
+        .collect::<Vec<_>>();
+    let column_ptrs = columns
+        .iter()
+        .map(|column| column.as_ptr())
+        .collect::<Vec<_>>();
+    let query = unsafe {
+        lance_fts_query_combined_fields_new(
+            terms.as_ptr(),
+            column_ptrs.as_ptr(),
+            column_ptrs.len(),
+            options,
+        )
+    };
+    assert!(!query.is_null(), "{}", take_last_error_message());
+    query
+}
+
+fn typed_boolean(clauses: &[(LanceFtsOccur, *mut LanceFtsQuery)]) -> *mut LanceFtsQuery {
+    let occurs = clauses
+        .iter()
+        .map(|(occur, _)| *occur as i32)
+        .collect::<Vec<_>>();
+    let queries = clauses
+        .iter()
+        .map(|(_, query)| *query as *const LanceFtsQuery)
+        .collect::<Vec<_>>();
+    let query =
+        unsafe { lance_fts_query_boolean_new(occurs.as_ptr(), queries.as_ptr(), queries.len()) };
+    assert!(!query.is_null(), "{}", take_last_error_message());
+    query
+}
+
+fn typed_boost(
+    positive: *mut LanceFtsQuery,
+    negative: *mut LanceFtsQuery,
+    options: &LanceFtsBoostOptions,
+) -> *mut LanceFtsQuery {
+    let query = unsafe { lance_fts_query_boost_new(positive, negative, options) };
+    assert!(!query.is_null(), "{}", take_last_error_message());
+    query
+}
+
+fn native_match_query(
+    terms: &str,
+    column: Option<&str>,
+    options: &LanceFtsMatchOptions,
+) -> FtsQuery {
+    let operator = match options.match_operator {
+        value if value == LanceFtsMatchOperator::Or as i32 => Operator::Or,
+        value if value == LanceFtsMatchOperator::And as i32 => Operator::And,
+        value => panic!("unexpected match operator {value}"),
+    };
+    let fuzziness = if options.fuzziness == -1 {
+        None
+    } else {
+        Some(u32::try_from(options.fuzziness).unwrap())
+    };
+    let granularity = match options.document_granularity {
+        value if value == LanceFtsDocumentGranularity::Unspecified as i32 => None,
+        value if value == LanceFtsDocumentGranularity::Row as i32 => Some(DocumentGranularity::Row),
+        value if value == LanceFtsDocumentGranularity::ListElement as i32 => {
+            Some(DocumentGranularity::ListElement)
+        }
+        value => panic!("unexpected document granularity {value}"),
+    };
+    let mut query = MatchQuery::new(terms.to_string())
+        .with_column(column.map(str::to_string))
+        .with_boost(options.boost)
+        .with_fuzziness(fuzziness)
+        .with_max_expansions(usize::try_from(options.max_expansions).unwrap())
+        .with_operator(operator)
+        .with_prefix_length(options.prefix_length);
+    if let Some(granularity) = granularity {
+        query = query.with_document_granularity(granularity);
+    }
+    query.into()
+}
+
+fn native_phrase_query(
+    terms: &str,
+    column: Option<&str>,
+    options: &LanceFtsPhraseOptions,
+) -> FtsQuery {
+    let granularity = match options.document_granularity {
+        value if value == LanceFtsDocumentGranularity::Unspecified as i32 => None,
+        value if value == LanceFtsDocumentGranularity::Row as i32 => Some(DocumentGranularity::Row),
+        value if value == LanceFtsDocumentGranularity::ListElement as i32 => {
+            Some(DocumentGranularity::ListElement)
+        }
+        value => panic!("unexpected document granularity {value}"),
+    };
+    let mut query = PhraseQuery::new(terms.to_string())
+        .with_column(column.map(str::to_string))
+        .with_slop(options.slop);
+    if let Some(granularity) = granularity {
+        query = query.with_document_granularity(granularity);
+    }
+    query.into()
+}
+
+fn native_multi_match_query(
+    terms: &str,
+    columns: &[&str],
+    options: &LanceFtsMultiMatchOptions,
+) -> FtsQuery {
+    let operator = match options.match_operator {
+        value if value == LanceFtsMatchOperator::Or as i32 => Operator::Or,
+        value if value == LanceFtsMatchOperator::And as i32 => Operator::And,
+        value => panic!("unexpected match operator {value}"),
+    };
+    let columns = columns.iter().map(|column| column.to_string()).collect();
+    let mut query = MultiMatchQuery::try_new(terms.to_string(), columns)
+        .unwrap()
+        .with_operator(operator);
+    if !options.boosts.is_null() {
+        let boosts =
+            unsafe { std::slice::from_raw_parts(options.boosts, options.boost_count).to_vec() };
+        query = query.try_with_boosts(boosts).unwrap();
+    }
+    query.into()
+}
+
+fn native_combined_fields_query(
+    terms: &str,
+    columns: &[&str],
+    options: &LanceFtsCombinedFieldsOptions,
+) -> FtsQuery {
+    let operator = match options.match_operator {
+        value if value == LanceFtsMatchOperator::Or as i32 => Operator::Or,
+        value if value == LanceFtsMatchOperator::And as i32 => Operator::And,
+        value => panic!("unexpected match operator {value}"),
+    };
+    let columns = columns.iter().map(|column| column.to_string()).collect();
+    let mut query = CombinedFieldsQuery::try_new(terms.to_string(), columns)
+        .unwrap()
+        .with_operator(operator);
+    if !options.boosts.is_null() {
+        let boosts =
+            unsafe { std::slice::from_raw_parts(options.boosts, options.boost_count).to_vec() };
+        query = query.try_with_boosts(boosts).unwrap();
+    }
+    query.into()
+}
+
+fn native_boolean_query(clauses: Vec<(Occur, FtsQuery)>) -> FtsQuery {
+    BooleanQuery::new(clauses).into()
+}
+
+fn native_boost_query(
+    positive: FtsQuery,
+    negative: FtsQuery,
+    options: &LanceFtsBoostOptions,
+) -> FtsQuery {
+    BoostQuery::new(positive, negative, Some(options.negative_boost)).into()
+}
+
+fn collect_scanner_typed_scores(scanner: *mut LanceScanner) -> std::collections::HashMap<i32, f32> {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let mut scores = std::collections::HashMap::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let batch_scores = batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            assert!(
+                scores
+                    .insert(ids.value(row), batch_scores.value(row))
+                    .is_none()
+            );
+        }
+    }
+    scores
+}
+
+fn collect_typed_query_scores(
+    dataset: *const LanceDataset,
+    query: *const LanceFtsQuery,
+    filter: Option<&CString>,
+    row_ids: Option<&[u64]>,
+    fragment_ids: Option<&[u64]>,
+) -> std::collections::HashMap<i32, f32> {
+    let scanner = unsafe {
+        lance_scanner_new(
+            dataset,
+            ptr::null(),
+            filter.map_or(ptr::null(), |filter| filter.as_ptr()),
+        )
+    };
+    assert!(!scanner.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query(scanner, query) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    if let Some(row_ids) = row_ids {
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_row_addr_allowlist(scanner, row_ids.as_ptr(), row_ids.len())
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+    }
+    if let Some(fragment_ids) = fragment_ids {
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_fragment_ids(scanner, fragment_ids.as_ptr(), fragment_ids.len())
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+    }
+    let scores = collect_scanner_typed_scores(scanner);
+    unsafe { lance_scanner_close(scanner) };
+    scores
+}
+
+fn collect_native_fts_scores(
+    uri: &str,
+    query: FtsQuery,
+    filter: Option<&str>,
+) -> std::collections::HashMap<i32, f32> {
+    use futures::TryStreamExt;
+
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap();
+        if let Some(filter) = filter {
+            scanner.filter(filter).unwrap();
+        }
+        let mut stream = scanner.try_into_stream().await.unwrap();
+        let mut scores = std::collections::HashMap::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let batch_scores = batch
+                .column_by_name("_score")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                assert!(
+                    scores
+                        .insert(ids.value(row), batch_scores.value(row))
+                        .is_none()
+                );
+            }
+        }
+        scores
+    })
+}
+
+fn sorted_score_ids(scores: &std::collections::HashMap<i32, f32>) -> Vec<i32> {
+    let mut ids = scores.keys().copied().collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
+fn assert_scores_match(
+    context: &str,
+    actual: &std::collections::HashMap<i32, f32>,
+    expected: &std::collections::HashMap<i32, f32>,
+) {
+    assert_eq!(
+        sorted_score_ids(actual),
+        sorted_score_ids(expected),
+        "{context}: result membership differs"
+    );
+    for (id, expected_score) in expected {
+        let actual_score = actual[id];
+        let tolerance = 1e-5 * expected_score.abs().max(1.0);
+        assert!(
+            (actual_score - expected_score).abs() <= tolerance,
+            "{context}: id {id} score {actual_score} != native {expected_score}"
+        );
+    }
+}
+
+fn collect_native_row_metadata(uri: &str) -> std::collections::HashMap<i32, (u64, u64)> {
+    use futures::TryStreamExt;
+
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.with_row_id();
+        scanner.with_row_address();
+        let mut stream = scanner.try_into_stream().await.unwrap();
+        let mut rows = std::collections::HashMap::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            let row_addresses = batch
+                .column_by_name("_rowaddr")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                assert!(
+                    rows.insert(
+                        ids.value(row),
+                        (row_ids.value(row), row_addresses.value(row))
+                    )
+                    .is_none()
+                );
+            }
+        }
+        rows
+    })
+}
+
+#[test]
+fn test_typed_fts_query_construction_and_validation() {
+    let match_defaults = initialized_match_options();
+    assert_eq!(match_defaults.boost, 1.0);
+    assert_eq!(match_defaults.fuzziness, 0);
+    assert_eq!(match_defaults.max_expansions, 50);
+    assert_eq!(
+        match_defaults.match_operator,
+        LanceFtsMatchOperator::Or as i32
+    );
+    assert_eq!(match_defaults.prefix_length, 0);
+    assert_eq!(
+        match_defaults.document_granularity,
+        LanceFtsDocumentGranularity::Unspecified as i32
+    );
+
+    let phrase_defaults = initialized_phrase_options();
+    assert_eq!(phrase_defaults.slop, 0);
+    assert_eq!(
+        phrase_defaults.document_granularity,
+        LanceFtsDocumentGranularity::Unspecified as i32
+    );
+    let multi_defaults = initialized_multi_match_options();
+    assert!(multi_defaults.boosts.is_null());
+    assert_eq!(multi_defaults.boost_count, 0);
+    assert_eq!(
+        multi_defaults.match_operator,
+        LanceFtsMatchOperator::Or as i32
+    );
+    let combined_defaults = initialized_combined_fields_options();
+    assert!(combined_defaults.boosts.is_null());
+    assert_eq!(combined_defaults.boost_count, 0);
+    assert_eq!(
+        combined_defaults.match_operator,
+        LanceFtsMatchOperator::Or as i32
+    );
+    let boost_defaults = initialized_boost_options();
+    assert_eq!(boost_defaults.negative_boost, 0.5);
+
+    let empty = c_str("");
+    let empty_match =
+        unsafe { lance_fts_query_match_new(empty.as_ptr(), ptr::null(), ptr::null()) };
+    assert!(!empty_match.is_null(), "{}", take_last_error_message());
+
+    let mut edge_match = initialized_match_options();
+    edge_match.boost = 0.0;
+    edge_match.fuzziness = -1;
+    edge_match.max_expansions = 0;
+    edge_match.match_operator = LanceFtsMatchOperator::And as i32;
+    edge_match.prefix_length = 2;
+    edge_match.document_granularity = LanceFtsDocumentGranularity::Row as i32;
+    let edge = c_str("rust");
+    let column = c_str("title");
+    let edge_match_query =
+        unsafe { lance_fts_query_match_new(edge.as_ptr(), column.as_ptr(), &edge_match) };
+    assert!(!edge_match_query.is_null(), "{}", take_last_error_message());
+    let mut invalid = edge_match;
+    invalid.fuzziness = -2;
+    let invalid_query =
+        unsafe { lance_fts_query_match_new(edge.as_ptr(), column.as_ptr(), &invalid) };
+    assert!(invalid_query.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("fuzziness"), "{message}");
+    invalid = edge_match;
+    invalid.match_operator = 7;
+    assert!(
+        unsafe { lance_fts_query_match_new(edge.as_ptr(), column.as_ptr(), &invalid) }.is_null()
+    );
+    assert!(take_last_error_message().contains("match_operator"));
+    invalid = edge_match;
+    invalid.document_granularity = 7;
+    assert!(
+        unsafe { lance_fts_query_match_new(edge.as_ptr(), column.as_ptr(), &invalid) }.is_null()
+    );
+    assert!(take_last_error_message().contains("document_granularity"));
+    assert!(unsafe { lance_fts_query_match_new(ptr::null(), ptr::null(), ptr::null()) }.is_null());
+    assert!(take_last_error_message().contains("terms must not be NULL"));
+
+    let mut phrase_options = initialized_phrase_options();
+    phrase_options.slop = u32::MAX;
+    phrase_options.document_granularity = LanceFtsDocumentGranularity::Row as i32;
+    let phrase =
+        unsafe { lance_fts_query_phrase_new(empty.as_ptr(), ptr::null(), &phrase_options) };
+    assert!(!phrase.is_null(), "{}", take_last_error_message());
+
+    let body_column = c_str("body");
+    let column_ptrs = [column.as_ptr(), body_column.as_ptr()];
+    let multi_options = initialized_multi_match_options();
+    let multi = unsafe {
+        lance_fts_query_multi_match_new(
+            empty.as_ptr(),
+            column_ptrs.as_ptr(),
+            column_ptrs.len(),
+            &multi_options,
+        )
+    };
+    assert!(!multi.is_null(), "{}", take_last_error_message());
+    let empty_multi = unsafe {
+        lance_fts_query_multi_match_new(empty.as_ptr(), column_ptrs.as_ptr(), 1, ptr::null())
+    };
+    assert!(!empty_multi.is_null(), "{}", take_last_error_message());
+    let multi_empty_columns =
+        unsafe { lance_fts_query_multi_match_new(edge.as_ptr(), ptr::null(), 0, ptr::null()) };
+    assert!(multi_empty_columns.is_null());
+    let message = take_last_error_message();
+    assert!(message.contains("no columns"), "{message}");
+    let one_boost = [1.0f32];
+    let mut mismatched = initialized_multi_match_options();
+    mismatched.boosts = one_boost.as_ptr();
+    mismatched.boost_count = 1;
+    assert!(
+        unsafe {
+            lance_fts_query_multi_match_new(
+                edge.as_ptr(),
+                column_ptrs.as_ptr(),
+                column_ptrs.len(),
+                &mismatched,
+            )
+        }
+        .is_null()
+    );
+    assert!(take_last_error_message().contains("number of boosts"));
+    let mut negative_multi = initialized_multi_match_options();
+    let negative_boosts = [-1.0f32, 1.0];
+    negative_multi.boosts = negative_boosts.as_ptr();
+    negative_multi.boost_count = negative_boosts.len();
+    let negative_multi_query = unsafe {
+        lance_fts_query_multi_match_new(
+            edge.as_ptr(),
+            column_ptrs.as_ptr(),
+            column_ptrs.len(),
+            &negative_multi,
+        )
+    };
+    assert!(
+        !negative_multi_query.is_null(),
+        "negative boosts are accepted by native construction and rejected by scan planning"
+    );
+
+    let mut combined_options = initialized_combined_fields_options();
+    let combined_boosts = [1.5f32, 2.0];
+    combined_options.boosts = combined_boosts.as_ptr();
+    combined_options.boost_count = combined_boosts.len();
+    let combined = unsafe {
+        lance_fts_query_combined_fields_new(
+            edge.as_ptr(),
+            column_ptrs.as_ptr(),
+            column_ptrs.len(),
+            &combined_options,
+        )
+    };
+    assert!(!combined.is_null(), "{}", take_last_error_message());
+    let empty_combined = unsafe {
+        lance_fts_query_combined_fields_new(empty.as_ptr(), column_ptrs.as_ptr(), 1, ptr::null())
+    };
+    assert!(!empty_combined.is_null(), "{}", take_last_error_message());
+    let duplicate_columns = [column.as_ptr(), column.as_ptr()];
+    assert!(
+        unsafe {
+            lance_fts_query_combined_fields_new(
+                edge.as_ptr(),
+                duplicate_columns.as_ptr(),
+                duplicate_columns.len(),
+                ptr::null(),
+            )
+        }
+        .is_null()
+    );
+    assert!(take_last_error_message().contains("unique"));
+    let mut invalid_weight = initialized_combined_fields_options();
+    let low_weight = [0.5f32, 1.0];
+    invalid_weight.boosts = low_weight.as_ptr();
+    invalid_weight.boost_count = low_weight.len();
+    assert!(
+        unsafe {
+            lance_fts_query_combined_fields_new(
+                edge.as_ptr(),
+                column_ptrs.as_ptr(),
+                column_ptrs.len(),
+                &invalid_weight,
+            )
+        }
+        .is_null()
+    );
+    assert!(take_last_error_message().contains("must be a finite value"));
+    let mut nan_weight = initialized_combined_fields_options();
+    let nan_weights = [f32::NAN, 1.0];
+    nan_weight.boosts = nan_weights.as_ptr();
+    nan_weight.boost_count = nan_weights.len();
+    assert!(
+        unsafe {
+            lance_fts_query_combined_fields_new(
+                edge.as_ptr(),
+                column_ptrs.as_ptr(),
+                column_ptrs.len(),
+                &nan_weight,
+            )
+        }
+        .is_null()
+    );
+
+    let empty_boolean = unsafe { lance_fts_query_boolean_new(ptr::null(), ptr::null(), 0) };
+    assert!(!empty_boolean.is_null(), "{}", take_last_error_message());
+    let invalid_occur = 9i32;
+    let child = [edge_match_query as *const LanceFtsQuery];
+    assert!(unsafe { lance_fts_query_boolean_new(&invalid_occur, child.as_ptr(), 1) }.is_null());
+    assert!(take_last_error_message().contains("occurs[0]"));
+    let null_child = [ptr::null::<LanceFtsQuery>()];
+    let occurs = [LanceFtsOccur::Must as i32];
+    assert!(
+        unsafe { lance_fts_query_boolean_new(occurs.as_ptr(), null_child.as_ptr(), 1) }.is_null()
+    );
+    assert!(take_last_error_message().contains("queries[0]"));
+
+    let boost = unsafe { lance_fts_query_boost_new(edge_match_query, phrase, ptr::null()) };
+    assert!(!boost.is_null(), "{}", take_last_error_message());
+    assert!(unsafe { lance_fts_query_boost_new(ptr::null(), phrase, ptr::null()) }.is_null());
+    assert!(take_last_error_message().contains("positive"));
+    assert!(
+        unsafe { lance_fts_query_boost_new(edge_match_query, ptr::null(), ptr::null()) }.is_null()
+    );
+    assert!(take_last_error_message().contains("negative"));
+
+    unsafe {
+        lance_fts_query_close(ptr::null_mut());
+        lance_fts_query_close(boost);
+        lance_fts_query_close(empty_boolean);
+        lance_fts_query_close(negative_multi_query);
+        lance_fts_query_close(combined);
+        lance_fts_query_close(empty_combined);
+        lance_fts_query_close(empty_multi);
+        lance_fts_query_close(multi);
+        lance_fts_query_close(phrase);
+        lance_fts_query_close(edge_match_query);
+        lance_fts_query_close(empty_match);
+    }
+}
+
+#[test]
+fn test_typed_fts_query_matches_native_semantics() {
+    let (_tmp, uri) = create_typed_fts_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+
+    let mut exact = initialized_match_options();
+    let exact_c = typed_match("alpha", Some("title"), &exact);
+    let exact_native = native_match_query("alpha", Some("title"), &exact);
+    assert_scores_match(
+        "exact match",
+        &collect_typed_query_scores(dataset, exact_c, None, None, None),
+        &collect_native_fts_scores(&uri, exact_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(exact_c) };
+
+    exact.match_operator = LanceFtsMatchOperator::And as i32;
+    let and_c = typed_match("alpha beta", Some("title"), &exact);
+    let and_native = native_match_query("alpha beta", Some("title"), &exact);
+    let and_scores = collect_typed_query_scores(dataset, and_c, None, None, None);
+    assert_eq!(sorted_score_ids(&and_scores), vec![1, 3]);
+    assert_scores_match(
+        "AND match",
+        &and_scores,
+        &collect_native_fts_scores(&uri, and_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(and_c) };
+
+    let mut fuzzy = initialized_match_options();
+    fuzzy.fuzziness = 1;
+    let fuzzy_c = typed_match("rust", Some("title"), &fuzzy);
+    let fuzzy_native = native_match_query("rust", Some("title"), &fuzzy);
+    let fuzzy_scores = collect_typed_query_scores(dataset, fuzzy_c, None, None, None);
+    assert_eq!(sorted_score_ids(&fuzzy_scores), vec![5, 6, 9, 10]);
+    assert_scores_match(
+        "fuzzy match",
+        &fuzzy_scores,
+        &collect_native_fts_scores(&uri, fuzzy_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(fuzzy_c) };
+
+    fuzzy.prefix_length = 1;
+    let prefix_c = typed_match("rust", Some("title"), &fuzzy);
+    let prefix_native = native_match_query("rust", Some("title"), &fuzzy);
+    let prefix_scores = collect_typed_query_scores(dataset, prefix_c, None, None, None);
+    assert_eq!(sorted_score_ids(&prefix_scores), vec![5, 6, 9]);
+    assert_scores_match(
+        "fuzzy exact-prefix match",
+        &prefix_scores,
+        &collect_native_fts_scores(&uri, prefix_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(prefix_c) };
+
+    fuzzy.prefix_length = 0;
+    fuzzy.max_expansions = 0;
+    let budget_c = typed_match("rust", Some("title"), &fuzzy);
+    let budget_native = native_match_query("rust", Some("title"), &fuzzy);
+    assert_scores_match(
+        "zero expansion budget",
+        &collect_typed_query_scores(dataset, budget_c, None, None, None),
+        &collect_native_fts_scores(&uri, budget_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(budget_c) };
+
+    fuzzy.max_expansions = 50;
+    fuzzy.fuzziness = -1;
+    let automatic_c = typed_match("rust", Some("title"), &fuzzy);
+    let automatic_native = native_match_query("rust", Some("title"), &fuzzy);
+    assert_scores_match(
+        "automatic fuzziness",
+        &collect_typed_query_scores(dataset, automatic_c, None, None, None),
+        &collect_native_fts_scores(&uri, automatic_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(automatic_c) };
+
+    let unscoped = initialized_match_options();
+    let unscoped_c = typed_match("rust", None, &unscoped);
+    let unscoped_native = native_match_query("rust", None, &unscoped);
+    assert_scores_match(
+        "unspecified match column",
+        &collect_typed_query_scores(dataset, unscoped_c, None, None, None),
+        &collect_native_fts_scores(&uri, unscoped_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(unscoped_c) };
+
+    let mut boosted = initialized_match_options();
+    boosted.boost = 2.0;
+    let boosted_c = typed_match("alpha", Some("title"), &boosted);
+    let boosted_native = native_match_query("alpha", Some("title"), &boosted);
+    let boosted_scores = collect_typed_query_scores(dataset, boosted_c, None, None, None);
+    let unboosted_c = typed_match("alpha", Some("title"), &initialized_match_options());
+    let unboosted_scores = collect_typed_query_scores(dataset, unboosted_c, None, None, None);
+    unsafe { lance_fts_query_close(unboosted_c) };
+    assert_eq!(
+        sorted_score_ids(&boosted_scores),
+        sorted_score_ids(&unboosted_scores)
+    );
+    for id in boosted_scores.keys() {
+        assert!(
+            (boosted_scores[id] - 2.0 * unboosted_scores[id]).abs() <= 1e-5,
+            "boost did not double the id {id} score"
+        );
+    }
+    assert_scores_match(
+        "match boost",
+        &boosted_scores,
+        &collect_native_fts_scores(&uri, boosted_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(boosted_c) };
+
+    let mut zero_boost = initialized_match_options();
+    zero_boost.boost = 0.0;
+    let zero_boost_c = typed_match("alpha", Some("title"), &zero_boost);
+    let zero_boost_native = native_match_query("alpha", Some("title"), &zero_boost);
+    assert_scores_match(
+        "zero boost",
+        &collect_typed_query_scores(dataset, zero_boost_c, None, None, None),
+        &collect_native_fts_scores(&uri, zero_boost_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(zero_boost_c) };
+
+    let mut row_granularity = initialized_match_options();
+    row_granularity.document_granularity = LanceFtsDocumentGranularity::Row as i32;
+    let row_granularity_c = typed_match("rust", Some("title"), &row_granularity);
+    let row_granularity_native = native_match_query("rust", Some("title"), &row_granularity);
+    assert_scores_match(
+        "explicit row granularity",
+        &collect_typed_query_scores(dataset, row_granularity_c, None, None, None),
+        &collect_native_fts_scores(&uri, row_granularity_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(row_granularity_c) };
+
+    let mut phrase_options = initialized_phrase_options();
+    let phrase_c = typed_phrase("alpha beta", Some("title"), &phrase_options);
+    let phrase_native = native_phrase_query("alpha beta", Some("title"), &phrase_options);
+    let phrase_scores = collect_typed_query_scores(dataset, phrase_c, None, None, None);
+    assert_eq!(sorted_score_ids(&phrase_scores), vec![1, 3]);
+    assert_scores_match(
+        "phrase",
+        &phrase_scores,
+        &collect_native_fts_scores(&uri, phrase_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(phrase_c) };
+
+    phrase_options.slop = 1;
+    let slop_c = typed_phrase("alpha beta", Some("title"), &phrase_options);
+    let slop_native = native_phrase_query("alpha beta", Some("title"), &phrase_options);
+    assert_scores_match(
+        "phrase slop",
+        &collect_typed_query_scores(dataset, slop_c, None, None, None),
+        &collect_native_fts_scores(&uri, slop_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(slop_c) };
+
+    let must = typed_match("alpha", Some("title"), &initialized_match_options());
+    let should = typed_match("rust", Some("body"), &initialized_match_options());
+    let must_not = typed_match("delta", Some("body"), &initialized_match_options());
+    let boolean = typed_boolean(&[
+        (LanceFtsOccur::Must, must),
+        (LanceFtsOccur::Should, should),
+        (LanceFtsOccur::MustNot, must_not),
+    ]);
+    let boolean_native = native_boolean_query(vec![
+        (
+            Occur::Must,
+            native_match_query("alpha", Some("title"), &initialized_match_options()),
+        ),
+        (
+            Occur::Should,
+            native_match_query("rust", Some("body"), &initialized_match_options()),
+        ),
+        (
+            Occur::MustNot,
+            native_match_query("delta", Some("body"), &initialized_match_options()),
+        ),
+    ]);
+    let boolean_scores = collect_typed_query_scores(dataset, boolean, None, None, None);
+    assert_eq!(sorted_score_ids(&boolean_scores), vec![1, 3]);
+    assert!(
+        boolean_scores[&1] > boolean_scores[&3],
+        "SHOULD clause must contribute its score"
+    );
+    assert_scores_match(
+        "mixed boolean",
+        &boolean_scores,
+        &collect_native_fts_scores(&uri, boolean_native.clone(), None),
+    );
+    unsafe {
+        lance_fts_query_close(must);
+        lance_fts_query_close(should);
+        lance_fts_query_close(must_not);
+        lance_fts_query_close(boolean);
+    }
+
+    let nested_must = typed_match("alpha", Some("title"), &initialized_match_options());
+    let nested_beta = typed_match("beta", Some("title"), &initialized_match_options());
+    let nested_gamma = typed_match("gamma", Some("title"), &initialized_match_options());
+    let nested_should = typed_boolean(&[
+        (LanceFtsOccur::Should, nested_beta),
+        (LanceFtsOccur::Should, nested_gamma),
+    ]);
+    let nested = typed_boolean(&[
+        (LanceFtsOccur::Must, nested_must),
+        (LanceFtsOccur::Must, nested_should),
+    ]);
+    let nested_native = native_boolean_query(vec![
+        (
+            Occur::Must,
+            native_match_query("alpha", Some("title"), &initialized_match_options()),
+        ),
+        (
+            Occur::Must,
+            native_boolean_query(vec![
+                (
+                    Occur::Should,
+                    native_match_query("beta", Some("title"), &initialized_match_options()),
+                ),
+                (
+                    Occur::Should,
+                    native_match_query("gamma", Some("title"), &initialized_match_options()),
+                ),
+            ]),
+        ),
+    ]);
+    let nested_scores = collect_typed_query_scores(dataset, nested, None, None, None);
+    assert_eq!(sorted_score_ids(&nested_scores), vec![1, 3]);
+    assert_scores_match(
+        "nested boolean",
+        &nested_scores,
+        &collect_native_fts_scores(&uri, nested_native.clone(), None),
+    );
+    unsafe {
+        lance_fts_query_close(nested_must);
+        lance_fts_query_close(nested_beta);
+        lance_fts_query_close(nested_gamma);
+        lance_fts_query_close(nested_should);
+        lance_fts_query_close(nested);
+    }
+
+    let should_alpha = typed_match("alpha", Some("title"), &initialized_match_options());
+    let should_rust = typed_match("rust", Some("title"), &initialized_match_options());
+    let should_only = typed_boolean(&[
+        (LanceFtsOccur::Should, should_alpha),
+        (LanceFtsOccur::Should, should_rust),
+    ]);
+    let should_only_native = native_boolean_query(vec![
+        (
+            Occur::Should,
+            native_match_query("alpha", Some("title"), &initialized_match_options()),
+        ),
+        (
+            Occur::Should,
+            native_match_query("rust", Some("title"), &initialized_match_options()),
+        ),
+    ]);
+    assert_scores_match(
+        "should-only boolean",
+        &collect_typed_query_scores(dataset, should_only, None, None, None),
+        &collect_native_fts_scores(&uri, should_only_native.clone(), None),
+    );
+    unsafe {
+        lance_fts_query_close(should_alpha);
+        lance_fts_query_close(should_rust);
+        lance_fts_query_close(should_only);
+    }
+
+    let positive = typed_match("alpha", Some("title"), &initialized_match_options());
+    let negative = typed_match("beta", Some("title"), &initialized_match_options());
+    let mut boost_options = initialized_boost_options();
+    boost_options.negative_boost = 0.5;
+    let boost = typed_boost(positive, negative, &boost_options);
+    let boost_native = native_boost_query(
+        native_match_query("alpha", Some("title"), &initialized_match_options()),
+        native_match_query("beta", Some("title"), &initialized_match_options()),
+        &boost_options,
+    );
+    let boost_scores = collect_typed_query_scores(dataset, boost, None, None, None);
+    assert_eq!(sorted_score_ids(&boost_scores), vec![1, 2, 3]);
+    let positive_scores = collect_typed_query_scores(dataset, positive, None, None, None);
+    assert!(
+        boost_scores[&1] < positive_scores[&1],
+        "negative child must reduce a matching positive score"
+    );
+    assert!(
+        (boost_scores[&2] - positive_scores[&2]).abs() <= 1e-6,
+        "negative child must not change a non-matching positive score"
+    );
+    assert_scores_match(
+        "boost query",
+        &boost_scores,
+        &collect_native_fts_scores(&uri, boost_native.clone(), None),
+    );
+    unsafe {
+        lance_fts_query_close(positive);
+        lance_fts_query_close(negative);
+        lance_fts_query_close(boost);
+    }
+
+    let multi_options = initialized_multi_match_options();
+    let multi = typed_multi_match("rust", &["title", "body"], &multi_options);
+    let multi_native = native_multi_match_query("rust", &["title", "body"], &multi_options);
+    let multi_scores = collect_typed_query_scores(dataset, multi, None, None, None);
+    assert_eq!(sorted_score_ids(&multi_scores), vec![1, 2, 5, 6]);
+    assert_scores_match(
+        "multi match",
+        &multi_scores,
+        &collect_native_fts_scores(&uri, multi_native.clone(), None),
+    );
+    let title_match = typed_match("rust", Some("title"), &initialized_match_options());
+    let body_match = typed_match("rust", Some("body"), &initialized_match_options());
+    let title_scores = collect_typed_query_scores(dataset, title_match, None, None, None);
+    let body_scores = collect_typed_query_scores(dataset, body_match, None, None, None);
+    for id in multi_scores.keys() {
+        let title_score = title_scores.get(id).copied().unwrap_or(0.0);
+        let body_score = body_scores.get(id).copied().unwrap_or(0.0);
+        assert!(
+            (multi_scores[id] - title_score.max(body_score)).abs() <= 1e-6,
+            "multi match must retain the maximum independent field score for id {id}"
+        );
+    }
+    unsafe {
+        lance_fts_query_close(title_match);
+        lance_fts_query_close(body_match);
+        lance_fts_query_close(multi);
+    }
+
+    let mut multi_boosted_options = initialized_multi_match_options();
+    let multi_boosts = [2.0f32, 1.0];
+    multi_boosted_options.boosts = multi_boosts.as_ptr();
+    multi_boosted_options.boost_count = multi_boosts.len();
+    let multi_boosted = typed_multi_match("rust", &["title", "body"], &multi_boosted_options);
+    let multi_boosted_native =
+        native_multi_match_query("rust", &["title", "body"], &multi_boosted_options);
+    let multi_boosted_scores = collect_typed_query_scores(dataset, multi_boosted, None, None, None);
+    assert_scores_match(
+        "boosted multi match",
+        &multi_boosted_scores,
+        &collect_native_fts_scores(&uri, multi_boosted_native.clone(), None),
+    );
+    assert!(
+        (multi_boosted_scores[&5] - 2.0 * multi_scores[&5]).abs() <= 1e-5,
+        "per-field boost must affect the retained best-field score"
+    );
+    unsafe { lance_fts_query_close(multi_boosted) };
+
+    let mut multi_and_options = initialized_multi_match_options();
+    multi_and_options.match_operator = LanceFtsMatchOperator::And as i32;
+    let multi_and = typed_multi_match("alpha beta", &["title", "body"], &multi_and_options);
+    let multi_and_native =
+        native_multi_match_query("alpha beta", &["title", "body"], &multi_and_options);
+    let multi_and_scores = collect_typed_query_scores(dataset, multi_and, None, None, None);
+    assert_eq!(sorted_score_ids(&multi_and_scores), vec![1, 3]);
+    assert_scores_match(
+        "AND multi match",
+        &multi_and_scores,
+        &collect_native_fts_scores(&uri, multi_and_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(multi_and) };
+
+    let combined_options = initialized_combined_fields_options();
+    let combined = typed_combined_fields("rust", &["title", "body"], &combined_options);
+    let combined_native =
+        native_combined_fields_query("rust", &["title", "body"], &combined_options);
+    let combined_scores = collect_typed_query_scores(dataset, combined, None, None, None);
+    assert_eq!(sorted_score_ids(&combined_scores), vec![1, 2, 5, 6]);
+    assert_scores_match(
+        "combined fields",
+        &combined_scores,
+        &collect_native_fts_scores(&uri, combined_native.clone(), None),
+    );
+    assert!(
+        combined_scores
+            .iter()
+            .any(|(id, score)| (*score - multi_scores[id]).abs() > 1e-6),
+        "BM25F scores must differ from independent best-field scores"
+    );
+    unsafe { lance_fts_query_close(combined) };
+
+    let mut combined_weighted_options = initialized_combined_fields_options();
+    let combined_weights = [2.0f32, 1.0];
+    combined_weighted_options.boosts = combined_weights.as_ptr();
+    combined_weighted_options.boost_count = combined_weights.len();
+    let combined_weighted =
+        typed_combined_fields("rust", &["title", "body"], &combined_weighted_options);
+    let combined_weighted_native =
+        native_combined_fields_query("rust", &["title", "body"], &combined_weighted_options);
+    assert_scores_match(
+        "weighted combined fields",
+        &collect_typed_query_scores(dataset, combined_weighted, None, None, None),
+        &collect_native_fts_scores(&uri, combined_weighted_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(combined_weighted) };
+
+    let mut combined_and_options = initialized_combined_fields_options();
+    combined_and_options.match_operator = LanceFtsMatchOperator::And as i32;
+    let combined_and =
+        typed_combined_fields("alpha beta", &["title", "body"], &combined_and_options);
+    let combined_and_native =
+        native_combined_fields_query("alpha beta", &["title", "body"], &combined_and_options);
+    let combined_and_scores = collect_typed_query_scores(dataset, combined_and, None, None, None);
+    // Unlike MultiMatch, CombinedFields treats columns as one virtual field,
+    // so a term may match in a different column from its sibling.
+    assert_eq!(sorted_score_ids(&combined_and_scores), vec![1, 3, 4]);
+    assert_scores_match(
+        "AND combined fields",
+        &combined_and_scores,
+        &collect_native_fts_scores(&uri, combined_and_native.clone(), None),
+    );
+    unsafe { lance_fts_query_close(combined_and) };
+
+    let combined_child = typed_combined_fields(
+        "rust",
+        &["title", "body"],
+        &initialized_combined_fields_options(),
+    );
+    let lance_child = typed_match("lance", Some("body"), &initialized_match_options());
+    let nested_combined = typed_boolean(&[
+        (LanceFtsOccur::Must, combined_child),
+        (LanceFtsOccur::Must, lance_child),
+    ]);
+    let nested_combined_native = native_boolean_query(vec![
+        (
+            Occur::Must,
+            native_combined_fields_query(
+                "rust",
+                &["title", "body"],
+                &initialized_combined_fields_options(),
+            ),
+        ),
+        (
+            Occur::Must,
+            native_match_query("lance", Some("body"), &initialized_match_options()),
+        ),
+    ]);
+    let nested_combined_scores =
+        collect_typed_query_scores(dataset, nested_combined, None, None, None);
+    assert_eq!(sorted_score_ids(&nested_combined_scores), vec![5]);
+    assert_scores_match(
+        "combined fields inside boolean",
+        &nested_combined_scores,
+        &collect_native_fts_scores(&uri, nested_combined_native.clone(), None),
+    );
+    unsafe {
+        lance_fts_query_close(combined_child);
+        lance_fts_query_close(lance_child);
+        lance_fts_query_close(nested_combined);
+    }
+
+    let empty_boolean = unsafe { lance_fts_query_boolean_new(ptr::null(), ptr::null(), 0) };
+    assert!(!empty_boolean.is_null());
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query(scanner, empty_boolean) },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("FTS query must contain at least one leaf query"),
+        "{message}"
+    );
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_fts_query_close(empty_boolean);
+    }
+
+    let negative_child = typed_match("delta", Some("body"), &initialized_match_options());
+    let negative_only = typed_boolean(&[(LanceFtsOccur::MustNot, negative_child)]);
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query(scanner, negative_only) },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("boolean query must have at least one should/must query"),
+        "{message}"
+    );
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_fts_query_close(negative_child);
+        lance_fts_query_close(negative_only);
+    }
+
+    let mut invalid_match = initialized_match_options();
+    invalid_match.boost = -1.0;
+    let invalid_match_query = typed_match("alpha", Some("title"), &invalid_match);
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query(scanner, invalid_match_query) },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    assert!(take_last_error_message().contains("MatchQuery boost"));
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_fts_query_close(invalid_match_query);
+    }
+
+    let invalid_negative = used_negative_boost(&mut boost_options);
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query(scanner, invalid_negative) },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    assert!(take_last_error_message().contains("BoostQuery negative_boost"));
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_fts_query_close(invalid_negative);
+    }
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+fn used_negative_boost(options: &mut LanceFtsBoostOptions) -> *mut LanceFtsQuery {
+    options.negative_boost = -1.0;
+    let positive = typed_match("alpha", Some("title"), &initialized_match_options());
+    let negative = typed_match("beta", Some("title"), &initialized_match_options());
+    let query = typed_boost(positive, negative, options);
+    unsafe {
+        lance_fts_query_close(positive);
+        lance_fts_query_close(negative);
+    }
+    query
+}
+
+#[test]
+fn test_typed_fts_query_ownership_filters_and_replacement() {
+    let (_tmp, uri) = create_typed_fts_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+
+    let must = typed_match("alpha", Some("title"), &initialized_match_options());
+    let should = typed_match("beta", Some("title"), &initialized_match_options());
+    let must_not = typed_match("delta", Some("body"), &initialized_match_options());
+    let boolean = typed_boolean(&[
+        (LanceFtsOccur::Must, must),
+        (LanceFtsOccur::Should, should),
+        (LanceFtsOccur::MustNot, must_not),
+    ]);
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query(scanner, boolean) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    // Children and the top-level tree are snapshotted by the scanner.
+    unsafe {
+        lance_fts_query_close(must);
+        lance_fts_query_close(should);
+        lance_fts_query_close(must_not);
+        lance_fts_query_close(boolean);
+    }
+    let early_release_scores = collect_scanner_typed_scores(scanner);
+    assert_eq!(sorted_score_ids(&early_release_scores), vec![1, 3]);
+    unsafe { lance_scanner_close(scanner) };
+
+    let first = typed_match("alpha", Some("title"), &initialized_match_options());
+    let second = typed_match("rust", Some("title"), &initialized_match_options());
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(unsafe { lance_scanner_set_fts_query(scanner, first) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_fts_query(scanner, second) }, 0);
+    unsafe {
+        lance_fts_query_close(first);
+        lance_fts_query_close(second);
+    }
+    assert_eq!(
+        sorted_score_ids(&collect_scanner_typed_scores(scanner)),
+        vec![5, 6]
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let previous = typed_match("alpha", Some("title"), &initialized_match_options());
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(unsafe { lance_scanner_set_fts_query(scanner, previous) }, 0);
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query(scanner, ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("query must not be NULL"));
+    assert_eq!(
+        sorted_score_ids(&collect_scanner_typed_scores(scanner)),
+        vec![1, 2, 3]
+    );
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_fts_query_close(previous);
+    }
+
+    let typed = typed_match("alpha", Some("title"), &initialized_match_options());
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(unsafe { lance_scanner_set_fts_query(scanner, typed) }, 0);
+    let replacement = c_str("delta");
+    assert_eq!(
+        unsafe { lance_scanner_full_text_search(scanner, replacement.as_ptr(), ptr::null(), 0) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let string_scores = collect_scanner_typed_scores(scanner);
+    assert_eq!(sorted_score_ids(&string_scores), vec![2, 8]);
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_fts_query_close(typed);
+    }
+
+    let filter = c_str("category = 'a'");
+    let multi = typed_multi_match(
+        "rust",
+        &["title", "body"],
+        &initialized_multi_match_options(),
+    );
+    let filtered_scores = collect_typed_query_scores(dataset, multi, Some(&filter), None, None);
+    assert_eq!(sorted_score_ids(&filtered_scores), vec![1, 5]);
+    assert_scores_match(
+        "SQL filter",
+        &filtered_scores,
+        &collect_native_fts_scores(
+            &uri,
+            native_multi_match_query(
+                "rust",
+                &["title", "body"],
+                &initialized_multi_match_options(),
+            ),
+            Some("category = 'a'"),
+        ),
+    );
+
+    let full_scores = collect_typed_query_scores(dataset, multi, None, None, None);
+    let row_metadata = collect_native_row_metadata(&uri);
+    let allowlisted = [row_metadata[&1].0, row_metadata[&6].0];
+    let allowlisted_scores =
+        collect_typed_query_scores(dataset, multi, None, Some(&allowlisted), None);
+    assert_eq!(sorted_score_ids(&allowlisted_scores), vec![1, 6]);
+    for (id, score) in &allowlisted_scores {
+        assert_eq!(*score, full_scores[id]);
+    }
+
+    let first_fragment = row_metadata[&1].1 >> 32;
+    assert!(
+        row_metadata
+            .values()
+            .any(|(_, address)| (*address >> 32) != first_fragment),
+        "fixture must contain more than one fragment"
+    );
+    let fragment_scores =
+        collect_typed_query_scores(dataset, multi, None, None, Some(&[first_fragment]));
+    assert_eq!(sorted_score_ids(&fragment_scores), vec![1, 2]);
+    unsafe { lance_fts_query_close(multi) };
+
+    let context = unsafe {
+        lance_dataset_prepare_fts_match_query(
+            dataset,
+            c_str("title").as_ptr(),
+            c_str("rust").as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!context.is_null(), "{}", take_last_error_message());
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+        0
+    );
+    let typed = typed_match("alpha", Some("title"), &initialized_match_options());
+    assert_eq!(unsafe { lance_scanner_set_fts_query(scanner, typed) }, -1);
+    assert!(
+        take_last_error_message().contains("FTS query context"),
+        "typed installation must preserve the prepared-context exclusion"
+    );
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_fts_query_close(typed);
+        lance_fts_query_context_close(context);
+    }
+
+    unsafe { lance_dataset_close(dataset) };
 }
 
 fn collect_context_fts_scores(
