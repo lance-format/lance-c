@@ -212,7 +212,7 @@ grep -q 'All C tests passed!' "$LOG_DIR/40-native-consumers.log" \
     || fail "consumer_assertion" "C consumer completion marker is missing"
 grep -q 'All C++ tests passed!' "$LOG_DIR/40-native-consumers.log" \
     || fail "consumer_assertion" "C++ consumer completion marker is missing"
-cleanup_markers="$(grep -o 'test_cleanup_and_lifecycle\\.\\.\\. OK' \
+cleanup_markers="$(grep -F -o 'test_cleanup_and_lifecycle... OK' \
     "$LOG_DIR/40-native-consumers.log" | wc -l)"
 [[ "$cleanup_markers" -ge 2 ]] \
     || fail "consumer_assertion" "C and C++ cleanup probes did not both execute"
