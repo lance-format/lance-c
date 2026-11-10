@@ -349,7 +349,7 @@ const char* lance_dataset_metadata_json(const LanceDataset* dataset);
  * follow the pinned Lance core.
  *
  * Caller must free the returned JSON string with `lance_free_string()`.
- * Returns NULL on error; on error the dataset's committed state is unchanged.
+ * Returns NULL on error. Commit and error semantics follow the native core.
  */
 const char* lance_dataset_update_metadata_json(
     LanceDataset* dataset,
@@ -369,7 +369,7 @@ const char* lance_dataset_update_metadata_json(
  * metadata through the Arrow schema returned by `lance_dataset_schema()`.
  *
  * Caller must free the returned JSON string with `lance_free_string()`.
- * Returns NULL on error; on error the dataset's committed state is unchanged.
+ * Returns NULL on error. Commit and error semantics follow the native core.
  */
 const char* lance_dataset_update_schema_metadata_json(
     LanceDataset* dataset,
