@@ -7,7 +7,8 @@
  *
  * Tests the RAII wrappers, exception handling, and builder pattern.
  *
- * Usage: test_cpp_api <dataset_uri> <write_uri> <blob_uri>
+ * Usage: test_cpp_api <dataset_uri> <write_uri> <blob_uri> <ordering_uri>
+ *                     <fragment_uri>
  */
 
 #include "lance/lance.hpp"

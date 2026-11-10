@@ -374,8 +374,9 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
 }
 
 /// Run a compiled test binary with the source dataset URI, a destination URI
-/// for the write test, the URI of a Blob v2 dataset, and the ordering dataset.
-/// The destination path must not pre-exist.
+/// for the write test, the URIs of the Blob v2 and ordering datasets, and the
+/// nested-schema dataset with fragment deletions. The destination path must not
+/// pre-exist.
 fn run_test_binary(
     binary: &Path,
     dataset_uri: &str,

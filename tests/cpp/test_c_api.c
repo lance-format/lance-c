@@ -8,7 +8,8 @@
  * This file is compiled by the Rust integration test to verify that
  * lance.h is valid C and the API works end-to-end.
  *
- * Usage: test_c_api <dataset_uri> <write_uri> <blob_uri>
+ * Usage: test_c_api <dataset_uri> <write_uri> <blob_uri> <ordering_uri>
+ *                    <fragment_uri>
  */
 
 #include "lance/lance.h"
