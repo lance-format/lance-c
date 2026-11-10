@@ -3176,14 +3176,17 @@ unsafe fn scanner_set_use_index_inner(scanner: *mut LanceScanner, enable: bool) 
     Ok(0)
 }
 
-/// Configure indexed-only vector search.
+/// Configure native indexed-only fast search.
 ///
-/// When enabled, the scanner calls Lance's native `fast_search()` before the
-/// nearest query and explicit `use_index` setting are applied. Native
-/// fast-search semantics therefore determine the result, including weak index
-/// consistency, absence of a flat fallback for unindexed fragments, and an
-/// empty outcome when no usable index is selected. Disabling restores the
-/// default native behavior. Must be set before the scan starts.
+/// This weak-consistency mode applies to vector queries, scalar-indexed filters
+/// and full-text search. Index-backed paths can omit unindexed data. Ordinary
+/// scans and non-indexable expressions follow native planning.
+///
+/// Lance's native `fast_search()` is applied before the nearest query and
+/// explicit `use_index` setting. For vector queries, unindexed fragments are
+/// omitted and the result is empty without a usable index, including when
+/// `use_index=false`. Disabling restores the default native behavior.
+/// Disabled by default. Must be set before the scan starts.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_fast_search(
     scanner: *mut LanceScanner,

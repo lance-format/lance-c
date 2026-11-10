@@ -1763,8 +1763,10 @@ public:
         if (lance_scanner_set_use_index(handle_.get(), enable) != 0) check_error();
         return *this;
     }
-    /// Use native indexed-only fast search, which omits unindexed rows and
-    /// never enables a flat fallback. Disabled by default. See lance.h.
+    /// Use native indexed-only fast search for vector queries, scalar-indexed
+    /// filters and full-text search. Index-backed paths can omit unindexed data.
+    /// Ordinary scans and non-indexable expressions follow native planning.
+    /// Disabled by default. See lance.h.
     Scanner& fast_search(bool enable = true) {
         if (lance_scanner_set_fast_search(handle_.get(), enable) != 0) check_error();
         return *this;

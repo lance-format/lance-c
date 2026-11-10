@@ -2361,15 +2361,18 @@ int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);
 int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
 
 /**
- * Configure indexed-only fast vector search.
+ * Configure native indexed-only fast search.
  *
- * When enabled, Lance's native `fast_search()` is applied before the nearest
- * query and explicit `use_index` setting. This is a weak-consistency search over
- * indexed data only: unindexed fragments are not read through a flat fallback,
- * and the native result is empty when no usable index is selected. Explicit
- * `use_index=false` remains effective and produces the same indexed-only
- * outcome rather than restoring fallback. Disabling restores the default native
- * behavior. Must be set before the scan starts.
+ * This weak-consistency mode applies to vector queries, scalar-indexed filters
+ * and full-text search. Index-backed paths can omit unindexed data. Ordinary
+ * scans and expressions without an indexable path follow the native planner's
+ * behavior.
+ *
+ * Lance's native `fast_search()` is applied before the nearest query and
+ * explicit `use_index` setting. For vector queries, unindexed fragments are
+ * omitted and the result is empty when no usable index is selected, including
+ * when `use_index=false`. Disabling restores the default native behavior.
+ * Disabled by default. Must be set before the scan starts.
  *
  * Passing NULL scanner or setting this after scanning starts returns -1 and
  * leaves the prior state unchanged.
