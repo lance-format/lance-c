@@ -3873,7 +3873,7 @@ fn arrow_field_at_path<'a>(schema: &'a Schema, path: &str) -> &'a Field {
         .split_first()
         .expect("field path must not be empty");
     let field = schema
-        .field_with_name(*first)
+        .field_with_name(first)
         .unwrap_or_else(|_| panic!("missing field {first}"));
     descend(field, remaining)
 }
@@ -4009,7 +4009,7 @@ fn assert_field_invalid_argument(rc: i32, expected_message: &str) {
 fn test_dataset_field_metadata_batch_matches_native_builder() {
     let (_c_tmp, c_uri) = create_fragment_snapshot_dataset(false);
     let (_native_tmp, native_uri) = create_fragment_snapshot_dataset(false);
-    let (c_uri_c, native_uri_c) = (c_str(&c_uri), c_str(&native_uri));
+    let c_uri_c = c_str(&c_uri);
     let ds = unsafe { lance_dataset_open(c_uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!ds.is_null());
     let mut native = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
@@ -4554,13 +4554,13 @@ fn test_dataset_snapshot_inspection_matches_native() {
         );
     }
 
-    let mut stable = true;
+    let stable = true;
     assert_field_invalid_argument(
         unsafe { lance_dataset_has_stable_row_ids(ds, ptr::null_mut()) },
         "out_has_stable_row_ids must not be NULL",
     );
     assert!(stable);
-    let mut count = usize::MAX;
+    let count = usize::MAX;
     assert_field_invalid_argument(
         unsafe { lance_dataset_field_id_count(ds, ptr::null_mut()) },
         "out_count must not be NULL",
