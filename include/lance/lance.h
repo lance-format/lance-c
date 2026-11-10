@@ -330,7 +330,9 @@ uint64_t lance_version_id(const LanceVersion* version);
  * lance_last_error_code()).
  *
  * The i64 nanosecond representation covers 1677-09-21 through 2262-04-11 UTC.
- * A timestamp outside that range fails snapshot creation instead of truncating.
+ * A timestamp outside that range makes this accessor return 0 with
+ * LANCE_ERR_INVALID_ARGUMENT. Snapshot creation and millisecond reads retain
+ * the native timestamp range.
  */
 int64_t lance_version_timestamp_ns(const LanceVersion* version);
 
@@ -563,6 +565,8 @@ int32_t lance_tag_branch(
 /**
  * Report the optional creation timestamp as Unix epoch nanoseconds.
  * Returns 1 when present, 0 when absent, or -1 on error.
+ * A present timestamp outside the i64 nanosecond range returns -1 with
+ * LANCE_ERR_INVALID_ARGUMENT. On absence or error, the output is unchanged.
  */
 int32_t lance_tag_created_at_ns(
     const LanceTag* tag,
@@ -572,6 +576,8 @@ int32_t lance_tag_created_at_ns(
 /**
  * Report the optional update timestamp as Unix epoch nanoseconds.
  * Returns 1 when present, 0 when absent, or -1 on error.
+ * A present timestamp outside the i64 nanosecond range returns -1 with
+ * LANCE_ERR_INVALID_ARGUMENT. On absence or error, the output is unchanged.
  */
 int32_t lance_tag_updated_at_ns(
     const LanceTag* tag,

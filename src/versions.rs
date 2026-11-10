@@ -24,8 +24,7 @@ use crate::runtime::block_on;
 /// One copied dataset-version snapshot.
 pub struct LanceVersion {
     id: u64,
-    timestamp_ms: i64,
-    timestamp_ns: i64,
+    timestamp: DateTime<Utc>,
     metadata: Vec<MetadataEntry>,
 }
 
@@ -43,8 +42,7 @@ impl LanceVersion {
         } = version;
         Ok(Self {
             id: version,
-            timestamp_ms: timestamp.timestamp_millis(),
-            timestamp_ns: timestamp_ns(&timestamp, "dataset version")?,
+            timestamp,
             metadata: metadata_entries(metadata, "dataset version")?,
         })
     }
@@ -70,8 +68,8 @@ pub struct LanceTag {
     name: CString,
     branch: Option<CString>,
     version: u64,
-    created_at_ns: Option<i64>,
-    updated_at_ns: Option<i64>,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
     manifest_size: u64,
     metadata: Vec<MetadataEntry>,
 }
@@ -89,22 +87,14 @@ impl LanceTag {
         let branch = branch
             .map(|branch| c_string(branch, "tag branch"))
             .transpose()?;
-        let created_at_ns = created_at
-            .as_ref()
-            .map(|timestamp| timestamp_ns(timestamp, "tag created_at"))
-            .transpose()?;
-        let updated_at_ns = updated_at
-            .as_ref()
-            .map(|timestamp| timestamp_ns(timestamp, "tag updated_at"))
-            .transpose()?;
         let mut metadata = metadata.into_iter().collect::<Vec<_>>();
         metadata.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(Self {
             name: c_string(name, "tag name")?,
             branch,
             version,
-            created_at_ns,
-            updated_at_ns,
+            created_at,
+            updated_at,
             manifest_size: manifest_size as u64,
             metadata: metadata_entries(metadata, "tag")?,
         })
@@ -265,7 +255,7 @@ pub unsafe extern "C" fn lance_version_id(version: *const LanceVersion) -> u64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_version_timestamp_ns(version: *const LanceVersion) -> i64 {
     ffi_try!(
-        unsafe { Ok::<_, lance_core::Error>(version_at(version)?.timestamp_ns) },
+        unsafe { timestamp_ns(&version_at(version)?.timestamp, "dataset version") },
         0
     )
 }
@@ -384,7 +374,13 @@ pub unsafe extern "C" fn lance_versions_timestamp_ms_at(
     index: usize,
 ) -> i64 {
     ffi_try!(
-        unsafe { Ok::<_, lance_core::Error>(version_entry_at(versions, index)?.timestamp_ms) },
+        unsafe {
+            Ok::<_, lance_core::Error>(
+                version_entry_at(versions, index)?
+                    .timestamp
+                    .timestamp_millis(),
+            )
+        },
         0
     )
 }
@@ -786,7 +782,11 @@ pub unsafe extern "C" fn lance_tag_created_at_ns(
     out_timestamp_ns: *mut i64,
 ) -> i32 {
     ffi_try!(
-        unsafe { tag_timestamp_inner(tag, out_timestamp_ns, |tag| tag.created_at_ns) },
+        unsafe {
+            tag_timestamp_inner(tag, out_timestamp_ns, "tag created_at", |tag| {
+                tag.created_at
+            })
+        },
         neg
     )
 }
@@ -799,7 +799,11 @@ pub unsafe extern "C" fn lance_tag_updated_at_ns(
     out_timestamp_ns: *mut i64,
 ) -> i32 {
     ffi_try!(
-        unsafe { tag_timestamp_inner(tag, out_timestamp_ns, |tag| tag.updated_at_ns) },
+        unsafe {
+            tag_timestamp_inner(tag, out_timestamp_ns, "tag updated_at", |tag| {
+                tag.updated_at
+            })
+        },
         neg
     )
 }
@@ -807,7 +811,8 @@ pub unsafe extern "C" fn lance_tag_updated_at_ns(
 unsafe fn tag_timestamp_inner(
     tag: *const LanceTag,
     out_timestamp_ns: *mut i64,
-    timestamp: impl FnOnce(&LanceTag) -> Option<i64>,
+    context: &str,
+    timestamp: impl FnOnce(&LanceTag) -> Option<DateTime<Utc>>,
 ) -> Result<i32> {
     if out_timestamp_ns.is_null() {
         return Err(invalid("out_timestamp_ns must not be NULL"));
@@ -815,6 +820,7 @@ unsafe fn tag_timestamp_inner(
     let tag = unsafe { tag_at(tag)? };
     match timestamp(tag) {
         Some(value) => {
+            let value = timestamp_ns(&value, context)?;
             unsafe { std::ptr::write(out_timestamp_ns, value) };
             Ok(1)
         }

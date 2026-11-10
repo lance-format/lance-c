@@ -115,7 +115,8 @@ struct VersionDetails {
     std::map<std::string, std::string> metadata;
 };
 
-/// Copied native TagContents plus its tag name.
+/// Copied native TagContents plus its tag name. Present timestamps must fit
+/// i64 nanoseconds; tag readers throw lance::Error when they do not.
 struct TagInfo {
     std::string name;
     std::optional<std::string> branch;
@@ -652,7 +653,8 @@ public:
     }
 
     /// Current version details, including native nanosecond timestamp and
-    /// manifest-summary metadata. Throws lance::Error on failure.
+    /// manifest-summary metadata. Timestamps must fit i64 nanoseconds.
+    /// Throws lance::Error on failure.
     VersionDetails current_version() const {
         auto* raw = lance_dataset_current_version(handle_.get());
         if (!raw) check_error();
@@ -661,7 +663,8 @@ public:
     }
 
     /// Full version-history details ordered by version id. Each entry contains
-    /// native nanosecond precision and manifest-summary metadata.
+    /// native nanosecond precision and manifest-summary metadata. Timestamps
+    /// must fit i64 nanoseconds; versions() retains millisecond precision.
     std::vector<VersionDetails> version_details() const {
         auto* raw = lance_dataset_versions(handle_.get());
         if (!raw) check_error();

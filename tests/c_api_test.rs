@@ -4006,7 +4006,10 @@ fn test_version_snapshots_preserve_out_of_range_timestamps() {
     let ds = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
     assert!(!ds.is_null());
     let versions = unsafe { lance_dataset_versions(ds) };
-    assert!(!versions.is_null(), "native-valid timestamps must remain listable");
+    assert!(
+        !versions.is_null(),
+        "native-valid timestamps must remain listable"
+    );
     assert_eq!(unsafe { lance_versions_count(versions) }, 2);
     assert_eq!(unsafe { lance_versions_id_at(versions, 1) }, 2);
     assert_eq!(
@@ -4066,10 +4069,16 @@ fn test_tag_snapshots_preserve_out_of_range_timestamps() {
     for snapshot in [tag.cast_const(), listed] {
         assert!(!snapshot.is_null());
         let mut timestamp = 77;
-        assert_eq!(unsafe { lance_tag_created_at_ns(snapshot, &mut timestamp) }, -1);
+        assert_eq!(
+            unsafe { lance_tag_created_at_ns(snapshot, &mut timestamp) },
+            -1
+        );
         assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
         assert_eq!(timestamp, 77);
-        assert_eq!(unsafe { lance_tag_updated_at_ns(snapshot, &mut timestamp) }, -1);
+        assert_eq!(
+            unsafe { lance_tag_updated_at_ns(snapshot, &mut timestamp) },
+            -1
+        );
         assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
         assert_eq!(timestamp, 77);
         assert_eq!(unsafe { lance_tag_version(snapshot) }, 2);

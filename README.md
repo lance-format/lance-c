@@ -518,6 +518,8 @@ auto tags = ds.tags();
 `lance_dataset_tags()` return copied snapshots. They remain valid after the
 originating dataset handle is closed. Timestamp accessors expose native
 nanosecond precision; the existing millisecond version accessor is unchanged.
+Nanosecond accessors report an error when a timestamp does not fit i64
+nanoseconds. Snapshot creation and millisecond reads retain the native range.
 There is no C-side timestamp/asof selector.
 
 ## Releasing
