@@ -130,6 +130,41 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a two-fragment dataset with a B-tree index for session cache tests.
+fn create_session_cache_dataset_on_disk() -> (tempfile::TempDir, String) {
+    let fixture = create_test_dataset_on_disk();
+    let uri = CString::new(fixture.1.as_str()).unwrap();
+    unsafe {
+        let dataset = lance_c::lance_dataset_open(uri.as_ptr(), std::ptr::null(), 0);
+        assert!(!dataset.is_null(), "failed to open session cache fixture");
+        assert_eq!(lance_c::lance_dataset_fragment_count(dataset), 2);
+        let column = c"id";
+        let index_name = c"id_idx";
+        let rc = lance_c::lance_dataset_create_scalar_index(
+            dataset,
+            column.as_ptr(),
+            index_name.as_ptr(),
+            lance_c::LanceScalarIndexType::BTree as i32,
+            std::ptr::null(),
+            false,
+        );
+        if rc != 0 {
+            let message = lance_c::lance_last_error_message();
+            let message = if message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(message) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            panic!("failed to create session cache B-tree index: {message}");
+        }
+        assert_eq!(lance_c::lance_dataset_index_count(dataset), 1);
+        lance_c::lance_dataset_close(dataset);
+    }
+    fixture
+}
+
 /// Create a two-fragment dataset with two independently indexed FTS columns.
 fn create_typed_fts_dataset_on_disk() -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
@@ -411,20 +446,22 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
 }
 
 /// Run a compiled test binary with the source dataset URI, a destination URI
-/// for the write test, the URI of a Blob v2 dataset, and the ordering dataset.
-/// The destination path must not pre-exist.
+/// for the write test, the URI of a Blob v2 dataset, the ordering dataset, and
+/// the indexed session-cache dataset. The destination path must not pre-exist.
 fn run_test_binary(
     binary: &Path,
     dataset_uri: &str,
     write_uri: &str,
     blob_uri: &str,
     ordering_uri: &str,
+    session_uri: &str,
 ) {
     let output = Command::new(binary)
         .arg(dataset_uri)
         .arg(write_uri)
         .arg(blob_uri)
         .arg(ordering_uri)
+        .arg(session_uri)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -478,6 +515,7 @@ fn test_c_compilation_and_execution() {
     let write_uri = tmp.path().join("c_write_ds").to_str().unwrap().to_string();
     let (_blob_tmp, blob_uri) = create_blob_dataset_on_disk();
     let (_ordering_tmp, ordering_uri) = create_ordering_dataset_on_disk();
+    let (_session_tmp, session_uri) = create_session_cache_dataset_on_disk();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -491,7 +529,14 @@ fn test_c_compilation_and_execution() {
         "C test compilation failed"
     );
 
-    run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri, &ordering_uri);
+    run_test_binary(
+        &binary,
+        &dataset_uri,
+        &write_uri,
+        &blob_uri,
+        &ordering_uri,
+        &session_uri,
+    );
 }
 
 #[test]
@@ -507,6 +552,7 @@ fn test_cpp_compilation_and_execution() {
         .to_string();
     let (_blob_tmp, blob_uri) = create_blob_dataset_on_disk();
     let (_ordering_tmp, ordering_uri) = create_ordering_dataset_on_disk();
+    let (_session_tmp, session_uri) = create_session_cache_dataset_on_disk();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -520,7 +566,14 @@ fn test_cpp_compilation_and_execution() {
         "C++ test compilation failed"
     );
 
-    run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri, &ordering_uri);
+    run_test_binary(
+        &binary,
+        &dataset_uri,
+        &write_uri,
+        &blob_uri,
+        &ordering_uri,
+        &session_uri,
+    );
 }
 
 #[test]

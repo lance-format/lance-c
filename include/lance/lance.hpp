@@ -229,20 +229,135 @@ struct SqlColumn {
 
 // ─── Shared Session ──────────────────────────────────────────────────────────
 
+enum class SessionCacheSpecKind : int32_t {
+    Default = LANCE_SESSION_CACHE_SPEC_DEFAULT,
+    Size    = LANCE_SESSION_CACHE_SPEC_SIZE,
+    Uri     = LANCE_SESSION_CACHE_SPEC_URI,
+    Config  = LANCE_SESSION_CACHE_SPEC_CONFIG,
+};
+
+/// Cache selection for one session cache tier. `default_cache()` uses the
+/// native tier default; `with_size(0)` requests an explicit zero capacity.
+struct SessionCacheSpec {
+    SessionCacheSpecKind kind = SessionCacheSpecKind::Default;
+    uint64_t size_bytes = 0;
+    std::string backend_uri;
+    std::string backend_kind;
+    std::vector<std::pair<std::string, std::string>> backend_options;
+
+    static SessionCacheSpec default_cache() { return {}; }
+
+    static SessionCacheSpec with_size(uint64_t capacity_bytes) {
+        SessionCacheSpec spec;
+        spec.kind = SessionCacheSpecKind::Size;
+        spec.size_bytes = capacity_bytes;
+        return spec;
+    }
+
+    static SessionCacheSpec from_uri(std::string uri) {
+        SessionCacheSpec spec;
+        spec.kind = SessionCacheSpecKind::Uri;
+        spec.backend_uri = std::move(uri);
+        return spec;
+    }
+
+    static SessionCacheSpec from_config(
+        std::string backend_kind,
+        std::vector<std::pair<std::string, std::string>> backend_options = {}) {
+        SessionCacheSpec spec;
+        spec.kind = SessionCacheSpecKind::Config;
+        spec.backend_kind = std::move(backend_kind);
+        spec.backend_options = std::move(backend_options);
+        return spec;
+    }
+};
+
 class Session {
     Handle<LanceSession, lance_session_close> handle_;
 
+    static LanceSessionCacheSpec c_cache_spec(
+        const SessionCacheSpec& spec,
+        std::vector<const char*>& option_keys,
+        std::vector<const char*>& option_values) {
+        LanceSessionCacheSpec c_spec{};
+        c_spec.kind = static_cast<int32_t>(spec.kind);
+        switch (spec.kind) {
+            case SessionCacheSpecKind::Default:
+                break;
+            case SessionCacheSpecKind::Size:
+                c_spec.size_bytes = spec.size_bytes;
+                break;
+            case SessionCacheSpecKind::Uri:
+                c_spec.backend_uri = spec.backend_uri.c_str();
+                break;
+            case SessionCacheSpecKind::Config:
+                c_spec.backend_kind = spec.backend_kind.c_str();
+                option_keys.reserve(spec.backend_options.size());
+                option_values.reserve(spec.backend_options.size());
+                for (const auto& [key, value] : spec.backend_options) {
+                    option_keys.push_back(key.c_str());
+                    option_values.push_back(value.c_str());
+                }
+                if (!option_keys.empty()) {
+                    c_spec.option_keys = option_keys.data();
+                    c_spec.option_values = option_values.data();
+                    c_spec.option_count = option_keys.size();
+                }
+                break;
+        }
+        return c_spec;
+    }
+
+    static LanceSession* create(
+        const SessionCacheSpec& index_cache,
+        const SessionCacheSpec& metadata_cache) {
+        std::vector<const char*> index_keys;
+        std::vector<const char*> index_values;
+        std::vector<const char*> metadata_keys;
+        std::vector<const char*> metadata_values;
+        auto c_index =
+            c_cache_spec(index_cache, index_keys, index_values);
+        auto c_metadata =
+            c_cache_spec(metadata_cache, metadata_keys, metadata_values);
+        return lance_session_new_with_cache_specs(&c_index, &c_metadata);
+    }
+
 public:
-    Session(uint64_t index_cache_size_bytes, uint64_t metadata_cache_size_bytes)
-        : handle_(lance_session_new(index_cache_size_bytes, metadata_cache_size_bytes)) {
+    /// Configure each cache tier independently. The spec values and their
+    /// string buffers are consumed during construction.
+    Session(
+        const SessionCacheSpec& index_cache,
+        const SessionCacheSpec& metadata_cache)
+        : handle_(create(index_cache, metadata_cache)) {
         if (!handle_) check_error();
     }
+
+    Session(uint64_t index_cache_size_bytes, uint64_t metadata_cache_size_bytes)
+        : Session(
+              SessionCacheSpec::with_size(index_cache_size_bytes),
+              SessionCacheSpec::with_size(metadata_cache_size_bytes)) {}
 
     LanceSessionCacheStats cache_stats() const {
         LanceSessionCacheStats stats{};
         if (lance_session_get_cache_stats(handle_.get(), &stats) != 0)
             check_error();
         return stats;
+    }
+
+    /// Current deep size of the session in bytes. This is not an RSS limit.
+    uint64_t size_bytes() const {
+        uint64_t size = 0;
+        if (lance_session_get_size_bytes(handle_.get(), &size) != 0)
+            check_error();
+        return size;
+    }
+
+    /// Approximate number of items retained in both cache tiers.
+    uint64_t approx_num_items() const {
+        uint64_t count = 0;
+        if (lance_session_get_approx_num_items(handle_.get(), &count) != 0)
+            check_error();
+        return count;
     }
 
     const LanceSession* c_handle() const { return handle_.get(); }

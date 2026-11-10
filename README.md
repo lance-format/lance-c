@@ -440,6 +440,38 @@ auto ds = lance::Dataset::open_with_session(session, "data.lance");
 auto stats = session.cache_stats();
 ```
 
+Each tier can independently use the native default, an explicit capacity, a
+backend URI, or a backend kind plus options. `Default` and an explicit zero
+capacity are different choices.
+
+```c
+LanceSessionCacheSpec index = {0};
+index.kind = LANCE_SESSION_CACHE_SPEC_URI;
+index.backend_uri = "moka://?capacity=67108864";
+
+LanceSessionCacheSpec metadata = {0};
+metadata.kind = LANCE_SESSION_CACHE_SPEC_SIZE;
+metadata.size_bytes = 0; /* explicit zero capacity */
+
+LanceSession* session = lance_session_new_with_cache_specs(&index, &metadata);
+uint64_t size_bytes = 0;
+uint64_t approx_items = 0;
+lance_session_get_size_bytes(session, &size_bytes);
+lance_session_get_approx_num_items(session, &approx_items);
+```
+
+```cpp
+lance::Session session(
+    lance::SessionCacheSpec::from_uri("moka://?capacity=67108864"),
+    lance::SessionCacheSpec::with_size(0));
+auto size_bytes = session.size_bytes();
+auto approx_items = session.approx_num_items();
+```
+
+`size_bytes()` is the native deep size of live session state, not an RSS
+measurement or a configured limit. `approx_num_items()` is explicitly
+approximate and may change as cache maintenance runs.
+
 ### Prewarm an index synchronously
 
 Prewarm a logical index before serving queries to move cold index reads out of
