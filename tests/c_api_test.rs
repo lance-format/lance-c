@@ -4835,7 +4835,6 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
     );
 
     let one_index = [0_u32];
-    let no_columns: [CString; 0] = [];
     let native_empty_projection_error = lance_c::runtime::block_on(native_fragment.take(
         &one_index,
         &fragment_projection(&native_fragment, Some(&[])),
