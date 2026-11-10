@@ -194,6 +194,7 @@ typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
+typedef struct LanceFtsQuery LanceFtsQuery;
 typedef struct LanceBlobFile LanceBlobFile;
 
 /* ─── Shared session ─── */
@@ -2403,6 +2404,235 @@ typedef enum {
     LANCE_FTS_MATCH_OPERATOR_AND = 1,
 } LanceFtsMatchOperator;
 
+/** Document unit selected by a Match or Phrase query. */
+typedef enum {
+    /** Infer the granularity stored by the target FTS index. */
+    LANCE_FTS_DOCUMENT_GRANULARITY_UNSPECIFIED = 0,
+    /** All text selected from one dataset row is one document. */
+    LANCE_FTS_DOCUMENT_GRANULARITY_ROW = 1,
+    /** Each element of the deepest list on the field path is one document. */
+    LANCE_FTS_DOCUMENT_GRANULARITY_LIST_ELEMENT = 2,
+} LanceFtsDocumentGranularity;
+
+/** Membership requirement for one Boolean query clause. */
+typedef enum {
+    /** The clause may match and contributes its score when it does. */
+    LANCE_FTS_OCCUR_SHOULD = 0,
+    /** The clause must match and contributes its score. */
+    LANCE_FTS_OCCUR_MUST = 1,
+    /** The clause must not match and never contributes to the score. */
+    LANCE_FTS_OCCUR_MUST_NOT = 2,
+} LanceFtsOccur;
+
+/**
+ * Options for lance_fts_query_match_new(). Call
+ * lance_fts_query_match_options_init() before changing individual fields.
+ */
+typedef struct LanceFtsMatchOptions {
+    /** Score multiplier; native default 1.0. Scan planning requires finite,
+     *  non-negative values. */
+    float boost;
+    /** -1 selects automatic fuzziness; 0 is an exact match. Other values are
+     *  explicit edit distances in [0, UINT32_MAX]. Native default 0. */
+    int64_t fuzziness;
+    /** Final fuzzy vocabulary budget for this Match leaf. Native default 50. */
+    uint64_t max_expansions;
+    /** Fixed-width LanceFtsMatchOperator discriminant. Native default OR. */
+    int32_t match_operator;
+    /** Beginning characters left unchanged during fuzzy matching. Native
+     *  default 0. */
+    uint32_t prefix_length;
+    /** Fixed-width LanceFtsDocumentGranularity discriminant. Native default
+     *  UNSPECIFIED. */
+    int32_t document_granularity;
+} LanceFtsMatchOptions;
+
+/**
+ * Options for lance_fts_query_phrase_new(). Call
+ * lance_fts_query_phrase_options_init() before changing individual fields.
+ */
+typedef struct LanceFtsPhraseOptions {
+    /** Maximum non-negative number of intervening token positions. Native
+     *  default 0. */
+    uint32_t slop;
+    /** Fixed-width LanceFtsDocumentGranularity discriminant. Native default
+     *  UNSPECIFIED. */
+    int32_t document_granularity;
+} LanceFtsPhraseOptions;
+
+/**
+ * Options for lance_fts_query_multi_match_new(). Call
+ * lance_fts_query_multi_match_options_init() before changing individual
+ * fields.
+ */
+typedef struct LanceFtsMultiMatchOptions {
+    /** Optional per-column boosts. NULL means the native default of 1.0 for
+     *  every column. A non-NULL pointer makes boost_count significant. */
+    const float* boosts;
+    /** Number of entries readable through boosts. */
+    size_t boost_count;
+    /** Fixed-width LanceFtsMatchOperator discriminant. Native default OR. */
+    int32_t match_operator;
+} LanceFtsMultiMatchOptions;
+
+/**
+ * Options for lance_fts_query_combined_fields_new(). Call
+ * lance_fts_query_combined_fields_options_init() before changing individual
+ * fields.
+ */
+typedef struct LanceFtsCombinedFieldsOptions {
+    /** Optional per-column BM25F weights. NULL means the native default of 1.0
+     *  for every column. A non-NULL pointer makes boost_count significant. */
+    const float* boosts;
+    /** Number of entries readable through boosts. */
+    size_t boost_count;
+    /** Fixed-width LanceFtsMatchOperator discriminant. Native default OR. */
+    int32_t match_operator;
+} LanceFtsCombinedFieldsOptions;
+
+/**
+ * Options for lance_fts_query_boost_new(). Call
+ * lance_fts_query_boost_options_init() before changing individual fields.
+ */
+typedef struct LanceFtsBoostOptions {
+    /** Multiplier subtracted from the positive score. Native default 0.5.
+     *  Scan planning requires finite, non-negative values. */
+    float negative_boost;
+} LanceFtsBoostOptions;
+
+/** Initialize Match options with the native defaults. NULL-safe. */
+void lance_fts_query_match_options_init(LanceFtsMatchOptions* options);
+
+/** Initialize Phrase options with the native defaults. NULL-safe. */
+void lance_fts_query_phrase_options_init(LanceFtsPhraseOptions* options);
+
+/** Initialize MultiMatch options with the native defaults. NULL-safe. */
+void lance_fts_query_multi_match_options_init(LanceFtsMultiMatchOptions* options);
+
+/** Initialize CombinedFields options with the native defaults. NULL-safe. */
+void lance_fts_query_combined_fields_options_init(
+    LanceFtsCombinedFieldsOptions* options
+);
+
+/** Initialize Boost options with the native defaults. NULL-safe. */
+void lance_fts_query_boost_options_init(LanceFtsBoostOptions* options);
+
+/**
+ * Create an immutable Match query.
+ *
+ * @param terms    Query text. May be empty. Must not be NULL.
+ * @param column   Target column, or NULL to let scan planning resolve the
+ *                 indexed columns.
+ * @param options  Match options, or NULL for the native defaults.
+ * @return Query handle on success, or NULL on error.
+ */
+LanceFtsQuery* lance_fts_query_match_new(
+    const char* terms,
+    const char* column,
+    const LanceFtsMatchOptions* options
+);
+
+/**
+ * Create an immutable Phrase query.
+ *
+ * The selected FTS index must store token positions; scan planning reports an
+ * error otherwise.
+ *
+ * @param terms    Query text. May be empty. Must not be NULL.
+ * @param column   Target column, or NULL to let scan planning resolve the
+ *                 indexed columns.
+ * @param options  Phrase options, or NULL for the native defaults.
+ * @return Query handle on success, or NULL on error.
+ */
+LanceFtsQuery* lance_fts_query_phrase_new(
+    const char* terms,
+    const char* column,
+    const LanceFtsPhraseOptions* options
+);
+
+/**
+ * Create an immutable MultiMatch query.
+ *
+ * Each target field is scored independently and the maximum field score is
+ * retained, matching the native best-fields behavior. Native construction
+ * rejects an empty column list. A provided boost list must contain exactly one
+ * entry per column; its values are validated by scan planning.
+ *
+ * @param terms         Query text. May be empty. Must not be NULL.
+ * @param columns       Array of column names. Must not be NULL when
+ *                      column_count is non-zero.
+ * @param column_count  Number of entries in columns.
+ * @param options       MultiMatch options, or NULL for the native defaults.
+ * @return Query handle on success, or NULL on error.
+ */
+LanceFtsQuery* lance_fts_query_multi_match_new(
+    const char* terms,
+    const char* const* columns,
+    size_t column_count,
+    const LanceFtsMultiMatchOptions* options
+);
+
+/**
+ * Create an immutable CombinedFields (BM25F) query.
+ *
+ * The target columns form one virtual field whose term statistics are blended.
+ * Native construction rejects an empty or duplicate column list and weights
+ * outside [1, 2^20].
+ *
+ * @param terms         Query text. May be empty. Must not be NULL.
+ * @param columns       Array of unique column names. Must not be NULL when
+ *                      column_count is non-zero.
+ * @param column_count  Number of entries in columns.
+ * @param options       CombinedFields options, or NULL for the native defaults.
+ * @return Query handle on success, or NULL on error.
+ */
+LanceFtsQuery* lance_fts_query_combined_fields_new(
+    const char* terms,
+    const char* const* columns,
+    size_t column_count,
+    const LanceFtsCombinedFieldsOptions* options
+);
+
+/**
+ * Create an immutable Boolean query.
+ *
+ * An empty clause list is accepted here and rejected by scan planning when the
+ * query has no positive clause. Both arrays must contain query_count entries
+ * unless the count is zero. Child query values are copied during construction.
+ *
+ * @param occurs       Fixed-width LanceFtsOccur discriminants.
+ * @param queries      Child query handles.
+ * @param query_count  Number of entries in both arrays.
+ * @return Query handle on success, or NULL on error.
+ */
+LanceFtsQuery* lance_fts_query_boolean_new(
+    const int32_t* occurs,
+    const LanceFtsQuery* const* queries,
+    size_t query_count
+);
+
+/**
+ * Create an immutable Boost query from positive and negative child queries.
+ * Child query values are copied during construction. negative_boost is
+ * validated by scan planning.
+ *
+ * @param positive  Positive child query. Must not be NULL.
+ * @param negative  Negative child query. Must not be NULL.
+ * @param options   Boost options, or NULL for the native default.
+ * @return Query handle on success, or NULL on error.
+ */
+LanceFtsQuery* lance_fts_query_boost_new(
+    const LanceFtsQuery* positive,
+    const LanceFtsQuery* negative,
+    const LanceFtsBoostOptions* options
+);
+
+/**
+ * Close a typed query handle. NULL-safe. Composite children and scanners that
+ * already attached this query retain their own cloned values.
+ */
+void lance_fts_query_close(LanceFtsQuery* query);
+
 /**
  * Prepare an OR Match query context for one column.
  *
@@ -2497,6 +2727,26 @@ int32_t lance_scanner_full_text_search(
     const char* query,
     const char* const* columns,
     uint32_t max_fuzzy_distance
+);
+
+/**
+ * Attach an immutable typed full-text query tree to the scanner.
+ *
+ * The scanner snapshots the query value, so the query handle and every source
+ * child handle may be closed after this function returns successfully.
+ *
+ * This is mutually exclusive with nearest search and with
+ * lance_scanner_set_fts_query_context(). Calling it again replaces the
+ * currently attached query. Invalid input returns an error without changing
+ * the previously attached configuration. Query-tree validation that requires
+ * planning (for example a Boolean tree with no positive clause) is reported
+ * when the scan starts.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_set_fts_query(
+    LanceScanner* scanner,
+    const LanceFtsQuery* query
 );
 
 /**

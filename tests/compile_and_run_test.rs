@@ -25,6 +25,8 @@ use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
 
+use std::ffi::CString;
+
 /// Build the lance-c cdylib and return the path to the shared library and include dir.
 fn build_lance_c() -> (PathBuf, PathBuf) {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -124,6 +126,106 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
         .await
         .unwrap();
     });
+
+    (tmp, uri)
+}
+
+/// Create a two-fragment dataset with two independently indexed FTS columns.
+fn create_typed_fts_dataset_on_disk() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("typed_fts_c_test_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("title", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, false),
+        Field::new("category", DataType::Utf8, false),
+    ]));
+
+    let make_batch =
+        |ids: Vec<i32>, titles: Vec<&str>, bodies: Vec<&str>, categories: Vec<&str>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(titles)),
+                    Arc::new(StringArray::from(bodies)),
+                    Arc::new(StringArray::from(categories)),
+                ],
+            )
+            .unwrap()
+        };
+    let first = make_batch(
+        vec![1, 2, 3, 4],
+        vec!["alpha beta", "alpha", "alpha beta", "beta gamma"],
+        vec!["gamma rust", "delta rust", "gamma", "alpha"],
+        vec!["a", "b", "a", "b"],
+    );
+    let second = make_batch(
+        vec![5, 6, 7, 8, 9, 10],
+        vec!["rust rust", "rust", "lance", "delta", "rusty", "bust"],
+        vec![
+            "lance",
+            "rust rust rust",
+            "database",
+            "alpha",
+            "suffix",
+            "prefix",
+        ],
+        vec!["a", "b", "a", "b", "a", "b"],
+    );
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap()
+        .append(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let uri_c = CString::new(uri.clone()).unwrap();
+    let dataset = unsafe { lance_c::lance_dataset_open(uri_c.as_ptr(), std::ptr::null(), 0) };
+    assert!(!dataset.is_null(), "failed to open typed FTS dataset");
+    let params =
+        CString::new(r#"{"base_tokenizer":"simple","language":"English","with_position":true}"#)
+            .unwrap();
+    for column in ["title", "body"] {
+        let column = CString::new(column).unwrap();
+        let rc = unsafe {
+            lance_c::lance_dataset_create_scalar_index(
+                dataset,
+                column.as_ptr(),
+                std::ptr::null(),
+                lance_c::LanceScalarIndexType::Inverted as i32,
+                params.as_ptr(),
+                false,
+            )
+        };
+        if rc != 0 {
+            let message = unsafe { lance_c::lance_last_error_message() };
+            let message = if message.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(message) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            panic!("failed to create inverted index: {message}");
+        }
+    }
+    unsafe { lance_c::lance_dataset_close(dataset) };
 
     (tmp, uri)
 }
@@ -278,6 +380,30 @@ fn run_test_binary(binary: &Path, dataset_uri: &str, write_uri: &str, blob_uri: 
     );
 }
 
+fn run_test_binary_with_dataset(binary: &Path, dataset_uri: &str) {
+    let output = Command::new(binary)
+        .arg(dataset_uri)
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    println!("--- stdout ---\n{stdout}");
+    if !stderr.is_empty() {
+        eprintln!("--- stderr ---\n{stderr}");
+    }
+
+    assert!(
+        output.status.success(),
+        "Test binary {} failed with exit code {:?}\nstdout: {}\nstderr: {}",
+        binary.display(),
+        output.status.code(),
+        stdout,
+        stderr
+    );
+}
+
 #[test]
 #[ignore = "requires C compiler (cc); run with: cargo test -p lance-c -- --ignored test_c_compilation"]
 fn test_c_compilation_and_execution() {
@@ -327,6 +453,33 @@ fn test_cpp_compilation_and_execution() {
     );
 
     run_test_binary(&binary, &dataset_uri, &write_uri, &blob_uri);
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_typed_fts_native_compilation_and_execution"]
+fn test_typed_fts_native_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (_tmp, dataset_uri) = create_typed_fts_dataset_on_disk();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_fts_query.c");
+    let c_binary = build_dir.path().join("test_fts_query_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C FTS test compilation failed"
+    );
+    run_test_binary_with_dataset(&c_binary, &dataset_uri);
+
+    let cpp_source = tests_dir.join("test_fts_query.cpp");
+    let cpp_binary = build_dir.path().join("test_fts_query_cpp");
+    assert!(
+        compile_cpp_test(&cpp_source, &cpp_binary, &include_dir, &lib_path),
+        "C++ FTS test compilation failed"
+    );
+    run_test_binary_with_dataset(&cpp_binary, &dataset_uri);
 }
 
 /// A fresh C executable must initialize OpenDAL even when archive constructors are omitted.
