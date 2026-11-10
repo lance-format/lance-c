@@ -3235,6 +3235,459 @@ fn test_fragment_ids() {
     unsafe { lance_dataset_close(ds) };
 }
 
+// ---------------------------------------------------------------------------
+// Dataset table and schema metadata
+// ---------------------------------------------------------------------------
+
+fn take_json_value(ptr: *const c_char) -> serde_json::Value {
+    assert!(
+        !ptr.is_null(),
+        "expected a JSON result; current error: {}",
+        take_last_error_message()
+    );
+    let json = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(ptr) };
+    serde_json::from_str(&json).unwrap()
+}
+
+fn metadata_map(entries: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+fn update_metadata_via_c(
+    dataset: *mut LanceDataset,
+    entries: &[(&str, Option<&str>)],
+    mode: LanceMetadataUpdateMode,
+    schema_metadata: bool,
+) -> serde_json::Value {
+    let keys: Vec<CString> = entries.iter().map(|(key, _)| c_str(key)).collect();
+    let values: Vec<Option<CString>> = entries.iter().map(|(_, value)| value.map(c_str)).collect();
+    let key_ptrs: Vec<*const c_char> = keys.iter().map(CString::as_ptr).collect();
+    let value_ptrs: Vec<*const c_char> = values
+        .iter()
+        .map(|value| value.as_ref().map_or(ptr::null(), CString::as_ptr))
+        .collect();
+
+    let json = unsafe {
+        if schema_metadata {
+            lance_dataset_update_schema_metadata_json(
+                dataset,
+                key_ptrs.as_ptr(),
+                value_ptrs.as_ptr(),
+                entries.len(),
+                mode as i32,
+            )
+        } else {
+            lance_dataset_update_metadata_json(
+                dataset,
+                key_ptrs.as_ptr(),
+                value_ptrs.as_ptr(),
+                entries.len(),
+                mode as i32,
+            )
+        }
+    };
+    take_json_value(json)
+}
+
+fn native_metadata_map(
+    uri: &str,
+    schema_metadata: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let metadata = if schema_metadata {
+        dataset.schema().metadata.clone()
+    } else {
+        dataset.metadata().clone()
+    };
+    metadata.into_iter().collect()
+}
+
+fn schema_metadata_via_c(
+    dataset: *const LanceDataset,
+) -> std::collections::BTreeMap<String, String> {
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(unsafe { lance_dataset_schema(dataset, &mut ffi_schema) }, 0);
+    let schema = Schema::try_from(&ffi_schema).unwrap();
+    schema.metadata().clone().into_iter().collect()
+}
+
+fn assert_metadata_update_failed(ptr: *const c_char, expected_message: &str) {
+    assert!(ptr.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message_ptr = lance_last_error_message();
+    assert!(!message_ptr.is_null());
+    let message = unsafe { std::ffi::CStr::from_ptr(message_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(message_ptr) };
+    assert!(
+        message.contains(expected_message),
+        "expected error containing {expected_message:?}, got {message:?}"
+    );
+}
+
+#[test]
+fn test_dataset_metadata_merge_replace_and_clear() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut expected_version = unsafe { lance_dataset_version(ds) };
+    assert_eq!(expected_version, 2, "fixture writes two versions");
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(ds) }),
+        serde_json::json!({})
+    );
+
+    let escaped_value = "line\n\"quoted\"\\path";
+    let merged = update_metadata_via_c(
+        ds,
+        &[
+            ("empty", Some("")),
+            ("escaped", Some(escaped_value)),
+            ("owner", Some("lance-c")),
+            ("remove", Some("gone")),
+            ("unicode", Some("你好")),
+            ("unicode-key", Some("value")),
+        ],
+        LanceMetadataUpdateMode::Merge,
+        false,
+    );
+    let mut expected = metadata_map(&[
+        ("empty", ""),
+        ("escaped", escaped_value),
+        ("owner", "lance-c"),
+        ("remove", "gone"),
+        ("unicode", "你好"),
+        ("unicode-key", "value"),
+    ]);
+    assert_eq!(merged, serde_json::to_value(&expected).unwrap());
+    assert_eq!(native_metadata_map(&uri, false), expected);
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let merged = update_metadata_via_c(
+        ds,
+        &[("owner", Some("updated")), ("remove", None)],
+        LanceMetadataUpdateMode::Merge,
+        false,
+    );
+    expected.insert("owner".to_string(), "updated".to_string());
+    expected.remove("remove");
+    assert_eq!(merged, serde_json::to_value(&expected).unwrap());
+    assert_eq!(native_metadata_map(&uri, false), expected);
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let replaced = update_metadata_via_c(
+        ds,
+        &[
+            ("ignored", None),
+            ("shared", Some("table")),
+            ("table-only", Some("one")),
+        ],
+        LanceMetadataUpdateMode::Replace,
+        false,
+    );
+    expected = metadata_map(&[("shared", "table"), ("table-only", "one")]);
+    assert_eq!(replaced, serde_json::to_value(&expected).unwrap());
+    assert_eq!(native_metadata_map(&uri, false), expected);
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let schema_merged = update_metadata_via_c(
+        ds,
+        &[
+            ("empty", Some("")),
+            ("schema-key", Some("schema")),
+            ("shared", Some("schema")),
+        ],
+        LanceMetadataUpdateMode::Merge,
+        true,
+    );
+    let expected_schema = metadata_map(&[
+        ("empty", ""),
+        ("schema-key", "schema"),
+        ("shared", "schema"),
+    ]);
+    assert_eq!(
+        schema_merged,
+        serde_json::to_value(&expected_schema).unwrap()
+    );
+    assert_eq!(native_metadata_map(&uri, true), expected_schema);
+    assert_eq!(schema_metadata_via_c(ds), expected_schema);
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        expected,
+        "schema metadata updates must not change table metadata"
+    );
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let schema_replaced = update_metadata_via_c(
+        ds,
+        &[("ignored", None), ("schema-only", Some("two"))],
+        LanceMetadataUpdateMode::Replace,
+        true,
+    );
+    let expected_schema = metadata_map(&[("schema-only", "two")]);
+    assert_eq!(
+        schema_replaced,
+        serde_json::to_value(&expected_schema).unwrap()
+    );
+    assert_eq!(native_metadata_map(&uri, true), expected_schema);
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        expected,
+        "schema replacement must not change table metadata"
+    );
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let schema_cleared = take_json_value(unsafe {
+        lance_dataset_update_schema_metadata_json(
+            ds,
+            ptr::null(),
+            ptr::null(),
+            0,
+            LanceMetadataUpdateMode::Replace as i32,
+        )
+    });
+    assert_eq!(schema_cleared, serde_json::json!({}));
+    assert!(native_metadata_map(&uri, true).is_empty());
+    assert!(schema_metadata_via_c(ds).is_empty());
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        expected,
+        "clearing schema metadata must not change table metadata"
+    );
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    let cleared = take_json_value(unsafe {
+        lance_dataset_update_metadata_json(
+            ds,
+            ptr::null(),
+            ptr::null(),
+            0,
+            LanceMetadataUpdateMode::Replace as i32,
+        )
+    });
+    assert_eq!(cleared, serde_json::json!({}));
+    assert!(native_metadata_map(&uri, false).is_empty());
+    expected_version += 1;
+    assert_eq!(unsafe { lance_dataset_version(ds) }, expected_version);
+
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 10);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_metadata_reopen_and_snapshot_identity() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let writer = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let old = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!writer.is_null() && !old.is_null());
+
+    let initial_version = unsafe { lance_dataset_version(old) };
+    assert_eq!(initial_version, 2);
+    update_metadata_via_c(
+        writer,
+        &[("persist", "yes")],
+        LanceMetadataUpdateMode::Merge,
+        false,
+    );
+    update_metadata_via_c(
+        writer,
+        &[("persist-schema", "yes")],
+        LanceMetadataUpdateMode::Merge,
+        true,
+    );
+
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 2
+    );
+    assert_eq!(unsafe { lance_dataset_version(old) }, initial_version);
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(old) }),
+        serde_json::json!({})
+    );
+    assert!(schema_metadata_via_c(old).is_empty());
+
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_version(reopened) },
+        initial_version + 2
+    );
+    assert_eq!(
+        native_metadata_map(&uri, false),
+        metadata_map(&[("persist", "yes")])
+    );
+    assert_eq!(
+        native_metadata_map(&uri, true),
+        metadata_map(&[("persist-schema", "yes")])
+    );
+    assert_eq!(
+        schema_metadata_via_c(reopened),
+        metadata_map(&[("persist-schema", "yes")])
+    );
+
+    let previous = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), initial_version + 1) };
+    assert!(!previous.is_null());
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(previous) }),
+        serde_json::to_value(metadata_map(&[("persist", "yes")])).unwrap()
+    );
+    assert!(
+        schema_metadata_via_c(previous).is_empty(),
+        "schema metadata commit must be isolated to the later version"
+    );
+
+    unsafe {
+        lance_dataset_close(previous);
+        lance_dataset_close(reopened);
+        lance_dataset_close(old);
+        lance_dataset_close(writer);
+    }
+}
+
+#[test]
+fn test_dataset_metadata_invalid_inputs_preserve_state() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let version = unsafe { lance_dataset_version(ds) };
+    let table_before = take_json_value(unsafe { lance_dataset_metadata_json(ds) });
+    let schema_before = schema_metadata_via_c(ds);
+
+    let key = c_str("key");
+    let value = c_str("value");
+    let keys = [key.as_ptr()];
+    let values = [value.as_ptr()];
+
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ptr::null_mut(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "dataset must not be NULL",
+    );
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_schema_metadata_json(
+                ptr::null_mut(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "dataset must not be NULL",
+    );
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                ptr::null(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "keys must not be NULL",
+    );
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                keys.as_ptr(),
+                ptr::null(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "values must not be NULL",
+    );
+
+    let null_key = [ptr::null()];
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                null_key.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "keys[0] must not be NULL",
+    );
+
+    let invalid_utf8 = CString::new(vec![0xff]).unwrap();
+    let invalid_key = [invalid_utf8.as_ptr()];
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                invalid_key.as_ptr(),
+                values.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "utf-8",
+    );
+    let invalid_value = [invalid_utf8.as_ptr()];
+    assert_metadata_update_failed(
+        unsafe {
+            lance_dataset_update_metadata_json(
+                ds,
+                keys.as_ptr(),
+                invalid_value.as_ptr(),
+                1,
+                LanceMetadataUpdateMode::Merge as i32,
+            )
+        },
+        "utf-8",
+    );
+    assert_metadata_update_failed(
+        unsafe { lance_dataset_update_metadata_json(ds, keys.as_ptr(), values.as_ptr(), 1, 99) },
+        "metadata update mode",
+    );
+    assert_metadata_update_failed(
+        unsafe { lance_dataset_metadata_json(ptr::null()) },
+        "dataset must not be NULL",
+    );
+
+    assert_eq!(unsafe { lance_dataset_version(ds) }, version);
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(ds) }),
+        table_before
+    );
+    assert_eq!(schema_metadata_via_c(ds), schema_before);
+    unsafe { lance_dataset_close(ds) };
+}
+
 #[test]
 fn test_scanner_with_fragment_ids() {
     let (_tmp, uri) = create_multi_fragment_dataset();
