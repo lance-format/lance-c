@@ -6,6 +6,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::record_batch::{RecordBatchIterator, RecordBatchReader};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch};
@@ -182,6 +183,32 @@ fn schema_signature(schema: &Schema) -> Vec<(String, DataType, bool)> {
             )
         })
         .collect()
+}
+
+fn introspected_schema(scanner: *const LanceScanner) -> SchemaRef {
+    let mut ffi = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_scanner_schema(scanner, &mut ffi) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()) }.to_string_lossy()
+    );
+    let schema = Schema::try_from(&ffi).unwrap();
+    if let Some(release) = ffi.release {
+        unsafe { release(&mut ffi) };
+    }
+    Arc::new(schema)
+}
+
+fn take_scanner_string(raw: *const std::ffi::c_char) -> String {
+    assert!(!raw.is_null(), "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    let value = unsafe { std::ffi::CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { lance_free_string(raw) };
+    value
 }
 
 #[test]
@@ -586,6 +613,123 @@ fn multivector_projection_window_uses_native_distance_before_offset_and_limit() 
             "multivector projection rows must match the native scanner"
         );
 
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn multivector_introspection_and_count_follow_the_rewritten_plan() {
+    let (_dir, uri) = fixture();
+    let datum = CString::new("vectors").unwrap();
+    let query = [1.0f32, 0., 0., 1.];
+    let projection = [("id_alias", "id"), ("distance_alias", "-_distance")];
+
+    unsafe {
+        let dataset = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!dataset.is_null());
+        let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+        assert!(!scanner.is_null());
+        set_projection(scanner, &projection);
+        assert_eq!(lance_scanner_disable_scoring_autoprojection(scanner), 0);
+        assert_eq!(
+            lance_scanner_nearest_multivector(
+                scanner,
+                datum.as_ptr(),
+                query.as_ptr().cast(),
+                2,
+                2,
+                LanceDataType::Float32 as i32,
+                10,
+            ),
+            0
+        );
+        assert_eq!(lance_scanner_set_use_index(scanner, false), 0);
+        assert_eq!(lance_scanner_set_prefilter(scanner, true), 0);
+
+        let schema = introspected_schema(scanner);
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["id_alias", "distance_alias"]
+        );
+        assert!(
+            schema
+                .field_with_name("_lance_c_multivector_distance")
+                .is_err(),
+            "the private distance key must not leak"
+        );
+        assert_eq!(
+            schema_signature(&introspected_schema(scanner)),
+            schema_signature(&schema)
+        );
+
+        let count = lance_scanner_count_rows(scanner);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+        assert_eq!(count, 3);
+        assert_eq!(lance_scanner_count_rows(scanner), count);
+        let analyze_count = take_scanner_string(lance_scanner_analyze_count_plan(scanner));
+        assert!(analyze_count.contains("AggregateExec"), "{analyze_count}");
+        assert_eq!(
+            lance_scanner_set_batch_size(scanner, 1),
+            0,
+            "planning and count must leave multivector configuration editable"
+        );
+
+        let (stream_schema, batches) = collect_projected_batches(scanner);
+        assert_eq!(
+            schema_signature(&stream_schema),
+            schema_signature(&schema)
+        );
+        assert_eq!(
+            count,
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("id_alias")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        lance_scanner_close(scanner);
+
+        let limited = lance_scanner_new(dataset, ptr::null(), ptr::null());
+        assert_eq!(
+            lance_scanner_nearest_multivector(
+                limited,
+                datum.as_ptr(),
+                query.as_ptr().cast(),
+                2,
+                2,
+                LanceDataType::Float32 as i32,
+                10,
+            ),
+            0
+        );
+        assert_eq!(lance_scanner_set_use_index(limited, false), 0);
+        assert_eq!(lance_scanner_set_prefilter(limited, true), 0);
+        assert_eq!(lance_scanner_set_limit(limited, 1), 0);
+        assert_eq!(lance_scanner_count_rows(limited), 0);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let c_error = take_scanner_string(lance_last_error_message());
+        assert!(
+            c_error.contains("Cannot use limit/offset with aggregate"),
+            "{c_error}"
+        );
+        lance_scanner_close(limited);
         lance_dataset_close(dataset);
     }
 }

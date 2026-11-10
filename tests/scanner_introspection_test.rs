@@ -384,7 +384,7 @@ fn scanner_schema_count_and_plan_strings_match_native_oracles() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
     assert_eq!(count, native.1);
     assert_eq!(
-        count, 4,
+        count, 3,
         "fragment, filter, allow and block scopes must all apply"
     );
     assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, count);

@@ -706,6 +706,28 @@ fn schema_signature(schema: &Schema) -> Vec<(String, DataType, bool)> {
         .collect()
 }
 
+fn scanner_introspection_schema(scanner: *const LanceScanner) -> Schema {
+    let mut ffi = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_scanner_schema(scanner, &mut ffi) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let schema = Schema::try_from(&ffi).unwrap();
+    if let Some(release) = ffi.release {
+        unsafe { release(&mut ffi) };
+    }
+    schema
+}
+
+fn take_scanner_string(raw: *const c_char) -> String {
+    assert!(!raw.is_null(), "{}", take_last_error_message());
+    let value = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+    unsafe { lance_free_string(raw) };
+    value
+}
+
 fn scan_ordering_rows(scanner: *mut LanceScanner) -> Vec<(i32, Option<String>, Option<i32>)> {
     let mut stream = FFI_ArrowArrayStream::empty();
     assert_eq!(
@@ -14927,9 +14949,12 @@ fn test_prepared_fts_expression_projection_and_scoring_control() {
         )
     };
     assert!(!context.is_null(), "{}", take_last_error_message());
+    let row_ids = ordering_row_ids(dataset);
+    let allow_ids = [row_ids[&1]];
+    let filter = c_str("id <= 1");
 
     let scan = |projection: &[(&str, &str)], disable: bool| {
-        let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+        let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
         assert_eq!(
             set_projection(scanner, projection),
             0,
@@ -14948,28 +14973,69 @@ fn test_prepared_fts_expression_projection_and_scoring_control() {
             "{}",
             take_last_error_message()
         );
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_row_addr_allowlist(
+                    scanner,
+                    allow_ids.as_ptr(),
+                    allow_ids.len(),
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let introspected_schema = scanner_introspection_schema(scanner);
+        assert_eq!(
+            schema_signature(&scanner_introspection_schema(scanner)),
+            schema_signature(&introspected_schema)
+        );
+        let count = unsafe { lance_scanner_count_rows(scanner) };
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+        let analyze_count = take_scanner_string(unsafe {
+            lance_scanner_analyze_count_plan(scanner)
+        });
+        assert!(analyze_count.contains("AggregateExec"), "{analyze_count}");
+        assert_eq!(
+            unsafe { lance_scanner_set_batch_size(scanner, 2) },
+            0,
+            "inspection and count must leave FTS configuration editable"
+        );
         let (schema, batches) = collect_scanner(scanner);
+        assert_eq!(
+            schema_signature(&schema),
+            schema_signature(&introspected_schema)
+        );
+        assert_eq!(
+            count,
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64
+        );
+        assert_eq!(count, 1);
         unsafe { lance_scanner_close(scanner) };
         (
             schema,
             batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            count,
         )
     };
 
     let projection = [("id_alias", "id")];
     let explicit_score = [("id_alias", "id"), ("_score", "_score")];
 
-    let (legacy_schema, legacy_rows) = scan(&projection, false);
+    let (legacy_schema, legacy_rows, legacy_count) = scan(&projection, false);
     assert!(legacy_schema.field_with_name("_score").is_ok());
     assert!(legacy_rows > 0);
+    assert_eq!(legacy_count, legacy_rows as u64);
 
-    let (disabled_schema, disabled_rows) = scan(&projection, true);
+    let (disabled_schema, disabled_rows, disabled_count) = scan(&projection, true);
     assert!(disabled_schema.field_with_name("_score").is_err());
     assert_eq!(disabled_rows, legacy_rows);
+    assert_eq!(disabled_count, legacy_rows as u64);
 
-    let (explicit_schema, explicit_rows) = scan(&explicit_score, true);
+    let (explicit_schema, explicit_rows, explicit_count) = scan(&explicit_score, true);
     assert!(explicit_schema.field_with_name("_score").is_ok());
     assert_eq!(explicit_rows, legacy_rows);
+    assert_eq!(explicit_count, legacy_rows as u64);
 
     unsafe {
         lance_fts_query_context_close(context);
@@ -15162,6 +15228,29 @@ fn test_prepared_fts_index_only_empty_segment_returns_empty_shard() {
                 0
             );
 
+            let introspected_schema = scanner_introspection_schema(scanner);
+            assert_eq!(
+                schema_signature(&scanner_introspection_schema(scanner)),
+                schema_signature(&introspected_schema)
+            );
+            let explain = take_scanner_string(unsafe {
+                lance_scanner_explain_plan(scanner, true)
+            });
+            assert!(!explain.is_empty());
+            assert!(explain.contains("EmptyExec"), "{explain}");
+            assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
+            assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+            assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
+            let analyze_count = take_scanner_string(unsafe {
+                lance_scanner_analyze_count_plan(scanner)
+            });
+            assert!(analyze_count.contains("AggregateExec"), "{analyze_count}");
+            assert_eq!(
+                unsafe { lance_scanner_set_batch_size(scanner, 2) },
+                0,
+                "planning and count must leave the scanner configurable"
+            );
+
             let mut stream = FFI_ArrowArrayStream::empty();
             assert_eq!(
                 unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
@@ -15170,6 +15259,10 @@ fn test_prepared_fts_index_only_empty_segment_returns_empty_shard() {
                 unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
             );
             let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream).unwrap() };
+            assert_eq!(
+                schema_signature(&reader.schema()),
+                schema_signature(&introspected_schema)
+            );
             let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
             assert_eq!(total_rows, 0);
             unsafe { lance_scanner_close(scanner) };
@@ -21346,6 +21439,104 @@ fn test_scalar_segment_scan_applies_expression_projection() {
         lance_scanner_close(scanner);
         lance_dataset_close(dataset);
     }
+}
+
+#[test]
+fn test_scalar_segment_introspection_and_count_use_configured_scope() {
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    let uri = c_str(&uri);
+    let filter = c_str("key >= 0 AND id >= 2");
+    let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let fragments = [0_u64];
+
+    for use_scalar_index in [false, true] {
+        let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
+        assert!(!scanner.is_null());
+        assert_eq!(
+            unsafe { lance_scanner_set_fragment_ids(scanner, fragments.as_ptr(), fragments.len()) },
+            0
+        );
+        assert_eq!(
+            unsafe { lance_scanner_set_scalar_index_segment(scanner, uuids[0].as_ptr()) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert_eq!(
+            unsafe { lance_scanner_set_use_scalar_index(scanner, use_scalar_index) },
+            0
+        );
+        let mut captured = CapturedScanStatistics::default();
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_statistics_callback(
+                    scanner,
+                    Some(capture_scan_statistics),
+                    (&mut captured as *mut CapturedScanStatistics).cast(),
+                )
+            },
+            0
+        );
+
+        let introspected_schema = scanner_introspection_schema(scanner);
+        assert_eq!(
+            schema_signature(&scanner_introspection_schema(scanner)),
+            schema_signature(&introspected_schema)
+        );
+        let count = unsafe { lance_scanner_count_rows(scanner) };
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+        assert_eq!(count, 2);
+        assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, count);
+        assert_eq!(captured.calls, 0, "count must not invoke stream statistics");
+
+        let analyze_count = take_scanner_string(unsafe {
+            lance_scanner_analyze_count_plan(scanner)
+        });
+        assert!(analyze_count.contains("AggregateExec"), "{analyze_count}");
+        let analyze = take_scanner_string(unsafe { lance_scanner_analyze_plan(scanner) });
+        assert!(!analyze.is_empty());
+        assert_eq!(captured.calls, 0, "analyze must not invoke stream statistics");
+
+        assert_eq!(
+            unsafe { lance_scanner_set_batch_size(scanner, 1) },
+            0,
+            "scalar-segment planning must leave configuration editable"
+        );
+        let (stream_schema, batches) = collect_scanner(scanner);
+        assert_eq!(
+            schema_signature(&stream_schema),
+            schema_signature(&introspected_schema)
+        );
+        let ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        let mut ids = ids;
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(count, ids.len() as u64);
+        assert_eq!(captured.calls, 1);
+
+        assert_eq!(
+            unsafe { lance_scanner_set_scalar_index_segment(scanner, ptr::null()) },
+            -1,
+            "real iteration must still freeze scalar-segment configuration"
+        );
+        unsafe { lance_scanner_close(scanner) };
+    }
+
+    unsafe { lance_dataset_close(dataset) };
 }
 
 #[test]
