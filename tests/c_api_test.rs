@@ -3430,7 +3430,7 @@ fn test_fragment_snapshot_metadata_schema_and_counts() {
             0
         );
         let actual_schema = Schema::try_from(&ffi_schema).unwrap();
-        let expected_schema: Schema = native_fragment.schema().clone().into();
+        let expected_schema: Schema = native_fragment.schema().into();
         assert_eq!(actual_schema, expected_schema);
         let profile = actual_schema.field_with_name("profile").unwrap();
         let DataType::Struct(profile_fields) = profile.data_type() else {
