@@ -817,6 +817,16 @@ static void test_commit_index_segments(const std::string& uri) {
     assert(committed.size() == 2);
     for (size_t i = 0; i < 2; ++i) assert(committed[i] == expected_uuids[i]);
 
+    auto segments_json = ds.index_segments_json();
+    assert(segments_json.find("\"name\":\"cpp_distributed_idx\"") !=
+           std::string::npos);
+    assert(segments_json.find("\"index_version\":1") != std::string::npos);
+    for (size_t i = 0; i < 2; ++i) {
+        auto coverage = "\"fragment_ids\":[" +
+                        std::to_string(all_ids[i]) + "]";
+        assert(segments_json.find(coverage) != std::string::npos);
+    }
+
     // Duplicate segment UUIDs in the commit set are rejected.
     bool caught = false;
     try {
