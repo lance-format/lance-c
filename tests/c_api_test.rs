@@ -26,6 +26,7 @@ use arrow_schema::{DataType, Field, Fields, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
+use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance::session::{CacheSpec as NativeCacheSpec, Session as NativeSession};
 use lance_c::*;
 use lance_index::scalar::FullTextSearchQuery;
@@ -15840,6 +15841,140 @@ fn default_write_params() -> LanceWriteParams {
     }
 }
 
+fn write_with_native_options(
+    uri: &str,
+    batch: RecordBatch,
+    mode: LanceWriteMode,
+    options: *const LanceWriteOptions,
+) -> i32 {
+    let c_uri = c_str(uri);
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(batch);
+    unsafe {
+        lance_dataset_write_with_options(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            mode as i32,
+            options,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    }
+}
+
+fn write_native(uri: &str, batch: RecordBatch, params: WriteParams) -> lance::Result<Dataset> {
+    let schema = batch.schema();
+    lance_c::runtime::block_on(Dataset::write(
+        arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(params),
+    ))
+}
+
+fn c_config_entries(dataset: *const LanceDataset) -> Vec<(String, String)> {
+    let config = unsafe { lance_dataset_config(dataset) };
+    assert!(
+        !config.is_null(),
+        "config snapshot failed: {}",
+        take_last_error_message()
+    );
+    let count = unsafe { lance_dataset_config_count(config) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut entries = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let key = unsafe { lance_dataset_config_key_at(config, i) };
+        assert!(!key.is_null(), "config key {i} was NULL");
+        let value = unsafe { lance_dataset_config_value_at(config, i) };
+        assert!(!value.is_null(), "config value {i} was NULL");
+        entries.push((
+            unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned(),
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        ));
+    }
+    unsafe { lance_dataset_config_close(config) };
+    entries.sort();
+    entries
+}
+
+fn c_config_entries_for_uri(uri: &str) -> Vec<(String, String)> {
+    let c_uri = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(
+        !dataset.is_null(),
+        "open failed: {}",
+        take_last_error_message()
+    );
+    let entries = c_config_entries(dataset);
+    unsafe { lance_dataset_close(dataset) };
+    entries
+}
+
+fn native_config_entries(uri: &str) -> Vec<(String, String)> {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let mut entries: Vec<_> = dataset
+        .config()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn c_dataset_observation(uri: &str) -> (u64, u64, u64) {
+    let c_uri = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(
+        !dataset.is_null(),
+        "open failed: {}",
+        take_last_error_message()
+    );
+    let observation = (
+        unsafe { lance_dataset_version(dataset) },
+        unsafe { lance_dataset_count_rows(dataset) },
+        unsafe { lance_dataset_fragment_count(dataset) },
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    unsafe { lance_dataset_close(dataset) };
+    observation
+}
+
+fn native_dataset_observation(uri: &str) -> (u64, u64, u64) {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let rows = lance_c::runtime::block_on(dataset.count_rows(None)).unwrap() as u64;
+    (
+        dataset.version().version,
+        rows,
+        dataset.count_fragments() as u64,
+    )
+}
+
+fn native_version_ids(uri: &str) -> Vec<u64> {
+    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+    let mut ids: Vec<_> = lance_c::runtime::block_on(dataset.versions())
+        .unwrap()
+        .into_iter()
+        .map(|version| version.version)
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn c_update_config_entries(
+    dataset: *mut LanceDataset,
+    entries: &[(CString, Option<CString>)],
+) -> i32 {
+    let keys: Vec<*const c_char> = entries.iter().map(|(key, _)| key.as_ptr()).collect();
+    let values: Vec<*const c_char> = entries
+        .iter()
+        .map(|(_, value)| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+        .collect();
+    unsafe { lance_dataset_update_config(dataset, keys.as_ptr(), values.as_ptr(), entries.len()) }
+}
+
 /// Build a larger batch than the minimal test batch so `max_rows_per_file`
 /// has enough rows to exercise multi-file output.
 fn large_write_batch(n: i32) -> RecordBatch {
@@ -16125,6 +16260,825 @@ fn test_write_with_params_stable_row_ids_accepted() {
         )
     };
     assert_eq!(rc, 0);
+}
+
+// ===========================================================================
+// lance_dataset_write_with_options / native auto-cleanup
+// ===========================================================================
+
+#[test]
+fn test_write_options_null_uses_native_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_default").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_default")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+
+    let native = write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams::default(),
+    )
+    .unwrap();
+
+    let c_entries = c_config_entries_for_uri(&c_uri);
+    let native_entries = native_config_entries(&native_uri);
+    assert_eq!(c_entries, native_entries);
+    assert!(
+        !c_entries
+            .iter()
+            .any(|(key, _)| key.starts_with("lance.auto_cleanup.")),
+        "NULL options must select native auto_cleanup=None: {c_entries:?}"
+    );
+    assert_eq!(native.version().version, 1);
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+}
+
+#[test]
+fn test_write_options_create_auto_cleanup_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_cleanup").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_cleanup")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 0,
+        older_than_seconds: 5,
+        older_than_nanos: 250_000_123,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+
+    let older_than = chrono::TimeDelta::try_seconds(5)
+        .unwrap()
+        .checked_add(&chrono::TimeDelta::nanoseconds(250_000_123))
+        .unwrap();
+    let native = write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams {
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 0,
+                older_than,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(native.version().version, 1);
+
+    let entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(entries, native_config_entries(&native_uri));
+    assert_eq!(
+        entries
+            .iter()
+            .find(|(key, _)| key == "lance.auto_cleanup.interval")
+            .map(|(_, value)| value.as_str()),
+        Some("0"),
+        "interval 0 must remain an explicit native policy"
+    );
+
+    // Reopen both to prove the config is persisted, not only visible on the
+    // writer's returned snapshot.
+    assert_eq!(entries, c_config_entries_for_uri(&c_uri));
+    assert_eq!(entries, native_config_entries(&native_uri));
+}
+
+#[test]
+fn test_write_options_existing_dataset_keeps_persisted_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_existing").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_existing")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let initial_cleanup = LanceAutoCleanupParams {
+        interval: 7,
+        older_than_seconds: 93_600,
+        older_than_nanos: 0,
+    };
+    let initial_params = LanceWriteParams {
+        max_rows_per_file: 2,
+        ..default_write_params()
+    };
+    let initial_options = LanceWriteOptions {
+        params: initial_params,
+        auto_cleanup: &initial_cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3, 4, 5], vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        LanceWriteMode::Create,
+        &initial_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3, 4, 5], vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        WriteParams {
+            max_rows_per_file: 2,
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 7,
+                older_than: chrono::TimeDelta::try_seconds(93_600).unwrap(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let initial_entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(initial_entries, native_config_entries(&native_uri));
+    let initial_observation = c_dataset_observation(&c_uri);
+    assert!(
+        initial_observation.2 > 1,
+        "fixture must produce multiple fragments, got {initial_observation:?}"
+    );
+    assert_eq!(initial_observation, native_dataset_observation(&native_uri));
+
+    let append_cleanup = LanceAutoCleanupParams {
+        interval: 0,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let append_options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: &append_cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![6, 7, 8, 9], vec![6.0, 7.0, 8.0, 9.0]),
+        LanceWriteMode::Append,
+        &append_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![6, 7, 8, 9], vec![6.0, 7.0, 8.0, 9.0]),
+        WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            max_rows_per_file: 2,
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 0,
+                older_than: chrono::TimeDelta::zero(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri),
+        "APPEND must not rewrite the persisted cleanup policy"
+    );
+    assert_eq!(c_config_entries_for_uri(&c_uri), initial_entries);
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+
+    let overwrite_options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: ptr::null(),
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![10, 11, 12], vec![10.0, 11.0, 12.0]),
+        LanceWriteMode::Overwrite,
+        &overwrite_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![10, 11, 12], vec![10.0, 11.0, 12.0]),
+        WriteParams {
+            mode: lance::dataset::WriteMode::Overwrite,
+            max_rows_per_file: 2,
+            auto_cleanup: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let overwritten_entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(overwritten_entries, native_config_entries(&native_uri));
+    assert_eq!(
+        overwritten_entries, initial_entries,
+        "OVERWRITE with None must not delete persisted cleanup config"
+    );
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+}
+
+fn run_auto_cleanup_sequence(uri: &str, via_c: bool, skip_auto_cleanup: bool) -> Vec<u64> {
+    let cleanup = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let initial_options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let first_batch = write_batch(vec![1, 2, 3, 4], vec![1.0, 2.0, 3.0, 4.0]);
+    if via_c {
+        let rc =
+            write_with_native_options(uri, first_batch, LanceWriteMode::Create, &initial_options);
+        assert_eq!(rc, 0, "{}", take_last_error_message());
+    } else {
+        write_native(
+            uri,
+            first_batch,
+            WriteParams {
+                max_rows_per_file: 2,
+                auto_cleanup: Some(AutoCleanupParams {
+                    interval: 1,
+                    older_than: chrono::TimeDelta::zero(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    for rows in [vec![5, 6], vec![7, 8], vec![9, 10]] {
+        let values: Vec<f32> = rows.iter().map(|row| *row as f32).collect();
+        let batch = write_batch(rows, values);
+        if via_c {
+            let append_options = LanceWriteOptions {
+                params: default_write_params(),
+                auto_cleanup: ptr::null(),
+                skip_auto_cleanup,
+            };
+            let rc = write_with_native_options(uri, batch, LanceWriteMode::Append, &append_options);
+            assert_eq!(rc, 0, "{}", take_last_error_message());
+        } else {
+            write_native(
+                uri,
+                batch,
+                WriteParams {
+                    mode: lance::dataset::WriteMode::Append,
+                    skip_auto_cleanup,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+    }
+    native_version_ids(uri)
+}
+
+#[test]
+fn test_write_options_skip_auto_cleanup_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_cleanup_run")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_cleanup_run")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let c_skip_uri = tmp
+        .path()
+        .join("c_cleanup_skip")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_skip_uri = tmp
+        .path()
+        .join("native_cleanup_skip")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let c_versions = run_auto_cleanup_sequence(&c_uri, true, false);
+    let native_versions = run_auto_cleanup_sequence(&native_uri, false, false);
+    assert_eq!(c_versions, native_versions);
+    assert!(
+        c_versions.len() < 4,
+        "auto-cleanup should have removed an old version: {c_versions:?}"
+    );
+
+    let c_skip_versions = run_auto_cleanup_sequence(&c_skip_uri, true, true);
+    let native_skip_versions = run_auto_cleanup_sequence(&native_skip_uri, false, true);
+    assert_eq!(c_skip_versions, native_skip_versions);
+    assert_eq!(
+        c_skip_versions,
+        vec![1, 2, 3, 4],
+        "skip_auto_cleanup must preserve every version"
+    );
+}
+
+#[test]
+fn test_write_options_auto_cleanup_retains_tagged_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_cleanup_tag")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: LanceWriteParams {
+            max_rows_per_file: 2,
+            ..default_write_params()
+        },
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3, 4], vec![1.0, 2.0, 3.0, 4.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+
+    let tagged = lance_c::runtime::block_on(Dataset::open(&c_uri)).unwrap();
+    lance_c::runtime::block_on(tagged.tags().create("keep_v1", 1u64)).unwrap();
+    drop(tagged);
+
+    for (ids, values) in [
+        (vec![5, 6], vec![5.0, 6.0]),
+        (vec![7, 8], vec![7.0, 8.0]),
+        (vec![9, 10], vec![9.0, 10.0]),
+    ] {
+        let append_options = LanceWriteOptions {
+            params: default_write_params(),
+            auto_cleanup: ptr::null(),
+            skip_auto_cleanup: false,
+        };
+        let rc = write_with_native_options(
+            &c_uri,
+            write_batch(ids, values),
+            LanceWriteMode::Append,
+            &append_options,
+        );
+        assert_eq!(rc, 0, "{}", take_last_error_message());
+    }
+
+    let versions = native_version_ids(&c_uri);
+    assert!(
+        versions.contains(&1),
+        "tagged version 1 must survive auto-cleanup: {versions:?}"
+    );
+    let dataset = lance_c::runtime::block_on(Dataset::open(&c_uri)).unwrap();
+    assert!(
+        lance_c::runtime::block_on(dataset.checkout_version(1)).is_ok(),
+        "tagged version 1 must remain readable"
+    );
+}
+
+#[test]
+fn test_write_options_cleanup_hook_failure_keeps_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_cleanup_fail")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_cleanup_fail")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let create_batch = write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]);
+    let rc = write_with_native_options(
+        &c_uri,
+        create_batch.clone(),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        create_batch,
+        WriteParams {
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 1,
+                older_than: chrono::TimeDelta::zero(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    let entries = [(c_str("lance.auto_cleanup.interval"), Some(c_str("invalid")))];
+    assert_eq!(
+        c_update_config_entries(c_ds, &entries),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(c_ds) };
+
+    let mut native_ds = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+    lance_c::runtime::block_on(async {
+        native_ds
+            .update_config([("lance.auto_cleanup.interval", "invalid")])
+            .await
+    })
+    .unwrap();
+    drop(native_ds);
+
+    let append_batch = write_batch(vec![4, 5], vec![4.0, 5.0]);
+    let append_options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: ptr::null(),
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        append_batch.clone(),
+        LanceWriteMode::Append,
+        &append_options,
+    );
+    assert_eq!(
+        rc,
+        0,
+        "cleanup-hook failure must not fail the committed write: {}",
+        take_last_error_message()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    write_native(
+        &native_uri,
+        append_batch,
+        WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri)
+    );
+}
+
+#[test]
+fn test_write_options_rejects_invalid_auto_cleanup_without_clamping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let bad_nanos = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: 0,
+        older_than_nanos: 1_000_000_000,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &bad_nanos,
+        skip_auto_cleanup: false,
+    };
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let rc = unsafe {
+        lance_dataset_write_with_options(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &options,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("older_than_nanos"));
+    assert!(
+        stream.release.is_none(),
+        "the stream must be consumed on validation errors"
+    );
+
+    let bad_seconds = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: i64::MAX,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &bad_seconds,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &uri,
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("older_than_seconds"));
+
+    let negative = LanceAutoCleanupParams {
+        interval: 1,
+        older_than_seconds: -1,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &negative,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &uri,
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(
+        rc, -1,
+        "negative older_than must be rejected by the native transaction builder"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) }.is_null(),
+        "failed writes must not leave a readable dataset"
+    );
+    let _ = take_last_error_message();
+}
+
+// ===========================================================================
+// lance_dataset_config / lance_dataset_update_config
+// ===========================================================================
+
+#[test]
+fn test_dataset_config_read_update_and_reopen_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp.path().join("c_config").to_str().unwrap().to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_config")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let cleanup = LanceAutoCleanupParams {
+        interval: 5,
+        older_than_seconds: 86_400,
+        older_than_nanos: 0,
+    };
+    let options = LanceWriteOptions {
+        params: default_write_params(),
+        auto_cleanup: &cleanup,
+        skip_auto_cleanup: false,
+    };
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams {
+            auto_cleanup: Some(AutoCleanupParams {
+                interval: 5,
+                older_than: chrono::TimeDelta::days(1),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri)
+    );
+
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    let updates = [
+        (c_str("custom.key"), Some(c_str("value"))),
+        (c_str("lance.auto_cleanup.interval"), Some(c_str("0"))),
+        (c_str("lance.auto_cleanup.older_than"), None),
+        (c_str(""), Some(c_str(""))),
+    ];
+    assert_eq!(
+        c_update_config_entries(c_ds, &updates),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let c_after_update = c_config_entries(c_ds);
+
+    // The snapshot must outlive the dataset handle it was copied from.
+    let snapshot = unsafe { lance_dataset_config(c_ds) };
+    assert!(!snapshot.is_null());
+    unsafe { lance_dataset_close(c_ds) };
+    let snapshot_count = unsafe { lance_dataset_config_count(snapshot) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    assert_eq!(snapshot_count as usize, c_after_update.len());
+    let snapshot_key = unsafe { lance_dataset_config_key_at(snapshot, 0) };
+    assert!(!snapshot_key.is_null());
+    let _ = unsafe { CStr::from_ptr(snapshot_key) };
+    unsafe { lance_dataset_config_close(snapshot) };
+
+    let reopened_entries = c_config_entries_for_uri(&c_uri);
+    assert_eq!(c_after_update, reopened_entries);
+
+    let mut native_ds = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+    lance_c::runtime::block_on(async {
+        native_ds
+            .update_config([
+                ("custom.key", Some("value")),
+                ("lance.auto_cleanup.interval", Some("0")),
+                ("lance.auto_cleanup.older_than", None),
+                ("", Some("")),
+            ])
+            .await
+    })
+    .unwrap();
+    drop(native_ds);
+    assert_eq!(reopened_entries, native_config_entries(&native_uri));
+    assert!(
+        reopened_entries
+            .iter()
+            .any(|(key, value)| key.is_empty() && value.is_empty())
+    );
+    assert!(
+        !reopened_entries
+            .iter()
+            .any(|(key, _)| key == "lance.auto_cleanup.older_than")
+    );
+
+    // Reopen the handle for the error-path checks, which must leave the
+    // committed config unchanged.
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    let version_before_errors = unsafe { lance_dataset_version(c_ds) };
+    let key = c_str("unchanged");
+    let value = c_str("value");
+    let keys = [key.as_ptr()];
+    let values = [value.as_ptr()];
+    assert_eq!(
+        unsafe { lance_dataset_update_config(ptr::null_mut(), keys.as_ptr(), values.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, ptr::null(), values.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, keys.as_ptr(), ptr::null(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    let null_key = [ptr::null()];
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, null_key.as_ptr(), values.as_ptr(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_version(c_ds) },
+        version_before_errors
+    );
+    unsafe { lance_dataset_close(c_ds) };
+}
+
+#[test]
+fn test_dataset_config_empty_update_matches_native() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c_uri = tmp
+        .path()
+        .join("c_config_empty")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let native_uri = tmp
+        .path()
+        .join("native_config_empty")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let rc = write_with_native_options(
+        &c_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    write_native(
+        &native_uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        WriteParams::default(),
+    )
+    .unwrap();
+
+    let c_ds = unsafe { lance_dataset_open(c_str(&c_uri).as_ptr(), ptr::null(), 0) };
+    assert!(!c_ds.is_null());
+    assert_eq!(
+        unsafe { lance_dataset_update_config(c_ds, ptr::null(), ptr::null(), 0) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(c_ds) };
+
+    let mut native_ds = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+    lance_c::runtime::block_on(async {
+        native_ds
+            .update_config([] as [(&str, Option<&str>); 0])
+            .await
+    })
+    .unwrap();
+    drop(native_ds);
+
+    assert_eq!(
+        c_dataset_observation(&c_uri),
+        native_dataset_observation(&native_uri)
+    );
+    assert_eq!(
+        c_config_entries_for_uri(&c_uri),
+        native_config_entries(&native_uri)
+    );
 }
 
 // ===========================================================================
