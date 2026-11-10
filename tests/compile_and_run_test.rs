@@ -153,7 +153,7 @@ fn create_session_cache_dataset_on_disk() -> (tempfile::TempDir, String) {
             let message = if message.is_null() {
                 "unknown error".to_string()
             } else {
-                unsafe { std::ffi::CStr::from_ptr(message) }
+                std::ffi::CStr::from_ptr(message)
                     .to_string_lossy()
                     .into_owned()
             };

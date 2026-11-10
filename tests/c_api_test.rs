@@ -996,8 +996,8 @@ fn test_session_cache_specs_accept_moka_uri_and_config() {
     let mut metadata_kind = b"MOKA\0".to_vec();
     let mut option_key = b"capacity\0".to_vec();
     let mut option_value = b"33554432\0".to_vec();
-    let mut option_keys = [option_key.as_ptr().cast()];
-    let mut option_values = [option_value.as_ptr().cast()];
+    let option_keys = [option_key.as_ptr().cast()];
+    let option_values = [option_value.as_ptr().cast()];
     let mut index_spec = empty_session_cache_spec();
     index_spec.kind = LanceSessionCacheSpecKind::Uri as i32;
     index_spec.backend_uri = index_uri.as_ptr().cast();
@@ -1015,8 +1015,6 @@ fn test_session_cache_specs_accept_moka_uri_and_config() {
     metadata_kind.fill(b'x');
     option_key.fill(b'x');
     option_value.fill(b'x');
-    option_keys[0] = ptr::null();
-    option_values[0] = ptr::null();
 
     let initial_size = session_size_bytes(session);
     let dataset =
