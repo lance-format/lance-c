@@ -2814,9 +2814,7 @@ pub unsafe extern "C" fn lance_scanner_analyze_plan(scanner: *const LanceScanner
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_count_rows(scanner: *const LanceScanner) -> u64 {
     scanner_poison_check!(scanner, 0);
-    scanner_ffi_try_value!(scanner, 0, unsafe {
-        scanner_count_rows_inner(scanner)
-    })
+    scanner_ffi_try_value!(scanner, 0, unsafe { scanner_count_rows_inner(scanner) })
 }
 
 unsafe fn scanner_count_rows_inner(scanner: *const LanceScanner) -> Result<u64> {
