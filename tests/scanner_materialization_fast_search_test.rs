@@ -528,13 +528,8 @@ fn fast_search_fixture() -> (tempfile::TempDir, String) {
             .map(|id| if *id == 64 { "hit" } else { "other" })
             .collect::<Vec<_>>();
         let values = Float32Array::from_iter_values(ids.iter().flat_map(|id| vector(*id)));
-        let embeddings = FixedSizeListArray::try_new(
-            item.clone(),
-            2,
-            Arc::new(values),
-            None,
-        )
-        .unwrap();
+        let embeddings =
+            FixedSizeListArray::try_new(item.clone(), 2, Arc::new(values), None).unwrap();
         RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -583,10 +578,7 @@ fn fast_search_fixture() -> (tempfile::TempDir, String) {
         let mut dataset = Dataset::open(uri.to_str().unwrap()).await.unwrap();
         dataset
             .append(
-                arrow::record_batch::RecordBatchIterator::new(
-                    vec![Ok(appended)],
-                    schema.clone(),
-                ),
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(appended)], schema.clone()),
                 None,
             )
             .await
@@ -599,7 +591,11 @@ fn fast_search_fixture() -> (tempfile::TempDir, String) {
             .into_iter()
             .map(|fragment| fragment.id())
             .collect::<Vec<_>>();
-        assert_eq!(unindexed, vec![1], "index must cover only the first fragment");
+        assert_eq!(
+            unindexed,
+            vec![1],
+            "index must cover only the first fragment"
+        );
         assert_eq!(dataset.count_fragments(), 2);
         assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
     });
@@ -748,7 +744,9 @@ fn direct_fast_search(uri: &str, case: FastSearchCase) -> (Vec<i32>, ScanStatist
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let mut ids = (0..values.len()).map(|row| values.value(row)).collect::<Vec<_>>();
+        let mut ids = (0..values.len())
+            .map(|row| values.value(row))
+            .collect::<Vec<_>>();
         ids.sort_unstable();
         (ids, statistics)
     })
@@ -920,10 +918,7 @@ fn fast_search_uses_only_indexed_fragments_and_matches_direct_native_queries() {
                 assert_eq!(wrapper_statistics.indices_loaded, 0, "{name}");
             } else {
                 assert!(wrapper_statistics.indices_loaded > 0, "{name}");
-                assert!(
-                    wrapper_statistics.index_partitions_loaded > 0,
-                    "{name}"
-                );
+                assert!(wrapper_statistics.index_partitions_loaded > 0, "{name}");
             }
         }
     }
@@ -936,19 +931,11 @@ fn fast_search_without_any_index_propagates_native_empty_result() {
     let item = Arc::new(Field::new("item", DataType::Float32, false));
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
-        Field::new(
-            "embedding",
-            DataType::FixedSizeList(item.clone(), 2),
-            false,
-        ),
+        Field::new("embedding", DataType::FixedSizeList(item.clone(), 2), false),
     ]));
     let ids = (0..16).collect::<Vec<_>>();
-    let values = Float32Array::from_iter_values(
-        ids.iter()
-            .flat_map(|id| [*id as f32, 0.0]),
-    );
-    let embeddings =
-        FixedSizeListArray::try_new(item, 2, Arc::new(values), None).unwrap();
+    let values = Float32Array::from_iter_values(ids.iter().flat_map(|id| [*id as f32, 0.0]));
+    let embeddings = FixedSizeListArray::try_new(item, 2, Arc::new(values), None).unwrap();
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -966,10 +953,7 @@ fn fast_search_without_any_index_propagates_native_empty_result() {
     let uri = uri.to_str().unwrap().to_owned();
     let uri_c = c(&uri);
 
-    for (fast_search, expected) in [
-        (false, vec![0, 1, 2]),
-        (true, Vec::new()),
-    ] {
+    for (fast_search, expected) in [(false, vec![0, 1, 2]), (true, Vec::new())] {
         let case = FastSearchCase {
             fast_search,
             use_index: None,
