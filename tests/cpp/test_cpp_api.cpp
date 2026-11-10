@@ -102,6 +102,12 @@ static void assert_field_metadata(
 static void assert_field_metadata_absent(
     const ArrowSchema* field,
     const char* key) {
+    if (arrow_field_metadata_value(field, key) != nullptr) {
+        fprintf(stderr,
+                "unexpected field metadata: field=%s key=%s\n",
+                field && field->name ? field->name : "<null>",
+                key);
+    }
     assert(arrow_field_metadata_value(field, key) == nullptr);
 }
 
