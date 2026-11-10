@@ -4016,9 +4016,9 @@ fn test_dataset_field_metadata_batch_matches_native_builder() {
 
     let c_field_ids = field_ids_via_c(ds);
     assert_eq!(c_field_ids, native.schema().field_ids());
-    let id_field_id = resolve_field_id_via_c(ds, 0, 0, &c_str("id"));
-    let name_field_id = resolve_field_id_via_c(ds, 0, 0, &c_str("profile.name"));
-    let score_field_id = resolve_field_id_via_c(ds, 0, 0, &c_str("profile.score"));
+    let id_field_id = resolve_field_id_via_c(ds, 1, 0, &c_str("id"));
+    let name_field_id = resolve_field_id_via_c(ds, 1, 0, &c_str("profile.name"));
+    let score_field_id = resolve_field_id_via_c(ds, 1, 0, &c_str("profile.score"));
     assert_eq!(id_field_id, native.schema().field("id").unwrap().id);
     assert_eq!(
         name_field_id,
@@ -4195,9 +4195,9 @@ fn test_dataset_field_metadata_semantics_errors_and_snapshots() {
 
     let initial_version = unsafe { lance_dataset_version(writer) };
     assert_eq!(initial_version, 2);
-    let id_field_id = resolve_field_id_via_c(writer, 0, 0, &c_str("id"));
-    let name_field_id = resolve_field_id_via_c(writer, 0, 0, &c_str("profile.name"));
-    let score_field_id = resolve_field_id_via_c(writer, 0, 0, &c_str("profile.score"));
+    let id_field_id = resolve_field_id_via_c(writer, 1, 0, &c_str("id"));
+    let name_field_id = resolve_field_id_via_c(writer, 1, 0, &c_str("profile.name"));
+    let score_field_id = resolve_field_id_via_c(writer, 1, 0, &c_str("profile.score"));
 
     let key = c_str("key");
     let value = c_str("value");
