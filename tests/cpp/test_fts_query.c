@@ -156,8 +156,7 @@ int main(int argc, char** argv) {
         assert(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT);
         const char* message = lance_last_error_message();
         assert(message != NULL &&
-               strstr(message,
-                      "boolean query must have at least one should/must query") !=
+               strstr(message, "FTS query must contain at least one leaf query") !=
                    NULL);
         lance_free_string(message);
         lance_scanner_close(scanner);

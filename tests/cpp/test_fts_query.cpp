@@ -270,7 +270,7 @@ static void test_validation_and_replacement(const lance::Dataset& dataset) {
         const std::string text = error.what();
         empty_rejected =
             error.code == LANCE_ERR_INVALID_ARGUMENT &&
-            text.find("boolean query must have at least one should/must query") !=
+            text.find("FTS query must contain at least one leaf query") !=
                 std::string::npos;
     }
     assert(empty_rejected);

@@ -9956,15 +9956,11 @@ fn test_typed_fts_query_matches_native_semantics() {
         lance_fts_query_close(nested);
     }
 
+    let should_alpha = typed_match("alpha", Some("title"), &initialized_match_options());
+    let should_rust = typed_match("rust", Some("title"), &initialized_match_options());
     let should_only = typed_boolean(&[
-        (
-            LanceFtsOccur::Should,
-            typed_match("alpha", Some("title"), &initialized_match_options()),
-        ),
-        (
-            LanceFtsOccur::Should,
-            typed_match("rust", Some("title"), &initialized_match_options()),
-        ),
+        (LanceFtsOccur::Should, should_alpha),
+        (LanceFtsOccur::Should, should_rust),
     ]);
     let should_only_native = native_boolean_query(vec![
         (
@@ -9981,7 +9977,11 @@ fn test_typed_fts_query_matches_native_semantics() {
         &collect_typed_query_scores(dataset, should_only, None, None, None),
         &collect_native_fts_scores(&uri, should_only_native.clone(), None),
     );
-    unsafe { lance_fts_query_close(should_only) };
+    unsafe {
+        lance_fts_query_close(should_alpha);
+        lance_fts_query_close(should_rust);
+        lance_fts_query_close(should_only);
+    }
 
     let positive = typed_match("alpha", Some("title"), &initialized_match_options());
     let negative = typed_match("beta", Some("title"), &initialized_match_options());
@@ -10148,12 +10148,35 @@ fn test_typed_fts_query_matches_native_semantics() {
     );
     let message = take_last_error_message();
     assert!(
-        message.contains("boolean query must have at least one should/must query"),
+        message.contains("FTS query must contain at least one leaf query"),
         "{message}"
     );
     unsafe {
         lance_scanner_close(scanner);
         lance_fts_query_close(empty_boolean);
+    }
+
+    let negative_child = typed_match("delta", Some("body"), &initialized_match_options());
+    let negative_only = typed_boolean(&[(LanceFtsOccur::MustNot, negative_child)]);
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query(scanner, negative_only) },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("boolean query must have at least one should/must query"),
+        "{message}"
+    );
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_fts_query_close(negative_child);
+        lance_fts_query_close(negative_only);
     }
 
     let mut invalid_match = initialized_match_options();
