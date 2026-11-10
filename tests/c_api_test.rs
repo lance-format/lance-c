@@ -9565,10 +9565,7 @@ fn test_typed_fts_query_construction_and_validation() {
 
     let body_column = c_str("body");
     let column_ptrs = [column.as_ptr(), body_column.as_ptr()];
-    let mut multi_options = initialized_multi_match_options();
-    let empty_boosts: [f32; 0] = [];
-    multi_options.boosts = empty_boosts.as_ptr();
-    multi_options.boost_count = 0;
+    let multi_options = initialized_multi_match_options();
     let multi = unsafe {
         lance_fts_query_multi_match_new(
             empty.as_ptr(),
@@ -9875,7 +9872,7 @@ fn test_typed_fts_query_matches_native_semantics() {
     unsafe { lance_fts_query_close(slop_c) };
 
     let must = typed_match("alpha", Some("title"), &initialized_match_options());
-    let should = typed_match("beta", Some("title"), &initialized_match_options());
+    let should = typed_match("rust", Some("body"), &initialized_match_options());
     let must_not = typed_match("delta", Some("body"), &initialized_match_options());
     let boolean = typed_boolean(&[
         (LanceFtsOccur::Must, must),
@@ -9889,7 +9886,7 @@ fn test_typed_fts_query_matches_native_semantics() {
         ),
         (
             Occur::Should,
-            native_match_query("beta", Some("title"), &initialized_match_options()),
+            native_match_query("rust", Some("body"), &initialized_match_options()),
         ),
         (
             Occur::MustNot,
@@ -10032,8 +10029,14 @@ fn test_typed_fts_query_matches_native_semantics() {
     let body_match = typed_match("rust", Some("body"), &initialized_match_options());
     let title_scores = collect_typed_query_scores(dataset, title_match, None, None, None);
     let body_scores = collect_typed_query_scores(dataset, body_match, None, None, None);
-    assert!((multi_scores[&5] - title_scores[&5]).abs() <= 1e-6);
-    assert!((multi_scores[&6] - body_scores[&6]).abs() <= 1e-6);
+    for id in multi_scores.keys() {
+        let title_score = title_scores.get(id).copied().unwrap_or(0.0);
+        let body_score = body_scores.get(id).copied().unwrap_or(0.0);
+        assert!(
+            (multi_scores[id] - title_score.max(body_score)).abs() <= 1e-6,
+            "multi match must retain the maximum independent field score for id {id}"
+        );
+    }
     unsafe {
         lance_fts_query_close(title_match);
         lance_fts_query_close(body_match);

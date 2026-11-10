@@ -157,7 +157,7 @@ static void test_boolean_phrase_and_boost(const lance::Dataset& dataset) {
     auto boolean_scanner = dataset.scan();
     {
         auto must = lance::FtsQuery::match("alpha", std::string("title"));
-        auto should = lance::FtsQuery::match("beta", std::string("title"));
+        auto should = lance::FtsQuery::match("rust", std::string("body"));
         auto must_not = lance::FtsQuery::match("delta", std::string("body"));
         auto query = lance::FtsQuery::boolean({
             {lance::FtsOccur::Must, &must},
