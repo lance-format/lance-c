@@ -109,6 +109,12 @@ static void assert_field_metadata(
 static void assert_field_metadata_absent(
     const struct ArrowSchema *field,
     const char *key) {
+    if (arrow_field_metadata_value(field, key, NULL) != NULL) {
+        fprintf(stderr,
+                "unexpected field metadata: field=%s key=%s\n",
+                field != NULL && field->name != NULL ? field->name : "<null>",
+                key);
+    }
     ASSERT(arrow_field_metadata_value(field, key, NULL) == NULL,
            "field metadata key should be absent");
 }
