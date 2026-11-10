@@ -8,7 +8,7 @@
 set -euo pipefail
 
 if (( $# != 1 )); then
-    echo "usage: $0 <fmt|check|clippy|test|c|cpp|typed|static>" >&2
+    echo "usage: $0 <fmt|check|clippy|test|test-<integration-file>|c|cpp|typed|static>" >&2
     exit 2
 fi
 
@@ -55,6 +55,12 @@ case "$mode" in
             cargo +1.94.0 test --test compile_and_run_test
             test_static_oss_transport
             -- --ignored --nocapture
+        )
+        ;;
+    test-*)
+        cmd=(
+            cargo +1.94.0 test --test "${mode#test-}" -j 8
+            -- --test-threads=4
         )
         ;;
     *)
