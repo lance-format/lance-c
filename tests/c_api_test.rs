@@ -4770,8 +4770,8 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
             .collect::<Vec<_>>(),
         vec![Some("d"), Some("a"), Some("d")]
     );
-    let meta = batches[0]
-        .schema()
+    let batch_schema = batches[0].schema();
+    let meta = batch_schema
         .field_with_name("meta")
         .unwrap()
         .metadata()
@@ -5039,8 +5039,8 @@ fn test_fragment_scan_uses_normal_scanner_and_owned_snapshot() {
     let batches = scan_all_rows_from_scanner(scanner);
     assert_eq!(fragment_id_values(&batches), vec![0, 2, 3]);
     assert_eq!(batches[0].num_columns(), 3);
-    let names = batches[0]
-        .schema()
+    let batch_schema = batches[0].schema();
+    let names = batch_schema
         .fields()
         .iter()
         .map(|field| field.name().as_str())
