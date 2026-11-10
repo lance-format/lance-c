@@ -696,6 +696,8 @@ fn direct_fast_search(uri: &str, case: FastSearchCase) -> (Vec<i32>, ScanStatist
         }
         if let Some(row_ids) = case.row_ids {
             let rows: RowAddrTreeMap = row_ids.iter().copied().collect();
+            // Lance 14 deprecates the older row-address name used by core13.
+            #[allow(deprecated)]
             scan.with_row_addr_prefilter(RowAddrMask::from_allowed(rows));
         }
         let selected_fragments = case.fragment_ids.map(|ids| {
