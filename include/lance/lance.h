@@ -190,12 +190,18 @@ typedef struct LanceScanner  LanceScanner;
 typedef struct LanceBatch    LanceBatch;
 typedef struct LanceSession  LanceSession;
 typedef struct LanceVersions LanceVersions;
+typedef struct LanceVersion  LanceVersion;
+typedef struct LanceVersionRefs LanceVersionRefs;
+typedef struct LanceRef      LanceRef;
+typedef struct LanceTag      LanceTag;
+typedef struct LanceTags     LanceTags;
 typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
 typedef struct LanceFtsQuery LanceFtsQuery;
 typedef struct LanceBlobFile LanceBlobFile;
+typedef struct LanceFragment LanceFragment;
 
 /* ─── Shared session ─── */
 
@@ -308,8 +314,62 @@ uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
 /* ─── Version history ─── */
 
 /**
+ * Snapshot the current dataset version, including its native metadata summary.
+ * Caller frees the returned handle with lance_version_close(). The snapshot is
+ * copied and remains valid after the dataset is closed.
+ * @return handle on success, or NULL on error
+ */
+LanceVersion* lance_dataset_current_version(const LanceDataset* dataset);
+
+/**
+ * Version id from a current-version or history snapshot.
+ * Returns 0 on error (check lance_last_error_code()).
+ */
+uint64_t lance_version_id(const LanceVersion* version);
+
+/**
+ * Commit timestamp as Unix epoch nanoseconds. Returns 0 on error (check
+ * lance_last_error_code()).
+ *
+ * The i64 nanosecond representation covers 1677-09-21 through 2262-04-11 UTC.
+ * A timestamp outside that range makes this accessor return 0 with
+ * LANCE_ERR_INVALID_ARGUMENT. Snapshot creation and millisecond reads retain
+ * the native timestamp range.
+ */
+int64_t lance_version_timestamp_ns(const LanceVersion* version);
+
+/**
+ * Number of version metadata entries. Native version metadata is the manifest
+ * summary map; it is empty only when the native map is empty. Returns 0 on
+ * error, so check lance_last_error_code().
+ */
+uint64_t lance_version_metadata_count(const LanceVersion* version);
+
+/**
+ * Metadata key at `index`, borrowed until the version handle is closed.
+ * Returns NULL on error (NULL handle or out-of-range index).
+ */
+const char* lance_version_metadata_key_at(
+    const LanceVersion* version,
+    size_t index
+);
+
+/**
+ * Metadata value at `index`, borrowed until the version handle is closed.
+ * Returns NULL on error (NULL handle or out-of-range index).
+ */
+const char* lance_version_metadata_value_at(
+    const LanceVersion* version,
+    size_t index
+);
+
+/** Close and free a current-version snapshot. Safe to call with NULL. */
+void lance_version_close(LanceVersion* version);
+
+/**
  * Snapshot the dataset's version history. Caller frees the returned handle
- * with lance_versions_close().
+ * with lance_versions_close(). The copied snapshot remains valid after the
+ * dataset is closed. Entries are ordered by version id.
  * @return handle on success, or NULL on error
  */
 LanceVersions* lance_dataset_versions(const LanceDataset* dataset);
@@ -319,6 +379,12 @@ LanceVersions* lance_dataset_versions(const LanceDataset* dataset);
  * lance_last_error_code()).
  */
 uint64_t lance_versions_count(const LanceVersions* versions);
+
+/**
+ * Borrowed version details at `index` (0 <= index < count), or NULL on error.
+ * The pointer remains valid until lance_versions_close().
+ */
+const LanceVersion* lance_versions_at(const LanceVersions* versions, size_t index);
 
 /**
  * Monotonic version id at `index` (0 <= index < count).
@@ -336,6 +402,207 @@ int64_t lance_versions_timestamp_ms_at(const LanceVersions* versions, size_t ind
 
 /** Close and free a versions handle. Safe to call with NULL. */
 void lance_versions_close(LanceVersions* versions);
+
+/**
+ * Snapshot the lightweight attached-version references. Unlike full version
+ * details, this only enumerates the attached manifest locations. Caller frees
+ * with lance_version_refs_close(). The snapshot remains valid after the dataset
+ * is closed. Entries are ordered by version id.
+ * @return handle on success, or NULL on error
+ */
+LanceVersionRefs* lance_dataset_version_refs(const LanceDataset* dataset);
+
+/** Number of lightweight version refs, or 0 on error. */
+uint64_t lance_version_refs_count(const LanceVersionRefs* refs);
+
+/**
+ * Version id at `index`, or 0 on error (NULL handle or out-of-range index).
+ * Check lance_last_error_code() to distinguish an error.
+ */
+uint64_t lance_version_refs_id_at(
+    const LanceVersionRefs* refs,
+    size_t index
+);
+
+/** Close and free a lightweight version-ref snapshot. Safe to call with NULL. */
+void lance_version_refs_close(LanceVersionRefs* refs);
+
+/* ─── Native references and checkout ─── */
+
+/** Construct Ref::VersionNumber(version). Caller frees with lance_ref_close(). */
+LanceRef* lance_ref_version_number(uint64_t version);
+
+/**
+ * Construct the native Ref::Version variant.
+ *
+ * `branch == NULL` maps to None. `has_version == false` maps the version to
+ * None; otherwise `version` is used. The native tuple conversion normalizes
+ * "main" to the default branch. No C-side validation policy is applied here;
+ * the native operation that consumes the ref validates it.
+ */
+LanceRef* lance_ref_version(
+    const char* branch,
+    bool has_version,
+    uint64_t version
+);
+
+/**
+ * Construct Ref::Tag(tag_name). A NULL name is rejected; an empty name is
+ * passed through to the native operation for its normal validation.
+ */
+LanceRef* lance_ref_tag(const char* tag_name);
+
+/** Close and free a native reference. Safe to call with NULL. */
+void lance_ref_close(LanceRef* reference);
+
+/**
+ * Check out a native Ref as a new dataset handle.
+ *
+ * The source dataset and reference are unchanged. The returned handle owns an
+ * independent snapshot and is usable after the source dataset is closed.
+ * Caller closes it with lance_dataset_close().
+ * @return new dataset handle, or NULL on error
+ */
+LanceDataset* lance_dataset_checkout_ref(
+    const LanceDataset* dataset,
+    const LanceRef* reference
+);
+
+/* ─── Tags ─── */
+
+/**
+ * Snapshot all tags. Caller frees with lance_tags_close(). The copied snapshot
+ * remains valid after the dataset is closed. Entry order is unspecified.
+ * @return handle on success, or NULL on error
+ */
+LanceTags* lance_dataset_tags(const LanceDataset* dataset);
+
+/** Number of tags, or 0 on error (check lance_last_error_code()). */
+uint64_t lance_tags_count(const LanceTags* tags);
+
+/**
+ * Borrowed tag at `index` (0 <= index < count), or NULL on error. The pointer
+ * remains valid until lance_tags_close().
+ */
+const LanceTag* lance_tags_at(const LanceTags* tags, size_t index);
+
+/** Close and free a tag-list snapshot. Safe to call with NULL. */
+void lance_tags_close(LanceTags* tags);
+
+/**
+ * Fetch one tag by name. Caller frees with lance_tag_close().
+ * @return tag handle, or NULL on error
+ */
+LanceTag* lance_dataset_tag_get(
+    const LanceDataset* dataset,
+    const char* tag_name
+);
+
+/**
+ * Create a tag from a native ref.
+ *
+ * Target resolution, name validation, version lookup and duplicate detection
+ * are performed by the native Tags::create implementation. A duplicate tag
+ * surfaces as LANCE_ERR_COMMIT_CONFLICT; an unknown version surfaces as
+ * LANCE_ERR_NOT_FOUND.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_tag_create(
+    const LanceDataset* dataset,
+    const char* tag_name,
+    const LanceRef* reference
+);
+
+/**
+ * Update an existing tag to a native ref. The native implementation preserves
+ * metadata while updating the target and timestamps.
+ * @return 0 on success, -1 on error (including LANCE_ERR_NOT_FOUND)
+ */
+int32_t lance_dataset_tag_update(
+    const LanceDataset* dataset,
+    const char* tag_name,
+    const LanceRef* reference
+);
+
+/**
+ * Delete a tag. An unknown tag surfaces as LANCE_ERR_NOT_FOUND.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_tag_delete(
+    const LanceDataset* dataset,
+    const char* tag_name
+);
+
+/**
+ * Replace all metadata entries on an existing tag.
+ *
+ * `metadata` is NULL-terminated key-value pairs ["key","value",NULL]. NULL
+ * means an empty map. Native storage serializes missing metadata as an empty
+ * map on read, so absent and empty metadata are observationally equivalent.
+ * @return 0 on success, -1 on error (including LANCE_ERR_NOT_FOUND)
+ */
+int32_t lance_dataset_tag_replace_metadata(
+    const LanceDataset* dataset,
+    const char* tag_name,
+    const char* const* metadata
+);
+
+/** Tag name, borrowed until the tag handle is closed. NULL on error. */
+const char* lance_tag_name(const LanceTag* tag);
+
+/** Tagged version id, or 0 on error. */
+uint64_t lance_tag_version(const LanceTag* tag);
+
+/**
+ * Report the tag's optional branch.
+ *
+ * Returns 1 and writes a borrowed branch when present, 0 and writes NULL when
+ * absent, or -1 on error. The branch remains valid until the tag is closed.
+ */
+int32_t lance_tag_branch(
+    const LanceTag* tag,
+    const char** out_branch
+);
+
+/**
+ * Report the optional creation timestamp as Unix epoch nanoseconds.
+ * Returns 1 when present, 0 when absent, or -1 on error.
+ * A present timestamp outside the i64 nanosecond range returns -1 with
+ * LANCE_ERR_INVALID_ARGUMENT. On absence or error, the output is unchanged.
+ */
+int32_t lance_tag_created_at_ns(
+    const LanceTag* tag,
+    int64_t* out_timestamp_ns
+);
+
+/**
+ * Report the optional update timestamp as Unix epoch nanoseconds.
+ * Returns 1 when present, 0 when absent, or -1 on error.
+ * A present timestamp outside the i64 nanosecond range returns -1 with
+ * LANCE_ERR_INVALID_ARGUMENT. On absence or error, the output is unchanged.
+ */
+int32_t lance_tag_updated_at_ns(
+    const LanceTag* tag,
+    int64_t* out_timestamp_ns
+);
+
+/** Manifest size recorded in the tag, or 0 on error. */
+uint64_t lance_tag_manifest_size(const LanceTag* tag);
+
+/**
+ * Number of tag metadata entries, or 0 on error. Missing metadata and an empty
+ * map both produce zero entries, matching native TagContents deserialization.
+ */
+uint64_t lance_tag_metadata_count(const LanceTag* tag);
+
+/** Metadata key at `index`, borrowed until the tag is closed. NULL on error. */
+const char* lance_tag_metadata_key_at(const LanceTag* tag, size_t index);
+
+/** Metadata value at `index`, borrowed until the tag is closed. NULL on error. */
+const char* lance_tag_metadata_value_at(const LanceTag* tag, size_t index);
+
+/** Close and free one tag handle. Safe to call with NULL. */
+void lance_tag_close(LanceTag* tag);
 
 /* ─── Data statistics ─── */
 
@@ -864,6 +1131,115 @@ uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
  * @return 0 on success, -1 on error
  */
 int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_ids);
+
+/* ─── Read-only fragment snapshots ─── */
+
+/**
+ * Resolve a fragment by ID from this dataset snapshot.
+ *
+ * The returned handle retains Native `FileFragment` snapshot ownership: it
+ * remains valid, and keeps reading the same dataset version, after `dataset`
+ * is closed or mutated.
+ *
+ * @param dataset      Open dataset snapshot.
+ * @param fragment_id  Fragment ID from lance_dataset_fragment_ids().
+ * @return Fragment handle, or NULL on error. A missing ID sets
+ *         LANCE_ERR_NOT_FOUND; a NULL dataset sets
+ *         LANCE_ERR_INVALID_ARGUMENT.
+ */
+LanceFragment* lance_dataset_open_fragment(
+    const LanceDataset* dataset,
+    uint64_t fragment_id
+);
+
+/** Close and free a fragment handle. Safe to call with NULL. */
+void lance_fragment_close(LanceFragment* fragment);
+
+/**
+ * Return the fragment ID. Returns 0 and sets LANCE_ERR_INVALID_ARGUMENT on a
+ * NULL handle.
+ */
+uint64_t lance_fragment_id(const LanceFragment* fragment);
+
+/**
+ * Return the number of Native base data files in the fragment. Overlay files
+ * and the deletion file are not included. Returns 0 and sets an error on a
+ * NULL handle.
+ */
+uint64_t lance_fragment_data_file_count(const LanceFragment* fragment);
+
+/**
+ * Serialize the Native fragment metadata as JSON.
+ *
+ * The object is Lance's `Fragment` serialization. It includes base data files
+ * (path, field IDs, column indices, file version, size, base ID), overlays,
+ * deletion-file metadata, row-id/version metadata, and physical_rows. Optional
+ * unknown values remain null or omitted as Native serializes them; they are
+ * never replaced with zero.
+ *
+ * The caller must free the returned string with lance_free_string(). Returns
+ * NULL and sets an error for a NULL handle or serialization failure.
+ */
+const char* lance_fragment_metadata_json(const LanceFragment* fragment);
+
+/**
+ * Export the fragment's logical dataset schema via Arrow C Data Interface.
+ *
+ * This is FileFragment::schema(), the logical dataset schema, not a physical
+ * file schema. `out` is caller-allocated and remains caller-owned; invoke its
+ * non-NULL release callback exactly once.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_schema(
+    const LanceFragment* fragment,
+    struct ArrowSchema* out
+);
+
+/**
+ * Read the physical row count, including deleted rows.
+ *
+ * Calls FileFragment::physical_rows(), which may perform data-file I/O when
+ * the manifest has no trustworthy cached count. Native errors propagate.
+ *
+ * @param fragment  Fragment snapshot.
+ * @param out_rows  Receives the count on success; unchanged on failure.
+ * @return 0 on success, -1 on error (including NULL fragment/out_rows).
+ */
+int32_t lance_fragment_physical_rows(
+    const LanceFragment* fragment,
+    uint64_t* out_rows
+);
+
+/**
+ * Read the deleted-row count.
+ *
+ * Calls FileFragment::count_deletions(), which may load the deletion vector
+ * when its count is not cached in the manifest. Native errors propagate.
+ *
+ * @param fragment  Fragment snapshot.
+ * @param out_rows  Receives the count on success; unchanged on failure.
+ * @return 0 on success, -1 on error (including NULL fragment/out_rows).
+ */
+int32_t lance_fragment_deleted_rows(
+    const LanceFragment* fragment,
+    uint64_t* out_rows
+);
+
+/**
+ * Read the logical row count.
+ *
+ * Calls FileFragment::count_rows(None) directly; the binding does not subtract
+ * the deletion count itself. Native errors propagate.
+ *
+ * @param fragment  Fragment snapshot.
+ * @param out_rows  Receives the count on success; unchanged on failure.
+ * @return 0 on success, -1 on error (including NULL fragment/out_rows).
+ */
+int32_t lance_fragment_logical_rows(
+    const LanceFragment* fragment,
+    uint64_t* out_rows
+);
 
 /* ─── Random access ─── */
 

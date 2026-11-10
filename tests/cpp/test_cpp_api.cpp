@@ -7,7 +7,8 @@
  *
  * Tests the RAII wrappers, exception handling, and builder pattern.
  *
- * Usage: test_cpp_api <dataset_uri> <write_uri> <blob_uri>
+ * Usage: test_cpp_api <dataset_uri> <write_uri> <blob_uri> <ordering_uri>
+ *                     <fragment_uri>
  */
 
 #include "lance/lance.hpp"
@@ -17,6 +18,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -737,6 +739,99 @@ static void test_versions(const std::string& uri) {
     }
     printf("count=%zu... ", versions.size());
 
+    PASS();
+}
+
+static void test_version_refs_and_tags(const std::string& uri) {
+    TEST(test_version_refs_and_tags);
+
+    auto ds = lance::Dataset::open(uri);
+    assert(ds.version() == 2);
+    assert(ds.count_rows() == 20);
+
+    auto current = ds.current_version();
+    assert(current.id == ds.version());
+    assert(current.timestamp_ns > 0);
+    assert(current.metadata.at("total_rows") == "20");
+    assert(current.metadata.at("total_fragments") == "2");
+
+    auto details = ds.version_details();
+    assert(details.size() == 2);
+    assert(details[0].id == 1);
+    assert(details[0].metadata.at("total_rows") == "10");
+    assert(details[1].id == 2);
+    assert(details[1].metadata.at("total_rows") == "20");
+
+    auto refs = ds.version_refs();
+    assert((refs == std::vector<uint64_t>{1, 2}));
+
+    auto checked_v1 = ds.checkout(lance::Ref::version_number(1));
+    assert(checked_v1.version() == 1 && checked_v1.count_rows() == 10);
+    auto checked_latest = ds.checkout(lance::Ref::version(std::nullopt, std::nullopt));
+    assert(checked_latest.version() == 2 && checked_latest.count_rows() == 20);
+    auto checked_main =
+        ds.checkout(lance::Ref::version(std::optional<std::string>("main"), 1));
+    assert(checked_main.version() == 1);
+
+    ds.create_tag("cpp-release", lance::Ref::version_number(1));
+    auto tag = ds.get_tag("cpp-release");
+    assert(tag.name == "cpp-release");
+    assert(tag.version == 1);
+    assert(!tag.branch.has_value());
+    assert(tag.created_at_ns.has_value());
+    assert(tag.updated_at_ns.has_value());
+    assert(tag.manifest_size > 0);
+    assert(tag.metadata.empty());
+
+    bool duplicate_conflict = false;
+    try {
+        ds.create_tag("cpp-release", lance::Ref::version_number(2));
+    } catch (const lance::Error& error) {
+        duplicate_conflict = error.code == LANCE_ERR_COMMIT_CONFLICT;
+    }
+    assert(duplicate_conflict);
+
+    auto old_checkout = ds.checkout(lance::Ref::tag("cpp-release"));
+    assert(old_checkout.version() == 1);
+
+    ds.replace_tag_metadata(
+        "cpp-release", {{"owner", "cpp"}, {"empty", ""}});
+    auto persisted = lance::Dataset::open(uri).get_tag("cpp-release");
+    assert(persisted.metadata.at("owner") == "cpp");
+    assert(persisted.metadata.at("empty").empty());
+
+    ds.update_tag(
+        "cpp-release",
+        lance::Ref::version(std::optional<std::string>("main"), 2));
+    auto updated = ds.get_tag("cpp-release");
+    assert(updated.version == 2);
+    assert(updated.metadata == persisted.metadata);
+    assert(updated.created_at_ns == tag.created_at_ns);
+    assert(updated.updated_at_ns.has_value());
+    assert(*updated.updated_at_ns >= *tag.created_at_ns);
+
+    // Existing checked-out snapshots keep their original manifest.
+    assert(old_checkout.version() == 1 && old_checkout.count_rows() == 10);
+    auto updated_checkout = ds.checkout(lance::Ref::tag("cpp-release"));
+    assert(updated_checkout.version() == 2 && updated_checkout.count_rows() == 20);
+
+    auto tags = ds.tags();
+    assert(tags.size() == 1);
+    assert(tags[0].name == "cpp-release");
+
+    ds.replace_tag_metadata("cpp-release", {});
+    assert(ds.get_tag("cpp-release").metadata.empty());
+
+    ds.delete_tag("cpp-release");
+    bool missing_tag = false;
+    try {
+        (void)ds.get_tag("cpp-release");
+    } catch (const lance::Error& error) {
+        missing_tag = error.code == LANCE_ERR_NOT_FOUND;
+    }
+    assert(missing_tag);
+
+    assert(ds.version() == 2);
     PASS();
 }
 
@@ -1861,10 +1956,108 @@ static void test_scanner_order_by(const std::string& uri) {
     PASS();
 }
 
+static const ArrowSchema* find_schema_child(
+    const ArrowSchema& schema,
+    const char* name) {
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        const ArrowSchema* child = schema.children[i];
+        if (child && child->name && strcmp(child->name, name) == 0) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
+static void test_fragment_snapshots(const std::string& uri) {
+    TEST(test_fragment_snapshots);
+
+    auto latest = lance::Dataset::open(uri);
+    auto ids = latest.fragment_ids();
+    assert(ids.size() == 2);
+    auto latest_version = latest.version();
+    assert(latest_version >= 3);
+
+    std::optional<lance::Fragment> before_delete;
+    {
+        auto before = lance::Dataset::open(uri, {}, latest_version - 1);
+        before_delete.emplace(before.open_fragment(ids[0]));
+    }
+    // The fragment retains its own snapshot after the source Dataset closes.
+    assert(before_delete->id() == ids[0]);
+    assert(before_delete->data_file_count() == 1);
+    assert(before_delete->physical_rows() == 4);
+    assert(before_delete->deleted_rows() == 0);
+    assert(before_delete->logical_rows() == 4);
+    auto before_metadata = before_delete->metadata_json();
+    assert(before_metadata.find("\"physical_rows\":4") != std::string::npos);
+    assert(before_metadata.find("\"deletion_file\"") == std::string::npos);
+
+    // The latest snapshot has one deletion in each fragment. The older
+    // fragment remains bound to version 2 rather than reading version 3.
+    auto current = latest.open_fragment(ids[0]);
+    assert(current.id() == ids[0]);
+    assert(current.physical_rows() == 4);
+    assert(current.deleted_rows() == 1);
+    assert(current.logical_rows() == 3);
+
+    auto metadata = current.metadata_json();
+    assert(metadata.find("\"files\":[") != std::string::npos);
+    assert(metadata.find("\"path\":\"") != std::string::npos);
+    assert(metadata.find("\"fields\":[") != std::string::npos);
+    assert(metadata.find("\"column_indices\":[") != std::string::npos);
+    assert(metadata.find("\"deletion_file\":{") != std::string::npos);
+    assert(metadata.find("\"read_version\":") != std::string::npos);
+    assert(metadata.find("\"num_deleted_rows\":1") != std::string::npos);
+
+    auto second = latest.open_fragment(ids[1]);
+    assert(second.id() == ids[1]);
+    assert(second.physical_rows() == 4);
+    assert(second.deleted_rows() == 1);
+    assert(second.logical_rows() == 3);
+
+    ArrowSchema schema{};
+    current.schema(&schema);
+    assert(schema.n_children == 2);
+    const ArrowSchema* profile = find_schema_child(schema, "profile");
+    assert(profile);
+    assert(profile->format && strcmp(profile->format, "+s") == 0);
+    assert(profile->n_children == 2);
+    assert(find_schema_child(*profile, "name"));
+    assert(find_schema_child(*profile, "score"));
+    if (schema.release) schema.release(&schema);
+
+    bool caught = false;
+    try {
+        (void)latest.open_fragment(std::numeric_limits<uint64_t>::max());
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_NOT_FOUND);
+        assert(std::string(error.what()).find("fragment_id") !=
+               std::string::npos);
+    }
+    assert(caught);
+
+    // Every read still works after the source Dataset is destroyed.
+    std::optional<lance::Fragment> owned;
+    {
+        auto ds = lance::Dataset::open(uri);
+        owned.emplace(ds.open_fragment(ids[0]));
+    }
+    assert(owned->id() == ids[0]);
+    assert(owned->physical_rows() == 4);
+    assert(owned->deleted_rows() == 1);
+    assert(owned->logical_rows() == 3);
+    assert(owned->metadata_json().find("\"deletion_file\":{") !=
+           std::string::npos);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
-    if (argc < 5) {
+    if (argc < 6) {
         fprintf(stderr,
-                "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri>\n",
+                "Usage: %s <dataset_uri> <write_uri> <blob_uri> "
+                "<ordering_uri> <fragment_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -1873,6 +2066,7 @@ int main(int argc, char** argv) {
     std::string write_uri(argv[2]);
     std::string blob_uri(argv[3]);
     std::string ordering_uri(argv[4]);
+    std::string fragment_uri(argv[5]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -1882,6 +2076,7 @@ int main(int argc, char** argv) {
     test_scanner_projection_filter(uri);
     test_scanner_projection(uri);
     test_scanner_order_by(ordering_uri);
+    test_fragment_snapshots(fragment_uri);
     test_scanner_row_addr_lists(uri);
     test_distance_range(uri);
     test_scanner_async_stream_ownership(uri);
@@ -1891,6 +2086,7 @@ int main(int argc, char** argv) {
     test_dataset_take_rows(uri);
     test_raii_cleanup(uri);
     test_versions(uri);
+    test_version_refs_and_tags(uri);
     test_restore_to_current(uri);
     test_error_exception(uri);
     test_index_lifecycle(uri);

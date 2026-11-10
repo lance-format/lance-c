@@ -49,13 +49,13 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Update operations | Expression-based row updates via `lance_dataset_update()` |
 | [x] | Merge-insert | Upsert via configurable when-matched / when-not-matched policies with `lance_dataset_merge_insert()` |
 | [x] | Schema evolution | Add columns via SQL / all-null / `ArrowArrayStream` with `lance_dataset_add_columns_*()`, drop via `lance_dataset_drop_columns()`, rename / retype / set nullability via `lance_dataset_alter_columns()` |
-| [x] | Version management | List via `lance_dataset_versions()`, rollback via `lance_dataset_restore()`, checkout via `lance_dataset_open(uri, opts, version)` |
+| [x] | Version management | Version details/metadata, lightweight refs, native ref checkout, tag CRUD/metadata, rollback, and numeric-version open |
 
 ### Phase 4: Advanced Features
 
 | Status | Component | Description |
 |--------|-----------|-------------|
-| [x] | Fragment-level access | Fragment enumeration, ID listing, scanner fragment filtering |
+| [x] | Fragment-level access | Fragment enumeration, ID listing, read-only metadata/schema/counts, scanner fragment filtering |
 | [x] | Compaction | Fragment consolidation via `lance_dataset_compact_files()` |
 | [x] | Statistics export | Per-field compressed on-disk size for query planning via `lance_dataset_calculate_data_stats()` |
 | [x] | Cloud storage | S3, GCS, Azure via storage options pass-through |
@@ -539,6 +539,27 @@ LanceDataset* ds = lance_dataset_open("data.lance", NULL, 42);
 ```cpp
 auto ds = lance::Dataset::open("data.lance", {}, /*version=*/42);
 ```
+
+Native refs can also select a version, the latest version on a branch, or a tag:
+
+```c
+LanceRef* ref = lance_ref_tag("release-2026-11");
+LanceDataset* ds = lance_dataset_checkout_ref(source, ref);
+lance_ref_close(ref);
+```
+
+```cpp
+auto ds = source.checkout(lance::Ref::tag("release-2026-11"));
+auto tags = ds.tags();
+```
+
+`lance_dataset_current_version()`, `lance_dataset_version_refs()` and
+`lance_dataset_tags()` return copied snapshots. They remain valid after the
+originating dataset handle is closed. Timestamp accessors expose native
+nanosecond precision; the existing millisecond version accessor is unchanged.
+Nanosecond accessors report an error when a timestamp does not fit i64
+nanoseconds. Snapshot creation and millisecond reads retain the native range.
+There is no C-side timestamp/asof selector.
 
 ## Releasing
 

@@ -19,6 +19,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -106,6 +107,63 @@ class FtsQuery;
 struct VersionInfo {
     uint64_t id;
     int64_t  timestamp_ms;
+};
+
+/// A copied version snapshot with native-precision timestamp and metadata.
+struct VersionDetails {
+    uint64_t id = 0;
+    int64_t timestamp_ns = 0;
+    std::map<std::string, std::string> metadata;
+};
+
+/// Copied native TagContents plus its tag name. Present timestamps must fit
+/// i64 nanoseconds; tag readers throw lance::Error when they do not.
+struct TagInfo {
+    std::string name;
+    std::optional<std::string> branch;
+    uint64_t version = 0;
+    std::optional<int64_t> created_at_ns;
+    std::optional<int64_t> updated_at_ns;
+    uint64_t manifest_size = 0;
+    std::map<std::string, std::string> metadata;
+};
+
+/// Owned native `lance::dataset::refs::Ref`.
+class Ref {
+    Handle<LanceRef, lance_ref_close> handle_;
+
+public:
+    explicit Ref(LanceRef* reference) : handle_(reference) {}
+
+    Ref(Ref&&) noexcept = default;
+    Ref& operator=(Ref&&) noexcept = default;
+    Ref(const Ref&) = delete;
+    Ref& operator=(const Ref&) = delete;
+
+    static Ref version_number(uint64_t version) {
+        auto* raw = lance_ref_version_number(version);
+        if (!raw) check_error();
+        return Ref(raw);
+    }
+
+    static Ref version(
+        std::optional<std::string> branch,
+        std::optional<uint64_t> version_number) {
+        auto* raw = lance_ref_version(
+            branch ? branch->c_str() : nullptr,
+            version_number.has_value(),
+            version_number.value_or(0));
+        if (!raw) check_error();
+        return Ref(raw);
+    }
+
+    static Ref tag(const std::string& tag_name) {
+        auto* raw = lance_ref_tag(tag_name.c_str());
+        if (!raw) check_error();
+        return Ref(raw);
+    }
+
+    const LanceRef* c_handle() const { return handle_.get(); }
 };
 
 /// Per-field storage statistics for query planning.
@@ -488,20 +546,163 @@ public:
     }
 };
 
+// ─── Read-only fragment snapshot ─────────────────────────────────────────────
+
+/// RAII handle over one fragment from a dataset snapshot. Native
+/// `FileFragment` owns an `Arc<Dataset>`, so this handle remains valid and
+/// keeps reading the same dataset version after the source Dataset is closed
+/// or mutated. Methods expose only read-only metadata and row counts.
+class Fragment {
+    Handle<LanceFragment, lance_fragment_close> handle_;
+
+public:
+    /// Adopt a handle from the C API; closed on destruction.
+    explicit Fragment(LanceFragment* fragment) : handle_(fragment) {}
+
+    Fragment(Fragment&&) noexcept = default;
+    Fragment& operator=(Fragment&&) noexcept = default;
+    Fragment(const Fragment&) = delete;
+    Fragment& operator=(const Fragment&) = delete;
+
+    /// Native fragment ID.
+    uint64_t id() const {
+        uint64_t value = lance_fragment_id(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Number of Native base data files; excludes overlays and the deletion file.
+    uint64_t data_file_count() const {
+        uint64_t value = lance_fragment_data_file_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Native `Fragment` metadata serialized as JSON. Includes base data
+    /// files, overlays, deletion-file metadata, row-id/version metadata, and
+    /// the optional physical_rows value.
+    std::string metadata_json() const {
+        const char* raw = lance_fragment_metadata_json(handle_.get());
+        if (!raw) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            raw, lance_free_string);
+        return std::string(raw);
+    }
+
+    /// Export the logical dataset schema through Arrow C Data Interface.
+    /// `out` is caller-owned; release it exactly once.
+    void schema(ArrowSchema* out) const {
+        if (lance_fragment_schema(handle_.get(), out) != 0) check_error();
+    }
+
+    /// Physical row count, including deleted rows. May perform data-file I/O.
+    uint64_t physical_rows() const {
+        uint64_t value = 0;
+        if (lance_fragment_physical_rows(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    /// Deleted-row count. May load the deletion vector.
+    uint64_t deleted_rows() const {
+        uint64_t value = 0;
+        if (lance_fragment_deleted_rows(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    /// Logical row count from Native count_rows(None).
+    uint64_t logical_rows() const {
+        uint64_t value = 0;
+        if (lance_fragment_logical_rows(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    const LanceFragment* c_handle() const { return handle_.get(); }
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
     Handle<LanceDataset, lance_dataset_close> handle_;
 
-    static std::vector<const char*> to_c_storage_options(
-        const std::vector<std::pair<std::string, std::string>>& storage_opts) {
+    static std::vector<const char*> to_c_key_values(
+        const std::vector<std::pair<std::string, std::string>>& entries) {
         std::vector<const char*> kv;
-        for (auto& [k, v] : storage_opts) {
+        for (auto& [k, v] : entries) {
             kv.push_back(k.c_str());
             kv.push_back(v.c_str());
         }
         kv.push_back(nullptr);
         return kv;
+    }
+
+    static VersionDetails read_version(const LanceVersion* version) {
+        VersionDetails out;
+        out.id = lance_version_id(version);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        out.timestamp_ns = lance_version_timestamp_ns(version);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+
+        uint64_t count = lance_version_metadata_count(version);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        for (uint64_t i = 0; i < count; ++i) {
+            const char* key = lance_version_metadata_key_at(
+                version, static_cast<size_t>(i));
+            if (!key) check_error();
+            const char* value = lance_version_metadata_value_at(
+                version, static_cast<size_t>(i));
+            if (!value) check_error();
+            out.metadata.emplace(key, value);
+        }
+        return out;
+    }
+
+    static TagInfo read_tag(const LanceTag* tag) {
+        TagInfo out;
+        const char* name = lance_tag_name(tag);
+        if (!name) check_error();
+        out.name = name;
+
+        out.version = lance_tag_version(tag);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        out.manifest_size = lance_tag_manifest_size(tag);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+
+        const char* branch = nullptr;
+        int32_t has_branch = lance_tag_branch(tag, &branch);
+        if (has_branch < 0) check_error();
+        if (has_branch) {
+            if (!branch) {
+                throw Error(LANCE_ERR_INTERNAL,
+                            "lance_tag_branch reported a present branch with a null pointer");
+            }
+            out.branch = std::string(branch);
+        }
+
+        int64_t timestamp = 0;
+        int32_t has_created = lance_tag_created_at_ns(tag, &timestamp);
+        if (has_created < 0) check_error();
+        if (has_created) out.created_at_ns = timestamp;
+
+        timestamp = 0;
+        int32_t has_updated = lance_tag_updated_at_ns(tag, &timestamp);
+        if (has_updated < 0) check_error();
+        if (has_updated) out.updated_at_ns = timestamp;
+
+        uint64_t metadata_count = lance_tag_metadata_count(tag);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        for (uint64_t i = 0; i < metadata_count; ++i) {
+            const char* key = lance_tag_metadata_key_at(
+                tag, static_cast<size_t>(i));
+            if (!key) check_error();
+            const char* value = lance_tag_metadata_value_at(
+                tag, static_cast<size_t>(i));
+            if (!value) check_error();
+            out.metadata.emplace(key, value);
+        }
+        return out;
     }
 
     /// Move raw handles into RAII owners. `blobs` must be reserved up front so
@@ -531,7 +732,7 @@ public:
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
         uint64_t version = 0) {
 
-        auto kv = to_c_storage_options(storage_opts);
+        auto kv = to_c_key_values(storage_opts);
         const char* const* opts_ptr =
             storage_opts.empty() ? nullptr : kv.data();
 
@@ -548,7 +749,7 @@ public:
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
         uint64_t version = 0) {
 
-        auto kv = to_c_storage_options(storage_opts);
+        auto kv = to_c_key_values(storage_opts);
         const char* const* opts_ptr =
             storage_opts.empty() ? nullptr : kv.data();
 
@@ -733,6 +934,122 @@ public:
             out.push_back(info);
         }
         return out;
+    }
+
+    /// Current version details, including native nanosecond timestamp and
+    /// manifest-summary metadata. Timestamps must fit i64 nanoseconds.
+    /// Throws lance::Error on failure.
+    VersionDetails current_version() const {
+        auto* raw = lance_dataset_current_version(handle_.get());
+        if (!raw) check_error();
+        Handle<LanceVersion, lance_version_close> version(raw);
+        return read_version(version.get());
+    }
+
+    /// Full version-history details ordered by version id. Each entry contains
+    /// native nanosecond precision and manifest-summary metadata. Timestamps
+    /// must fit i64 nanoseconds; versions() retains millisecond precision.
+    std::vector<VersionDetails> version_details() const {
+        auto* raw = lance_dataset_versions(handle_.get());
+        if (!raw) check_error();
+        Handle<LanceVersions, lance_versions_close> snap(raw);
+
+        uint64_t count = lance_versions_count(snap.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<VersionDetails> out;
+        out.reserve(static_cast<size_t>(count));
+        for (uint64_t i = 0; i < count; ++i) {
+            const LanceVersion* version =
+                lance_versions_at(snap.get(), static_cast<size_t>(i));
+            if (!version) check_error();
+            out.push_back(read_version(version));
+        }
+        return out;
+    }
+
+    /// Lightweight attached-version refs ordered by version id.
+    std::vector<uint64_t> version_refs() const {
+        auto* raw = lance_dataset_version_refs(handle_.get());
+        if (!raw) check_error();
+        Handle<LanceVersionRefs, lance_version_refs_close> refs(raw);
+
+        uint64_t count = lance_version_refs_count(refs.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<uint64_t> out;
+        out.reserve(static_cast<size_t>(count));
+        for (uint64_t i = 0; i < count; ++i) {
+            uint64_t id =
+                lance_version_refs_id_at(refs.get(), static_cast<size_t>(i));
+            if (lance_last_error_code() != LANCE_OK) check_error();
+            out.push_back(id);
+        }
+        return out;
+    }
+
+    /// Check out a native ref as an independent dataset snapshot.
+    Dataset checkout(const Ref& reference) const {
+        auto* out = lance_dataset_checkout_ref(
+            handle_.get(), reference.c_handle());
+        if (!out) check_error();
+        return Dataset(out);
+    }
+
+    /// Snapshot all tags. Entry order is unspecified.
+    std::vector<TagInfo> tags() const {
+        auto* raw = lance_dataset_tags(handle_.get());
+        if (!raw) check_error();
+        Handle<LanceTags, lance_tags_close> tags(raw);
+
+        uint64_t count = lance_tags_count(tags.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<TagInfo> out;
+        out.reserve(static_cast<size_t>(count));
+        for (uint64_t i = 0; i < count; ++i) {
+            const LanceTag* tag = lance_tags_at(tags.get(), static_cast<size_t>(i));
+            if (!tag) check_error();
+            out.push_back(read_tag(tag));
+        }
+        return out;
+    }
+
+    /// Fetch one tag by name.
+    TagInfo get_tag(const std::string& name) const {
+        auto* raw = lance_dataset_tag_get(handle_.get(), name.c_str());
+        if (!raw) check_error();
+        Handle<LanceTag, lance_tag_close> tag(raw);
+        return read_tag(tag.get());
+    }
+
+    /// Create a tag from a native ref.
+    void create_tag(const std::string& name, const Ref& reference) const {
+        if (lance_dataset_tag_create(
+                handle_.get(), name.c_str(), reference.c_handle()) != 0)
+            check_error();
+    }
+
+    /// Update an existing tag to a native ref. Metadata is preserved natively.
+    void update_tag(const std::string& name, const Ref& reference) const {
+        if (lance_dataset_tag_update(
+                handle_.get(), name.c_str(), reference.c_handle()) != 0)
+            check_error();
+    }
+
+    /// Delete a tag.
+    void delete_tag(const std::string& name) const {
+        if (lance_dataset_tag_delete(handle_.get(), name.c_str()) != 0)
+            check_error();
+    }
+
+    /// Replace all metadata entries on a tag. An empty map writes empty
+    /// metadata; native reads treat absent and empty metadata the same.
+    void replace_tag_metadata(
+        const std::string& name,
+        const std::vector<std::pair<std::string, std::string>>& metadata) const {
+        auto kv = to_c_key_values(metadata);
+        const char* const* metadata_ptr = metadata.empty() ? nullptr : kv.data();
+        if (lance_dataset_tag_replace_metadata(
+                handle_.get(), name.c_str(), metadata_ptr) != 0)
+            check_error();
     }
 
     /// Compute per-field data statistics (compressed on-disk byte size) for
@@ -1169,6 +1486,16 @@ public:
                 check_error();
         }
         return ids;
+    }
+
+    /// Resolve a read-only fragment snapshot by ID. The returned handle stays
+    /// bound to this dataset version and remains valid after this Dataset is
+    /// destroyed. A missing ID throws LANCE_ERR_NOT_FOUND.
+    Fragment open_fragment(uint64_t fragment_id) const {
+        auto* fragment =
+            lance_dataset_open_fragment(handle_.get(), fragment_id);
+        if (!fragment) check_error();
+        return Fragment(fragment);
     }
 
     /// Create a vector index on a column.
