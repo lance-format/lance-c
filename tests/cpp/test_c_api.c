@@ -700,6 +700,210 @@ static void test_native_refs_and_tags(const char *uri) {
     printf("OK\n");
 }
 
+static void test_branch_lifecycle(const char *uri) {
+    printf("  test_branch_lifecycle... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    ASSERT(lance_dataset_version(ds) == 2, "fixture must have two versions");
+    ASSERT(lance_dataset_count_rows(ds) == 20, "fixture must have twenty rows");
+
+    const char *json = lance_dataset_branch_identifier_json(ds);
+    ASSERT(json != NULL, "main branch identifier JSON");
+    ASSERT(strcmp(json, "{\"version_mapping\":[]}") == 0,
+           "main branch identifier must have an empty mapping");
+    lance_free_string(json);
+
+    json = lance_dataset_branches_json(ds);
+    ASSERT(json != NULL, "initial branch list JSON");
+    ASSERT(strcmp(json, "{}") == 0, "fixture must start without branches");
+    lance_free_string(json);
+
+    LanceRef *version1 = lance_ref_version_number(1);
+    ASSERT(version1 != NULL, "version ref");
+    LanceDataset *parent =
+        lance_dataset_branch_create(ds, "c/parent", version1, NULL);
+    ASSERT(parent != NULL, "branch create");
+    lance_ref_close(version1);
+    ASSERT(lance_dataset_version(parent) == 1, "branch version");
+    ASSERT(lance_dataset_count_rows(parent) == 10, "branch row count");
+
+    LanceRef *child_ref = lance_ref_version_number(1);
+    LanceDataset *child = lance_dataset_branch_create(
+        parent, "c/parent/child", child_ref, NULL);
+    ASSERT(child != NULL, "child branch create");
+    lance_ref_close(child_ref);
+    ASSERT(lance_dataset_count_rows(child) == 10, "child branch row count");
+
+    const char *parent_json =
+        lance_dataset_branch_get_json(ds, "c/parent");
+    ASSERT(parent_json != NULL, "branch get JSON");
+    ASSERT(strstr(parent_json, "\"parentBranch\":null") != NULL,
+           "main-based branch has no parent branch");
+    ASSERT(strstr(parent_json, "\"parentVersion\":1") != NULL,
+           "branch parent version");
+    ASSERT(strstr(parent_json, "\"createAt\":") != NULL,
+           "branch createAt");
+    ASSERT(strstr(parent_json, "\"manifestSize\":") != NULL,
+           "branch manifestSize");
+    ASSERT(strstr(parent_json, "\"identifier\":{\"version_mapping\":") != NULL,
+           "branch identifier mapping");
+    ASSERT(strstr(parent_json, "\"metadata\":{}") != NULL,
+           "branch starts with empty metadata");
+    lance_free_string(parent_json);
+
+    const char *child_json =
+        lance_dataset_branch_get_json(ds, "c/parent/child");
+    ASSERT(child_json != NULL, "child branch get JSON");
+    ASSERT(strstr(child_json, "\"parentBranch\":\"c/parent\"") != NULL,
+           "child branch parent");
+    ASSERT(strstr(child_json, "\"parentVersion\":1") != NULL,
+           "child branch parent version");
+    lance_free_string(child_json);
+
+    const char *branches_json = lance_dataset_branches_json(ds);
+    ASSERT(branches_json != NULL, "branch list JSON");
+    ASSERT(strstr(branches_json, "\"c/parent\"") != NULL,
+           "branch list includes parent");
+    ASSERT(strstr(branches_json, "\"c/parent/child\"") != NULL,
+           "branch list includes child");
+
+    const char *metadata[] = {"owner", "c-api", "empty", "", NULL};
+    ASSERT(lance_dataset_branch_replace_metadata(
+               ds, "c/parent", metadata) == 0,
+           "branch metadata replace");
+    parent_json = lance_dataset_branch_get_json(ds, "c/parent");
+    ASSERT(parent_json != NULL, "branch metadata JSON");
+    ASSERT(strstr(parent_json, "\"owner\":\"c-api\"") != NULL,
+           "branch metadata owner");
+    ASSERT(strstr(parent_json, "\"empty\":\"\"") != NULL,
+           "branch metadata empty value");
+    lance_free_string(parent_json);
+
+    LanceDataset *parent_checkout =
+        lance_dataset_checkout_branch(ds, "c/parent");
+    LanceDataset *main_checkout =
+        lance_dataset_checkout_branch(ds, "main");
+    ASSERT(parent_checkout != NULL && main_checkout != NULL,
+           "branch checkout");
+    ASSERT(lance_dataset_version(parent_checkout) == 1 &&
+               lance_dataset_count_rows(parent_checkout) == 10,
+           "parent branch checkout snapshot");
+    ASSERT(lance_dataset_version(main_checkout) == 2 &&
+               lance_dataset_count_rows(main_checkout) == 20,
+           "main branch checkout");
+
+    LanceRef *reserved = lance_ref_version("main", true, 1);
+    ASSERT(lance_dataset_branch_create(ds, "main", reserved, NULL) == NULL,
+           "main is reserved for branch creation");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "create reserved main branch");
+    lance_ref_close(reserved);
+
+    LanceRef *duplicate = lance_ref_version_number(2);
+    ASSERT(lance_dataset_branch_create(ds, "c/parent", duplicate, NULL) == NULL,
+           "duplicate branch must fail");
+    expect_error(LANCE_ERR_COMMIT_CONFLICT, "duplicate branch");
+    lance_ref_close(duplicate);
+
+    ASSERT(lance_dataset_branch_delete(ds, "c/parent") == -1,
+           "parent with child must not delete");
+    expect_error(LANCE_ERR_COMMIT_CONFLICT, "delete parent branch");
+
+    /* JSON and checkout handles own their data. */
+    const char *owned_list = lance_dataset_branches_json(ds);
+    const char *owned_parent = lance_dataset_branch_get_json(ds, "c/parent");
+    ASSERT(owned_list != NULL && owned_parent != NULL, "owned branch JSON");
+    lance_dataset_close(ds);
+    ASSERT(strstr(owned_list, "\"c/parent\"") != NULL,
+           "branch list after source close");
+    ASSERT(strstr(owned_parent, "\"owner\":\"c-api\"") != NULL,
+           "branch JSON after source close");
+    ASSERT(lance_dataset_count_rows(parent_checkout) == 10,
+           "checkout after source close");
+    lance_free_string(owned_parent);
+    lance_free_string(owned_list);
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "reopen failed");
+    parent_json = lance_dataset_branch_get_json(ds, "c/parent");
+    ASSERT(parent_json != NULL, "persisted branch metadata");
+    ASSERT(strstr(parent_json, "\"owner\":\"c-api\"") != NULL,
+           "persisted branch metadata value");
+    lance_free_string(parent_json);
+
+    /* NULL or an empty array fully replaces metadata with an empty map. */
+    ASSERT(lance_dataset_branch_replace_metadata(ds, "c/parent", NULL) == 0,
+           "clear branch metadata");
+    parent_json = lance_dataset_branch_get_json(ds, "c/parent");
+    ASSERT(parent_json != NULL && strstr(parent_json, "\"owner\"") == NULL,
+           "cleared branch metadata");
+    lance_free_string(parent_json);
+
+    LanceRef *empty_options_ref = lance_ref_version_number(1);
+    const char *empty_options[] = {NULL};
+    LanceDataset *options_branch = lance_dataset_branch_create(
+        ds, "c/empty-options", empty_options_ref, empty_options);
+    ASSERT(options_branch != NULL, "explicit empty storage options");
+    lance_ref_close(empty_options_ref);
+    lance_dataset_close(options_branch);
+    ASSERT(lance_dataset_branch_delete(ds, "c/empty-options") == 0,
+           "delete explicit-options branch");
+
+    ASSERT(lance_dataset_branch_delete(ds, "c/parent/child") == 0,
+           "delete child branch");
+    ASSERT(lance_dataset_branch_delete(ds, "c/parent") == 0,
+           "delete parent branch after child");
+
+    LanceRef *tagged_ref = lance_ref_version_number(1);
+    LanceDataset *tagged =
+        lance_dataset_branch_create(ds, "c/tagged", tagged_ref, NULL);
+    ASSERT(tagged != NULL, "tagged branch create");
+    lance_ref_close(tagged_ref);
+    LanceRef *tag_target = lance_ref_version("c/tagged", true, 1);
+    ASSERT(lance_dataset_tag_create(ds, "c-branch-tag", tag_target) == 0,
+           "tag branch");
+    ASSERT(lance_dataset_branch_delete(ds, "c/tagged") == -1,
+           "tagged branch must not delete");
+    expect_error(LANCE_ERR_COMMIT_CONFLICT, "delete tagged branch");
+    ASSERT(lance_dataset_tag_delete(ds, "c-branch-tag") == 0,
+           "delete branch tag");
+    ASSERT(lance_dataset_branch_delete(ds, "c/tagged") == 0,
+           "delete tagged branch after tag");
+
+    json = lance_dataset_branches_json(ds);
+    ASSERT(json != NULL, "final branch list");
+    ASSERT(strcmp(json, "{}") == 0, "branch list must be empty");
+    lance_free_string(json);
+
+    ASSERT(lance_dataset_branch_get_json(ds, "missing") == NULL,
+           "missing branch get");
+    expect_error(LANCE_ERR_NOT_FOUND, "missing branch get");
+    ASSERT(lance_dataset_checkout_branch(ds, "missing") == NULL,
+           "missing branch checkout");
+    expect_error(LANCE_ERR_NOT_FOUND, "missing branch checkout");
+    ASSERT(lance_dataset_branch_delete(ds, "missing") == -1,
+           "missing branch delete");
+    expect_error(LANCE_ERR_NOT_FOUND, "missing branch delete");
+
+    ASSERT(lance_dataset_branches_json(NULL) == NULL,
+           "NULL branch list");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "NULL branch list");
+    ASSERT(lance_dataset_branch_identifier_json(NULL) == NULL,
+           "NULL branch identifier");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "NULL branch identifier");
+    ASSERT(branches_json != NULL, "keep branch JSON alive");
+    lance_free_string(branches_json);
+
+    lance_ref_close(tag_target);
+    lance_dataset_close(tagged);
+    lance_dataset_close(ds);
+    lance_dataset_close(main_checkout);
+    lance_dataset_close(parent_checkout);
+    lance_dataset_close(child);
+    lance_dataset_close(parent);
+    printf("OK\n");
+}
+
 /* Restore the dataset to its own current version — always commits a new
  * manifest (no skip-if-equal optimization) so the caller's "make `version`
  * the new latest" intent holds even under concurrent writers. */
@@ -2177,6 +2381,7 @@ int main(int argc, char **argv) {
     test_take_blobs(blob_uri);
     test_versions(uri);
     test_native_refs_and_tags(uri);
+    test_branch_lifecycle(uri);
     test_restore_to_current(uri);
     test_error_handling();
     test_index_segment_builder(uri);

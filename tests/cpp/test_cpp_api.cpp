@@ -775,6 +775,141 @@ static void test_version_refs_and_tags(const std::string& uri) {
     PASS();
 }
 
+static void test_branch_lifecycle(const std::string& uri) {
+    TEST(test_branch_lifecycle);
+
+    auto ds = lance::Dataset::open(uri);
+    assert(ds.version() == 2);
+    assert(ds.count_rows() == 20);
+
+    auto main_identifier = ds.branch_identifier_json();
+    assert(main_identifier.find("\"version_mapping\":[]") !=
+           std::string::npos);
+    assert(ds.branches_json() == "{}");
+
+    auto parent = ds.create_branch(
+        "cpp/parent", lance::Ref::version_number(1));
+    assert(parent.version() == 1);
+    assert(parent.count_rows() == 10);
+    auto child = parent.create_branch(
+        "cpp/parent/child", lance::Ref::version_number(1));
+    assert(child.count_rows() == 10);
+
+    auto parent_json = ds.get_branch_json("cpp/parent");
+    assert(parent_json.find("\"parentBranch\":null") != std::string::npos);
+    assert(parent_json.find("\"parentVersion\":1") != std::string::npos);
+    assert(parent_json.find("\"createAt\":") != std::string::npos);
+    assert(parent_json.find("\"manifestSize\":") != std::string::npos);
+    assert(parent_json.find("\"identifier\":{\"version_mapping\":") !=
+           std::string::npos);
+    assert(parent_json.find("\"metadata\":{}") != std::string::npos);
+
+    auto child_json = ds.get_branch_json("cpp/parent/child");
+    assert(child_json.find("\"parentBranch\":\"cpp/parent\"") !=
+           std::string::npos);
+
+    auto branch_list = ds.branches_json();
+    assert(branch_list.find("\"cpp/parent\"") != std::string::npos);
+    assert(branch_list.find("\"cpp/parent/child\"") != std::string::npos);
+    assert(parent.branch_identifier_json().find(
+               "\"version_mapping\":[[") != std::string::npos);
+
+    std::vector<std::pair<std::string, std::string>> empty_storage_opts;
+    auto options_branch = ds.create_branch(
+        "cpp/empty-options",
+        lance::Ref::version_number(1),
+        empty_storage_opts);
+    assert(options_branch.count_rows() == 10);
+    options_branch = ds.create_branch(
+        "cpp/empty-options-2", lance::Ref::version_number(2));
+    assert(options_branch.count_rows() == 20);
+
+    auto parent_checkout = ds.checkout_branch("cpp/parent");
+    auto main_checkout = ds.checkout_branch("main");
+    assert(parent_checkout.version() == 1);
+    assert(parent_checkout.count_rows() == 10);
+    assert(main_checkout.version() == 2);
+    assert(main_checkout.count_rows() == 20);
+
+    ds.replace_branch_metadata(
+        "cpp/parent", {{"owner", "cpp"}, {"empty", ""}});
+    auto persisted = lance::Dataset::open(uri).get_branch_json("cpp/parent");
+    assert(persisted.find("\"owner\":\"cpp\"") != std::string::npos);
+    assert(persisted.find("\"empty\":\"\"") != std::string::npos);
+    ds.replace_branch_metadata("cpp/parent", {});
+    auto cleared = ds.get_branch_json("cpp/parent");
+    assert(cleared.find("\"owner\"") == std::string::npos);
+    assert(cleared.find("\"metadata\":{}") != std::string::npos);
+
+    bool duplicate_conflict = false;
+    try {
+        ds.create_branch("cpp/parent", lance::Ref::version_number(2));
+    } catch (const lance::Error& error) {
+        duplicate_conflict = error.code == LANCE_ERR_COMMIT_CONFLICT;
+    }
+    assert(duplicate_conflict);
+
+    bool child_protection = false;
+    try {
+        ds.delete_branch("cpp/parent");
+    } catch (const lance::Error& error) {
+        child_protection = error.code == LANCE_ERR_COMMIT_CONFLICT;
+    }
+    assert(child_protection);
+
+    ds.delete_branch("cpp/parent/child");
+    ds.delete_branch("cpp/parent");
+    ds.delete_branch("cpp/empty-options");
+    ds.delete_branch("cpp/empty-options-2");
+
+    auto tagged = ds.create_branch(
+        "cpp/tagged", lance::Ref::version_number(1));
+    ds.create_tag(
+        "cpp-branch-tag",
+        lance::Ref::version(
+            std::optional<std::string>("cpp/tagged"),
+            std::optional<uint64_t>(1)));
+    bool tag_protection = false;
+    try {
+        ds.delete_branch("cpp/tagged");
+    } catch (const lance::Error& error) {
+        tag_protection = error.code == LANCE_ERR_COMMIT_CONFLICT;
+    }
+    assert(tag_protection);
+    ds.delete_tag("cpp-branch-tag");
+    ds.delete_branch("cpp/tagged");
+
+    bool reserved_main = false;
+    try {
+        ds.create_branch("main", lance::Ref::version_number(1));
+    } catch (const lance::Error& error) {
+        reserved_main = error.code == LANCE_ERR_INVALID_ARGUMENT;
+    }
+    assert(reserved_main);
+
+    bool missing_get = false;
+    try {
+        (void)ds.get_branch_json("missing");
+    } catch (const lance::Error& error) {
+        missing_get = error.code == LANCE_ERR_NOT_FOUND;
+    }
+    assert(missing_get);
+
+    bool missing_checkout = false;
+    try {
+        (void)ds.checkout_branch("missing");
+    } catch (const lance::Error& error) {
+        missing_checkout = error.code == LANCE_ERR_NOT_FOUND;
+    }
+    assert(missing_checkout);
+
+    assert(ds.branches_json() == "{}");
+    assert(tagged.version() == 1);
+    assert(parent_checkout.count_rows() == 10);
+    assert(main_checkout.count_rows() == 20);
+    PASS();
+}
+
 // Restore to the dataset's own current version — always commits a new
 // manifest (no skip-if-equal optimization) to defeat TOCTOU races against
 // concurrent writers.
@@ -2026,6 +2161,7 @@ int main(int argc, char** argv) {
     test_raii_cleanup(uri);
     test_versions(uri);
     test_version_refs_and_tags(uri);
+    test_branch_lifecycle(uri);
     test_restore_to_current(uri);
     test_error_exception(uri);
     test_index_lifecycle(uri);
