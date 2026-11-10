@@ -75,6 +75,21 @@ pub unsafe fn parse_c_string_map(
     Ok(map)
 }
 
+/// Parse a nullable NULL-terminated key-value array.
+///
+/// A NULL pointer means the native `Option` is `None`. A non-NULL pointer,
+/// including one whose first entry is NULL, means `Some`, with the latter
+/// representing an explicitly empty map.
+pub unsafe fn parse_optional_c_string_map(
+    ptr: *const *const c_char,
+    label: &str,
+) -> Result<Option<HashMap<String, String>>> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    unsafe { parse_c_string_map(ptr, label).map(Some) }
+}
+
 /// Parse NULL-terminated storage option pairs. NULL means no options.
 pub unsafe fn parse_storage_options(ptr: *const *const c_char) -> Result<HashMap<String, String>> {
     unsafe { parse_c_string_map(ptr, "storage options") }
