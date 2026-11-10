@@ -608,6 +608,9 @@ fn native_ordering_rows(
     })
 }
 
+type OrderingSpec<'a> = (&'a str, LanceOrderDirection, LanceNullOrder);
+type OrderingCase<'a> = (Vec<OrderingSpec<'a>>, Vec<i32>);
+
 // ---------------------------------------------------------------------------
 // Dataset tests
 // ---------------------------------------------------------------------------
@@ -841,7 +844,7 @@ fn test_scanner_order_by_single_and_multi_key() {
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
     assert!(!ds.is_null());
 
-    let cases: Vec<(Vec<(&str, LanceOrderDirection, LanceNullOrder)>, Vec<i32>)> = vec![
+    let cases: Vec<OrderingCase<'_>> = vec![
         (
             vec![
                 (
