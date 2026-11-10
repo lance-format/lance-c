@@ -29,6 +29,8 @@
 
 namespace lance {
 
+class Scanner;
+
 // ─── Error ───────────────────────────────────────────────────────────────────
 
 class Error : public std::runtime_error {
@@ -904,6 +906,31 @@ public:
     uint64_t logical_rows() const {
         uint64_t value = 0;
         if (lance_fragment_logical_rows(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    /// Start a scanner over this fragment's owned snapshot.
+    Scanner scan() const;
+
+    /// Take fragment-local logical rows by index with an explicit projection.
+    /// Indices retain the selected core's ordering and duplicate constraints.
+    /// `out` is caller-owned and its non-null `release` must be called exactly
+    /// once. An empty `columns` vector is an explicit empty projection.
+    void take(const uint32_t* indices, size_t num_indices,
+              const std::vector<std::string>& columns,
+              ArrowArrayStream* out) const;
+
+    /// Take fragment-local logical rows with the full logical schema.
+    void take(const uint32_t* indices, size_t num_indices,
+              ArrowArrayStream* out) const;
+
+    /// Count fragment rows. `std::nullopt` calls native count_rows(None); an
+    /// empty string is passed as an explicit native filter.
+    uint64_t count_rows(std::optional<std::string> filter = std::nullopt) const {
+        uint64_t value = 0;
+        if (lance_fragment_count_rows(
+                handle_.get(), filter ? filter->c_str() : nullptr, &value) != 0)
             check_error();
         return value;
     }
@@ -2890,6 +2917,8 @@ class Scanner {
     Handle<LanceScanner, lance_scanner_close> handle_;
 
 public:
+    friend class Fragment;
+
     explicit Scanner(LanceScanner* s) : handle_(s) {}
 
     /// Set the row limit.
@@ -3392,6 +3421,41 @@ public:
     /// Access the underlying C handle.
     LanceScanner* c_handle() { return handle_.get(); }
 };
+
+inline Scanner Fragment::scan() const {
+    auto* scanner = lance_fragment_scan(handle_.get());
+    if (!scanner) check_error();
+    return Scanner(scanner);
+}
+
+inline void Fragment::take(
+    const uint32_t* indices,
+    size_t num_indices,
+    const std::vector<std::string>& columns,
+    ArrowArrayStream* out) const {
+    std::vector<const char*> column_ptrs;
+    column_ptrs.reserve(columns.size() + 1);
+    for (const auto& column : columns) column_ptrs.push_back(column.c_str());
+    column_ptrs.push_back(nullptr);
+
+    const char* const empty_projection[] = {nullptr};
+    const char* const* columns_ptr =
+        columns.empty() ? empty_projection : column_ptrs.data();
+    if (lance_fragment_take(
+            handle_.get(), indices, num_indices, columns_ptr, out) != 0) {
+        check_error();
+    }
+}
+
+inline void Fragment::take(
+    const uint32_t* indices,
+    size_t num_indices,
+    ArrowArrayStream* out) const {
+    if (lance_fragment_take(
+            handle_.get(), indices, num_indices, nullptr, out) != 0) {
+        check_error();
+    }
+}
 
 inline Scanner Dataset::scan() const {
     return scan(std::nullopt);

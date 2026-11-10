@@ -2058,6 +2058,77 @@ int32_t lance_fragment_logical_rows(
     uint64_t* out_rows
 );
 
+/**
+ * Start a scanner over the fragment's owned dataset snapshot.
+ *
+ * This calls Native `FileFragment::scan`, which uses the ordinary scanner path
+ * with this fragment selected as the initial scan scope. The returned scanner
+ * follows the normal scanner lifecycle and configuration rules. It remains
+ * valid after the fragment and source dataset handles are closed.
+ *
+ * @param fragment  Fragment snapshot. Must not be NULL.
+ * @return Scanner handle, or NULL on error.
+ */
+LanceScanner* lance_fragment_scan(const LanceFragment* fragment);
+
+/**
+ * Take fragment-local logical rows by index.
+ *
+ * Indices address logical rows in this fragment after deletion vectors are
+ * resolved. They are not dataset `_rowid` values or physical row addresses.
+ * Indices are forwarded unchanged to native `FileFragment::take`. Deletion
+ * resolution, supported index ordering, duplicate handling, range validation,
+ * projection and JSON conversion follow the selected core. Lance 14.0.2's
+ * v2 decoder can reject unsorted or duplicate indices.
+ *
+ * `columns` is a NULL-terminated array of UTF-8 column paths:
+ * - NULL selects the fragment's full logical schema.
+ * - A non-NULL array whose first entry is NULL is an explicit empty
+ *   projection and retains Native take's failure behavior instead of being
+ *   treated as full. Missing top-level columns and non-UTF-8 names are errors;
+ *   nested paths follow Native `Schema::project` semantics.
+ * `indices` may be NULL only when `num_indices` is zero.
+ *
+ * On success `out` is initialized in caller-owned storage and must have its
+ * non-NULL release callback invoked exactly once. The stream owns its result
+ * and remains valid after the fragment and dataset handles are closed. Schema
+ * validation and native take errors are reported before the callbacks are
+ * exposed; deferred iteration and cleanup panics follow the existing guarded
+ * Arrow stream contract. `out` is unchanged on failure.
+ *
+ * @param fragment     Fragment snapshot. Must not be NULL.
+ * @param indices      Fragment-local logical row indices.
+ * @param num_indices  Length of `indices`; zero is a valid empty request.
+ * @param columns      NULL-terminated projected column paths, or NULL for all.
+ * @param out          Pointer to caller-allocated ArrowArrayStream.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_take(
+    const LanceFragment* fragment,
+    const uint32_t* indices,
+    size_t num_indices,
+    const char* const* columns,
+    struct ArrowArrayStream* out
+);
+
+/**
+ * Count this fragment's rows, optionally applying a native SQL filter.
+ *
+ * NULL calls Native `FileFragment::count_rows(None)`. A non-NULL string,
+ * including an empty string, is passed as `Some(filter)` without binding-side
+ * pruning; Native validation and errors are preserved.
+ *
+ * @param fragment  Fragment snapshot. Must not be NULL.
+ * @param filter    SQL filter expression, or NULL for no filter.
+ * @param out_rows  Receives the count on success; unchanged on failure.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_count_rows(
+    const LanceFragment* fragment,
+    const char* filter,
+    uint64_t* out_rows
+);
+
 /* ─── Random access ─── */
 
 /**

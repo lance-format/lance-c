@@ -3504,7 +3504,7 @@ static void test_fragment_snapshot(const char *uri) {
     ASSERT(lance_fragment_schema(fragment, &schema) == 0,
            "fragment schema export failed");
     CHECK_OK();
-    ASSERT(schema.n_children == 2, "fragment schema field count mismatch");
+    ASSERT(schema.n_children == 3, "fragment schema field count mismatch");
     const struct ArrowSchema *profile = find_schema_child(&schema, "profile");
     ASSERT(profile != NULL, "nested profile field missing");
     ASSERT(profile->format != NULL && strcmp(profile->format, "+s") == 0,
@@ -3514,6 +3514,10 @@ static void test_fragment_snapshot(const char *uri) {
            "nested name field missing");
     ASSERT(find_schema_child(profile, "score") != NULL,
            "nested score field missing");
+    const struct ArrowSchema *meta = find_schema_child(&schema, "meta");
+    ASSERT(meta != NULL, "JSON meta field missing");
+    ASSERT(meta->format != NULL && strcmp(meta->format, "Z") == 0,
+           "fragment schema must retain native JSONB storage");
     if (schema.release) schema.release(&schema);
 
     ASSERT(lance_fragment_physical_rows(fragment, &rows) == 0,
@@ -3532,11 +3536,221 @@ static void test_fragment_snapshot(const char *uri) {
     printf("OK\n");
 }
 
+static void check_fragment_take_ids(
+    struct ArrowArrayStream *stream,
+    const char *label,
+    const int32_t *expected,
+    size_t expected_len,
+    int profile_name_only
+) {
+    struct ArrowSchema schema = {0};
+    ASSERT(stream->get_schema(stream, &schema) == 0, "fragment take get_schema");
+    ASSERT(schema.n_children == 3, "fragment take schema field count");
+    int id_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (schema.children[i] != NULL && schema.children[i]->name != NULL &&
+            strcmp(schema.children[i]->name, "id") == 0) {
+            id_column = (int)i;
+        }
+    }
+    ASSERT(id_column >= 0, "fragment take id column missing");
+    const struct ArrowSchema *profile = find_schema_child(&schema, "profile");
+    ASSERT(profile != NULL && profile->format != NULL &&
+           strcmp(profile->format, "+s") == 0, "fragment take profile schema");
+    ASSERT(profile->n_children == (profile_name_only ? 1 : 2),
+           "fragment take profile projection");
+    ASSERT(find_schema_child(&schema, "meta") != NULL,
+           "fragment take JSON field missing");
+    schema.release(&schema);
+
+    int32_t actual[16];
+    size_t actual_len = 0;
+    while (1) {
+        struct ArrowArray array = {0};
+        ASSERT(stream->get_next(stream, &array) == 0, "fragment take get_next");
+        if (!array.release) break;
+        ASSERT(array.n_children == 3, "fragment take batch field count");
+        const struct ArrowArray *ids = array.children[id_column];
+        ASSERT(ids != NULL && ids->buffers[1] != NULL, "fragment take id values");
+        const int32_t *values = (const int32_t *)ids->buffers[1];
+        for (int64_t row = 0; row < array.length; ++row) {
+            ASSERT(actual_len < sizeof(actual) / sizeof(actual[0]),
+                   "fragment take output too large for fixture assertion");
+            actual[actual_len++] = values[ids->offset + row];
+        }
+        array.release(&array);
+    }
+    stream->release(stream);
+    ASSERT(actual_len == expected_len, label);
+    ASSERT(memcmp(actual, expected, expected_len * sizeof(expected[0])) == 0,
+           label);
+}
+
+static void test_fragment_read_operations(const char *uri) {
+    printf("  test_fragment_read_operations... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "fragment read fixture open failed");
+    CHECK_OK();
+    bool stable_row_ids = false;
+    ASSERT(lance_dataset_has_stable_row_ids(ds, &stable_row_ids) == 0,
+           "fragment read stable-row-ID inspection failed");
+    ASSERT(stable_row_ids, "fragment read fixture must use stable row IDs");
+    uint64_t ids[2] = {0, 0};
+    ASSERT(lance_dataset_fragment_ids(ds, ids) == 0,
+           "fragment read enumeration failed");
+    CHECK_OK();
+    LanceFragment *fragment = lance_dataset_open_fragment(ds, ids[0]);
+    ASSERT(fragment != NULL, "fragment read lookup failed");
+    CHECK_OK();
+
+    uint64_t rows = UINT64_MAX;
+    ASSERT(lance_fragment_count_rows(fragment, NULL, &rows) == 0,
+           "fragment count_rows(NULL) failed");
+    CHECK_OK();
+    ASSERT(rows == 3, "fragment count_rows(NULL) mismatch");
+    ASSERT(lance_fragment_count_rows(fragment, "id >= 2", &rows) == 0,
+           "fragment filtered count failed");
+    CHECK_OK();
+    ASSERT(rows == 2, "fragment filtered count mismatch");
+    rows = 77;
+    ASSERT(lance_fragment_count_rows(fragment, "", &rows) == -1,
+           "empty fragment filter must fail");
+    ASSERT(rows == 77, "failed fragment count must not write out_rows");
+    const char *message = lance_last_error_message();
+    ASSERT(message != NULL, "empty fragment filter must set an error");
+    lance_free_string(message);
+
+    const uint32_t indices[] = {0, 2};
+    const int32_t expected[] = {0, 3};
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_fragment_take(
+               fragment, indices, 2, NULL, &stream) == 0,
+           "fragment take full projection failed");
+    CHECK_OK();
+    check_fragment_take_ids(
+        &stream, "fragment take logical offsets",
+        expected, 2, 0);
+
+    const char *nested_columns[] = {"id", "profile.name", "meta", NULL};
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_fragment_take(
+               fragment, indices, 2, nested_columns, &stream) == 0,
+           "fragment take nested projection failed");
+    CHECK_OK();
+    check_fragment_take_ids(
+        &stream, "fragment take nested projection rows",
+        expected, 2, 1);
+
+    const char *empty_columns[] = {NULL};
+    const uint32_t one_index[] = {0};
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_fragment_take(
+               fragment, one_index, 1, empty_columns, &stream) == -1,
+           "explicit empty projection must preserve native take failure");
+    ASSERT(lance_last_error_code() == LANCE_ERR_NOT_FOUND,
+           "explicit empty projection native error code");
+    ASSERT(stream.release == NULL,
+           "failed empty projection must leave out uninitialized");
+    message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "No data files") != NULL,
+           "explicit empty projection native error message");
+    lance_free_string(message);
+
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_fragment_take(
+               fragment, NULL, 0, NULL, &stream) == 0,
+           "fragment take NULL/zero indices failed");
+    CHECK_OK();
+    ASSERT(count_stream_rows(&stream) == 0,
+           "NULL/zero indices must produce an empty stream");
+
+    const uint32_t out_of_range[] = {3};
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_fragment_take(
+               fragment, out_of_range, 1, NULL, &stream) == -1,
+           "fragment take out-of-range index must fail");
+    ASSERT(stream.release == NULL, "failed take must leave out uninitialized");
+    message = lance_last_error_message();
+    ASSERT(message != NULL, "out-of-range take must set an error");
+    lance_free_string(message);
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_fragment_take(
+               fragment, NULL, 1, NULL, &stream) == -1,
+           "fragment take NULL indices with nonzero count must fail");
+    message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "indices") != NULL,
+           "NULL indices error must name indices");
+    lance_free_string(message);
+
+    LanceScanner *scanner = lance_fragment_scan(fragment);
+    ASSERT(scanner != NULL, "fragment scan failed");
+    CHECK_OK();
+    LanceColumnOrdering descending = {
+        "id", LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_LAST,
+    };
+    ASSERT(lance_scanner_set_order_by(scanner, &descending, 1) == 0,
+           "fragment scanner order_by");
+    ASSERT(lance_scanner_set_limit(scanner, 1) == 0,
+           "fragment scanner limit");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "fragment scanner stream");
+    CHECK_OK();
+    const int32_t last_id[] = {3};
+    check_fragment_take_ids(
+        &stream, "fragment scanner must honor normal controls",
+        last_id, 1, 0);
+    lance_scanner_close(scanner);
+
+    scanner = lance_fragment_scan(fragment);
+    ASSERT(scanner != NULL, "fragment validation scanner");
+    LanceColumnOrdering missing = {
+        "missing", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST,
+    };
+    ASSERT(lance_scanner_set_order_by(scanner, &missing, 1) == 0,
+           "set missing fragment order column");
+    struct LanceBatch *batch = NULL;
+    ASSERT(lance_scanner_next(scanner, &batch) == -1,
+           "missing fragment order column must fail during iteration");
+    ASSERT(batch == NULL, "failed fragment iteration must not return a batch");
+    message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "missing") != NULL,
+           "fragment iteration error must name the missing column");
+    lance_free_string(message);
+    lance_scanner_close(scanner);
+
+    /* Streams and scanners own their results after parent handles close. */
+    memset(&stream, 0, sizeof(stream));
+    const int32_t first_id[] = {0};
+    ASSERT(lance_fragment_take(
+               fragment, one_index, 1, NULL, &stream) == 0,
+           "fragment take before close");
+    scanner = lance_fragment_scan(fragment);
+    ASSERT(scanner != NULL, "fragment scan before close");
+    struct ArrowArrayStream scan_stream = {0};
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &scan_stream) == 0,
+           "fragment scan stream before close");
+    lance_scanner_close(scanner);
+    lance_fragment_close(fragment);
+    lance_dataset_close(ds);
+
+    check_fragment_take_ids(
+        &stream, "take stream must outlive fragment and dataset",
+        first_id, 1, 0);
+    const int32_t fragment_ids[] = {0, 2, 3};
+    check_fragment_take_ids(
+        &scan_stream, "scan stream must retain initial fragment scope",
+        fragment_ids, 3, 0);
+
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
-    if (argc < 8) {
+    if (argc < 9) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
-                "<session_uri> <fragment_uri> <cleanup_uri>\n",
+                "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -3547,7 +3761,8 @@ int main(int argc, char **argv) {
     const char *ordering_uri = argv[4];
     const char *session_uri = argv[5];
     const char *fragment_uri = argv[6];
-    const char *cleanup_uri = argv[7];
+    const char *fragment_read_uri = argv[7];
+    const char *cleanup_uri = argv[8];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
@@ -3562,6 +3777,7 @@ int main(int argc, char **argv) {
     test_scan_with_row_addr_lists(uri);
     test_scanner_order_by(ordering_uri);
     test_fragment_snapshot(fragment_uri);
+    test_fragment_read_operations(fragment_read_uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_versions(uri);

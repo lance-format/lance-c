@@ -2887,13 +2887,16 @@ static void test_fragment_snapshots(const std::string& uri) {
 
     ArrowSchema schema{};
     current.schema(&schema);
-    assert(schema.n_children == 2);
+    assert(schema.n_children == 3);
     const ArrowSchema* profile = find_schema_child(schema, "profile");
     assert(profile);
     assert(profile->format && strcmp(profile->format, "+s") == 0);
     assert(profile->n_children == 2);
     assert(find_schema_child(*profile, "name"));
     assert(find_schema_child(*profile, "score"));
+    const ArrowSchema* meta = find_schema_child(schema, "meta");
+    assert(meta);
+    assert(meta->format && strcmp(meta->format, "Z") == 0);
     if (schema.release) schema.release(&schema);
 
     bool caught = false;
@@ -2923,11 +2926,155 @@ static void test_fragment_snapshots(const std::string& uri) {
     PASS();
 }
 
+static std::vector<int32_t> read_fragment_take_ids(
+    ArrowArrayStream& stream,
+    bool profile_name_only) {
+    ArrowSchema schema{};
+    assert(stream.get_schema(&stream, &schema) == 0);
+    assert(schema.n_children == 3);
+    int id_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (schema.children[i] && schema.children[i]->name &&
+            strcmp(schema.children[i]->name, "id") == 0) {
+            id_column = static_cast<int>(i);
+        }
+    }
+    assert(id_column >= 0);
+    const ArrowSchema* profile = find_schema_child(schema, "profile");
+    assert(profile && profile->format && strcmp(profile->format, "+s") == 0);
+    assert(profile->n_children == (profile_name_only ? 1 : 2));
+    const ArrowSchema* meta = find_schema_child(schema, "meta");
+    assert(meta);
+    assert(meta->format && strcmp(meta->format, "u") == 0);
+    schema.release(&schema);
+
+    std::vector<int32_t> ids;
+    while (true) {
+        ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        assert(stream.get_next(&stream, &array) == 0);
+        if (!array.release) break;
+        assert(array.n_children == 3);
+        const ArrowArray* id_array = array.children[id_column];
+        assert(id_array && id_array->buffers[1]);
+        const auto* values =
+            static_cast<const int32_t*>(id_array->buffers[1]);
+        for (int64_t row = 0; row < array.length; ++row) {
+            ids.push_back(values[id_array->offset + row]);
+        }
+        array.release(&array);
+    }
+    if (stream.release) stream.release(&stream);
+    return ids;
+}
+
+static void test_fragment_read_operations(const std::string& uri) {
+    TEST(test_fragment_read_operations);
+
+    auto latest = lance::Dataset::open(uri);
+    assert(latest.has_stable_row_ids());
+    auto ids = latest.fragment_ids();
+    assert(ids.size() == 2);
+    auto fragment = latest.open_fragment(ids[0]);
+    assert(fragment.count_rows() == 3);
+    assert(fragment.count_rows("id >= 2") == 2);
+
+    bool caught = false;
+    try {
+        (void)fragment.count_rows(std::string{});
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+
+    std::vector<uint32_t> indices{0, 2};
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    fragment.take(indices.data(), indices.size(), &stream);
+    assert((read_fragment_take_ids(stream, false) ==
+            std::vector<int32_t>{0, 3}));
+
+    std::vector<std::string> columns{"id", "profile.name", "meta"};
+    memset(&stream, 0, sizeof(stream));
+    fragment.take(indices.data(), indices.size(), columns, &stream);
+    assert((read_fragment_take_ids(stream, true) ==
+            std::vector<int32_t>{0, 3}));
+
+    std::vector<std::string> empty_columns;
+    std::vector<uint32_t> one_index{0};
+    caught = false;
+    memset(&stream, 0, sizeof(stream));
+    try {
+        fragment.take(one_index.data(), one_index.size(), empty_columns, &stream);
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_NOT_FOUND);
+        assert(std::string(error.what()).find("No data files") !=
+               std::string::npos);
+    }
+    assert(caught);
+
+    {
+        auto scanner = fragment.scan();
+        scanner.order_by(std::vector<lance::ColumnOrdering>{
+            {"id", LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_LAST},
+        }).limit(1);
+        ArrowArrayStream scan_stream;
+        memset(&scan_stream, 0, sizeof(scan_stream));
+        scanner.to_arrow_stream(&scan_stream);
+        assert((read_fragment_take_ids(scan_stream, false) ==
+                std::vector<int32_t>{3}));
+    }
+
+    caught = false;
+    try {
+        auto scanner = fragment.scan();
+        scanner.order_by(std::vector<lance::ColumnOrdering>{
+            {"missing", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+        });
+        ArrowArrayStream scan_stream;
+        memset(&scan_stream, 0, sizeof(scan_stream));
+        scanner.to_arrow_stream(&scan_stream);
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        assert(std::string(error.what()).find("missing") !=
+               std::string::npos);
+    }
+    assert(caught);
+
+    /* The returned streams own their data after all parent handles close. */
+    std::optional<lance::Fragment> held_fragment;
+    std::optional<lance::Scanner> held_scanner;
+    ArrowArrayStream take_stream;
+    memset(&take_stream, 0, sizeof(take_stream));
+    {
+        auto ds = lance::Dataset::open(uri);
+        auto owned = ds.open_fragment(ids[0]);
+        owned.take(one_index.data(), one_index.size(), &take_stream);
+        held_fragment.emplace(std::move(owned));
+        held_scanner.emplace(held_fragment->scan());
+    }
+    held_fragment.reset();
+    ArrowArrayStream scan_stream;
+    memset(&scan_stream, 0, sizeof(scan_stream));
+    held_scanner->to_arrow_stream(&scan_stream);
+    held_scanner.reset();
+
+    assert((read_fragment_take_ids(take_stream, false) ==
+            std::vector<int32_t>{0}));
+    assert((read_fragment_take_ids(scan_stream, false) ==
+            std::vector<int32_t>{0, 2, 3}));
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
-    if (argc < 8) {
+    if (argc < 9) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
-                "<session_uri> <fragment_uri> <cleanup_uri>\n",
+                "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -2938,7 +3085,8 @@ int main(int argc, char** argv) {
     std::string ordering_uri(argv[4]);
     std::string session_uri(argv[5]);
     std::string fragment_uri(argv[6]);
-    std::string cleanup_uri(argv[7]);
+    std::string fragment_read_uri(argv[7]);
+    std::string cleanup_uri(argv[8]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -2950,6 +3098,7 @@ int main(int argc, char** argv) {
     test_scanner_projection(uri);
     test_scanner_order_by(ordering_uri);
     test_fragment_snapshots(fragment_uri);
+    test_fragment_read_operations(fragment_read_uri);
     test_scanner_row_addr_lists(uri);
     test_distance_range(uri);
     test_scanner_async_stream_ownership(uri);
