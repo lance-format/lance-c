@@ -102,7 +102,7 @@ unsafe fn update_metadata_json_inner(
     let mode = LanceMetadataUpdateMode::from_raw(mode)?;
     let entries = unsafe { parse_metadata_entries(keys, values, count)? };
 
-    let updated = dataset.with_mut(|dataset| {
+    let updated = dataset.with_mut(|dataset: &mut lance::Dataset| {
         let builder = if schema_metadata {
             dataset.update_schema_metadata(entries)
         } else {
@@ -118,14 +118,14 @@ unsafe fn update_metadata_json_inner(
     serialize_metadata_map(&updated)
 }
 
-unsafe fn dataset_ref(dataset: *const LanceDataset) -> Result<&LanceDataset> {
+unsafe fn dataset_ref<'a>(dataset: *const LanceDataset) -> Result<&'a LanceDataset> {
     if dataset.is_null() {
         return Err(lance_core::Error::invalid_input("dataset must not be NULL"));
     }
     Ok(unsafe { &*dataset })
 }
 
-unsafe fn dataset_mut_ref(dataset: *mut LanceDataset) -> Result<&LanceDataset> {
+unsafe fn dataset_mut_ref<'a>(dataset: *mut LanceDataset) -> Result<&'a LanceDataset> {
     if dataset.is_null() {
         return Err(lance_core::Error::invalid_input("dataset must not be NULL"));
     }
