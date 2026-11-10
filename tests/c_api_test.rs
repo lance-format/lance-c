@@ -4190,10 +4190,12 @@ fn test_index_segments_json_reports_physical_metadata() {
 fn test_index_segments_json_unknown_coverage() {
     use lance::dataset::transaction::Operation;
     use lance::index::DatasetIndexExt;
+    use lance::index::vector::VectorIndexParams;
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_linalg::distance::MetricType;
 
-    let (_tmp, uri) = create_many_small_fragments(2);
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 16, 8, false);
     let expected_dataset_version = 2_u64;
     let commit_version = 3_u64;
     lance_c::runtime::block_on(async {
@@ -4208,10 +4210,26 @@ fn test_index_segments_json_unknown_coverage() {
             .await
             .unwrap();
         segment.fragment_bitmap = None;
+        let vector_params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        let known_vector = dataset
+            .create_index_builder(&["embedding"], IndexType::Vector, &vector_params)
+            .name("known_vector".to_string())
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let mut unknown_vector = dataset
+            .create_index_builder(&["embedding"], IndexType::Vector, &vector_params)
+            .name("unknown_vector".to_string())
+            .fragments(vec![1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        unknown_vector.fragment_bitmap = None;
         let committed = Dataset::commit(
             &uri,
             Operation::CreateIndex {
-                new_indices: vec![segment],
+                new_indices: vec![segment, known_vector, unknown_vector],
                 removed_indices: Vec::new(),
             },
             Some(commit_version - 1),
@@ -4236,15 +4254,94 @@ fn test_index_segments_json_unknown_coverage() {
     unsafe { lance_free_string(json_ptr) };
     let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
     let entries = entries.as_array().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["name"], "unknown_coverage");
-    assert_eq!(entries[0]["columns"], serde_json::json!(["id"]));
-    assert_eq!(entries[0]["type"], "Bitmap");
-    assert_eq!(entries[0]["dataset_version"], expected_dataset_version);
-    assert_eq!(entries[0]["index_version"], 0);
-    assert!(entries[0]["fragment_ids"].is_null());
+    assert_eq!(entries.len(), 3);
+    let by_name = entries
+        .iter()
+        .map(|entry| (entry["name"].as_str().unwrap(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let scalar = by_name["unknown_coverage"];
+    assert_eq!(scalar["columns"], serde_json::json!(["id"]));
+    assert_eq!(scalar["type"], "Bitmap");
+    assert_eq!(scalar["dataset_version"], expected_dataset_version);
+    assert_eq!(scalar["index_version"], 0);
+    assert!(scalar["fragment_ids"].is_null());
+    for name in ["known_vector", "unknown_vector"] {
+        let vector = by_name[name];
+        assert_eq!(vector["type"], "IVF_FLAT", "{name}");
+        assert_eq!(vector["columns"], serde_json::json!(["embedding"]));
+    }
+    assert_eq!(
+        by_name["known_vector"]["fragment_ids"],
+        serde_json::json!([0])
+    );
+    assert!(by_name["unknown_vector"]["fragment_ids"].is_null());
 
     unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_index_segments_json_nested_column_paths() {
+    use lance::dataset::WriteParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("nested").to_str().unwrap().to_string();
+    let child = Arc::new(Field::new("value", DataType::Int32, false));
+    let fields = arrow_schema::Fields::from(vec![child.clone()]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("data", DataType::Struct(fields.clone()), false),
+        Field::new("other", DataType::Struct(fields), false),
+    ]));
+    let data = arrow_array::StructArray::from(vec![(
+        child.clone(),
+        Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as arrow_array::ArrayRef,
+    )]);
+    let other = arrow_array::StructArray::from(vec![(
+        child,
+        Arc::new(Int32Array::from(vec![5, 6, 7, 8])) as arrow_array::ArrayRef,
+    )]);
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(other)]).unwrap();
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                max_rows_per_group: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+    });
+    let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    for column in ["data.value", "other.value"] {
+        let rc = unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                c_str(column).as_ptr(),
+                c_str(column).as_ptr(),
+                LanceScalarIndexType::Bitmap as i32,
+                ptr::null(),
+                false,
+            )
+        };
+        assert_eq!(rc, 0, "{}", take_last_error_message());
+    }
+    let json = unsafe { lance_dataset_index_segments_json(dataset) };
+    assert!(!json.is_null(), "{}", take_last_error_message());
+    let entries: serde_json::Value =
+        serde_json::from_str(unsafe { std::ffi::CStr::from_ptr(json) }.to_str().unwrap()).unwrap();
+    unsafe { lance_free_string(json) };
+    let entries = entries.as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        let expected = entry["name"].as_str().unwrap();
+        assert_eq!(entry["columns"], serde_json::json!([expected]));
+    }
+    unsafe { lance_dataset_close(dataset) };
 }
 
 #[test]
