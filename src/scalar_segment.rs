@@ -175,22 +175,23 @@ impl PreparedScalarSegment {
         let stats_callback = if let Some(callback) = self.callback {
             // Preserve the callback's once-per-successfully-exhausted-stream contract.
             // Candidate work is not part of the underlying reader's plan metrics.
-            let combined = Arc::new(move |read: &ExecutionSummaryCounts| {
-                let mut combined = read.clone();
-                combined.iops += stats.iops;
-                combined.requests += stats.requests;
-                combined.bytes_read += stats.bytes_read;
-                combined.indices_loaded += stats.indices_loaded;
-                combined.parts_loaded += stats.parts_loaded;
-                combined.index_comparisons += stats.index_comparisons;
-                for (name, value) in &stats.all_counts {
-                    *combined.all_counts.entry(name.clone()).or_default() += value;
-                }
-                for (name, value) in &stats.all_times {
-                    *combined.all_times.entry(name.clone()).or_default() += value;
-                }
-                callback(&combined);
-            });
+            let combined: ExecutionStatsCallback =
+                Arc::new(move |read: &ExecutionSummaryCounts| {
+                    let mut combined = read.clone();
+                    combined.iops += stats.iops;
+                    combined.requests += stats.requests;
+                    combined.bytes_read += stats.bytes_read;
+                    combined.indices_loaded += stats.indices_loaded;
+                    combined.parts_loaded += stats.parts_loaded;
+                    combined.index_comparisons += stats.index_comparisons;
+                    for (name, value) in &stats.all_counts {
+                        *combined.all_counts.entry(name.clone()).or_default() += value;
+                    }
+                    for (name, value) in &stats.all_times {
+                        *combined.all_times.entry(name.clone()).or_default() += value;
+                    }
+                    callback(&combined);
+                });
             reader.scan_stats_callback(combined.clone());
             Some(combined)
         } else {
