@@ -20988,11 +20988,9 @@ fn test_scanner_substrait_aggregate_native_validation_errors() {
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
     assert!(!scanner.is_null());
 
-    let invalid_column = aggregate_plan(&[], &[AggregateKind::Sum(99)], &["bad"]);
     for (bytes, code) in [
         (empty_plan(), LanceErrorCode::InvalidArgument),
         (non_aggregate_plan(), LanceErrorCode::InvalidArgument),
-        (invalid_column, LanceErrorCode::InvalidArgument),
         (malformed_plan(), LanceErrorCode::IoError),
     ] {
         let native_error = native_aggregate_error(&uri, &bytes);
@@ -21046,6 +21044,57 @@ fn test_scanner_substrait_aggregate_native_validation_errors() {
 
     unsafe {
         lance_scanner_close(scanner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_scanner_substrait_aggregate_out_of_bounds_field_panics_safely() {
+    // Pinned datafusion-substrait indexes DFSchema::qualified_field without a
+    // bounds check, so an out-of-range Substrait field reference unwinds inside
+    // native aggregate parsing. The FFI boundary must turn that into the shared
+    // panic/poison contract instead of unwinding into the C caller.
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let invalid_column = aggregate_plan(&[], &[AggregateKind::Sum(99)], &["bad"]);
+
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_substrait_aggregate(
+                scanner,
+                invalid_column.as_ptr(),
+                invalid_column.len(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+    let message = take_last_error_message();
+    assert!(message.contains("panic in FFI call"), "{message}");
+    assert!(message.contains("index out of bounds"), "{message}");
+
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 1) }, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+    assert!(take_last_error_message().contains("scanner is poisoned"));
+
+    let fresh = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!fresh.is_null());
+    let valid = aggregate_plan(&[], &[AggregateKind::CountStar], &["total"]);
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(fresh, valid.as_ptr(), valid.len()) },
+        0,
+        "a panic on one scanner must not affect dataset-backed fresh scanners"
+    );
+    let (_, batches) = collect_scanner(fresh);
+    assert_eq!(cells(&batches), vec![vec![Cell::Int(12)]]);
+
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_scanner_close(fresh);
         lance_dataset_close(ds);
     }
 }
