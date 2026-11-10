@@ -7,8 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchReader,
-    StringArray, StructArray,
+    Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use lance::Dataset;
@@ -286,7 +285,7 @@ fn c_materialization_scan(
         ok(unsafe {
             lance_scanner_set_materialization_style(
                 scan.0,
-                style,
+                style as i32,
                 pointers.as_ptr(),
                 pointers.len(),
             )
@@ -424,7 +423,7 @@ fn materialization_rejections_preserve_state_and_lifecycle() {
     ok(unsafe {
         lance_scanner_set_materialization_style(
             scan.0,
-            LanceMaterializationStyle::AllLate,
+            LanceMaterializationStyle::AllLate as i32,
             ptr::null(),
             0,
         )
@@ -434,7 +433,7 @@ fn materialization_rejections_preserve_state_and_lifecycle() {
         unsafe {
             lance_scanner_set_materialization_style(
                 scan.0,
-                LanceMaterializationStyle::AllEarlyExcept,
+                LanceMaterializationStyle::AllEarlyExcept as i32,
                 [missing.as_ptr()].as_ptr(),
                 1,
             )
@@ -449,7 +448,7 @@ fn materialization_rejections_preserve_state_and_lifecycle() {
         unsafe {
             lance_scanner_set_materialization_style(
                 scan.0,
-                LanceMaterializationStyle::AllEarlyExcept,
+                LanceMaterializationStyle::AllEarlyExcept as i32,
                 [ptr::null()].as_ptr(),
                 1,
             )
@@ -460,7 +459,7 @@ fn materialization_rejections_preserve_state_and_lifecycle() {
         unsafe {
             lance_scanner_set_materialization_style(
                 scan.0,
-                LanceMaterializationStyle::AllEarly,
+                LanceMaterializationStyle::AllEarly as i32,
                 [payload.as_ptr()].as_ptr(),
                 1,
             )
@@ -491,7 +490,7 @@ fn materialization_rejections_preserve_state_and_lifecycle() {
         unsafe {
             lance_scanner_set_materialization_style(
                 scan.0,
-                LanceMaterializationStyle::AllEarly,
+                LanceMaterializationStyle::AllEarly as i32,
                 ptr::null(),
                 0,
             )
@@ -501,7 +500,9 @@ fn materialization_rejections_preserve_state_and_lifecycle() {
 }
 
 fn fast_search_fixture() -> (tempfile::TempDir, String) {
-    use lance::index::{DatasetIndexExt, vector::VectorIndexParams};
+    use lance::index::{
+        DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams,
+    };
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
 
@@ -514,7 +515,7 @@ fn fast_search_fixture() -> (tempfile::TempDir, String) {
         Field::new("embedding", DataType::FixedSizeList(item.clone(), 2), false),
     ]));
 
-    let make_batch = |ids: Vec<i32>, vector: impl Fn(i32) -> [f32; 2]| {
+    let make_batch = |ids: Vec<i32>, vector: fn(i32) -> [f32; 2]| {
         let categories = ids
             .iter()
             .map(|id| if *id == 64 { "hit" } else { "other" })
@@ -581,7 +582,7 @@ fn fast_search_fixture() -> (tempfile::TempDir, String) {
             .await
             .unwrap()
             .into_iter()
-            .map(|fragment| fragment.id())
+            .map(|fragment| fragment.id)
             .collect::<Vec<_>>();
         assert_eq!(
             unindexed,
@@ -699,7 +700,8 @@ fn direct_fast_search(uri: &str, case: FastSearchCase) -> (Vec<i32>, ScanStatist
             dataset
                 .get_fragments()
                 .into_iter()
-                .filter(|fragment| ids.contains(&fragment.id()))
+                .filter(|fragment| ids.contains(&(fragment.id() as u64)))
+                .map(|fragment| fragment.metadata().clone())
                 .collect::<Vec<_>>()
         });
         if case.prefilter
