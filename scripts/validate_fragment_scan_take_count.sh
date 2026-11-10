@@ -11,6 +11,8 @@ ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 mkdir -p "$EVIDENCE_DIR/logs"
 : >"$EVIDENCE_DIR/commands.log"
+: >"$EVIDENCE_DIR/runner.log"
+exec > >(tee -a "$EVIDENCE_DIR/runner.log") 2>&1
 
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 SUCCESS=0
@@ -106,7 +108,7 @@ run_step 10-fmt cargo "+$CARGO_TOOLCHAIN" fmt --all -- --check
 run_step 11-check cargo "+$CARGO_TOOLCHAIN" check --all-targets -j 8
 run_step 12-clippy cargo "+$CARGO_TOOLCHAIN" clippy --all-targets -j 8 -- -D warnings
 run_step 20-full-rust cargo "+$CARGO_TOOLCHAIN" test -j 8 -- --test-threads=4
-run_step 21-c-cpp-consumers cargo "+$CARGO_TOOLCHAIN" test --test compile_and_run_test -j 8 -- --ignored --test-threads=4
+run_step 21-c-cpp-consumers cargo "+$CARGO_TOOLCHAIN" test --test compile_and_run_test -j 8 -- --ignored --test-threads=4 --nocapture
 
 for test_name in \
     test_fragment_take_matches_native_projection_and_logical_order \
