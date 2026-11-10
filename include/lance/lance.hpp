@@ -165,15 +165,16 @@ struct FtsPhraseOptions {
         FtsDocumentGranularity::Unspecified;
 };
 
-/// Options for FtsQuery::multi_match(). An empty boosts vector means the
-/// native default of 1.0 per column; `std::nullopt` omits boosts entirely.
+/// Options for FtsQuery::multi_match(). `std::nullopt` uses the native default
+/// of 1.0 per column; a provided vector must contain one entry per column.
 struct FtsMultiMatchOptions {
     std::optional<std::vector<float>> boosts;
     FtsMatchOperator match_operator = FtsMatchOperator::Or;
 };
 
-/// Options for FtsQuery::combined_fields(). An empty boosts vector means the
-/// native default of 1.0 per column; `std::nullopt` omits weights entirely.
+/// Options for FtsQuery::combined_fields(). `std::nullopt` uses the native
+/// default of 1.0 per column; a provided vector must contain one entry per
+/// column.
 struct FtsCombinedFieldsOptions {
     std::optional<std::vector<float>> boosts;
     FtsMatchOperator match_operator = FtsMatchOperator::Or;

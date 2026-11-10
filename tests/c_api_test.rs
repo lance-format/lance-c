@@ -10117,7 +10117,9 @@ fn test_typed_fts_query_matches_native_semantics() {
     let combined_and_native =
         native_combined_fields_query("alpha beta", &["title", "body"], &combined_and_options);
     let combined_and_scores = collect_typed_query_scores(dataset, combined_and, None, None, None);
-    assert_eq!(sorted_score_ids(&combined_and_scores), vec![1, 3]);
+    // Unlike MultiMatch, CombinedFields treats columns as one virtual field,
+    // so a term may match in a different column from its sibling.
+    assert_eq!(sorted_score_ids(&combined_and_scores), vec![1, 3, 4]);
     assert_scores_match(
         "AND combined fields",
         &combined_and_scores,
