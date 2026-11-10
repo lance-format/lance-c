@@ -11534,6 +11534,167 @@ fn test_typed_fts_query_construction_and_validation() {
 }
 
 #[test]
+fn test_typed_fts_projection_fast_search_and_scoring_match_native() {
+    use lance::dataset::scanner::MaterializationStyle;
+
+    let (_tmp, uri) = create_typed_fts_dataset();
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("title", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![11])),
+                Arc::new(StringArray::from(vec!["alpha"])),
+                Arc::new(StringArray::from(vec!["beta"])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        // This fragment lies outside the existing FTS indices' coverage.
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+    });
+
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let query = typed_match("alpha", Some("title"), &initialized_match_options());
+    let id_projection = [("id", "id")];
+    let explicit_score = [("id", "id"), ("_score", "_score")];
+    let computed_score = [("id", "id"), ("double_score", "_score + _score")];
+    let rows = |batches: &[RecordBatch], score_name: Option<&str>| {
+        let mut rows = std::collections::HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let scores = score_name.map(|name| {
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+            });
+            for row in 0..batch.num_rows() {
+                assert!(
+                    rows.insert(
+                        ids.value(row),
+                        scores.map_or(0.0, |scores| scores.value(row))
+                    )
+                    .is_none()
+                );
+            }
+        }
+        rows
+    };
+
+    for fast_search in [false, true] {
+        for (projection, disable, score_name) in [
+            (id_projection.as_slice(), false, Some("_score")),
+            (id_projection.as_slice(), true, None),
+            (explicit_score.as_slice(), true, Some("_score")),
+            (computed_score.as_slice(), true, Some("double_score")),
+        ] {
+            let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+            assert!(!scanner.is_null(), "{}", take_last_error_message());
+            assert_eq!(
+                set_projection(scanner, projection),
+                0,
+                "{}",
+                take_last_error_message()
+            );
+            if disable {
+                assert_eq!(
+                    unsafe { lance_scanner_disable_scoring_autoprojection(scanner) },
+                    0
+                );
+            }
+            assert_eq!(
+                unsafe { lance_scanner_set_fast_search(scanner, fast_search) },
+                0
+            );
+            assert_eq!(
+                unsafe {
+                    lance_scanner_set_materialization_style(
+                        scanner,
+                        LanceMaterializationStyle::AllLate as i32,
+                        ptr::null(),
+                        0,
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { lance_scanner_set_fts_query(scanner, query) }, 0);
+            let (schema, batches) = collect_scanner(scanner);
+            unsafe { lance_scanner_close(scanner) };
+
+            let (native_schema, native_batches) = lance_c::runtime::block_on(async {
+                let dataset = Dataset::open(&uri).await.unwrap();
+                let mut scanner = dataset.scan();
+                scanner.project_with_transform(projection).unwrap();
+                if disable {
+                    scanner.disable_scoring_autoprojection();
+                }
+                if fast_search {
+                    scanner.fast_search();
+                }
+                scanner.materialization_style(MaterializationStyle::AllLate);
+                scanner
+                    .full_text_search(FullTextSearchQuery::new_query(
+                        MatchQuery::new("alpha".to_string())
+                            .with_column(Some("title".to_string()))
+                            .into(),
+                    ))
+                    .unwrap();
+                let stream = scanner.try_into_stream().await.unwrap();
+                let schema = stream.schema();
+                let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+                (schema, batches)
+            });
+            assert_eq!(schema.fields().len(), 1 + usize::from(score_name.is_some()));
+            assert_eq!(
+                schema_signature(schema.as_ref()),
+                schema_signature(native_schema.as_ref())
+            );
+            let actual = rows(&batches, score_name);
+            assert_eq!(
+                sorted_score_ids(&actual),
+                if fast_search {
+                    vec![1, 2, 3]
+                } else {
+                    vec![1, 2, 3, 11]
+                }
+            );
+            assert_scores_match(
+                "typed FTS projection",
+                &actual,
+                &rows(&native_batches, score_name),
+            );
+        }
+    }
+    unsafe {
+        lance_fts_query_close(query);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
 fn test_typed_fts_query_matches_native_semantics() {
     let (_tmp, uri) = create_typed_fts_dataset();
     let uri_c = c_str(&uri);
