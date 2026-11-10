@@ -357,13 +357,13 @@ three of them:
 | Archive | Selected by |
 | --- | --- |
 | `lance-c-v0.1.9-x86_64-unknown-linux-gnu.tar.xz` | Not selected by the current recipes |
-| `lance-c-v0.1.9-x86_64-unknown-linux-gnu-debian12.tar.xz` | vcpkg `x64-linux`, `x64-linux-dynamic`; Conan `Linux/x86_64` |
-| `lance-c-v0.1.9-aarch64-unknown-linux-gnu.tar.xz` | vcpkg `arm64-linux`, `arm64-linux-dynamic`; Conan `Linux/armv8` |
+| `lance-c-v0.1.9-x86_64-unknown-linux-gnu-debian12.tar.xz` | vcpkg `x64-linux`, `x64-linux-dynamic`, Conan `Linux/x86_64` |
+| `lance-c-v0.1.9-aarch64-unknown-linux-gnu.tar.xz` | vcpkg `arm64-linux`, `arm64-linux-dynamic`, Conan `Linux/armv8` |
 | `lance-c-v0.1.9-aarch64-unknown-linux-gnu-debian12.tar.xz` | Not selected by the current recipes |
-| `lance-c-v0.1.9-aarch64-apple-darwin.tar.xz` | vcpkg `arm64-osx`, `arm64-osx-dynamic`; Conan `Macos/armv8` |
+| `lance-c-v0.1.9-aarch64-apple-darwin.tar.xz` | vcpkg `arm64-osx`, `arm64-osx-dynamic`, Conan `Macos/armv8` |
 
-Intel macOS (`x86_64-apple-darwin`) has no prebuilt archive in v0.1.9; use the
-`from-source` path. The archives contain headers, static and shared libraries,
+Intel macOS (`x86_64-apple-darwin`) uses the `from-source` path for v0.1.9.
+The archives contain headers, static and shared libraries,
 CMake package files, pkg-config metadata, and the license. The package recipes
 install only the linkage selected for that package.
 
@@ -382,11 +382,14 @@ The macOS dylib is a thin `arm64` Mach-O binary with install name
 `SystemConfiguration`, `libobjc.A.dylib`, `IOKit`, `CoreFoundation`,
 `Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`.
 
-These values describe the published dynamic libraries. The highest symbol
-reference is a loading constraint, not a tested minimum OS or libc floor; the
-ARM64 and macOS static archives were not consumer-tested. Native ARM64 Linux
-and macOS consumers were not executed for v0.1.9. The Linux x86_64 consumer
-evidence is recorded in the [issue 100 validation
+The highest GLIBC symbol reference records a dynamic-loader requirement.
+The Mach-O `minos` field records the binary's declared deployment target.
+Runtime compatibility requires consumer verification on the intended OS.
+Static archive inspection established object architecture. The complete
+binary metadata is recorded in the [artifact
+audit](https://github.com/lance-format/lance-c/blob/2c00796/validation/issue-103/RESULTS.md).
+Runtime consumer evidence covers Linux x86_64 and is recorded in the
+[issue 100 validation
 record](https://github.com/lance-format/lance-c/blob/5a29b67/validation/issue-100/RESULTS.md).
 
 ### From source via cargo (Rust developers)
@@ -605,7 +608,7 @@ There is no C-side timestamp/asof selector.
 
 ## Releasing
 
-Releases are tag-driven: pushing a `v*.*.*` tag fires [`release.yml`](.github/workflows/release.yml), which builds five prebuilt tarballs: Linux x86_64 and aarch64, their Debian 12 variants, and macOS arm64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. (`x86_64-apple-darwin` is not built — see the matrix comment in `release.yml`.)
+Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds five prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, and macOS arm64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. Intel macOS consumers use the source build described above.
 
 ### Recommended: cut a release via Actions UI
 
