@@ -36,7 +36,7 @@ jobs:
         include:
           - runner: ubuntu-24.04
             os_label: linux
-          - runner: macos-14
+          - runner: macos-15
             os_label: macos
     env:
       CC: clang
