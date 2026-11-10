@@ -2983,26 +2983,6 @@ fn test_versions_close_null_is_safe() {
     unsafe { lance_versions_close(ptr::null_mut()) };
 }
 
-/// Two versions and two fragments: version 1 has five rows in one fragment,
-/// version 2 appends two rows in a second fragment.
-fn create_two_version_dataset() -> (tempfile::TempDir, String) {
-    let (tmp, uri) = create_test_dataset();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("name", DataType::Utf8, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![6, 7])),
-            Arc::new(StringArray::from(vec!["frank", "grace"])),
-        ],
-    )
-    .unwrap();
-    append_batch(&uri, schema, batch);
-    (tmp, uri)
-}
-
 fn version_metadata(version: *const LanceVersion) -> std::collections::BTreeMap<String, String> {
     let count = unsafe { lance_version_metadata_count(version) };
     assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
