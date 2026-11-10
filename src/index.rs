@@ -17,6 +17,8 @@ use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_table::format::IndexMetadata;
+use prost::Message;
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::dataset::LanceDataset;
@@ -454,6 +456,121 @@ unsafe fn index_list_json_inner(dataset: *const LanceDataset) -> Result<*const c
     Ok(CString::new(json)
         .map(|s| s.into_raw() as *const c_char)
         .unwrap_or(std::ptr::null()))
+}
+
+/// JSON array describing non-system physical index segments visible to core.
+/// Caller must free with lance_free_string().
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_index_segments_json(
+    dataset: *const LanceDataset,
+) -> *const c_char {
+    ffi_try!(unsafe { index_segments_json_inner(dataset) }, null)
+}
+
+unsafe fn index_segments_json_inner(dataset: *const LanceDataset) -> Result<*const c_char> {
+    if dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
+    }
+    let ds = unsafe { &*dataset };
+    let snap = ds.snapshot();
+    let indices = block_on(snap.load_indices())?;
+
+    let schema = snap.schema();
+    let json = serialize_index_segments_json(&indices, |field_id| {
+        schema.field_path_minimal(field_id).ok()
+    })?;
+    CString::new(json)
+        .map(|value| value.into_raw() as *const c_char)
+        .map_err(|_| {
+            lance_core::Error::invalid_input(
+                "index segment listing contains an embedded NUL byte".to_string(),
+            )
+        })
+}
+
+fn serialized_index_type(index: &IndexMetadata) -> String {
+    let Some(details) = &index.index_details else {
+        // Core descriptions recognize pre-details vector indices by this file.
+        return if index.files.as_ref().is_some_and(|files| {
+            files
+                .iter()
+                .any(|file| file.path == lance_index::INDEX_FILE_NAME)
+        }) {
+            "Vector"
+        } else {
+            "Unknown"
+        }
+        .to_string();
+    };
+    let details = lance::index::scalar::IndexDetails(Arc::clone(details));
+    if details.is_vector() {
+        // Describe the stored protobuf independently of coverage, using core's
+        // vector description format. Core's formatter is crate-private.
+        if details.0.value.is_empty() {
+            return "Vector".to_string();
+        }
+        let Ok(vector) = lance_index::pb::VectorIndexDetails::decode(details.0.value.as_slice())
+        else {
+            return "Vector".to_string();
+        };
+        use lance_index::pb::vector_index_details::Compression;
+        let compression = match vector.compression {
+            None | Some(Compression::Flat(_)) => "FLAT",
+            Some(Compression::Pq(_)) => "PQ",
+            Some(Compression::Sq(_)) => "SQ",
+            Some(Compression::Rq(_)) => "RQ",
+        };
+        let prefix = if vector.hnsw_index_config.is_some() {
+            "IVF_HNSW_"
+        } else {
+            "IVF_"
+        };
+        format!("{prefix}{compression}")
+    } else {
+        details
+            .get_plugin()
+            .map(|plugin| plugin.name().to_string())
+            .unwrap_or_else(|_| {
+                lance_index::registry::display_type_from_url(&details.0.type_url).to_string()
+            })
+    }
+}
+
+fn serialize_index_segments_json(
+    indices: &[IndexMetadata],
+    field_name: impl Fn(i32) -> Option<String>,
+) -> Result<String> {
+    let entries = indices
+        .iter()
+        .filter(|index| !lance_index::is_system_index(index))
+        .map(|index| {
+            let columns = index
+                .keyed_fields()
+                .iter()
+                .filter_map(|field_id| field_name(*field_id))
+                .collect::<Vec<_>>();
+            let fragment_ids = index
+                .fragment_bitmap
+                .as_ref()
+                .map(|bitmap| bitmap.iter().collect::<Vec<_>>());
+            json!({
+                "name": index.name,
+                "uuid": index.uuid.to_string(),
+                "columns": columns,
+                "type": serialized_index_type(index),
+                "dataset_version": index.dataset_version,
+                "index_version": index.index_version,
+                "fragment_ids": fragment_ids,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&entries).map_err(|error| {
+        lance_core::Error::internal(format!(
+            "failed to serialize index segment listing: {error}"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------

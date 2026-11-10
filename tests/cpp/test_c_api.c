@@ -1417,6 +1417,24 @@ static void test_commit_index_segments(const char *uri) {
                memcmp(committed_uuids + 16, expected_uuids[1], 16) == 0,
            "committed segment UUIDs mismatch");
 
+    const char *segments_json = lance_dataset_index_segments_json(ds);
+    ASSERT(segments_json != NULL, "index segment listing failed");
+    ASSERT(strstr(segments_json, "\"name\":\"c_distributed_idx\"") != NULL,
+           "segment listing must include the committed index name");
+    ASSERT(strstr(segments_json, "\"index_version\":1") != NULL,
+           "segment listing must include the recorded physical index version");
+    char first_coverage[64];
+    char second_coverage[64];
+    snprintf(first_coverage, sizeof(first_coverage),
+             "\"fragment_ids\":[%u]", fragment_ids[0]);
+    snprintf(second_coverage, sizeof(second_coverage),
+             "\"fragment_ids\":[%u]", fragment_ids[1]);
+    ASSERT(strstr(segments_json, first_coverage) != NULL,
+           "segment listing must record the first segment's coverage");
+    ASSERT(strstr(segments_json, second_coverage) != NULL,
+           "segment listing must record the second segment's coverage");
+    lance_free_string(segments_json);
+
     /* Duplicate segment UUIDs in the commit set are rejected. */
     const uint8_t *dup_bytes[2] = {segment_bytes[0], segment_bytes[0]};
     size_t dup_lens[2] = {segment_lens[0], segment_lens[0]};
