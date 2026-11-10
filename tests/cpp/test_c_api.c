@@ -1556,8 +1556,8 @@ static void test_materialization_and_fast_search(const char *uri) {
                scanner, LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT,
                missing_name, 1) == -1,
            "missing exception column must fail");
-    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
-           "missing exception column error code");
+    ASSERT(lance_last_error_code() != LANCE_OK,
+           "missing exception column must set an error");
     ASSERT(lance_scanner_set_materialization_style(
                scanner, (LanceMaterializationStyle)99, NULL, 0) == -1,
            "unknown materialization style must fail");

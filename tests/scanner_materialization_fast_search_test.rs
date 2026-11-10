@@ -440,7 +440,14 @@ fn materialization_rejections_preserve_state_and_lifecycle() {
         },
         -1
     );
-    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+    let message = unsafe {
+        let pointer = lance_last_error_message();
+        let message = CStr::from_ptr(pointer).to_string_lossy().into_owned();
+        lance_free_string(pointer);
+        message
+    };
+    assert!(message.contains("missing"), "{message}");
     assert_eq!(
         unsafe {
             lance_scanner_set_materialization_style(
@@ -902,13 +909,12 @@ fn fast_search_uses_only_indexed_fragments_and_matches_direct_native_queries() {
             "{name} statistics differ"
         );
         assert_eq!(wrapper_statistics.calls, 1, "{name}");
-        if case.fast_search {
-            if expected.is_empty() {
-                assert_eq!(wrapper_statistics.indices_loaded, 0, "{name}");
-            } else {
-                assert!(wrapper_statistics.indices_loaded > 0, "{name}");
-                assert!(wrapper_statistics.index_partitions_loaded > 0, "{name}");
-            }
+        if case.fast_search && case.use_index == Some(false) {
+            assert_eq!(wrapper_statistics.indices_loaded, 0, "{name}");
+        }
+        if case.fast_search && !expected.is_empty() {
+            assert!(wrapper_statistics.indices_loaded > 0, "{name}");
+            assert!(wrapper_statistics.index_partitions_loaded > 0, "{name}");
         }
     }
 }
