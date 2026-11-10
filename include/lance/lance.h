@@ -1262,13 +1262,13 @@ typedef struct LanceProjectionColumn {
  * Replace the scanner projection with ordered output-name / SQL-expression
  * pairs, mirroring Lance `Scanner::project_with_transform()`.
  *
- * Each expression may reference aliases, stored columns, metadata columns,
- * nested field paths, and query-generated scoring columns according to the
- * selected Lance version. Output order follows the input array. Lance parses
- * and validates expressions, duplicate output names, and schema-dependent
- * expression resolution during this call. Planning-only errors, such as an
- * unsupported projection with no physical output column, are reported when the
- * scan starts.
+ * Each output name may be an alias. Each expression may reference stored
+ * columns, metadata columns, nested field paths, and query-generated scoring
+ * columns according to the selected Lance version. Output order follows the
+ * input array. Lance parses and validates expressions, duplicate output names,
+ * and schema-dependent expression resolution during this call. Planning-only
+ * errors, such as an unsupported projection with no physical output column, are
+ * reported when the scan starts.
  *
  * Passing `columns == NULL` with `len == 0` clears the projection and restores
  * the native unset projection, which selects all dataset columns. Passing a
