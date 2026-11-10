@@ -524,6 +524,99 @@ static void test_versions(const std::string& uri) {
     PASS();
 }
 
+static void test_version_refs_and_tags(const std::string& uri) {
+    TEST(test_version_refs_and_tags);
+
+    auto ds = lance::Dataset::open(uri);
+    assert(ds.version() == 2);
+    assert(ds.count_rows() == 20);
+
+    auto current = ds.current_version();
+    assert(current.id == ds.version());
+    assert(current.timestamp_ns > 0);
+    assert(current.metadata.at("total_rows") == "20");
+    assert(current.metadata.at("total_fragments") == "2");
+
+    auto details = ds.version_details();
+    assert(details.size() == 2);
+    assert(details[0].id == 1);
+    assert(details[0].metadata.at("total_rows") == "10");
+    assert(details[1].id == 2);
+    assert(details[1].metadata.at("total_rows") == "20");
+
+    auto refs = ds.version_refs();
+    assert((refs == std::vector<uint64_t>{1, 2}));
+
+    auto checked_v1 = ds.checkout(lance::Ref::version_number(1));
+    assert(checked_v1.version() == 1 && checked_v1.count_rows() == 10);
+    auto checked_latest = ds.checkout(lance::Ref::version(std::nullopt, std::nullopt));
+    assert(checked_latest.version() == 2 && checked_latest.count_rows() == 20);
+    auto checked_main =
+        ds.checkout(lance::Ref::version(std::optional<std::string>("main"), 1));
+    assert(checked_main.version() == 1);
+
+    ds.create_tag("cpp-release", lance::Ref::version_number(1));
+    auto tag = ds.get_tag("cpp-release");
+    assert(tag.name == "cpp-release");
+    assert(tag.version == 1);
+    assert(!tag.branch.has_value());
+    assert(tag.created_at_ns.has_value());
+    assert(tag.updated_at_ns.has_value());
+    assert(tag.manifest_size > 0);
+    assert(tag.metadata.empty());
+
+    bool duplicate_conflict = false;
+    try {
+        ds.create_tag("cpp-release", lance::Ref::version_number(2));
+    } catch (const lance::Error& error) {
+        duplicate_conflict = error.code == LANCE_ERR_COMMIT_CONFLICT;
+    }
+    assert(duplicate_conflict);
+
+    auto old_checkout = ds.checkout(lance::Ref::tag("cpp-release"));
+    assert(old_checkout.version() == 1);
+
+    ds.replace_tag_metadata(
+        "cpp-release", {{"owner", "cpp"}, {"empty", ""}});
+    auto persisted = lance::Dataset::open(uri).get_tag("cpp-release");
+    assert(persisted.metadata.at("owner") == "cpp");
+    assert(persisted.metadata.at("empty").empty());
+
+    ds.update_tag(
+        "cpp-release",
+        lance::Ref::version(std::optional<std::string>("main"), 2));
+    auto updated = ds.get_tag("cpp-release");
+    assert(updated.version == 2);
+    assert(updated.metadata == persisted.metadata);
+    assert(updated.created_at_ns == tag.created_at_ns);
+    assert(updated.updated_at_ns.has_value());
+    assert(*updated.updated_at_ns >= *tag.created_at_ns);
+
+    // Existing checked-out snapshots keep their original manifest.
+    assert(old_checkout.version() == 1 && old_checkout.count_rows() == 10);
+    auto updated_checkout = ds.checkout(lance::Ref::tag("cpp-release"));
+    assert(updated_checkout.version() == 2 && updated_checkout.count_rows() == 20);
+
+    auto tags = ds.tags();
+    assert(tags.size() == 1);
+    assert(tags[0].name == "cpp-release");
+
+    ds.replace_tag_metadata("cpp-release", {});
+    assert(ds.get_tag("cpp-release").metadata.empty());
+
+    ds.delete_tag("cpp-release");
+    bool missing_tag = false;
+    try {
+        (void)ds.get_tag("cpp-release");
+    } catch (const lance::Error& error) {
+        missing_tag = error.code == LANCE_ERR_NOT_FOUND;
+    }
+    assert(missing_tag);
+
+    assert(ds.version() == 2);
+    PASS();
+}
+
 // Restore to the dataset's own current version — always commits a new
 // manifest (no skip-if-equal optimization) to defeat TOCTOU races against
 // concurrent writers.
@@ -1415,6 +1508,7 @@ int main(int argc, char** argv) {
     test_dataset_take_rows(uri);
     test_raii_cleanup(uri);
     test_versions(uri);
+    test_version_refs_and_tags(uri);
     test_restore_to_current(uri);
     test_error_exception(uri);
     test_index_lifecycle(uri);

@@ -506,6 +506,199 @@ static void test_versions(const char *uri) {
     printf("OK\n");
 }
 
+static const char *version_metadata_get(const LanceVersion *version, const char *key) {
+    uint64_t count = lance_version_metadata_count(version);
+    CHECK_OK();
+    for (uint64_t i = 0; i < count; ++i) {
+        const char *candidate = lance_version_metadata_key_at(version, (size_t)i);
+        ASSERT(candidate != NULL, "version metadata key");
+        if (strcmp(candidate, key) == 0) {
+            const char *value = lance_version_metadata_value_at(version, (size_t)i);
+            ASSERT(value != NULL, "version metadata value");
+            return value;
+        }
+    }
+    return NULL;
+}
+
+static const char *tag_metadata_get(const LanceTag *tag, const char *key) {
+    uint64_t count = lance_tag_metadata_count(tag);
+    CHECK_OK();
+    for (uint64_t i = 0; i < count; ++i) {
+        const char *candidate = lance_tag_metadata_key_at(tag, (size_t)i);
+        ASSERT(candidate != NULL, "tag metadata key");
+        if (strcmp(candidate, key) == 0) {
+            const char *value = lance_tag_metadata_value_at(tag, (size_t)i);
+            ASSERT(value != NULL, "tag metadata value");
+            return value;
+        }
+    }
+    return NULL;
+}
+
+static void expect_error(LanceErrorCode expected, const char *operation) {
+    if (lance_last_error_code() != expected) {
+        const char *msg = lance_last_error_message();
+        fprintf(stderr, "FAIL: %s returned error code %d, expected %d: %s\n",
+                operation, (int)lance_last_error_code(), (int)expected,
+                msg ? msg : "unknown");
+        if (msg) lance_free_string(msg);
+        exit(1);
+    }
+    const char *msg = lance_last_error_message();
+    if (msg) lance_free_string(msg);
+}
+
+static void test_native_refs_and_tags(const char *uri) {
+    printf("  test_native_refs_and_tags... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    ASSERT(lance_dataset_version(ds) == 2, "fixture must have two versions");
+    ASSERT(lance_dataset_count_rows(ds) == 20, "fixture must have twenty rows");
+
+    LanceVersion *current = lance_dataset_current_version(ds);
+    ASSERT(current != NULL, "current version snapshot failed");
+    ASSERT(lance_version_id(current) == 2, "wrong current version id");
+    ASSERT(lance_version_timestamp_ns(current) > 0, "missing native timestamp");
+    ASSERT(strcmp(version_metadata_get(current, "total_rows"), "20") == 0,
+           "current version row metadata");
+    ASSERT(strcmp(version_metadata_get(current, "total_fragments"), "2") == 0,
+           "current version fragment metadata");
+
+    LanceVersions *versions = lance_dataset_versions(ds);
+    ASSERT(versions != NULL, "version snapshot failed");
+    ASSERT(lance_versions_count(versions) == 2, "wrong version count");
+    const LanceVersion *first = lance_versions_at(versions, 0);
+    ASSERT(first != NULL, "first version details");
+    ASSERT(lance_version_id(first) == 1, "wrong first version id");
+    ASSERT(strcmp(version_metadata_get(first, "total_rows"), "10") == 0,
+           "first version row metadata");
+
+    LanceVersionRefs *refs = lance_dataset_version_refs(ds);
+    ASSERT(refs != NULL, "version refs snapshot failed");
+    ASSERT(lance_version_refs_count(refs) == 2, "wrong version ref count");
+    ASSERT(lance_version_refs_id_at(refs, 0) == 1, "first version ref");
+    ASSERT(lance_version_refs_id_at(refs, 1) == 2, "second version ref");
+
+    LanceRef *version1 = lance_ref_version_number(1);
+    LanceRef *latest = lance_ref_version(NULL, false, 0);
+    LanceRef *main_v1 = lance_ref_version("main", true, 1);
+    ASSERT(version1 != NULL && latest != NULL && main_v1 != NULL, "ref creation");
+
+    LanceDataset *checked_v1 = lance_dataset_checkout_ref(ds, version1);
+    LanceDataset *checked_latest = lance_dataset_checkout_ref(ds, latest);
+    LanceDataset *checked_main = lance_dataset_checkout_ref(ds, main_v1);
+    ASSERT(checked_v1 != NULL && checked_latest != NULL && checked_main != NULL,
+           "ref checkout");
+    ASSERT(lance_dataset_version(checked_v1) == 1 &&
+           lance_dataset_count_rows(checked_v1) == 10,
+           "version-number checkout");
+    ASSERT(lance_dataset_version(checked_latest) == 2 &&
+           lance_dataset_count_rows(checked_latest) == 20,
+           "latest checkout");
+    ASSERT(lance_dataset_version(checked_main) == 1,
+           "main branch alias checkout");
+
+    LanceRef *tag_source = lance_ref_version_number(1);
+    ASSERT(lance_dataset_tag_create(ds, "c-release", tag_source) == 0,
+           "tag create");
+    lance_ref_close(tag_source);
+    LanceTag *tag = lance_dataset_tag_get(ds, "c-release");
+    ASSERT(tag != NULL, "tag get");
+    ASSERT(strcmp(lance_tag_name(tag), "c-release") == 0, "tag name");
+    ASSERT(lance_tag_version(tag) == 1, "tag version");
+    ASSERT(lance_tag_manifest_size(tag) > 0, "tag manifest size");
+    const char *branch = "unset";
+    ASSERT(lance_tag_branch(tag, &branch) == 0 && branch == NULL,
+           "main tag has no explicit branch");
+    int64_t created_at = 0;
+    int64_t updated_at = 0;
+    ASSERT(lance_tag_created_at_ns(tag, &created_at) == 1 && created_at > 0,
+           "tag created timestamp");
+    ASSERT(lance_tag_updated_at_ns(tag, &updated_at) == 1 && updated_at >= created_at,
+           "tag updated timestamp");
+
+    LanceRef *duplicate = lance_ref_version_number(2);
+    ASSERT(lance_dataset_tag_create(ds, "c-release", duplicate) == -1,
+           "duplicate tag must conflict");
+    expect_error(LANCE_ERR_COMMIT_CONFLICT, "duplicate tag");
+    lance_ref_close(duplicate);
+
+    LanceRef *tag_ref = lance_ref_tag("c-release");
+    LanceDataset *tag_checkout = lance_dataset_checkout_ref(ds, tag_ref);
+    ASSERT(tag_checkout != NULL && lance_dataset_version(tag_checkout) == 1,
+           "tag checkout before update");
+
+    const char *metadata[] = {"owner", "c-api", "empty", "", NULL};
+    ASSERT(lance_dataset_tag_replace_metadata(ds, "c-release", metadata) == 0,
+           "tag metadata replace");
+
+    LanceTags *tags = lance_dataset_tags(ds);
+    ASSERT(tags != NULL && lance_tags_count(tags) == 1, "tag list");
+    const LanceTag *listed = lance_tags_at(tags, 0);
+    ASSERT(listed != NULL && strcmp(lance_tag_name(listed), "c-release") == 0,
+           "listed tag");
+
+    lance_dataset_close(ds);
+    ASSERT(lance_version_id(current) == 2, "current snapshot after dataset close");
+    ASSERT(lance_versions_count(versions) == 2, "versions snapshot after dataset close");
+    ASSERT(lance_version_refs_count(refs) == 2, "refs snapshot after dataset close");
+    ASSERT(lance_tags_count(tags) == 1, "tags snapshot after dataset close");
+    ASSERT(lance_dataset_version(tag_checkout) == 1,
+           "old checkout after dataset close");
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "reopen failed");
+    tag = lance_dataset_tag_get(ds, "c-release");
+    ASSERT(tag != NULL, "persisted tag");
+    ASSERT(strcmp(tag_metadata_get(tag, "owner"), "c-api") == 0,
+           "persisted metadata value");
+    ASSERT(strcmp(tag_metadata_get(tag, "empty"), "") == 0,
+           "empty metadata value");
+    lance_tag_close(tag);
+
+    LanceRef *version2 = lance_ref_version_number(2);
+    ASSERT(lance_dataset_tag_update(ds, "c-release", version2) == 0,
+           "tag update");
+    lance_ref_close(version2);
+    tag = lance_dataset_tag_get(ds, "c-release");
+    ASSERT(tag != NULL && lance_tag_version(tag) == 2, "updated tag target");
+    ASSERT(strcmp(tag_metadata_get(tag, "owner"), "c-api") == 0,
+           "update preserves metadata");
+    int64_t updated_created_at = 0;
+    ASSERT(lance_tag_created_at_ns(tag, &updated_created_at) == 1 &&
+           updated_created_at == created_at,
+           "update preserves created_at");
+    lance_tag_close(tag);
+
+    ASSERT(lance_dataset_version(tag_checkout) == 1,
+           "pre-update checkout remains old");
+    LanceDataset *updated_checkout = lance_dataset_checkout_ref(ds, tag_ref);
+    ASSERT(updated_checkout != NULL && lance_dataset_version(updated_checkout) == 2,
+           "updated tag checkout");
+
+    ASSERT(lance_dataset_tag_delete(ds, "c-release") == 0, "tag delete");
+    ASSERT(lance_dataset_tag_delete(ds, "c-release") == -1, "unknown tag delete");
+    expect_error(LANCE_ERR_NOT_FOUND, "unknown tag delete");
+
+    lance_ref_close(tag_ref);
+    lance_dataset_close(updated_checkout);
+    lance_dataset_close(tag_checkout);
+    lance_dataset_close(checked_main);
+    lance_dataset_close(checked_latest);
+    lance_dataset_close(checked_v1);
+    lance_ref_close(main_v1);
+    lance_ref_close(latest);
+    lance_ref_close(version1);
+    lance_tags_close(tags);
+    lance_version_refs_close(refs);
+    lance_versions_close(versions);
+    lance_version_close(current);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 /* Restore the dataset to its own current version — always commits a new
  * manifest (no skip-if-equal optimization) so the caller's "make `version`
  * the new latest" intent holds even under concurrent writers. */
@@ -1535,6 +1728,7 @@ int main(int argc, char **argv) {
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_versions(uri);
+    test_native_refs_and_tags(uri);
     test_restore_to_current(uri);
     test_error_handling();
     test_index_segment_builder(uri);
