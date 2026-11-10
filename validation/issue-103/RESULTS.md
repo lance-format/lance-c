@@ -71,6 +71,12 @@ The first member of each arm64 `liblance_c.a` is an AArch64 ELF relocatable
 object. The macOS `liblance_c.a` is a Mach-O archive containing thin arm64
 objects. Static archives were not linked or executed on either target.
 
+The static archive check used `ar t`, `ar x`, `readelf --file-header`, and
+LLVM `llvm-objdump --macho --private-headers`. Both arm64 Linux archives
+reported `AArch64` / `REL`; the first macOS object reported `ARM64` /
+`OBJECT`. This establishes object architecture only, not static link
+compatibility.
+
 ## Mach-O metadata
 
 The macOS dylib was inspected with LLVM 18 `llvm-lipo`, `llvm-objdump
