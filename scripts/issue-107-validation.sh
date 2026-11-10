@@ -41,6 +41,9 @@ publish_status() {
     if [[ "$phase" == core-* ]]; then
         echo "core_rustc=$(rustc +1.94.0 --version 2>&1)"
     fi
+    if [[ "$phase" == msrv-* ]]; then
+        echo "msrv_rustc=$(rustc +1.91.0 --version 2>&1)"
+    fi
     echo "CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS"
     echo "RUST_TEST_THREADS=$RUST_TEST_THREADS"
     echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -110,6 +113,25 @@ case "$phase" in
         ;;
     native-cpp)
         run_cmd cargo test --test compile_and_run_test -- --ignored test_cpp_compilation_and_execution
+        ;;
+    msrv-check)
+        run_cmd cargo +1.91.0 check --all-targets
+        ;;
+    msrv-clippy)
+        run_cmd cargo +1.91.0 clippy --all-targets -- -D warnings
+        ;;
+    msrv-order)
+        run_cmd cargo +1.91.0 test --test c_api_test order_by
+        run_cmd cargo +1.91.0 test --test multivector_test multivector_rejects_order_by
+        ;;
+    msrv-full)
+        run_cmd cargo +1.91.0 test
+        ;;
+    msrv-native-c)
+        run_cmd cargo +1.91.0 test --test compile_and_run_test -- --ignored test_c_compilation_and_execution
+        ;;
+    msrv-native-cpp)
+        run_cmd cargo +1.91.0 test --test compile_and_run_test -- --ignored test_cpp_compilation_and_execution
         ;;
     core-check)
         run_cmd cargo +1.94.0 check --all-targets
