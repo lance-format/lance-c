@@ -10989,9 +10989,11 @@ fn test_cleanup_branch_cascade_and_copied_explanation() {
     );
     unsafe { lance_dataset_close(dataset) };
 
-    assert_eq!(native_cleanup_version_ids(&uri, None), vec![4]);
+    // Cascade cleanup removes the branch's old manifest, but the parent
+    // manifest that anchors the branch's remaining lineage is still retained.
+    assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 4]);
     assert_eq!(native_cleanup_version_ids(&uri, Some("dev")), vec![3]);
-    assert_eq!(after_manifests, 2);
+    assert_eq!(after_manifests, 3);
     drop(tmp);
 }
 
