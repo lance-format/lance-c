@@ -4583,10 +4583,7 @@ fn create_fragment_read_dataset() -> (tempfile::TempDir, String) {
         Field::new("score", DataType::Float32, true),
     ]);
     let mut json_metadata = std::collections::HashMap::new();
-    json_metadata.insert(
-        "ARROW:extension:name".to_string(),
-        "arrow.json".to_string(),
-    );
+    json_metadata.insert("ARROW:extension:name".to_string(), "arrow.json".to_string());
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("profile", DataType::Struct(profile_fields.clone()), true),
@@ -4706,15 +4703,7 @@ fn take_fragment_via_c(
         .map_or(ptr::null(), |columns| columns.as_ptr());
     let mut stream = FFI_ArrowArrayStream::empty();
     assert_eq!(
-        unsafe {
-            lance_fragment_take(
-                fragment,
-                index_ptr,
-                num_indices,
-                columns_ptr,
-                &mut stream,
-            )
-        },
+        unsafe { lance_fragment_take(fragment, index_ptr, num_indices, columns_ptr, &mut stream,) },
         0,
         "fragment take failed: {}",
         take_last_error_message()
@@ -4756,10 +4745,9 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
 
     let indices = [2_u32, 0, 2];
     let (schema, batches) = take_fragment_via_c(fragment, Some(&indices), None);
-    let native_batch = lance_c::runtime::block_on(native_fragment.take(
-        &indices,
-        &fragment_projection(&native_fragment, None),
-    ))
+    let native_batch = lance_c::runtime::block_on(
+        native_fragment.take(&indices, &fragment_projection(&native_fragment, None)),
+    )
     .unwrap();
     assert_eq!(schema, *native_batch.schema());
     assert_eq!(batches.len(), 1);
@@ -4820,8 +4808,7 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
     assert_eq!(fragment_id_values(&nested_batches), vec![3, 0, 3]);
 
     let empty_indices: Option<&[u32]> = None;
-    let (empty_schema, empty_batches) =
-        take_fragment_via_c(fragment, empty_indices, None);
+    let (empty_schema, empty_batches) = take_fragment_via_c(fragment, empty_indices, None);
     let native_empty = lance_c::runtime::block_on(
         native_fragment.take(&[], &fragment_projection(&native_fragment, None)),
     )
@@ -4844,10 +4831,7 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
         &fragment_projection(&native_fragment, Some(&[])),
     ))
     .unwrap();
-    assert_eq!(
-        empty_projection_schema,
-        *native_empty_projection.schema()
-    );
+    assert_eq!(empty_projection_schema, *native_empty_projection.schema());
     assert!(empty_projection_schema.fields().is_empty());
     assert_eq!(empty_projection_batches.len(), 1);
     assert_eq!(empty_projection_batches[0], native_empty_projection);
@@ -4880,10 +4864,9 @@ fn test_fragment_take_uses_deletion_aware_local_indices_and_errors() {
     let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
     let native_first = native.get_fragment(ids[0] as usize).unwrap();
     let out_of_range = [3_u32];
-    let native_error = lance_c::runtime::block_on(native_first.take(
-        &out_of_range,
-        &fragment_projection(&native_first, None),
-    ))
+    let native_error = lance_c::runtime::block_on(
+        native_first.take(&out_of_range, &fragment_projection(&native_first, None)),
+    )
     .unwrap_err();
     let mut stream = FFI_ArrowArrayStream::empty();
     assert_eq!(
@@ -4898,7 +4881,10 @@ fn test_fragment_take_uses_deletion_aware_local_indices_and_errors() {
         },
         -1
     );
-    assert!(stream.release.is_none(), "failed take must not initialize out");
+    assert!(
+        stream.release.is_none(),
+        "failed take must not initialize out"
+    );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     let message = take_last_error_message();
     assert!(
@@ -4908,15 +4894,7 @@ fn test_fragment_take_uses_deletion_aware_local_indices_and_errors() {
 
     let mut untouched = FFI_ArrowArrayStream::empty();
     assert_eq!(
-        unsafe {
-            lance_fragment_take(
-                first,
-                ptr::null(),
-                1,
-                ptr::null(),
-                &mut untouched,
-            )
-        },
+        unsafe { lance_fragment_take(first, ptr::null(), 1, ptr::null(), &mut untouched,) },
         -1
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
@@ -5003,10 +4981,8 @@ fn test_fragment_count_rows_matches_native_filters() {
     );
 
     let empty_filter = c_str("");
-    let native_empty = lance_c::runtime::block_on(
-        native_fragment.count_rows(Some(String::new())),
-    )
-    .unwrap_err();
+    let native_empty =
+        lance_c::runtime::block_on(native_fragment.count_rows(Some(String::new()))).unwrap_err();
     rows = 77;
     assert_eq!(
         unsafe { lance_fragment_count_rows(fragment, empty_filter.as_ptr(), &mut rows) },

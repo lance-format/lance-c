@@ -336,39 +336,35 @@ fn create_fragment_dataset_on_disk() -> (tempfile::TempDir, String) {
         Field::new("score", DataType::Float32, true),
     ]);
     let mut json_metadata = std::collections::HashMap::new();
-    json_metadata.insert(
-        "ARROW:extension:name".to_string(),
-        "arrow.json".to_string(),
-    );
+    json_metadata.insert("ARROW:extension:name".to_string(), "arrow.json".to_string());
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("profile", DataType::Struct(profile_fields.clone()), true),
         Field::new("meta", DataType::Utf8, true).with_metadata(json_metadata),
     ]));
 
-    let make_batch =
-        |ids: Vec<i32>,
-         names: Vec<Option<&str>>,
-         scores: Vec<Option<f32>>,
-         meta: Vec<Option<&str>>| {
-            let profiles = StructArray::new(
-                profile_fields.clone(),
-                vec![
-                    Arc::new(StringArray::from(names)),
-                    Arc::new(Float32Array::from(scores)),
-                ],
-                None,
-            );
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(ids)),
-                    Arc::new(profiles),
-                    Arc::new(StringArray::from(meta)),
-                ],
-            )
-            .unwrap()
-        };
+    let make_batch = |ids: Vec<i32>,
+                      names: Vec<Option<&str>>,
+                      scores: Vec<Option<f32>>,
+                      meta: Vec<Option<&str>>| {
+        let profiles = StructArray::new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(Float32Array::from(scores)),
+            ],
+            None,
+        );
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(profiles),
+                Arc::new(StringArray::from(meta)),
+            ],
+        )
+        .unwrap()
+    };
 
     lance_c::runtime::block_on(async {
         let first = make_batch(

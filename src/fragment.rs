@@ -276,9 +276,7 @@ unsafe fn fragment_logical_rows_inner(
 /// the ordinary scanner lifecycle and configuration rules, with the fragment
 /// selected as its initial scan scope.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lance_fragment_scan(
-    fragment: *const LanceFragment,
-) -> *mut LanceScanner {
+pub unsafe extern "C" fn lance_fragment_scan(fragment: *const LanceFragment) -> *mut LanceScanner {
     ffi_try!(unsafe { fragment_scan_inner(fragment) }, null)
 }
 
