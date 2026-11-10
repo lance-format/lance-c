@@ -894,8 +894,9 @@ static void test_dataset_write_roundtrip(const std::string& src_uri,
     memset(&stream, 0, sizeof(stream));
     scanner.to_arrow_stream(&stream);
 
+    // The existing five-argument call must accept brace-initialized defaults.
     auto dst = lance::Dataset::write(
-        dst_uri, &stream, lance::WriteMode::Create);
+        dst_uri, &stream, lance::WriteMode::Create, {}, {});
 
     uint64_t dst_rows = dst.count_rows();
     assert(dst_rows == src_rows);
