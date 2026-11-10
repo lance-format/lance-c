@@ -452,6 +452,66 @@ static void test_scanner_projection_filter(const std::string& uri) {
     PASS();
 }
 
+static void test_scanner_projection(const std::string& uri) {
+    TEST(test_scanner_projection);
+
+    auto ds = lance::Dataset::open(uri);
+
+    auto scanner = ds.scan();
+    scanner.project({
+        {"id_alias", "id"},
+        {"next_id", "id + 1"},
+    }).disable_scoring_autoprojection();
+
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+
+    ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    assert(stream.get_schema(&stream, &schema) == 0);
+    assert(schema.n_children == 2);
+    assert(strcmp(schema.children[0]->name, "id_alias") == 0);
+    assert(strcmp(schema.children[1]->name, "next_id") == 0);
+    if (schema.release) schema.release(&schema);
+
+    uint64_t rows = 0;
+    while (true) {
+        ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        assert(stream.get_next(&stream, &array) == 0);
+        if (!array.release) break;
+        rows += static_cast<uint64_t>(array.length);
+        array.release(&array);
+    }
+    assert(rows > 0);
+    if (stream.release) stream.release(&stream);
+
+    // std::nullopt restores the unset projection; an empty vector is explicit empty.
+    auto cleared = ds.scan();
+    cleared.project({{"ignored", "id"}})
+           .project(std::nullopt);
+    memset(&stream, 0, sizeof(stream));
+    cleared.to_arrow_stream(&stream);
+    memset(&schema, 0, sizeof(schema));
+    assert(stream.get_schema(&stream, &schema) == 0);
+    assert(schema.n_children > 1);
+    if (schema.release) schema.release(&schema);
+    if (stream.release) stream.release(&stream);
+
+    auto empty = ds.scan();
+    empty.project(std::vector<lance::ProjectionColumn>{});
+    memset(&stream, 0, sizeof(stream));
+    empty.to_arrow_stream(&stream);
+    memset(&schema, 0, sizeof(schema));
+    assert(stream.get_schema(&stream, &schema) == 0);
+    assert(schema.n_children == 0);
+    if (schema.release) schema.release(&schema);
+    if (stream.release) stream.release(&stream);
+
+    PASS();
+}
+
 static void test_scanner_row_addr_lists(const std::string& uri) {
     TEST(test_scanner_row_addr_lists);
 
@@ -2227,6 +2287,7 @@ int main(int argc, char** argv) {
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
     test_scanner_projection_filter(uri);
+    test_scanner_projection(uri);
     test_scanner_order_by(ordering_uri);
     test_fragment_snapshots(fragment_uri);
     test_scanner_row_addr_lists(uri);

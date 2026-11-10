@@ -428,6 +428,62 @@ static uint64_t count_stream_rows(struct ArrowArrayStream *stream) {
     return total_rows;
 }
 
+static void test_scanner_projection(const char *uri) {
+    printf("  test_scanner_projection... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "dataset open failed");
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+
+    LanceProjectionColumn projection[] = {
+        {"id_alias", "id"},
+        {"next_id", "id + 1"},
+    };
+    ASSERT(lance_scanner_set_projection(scanner, projection, 2) == 0,
+           "set expression projection");
+    ASSERT(lance_scanner_disable_scoring_autoprojection(scanner) == 0,
+           "disable scoring autoprojection");
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "projection stream failed");
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "projection schema failed");
+    ASSERT(schema.n_children == 2, "projection should have two fields");
+    ASSERT(strcmp(schema.children[0]->name, "id_alias") == 0,
+           "first projection field");
+    ASSERT(strcmp(schema.children[1]->name, "next_id") == 0,
+           "second projection field");
+    if (schema.release) schema.release(&schema);
+    ASSERT(count_stream_rows(&stream) > 0, "projection should return rows");
+    ASSERT(lance_scanner_set_projection(scanner, NULL, 0) == -1,
+           "projection after scan start must fail");
+    ASSERT(lance_scanner_disable_scoring_autoprojection(scanner) == -1,
+           "scoring setting after scan start must fail");
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    LanceProjectionColumn explicit_empty = {NULL, NULL};
+    ASSERT(lance_scanner_set_projection(scanner, &explicit_empty, 0) == 0,
+           "explicit empty projection");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "empty projection stream failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "empty projection schema failed");
+    ASSERT(schema.n_children == 0, "explicit empty projection should have no fields");
+    if (schema.release) schema.release(&schema);
+    if (stream.release) stream.release(&stream);
+    lance_scanner_close(scanner);
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static void test_scan_with_row_addr_lists(const char *uri) {
     printf("  test_scan_with_row_addr_lists... ");
 
@@ -2569,6 +2625,7 @@ int main(int argc, char **argv) {
     test_shared_session(uri);
     test_session_cache_config(session_uri);
     test_scan(uri);
+    test_scanner_projection(uri);
     test_distance_range(uri);
     test_scan_with_limit(uri);
     test_scan_with_row_addr_lists(uri);

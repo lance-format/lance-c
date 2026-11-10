@@ -150,6 +150,36 @@ fn read(scan: &Scan) -> Vec<(i32, i32, f32)> {
     result.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.total_cmp(&b.2)).then(a.1.cmp(&b.1)));
     result
 }
+
+fn set_projection(scan: &Scan, projection: &[(&str, &str)]) {
+    let names = projection
+        .iter()
+        .map(|(name, _)| c(name))
+        .collect::<Vec<_>>();
+    let expressions = projection
+        .iter()
+        .map(|(_, expression)| c(expression))
+        .collect::<Vec<_>>();
+    let columns = names
+        .iter()
+        .zip(&expressions)
+        .map(|(name, expression)| LanceProjectionColumn {
+            output_name: name.as_ptr(),
+            expression: expression.as_ptr(),
+        })
+        .collect::<Vec<_>>();
+    let explicit_empty = LanceProjectionColumn {
+        output_name: ptr::null(),
+        expression: ptr::null(),
+    };
+    let data = if columns.is_empty() {
+        &explicit_empty
+    } else {
+        columns.as_ptr()
+    };
+    ok(unsafe { lance_scanner_set_projection(scan.0, data, columns.len()) });
+}
+
 fn expected(q: &[f32], k: usize, minimum_id: i32) -> Vec<(i32, i32, f32)> {
     let mut result = Vec::new();
     for (index, q) in q.as_chunks::<2>().0.iter().enumerate() {
@@ -183,6 +213,46 @@ fn batch_nearest_flat_preserves_independent_queries_and_copies_input() {
         ok(unsafe { lance_scanner_set_batch_size(scan.0, 2) });
         ok(unsafe { lance_scanner_set_strict_batch_size(scan.0, true) });
         assert_eq!(read(&scan), want);
+    }
+}
+
+#[test]
+fn batch_nearest_projection_and_scoring_autoprojection() {
+    let (_dir, uri) = fixture();
+    let data = Data::open(&uri);
+    let q = [2.25, 1., 100.25, 1.];
+
+    let alias = [("id_alias", "id")];
+    let explicit_distance = [("id_alias", "id"), ("_distance", "_distance")];
+    for (projection, disable, expect_distance) in [
+        (alias.as_slice(), false, true),
+        (alias.as_slice(), true, false),
+        (explicit_distance.as_slice(), true, true),
+    ] {
+        let scan = data.scan();
+        set_projection(&scan, projection);
+        if disable {
+            ok(unsafe { lance_scanner_disable_scoring_autoprojection(scan.0) });
+        }
+        configure(&scan, &q, 2);
+        ok(unsafe { lance_scanner_set_use_index(scan.0, false) });
+
+        let mut stream = FFI_ArrowArrayStream::empty();
+        ok(unsafe { lance_scanner_to_arrow_stream(scan.0, &mut stream) });
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+        let fields = reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(fields[0], "query_index");
+        assert!(fields.contains(&"id_alias".to_string()));
+        assert_eq!(fields.contains(&"_distance".to_string()), expect_distance);
+        assert_eq!(
+            reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
+            4
+        );
     }
 }
 

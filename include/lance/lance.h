@@ -1871,6 +1871,70 @@ typedef struct LanceColumnOrdering {
 } LanceColumnOrdering;
 
 /**
+ * One ordered scanner projection entry.
+ *
+ * `output_name` is the output field name and may be an alias. `expression` is
+ * a Lance SQL expression evaluated against the dataset schema. Both strings
+ * are copied during `lance_scanner_set_projection()`.
+ */
+typedef struct LanceProjectionColumn {
+    const char* output_name;
+    const char* expression;
+} LanceProjectionColumn;
+
+/**
+ * Replace the scanner projection with ordered output-name / SQL-expression
+ * pairs, mirroring Lance `Scanner::project_with_transform()`.
+ *
+ * Each output name may be an alias. Each expression may reference stored
+ * columns, metadata columns, nested field paths, and query-generated scoring
+ * columns according to the selected Lance version. Output order follows the
+ * input array. Lance parses and validates expressions, duplicate output names,
+ * and schema-dependent expression resolution during this call. Planning-only
+ * errors, such as an unsupported projection with no physical output column, are
+ * reported when the scan starts.
+ *
+ * Passing `columns == NULL` with `len == 0` clears the projection and restores
+ * the native unset projection, which selects all dataset columns. Passing a
+ * non-NULL pointer with `len == 0` sets an explicit empty projection. A NULL
+ * pointer with `len > 0` is invalid.
+ *
+ * The array and every string are copied before this call returns. A NULL
+ * output name or expression, non-UTF-8 input, or a projection rejected by
+ * Lance leaves the previous projection unchanged. This does not alter the
+ * column-list projection accepted by `lance_scanner_new()`; that path keeps
+ * Lance's escaped field-path behavior.
+ *
+ * Must be called before the scan starts.
+ *
+ * @param scanner  Scanner handle. Must not be NULL.
+ * @param columns  Projection entries, or NULL to clear.
+ * @param len      Number of projection entries.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_set_projection(
+    LanceScanner* scanner,
+    const LanceProjectionColumn* columns,
+    size_t len
+);
+
+/**
+ * Disable automatic `_score` / `_distance` projection for this scanner.
+ *
+ * With the published default, an explicit projection still receives `_score`
+ * for full-text search or `_distance` for vector search. After this call
+ * succeeds, those columns are included only when explicitly requested by the
+ * projection, matching Lance `Scanner::disable_scoring_autoprojection()`.
+ *
+ * The change is one-way for the lifetime of the scanner. Must be called before
+ * the scan starts.
+ *
+ * @param scanner  Scanner handle. Must not be NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_disable_scoring_autoprojection(LanceScanner* scanner);
+
+/**
  * Replace the scanner's native result ordering.
  *
  * Entries are applied in array order, matching Lance's ColumnOrdering list.
