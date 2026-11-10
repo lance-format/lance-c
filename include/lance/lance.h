@@ -199,6 +199,7 @@ typedef struct LanceRef      LanceRef;
 typedef struct LanceTag      LanceTag;
 typedef struct LanceTags     LanceTags;
 typedef struct LanceDataStatistics LanceDataStatistics;
+typedef struct LanceCleanupExplanation LanceCleanupExplanation;
 typedef struct LanceDatasetConfig LanceDatasetConfig;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
@@ -414,10 +415,343 @@ uint64_t lance_dataset_version(const LanceDataset* dataset);
 uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
 
 /**
+ * Return the number of rows matching an optional SQL filter.
+ *
+ * `filter == NULL` maps to native `Dataset::count_rows(None)` and uses the
+ * metadata fast path. A non-NULL `filter`, including `""`, maps to
+ * `Dataset::count_rows(Some(filter))` and therefore follows native SQL filter
+ * parsing and error semantics.
+ *
+ * Returns 0 on error; an empty match also returns 0, so check
+ * lance_last_error_code().
+ */
+uint64_t lance_dataset_count_rows_filtered(
+    const LanceDataset* dataset,
+    const char* filter
+);
+
+/**
  * Return the latest version ID (I/O), or 0 on error (check
  * lance_last_error_code()).
  */
 uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
+
+/* ─── Dataset maintenance ─── */
+
+/**
+ * Copied native `RemovalStats`.
+ *
+ * `failed_deletes` counts files that cleanup attempted but could not remove.
+ * Those files are not counted as removed and are found again by a later
+ * cleanup. Cleanup does not roll back deletes that already succeeded when a
+ * later file fails.
+ */
+typedef struct LanceRemovalStats {
+    uint64_t bytes_removed;
+    uint64_t old_versions;
+    uint64_t data_files_removed;
+    uint64_t transaction_files_removed;
+    uint64_t index_files_removed;
+    uint64_t deletion_files_removed;
+    uint64_t failed_deletes;
+} LanceRemovalStats;
+
+/**
+ * Native `CleanupFileKind` discriminants. Accessors return a fixed-width
+ * int32_t carrying one of these values.
+ */
+typedef enum {
+    LANCE_CLEANUP_FILE_MANIFEST           = 0,
+    LANCE_CLEANUP_FILE_DATA               = 1,
+    LANCE_CLEANUP_FILE_TRANSACTION        = 2,
+    LANCE_CLEANUP_FILE_INDEX              = 3,
+    LANCE_CLEANUP_FILE_DELETION           = 4,
+    LANCE_CLEANUP_FILE_TEMPORARY_MANIFEST = 5,
+} LanceCleanupFileKind;
+
+/**
+ * Native manual cleanup policy with explicit presence for every optional
+ * selector. Zero-initialize this struct to leave every optional field unset
+ * and inherit native defaults. In particular, the native default
+ * `error_if_tagged_old_versions` is true; it is not the legacy writer's
+ * automatic 20-version / 14-day policy.
+ *
+ * `before_timestamp`, `before_version` and `versions` are independent
+ * selectors. When more than one is set, a version is eligible only if it
+ * satisfies all of them (AND).
+ *
+ * - `versions == NULL` means no exact-version selector. A non-NULL pointer
+ *   with `num_versions == 0` is an explicit empty selection and Lance rejects
+ *   it.
+ * - Set `has_retain_versions` to use the native asynchronous
+ *   `CleanupPolicyBuilder::retain_n_versions`; zero is rejected by Lance.
+ *   Do not set both `has_before_version` and `has_retain_versions`, because
+ *   both set the same native field.
+ * - A present boolean may be true or false. The `has_*` field controls
+ *   presence independently, so zero-initialized optional values preserve
+ *   native defaults.
+ * - Timestamps use seconds plus a nanosecond component. They are not narrowed
+ *   to the signed 64-bit nanosecond range.
+ *
+ * The policy and `versions` array are copied before asynchronous work.
+ */
+typedef struct LanceCleanupPolicy {
+    int32_t     has_before_timestamp;
+    int64_t     before_timestamp_seconds;
+    uint32_t    before_timestamp_nanos;
+    int32_t     has_before_version;
+    uint64_t    before_version;
+    const uint64_t* versions;
+    size_t      num_versions;
+    int32_t     has_retain_versions;
+    uint64_t    retain_versions;
+    int32_t     has_delete_unverified;
+    bool        delete_unverified;
+    int32_t     has_error_if_tagged_old_versions;
+    bool        error_if_tagged_old_versions;
+    int32_t     has_clean_referenced_branches;
+    bool        clean_referenced_branches;
+    int32_t     has_delete_rate_limit;
+    uint64_t    delete_rate_limit;
+} LanceCleanupPolicy;
+
+/**
+ * Optional native `CleanupOperation` overrides. Zero-initialize to use the
+ * native operation defaults.
+ *
+ * An operation-level delete rate limit overrides the policy-level value.
+ * `max_candidate_files` affects explanations only; zero is valid and means
+ * include no candidate files while still returning aggregate stats and a
+ * truncation flag.
+ */
+typedef struct LanceCleanupOperationOptions {
+    int32_t  has_delete_concurrency;
+    uint64_t delete_concurrency;
+    int32_t  has_delete_rate_limit;
+    uint64_t delete_rate_limit;
+    int32_t  has_max_candidate_files;
+    uint64_t max_candidate_files;
+} LanceCleanupOperationOptions;
+
+/**
+ * Relative-duration cleanup options for
+ * `lance_dataset_cleanup_old_versions`.
+ *
+ * `older_than_seconds + older_than_nanos / 1000000000` is converted to the
+ * native `chrono::TimeDelta` range without narrowing through signed 64-bit
+ * nanoseconds. Both components carry the sign; `older_than_nanos` must be in
+ * [-999999999, 999999999]. This entry point calls
+ * `Dataset::cleanup_old_versions`, so Lance owns the time cutoff. The optional
+ * booleans use independent presence flags; leaving them unset preserves native
+ * defaults.
+ */
+typedef struct LanceCleanupOldVersionsOptions {
+    int64_t  older_than_seconds;
+    int32_t  older_than_nanos;
+    int32_t  has_delete_unverified;
+    bool     delete_unverified;
+    int32_t  has_error_if_tagged_old_versions;
+    bool     error_if_tagged_old_versions;
+} LanceCleanupOldVersionsOptions;
+
+/**
+ * Destructively clean versions older than a relative duration using native
+ * `Dataset::cleanup_old_versions`.
+ *
+ * The current version, tagged versions, referenced branch state and
+ * unverified-file protection follow Lance core. Deletes already performed are
+ * not rolled back if a later delete fails; inspect `failed_deletes`. The
+ * function has no lease or ownership relationship with historical snapshot
+ * handles, and removed files are no longer available to them.
+ *
+ * @param dataset   Open dataset. Must not be NULL.
+ * @param options   Relative window and optional native flags. Must not be NULL.
+ * @param out_stats Receives copied native stats on success only.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_cleanup_old_versions(
+    const LanceDataset* dataset,
+    const LanceCleanupOldVersionsOptions* options,
+    LanceRemovalStats* out_stats
+);
+
+/**
+ * Execute manual cleanup with an explicit native policy.
+ *
+ * Cleanup re-evaluates current dataset references and storage state. It
+ * protects the current version, tags and referenced branches according to
+ * Lance core. Deletes already performed are not rolled back when a later
+ * delete fails; `failed_deletes` reports failures.
+ *
+ * @param dataset           Open dataset. Must not be NULL.
+ * @param policy            Native cleanup policy. Must not be NULL.
+ * @param operation_options Optional operation overrides; NULL uses defaults.
+ * @param out_stats         Receives copied native stats on success only.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_cleanup(
+    const LanceDataset* dataset,
+    const LanceCleanupPolicy* policy,
+    const LanceCleanupOperationOptions* operation_options,
+    LanceRemovalStats* out_stats
+);
+
+/**
+ * Explain manual cleanup without deleting files.
+ *
+ * Execution state is re-evaluated by a later
+ * `lance_dataset_cleanup`/`lance_dataset_cleanup_old_versions` call, so an
+ * explanation is not a deletion plan or a reservation.
+ *
+ * @param dataset           Open dataset. Must not be NULL.
+ * @param policy            Native cleanup policy. Must not be NULL.
+ * @param operation_options Optional operation overrides; NULL uses defaults.
+ * @return Owned explanation snapshot, or NULL on error. Close it with
+ *         `lance_cleanup_explanation_close`. All strings borrowed from it
+ *         remain valid until close.
+ */
+LanceCleanupExplanation* lance_dataset_cleanup_explain(
+    const LanceDataset* dataset,
+    const LanceCleanupPolicy* policy,
+    const LanceCleanupOperationOptions* operation_options
+);
+
+/** Dataset version observed when the explanation was produced. */
+uint64_t lance_cleanup_explanation_read_version(
+    const LanceCleanupExplanation* explanation
+);
+
+/**
+ * Copy aggregate removal stats from an explanation. The output is written
+ * only on success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_cleanup_explanation_stats(
+    const LanceCleanupExplanation* explanation,
+    LanceRemovalStats* out_stats
+);
+
+/** Number of candidate files included in the explanation. */
+uint64_t lance_cleanup_explanation_candidate_count(
+    const LanceCleanupExplanation* explanation
+);
+
+/**
+ * Whether more candidate files were found than included.
+ * @return 1 or 0 on success, -1 on error.
+ */
+int32_t lance_cleanup_explanation_candidate_files_truncated(
+    const LanceCleanupExplanation* explanation
+);
+
+/** Native maximum candidate-file count used by the explanation. */
+uint64_t lance_cleanup_explanation_candidate_file_limit(
+    const LanceCleanupExplanation* explanation
+);
+
+/** Candidate path at `index`; owned by `explanation`. NULL on error. */
+const char* lance_cleanup_explanation_candidate_path_at(
+    const LanceCleanupExplanation* explanation,
+    size_t index
+);
+
+/**
+ * Candidate `LanceCleanupFileKind` at `index`.
+ * @return the fixed-width discriminant, or -1 on error.
+ */
+int32_t lance_cleanup_explanation_candidate_kind_at(
+    const LanceCleanupExplanation* explanation,
+    size_t index
+);
+
+/**
+ * Candidate unverified flag at `index`.
+ * @return 1 or 0 on success, -1 on error.
+ */
+int32_t lance_cleanup_explanation_candidate_unverified_at(
+    const LanceCleanupExplanation* explanation,
+    size_t index
+);
+
+/** Candidate file size in bytes at `index`; 0 on error (check error code). */
+uint64_t lance_cleanup_explanation_candidate_size_bytes_at(
+    const LanceCleanupExplanation* explanation,
+    size_t index
+);
+
+/** Number of referenced child branches in the explanation. */
+uint64_t lance_cleanup_explanation_referenced_branch_count(
+    const LanceCleanupExplanation* explanation
+);
+
+/** Referenced branch name at `index`; owned by `explanation`. NULL on error. */
+const char* lance_cleanup_explanation_referenced_branch_name_at(
+    const LanceCleanupExplanation* explanation,
+    size_t index
+);
+
+/** Referenced version at `index`; 0 on error (check error code). */
+uint64_t lance_cleanup_explanation_referenced_branch_version_at(
+    const LanceCleanupExplanation* explanation,
+    size_t index
+);
+
+/**
+ * Whether the referenced branch at `index` is a cascade cleanup candidate.
+ * @return 1 or 0 on success, -1 on error.
+ */
+int32_t lance_cleanup_explanation_referenced_branch_cleanup_candidate_at(
+    const LanceCleanupExplanation* explanation,
+    size_t index
+);
+
+/** Number of non-fatal warnings in the explanation. */
+uint64_t lance_cleanup_explanation_warning_count(
+    const LanceCleanupExplanation* explanation
+);
+
+/** Warning at `index`; owned by `explanation`. NULL on error. */
+const char* lance_cleanup_explanation_warning_at(
+    const LanceCleanupExplanation* explanation,
+    size_t index
+);
+
+/** Close an explanation snapshot. Safe to call with NULL. */
+void lance_cleanup_explanation_close(LanceCleanupExplanation* explanation);
+
+/**
+ * Validate the dataset's fragments, stable row IDs and indices.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_validate(const LanceDataset* dataset);
+
+/**
+ * Count rows hidden by deletion files across all fragments.
+ *
+ * @param dataset  Open dataset. Must not be NULL.
+ * @param out_rows Receives the native count on success only.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_count_deleted_rows(
+    const LanceDataset* dataset,
+    uint64_t* out_rows
+);
+
+/**
+ * Count fragments with fewer physical rows than `max_rows_per_group`.
+ *
+ * This follows the infallible native contract: in particular,
+ * `max_rows_per_group == 0` returns 0. The output is written on success only.
+ *
+ * @return 0 on success, -1 on binding input error.
+ */
+int32_t lance_dataset_num_small_files(
+    const LanceDataset* dataset,
+    size_t max_rows_per_group,
+    uint64_t* out_count
+);
 
 /* ─── Dataset table and schema metadata ─── */
 
@@ -2601,6 +2935,95 @@ int32_t lance_scanner_set_statistics_callback(
  * callbacks, because close must wait for that callback to return.
  */
 void lance_scanner_close(LanceScanner* scanner);
+
+/* ─── Scanner planning, introspection and count ─── */
+
+/**
+ * Export the configured scanner output schema.
+ *
+ * Schemas come from the native plan for the actual configured execution path,
+ * including projections, scoring columns, multi-vector and prepared FTS
+ * transformations, and scalar-segment setup. A binding-private multi-vector
+ * distance column is removed before export.
+ *
+ * This is planning-only: it does not start iteration or advance any stream
+ * already owned by or exported from this scanner. Configuration setters remain
+ * usable afterward. Read-only index metadata and scalar-segment candidate work
+ * required to construct the configured plan may still perform I/O.
+ *
+ * `out` must be non-NULL and point to an empty ArrowSchema whose `release`
+ * callback is NULL. On success the caller must invoke `out->release(out)`
+ * exactly once.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_schema(
+    const LanceScanner* scanner,
+    struct ArrowSchema* out
+);
+
+/**
+ * Explain the configured scanner plan without executing it.
+ *
+ * `verbose` selects native DataFusion tree formatting. The plan includes the
+ * same transformations used by a stream from this configuration.
+ *
+ * This does not start iteration or advance any stream already owned by or
+ * exported from this scanner, and the scanner remains configurable afterward.
+ * Read-only index metadata and scalar-segment candidate work required to
+ * construct the configured plan may still perform I/O.
+ *
+ * The returned string is owned by the caller and must be freed with
+ * lance_free_string(). Returns NULL on error.
+ */
+const char* lance_scanner_explain_plan(
+    const LanceScanner* scanner,
+    bool verbose
+);
+
+/**
+ * Execute the configured scanner plan and return its native runtime analysis.
+ *
+ * This executes the same plan a stream from this configuration would use,
+ * including scalar-segment, multi-vector, and prepared FTS transformations.
+ * It does not consume or advance any existing stream. The scanner remains
+ * configurable afterward.
+ *
+ * The returned string is owned by the caller and must be freed with
+ * lance_free_string(). Returns NULL on error.
+ */
+const char* lance_scanner_analyze_plan(const LanceScanner* scanner);
+
+/**
+ * Count rows matched by the configured scanner.
+ *
+ * This applies the native `COUNT(*)` aggregate to the configured scanner plan
+ * and executes that count plan. It does not count batches from a stream.
+ * Native aggregate planning rejects any configured limit, offset, or ordering.
+ * Count execution uses the native count operation's execution options; the
+ * registered scan-statistics callback is not invoked for this separate count
+ * operation.
+ *
+ * This does not start normal scanner iteration or advance an existing stream,
+ * and the scanner remains configurable afterward.
+ *
+ * Returns 0 on error; an empty match also returns 0, so check
+ * lance_last_error_code().
+ */
+uint64_t lance_scanner_count_rows(const LanceScanner* scanner);
+
+/**
+ * Execute and format the configured native `COUNT(*)` plan.
+ *
+ * This analyzes the plan used by `lance_scanner_count_rows`, not the ordinary
+ * scan plan. It obeys the same aggregate planning constraints and does not
+ * invoke the registered scan-statistics callback. The scanner remains
+ * configurable afterward.
+ *
+ * The returned string is owned by the caller and must be freed with
+ * lance_free_string(). Returns NULL on error.
+ */
+const char* lance_scanner_analyze_count_plan(const LanceScanner* scanner);
 
 /* ─── Sync scan: ArrowArrayStream ─── */
 

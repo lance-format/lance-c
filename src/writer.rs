@@ -466,37 +466,9 @@ fn legacy_auto_cleanup_params() -> AutoCleanupParams {
 /// `TimeDelta` subsecond range. Out-of-range values and durations outside
 /// `chrono::TimeDelta` are rejected with context instead of being clamped.
 fn auto_cleanup_from_ffi(raw: &LanceAutoCleanupParams) -> Result<AutoCleanupParams> {
-    const MAX_NANOS: i32 = 999_999_999;
-    if raw.older_than_nanos < -MAX_NANOS || raw.older_than_nanos > MAX_NANOS {
-        return Err(lance_core::Error::invalid_input_source(
-            format!(
-                "auto_cleanup.older_than_nanos={} must be in [-{MAX_NANOS}, {MAX_NANOS}]",
-                raw.older_than_nanos
-            )
-            .into(),
-        ));
-    }
-
     let interval = u64_to_usize(raw.interval, "auto_cleanup.interval")?;
-    let seconds = TimeDelta::try_seconds(raw.older_than_seconds).ok_or_else(|| {
-        lance_core::Error::invalid_input_source(
-            format!(
-                "auto_cleanup.older_than_seconds={} is outside chrono::TimeDelta range",
-                raw.older_than_seconds
-            )
-            .into(),
-        )
-    })?;
-    let nanos = TimeDelta::nanoseconds(i64::from(raw.older_than_nanos));
-    let older_than = seconds.checked_add(&nanos).ok_or_else(|| {
-        lance_core::Error::invalid_input_source(
-            format!(
-                "auto_cleanup older_than ({} seconds + {} nanoseconds) is outside chrono::TimeDelta range",
-                raw.older_than_seconds, raw.older_than_nanos
-            )
-            .into(),
-        )
-    })?;
+    let older_than =
+        helpers::time_delta_from_ffi(raw.older_than_seconds, raw.older_than_nanos, "auto_cleanup")?;
 
     Ok(AutoCleanupParams {
         interval,

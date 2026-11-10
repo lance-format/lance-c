@@ -57,7 +57,7 @@ jobs:
           # macos-13 runners and jobs queue 24h+ before timing out. Restore
           # this row once a macos-* Intel runner is reliably available again.
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             os_label: macos
             container: ""
             artifact_suffix: ""
@@ -122,6 +122,9 @@ jobs:
           cmake --build build --parallel
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
+      - name: Verify macOS staged libraries
+        if: matrix.os_label == 'macos'
+        run: bash .github/scripts/verify-macos-staging.sh stage arm64
       - name: Tar
         id: pack
         run: |

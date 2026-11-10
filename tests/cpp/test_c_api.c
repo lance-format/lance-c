@@ -9,7 +9,7 @@
  * lance.h is valid C and the API works end-to-end.
  *
  * Usage: test_c_api <dataset_uri> <write_uri> <blob_uri> <ordering_uri>
- *                    <fragment_uri>
+ *                    <session_uri> <fragment_uri> <cleanup_uri>
  */
 
 #include "lance/lance.h"
@@ -39,6 +39,11 @@
             exit(1);                                                           \
         }                                                                      \
     } while (0)
+
+static void discard_last_error(void) {
+    const char *message = lance_last_error_message();
+    if (message) lance_free_string(message);
+}
 
 static const char *arrow_field_metadata_value(
     const struct ArrowSchema *field,
@@ -491,6 +496,127 @@ static void test_scan_with_limit(const char *uri) {
 
     if (stream.release) stream.release(&stream);
     lance_scanner_close(scanner);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+static uint64_t count_stream_rows(struct ArrowArrayStream *stream);
+
+static void test_scanner_introspection(const char *uri) {
+    printf("  test_scanner_introspection... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "dataset open failed");
+    CHECK_OK();
+    uint64_t all_rows = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(all_rows == 20, "fixture row count");
+    ASSERT(lance_dataset_count_rows_filtered(ds, NULL) == all_rows,
+           "NULL filter must use the native None fast path");
+    CHECK_OK();
+
+    const char *filter = "id >= 11";
+    ASSERT(lance_dataset_count_rows_filtered(ds, filter) == 10,
+           "filtered dataset count");
+    CHECK_OK();
+    const char *empty_filter = "";
+    ASSERT(lance_dataset_count_rows_filtered(ds, empty_filter) == 0,
+           "empty filter must be an explicit Some input");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "empty dataset filter must fail");
+    const char *error = lance_last_error_message();
+    ASSERT(error != NULL && error[0] != '\0', "empty filter error message");
+    if (error) lance_free_string(error);
+
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, filter);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    CHECK_OK();
+    LanceProjectionColumn projection[] = {
+        {"id_alias", "id"},
+        {"next_id", "id + 1"},
+    };
+    ASSERT(lance_scanner_set_projection(scanner, projection, 2) == 0,
+           "scanner expression projection");
+    CHECK_OK();
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_scanner_schema(scanner, &schema) == 0,
+           "scanner schema planning");
+    CHECK_OK();
+    ASSERT(schema.n_children == 2, "scanner schema field count");
+    int saw_id = 0;
+    int saw_next = 0;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        const char *name = schema.children[i]->name;
+        if (name && strcmp(name, "id_alias") == 0) saw_id = 1;
+        if (name && strcmp(name, "next_id") == 0) saw_next = 1;
+    }
+    ASSERT(saw_id && saw_next, "scanner schema projected fields");
+    if (schema.release) schema.release(&schema);
+
+    uint64_t count = lance_scanner_count_rows(scanner);
+    CHECK_OK();
+    ASSERT(count == 10, "scanner native count");
+    ASSERT(lance_scanner_count_rows(scanner) == count,
+           "scanner count must be repeatable");
+    CHECK_OK();
+
+    const char *explain = lance_scanner_explain_plan(scanner, false);
+    ASSERT(explain != NULL && explain[0] != '\0', "scanner explain");
+    lance_free_string(explain);
+    CHECK_OK();
+    const char *analyze = lance_scanner_analyze_plan(scanner);
+    ASSERT(analyze != NULL && strstr(analyze, "AggregateExec") == NULL,
+           "normal analyze must not use the count plan");
+    lance_free_string(analyze);
+    CHECK_OK();
+    const char *analyze_count = lance_scanner_analyze_count_plan(scanner);
+    ASSERT(analyze_count != NULL &&
+               strstr(analyze_count, "AggregateExec") != NULL,
+           "analyze count plan must contain the native aggregate");
+    lance_free_string(analyze_count);
+    CHECK_OK();
+
+    ASSERT(lance_scanner_set_batch_size(scanner, 2) == 0,
+           "planning must leave scanner configuration editable");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "scanner stream after inspection");
+    CHECK_OK();
+    ASSERT(count_stream_rows(&stream) == count,
+           "scanner count must match the configured stream");
+    lance_scanner_close(scanner);
+
+    LanceScanner *limited = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(limited != NULL, "limited scanner");
+    ASSERT(lance_scanner_set_limit(limited, 0) == 0, "zero limit setter");
+    ASSERT(lance_scanner_count_rows(limited) == 0,
+           "native aggregate must reject a zero limit");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "aggregate limit error code");
+    error = lance_last_error_message();
+    ASSERT(error != NULL &&
+               strstr(error, "Cannot use limit/offset with aggregate") != NULL,
+           "aggregate limit error message");
+    if (error) lance_free_string(error);
+    lance_scanner_close(limited);
+
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_scanner_schema(NULL, &schema) == -1,
+           "NULL scanner schema must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL scanner schema error code");
+    error = lance_last_error_message();
+    if (error) lance_free_string(error);
+    ASSERT(lance_scanner_count_rows(NULL) == 0,
+           "NULL scanner count must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL scanner count error code");
+    error = lance_last_error_message();
+    if (error) lance_free_string(error);
+
     lance_dataset_close(ds);
     printf("OK\n");
 }
@@ -1471,6 +1597,213 @@ static void test_data_statistics(const char *write_uri) {
     lance_data_statistics_close(NULL); /* must be a safe no-op */
 
     printf("fields=%llu... OK\n", (unsigned long long)n);
+}
+
+/* Exercises native manual cleanup, explanation snapshots, validation and
+ * lifecycle statistics on the dedicated five-version fixture. */
+static void test_cleanup_and_lifecycle(const char *uri) {
+    printf("  test_cleanup_and_lifecycle... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "cleanup fixture open failed");
+    ASSERT(lance_dataset_version(ds) == 5, "cleanup fixture version mismatch");
+    ASSERT(lance_dataset_validate(ds) == 0, "valid fixture failed validation");
+    CHECK_OK();
+
+    uint64_t deleted = UINT64_MAX;
+    ASSERT(lance_dataset_count_deleted_rows(ds, &deleted) == 0,
+           "deleted-row count failed");
+    CHECK_OK();
+    ASSERT(deleted == 1, "cleanup fixture deleted-row count mismatch");
+
+    uint64_t small = UINT64_MAX;
+    ASSERT(lance_dataset_num_small_files(ds, 0, &small) == 0,
+           "zero small-file threshold failed");
+    ASSERT(small == 0, "native zero threshold must return zero");
+    ASSERT(lance_dataset_num_small_files(ds, 5, &small) == 0,
+           "small-file count failed");
+    ASSERT(small == 4, "small-file count mismatch");
+    ASSERT(lance_dataset_num_small_files(ds, 4, &small) == 0,
+           "strict small-file boundary failed");
+    ASSERT(small == 0, "physical rows equal to threshold are not small");
+
+    const uint64_t selected[] = {2, 3};
+    LanceCleanupPolicy policy = {0};
+    policy.has_before_version = 1;
+    policy.before_version = 5;
+    policy.versions = selected;
+    policy.num_versions = 2;
+    LanceCleanupOperationOptions operation = {0};
+    operation.has_max_candidate_files = 1;
+    operation.max_candidate_files = 1;
+
+    LanceCleanupExplanation *explanation =
+        lance_dataset_cleanup_explain(ds, &policy, &operation);
+    ASSERT(explanation != NULL, "cleanup explanation failed");
+    CHECK_OK();
+    ASSERT(lance_cleanup_explanation_read_version(explanation) == 5,
+           "explanation read_version mismatch");
+    CHECK_OK();
+    LanceRemovalStats stats = {0};
+    ASSERT(lance_cleanup_explanation_stats(explanation, &stats) == 0,
+           "explanation stats failed");
+    CHECK_OK();
+    ASSERT(stats.old_versions == 2, "explanation old_versions mismatch");
+    ASSERT(lance_cleanup_explanation_candidate_count(explanation) == 1,
+           "candidate limit should include one file");
+    CHECK_OK();
+    ASSERT(lance_cleanup_explanation_candidate_files_truncated(explanation) == 1,
+           "candidate list should report truncation");
+    ASSERT(lance_cleanup_explanation_candidate_file_limit(explanation) == 1,
+           "candidate limit mismatch");
+    const char *candidate_path =
+        lance_cleanup_explanation_candidate_path_at(explanation, 0);
+    ASSERT(candidate_path != NULL && candidate_path[0] != '\0',
+           "candidate path must be copied");
+    int32_t candidate_kind =
+        lance_cleanup_explanation_candidate_kind_at(explanation, 0);
+    ASSERT(candidate_kind >= LANCE_CLEANUP_FILE_MANIFEST &&
+               candidate_kind <= LANCE_CLEANUP_FILE_TEMPORARY_MANIFEST,
+           "candidate kind out of range");
+    int32_t candidate_unverified =
+        lance_cleanup_explanation_candidate_unverified_at(explanation, 0);
+    ASSERT(candidate_unverified >= 0, "candidate unverified flag failed");
+    ASSERT(lance_cleanup_explanation_candidate_size_bytes_at(explanation, 0) > 0,
+           "candidate size must be copied");
+    CHECK_OK();
+    ASSERT(lance_cleanup_explanation_warning_count(explanation) == 1,
+           "truncation warning missing");
+    CHECK_OK();
+    const char *warning = lance_cleanup_explanation_warning_at(explanation, 0);
+    ASSERT(warning != NULL && strstr(warning, "truncated to 1 entries") != NULL,
+           "unexpected truncation warning");
+
+    /* Explanation is read-only and owns its data after the dataset closes. */
+    LanceDataset *old_version = lance_dataset_open(uri, NULL, 1);
+    ASSERT(old_version != NULL, "explain must not delete old versions");
+    lance_dataset_close(old_version);
+    lance_dataset_close(ds);
+    ASSERT(lance_cleanup_explanation_read_version(explanation) == 5,
+           "owned explanation changed after dataset close");
+    CHECK_OK();
+    lance_cleanup_explanation_close(explanation);
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "cleanup fixture reopen failed");
+
+    /* Explicit zero includes no candidate files but keeps full aggregate stats. */
+    memset(&policy, 0, sizeof(policy));
+    policy.has_retain_versions = 1;
+    policy.retain_versions = 3;
+    operation.has_max_candidate_files = 1;
+    operation.max_candidate_files = 0;
+    explanation = lance_dataset_cleanup_explain(ds, &policy, &operation);
+    ASSERT(explanation != NULL, "zero-limit explanation failed");
+    CHECK_OK();
+    ASSERT(lance_cleanup_explanation_candidate_count(explanation) == 0,
+           "zero candidate limit must include no files");
+    CHECK_OK();
+    ASSERT(lance_cleanup_explanation_candidate_files_truncated(explanation) == 1,
+           "zero candidate limit must report truncation");
+    ASSERT(lance_cleanup_explanation_candidate_file_limit(explanation) == 0,
+           "zero candidate limit mismatch");
+    memset(&stats, 0, sizeof(stats));
+    ASSERT(lance_cleanup_explanation_stats(explanation, &stats) == 0,
+           "zero-limit explanation stats failed");
+    ASSERT(stats.old_versions == 2,
+           "zero candidate limit must retain aggregate stats");
+    lance_cleanup_explanation_close(explanation);
+
+    /* Explicit empty version selection reaches the native builder error. */
+    uint64_t empty_version = 0;
+    memset(&policy, 0, sizeof(policy));
+    policy.versions = &empty_version;
+    policy.num_versions = 0;
+    ASSERT(lance_dataset_cleanup_explain(ds, &policy, NULL) == NULL,
+           "empty version selection must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "empty version selection must be INVALID_ARGUMENT");
+    const char *message = lance_last_error_message();
+    ASSERT(message != NULL &&
+               strstr(message, "versions must not be empty when specified") != NULL,
+           "empty version error missing native context");
+    if (message) lance_free_string(message);
+
+    LanceCleanupOldVersionsOptions invalid_relative = {0};
+    invalid_relative.older_than_nanos = 1000000000;
+    LanceRemovalStats sentinel = {
+        UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX,
+        UINT64_MAX, UINT64_MAX, UINT64_MAX};
+    stats = sentinel;
+    ASSERT(lance_dataset_cleanup_old_versions(
+               ds, &invalid_relative, &stats) == -1,
+           "invalid nanosecond duration must fail");
+    ASSERT(memcmp(&stats, &sentinel, sizeof(stats)) == 0,
+           "failed relative cleanup must not write stats");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    /* Native operation overrides are forwarded. */
+    uint64_t version_two[] = {2};
+    memset(&policy, 0, sizeof(policy));
+    policy.versions = version_two;
+    policy.num_versions = 1;
+    memset(&operation, 0, sizeof(operation));
+    operation.has_delete_concurrency = 1;
+    operation.delete_concurrency = 2;
+    operation.has_delete_rate_limit = 1;
+    operation.delete_rate_limit = 1000000;
+    memset(&stats, 0, sizeof(stats));
+    ASSERT(lance_dataset_cleanup(ds, &policy, &operation, &stats) == 0,
+           "manual cleanup failed");
+    CHECK_OK();
+    ASSERT(stats.old_versions == 1, "manual cleanup old_versions mismatch");
+    ASSERT(stats.failed_deletes == 0, "unexpected failed deletes");
+    lance_dataset_close(ds);
+
+    old_version = lance_dataset_open(uri, NULL, 2);
+    ASSERT(old_version == NULL, "removed version must no longer open");
+    ASSERT(lance_last_error_code() == LANCE_ERR_NOT_FOUND,
+           "removed version should be NOT_FOUND");
+    message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "cleanup fixture reopen after delete failed");
+    LanceCleanupOldVersionsOptions relative = {0};
+    memset(&stats, 0, sizeof(stats));
+    ASSERT(lance_dataset_cleanup_old_versions(ds, &relative, &stats) == 0,
+           "relative cleanup failed");
+    CHECK_OK();
+    ASSERT(stats.old_versions == 3,
+           "relative cleanup should remove the three remaining old versions");
+
+    /* Binding validation and success-only outputs. */
+    uint64_t untouched = 123;
+    ASSERT(lance_dataset_count_deleted_rows(NULL, &untouched) == -1,
+           "NULL count_deleted_rows dataset must fail");
+    ASSERT(untouched == 123, "failed deleted-row count wrote output");
+    ASSERT(lance_dataset_num_small_files(NULL, 5, &untouched) == -1,
+           "NULL num_small_files dataset must fail");
+    ASSERT(untouched == 123, "failed small-file count wrote output");
+    ASSERT(lance_dataset_validate(NULL) == -1,
+           "NULL validate dataset must fail");
+    ASSERT(lance_dataset_cleanup_explain(NULL, &policy, NULL) == NULL,
+           "NULL explanation dataset must fail");
+    ASSERT(lance_dataset_cleanup_old_versions(ds, NULL, &stats) == -1,
+           "NULL relative cleanup options must fail");
+    discard_last_error();
+    ASSERT(lance_cleanup_explanation_read_version(NULL) == 0,
+           "NULL explanation accessor must fail");
+    ASSERT(lance_cleanup_explanation_candidate_count(NULL) == 0,
+           "NULL explanation count must fail");
+    ASSERT(lance_cleanup_explanation_candidate_files_truncated(NULL) == -1,
+           "NULL explanation truncation must fail");
+    discard_last_error();
+    lance_dataset_close(ds);
+    lance_cleanup_explanation_close(NULL);
+
+    printf("OK\n");
 }
 
 /* Exercises native table/schema metadata reads and updates through the C API,
@@ -3535,10 +3868,10 @@ static void test_fragment_read_operations(const char *uri) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 8) {
+    if (argc < 9) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
-                "<session_uri> <fragment_uri> <fragment_read_uri>\n",
+                "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -3550,6 +3883,7 @@ int main(int argc, char **argv) {
     const char *session_uri = argv[5];
     const char *fragment_uri = argv[6];
     const char *fragment_read_uri = argv[7];
+    const char *cleanup_uri = argv[8];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
@@ -3561,6 +3895,7 @@ int main(int argc, char **argv) {
     test_scanner_projection(uri);
     test_distance_range(uri);
     test_scan_with_limit(uri);
+    test_scanner_introspection(uri);
     test_scan_with_row_addr_lists(uri);
     test_scanner_order_by(ordering_uri);
     test_fragment_snapshot(fragment_uri);
@@ -3580,6 +3915,7 @@ int main(int argc, char **argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
+    test_cleanup_and_lifecycle(cleanup_uri);
     test_dataset_metadata(write_uri);
     test_dataset_field_metadata(fragment_uri);
     test_update(write_uri);

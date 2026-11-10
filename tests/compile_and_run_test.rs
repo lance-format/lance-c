@@ -142,6 +142,50 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a five-version, four-fragment dataset with one deleted row for
+/// maintenance API tests.
+fn create_cleanup_dataset_on_disk() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("cleanup_c_test_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = |start: i32| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(start..start + 4))],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch(0))], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        for start in [4, 8, 12] {
+            dataset
+                .append(
+                    arrow::record_batch::RecordBatchIterator::new(
+                        vec![Ok(batch(start))],
+                        schema.clone(),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        dataset.delete("id = 1").await.unwrap();
+    });
+    (tmp, uri)
+}
+
 /// Create a two-fragment dataset with a B-tree index for session cache tests.
 fn create_session_cache_dataset_on_disk() -> (tempfile::TempDir, String) {
     let fixture = create_test_dataset_on_disk();
@@ -549,8 +593,8 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
 
 /// Run a compiled test binary with the source dataset URI, a destination URI
 /// for the write test, the Blob v2 and ordering datasets, the indexed session
-/// cache dataset and separate non-stable/stable fragment-deletion datasets. The
-/// destination path must not pre-exist.
+/// cache dataset, separate non-stable/stable fragment-deletion datasets and the
+/// cleanup fixture. The destination path must not pre-exist.
 #[allow(clippy::too_many_arguments)]
 fn run_test_binary(
     binary: &Path,
@@ -561,6 +605,7 @@ fn run_test_binary(
     session_uri: &str,
     fragment_uri: &str,
     fragment_read_uri: &str,
+    cleanup_uri: &str,
 ) {
     let output = Command::new(binary)
         .arg(dataset_uri)
@@ -570,6 +615,7 @@ fn run_test_binary(
         .arg(session_uri)
         .arg(fragment_uri)
         .arg(fragment_read_uri)
+        .arg(cleanup_uri)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -649,6 +695,7 @@ fn test_c_compilation_and_execution() {
     let (_session_tmp, session_uri) = create_session_cache_dataset_on_disk();
     let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk(false);
     let (_fragment_read_tmp, fragment_read_uri) = create_fragment_dataset_on_disk(true);
+    let (_cleanup_tmp, cleanup_uri) = create_cleanup_dataset_on_disk();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -671,6 +718,7 @@ fn test_c_compilation_and_execution() {
         &session_uri,
         &fragment_uri,
         &fragment_read_uri,
+        &cleanup_uri,
     );
 }
 
@@ -690,6 +738,7 @@ fn test_cpp_compilation_and_execution() {
     let (_session_tmp, session_uri) = create_session_cache_dataset_on_disk();
     let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk(false);
     let (_fragment_read_tmp, fragment_read_uri) = create_fragment_dataset_on_disk(true);
+    let (_cleanup_tmp, cleanup_uri) = create_cleanup_dataset_on_disk();
     let build_dir = tempfile::tempdir().unwrap();
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -712,6 +761,7 @@ fn test_cpp_compilation_and_execution() {
         &session_uri,
         &fragment_uri,
         &fragment_read_uri,
+        &cleanup_uri,
     );
 }
 

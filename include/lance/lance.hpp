@@ -178,6 +178,99 @@ struct FieldStatistics {
     uint64_t bytes_on_disk;
 };
 
+// ─── Dataset maintenance ─────────────────────────────────────────────────────
+
+/// Copied native `RemovalStats`.
+struct RemovalStats {
+    uint64_t bytes_removed = 0;
+    uint64_t old_versions = 0;
+    uint64_t data_files_removed = 0;
+    uint64_t transaction_files_removed = 0;
+    uint64_t index_files_removed = 0;
+    uint64_t deletion_files_removed = 0;
+    uint64_t failed_deletes = 0;
+};
+
+/// Native cleanup file kinds.
+enum class CleanupFileKind : int32_t {
+    Manifest          = LANCE_CLEANUP_FILE_MANIFEST,
+    Data              = LANCE_CLEANUP_FILE_DATA,
+    Transaction       = LANCE_CLEANUP_FILE_TRANSACTION,
+    Index             = LANCE_CLEANUP_FILE_INDEX,
+    Deletion          = LANCE_CLEANUP_FILE_DELETION,
+    TemporaryManifest = LANCE_CLEANUP_FILE_TEMPORARY_MANIFEST,
+};
+
+/// Whole seconds plus nanoseconds since the Unix epoch.
+struct CleanupTimestamp {
+    int64_t  seconds = 0;
+    uint32_t nanos = 0;
+};
+
+/// Native manual cleanup policy.
+///
+/// A default-constructed value leaves all optional selectors unset and
+/// inherits native defaults, including
+/// `error_if_tagged_old_versions = true`. `before_timestamp`, `before_version`
+/// and `versions` combine with AND. `retain_versions` is resolved by the native
+/// asynchronous builder and cannot be combined with `before_version`.
+///
+/// `versions == std::nullopt` means no exact-version selector. An engaged empty
+/// vector is an explicit empty selection and is rejected by Lance.
+struct CleanupPolicy {
+    std::optional<CleanupTimestamp>       before_timestamp;
+    std::optional<uint64_t>               before_version;
+    std::optional<std::vector<uint64_t>>  versions;
+    std::optional<uint64_t>               retain_versions;
+    std::optional<bool>                   delete_unverified;
+    std::optional<bool>                   error_if_tagged_old_versions;
+    std::optional<bool>                   clean_referenced_branches;
+    std::optional<uint64_t>               delete_rate_limit;
+};
+
+/// Optional native `CleanupOperation` overrides.
+///
+/// `max_candidate_files` affects explanations and zero is valid.
+struct CleanupOperationOptions {
+    std::optional<uint64_t> delete_concurrency;
+    std::optional<uint64_t> delete_rate_limit;
+    std::optional<uint64_t> max_candidate_files;
+};
+
+/// Relative-duration inputs for `Dataset::cleanup_old_versions`.
+struct CleanupOldVersionsOptions {
+    int64_t             older_than_seconds = 0;
+    int32_t             older_than_nanos = 0;
+    std::optional<bool> delete_unverified;
+    std::optional<bool> error_if_tagged_old_versions;
+};
+
+/// One copied cleanup candidate.
+struct CleanupCandidateFile {
+    std::string      path;
+    CleanupFileKind  kind = CleanupFileKind::Manifest;
+    bool             unverified = false;
+    uint64_t         size_bytes = 0;
+};
+
+/// One copied referenced child branch.
+struct CleanupReferencedBranch {
+    std::string name;
+    uint64_t    referenced_version = 0;
+    bool        cleanup_candidate = false;
+};
+
+/// Fully copied native `CleanupExplanation`.
+struct CleanupExplanation {
+    uint64_t read_version = 0;
+    RemovalStats stats;
+    std::vector<CleanupCandidateFile> candidate_files;
+    bool candidate_files_truncated = false;
+    uint64_t candidate_file_limit = 0;
+    std::vector<CleanupReferencedBranch> referenced_branches;
+    std::vector<std::string> warnings;
+};
+
 // ─── Write mode ──────────────────────────────────────────────────────────────
 
 enum class WriteMode : int32_t {
@@ -1186,6 +1279,166 @@ class Dataset {
         return c_options;
     }
 
+    static RemovalStats from_c_removal_stats(const LanceRemovalStats& stats) {
+        RemovalStats out;
+        out.bytes_removed = stats.bytes_removed;
+        out.old_versions = stats.old_versions;
+        out.data_files_removed = stats.data_files_removed;
+        out.transaction_files_removed = stats.transaction_files_removed;
+        out.index_files_removed = stats.index_files_removed;
+        out.deletion_files_removed = stats.deletion_files_removed;
+        out.failed_deletes = stats.failed_deletes;
+        return out;
+    }
+
+    static LanceCleanupPolicy to_c_cleanup_policy(
+        const CleanupPolicy& policy,
+        std::vector<uint64_t>& versions,
+        uint64_t& empty_versions_sentinel) {
+        LanceCleanupPolicy out{};
+        if (policy.before_timestamp) {
+            out.has_before_timestamp = 1;
+            out.before_timestamp_seconds = policy.before_timestamp->seconds;
+            out.before_timestamp_nanos = policy.before_timestamp->nanos;
+        }
+        if (policy.before_version) {
+            out.has_before_version = 1;
+            out.before_version = *policy.before_version;
+        }
+        if (policy.versions) {
+            versions = *policy.versions;
+            out.versions =
+                versions.empty() ? &empty_versions_sentinel : versions.data();
+            out.num_versions = versions.size();
+        }
+        if (policy.retain_versions) {
+            out.has_retain_versions = 1;
+            out.retain_versions = *policy.retain_versions;
+        }
+        if (policy.delete_unverified) {
+            out.has_delete_unverified = 1;
+            out.delete_unverified = *policy.delete_unverified;
+        }
+        if (policy.error_if_tagged_old_versions) {
+            out.has_error_if_tagged_old_versions = 1;
+            out.error_if_tagged_old_versions =
+                *policy.error_if_tagged_old_versions;
+        }
+        if (policy.clean_referenced_branches) {
+            out.has_clean_referenced_branches = 1;
+            out.clean_referenced_branches =
+                *policy.clean_referenced_branches;
+        }
+        if (policy.delete_rate_limit) {
+            out.has_delete_rate_limit = 1;
+            out.delete_rate_limit = *policy.delete_rate_limit;
+        }
+        return out;
+    }
+
+    static LanceCleanupOperationOptions to_c_cleanup_operation(
+        const CleanupOperationOptions& options) {
+        LanceCleanupOperationOptions out{};
+        if (options.delete_concurrency) {
+            out.has_delete_concurrency = 1;
+            out.delete_concurrency = *options.delete_concurrency;
+        }
+        if (options.delete_rate_limit) {
+            out.has_delete_rate_limit = 1;
+            out.delete_rate_limit = *options.delete_rate_limit;
+        }
+        if (options.max_candidate_files) {
+            out.has_max_candidate_files = 1;
+            out.max_candidate_files = *options.max_candidate_files;
+        }
+        return out;
+    }
+
+    static CleanupExplanation read_cleanup_explanation(
+        const LanceCleanupExplanation* explanation) {
+        CleanupExplanation out;
+        out.read_version =
+            lance_cleanup_explanation_read_version(explanation);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+
+        LanceRemovalStats stats{};
+        if (lance_cleanup_explanation_stats(explanation, &stats) != 0)
+            check_error();
+        out.stats = from_c_removal_stats(stats);
+
+        const uint64_t candidate_count =
+            lance_cleanup_explanation_candidate_count(explanation);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        out.candidate_files.reserve(static_cast<size_t>(candidate_count));
+        for (uint64_t i = 0; i < candidate_count; ++i) {
+            const auto index = static_cast<size_t>(i);
+            CleanupCandidateFile candidate;
+            const char* path =
+                lance_cleanup_explanation_candidate_path_at(explanation, index);
+            if (!path) check_error();
+            candidate.path = path;
+
+            const int32_t kind =
+                lance_cleanup_explanation_candidate_kind_at(explanation, index);
+            if (kind < 0) check_error();
+            candidate.kind = static_cast<CleanupFileKind>(kind);
+            const int32_t unverified =
+                lance_cleanup_explanation_candidate_unverified_at(
+                    explanation, index);
+            if (unverified < 0) check_error();
+            candidate.unverified = unverified != 0;
+            candidate.size_bytes =
+                lance_cleanup_explanation_candidate_size_bytes_at(
+                    explanation, index);
+            if (lance_last_error_code() != LANCE_OK) check_error();
+            out.candidate_files.push_back(std::move(candidate));
+        }
+
+        const int32_t truncated =
+            lance_cleanup_explanation_candidate_files_truncated(explanation);
+        if (truncated < 0) check_error();
+        out.candidate_files_truncated = truncated != 0;
+        out.candidate_file_limit =
+            lance_cleanup_explanation_candidate_file_limit(explanation);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+
+        const uint64_t branch_count =
+            lance_cleanup_explanation_referenced_branch_count(explanation);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        out.referenced_branches.reserve(static_cast<size_t>(branch_count));
+        for (uint64_t i = 0; i < branch_count; ++i) {
+            const auto index = static_cast<size_t>(i);
+            CleanupReferencedBranch branch;
+            const char* name =
+                lance_cleanup_explanation_referenced_branch_name_at(
+                    explanation, index);
+            if (!name) check_error();
+            branch.name = name;
+            branch.referenced_version =
+                lance_cleanup_explanation_referenced_branch_version_at(
+                    explanation, index);
+            if (lance_last_error_code() != LANCE_OK) check_error();
+            const int32_t candidate =
+                lance_cleanup_explanation_referenced_branch_cleanup_candidate_at(
+                    explanation, index);
+            if (candidate < 0) check_error();
+            branch.cleanup_candidate = candidate != 0;
+            out.referenced_branches.push_back(std::move(branch));
+        }
+
+        const uint64_t warning_count =
+            lance_cleanup_explanation_warning_count(explanation);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        out.warnings.reserve(static_cast<size_t>(warning_count));
+        for (uint64_t i = 0; i < warning_count; ++i) {
+            const char* warning = lance_cleanup_explanation_warning_at(
+                explanation, static_cast<size_t>(i));
+            if (!warning) check_error();
+            out.warnings.emplace_back(warning);
+        }
+        return out;
+    }
+
     static VersionDetails read_version(const LanceVersion* version) {
         VersionDetails out;
         out.id = lance_version_id(version);
@@ -1599,6 +1852,17 @@ public:
     /// Number of rows in the dataset.
     uint64_t count_rows() const {
         uint64_t n = lance_dataset_count_rows(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return n;
+    }
+
+    /// Number of rows matching `filter` through native
+    /// `Dataset::count_rows(Some(filter))`. An empty string is an explicit
+    /// filter, not the unfiltered metadata fast path; use count_rows() for
+    /// native `None`.
+    uint64_t count_rows(const std::string& filter) const {
+        uint64_t n =
+            lance_dataset_count_rows_filtered(handle_.get(), filter.c_str());
         if (lance_last_error_code() != LANCE_OK) check_error();
         return n;
     }
@@ -2050,6 +2314,102 @@ public:
             out.push_back(fs);
         }
         return out;
+    }
+
+    /// Clean versions older than a relative duration through native
+    /// `Dataset::cleanup_old_versions`. Lance core owns the timestamp cutoff.
+    /// Throws lance::Error on failure.
+    RemovalStats cleanup_old_versions(
+        const CleanupOldVersionsOptions& options) const {
+        LanceCleanupOldVersionsOptions raw{};
+        raw.older_than_seconds = options.older_than_seconds;
+        raw.older_than_nanos = options.older_than_nanos;
+        if (options.delete_unverified) {
+            raw.has_delete_unverified = 1;
+            raw.delete_unverified = *options.delete_unverified;
+        }
+        if (options.error_if_tagged_old_versions) {
+            raw.has_error_if_tagged_old_versions = 1;
+            raw.error_if_tagged_old_versions =
+                *options.error_if_tagged_old_versions;
+        }
+        LanceRemovalStats stats{};
+        if (lance_dataset_cleanup_old_versions(
+                handle_.get(), &raw, &stats) != 0) {
+            check_error();
+        }
+        return from_c_removal_stats(stats);
+    }
+
+    /// Execute native manual cleanup with an explicit policy. Current versions,
+    /// tags, referenced branches and unverified files follow Lance core.
+    /// Throws lance::Error on failure.
+    RemovalStats cleanup(
+        const CleanupPolicy& policy,
+        const CleanupOperationOptions& operation = {}) const {
+        std::vector<uint64_t> versions;
+        uint64_t empty_versions_sentinel = 0;
+        const LanceCleanupPolicy raw_policy = to_c_cleanup_policy(
+            policy, versions, empty_versions_sentinel);
+        const LanceCleanupOperationOptions raw_operation =
+            to_c_cleanup_operation(operation);
+        LanceRemovalStats stats{};
+        if (lance_dataset_cleanup(
+                handle_.get(),
+                &raw_policy,
+                &raw_operation,
+                &stats) != 0) {
+            check_error();
+        }
+        return from_c_removal_stats(stats);
+    }
+
+    /// Explain cleanup without deleting files. The returned value owns copies
+    /// of every native field and remains valid after this Dataset is closed.
+    /// A later cleanup re-evaluates current references and storage state.
+    /// Throws lance::Error on failure.
+    CleanupExplanation explain_cleanup(
+        const CleanupPolicy& policy,
+        const CleanupOperationOptions& operation = {}) const {
+        std::vector<uint64_t> versions;
+        uint64_t empty_versions_sentinel = 0;
+        const LanceCleanupPolicy raw_policy = to_c_cleanup_policy(
+            policy, versions, empty_versions_sentinel);
+        const LanceCleanupOperationOptions raw_operation =
+            to_c_cleanup_operation(operation);
+        auto* raw = lance_dataset_cleanup_explain(
+            handle_.get(), &raw_policy, &raw_operation);
+        if (!raw) check_error();
+        Handle<LanceCleanupExplanation, lance_cleanup_explanation_close> snap(
+            raw);
+        return read_cleanup_explanation(snap.get());
+    }
+
+    /// Validate native fragments, stable row IDs and indices. Throws
+    /// lance::Error on failure.
+    void validate() const {
+        if (lance_dataset_validate(handle_.get()) != 0) check_error();
+    }
+
+    /// Count rows hidden by deletion files across all fragments.
+    /// Throws lance::Error on failure.
+    uint64_t count_deleted_rows() const {
+        uint64_t rows = 0;
+        if (lance_dataset_count_deleted_rows(handle_.get(), &rows) != 0)
+            check_error();
+        return rows;
+    }
+
+    /// Count fragments with fewer physical rows than `max_rows_per_group`.
+    /// Native `max_rows_per_group == 0` returns 0. Throws lance::Error only
+    /// for binding input errors.
+    uint64_t num_small_files(size_t max_rows_per_group) const {
+        uint64_t count = 0;
+        if (lance_dataset_num_small_files(
+                handle_.get(), max_rows_per_group, &count) != 0) {
+            check_error();
+        }
+        return count;
     }
 
     /// Commit a new manifest that aliases `version` as the latest. The
@@ -2994,6 +3354,19 @@ struct ProjectionColumn {
 class Scanner {
     Handle<LanceScanner, lance_scanner_close> handle_;
 
+    static std::string take_owned_string(const char* raw) {
+        if (!raw) {
+            if (lance_last_error_code() == LANCE_OK) {
+                throw Error(LANCE_ERR_INTERNAL,
+                            "scanner plan API returned NULL without an error");
+            }
+            check_error();
+        }
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            raw, lance_free_string);
+        return std::string(raw);
+    }
+
 public:
     friend class Fragment;
 
@@ -3314,6 +3687,41 @@ public:
     /// (typed vector overload).
     Scanner& index_segments(const std::vector<std::array<uint8_t, 16>>& uuids) {
         return index_segments(reinterpret_cast<const uint8_t*>(uuids.data()), uuids.size());
+    }
+
+    /// Export the configured output schema from its actual native plan.
+    /// Planning-only; does not start iteration or advance an existing stream.
+    /// `out` is caller-owned; release it exactly once on success.
+    void schema(ArrowSchema* out) const {
+        if (lance_scanner_schema(handle_.get(), out) != 0)
+            check_error();
+    }
+
+    /// Explain the configured native plan without executing it.
+    std::string explain_plan(bool verbose = false) const {
+        return take_owned_string(
+            lance_scanner_explain_plan(handle_.get(), verbose));
+    }
+
+    /// Execute and format the configured native plan with runtime metrics.
+    /// Does not consume or advance an existing stream.
+    std::string analyze_plan() const {
+        return take_owned_string(lance_scanner_analyze_plan(handle_.get()));
+    }
+
+    /// Execute the native COUNT(*) plan for this scanner. Native aggregate
+    /// planning rejects configured limit/offset/ordering. Throws lance::Error
+    /// on failure.
+    uint64_t count_rows() const {
+        uint64_t count = lance_scanner_count_rows(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    /// Execute and format the native COUNT(*) plan, not the ordinary plan.
+    std::string analyze_count_plan() const {
+        return take_owned_string(
+            lance_scanner_analyze_count_plan(handle_.get()));
     }
 
     /// Materialize an independent ArrowArrayStream (blocking). The scanner remains valid.

@@ -58,6 +58,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 |--------|-----------|-------------|
 | [x] | Fragment-level access | Fragment enumeration, ID listing, read-only metadata/schema/counts, scanner fragment filtering |
 | [x] | Compaction | Fragment consolidation via `lance_dataset_compact_files()` |
+| [x] | Dataset maintenance | Native manual cleanup/explain, dataset validation, deleted-row and small-file counts |
 | [x] | Statistics export | Per-field compressed on-disk size for query planning via `lance_dataset_calculate_data_stats()` |
 | [x] | Cloud storage | S3, GCS, Azure via storage options pass-through |
 | [x] | Package distribution | vcpkg and Conan recipe packaging |
@@ -135,6 +136,44 @@ metadata. `lance_dataset_data_storage_version()`,
 `lance_dataset_field_id_at()`, `lance_dataset_resolve_field_id()` and
 `lance_dataset_field_path()` expose the current native snapshot; the C++
 wrappers provide the corresponding `Dataset` methods.
+
+## Dataset maintenance
+
+Manual version cleanup and its read-only explanation bind the native
+`CleanupPolicy`, `CleanupOperation`, `Dataset::cleanup_old_versions`,
+`Dataset::validate`, `Dataset::count_deleted_rows` and
+`Dataset::num_small_files` operations:
+
+```cpp
+lance::CleanupPolicy policy;
+policy.versions = std::vector<uint64_t>{2, 3};
+policy.before_version = 5;
+
+lance::CleanupOperationOptions operation;
+operation.max_candidate_files = 100;
+
+auto preview = ds.explain_cleanup(policy, operation);
+auto removed = ds.cleanup(policy, operation);
+
+ds.validate();
+uint64_t deleted_rows = ds.count_deleted_rows();
+uint64_t small_files = ds.num_small_files(/*max_rows_per_group=*/1000);
+```
+
+Policy selectors combine with AND. A default-constructed policy inherits native
+defaults rather than the legacy writer's automatic 20-version / 14-day policy.
+`std::nullopt` versus an engaged empty vector distinguishes absent from explicit
+empty version selection, and `retain_versions` uses Lance's asynchronous native
+builder. Use `CleanupOldVersionsOptions` /
+`lance_dataset_cleanup_old_versions()` for relative-duration cleanup; Lance core
+owns the clock cutoff.
+
+Explanations copy all aggregate stats, candidate files, truncation state,
+referenced branches and warnings, so they remain valid after the dataset handle
+closes. They do not reserve files. Execution re-evaluates current references
+and storage state, protects current/tagged/branch/unverified data according to
+Lance, and reports partial deletion through `failed_deletes`; it does not roll
+back successful deletes. Historical snapshot handles do not own a storage lease.
 
 ## Scanner ordering
 
