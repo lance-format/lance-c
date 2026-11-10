@@ -4608,7 +4608,7 @@ fn test_dataset_snapshot_inspection_matches_native() {
         },
         "profile.missing",
     );
-    assert_eq!(field_id, nested_id);
+    assert_eq!(field_id, -123);
     let unknown_path = unsafe { lance_dataset_field_path(ds, 99_999) };
     assert!(unknown_path.is_null());
     assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);

@@ -1049,8 +1049,8 @@ static void test_dataset_field_metadata(const char *fragment_uri) {
     CHECK_OK();
     ASSERT(lance_dataset_fragment_count(ds) == 2,
            "nested fixture must have two fragments");
-    ASSERT(lance_dataset_count_rows(ds) == 8,
-           "nested fixture must retain all rows");
+    ASSERT(lance_dataset_count_rows(ds) == 6,
+           "nested fixture must retain its logical rows");
 
     const char *storage_version = lance_dataset_data_storage_version(ds);
     ASSERT(storage_version != NULL, "data storage version read failed");

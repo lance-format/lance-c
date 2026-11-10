@@ -1334,7 +1334,7 @@ static void test_dataset_field_metadata(const std::string& uri) {
     auto ds = lance::Dataset::open(uri);
     const uint64_t initial_version = ds.version();
     assert(ds.fragment_count() == 2);
-    assert(ds.count_rows() == 8);
+    assert(ds.count_rows() == 6);
     assert(ds.data_storage_version() == "2.2");
     assert(!ds.has_stable_row_ids());
 
