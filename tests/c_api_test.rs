@@ -5162,7 +5162,12 @@ fn test_branch_metadata_full_replace_persistence_and_options() {
     let duplicate =
         unsafe { lance_dataset_branch_create(ds, meta_name.as_ptr(), duplicate_ref, ptr::null()) };
     assert!(duplicate.is_null());
-    assert_eq!(lance_last_error_code(), LanceErrorCode::CommitConflict);
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::CommitConflict,
+        "{}",
+        take_last_error_message()
+    );
     unsafe {
         lance_ref_close(duplicate_ref);
     }
