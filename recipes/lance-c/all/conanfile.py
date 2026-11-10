@@ -73,9 +73,11 @@ class LanceCConan(ConanFile):
             cmake_layout(self)
 
     def source(self):
-        if self.options.from_source:
-            data = self.conan_data["source-from-tag"][self.version]
-            get(self, **data, strip_root=True)
+        # Options are not available in source(). Fetch the tagged source
+        # unconditionally so the from_source build has it; the prebuilt path
+        # only installs the binary archive from build().
+        data = self.conan_data["source-from-tag"][self.version]
+        get(self, **data, strip_root=True)
 
     def generate(self):
         if self.options.from_source:
