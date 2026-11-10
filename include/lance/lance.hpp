@@ -168,7 +168,7 @@ struct AutoCleanupParams {
     int32_t  older_than_nanos = 0;
 };
 
-/// Native write settings for the `Dataset::write` overload that selects
+/// Native write settings for `Dataset::write_with_options`, which selects
 /// Rust's `WriteParams::default()`.
 ///
 /// A default-constructed `WriteOptions` sets `auto_cleanup = std::nullopt`
@@ -531,7 +531,7 @@ public:
     /// Pass a default-constructed `WriteParams{}` to inherit upstream defaults.
     ///
     /// This overload preserves the legacy lance-c 20-version / 14-day
-    /// auto-cleanup policy. Use the `WriteOptions` overload for native
+    /// auto-cleanup policy. Use `write_with_options` for native
     /// `WriteParams::default()` semantics.
     static Dataset write(
         const std::string& uri,
@@ -552,14 +552,14 @@ public:
             uri, stream, mode, &c_params, nullptr, storage_opts);
     }
 
-    /// Same as `write` but selects native `WriteParams::default()` semantics.
+    /// Write using native `WriteParams::default()` semantics.
     ///
     /// A default-constructed `WriteOptions` sets `auto_cleanup =
     /// std::nullopt` (native `None`) and `skip_auto_cleanup = false`.
     /// `auto_cleanup` is persisted only by CREATE; APPEND and OVERWRITE leave
     /// an existing dataset's policy unchanged. `skip_auto_cleanup` affects only
     /// the current commit. Throws `lance::Error` on failure.
-    static Dataset write(
+    static Dataset write_with_options(
         const std::string& uri,
         ArrowArrayStream* stream,
         WriteMode mode,

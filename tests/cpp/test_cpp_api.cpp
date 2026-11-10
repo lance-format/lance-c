@@ -924,7 +924,7 @@ static void test_write_options_and_config(const std::string& src_uri,
         scanner.to_arrow_stream(&stream);
 
         lance::WriteOptions options;
-        auto ds = lance::Dataset::write(
+        auto ds = lance::Dataset::write_with_options(
             uri, &stream, lance::WriteMode::Create, options);
         assert(ds.count_rows() == src_rows);
         auto config = ds.config();
@@ -942,7 +942,7 @@ static void test_write_options_and_config(const std::string& src_uri,
         options.params.max_rows_per_file = 2;
         options.auto_cleanup = lance::AutoCleanupParams{0, 0, 0};
         options.skip_auto_cleanup = true;
-        auto ds = lance::Dataset::write(
+        auto ds = lance::Dataset::write_with_options(
             uri, &stream, lance::WriteMode::Append, options);
         assert(ds.count_rows() == src_rows * 2);
         auto config = ds.config();
