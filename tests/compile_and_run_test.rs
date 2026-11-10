@@ -570,6 +570,7 @@ fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: 
 /// for the write test, the Blob v2 and ordering datasets, the indexed session
 /// cache dataset, the nested-schema fragment-deletion dataset and the cleanup
 /// fixture. The destination path must not pre-exist.
+#[allow(clippy::too_many_arguments)]
 fn run_test_binary(
     binary: &Path,
     dataset_uri: &str,

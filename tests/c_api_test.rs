@@ -10440,20 +10440,23 @@ fn test_cleanup_selectors_explanation_owned_output_and_reexecution() {
     assert_eq!(native_cleanup_version_ids(&uri, None), vec![1, 2, 3, 4, 5]);
     assert_eq!(count_files_with_extension(root, "manifest"), 5);
 
-    let mut policy = LanceCleanupPolicy::default();
-    policy.has_before_timestamp = 1;
-    // Beyond the i64-nanosecond range (year 3000).
-    policy.before_timestamp_seconds = 32_503_680_000;
-    policy.before_timestamp_nanos = 999_999_999;
-    policy.has_before_version = 1;
-    policy.before_version = 5;
     let selected_versions = [2_u64, 3];
-    policy.versions = selected_versions.as_ptr();
-    policy.num_versions = selected_versions.len();
-
-    let mut operation = LanceCleanupOperationOptions::default();
-    operation.has_max_candidate_files = 1;
-    operation.max_candidate_files = 1;
+    let mut policy = LanceCleanupPolicy {
+        has_before_timestamp: 1,
+        // Beyond the i64-nanosecond range (year 3000).
+        before_timestamp_seconds: 32_503_680_000,
+        before_timestamp_nanos: 999_999_999,
+        has_before_version: 1,
+        before_version: 5,
+        versions: selected_versions.as_ptr(),
+        num_versions: selected_versions.len(),
+        ..LanceCleanupPolicy::default()
+    };
+    let mut operation = LanceCleanupOperationOptions {
+        has_max_candidate_files: 1,
+        max_candidate_files: 1,
+        ..LanceCleanupOperationOptions::default()
+    };
 
     let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!dataset.is_null(), "{}", take_last_error_message());
@@ -10581,9 +10584,11 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
     assert!(!dataset.is_null());
 
     // A zero-initialized optional tag flag inherits the native true default.
-    let mut policy = LanceCleanupPolicy::default();
-    policy.has_before_version = 1;
-    policy.before_version = 5;
+    let mut policy = LanceCleanupPolicy {
+        has_before_version: 1,
+        before_version: 5,
+        ..LanceCleanupPolicy::default()
+    };
     let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, ptr::null()) };
     assert!(explanation.is_null());
     assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
@@ -10592,11 +10597,13 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
 
     // Retain-N uses the native asynchronous builder. Explicitly disabling the
     // tag error leaves the tagged version protected but continues cleanup.
-    policy = LanceCleanupPolicy::default();
-    policy.has_retain_versions = 1;
-    policy.retain_versions = 3;
-    policy.has_error_if_tagged_old_versions = 1;
-    policy.error_if_tagged_old_versions = false;
+    policy = LanceCleanupPolicy {
+        has_retain_versions: 1,
+        retain_versions: 3,
+        has_error_if_tagged_old_versions: 1,
+        error_if_tagged_old_versions: false,
+        ..LanceCleanupPolicy::default()
+    };
     let mut stats = sentinel_cleanup_stats();
     assert_eq!(
         unsafe { lance_dataset_cleanup(dataset, &policy, ptr::null(), &mut stats) },
@@ -10608,9 +10615,11 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
     assert_eq!(native_cleanup_version_ids(&uri, None), vec![2, 3, 4, 5]);
 
     // Native retain-N validation.
-    policy = LanceCleanupPolicy::default();
-    policy.has_retain_versions = 1;
-    policy.retain_versions = 0;
+    policy = LanceCleanupPolicy {
+        has_retain_versions: 1,
+        retain_versions: 0,
+        ..LanceCleanupPolicy::default()
+    };
     let mut stats = sentinel_cleanup_stats();
     assert_eq!(
         unsafe { lance_dataset_cleanup(dataset, &policy, ptr::null(), &mut stats) },
@@ -10622,9 +10631,11 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
     // An explicit empty version selection reaches the native builder and is
     // rejected there rather than being treated as an absent selector.
     let empty_version_sentinel = 0_u64;
-    policy = LanceCleanupPolicy::default();
-    policy.versions = &empty_version_sentinel;
-    policy.num_versions = 0;
+    policy = LanceCleanupPolicy {
+        versions: &empty_version_sentinel,
+        num_versions: 0,
+        ..LanceCleanupPolicy::default()
+    };
     let explanation = unsafe { lance_dataset_cleanup_explain(dataset, &policy, ptr::null()) };
     assert!(explanation.is_null());
     assert!(take_last_error_message().contains("versions must not be empty when specified"));
@@ -10632,11 +10643,13 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
 
     // before_version and retain_versions write the same native field, so the
     // binding rejects the ambiguous combination instead of choosing silently.
-    policy = LanceCleanupPolicy::default();
-    policy.has_before_version = 1;
-    policy.before_version = 4;
-    policy.has_retain_versions = 1;
-    policy.retain_versions = 2;
+    policy = LanceCleanupPolicy {
+        has_before_version: 1,
+        before_version: 4,
+        has_retain_versions: 1,
+        retain_versions: 2,
+        ..LanceCleanupPolicy::default()
+    };
     assert_eq!(
         unsafe { lance_dataset_cleanup(dataset, &policy, ptr::null(), &mut stats) },
         -1
@@ -10644,9 +10657,11 @@ fn test_cleanup_retain_native_defaults_invalid_forms_and_operation_errors() {
     assert!(take_last_error_message().contains("both set the native before_version"));
 
     let selected = [3_u64];
-    policy = LanceCleanupPolicy::default();
-    policy.versions = selected.as_ptr();
-    policy.num_versions = selected.len();
+    policy = LanceCleanupPolicy {
+        versions: selected.as_ptr(),
+        num_versions: selected.len(),
+        ..LanceCleanupPolicy::default()
+    };
 
     // Native operation setters validate through their own stages.
     let invalid_concurrency = LanceCleanupOperationOptions {
@@ -10709,9 +10724,11 @@ fn test_cleanup_relative_duration_and_unverified_candidates() {
     assert!(!dataset.is_null());
 
     let selected = [2_u64];
-    let mut policy = LanceCleanupPolicy::default();
-    policy.versions = selected.as_ptr();
-    policy.num_versions = selected.len();
+    let mut policy = LanceCleanupPolicy {
+        versions: selected.as_ptr(),
+        num_versions: selected.len(),
+        ..LanceCleanupPolicy::default()
+    };
     let operation = LanceCleanupOperationOptions {
         has_max_candidate_files: 1,
         max_candidate_files: 100,
@@ -10927,11 +10944,13 @@ fn test_cleanup_branch_cascade_and_copied_explanation() {
     let root = std::path::Path::new(&uri);
     let before_manifests = count_files_with_extension(root, "manifest");
 
-    let mut policy = LanceCleanupPolicy::default();
-    policy.has_retain_versions = 1;
-    policy.retain_versions = 1;
-    policy.has_clean_referenced_branches = 1;
-    policy.clean_referenced_branches = true;
+    let policy = LanceCleanupPolicy {
+        has_retain_versions: 1,
+        retain_versions: 1,
+        has_clean_referenced_branches: 1,
+        clean_referenced_branches: true,
+        ..LanceCleanupPolicy::default()
+    };
     let operation = LanceCleanupOperationOptions {
         has_max_candidate_files: 1,
         max_candidate_files: 100,
