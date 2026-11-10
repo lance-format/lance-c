@@ -47,6 +47,8 @@ run_step() {
 
 preflight_fail() {
     printf 'preflight failed: %s\n' "$1" | tee "$RUN_DIR/preflight.txt"
+    printf '2\n' >"$RUN_DIR/overall.exit.tmp"
+    mv "$RUN_DIR/overall.exit.tmp" "$RUN_DIR/overall.exit"
     exit 2
 }
 
@@ -120,5 +122,7 @@ run_step c_cpp_consumers \
     done
 } >"$RUN_DIR/summary.txt.tmp"
 mv "$RUN_DIR/summary.txt.tmp" "$RUN_DIR/summary.txt"
+printf '%s\n' "$FAILED" >"$RUN_DIR/overall.exit.tmp"
+mv "$RUN_DIR/overall.exit.tmp" "$RUN_DIR/overall.exit"
 
 exit "$FAILED"
