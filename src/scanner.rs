@@ -4254,7 +4254,11 @@ mod tests {
         let (dataset, scanner) = open_dataset_and_scanner(&uri);
         let name = CString::new("name").unwrap();
         let missing = CString::new("missing").unwrap();
-        let name_id = (*dataset).snapshot().schema().field("name").unwrap().id as u32;
+        let name_id = unsafe { (*dataset).snapshot() }
+            .schema()
+            .field("name")
+            .unwrap()
+            .id as u32;
 
         assert!(matches!(
             &unsafe { &*scanner }.materialization_style,
@@ -4331,9 +4335,7 @@ mod tests {
             -1
         );
         assert_eq!(
-            unsafe {
-                lance_scanner_set_materialization_style(scanner, 99, ptr::null(), 0)
-            },
+            unsafe { lance_scanner_set_materialization_style(scanner, 99, ptr::null(), 0) },
             -1
         );
         assert!(matches!(
@@ -4363,10 +4365,7 @@ mod tests {
         assert!(!unsafe { &*scanner }.fast_search);
 
         let prepared = unsafe { &*scanner }.build_scanner().unwrap();
-        assert_eq!(
-            unsafe { lance_scanner_set_fast_search(scanner, true) },
-            -1
-        );
+        assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, true) }, -1);
         assert_eq!(
             unsafe {
                 lance_scanner_set_materialization_style(
