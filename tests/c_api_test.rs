@@ -9375,7 +9375,9 @@ fn collect_native_fts_scores(
     lance_c::runtime::block_on(async {
         let dataset = Dataset::open(uri).await.unwrap();
         let mut scanner = dataset.scan();
-        scanner.full_text_search(FullTextSearchQuery::new_query(query));
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap();
         if let Some(filter) = filter {
             scanner.filter(filter).unwrap();
         }
