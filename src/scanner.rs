@@ -12,7 +12,10 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::SchemaRef;
-use datafusion::physical_plan::{ExecutionPlan, empty::EmptyExec};
+use datafusion::physical_expr::expressions;
+use datafusion::physical_plan::{
+    ExecutionPlan, empty::EmptyExec, projection::ProjectionExec as DFProjectionExec,
+};
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::fragment::FileFragment;
@@ -22,7 +25,7 @@ use lance::dataset::scanner::{
 };
 use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use lance_core::Result;
-use lance_core::datatypes::BlobHandling;
+use lance_core::datatypes::{BlobHandling, escape_field_path_for_project};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::ApproxMode;
 use lance_io::stream::RecordBatchStream;
@@ -44,6 +47,12 @@ use crate::helpers;
 use crate::runtime::{RT, block_on};
 use crate::scalar_segment::PreparedScalarSegment;
 use crate::stream_guard::GuardedReader;
+
+const DISTANCE_COLUMN: &str = "_distance";
+/// Prefix for the binding-private column that carries the native distance
+/// through the caller's final projection. Projection expressions may rename or
+/// transform `_distance`, so the result window cannot rank on the output name.
+const MULTIVECTOR_WINDOW_DISTANCE_COLUMN: &str = "_lance_c_multivector_distance";
 
 /// Data type tag for query vectors, mirroring the C enum `LanceDataType`.
 #[repr(i32)]
@@ -144,10 +153,48 @@ pub struct LanceColumnOrdering {
     pub null_order: i32,
 }
 
+/// One scanner projection entry, mirroring the C struct
+/// `LanceProjectionColumn`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LanceProjectionColumn {
+    pub output_name: *const c_char,
+    pub expression: *const c_char,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionExpression {
+    output_name: String,
+    expression: String,
+}
+
+/// A scanner has exactly one projection source: the legacy column list passed
+/// to `lance_scanner_new`, an ordered SQL-expression projection, or no
+/// projection at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProjectionSelection {
+    Columns(Vec<String>),
+    Expressions(Vec<ProjectionExpression>),
+}
+
+impl ProjectionSelection {
+    fn conflicts_with_output(&self, name: &str) -> bool {
+        match self {
+            Self::Columns(columns) => columns
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case(name)),
+            Self::Expressions(columns) => columns
+                .iter()
+                .any(|column| column.output_name.eq_ignore_ascii_case(name)),
+        }
+    }
+}
+
 /// Opaque scanner handle. Stores configuration until stream materialization.
 pub struct LanceScanner {
     dataset: Arc<Dataset>,
-    columns: Option<Vec<String>>,
+    projection: Option<ProjectionSelection>,
+    disable_scoring_autoprojection: bool,
     filter: Option<String>,
     substrait_filter: Option<Vec<u8>>,
     additional_sql_filters: Vec<String>,
@@ -353,7 +400,8 @@ impl LanceScanner {
     fn new(dataset: Arc<Dataset>) -> Self {
         Self {
             dataset,
-            columns: None,
+            projection: None,
+            disable_scoring_autoprojection: false,
             filter: None,
             substrait_filter: None,
             additional_sql_filters: Vec::new(),
@@ -435,6 +483,85 @@ impl LanceScanner {
         Ok(())
     }
 
+    /// Pick an output name for the native distance that cannot collide with a
+    /// stored field, a projected output, or wildcard expansion of the stored
+    /// schema. The name is binding-private and removed after the result window.
+    fn multi_vector_window_distance_column(&self) -> String {
+        let mut name = MULTIVECTOR_WINDOW_DISTANCE_COLUMN.to_string();
+        let mut suffix = 0usize;
+        loop {
+            let stored = self
+                .dataset
+                .schema()
+                .fields
+                .iter()
+                .any(|field| field.name.eq_ignore_ascii_case(&name));
+            let projected = self
+                .projection
+                .as_ref()
+                .is_some_and(|projection| projection.conflicts_with_output(&name));
+            if !stored && !projected {
+                return name;
+            }
+            suffix += 1;
+            name = format!("{MULTIVECTOR_WINDOW_DISTANCE_COLUMN}_{suffix}");
+        }
+    }
+
+    /// Apply the configured projection to the native scanner.
+    ///
+    /// `window_distance_column` is only used by the multi-vector adapter. It
+    /// adds the native distance as an extra output so the final result window
+    /// can rank on it even when the caller's projection renames or transforms
+    /// `_distance`.
+    fn apply_projection(
+        &self,
+        scanner: &mut lance::dataset::scanner::Scanner,
+        window_distance_column: Option<&str>,
+    ) -> Result<()> {
+        match &self.projection {
+            None => {}
+            Some(ProjectionSelection::Columns(columns)) if window_distance_column.is_none() => {
+                scanner.project(columns)?;
+            }
+            Some(ProjectionSelection::Columns(columns)) => {
+                let mut native = columns
+                    .iter()
+                    .map(|column| (column.as_str(), escape_field_path_for_project(column)))
+                    .collect::<Vec<_>>();
+                if let Some(distance_column) = window_distance_column {
+                    native.push((distance_column, DISTANCE_COLUMN.to_string()));
+                }
+                scanner.project_with_transform(&native)?;
+            }
+            Some(ProjectionSelection::Expressions(columns)) => {
+                let mut native = columns
+                    .iter()
+                    .map(|column| (column.output_name.as_str(), column.expression.as_str()))
+                    .collect::<Vec<_>>();
+                if let Some(distance_column) = window_distance_column {
+                    native.push((distance_column, DISTANCE_COLUMN));
+                }
+                scanner.project_with_transform(&native)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate an expression projection through the same native configuration
+    /// method the scan will use. Lance reports malformed expressions, duplicate
+    /// outputs, and schema-dependent expression resolution here; planning-only
+    /// errors remain materialization errors.
+    fn validate_expression_projection(&self, columns: &[ProjectionExpression]) -> Result<()> {
+        let mut scanner = self.dataset.scan();
+        let native = columns
+            .iter()
+            .map(|column| (column.output_name.as_str(), column.expression.as_str()))
+            .collect::<Vec<_>>();
+        scanner.project_with_transform(&native)?;
+        Ok(())
+    }
+
     /// Restrict the scan/search domain to fragment_ids when they are set.
     /// For nearest queries this limits candidates before Top-K regardless of prefilter;
     /// it is not a predicate applied to the ranked results.
@@ -509,18 +636,25 @@ impl LanceScanner {
     fn build_scanner(&self) -> Result<PreparedScanner> {
         self.scan_started.store(true, Ordering::Release);
         let mut scanner = self.dataset.scan();
-        if let Some(cols) = &self.columns {
-            scanner.project(cols)?;
-        }
-        if let Some(handling) = &self.blob_handling {
-            scanner.blob_handling(handling.clone());
-        }
         // Both batch and multi-vector inputs are matrices, but only multi-vector
         // queries may use the custom row-level scoring and global result window.
         let multi_vector = self
             .nearest
             .as_ref()
             .is_some_and(|query| query.mode == NearestMode::MultiVector);
+        // The multi-vector window must rank on the native distance after the
+        // final projection. Projections can rename or transform `_distance`,
+        // so carry a binding-private copy whenever a projection is configured.
+        let private_multi_vector_distance = multi_vector && self.projection.is_some();
+        let window_distance_column =
+            private_multi_vector_distance.then(|| self.multi_vector_window_distance_column());
+        self.apply_projection(&mut scanner, window_distance_column.as_deref())?;
+        if self.disable_scoring_autoprojection && !(multi_vector && self.projection.is_none()) {
+            scanner.disable_scoring_autoprojection();
+        }
+        if let Some(handling) = &self.blob_handling {
+            scanner.blob_handling(handling.clone());
+        }
         if multi_vector
             && self
                 .order_by
@@ -745,10 +879,14 @@ impl LanceScanner {
         Ok(PreparedScanner {
             scanner,
             distributed_fts,
-            multi_vector_window: multi_vector.then_some((
-                self.offset.unwrap_or(0) as usize,
-                self.limit.map(|n| n as usize),
-            )),
+            multi_vector_window: multi_vector.then_some(MultiVectorWindow {
+                offset: self.offset.unwrap_or(0) as usize,
+                limit: self.limit.map(|n| n as usize),
+                distance_column: window_distance_column
+                    .unwrap_or_else(|| DISTANCE_COLUMN.to_string()),
+                drop_distance_column: private_multi_vector_distance
+                    || (self.projection.is_none() && self.disable_scoring_autoprojection),
+            }),
             batch_size: self.batch_size,
             scan_statistics_callback: self.scan_statistics_callback.clone(),
             scalar_segment,
@@ -770,10 +908,20 @@ struct PreparedFtsExecution {
 struct PreparedScanner {
     scanner: lance::dataset::scanner::Scanner,
     distributed_fts: Option<PreparedFtsExecution>,
-    multi_vector_window: Option<(usize, Option<usize>)>,
+    multi_vector_window: Option<MultiVectorWindow>,
     batch_size: Option<usize>,
     scan_statistics_callback: Option<ExecutionStatsCallback>,
     scalar_segment: Option<PreparedScalarSegment>,
+}
+
+struct MultiVectorWindow {
+    offset: usize,
+    limit: Option<usize>,
+    /// Column holding the native distance before any caller projection
+    /// expression is applied.
+    distance_column: String,
+    /// Whether `distance_column` is binding-private and must not be returned.
+    drop_distance_column: bool,
 }
 
 impl PreparedScanner {
@@ -785,9 +933,19 @@ impl PreparedScanner {
                 .try_into_stream()
                 .await;
         }
-        if let Some((offset, limit)) = self.multi_vector_window {
+        if let Some(window) = self.multi_vector_window {
             let plan = crate::multivector::rewrite(self.scanner.create_plan().await?)?;
-            let plan = crate::multivector::apply_result_window(plan, offset, limit)?;
+            let plan = crate::multivector::apply_result_window(
+                plan,
+                window.offset,
+                window.limit,
+                &window.distance_column,
+            )?;
+            let plan = if window.drop_distance_column {
+                drop_column_from_plan(plan, &window.distance_column)?
+            } else {
+                plan
+            };
             let stream = lance_datafusion::exec::execute_plan(
                 plan,
                 lance_datafusion::exec::LanceExecutionOptions {
@@ -849,6 +1007,25 @@ impl PreparedScanner {
         )?;
         Ok(DatasetRecordBatchStream::new(stream))
     }
+}
+
+fn drop_column_from_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    column_name: &str,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    let projection = schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() != column_name)
+        .map(|field| {
+            Ok((
+                expressions::col(field.name(), schema.as_ref())?,
+                field.name().clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(DFProjectionExec::try_new(projection, plan)?))
 }
 
 fn fts_plan_has_only_empty_sources(plan: &dyn ExecutionPlan) -> bool {
@@ -1269,7 +1446,7 @@ unsafe fn scanner_new_inner(
     let filter_str = unsafe { helpers::parse_c_string(filter)? }.map(|s| s.to_string());
 
     let mut scanner = LanceScanner::new(ds.snapshot());
-    scanner.columns = col_names;
+    scanner.projection = col_names.map(ProjectionSelection::Columns);
     scanner.filter = filter_str;
     Ok(Box::into_raw(Box::new(scanner)))
 }
@@ -1755,6 +1932,118 @@ unsafe fn parse_column_ordering(spec: &LanceColumnOrdering) -> Result<ColumnOrde
         nulls_first,
         column_name,
     })
+}
+
+/// Replace the scanner projection with ordered output-name / SQL-expression pairs.
+///
+/// `columns == NULL` with `len == 0` clears the projection, returning to the
+/// native unset projection (all columns). A non-NULL array, including
+/// `len == 0`, is an explicit projection; an empty array therefore selects no
+/// output columns. Entries and both strings are copied before this call
+/// returns. An invalid entry or a projection rejected by Lance leaves the
+/// previous projection unchanged.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_projection(
+    scanner: *mut LanceScanner,
+    columns: *const LanceProjectionColumn,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_projection_inner(scanner, columns, len)
+    })
+}
+
+unsafe fn scanner_set_projection_inner(
+    scanner: *mut LanceScanner,
+    columns: *const LanceProjectionColumn,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("projection")?;
+
+    let parsed = unsafe { parse_projection_columns(columns, len)? };
+    if let Some(columns) = &parsed {
+        scanner.validate_expression_projection(columns)?;
+    }
+    scanner.projection = parsed.map(ProjectionSelection::Expressions);
+    Ok(0)
+}
+
+unsafe fn parse_projection_columns(
+    columns: *const LanceProjectionColumn,
+    len: usize,
+) -> Result<Option<Vec<ProjectionExpression>>> {
+    if columns.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "columns is NULL but len > 0".into(),
+        ));
+    }
+    if columns.is_null() {
+        return Ok(None);
+    }
+    let specs = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(columns, len) }
+    };
+    let mut parsed = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let output_name = unsafe { helpers::parse_c_string(spec.output_name)? }
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    "projection output_name must not be NULL".into(),
+                )
+            })?
+            .to_owned();
+        let expression = unsafe { helpers::parse_c_string(spec.expression)? }
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    "projection expression must not be NULL".into(),
+                )
+            })?
+            .to_owned();
+        parsed.push(ProjectionExpression {
+            output_name,
+            expression,
+        });
+    }
+    Ok(Some(parsed))
+}
+
+/// Disable automatic projection of `_score` / `_distance` for this scanner.
+///
+/// The published default remains unchanged unless this function succeeds:
+/// explicit projections still receive scoring columns automatically. Once
+/// disabled, the setting cannot be re-enabled on the same scanner; create a
+/// new scanner to restore the default. Must be called before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_disable_scoring_autoprojection(
+    scanner: *mut LanceScanner,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_disable_scoring_autoprojection_inner(scanner)
+    })
+}
+
+unsafe fn scanner_disable_scoring_autoprojection_inner(scanner: *mut LanceScanner) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("disable_scoring_autoprojection")?;
+    scanner.disable_scoring_autoprojection = true;
+    Ok(0)
 }
 
 /// Set how blob columns are materialized. `handling` is the C enum
@@ -4791,6 +5080,14 @@ mod tests {
         assert_poison_error_pending();
 
         let rc = unsafe { lance_scanner_set_prefilter(scanner, true) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        let rc = unsafe { lance_scanner_set_projection(scanner, ptr::null(), 0) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        let rc = unsafe { lance_scanner_disable_scoring_autoprojection(scanner) };
         assert_eq!(rc, -1);
         assert_poison_error_pending();
 

@@ -134,10 +134,13 @@ typedef enum {
 } LanceVectorIndexType;
 
 typedef enum {
-    LANCE_SCALAR_BTREE      = 1,
-    LANCE_SCALAR_BITMAP     = 2,
-    LANCE_SCALAR_LABEL_LIST = 3,
-    LANCE_SCALAR_INVERTED   = 4,
+    LANCE_SCALAR_BTREE        = 1,
+    LANCE_SCALAR_BITMAP       = 2,
+    LANCE_SCALAR_LABEL_LIST   = 3,
+    LANCE_SCALAR_INVERTED     = 4,
+    LANCE_SCALAR_NGRAM        = 5,
+    LANCE_SCALAR_ZONE_MAP     = 6,
+    LANCE_SCALAR_BLOOM_FILTER = 7,
 } LanceScalarIndexType;
 
 typedef enum {
@@ -489,6 +492,132 @@ const char* lance_dataset_update_schema_metadata_json(
     LanceMetadataUpdateMode mode
 );
 
+/** Selects a field by numeric ID or by Lance field path. */
+typedef enum {
+    LANCE_FIELD_REFERENCE_ID   = 0,
+    LANCE_FIELD_REFERENCE_PATH = 1,
+} LanceFieldReferenceKind;
+
+/**
+ * A field reference for `lance_dataset_update_field_metadata` and
+ * `lance_dataset_resolve_field_id`.
+ *
+ * For `LANCE_FIELD_REFERENCE_ID`, `field_id` is used and `path` is ignored.
+ * For `LANCE_FIELD_REFERENCE_PATH`, `path` must be a non-NULL, NUL-terminated
+ * UTF-8 Lance field path (for example `profile.name`) and `field_id` is
+ * ignored.
+ */
+typedef struct LanceFieldReference {
+    LanceFieldReferenceKind kind;
+    int32_t field_id;
+    const char* path;
+} LanceFieldReference;
+
+/**
+ * One field's metadata update in a batch.
+ *
+ * `keys` and `values` are parallel arrays of length `count`. A NULL value
+ * removes its key; an empty string remains a real empty value. `mode` is
+ * applied independently to this field. `keys` and `values` may be NULL only
+ * when `count == 0`.
+ */
+typedef struct LanceFieldMetadataUpdate {
+    LanceFieldReference field;
+    const char* const* keys;
+    const char* const* values;
+    size_t count;
+    LanceMetadataUpdateMode mode;
+} LanceFieldMetadataUpdate;
+
+/**
+ * Apply a batch of field metadata updates and commit one native operation.
+ *
+ * Each `updates[i]` is resolved against the dataset's current schema when the
+ * call starts. A batch may mix field references, merge/replace modes and
+ * fields. If the same field is referenced more than once, the native builder's
+ * last update wins.
+ *
+ * The input array, keys, values and paths are borrowed only for this call and
+ * are copied before the native asynchronous operation starts. The native
+ * builder performs the commit and validation. The same dataset handle sees the
+ * new version; existing snapshots, scanners and independent handles keep their
+ * prior view. Read the resulting field metadata through the Arrow schema
+ * returned by `lance_dataset_schema()`.
+ *
+ * Returns 0 on success, -1 on error. Input, field lookup, validation and commit
+ * errors follow the native Lance core.
+ */
+int32_t lance_dataset_update_field_metadata(
+    LanceDataset* dataset,
+    const LanceFieldMetadataUpdate* updates,
+    size_t update_count
+);
+
+/**
+ * Return the current snapshot's canonical Lance data-storage version string
+ * (for example `"2.2"`). The value is the native manifest file-format version.
+ *
+ * Caller must free the returned string with `lance_free_string()`.
+ * Returns NULL on error.
+ */
+const char* lance_dataset_data_storage_version(const LanceDataset* dataset);
+
+/**
+ * Report whether the current snapshot uses stable row IDs.
+ * On success writes `*out_has_stable_row_ids` and returns 0; on error returns
+ * -1 and leaves the output untouched.
+ */
+int32_t lance_dataset_has_stable_row_ids(
+    const LanceDataset* dataset,
+    bool* out_has_stable_row_ids
+);
+
+/**
+ * Return the number of field IDs in the current snapshot's schema. IDs are
+ * available in native pre-order traversal through `lance_dataset_field_id_at`.
+ * On success writes `*out_count` and returns 0; on error returns -1 and leaves
+ * the output untouched.
+ */
+int32_t lance_dataset_field_id_count(
+    const LanceDataset* dataset,
+    size_t* out_count
+);
+
+/**
+ * Return the field ID at `index` in native pre-order traversal. Index 0 is the
+ * first top-level field; nested children follow their parent.
+ * On success writes `*out_field_id` and returns 0; on error returns -1 and
+ * leaves the output untouched.
+ */
+int32_t lance_dataset_field_id_at(
+    const LanceDataset* dataset,
+    size_t index,
+    int32_t* out_field_id
+);
+
+/**
+ * Resolve a field reference by ID or path against the current snapshot.
+ * Native `FieldRef` validation supplies the error for an unknown ID or path.
+ * On success writes `*out_field_id` and returns 0; on error returns -1 and
+ * leaves the output untouched.
+ */
+int32_t lance_dataset_resolve_field_id(
+    const LanceDataset* dataset,
+    const LanceFieldReference* field,
+    int32_t* out_field_id
+);
+
+/**
+ * Return the native minimal Lance field path for `field_id` in the current
+ * schema. The path round-trips through Lance field-path parsing and includes
+ * nested fields. Caller must free the returned string with
+ * `lance_free_string()`. Returns NULL on error, including an unknown ID.
+ */
+const char* lance_dataset_field_path(
+    const LanceDataset* dataset,
+    int32_t field_id
+);
+
 /* ─── Version history ─── */
 
 /**
@@ -644,6 +773,129 @@ void lance_ref_close(LanceRef* reference);
 LanceDataset* lance_dataset_checkout_ref(
     const LanceDataset* dataset,
     const LanceRef* reference
+);
+
+/* ─── Branches ─── */
+
+/**
+ * Create a branch from a native ref.
+ *
+ * `branch_name` must be UTF-8. `reference` must be an existing LanceRef.
+ * Branch-name validation, reference resolution and duplicate detection are
+ * performed by Lance's `Dataset::create_branch`. Reusing an existing branch
+ * name may fail in the native shallow-clone phase instead of reaching the
+ * BranchContents conflict check; that native error is passed through rather
+ * than replaced with a synthesized conflict.
+ *
+ * `storage_opts` is NULL-terminated key-value pairs, or NULL. NULL passes
+ * `None` to native, so the source dataset's store params are used. A non-NULL
+ * array, including an immediately NULL-terminated empty array, passes explicit
+ * object-store params.
+ *
+ * Native creation is a non-atomic shallow clone followed by a BranchContents
+ * write. If creation stops after the clone, a branch dataset without
+ * BranchContents may remain. Retrying the same name may then fail; use
+ * lance_dataset_branch_force_delete() to remove that zombie dataset.
+ *
+ * The returned dataset owns an independent snapshot and remains usable after
+ * the source dataset or reference is closed.
+ * @return new dataset handle, or NULL on error
+ */
+LanceDataset* lance_dataset_branch_create(
+    const LanceDataset* dataset,
+    const char* branch_name,
+    const LanceRef* reference,
+    const char* const* storage_opts
+);
+
+/**
+ * Check out the latest version of a branch as an independent dataset.
+ *
+ * "main" selects the default branch. The returned handle remains usable after
+ * the source dataset is closed.
+ * @return new dataset handle, or NULL on error
+ */
+LanceDataset* lance_dataset_checkout_branch(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Serialize all branches as a JSON object keyed by branch name.
+ *
+ * The value is Lance's native `HashMap<String, BranchContents>` serde output.
+ * Each value has the selected core's BranchContents shape, including
+ * `parentBranch`, `identifier.version_mapping`, `parentVersion`, `createAt`
+ * (Unix seconds), `manifestSize` and `metadata`. Map enumeration order is not
+ * promised. The caller owns the string and frees it with
+ * lance_free_string().
+ * @return JSON string, or NULL on error
+ */
+const char* lance_dataset_branches_json(const LanceDataset* dataset);
+
+/**
+ * Serialize one native BranchContents as JSON.
+ *
+ * The object follows the selected core's BranchContents serde shape. The
+ * caller owns the string and frees it with lance_free_string().
+ * @return JSON string, or NULL on error (including LANCE_ERR_NOT_FOUND)
+ */
+const char* lance_dataset_branch_get_json(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Serialize the current dataset's native BranchIdentifier as JSON.
+ *
+ * The object follows the selected core's BranchIdentifier serde shape:
+ * `{"version_mapping":[[version,uuid],...]}`. For the main branch this is
+ * empty. The caller owns the string and frees it with lance_free_string().
+ * @return JSON string, or NULL on error
+ */
+const char* lance_dataset_branch_identifier_json(const LanceDataset* dataset);
+
+/**
+ * Delete a branch.
+ *
+ * Native checks reject a branch referenced by a child branch or by any tag
+ * with LANCE_ERR_COMMIT_CONFLICT. A missing BranchContents produces
+ * LANCE_ERR_NOT_FOUND. The branch dataset directories are cleaned up by the
+ * native implementation.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_branch_delete(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Delete a branch, bypassing only a missing BranchContents.
+ *
+ * This is the native recovery path for a branch dataset left without
+ * BranchContents by the non-atomic creation sequence. Child-branch and tag
+ * reference checks still apply and surface as LANCE_ERR_COMMIT_CONFLICT.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_branch_force_delete(
+    const LanceDataset* dataset,
+    const char* branch_name
+);
+
+/**
+ * Replace all metadata entries on an existing branch.
+ *
+ * `metadata` is NULL-terminated key-value pairs ["key","value",NULL]. NULL or
+ * an empty array means an empty native map. This is a full replacement of
+ * BranchContents.metadata, not a merge or a special NULL-delete operation.
+ * Other branch fields are preserved. An unknown branch surfaces as
+ * LANCE_ERR_NOT_FOUND.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_branch_replace_metadata(
+    const LanceDataset* dataset,
+    const char* branch_name,
+    const char* const* metadata
 );
 
 /* ─── Tags ─── */
@@ -1942,6 +2194,70 @@ typedef struct LanceColumnOrdering {
 } LanceColumnOrdering;
 
 /**
+ * One ordered scanner projection entry.
+ *
+ * `output_name` is the output field name and may be an alias. `expression` is
+ * a Lance SQL expression evaluated against the dataset schema. Both strings
+ * are copied during `lance_scanner_set_projection()`.
+ */
+typedef struct LanceProjectionColumn {
+    const char* output_name;
+    const char* expression;
+} LanceProjectionColumn;
+
+/**
+ * Replace the scanner projection with ordered output-name / SQL-expression
+ * pairs, mirroring Lance `Scanner::project_with_transform()`.
+ *
+ * Each output name may be an alias. Each expression may reference stored
+ * columns, metadata columns, nested field paths, and query-generated scoring
+ * columns according to the selected Lance version. Output order follows the
+ * input array. Lance parses and validates expressions, duplicate output names,
+ * and schema-dependent expression resolution during this call. Planning-only
+ * errors, such as an unsupported projection with no physical output column, are
+ * reported when the scan starts.
+ *
+ * Passing `columns == NULL` with `len == 0` clears the projection and restores
+ * the native unset projection, which selects all dataset columns. Passing a
+ * non-NULL pointer with `len == 0` sets an explicit empty projection. A NULL
+ * pointer with `len > 0` is invalid.
+ *
+ * The array and every string are copied before this call returns. A NULL
+ * output name or expression, non-UTF-8 input, or a projection rejected by
+ * Lance leaves the previous projection unchanged. This does not alter the
+ * column-list projection accepted by `lance_scanner_new()`; that path keeps
+ * Lance's escaped field-path behavior.
+ *
+ * Must be called before the scan starts.
+ *
+ * @param scanner  Scanner handle. Must not be NULL.
+ * @param columns  Projection entries, or NULL to clear.
+ * @param len      Number of projection entries.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_set_projection(
+    LanceScanner* scanner,
+    const LanceProjectionColumn* columns,
+    size_t len
+);
+
+/**
+ * Disable automatic `_score` / `_distance` projection for this scanner.
+ *
+ * With the published default, an explicit projection still receives `_score`
+ * for full-text search or `_distance` for vector search. After this call
+ * succeeds, those columns are included only when explicitly requested by the
+ * projection, matching Lance `Scanner::disable_scoring_autoprojection()`.
+ *
+ * The change is one-way for the lifetime of the scanner. Must be called before
+ * the scan starts.
+ *
+ * @param scanner  Scanner handle. Must not be NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_scanner_disable_scoring_autoprojection(LanceScanner* scanner);
+
+/**
  * Replace the scanner's native result ordering.
  *
  * Entries are applied in array order, matching Lance's ColumnOrdering list.
@@ -2487,7 +2803,11 @@ int32_t lance_dataset_create_vector_index(
 
 /**
  * Create a scalar index on a column.
- * @param params_json Optional JSON params string (e.g. inverted tokenizer config), or NULL.
+ * @param params_json Optional JSON params forwarded unchanged to the native
+ *                    Lance scalar-index plugin, or NULL for plugin defaults.
+ *                    Plugin field names and validation apply; for example
+ *                    ZoneMap uses `rows_per_zone`/`use_seeds` and BloomFilter
+ *                    uses `number_of_items`/`probability`.
  * @return 0 on success, -1 on error.
  */
 int32_t lance_dataset_create_scalar_index(

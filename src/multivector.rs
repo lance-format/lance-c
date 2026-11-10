@@ -70,10 +70,13 @@ pub(crate) fn rewrite(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionP
 }
 
 /// Apply the final distance-ordered window without invalidating output batching.
+/// `distance_column` carries the native distance even when the caller's
+/// projection renames or transforms the visible `_distance` column.
 pub(crate) fn apply_result_window(
     plan: Arc<dyn ExecutionPlan>,
     offset: usize,
     limit: Option<usize>,
+    distance_column: &str,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     use datafusion::physical_expr::{PhysicalSortExpr, expressions};
     use datafusion::physical_plan::{
@@ -85,11 +88,12 @@ pub(crate) fn apply_result_window(
     {
         // Offset can split a previously strict batch. Keep Lance's final rechunker
         // outside the window, preserving its resolved batch size, including defaults.
-        let input = apply_result_window(plan.children()[0].clone(), offset, limit)?;
+        let input =
+            apply_result_window(plan.children()[0].clone(), offset, limit, distance_column)?;
         return plan.with_new_children(vec![input]);
     }
     let sort = PhysicalSortExpr {
-        expr: expressions::col("_distance", plan.schema().as_ref())?,
+        expr: expressions::col(distance_column, plan.schema().as_ref())?,
         options: arrow::compute::SortOptions {
             descending: false,
             nulls_first: false,
@@ -471,7 +475,7 @@ mod tests {
                         RecordBatchStreamAdapter::new(schema, stream::iter(batches)),
                     )));
                     let plan = Arc::new(StrictBatchSizeExec::new(input, size));
-                    let plan = apply_result_window(plan, offset, limit).unwrap();
+                    let plan = apply_result_window(plan, offset, limit, "_distance").unwrap();
                     let batches: Vec<_> = execute_plan(
                         plan,
                         LanceExecutionOptions {

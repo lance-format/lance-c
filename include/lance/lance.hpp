@@ -189,6 +189,48 @@ enum class MetadataUpdateMode : int32_t {
     Replace = LANCE_METADATA_UPDATE_REPLACE,
 };
 
+enum class FieldReferenceKind : int32_t {
+    Id   = LANCE_FIELD_REFERENCE_ID,
+    Path = LANCE_FIELD_REFERENCE_PATH,
+};
+
+/// Owned field reference for field metadata updates and field-ID resolution.
+/// The wrapper keeps the path string alive for the duration of C calls.
+class FieldReference {
+    FieldReferenceKind kind_;
+    int32_t field_id_ = 0;
+    std::string path_;
+
+    FieldReference(FieldReferenceKind kind, int32_t field_id, std::string path)
+        : kind_(kind), field_id_(field_id), path_(std::move(path)) {}
+
+public:
+    static FieldReference by_id(int32_t field_id) {
+        return FieldReference(FieldReferenceKind::Id, field_id, {});
+    }
+
+    static FieldReference by_path(std::string path) {
+        return FieldReference(FieldReferenceKind::Path, 0, std::move(path));
+    }
+
+    LanceFieldReference c_handle() const {
+        return LanceFieldReference{
+            static_cast<LanceFieldReferenceKind>(kind_),
+            field_id_,
+            kind_ == FieldReferenceKind::Path ? path_.c_str() : nullptr,
+        };
+    }
+};
+
+/// One field's metadata update in a batch. A `std::nullopt` value removes its
+/// key; an empty string stores a real empty value. The mode applies only to
+/// this field.
+struct FieldMetadataUpdate {
+    FieldReference field;
+    std::vector<std::pair<std::string, std::optional<std::string>>> values;
+    MetadataUpdateMode mode = MetadataUpdateMode::Merge;
+};
+
 enum class FtsCoverageMode : int32_t {
     Strict    = LANCE_FTS_COVERAGE_STRICT,
     IndexOnly = LANCE_FTS_COVERAGE_INDEX_ONLY,
@@ -932,6 +974,40 @@ class Dataset {
         return out;
     }
 
+    static void run_field_metadata_update(
+        LanceDataset* dataset,
+        const std::vector<FieldMetadataUpdate>& updates) {
+
+        std::vector<std::vector<const char*>> keys(updates.size());
+        std::vector<std::vector<const char*>> values(updates.size());
+        std::vector<LanceFieldMetadataUpdate> raw;
+        raw.reserve(updates.size());
+
+        for (size_t i = 0; i < updates.size(); ++i) {
+            keys[i].reserve(updates[i].values.size());
+            values[i].reserve(updates[i].values.size());
+            for (const auto& [key, value] : updates[i].values) {
+                keys[i].push_back(key.c_str());
+                values[i].push_back(value ? value->c_str() : nullptr);
+            }
+            raw.push_back(LanceFieldMetadataUpdate{
+                updates[i].field.c_handle(),
+                keys[i].data(),
+                values[i].data(),
+                updates[i].values.size(),
+                static_cast<LanceMetadataUpdateMode>(updates[i].mode),
+            });
+        }
+
+        if (lance_dataset_update_field_metadata(
+                dataset,
+                updates.empty() ? nullptr : raw.data(),
+                updates.size()) != 0) {
+            check_error();
+        }
+    }
+
+
     /// Shared write path. `native_options` selects the native-defaults entry
     /// point; otherwise `legacy_params` selects the legacy 20/14 entry point.
     static Dataset write_impl(
@@ -1231,6 +1307,75 @@ public:
             handle_.get(), values, mode, /*schema_metadata=*/true);
     }
 
+    /// Apply a batch of per-field metadata updates in one native commit.
+    /// Duplicate references to the same resolved field follow native
+    /// last-write-wins behavior. Read the committed field metadata through
+    /// `schema()`. Throws lance::Error on failure.
+    void update_field_metadata(const std::vector<FieldMetadataUpdate>& updates) {
+        run_field_metadata_update(handle_.get(), updates);
+    }
+
+    /// Current snapshot's canonical native Lance data-storage version string.
+    /// Throws lance::Error on failure.
+    std::string data_storage_version() const {
+        const char* version =
+            lance_dataset_data_storage_version(handle_.get());
+        if (!version) check_error();
+        std::string out(version);
+        lance_free_string(version);
+        return out;
+    }
+
+    /// Whether the current snapshot uses stable row IDs.
+    /// Throws lance::Error on failure.
+    bool has_stable_row_ids() const {
+        bool stable = false;
+        if (lance_dataset_has_stable_row_ids(handle_.get(), &stable) != 0) {
+            check_error();
+        }
+        return stable;
+    }
+
+    /// Field IDs in the current schema's native pre-order traversal.
+    /// Throws lance::Error on failure.
+    std::vector<int32_t> field_ids() const {
+        size_t count = 0;
+        if (lance_dataset_field_id_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::vector<int32_t> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            int32_t field_id = 0;
+            if (lance_dataset_field_id_at(handle_.get(), i, &field_id) != 0) {
+                check_error();
+            }
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Resolve a field reference against the current snapshot's schema.
+    /// Throws lance::Error on an unknown ID or path.
+    int32_t resolve_field_id(const FieldReference& field) const {
+        int32_t field_id = 0;
+        LanceFieldReference raw = field.c_handle();
+        if (lance_dataset_resolve_field_id(handle_.get(), &raw, &field_id) != 0) {
+            check_error();
+        }
+        return field_id;
+    }
+
+    /// Native minimal Lance field path for `field_id`, including nested fields.
+    /// Throws lance::Error on failure.
+    std::string field_path(int32_t field_id) const {
+        const char* path = lance_dataset_field_path(handle_.get(), field_id);
+        if (!path) check_error();
+        std::string out(path);
+        lance_free_string(path);
+        return out;
+    }
+
     /// Snapshot the dataset's version history, ordered by version id.
     /// Throws lance::Error on failure.
     std::vector<VersionInfo> versions() const {
@@ -1360,6 +1505,99 @@ public:
             handle_.get(), reference.c_handle());
         if (!out) check_error();
         return Dataset(out);
+    }
+
+    /// Create a native branch from `reference`.
+    ///
+    /// `storage_opts == std::nullopt` uses the source dataset's native store
+    /// params. An explicitly empty vector passes explicit empty object-store
+    /// params. Native branch creation is a non-atomic shallow clone followed by
+    /// a BranchContents write; see the C API documentation for zombie recovery.
+    Dataset create_branch(
+        const std::string& branch_name,
+        const Ref& reference,
+        std::optional<std::vector<std::pair<std::string, std::string>>> storage_opts =
+            std::nullopt) const {
+        std::vector<const char*> kv;
+        const char* const* storage_opts_ptr = nullptr;
+        if (storage_opts.has_value()) {
+            kv = to_c_key_values(*storage_opts);
+            storage_opts_ptr = kv.data();
+        }
+        auto* out = lance_dataset_branch_create(
+            handle_.get(),
+            branch_name.c_str(),
+            reference.c_handle(),
+            storage_opts_ptr);
+        if (!out) check_error();
+        return Dataset(out);
+    }
+
+    /// Check out the latest version of a branch as an independent dataset.
+    /// Pass "main" for the default branch.
+    Dataset checkout_branch(const std::string& branch_name) const {
+        auto* out =
+            lance_dataset_checkout_branch(handle_.get(), branch_name.c_str());
+        if (!out) check_error();
+        return Dataset(out);
+    }
+
+    /// JSON object keyed by branch name. Values are native BranchContents
+    /// serde objects; map order is unspecified.
+    std::string branches_json() const {
+        const char* json = lance_dataset_branches_json(handle_.get());
+        if (!json) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            json, lance_free_string);
+        return std::string(json);
+    }
+
+    /// JSON object for one native BranchContents value.
+    std::string get_branch_json(const std::string& branch_name) const {
+        const char* json =
+            lance_dataset_branch_get_json(handle_.get(), branch_name.c_str());
+        if (!json) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            json, lance_free_string);
+        return std::string(json);
+    }
+
+    /// JSON object for this dataset snapshot's native BranchIdentifier.
+    std::string branch_identifier_json() const {
+        const char* json =
+            lance_dataset_branch_identifier_json(handle_.get());
+        if (!json) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            json, lance_free_string);
+        return std::string(json);
+    }
+
+    /// Delete a branch. Child-branch and tag references surface as
+    /// LANCE_ERR_COMMIT_CONFLICT.
+    void delete_branch(const std::string& branch_name) const {
+        if (lance_dataset_branch_delete(
+                handle_.get(), branch_name.c_str()) != 0)
+            check_error();
+    }
+
+    /// Delete a branch while bypassing only a missing BranchContents. Native
+    /// child-branch and tag reference checks still apply.
+    void force_delete_branch(const std::string& branch_name) const {
+        if (lance_dataset_branch_force_delete(
+                handle_.get(), branch_name.c_str()) != 0)
+            check_error();
+    }
+
+    /// Replace all metadata entries on a branch. An empty vector writes an
+    /// empty map; this is not a merge or NULL-delete operation.
+    void replace_branch_metadata(
+        const std::string& branch_name,
+        const std::vector<std::pair<std::string, std::string>>& metadata) const {
+        auto kv = to_c_key_values(metadata);
+        const char* const* metadata_ptr = metadata.empty() ? nullptr : kv.data();
+        if (lance_dataset_branch_replace_metadata(
+                handle_.get(), branch_name.c_str(), metadata_ptr) != 0)
+            check_error();
     }
 
     /// Snapshot all tags. Entry order is unspecified.
@@ -2320,6 +2558,12 @@ struct ColumnOrdering {
     LanceNullOrder null_order = LANCE_ORDER_NULLS_LAST;
 };
 
+/// One ordered scanner projection entry. `output_name` may be an alias.
+struct ProjectionColumn {
+    std::string output_name;
+    std::string expression;
+};
+
 class Scanner {
     Handle<LanceScanner, lance_scanner_close> handle_;
 
@@ -2409,6 +2653,40 @@ public:
     /// Configure whether file statistics may optimize the scan.
     Scanner& use_stats(bool use_stats = true) {
         if (lance_scanner_set_use_stats(handle_.get(), use_stats) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Clear the projection and scan all dataset columns (native unset).
+    Scanner& project(std::nullopt_t) {
+        if (lance_scanner_set_projection(handle_.get(), nullptr, 0) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Replace the projection with ordered output-name / SQL-expression pairs.
+    /// An empty vector is an explicit empty projection; use std::nullopt to
+    /// restore the unset projection. Strings are copied during this call.
+    Scanner& project(const std::vector<ProjectionColumn>& columns) {
+        std::vector<LanceProjectionColumn> native;
+        native.reserve(columns.size());
+        for (const auto& column : columns) {
+            native.push_back({
+                column.output_name.c_str(),
+                column.expression.c_str(),
+            });
+        }
+        LanceProjectionColumn explicit_empty = {};
+        const LanceProjectionColumn* data =
+            native.empty() ? &explicit_empty : native.data();
+        if (lance_scanner_set_projection(handle_.get(), data, native.size()) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Stop adding `_score` / `_distance` to explicit search projections.
+    Scanner& disable_scoring_autoprojection() {
+        if (lance_scanner_disable_scoring_autoprojection(handle_.get()) != 0)
             check_error();
         return *this;
     }
