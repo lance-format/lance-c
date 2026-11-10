@@ -243,6 +243,96 @@ unsafe fn dataset_count_rows_inner(dataset: *const LanceDataset) -> Result<u64> 
     Ok(block_on(ds.snapshot().count_rows(None))? as u64)
 }
 
+/// Validate the dataset's fragments, stable row IDs and indices.
+///
+/// This calls the native `Dataset::validate` over the handle's current
+/// snapshot. Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_validate(dataset: *const LanceDataset) -> i32 {
+    ffi_try!(unsafe { dataset_validate_inner(dataset) }, neg)
+}
+
+unsafe fn dataset_validate_inner(dataset: *const LanceDataset) -> Result<i32> {
+    if dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
+    }
+    let ds = unsafe { &*dataset };
+    block_on(ds.snapshot().validate())?;
+    Ok(0)
+}
+
+/// Count rows hidden by deletion files across all fragments.
+///
+/// The output is written only on success. Uses the native
+/// `Dataset::count_deleted_rows` result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_count_deleted_rows(
+    dataset: *const LanceDataset,
+    out_rows: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { dataset_count_deleted_rows_inner(dataset, out_rows) },
+        neg
+    )
+}
+
+unsafe fn dataset_count_deleted_rows_inner(
+    dataset: *const LanceDataset,
+    out_rows: *mut u64,
+) -> Result<i32> {
+    if dataset.is_null() || out_rows.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset and out_rows must not be NULL".into(),
+        ));
+    }
+    let ds = unsafe { &*dataset };
+    let rows = block_on(ds.snapshot().count_deleted_rows())? as u64;
+    // SAFETY: both pointers are non-NULL and caller-owned. The output is
+    // written only after the native count succeeds.
+    unsafe {
+        std::ptr::write_unaligned(out_rows, rows);
+    }
+    Ok(0)
+}
+
+/// Count fragments with fewer physical rows than `max_rows_per_group`.
+///
+/// This is the infallible native `Dataset::num_small_files` contract:
+/// `max_rows_per_group == 0` therefore returns 0. The output is written only
+/// when `dataset` and `out_count` are non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_num_small_files(
+    dataset: *const LanceDataset,
+    max_rows_per_group: usize,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { dataset_num_small_files_inner(dataset, max_rows_per_group, out_count) },
+        neg
+    )
+}
+
+unsafe fn dataset_num_small_files_inner(
+    dataset: *const LanceDataset,
+    max_rows_per_group: usize,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if dataset.is_null() || out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset and out_count must not be NULL".into(),
+        ));
+    }
+    let ds = unsafe { &*dataset };
+    let count = block_on(ds.snapshot().num_small_files(max_rows_per_group)) as u64;
+    // SAFETY: both pointers are non-NULL and caller-owned.
+    unsafe {
+        std::ptr::write_unaligned(out_count, count);
+    }
+    Ok(0)
+}
+
 /// Return the latest version ID of the dataset.
 /// Returns 0 on error — check `lance_last_error_code()`.
 #[unsafe(no_mangle)]

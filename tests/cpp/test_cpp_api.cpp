@@ -8,7 +8,7 @@
  * Tests the RAII wrappers, exception handling, and builder pattern.
  *
  * Usage: test_cpp_api <dataset_uri> <write_uri> <blob_uri> <ordering_uri>
- *                     <fragment_uri>
+ *                     <session_uri> <fragment_uri> <cleanup_uri>
  */
 
 #include "lance/lance.hpp"
@@ -1609,6 +1609,159 @@ static void test_data_statistics(const std::string& dst_uri) {
     PASS();
 }
 
+static void test_cleanup_and_lifecycle(const std::string& uri) {
+    TEST(test_cleanup_and_lifecycle);
+
+    std::optional<lance::CleanupExplanation> owned;
+    {
+        auto ds = lance::Dataset::open(uri);
+        assert(ds.version() == 5);
+        ds.validate();
+        assert(ds.count_deleted_rows() == 1);
+        assert(ds.num_small_files(0) == 0);
+        assert(ds.num_small_files(5) == 4);
+        assert(ds.num_small_files(4) == 0);
+
+        lance::CleanupPolicy policy;
+        policy.before_version = 5;
+        policy.versions = std::vector<uint64_t>{2, 3};
+        lance::CleanupOperationOptions operation;
+        operation.max_candidate_files = 1;
+        owned.emplace(ds.explain_cleanup(policy, operation));
+    }
+
+    // The explanation is a fully copied value and remains usable after the
+    // dataset wrapper is destroyed.
+    assert(owned->read_version == 5);
+    assert(owned->stats.old_versions == 2);
+    assert(owned->candidate_files.size() == 1);
+    assert(owned->candidate_files_truncated);
+    assert(owned->candidate_file_limit == 1);
+    assert(owned->warnings.size() == 1);
+    assert(owned->warnings[0].find("truncated to 1 entries") !=
+           std::string::npos);
+    assert(!owned->candidate_files[0].path.empty());
+    assert(owned->candidate_files[0].size_bytes > 0);
+    const int32_t kind =
+        static_cast<int32_t>(owned->candidate_files[0].kind);
+    assert(kind >= LANCE_CLEANUP_FILE_MANIFEST);
+    assert(kind <= LANCE_CLEANUP_FILE_TEMPORARY_MANIFEST);
+
+    // Explain did not delete the selected version.
+    assert(lance::Dataset::open(uri, {}, 1).version() == 1);
+
+    {
+        auto ds = lance::Dataset::open(uri);
+        lance::CleanupPolicy policy;
+        policy.retain_versions = 3;
+        lance::CleanupOperationOptions operation;
+        operation.max_candidate_files = 0;
+        auto zero = ds.explain_cleanup(policy, operation);
+        assert(zero.stats.old_versions == 2);
+        assert(zero.candidate_files.empty());
+        assert(zero.candidate_files_truncated);
+        assert(zero.candidate_file_limit == 0);
+    }
+
+    {
+        auto ds = lance::Dataset::open(uri);
+        bool caught = false;
+        try {
+            lance::CleanupPolicy policy;
+            policy.retain_versions = 0;
+            lance::CleanupOperationOptions operation;
+            operation.max_candidate_files = 100;
+            (void)ds.explain_cleanup(policy, operation);
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        }
+        assert(caught);
+
+        caught = false;
+        try {
+            lance::CleanupPolicy policy;
+            policy.versions = std::vector<uint64_t>{};
+            (void)ds.explain_cleanup(policy);
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::string(error.what()).find(
+                       "versions must not be empty when specified") !=
+                   std::string::npos);
+        }
+        assert(caught);
+
+        caught = false;
+        try {
+            lance::CleanupPolicy policy;
+            policy.versions = std::vector<uint64_t>{2};
+            lance::CleanupOperationOptions operation;
+            operation.delete_concurrency = 0;
+            (void)ds.cleanup(policy, operation);
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::string(error.what()).find(
+                       "delete_concurrency must be between 1") !=
+                   std::string::npos);
+        }
+        assert(caught);
+        assert(lance::Dataset::open(uri, {}, 2).version() == 2);
+    }
+
+    {
+        auto ds = lance::Dataset::open(uri);
+        lance::CleanupPolicy policy;
+        policy.versions = std::vector<uint64_t>{2};
+        lance::CleanupOperationOptions operation;
+        operation.delete_concurrency = 2;
+        operation.delete_rate_limit = 1000000;
+        auto stats = ds.cleanup(policy, operation);
+        assert(stats.old_versions == 1);
+        assert(stats.failed_deletes == 0);
+    }
+
+    bool caught = false;
+    try {
+        (void)lance::Dataset::open(uri, {}, 2);
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_NOT_FOUND);
+    }
+    assert(caught);
+
+    {
+        auto ds = lance::Dataset::open(uri);
+        lance::CleanupOldVersionsOptions relative;
+        auto stats = ds.cleanup_old_versions(relative);
+        assert(stats.old_versions == 3);
+
+        caught = false;
+        try {
+            lance::CleanupOldVersionsOptions invalid;
+            invalid.older_than_nanos = 1000000000;
+            (void)ds.cleanup_old_versions(invalid);
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        }
+        assert(caught);
+    }
+
+    caught = false;
+    try {
+        (void)lance::Dataset::open(uri, {}, 1);
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_NOT_FOUND);
+    }
+    assert(caught);
+    assert(lance::Dataset::open(uri).version() == 5);
+
+    PASS();
+}
+
 // Exercises table/schema metadata through the C++17 wrappers, including
 // removal, real empty values, replace/clear, snapshot isolation and reopen.
 static void test_dataset_metadata(const std::string& dst_uri) {
@@ -2771,10 +2924,10 @@ static void test_fragment_snapshots(const std::string& uri) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 7) {
+    if (argc < 8) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
-                "<session_uri> <fragment_uri>\n",
+                "<session_uri> <fragment_uri> <cleanup_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -2785,6 +2938,7 @@ int main(int argc, char** argv) {
     std::string ordering_uri(argv[4]);
     std::string session_uri(argv[5]);
     std::string fragment_uri(argv[6]);
+    std::string cleanup_uri(argv[7]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -2824,6 +2978,7 @@ int main(int argc, char** argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
+    test_cleanup_and_lifecycle(cleanup_uri);
     test_dataset_metadata(write_uri);
     test_dataset_field_metadata(fragment_uri);
     test_update(write_uri);
