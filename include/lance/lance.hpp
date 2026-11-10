@@ -182,6 +182,11 @@ enum class WriteMode : int32_t {
     Overwrite = LANCE_WRITE_OVERWRITE,
 };
 
+enum class MetadataUpdateMode : int32_t {
+    Merge   = LANCE_METADATA_UPDATE_MERGE,
+    Replace = LANCE_METADATA_UPDATE_REPLACE,
+};
+
 enum class FtsCoverageMode : int32_t {
     Strict    = LANCE_FTS_COVERAGE_STRICT,
     IndexOnly = LANCE_FTS_COVERAGE_INDEX_ONLY,
@@ -757,6 +762,34 @@ class Dataset {
         }
     }
 
+    static std::string run_metadata_update_json(
+        LanceDataset* dataset,
+        const std::vector<std::pair<std::string, std::optional<std::string>>>& values,
+        MetadataUpdateMode mode,
+        bool schema_metadata) {
+
+        std::vector<const char*> keys;
+        std::vector<const char*> raw_values;
+        keys.reserve(values.size());
+        raw_values.reserve(values.size());
+        for (const auto& [key, value] : values) {
+            keys.push_back(key.c_str());
+            raw_values.push_back(value ? value->c_str() : nullptr);
+        }
+
+        const char* json = schema_metadata
+            ? lance_dataset_update_schema_metadata_json(
+                  dataset, keys.data(), raw_values.data(), values.size(),
+                  static_cast<LanceMetadataUpdateMode>(mode))
+            : lance_dataset_update_metadata_json(
+                  dataset, keys.data(), raw_values.data(), values.size(),
+                  static_cast<LanceMetadataUpdateMode>(mode));
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
+    }
+
     /// Shared write path. `native_options` selects the native-defaults entry
     /// point; otherwise `legacy_params` selects the legacy 20/14 entry point.
     static Dataset write_impl(
@@ -1020,6 +1053,40 @@ public:
         uint64_t v = lance_dataset_latest_version(handle_.get());
         if (lance_last_error_code() != LANCE_OK) check_error();
         return v;
+    }
+
+    /// Table metadata for this snapshot as a JSON object.
+    /// Schema metadata is available through `schema()` instead.
+    /// Throws lance::Error on failure.
+    std::string metadata_json() const {
+        const char* json = lance_dataset_metadata_json(handle_.get());
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
+    }
+
+    /// Merge or replace table metadata and return the complete updated map as
+    /// a JSON object. A `std::nullopt` value removes its key; an empty string
+    /// stores a real empty value. `MetadataUpdateMode::Replace` with an empty
+    /// vector clears the map. Mutates this dataset in place; existing
+    /// snapshots keep their prior view. Throws lance::Error on failure.
+    std::string update_metadata_json(
+        const std::vector<std::pair<std::string, std::optional<std::string>>>& values,
+        MetadataUpdateMode mode = MetadataUpdateMode::Merge) {
+        return run_metadata_update_json(
+            handle_.get(), values, mode, /*schema_metadata=*/false);
+    }
+
+    /// Merge or replace schema metadata and return the complete updated map as
+    /// a JSON object. Input semantics match `update_metadata_json`. Read the
+    /// committed schema metadata through `schema()`. Throws lance::Error on
+    /// failure.
+    std::string update_schema_metadata_json(
+        const std::vector<std::pair<std::string, std::optional<std::string>>>& values,
+        MetadataUpdateMode mode = MetadataUpdateMode::Merge) {
+        return run_metadata_update_json(
+            handle_.get(), values, mode, /*schema_metadata=*/true);
     }
 
     /// Snapshot the dataset's version history, ordered by version id.

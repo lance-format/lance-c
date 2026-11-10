@@ -1246,6 +1246,70 @@ static void test_data_statistics(const std::string& dst_uri) {
     PASS();
 }
 
+// Exercises table/schema metadata through the C++17 wrappers, including
+// removal, real empty values, replace/clear, snapshot isolation and reopen.
+static void test_dataset_metadata(const std::string& dst_uri) {
+    TEST(test_dataset_metadata);
+    using MetadataUpdates =
+        std::vector<std::pair<std::string, std::optional<std::string>>>;
+
+    auto old = lance::Dataset::open(dst_uri);
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t initial_version = ds.version();
+    assert(ds.metadata_json() == "{}");
+
+    auto updated = ds.update_metadata_json(MetadataUpdates{
+        {"empty", std::string("")},
+        {"escaped", std::string("line\n\"quoted\"\\path")},
+        {"owner", std::string("c++")},
+        {"remove", std::string("temporary")},
+    });
+    assert(updated.find("\"empty\":\"\"") != std::string::npos);
+    assert(updated.find("\"owner\":\"c++\"") != std::string::npos);
+    assert(updated.find("\\n") != std::string::npos);
+    assert(updated.find("\\\"quoted\\\"") != std::string::npos);
+    assert(old.version() == initial_version);
+    assert(old.metadata_json() == "{}");
+
+    auto removed = ds.update_metadata_json(
+        MetadataUpdates{{"remove", std::nullopt}});
+    assert(removed.find("\"remove\"") == std::string::npos);
+
+    auto schema_updated = ds.update_schema_metadata_json(
+        MetadataUpdates{{"schema-owner", std::string("c++")}});
+    assert(schema_updated.find("\"schema-owner\":\"c++\"") !=
+           std::string::npos);
+    assert(ds.metadata_json().find("schema-owner") == std::string::npos);
+
+    auto cleared = ds.update_metadata_json(
+        MetadataUpdates{}, lance::MetadataUpdateMode::Replace);
+    assert(cleared == "{}");
+    ds.update_metadata_json(
+        MetadataUpdates{{"persist", std::string("yes")}});
+    auto schema_cleared = ds.update_schema_metadata_json(
+        MetadataUpdates{}, lance::MetadataUpdateMode::Replace);
+    assert(schema_cleared == "{}");
+
+    auto reopened = lance::Dataset::open(dst_uri);
+    assert(reopened.version() > initial_version);
+    assert(reopened.metadata_json().find("\"persist\":\"yes\"") !=
+           std::string::npos);
+
+    bool caught = false;
+    try {
+        ds.update_metadata_json(
+            MetadataUpdates{{"bad", std::string("value")}},
+            static_cast<lance::MetadataUpdateMode>(99));
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+    assert(ds.metadata_json().find("\"bad\"") == std::string::npos);
+
+    PASS();
+}
+
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::update`. Must run before `test_delete_rows`, which
 // empties the dataset.
@@ -2102,6 +2166,7 @@ int main(int argc, char** argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
+    test_dataset_metadata(write_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);
