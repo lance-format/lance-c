@@ -2223,13 +2223,17 @@ static void test_fragment_read_operations(const std::string& uri) {
 
     std::vector<std::string> empty_columns;
     std::vector<uint32_t> one_index{0};
+    caught = false;
     memset(&stream, 0, sizeof(stream));
-    fragment.take(one_index.data(), one_index.size(), empty_columns, &stream);
-    ArrowSchema empty_schema{};
-    assert(stream.get_schema(&stream, &empty_schema) == 0);
-    assert(empty_schema.n_children == 0);
-    empty_schema.release(&empty_schema);
-    stream.release(&stream);
+    try {
+        fragment.take(one_index.data(), one_index.size(), empty_columns, &stream);
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_NOT_FOUND);
+        assert(std::string(error.what()).find("No data files") !=
+               std::string::npos);
+    }
+    assert(caught);
 
     {
         auto scanner = fragment.scan();

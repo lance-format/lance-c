@@ -13,7 +13,7 @@ use std::ptr;
 
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
-use arrow_array::{RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment;
 use lance_core::datatypes::Schema as LanceSchema;
@@ -324,14 +324,6 @@ fn prepare_take_indices(indices: &[u32]) -> (Vec<u32>, Option<UInt32Array>) {
 }
 
 fn reorder_taken_batch(batch: RecordBatch, reorder: &UInt32Array) -> Result<RecordBatch> {
-    if batch.num_columns() == 0 {
-        let options = RecordBatchOptions::new().with_row_count(Some(reorder.len()));
-        return Ok(RecordBatch::try_new_with_options(
-            batch.schema(),
-            vec![],
-            &options,
-        )?);
-    }
     Ok(arrow::compute::kernels::take::take_record_batch(
         &batch, reorder,
     )?)
@@ -351,8 +343,10 @@ fn reorder_taken_batch(batch: RecordBatch, reorder: &UInt32Array) -> Result<Reco
 /// native fragment take path.
 ///
 /// `columns` is a NULL-terminated array. NULL selects the fragment's full
-/// logical schema. A non-NULL array whose first entry is NULL is an explicit
-/// empty projection. `indices` may be NULL only when `num_indices` is zero.
+/// logical schema. A non-NULL array whose first entry is NULL is passed to
+/// native take as an explicit empty projection, so its native failure behavior
+/// is preserved rather than treated as a full projection. `indices` may be
+/// NULL only when `num_indices` is zero.
 /// On success `out` receives a caller-owned Arrow stream that remains valid
 /// after the fragment and source dataset handles are closed.
 #[unsafe(no_mangle)]

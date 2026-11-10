@@ -4836,17 +4836,31 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
 
     let one_index = [0_u32];
     let no_columns: [CString; 0] = [];
-    let (empty_projection_schema, empty_projection_batches) =
-        take_fragment_via_c(fragment, Some(&one_index), Some(no_columns.as_slice()));
-    let native_empty_projection = lance_c::runtime::block_on(native_fragment.take(
+    let native_empty_projection_error = lance_c::runtime::block_on(native_fragment.take(
         &one_index,
         &fragment_projection(&native_fragment, Some(&[])),
     ))
-    .unwrap();
-    assert_eq!(empty_projection_schema, *native_empty_projection.schema());
-    assert!(empty_projection_schema.fields().is_empty());
-    assert_eq!(empty_projection_batches.len(), 1);
-    assert_eq!(empty_projection_batches[0], native_empty_projection);
+    .unwrap_err();
+    let mut empty_projection_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe {
+            lance_fragment_take(
+                fragment,
+                one_index.as_ptr(),
+                one_index.len(),
+                [ptr::null::<c_char>()].as_ptr(),
+                &mut empty_projection_stream,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    let message = take_last_error_message();
+    assert!(
+        message.contains(&native_empty_projection_error.to_string()),
+        "C error {message:?} must preserve native error {native_empty_projection_error}"
+    );
+    assert!(empty_projection_stream.release.is_none());
 
     unsafe { lance_fragment_close(fragment) };
     unsafe { lance_dataset_close(ds) };

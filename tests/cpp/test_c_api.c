@@ -2523,16 +2523,16 @@ static void test_fragment_read_operations(const char *uri) {
     const uint32_t one_index[] = {0};
     memset(&stream, 0, sizeof(stream));
     ASSERT(lance_fragment_take(
-               fragment, one_index, 1, empty_columns, &stream) == 0,
-           "fragment take explicit empty projection failed");
-    CHECK_OK();
-    struct ArrowSchema empty_schema = {0};
-    ASSERT(stream.get_schema(&stream, &empty_schema) == 0,
-           "empty projection get_schema");
-    ASSERT(empty_schema.n_children == 0,
-           "explicit empty projection must remain empty");
-    empty_schema.release(&empty_schema);
-    stream.release(&stream);
+               fragment, one_index, 1, empty_columns, &stream) == -1,
+           "explicit empty projection must preserve native take failure");
+    ASSERT(lance_last_error_code() == LANCE_ERR_NOT_FOUND,
+           "explicit empty projection native error code");
+    ASSERT(stream.release == NULL,
+           "failed empty projection must leave out uninitialized");
+    message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "No data files") != NULL,
+           "explicit empty projection native error message");
+    lance_free_string(message);
 
     memset(&stream, 0, sizeof(stream));
     ASSERT(lance_fragment_take(

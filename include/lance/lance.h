@@ -1446,7 +1446,8 @@ LanceScanner* lance_fragment_scan(const LanceFragment* fragment);
  * `columns` is a NULL-terminated array of UTF-8 column paths:
  * - NULL selects the fragment's full logical schema.
  * - A non-NULL array whose first entry is NULL is an explicit empty
- *   projection. Missing top-level columns and non-UTF-8 names are errors;
+ *   projection and retains Native take's failure behavior instead of being
+ *   treated as full. Missing top-level columns and non-UTF-8 names are errors;
  *   nested paths follow Native `Schema::project` semantics.
  * `indices` may be NULL only when `num_indices` is zero.
  *
