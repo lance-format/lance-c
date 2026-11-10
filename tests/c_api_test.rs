@@ -4780,7 +4780,7 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
     let batch_schema = batches[0].schema();
     assert_eq!(
         batch_schema.field_with_name("meta").unwrap().data_type(),
-        &DataType::LargeUtf8
+        &DataType::Utf8
     );
     let meta = batch_schema
         .field_with_name("meta")
@@ -5070,7 +5070,7 @@ fn test_fragment_scan_uses_normal_scanner_and_owned_snapshot() {
     assert_eq!(batches[0].num_columns(), 3);
     let batch_schema = batches[0].schema();
     let meta = batch_schema.field_with_name("meta").unwrap();
-    assert_eq!(meta.data_type(), &DataType::LargeUtf8);
+    assert_eq!(meta.data_type(), &DataType::Utf8);
     assert_eq!(
         meta.metadata()
             .get("ARROW:extension:name")
