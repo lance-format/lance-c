@@ -34,6 +34,10 @@ if [ -e "$run_dir/exit_status" ]; then
     echo "refusing to overwrite completed run: $run_dir" >&2
     exit 2
 fi
+if [ -e "$run_dir/log.txt" ]; then
+    echo "refusing to overwrite existing log: $run_dir" >&2
+    exit 2
+fi
 
 commit=$(git -C "$source_dir" rev-parse HEAD)
 dirty=$(git -C "$source_dir" status --porcelain=v1)
@@ -47,21 +51,27 @@ meta_tmp="$run_dir/.meta.tmp"
     printf 'source_branch=%s\n' "$(git -C "$source_dir" symbolic-ref --short -q HEAD || echo DETACHED)"
     printf 'source_dirty=%s\n' "$([ -n "$dirty" ] && echo true || echo false)"
     printf 'toolchain=%s\n' "$toolchain"
-    printf 'cargo_build_jobs=%s\n' "${CARGO_BUILD_JOBS:-unset}"
-    printf 'rust_test_threads=%s\n' "${RUST_TEST_THREADS:-unset}"
-    printf 'command=%q ' "${command[@]}"
+    printf 'cargo_build_jobs=8\n'
+    printf 'rust_test_threads=4\n'
+    printf 'command='
+    printf '%q ' "${command[@]}"
     printf '\n'
 } > "$meta_tmp"
 mv "$meta_tmp" "$run_dir/meta.txt"
-printf '%q ' "${command[@]}" > "$run_dir/command.txt"
-printf '\n' >> "$run_dir/command.txt"
+command_tmp="$run_dir/.command.tmp"
+printf '%q ' "${command[@]}" > "$command_tmp"
+printf '\n' >> "$command_tmp"
+mv "$command_tmp" "$run_dir/command.txt"
 
 cd "$source_dir" || exit 2
 export CARGO_BUILD_JOBS=8
 export RUST_TEST_THREADS=4
 "${command[@]}" > "$run_dir/log.txt" 2>&1
 status=$?
-printf 'finished_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$run_dir/meta.txt"
+meta_tmp="$run_dir/.meta.tmp"
+cp "$run_dir/meta.txt" "$meta_tmp"
+printf 'finished_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$meta_tmp"
+mv "$meta_tmp" "$run_dir/meta.txt"
 printf '%s\n' "$status" > "$run_dir/.exit_status.tmp"
 mv "$run_dir/.exit_status.tmp" "$run_dir/exit_status"
 exit "$status"
