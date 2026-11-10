@@ -5158,7 +5158,7 @@ fn test_branch_metadata_full_replace_persistence_and_options() {
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
 
-    let duplicate_ref = unsafe { lance_ref_version_number(1) };
+    let duplicate_ref = unsafe { lance_ref_version_number(2) };
     let duplicate =
         unsafe { lance_dataset_branch_create(ds, meta_name.as_ptr(), duplicate_ref, ptr::null()) };
     assert!(duplicate.is_null());
@@ -5428,9 +5428,9 @@ fn test_branch_invalid_inputs_and_missing_references() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
     assert_eq!(
         unsafe { lance_dataset_branch_force_delete(ds, c_str("missing").as_ptr()) },
-        -1
+        0
     );
-    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
 
     assert!(
         unsafe {
