@@ -3,8 +3,18 @@ The package lance-c provides CMake targets:
     find_package(LanceC CONFIG REQUIRED)
     target_link_libraries(main PRIVATE LanceC::lance_c)
 
+Consumers require C++17 for lance.hpp. C consumers include lance/lance.h.
+
 The default linkage matches the vcpkg triplet:
     x64-linux         → static  (LanceC::lance_c → LanceC::lance_c_static)
     x64-linux-dynamic → shared  (LanceC::lance_c → LanceC::lance_c_shared)
 
 Override per-build by setting LanceC_LINK=static|shared before find_package.
+
+Prebuilt archives are published for x64-linux, arm64-linux, and arm64-osx.
+Other supported vcpkg platforms, including x64-osx, have no matching prebuilt
+asset in this release. Install those with the from-source feature:
+
+    vcpkg install 'lance-c[from-source]'
+
+Source builds require a Rust toolchain, CMake, and protoc on the build host.
