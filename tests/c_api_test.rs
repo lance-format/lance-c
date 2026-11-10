@@ -4194,10 +4194,11 @@ fn test_index_segments_json_unknown_coverage() {
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
     let (_tmp, uri) = create_many_small_fragments(2);
-    let expected_version = 3_u64;
+    let expected_dataset_version = 2_u64;
+    let commit_version = 3_u64;
     lance_c::runtime::block_on(async {
         let mut dataset = Dataset::open(&uri).await.unwrap();
-        assert_eq!(dataset.version().version, expected_version - 1);
+        assert_eq!(dataset.version().version, expected_dataset_version);
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
         let mut segment = dataset
             .create_index_builder(&["id"], IndexType::Bitmap, &params)
@@ -4207,13 +4208,13 @@ fn test_index_segments_json_unknown_coverage() {
             .await
             .unwrap();
         segment.fragment_bitmap = None;
-        Dataset::commit(
+        let committed = Dataset::commit(
             &uri,
             Operation::CreateIndex {
                 new_indices: vec![segment],
                 removed_indices: Vec::new(),
             },
-            Some(expected_version - 1),
+            Some(commit_version - 1),
             None,
             None,
             Default::default(),
@@ -4221,6 +4222,7 @@ fn test_index_segments_json_unknown_coverage() {
         )
         .await
         .unwrap();
+        assert_eq!(committed.version().version, commit_version);
     });
 
     let ds = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
@@ -4238,7 +4240,7 @@ fn test_index_segments_json_unknown_coverage() {
     assert_eq!(entries[0]["name"], "unknown_coverage");
     assert_eq!(entries[0]["columns"], serde_json::json!(["id"]));
     assert_eq!(entries[0]["type"], "Bitmap");
-    assert_eq!(entries[0]["dataset_version"], expected_version);
+    assert_eq!(entries[0]["dataset_version"], expected_dataset_version);
     assert_eq!(entries[0]["index_version"], 0);
     assert!(entries[0]["fragment_ids"].is_null());
 
@@ -4252,10 +4254,11 @@ fn test_index_segments_json_empty_coverage() {
     use lance_index::scalar::InvertedIndexParams;
 
     let (_tmp, uri) = create_test_dataset();
-    let expected_version = 2_u64;
+    let expected_dataset_version = 1_u64;
+    let commit_version = 2_u64;
     lance_c::runtime::block_on(async {
         let mut dataset = Dataset::open(&uri).await.unwrap();
-        assert_eq!(dataset.version().version, expected_version - 1);
+        assert_eq!(dataset.version().version, expected_dataset_version);
         dataset
             .create_index_builder(
                 &["name"],
@@ -4266,7 +4269,7 @@ fn test_index_segments_json_empty_coverage() {
             .train(false)
             .await
             .unwrap();
-        assert_eq!(dataset.version().version, expected_version);
+        assert_eq!(dataset.version().version, commit_version);
     });
 
     let ds = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
@@ -4284,7 +4287,7 @@ fn test_index_segments_json_empty_coverage() {
     assert_eq!(entries[0]["name"], "empty_name_fts");
     assert_eq!(entries[0]["columns"], serde_json::json!(["name"]));
     assert_eq!(entries[0]["type"], "Inverted");
-    assert_eq!(entries[0]["dataset_version"], expected_version);
+    assert_eq!(entries[0]["dataset_version"], expected_dataset_version);
     assert_eq!(entries[0]["index_version"], 0);
     assert_eq!(entries[0]["fragment_ids"], serde_json::json!([]));
 
