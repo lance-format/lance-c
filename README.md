@@ -321,14 +321,22 @@ unsupported triples, opt into a source build with the `from-source` feature:
 vcpkg install 'lance-c[from-source]'  # requires Rust toolchain
 ```
 
+Prebuilt v0.1.9 archives cover Linux x86_64/aarch64 and macOS arm64. The Linux
+x86_64 mapping uses the Debian 12 build, which lowers its libc requirement to
+the Debian 12 baseline; the arm64 mapping still uses the standard release
+archive. Intel macOS has no prebuilt asset in this release, so use
+`lance-c[from-source]` there. Source builds also require CMake and `protoc` on
+the build host.
+
 ### Conan
 
 ```bash
-conan install --requires=lance-c/0.1.0
+conan install --requires=lance-c/0.1.9
 ```
 
 Default path downloads prebuilts; `-o lance-c/*:from_source=True` builds
-from source via cargo.
+from source via cargo. As with vcpkg, Intel macOS must use the source path in
+this release.
 
 ### Header path
 
@@ -482,7 +490,7 @@ Releases are tag-driven: pushing a `v*.*.*` tag fires [`release.yml`](.github/wo
    - Commits as `github-actions[bot]` with message `chore: bump version to <version>`.
    - Pushes the commit to `main` and pushes the tag.
    - Dispatches `release.yml` at the new tag's ref. (Direct tag push by `GITHUB_TOKEN` does not trigger workflows — GitHub's recursion guard — so we explicitly `gh workflow run` instead.)
-4. `release.yml` builds artifacts. ~20 minutes later the [GitHub Release](https://github.com/lance-format/lance-c/releases) has all four `.tar.xz` artifacts plus a `SHA512SUMS` file.
+4. `release.yml` builds artifacts. ~20 minutes later the [GitHub Release](https://github.com/lance-format/lance-c/releases) has all published `.tar.xz` artifacts (Linux x86_64/aarch64, their Debian 12 variants, and macOS arm64) plus a `SHA512SUMS` file.
 5. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
    - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
    - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
