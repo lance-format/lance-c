@@ -9,7 +9,8 @@ use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::record_batch::{RecordBatchIterator, RecordBatchReader};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use futures::TryStreamExt;
 use lance::Dataset;
 use lance_c::*;
 
@@ -125,7 +126,7 @@ fn set_projection(scanner: *mut LanceScanner, specs: &[(&str, &str)]) {
     }
 }
 
-unsafe fn collect_projected(scanner: *mut LanceScanner) -> (Vec<String>, Vec<(i32, Option<f32>)>) {
+unsafe fn collect_projected_batches(scanner: *mut LanceScanner) -> (SchemaRef, Vec<RecordBatch>) {
     let mut stream = FFI_ArrowArrayStream::empty();
     let status = unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) };
     if status != 0 {
@@ -135,15 +136,20 @@ unsafe fn collect_projected(scanner: *mut LanceScanner) -> (Vec<String>, Vec<(i3
         );
     }
     let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
-    let fields = reader
-        .schema()
+    let schema = reader.schema();
+    let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+    (schema, batches)
+}
+
+unsafe fn collect_projected(scanner: *mut LanceScanner) -> (Vec<String>, Vec<(i32, Option<f32>)>) {
+    let (schema, batches) = unsafe { collect_projected_batches(scanner) };
+    let fields = schema
         .fields()
         .iter()
         .map(|field| field.name().clone())
         .collect::<Vec<_>>();
     let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch.unwrap();
+    for batch in batches {
         let ids = batch
             .column_by_name("id_alias")
             .unwrap()
@@ -161,6 +167,20 @@ unsafe fn collect_projected(scanner: *mut LanceScanner) -> (Vec<String>, Vec<(i3
         }
     }
     (fields, rows)
+}
+
+fn schema_signature(schema: &Schema) -> Vec<(String, DataType, bool)> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            (
+                field.name().clone(),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -211,17 +231,30 @@ fn multivector_projection_keeps_the_internal_scoring_window() {
     let distances = [0.0, 6.0, 8.0];
     let negated_distances = [0.0, -6.0, -8.0];
 
-    for (projection, disable, expected_distances) in [
-        (alias.as_slice(), false, Some(distances.as_slice())),
-        (alias.as_slice(), true, None),
+    for (projection, disable, expected_fields, expected_distances) in [
+        (
+            alias.as_slice(),
+            false,
+            &["id_alias", "_distance"][..],
+            Some(distances.as_slice()),
+        ),
+        (alias.as_slice(), true, &["id_alias"][..], None),
         (
             explicit_distance.as_slice(),
             true,
+            &["id_alias", "_distance"][..],
             Some(distances.as_slice()),
         ),
         (
             negated_distance.as_slice(),
             true,
+            &["id_alias", "_distance"][..],
+            Some(negated_distances.as_slice()),
+        ),
+        (
+            negated_distance.as_slice(),
+            false,
+            &["id_alias", "_distance"][..],
             Some(negated_distances.as_slice()),
         ),
     ] {
@@ -250,8 +283,7 @@ fn multivector_projection_keeps_the_internal_scoring_window() {
 
             let (fields, rows) = collect_projected(scan);
             assert_eq!(
-                fields.contains(&"_distance".to_string()),
-                expected_distances.is_some(),
+                fields, expected_fields,
                 "projection={projection:?} disable={disable}"
             );
             let ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
@@ -272,6 +304,473 @@ fn multivector_projection_keeps_the_internal_scoring_window() {
             lance_scanner_close(scan);
             lance_dataset_close(ds);
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedDistance<'a> {
+    Absent,
+    Float32(&'a [f32]),
+    Int32(&'a [i32]),
+}
+
+struct WindowCase<'a> {
+    projection: &'a [(&'a str, &'a str)],
+    disable_scoring_autoprojection: bool,
+    vector_count: usize,
+    k: usize,
+    offset: i64,
+    limit: i64,
+    expected_ids: &'a [i32],
+    expected_distance: ExpectedDistance<'a>,
+}
+
+unsafe fn run_window_case(
+    dataset: *const LanceDataset,
+    column: &CString,
+    query: &[f32],
+    case: &WindowCase<'_>,
+) -> (SchemaRef, Vec<RecordBatch>) {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    set_projection(scanner, case.projection);
+    if case.disable_scoring_autoprojection {
+        assert_eq!(
+            unsafe { lance_scanner_disable_scoring_autoprojection(scanner) },
+            0
+        );
+    }
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest_multivector(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr().cast(),
+                2,
+                case.vector_count,
+                LanceDataType::Float32 as i32,
+                case.k as u32,
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_use_index(scanner, false) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_offset(scanner, case.offset) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, case.limit) }, 0);
+    let result = unsafe { collect_projected_batches(scanner) };
+    unsafe { lance_scanner_close(scanner) };
+    result
+}
+
+fn assert_window_result(
+    schema: &Schema,
+    batches: &[RecordBatch],
+    expected_ids: &[i32],
+    expected_distance: ExpectedDistance<'_>,
+) {
+    let expected_fields = match expected_distance {
+        ExpectedDistance::Absent => 1,
+        ExpectedDistance::Float32(_) | ExpectedDistance::Int32(_) => 2,
+    };
+    assert_eq!(schema.fields().len(), expected_fields);
+    assert_eq!(schema.field(0).name(), "id_alias");
+
+    let mut ids = Vec::new();
+    for batch in batches {
+        let values = batch
+            .column_by_name("id_alias")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        ids.extend(values.values().iter().copied());
+    }
+    assert_eq!(ids, expected_ids);
+
+    match expected_distance {
+        ExpectedDistance::Absent => {
+            assert!(schema.field_with_name("_distance").is_err());
+        }
+        ExpectedDistance::Float32(expected) => {
+            assert_eq!(schema.field(1).name(), "_distance");
+            assert_eq!(schema.field(1).data_type(), &DataType::Float32);
+            let mut actual = Vec::new();
+            for batch in batches {
+                let values = batch
+                    .column_by_name("_distance")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                actual.extend(values.values().iter().copied());
+            }
+            assert_eq!(actual, expected);
+        }
+        ExpectedDistance::Int32(expected) => {
+            assert_eq!(schema.field(1).name(), "_distance");
+            assert_eq!(schema.field(1).data_type(), &DataType::Int32);
+            let mut actual = Vec::new();
+            for batch in batches {
+                let values = batch
+                    .column_by_name("_distance")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                actual.extend(values.values().iter().copied());
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+fn native_multivector_batches(
+    uri: &str,
+    projection: &[(&str, &str)],
+    vector_count: usize,
+    k: usize,
+    offset: i64,
+    limit: i64,
+) -> (SchemaRef, Vec<RecordBatch>) {
+    lance_c::runtime::block_on(async move {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.project_with_transform(projection).unwrap();
+        scanner.disable_scoring_autoprojection();
+        let query = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            2,
+            Arc::new(Float32Array::from(vec![1.0f32, 0., 0., 1.])),
+            None,
+        )
+        .unwrap();
+        assert_eq!(query.len(), vector_count);
+        scanner.nearest("vectors", &query, k).unwrap();
+        scanner.use_index(false);
+        scanner.limit(Some(limit), Some(offset)).unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        (schema, batches)
+    })
+}
+
+fn float_rows(schema: &Schema, batches: &[RecordBatch]) -> Vec<(i32, Option<f32>)> {
+    assert!(schema.field_with_name("_distance").is_ok());
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id_alias")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let distances = batch
+            .column_by_name("_distance")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row),
+                (!distances.is_null(row)).then(|| distances.value(row)),
+            ));
+        }
+    }
+    rows
+}
+
+#[test]
+fn multivector_projection_window_uses_native_distance_before_offset_and_limit() {
+    let (_dir, uri) = fixture();
+    let datum = CString::new("vectors").unwrap();
+    let query = [1.0f32, 0., 0., 1.];
+    let alias = [("id_alias", "id")];
+    let raw_distance = [("id_alias", "id"), ("_distance", "_distance")];
+    let negated_distance = [("id_alias", "id"), ("_distance", "-_distance")];
+    let int_distance = [("id_alias", "id"), ("_distance", "-id")];
+    let cases = [
+        WindowCase {
+            projection: &alias,
+            disable_scoring_autoprojection: true,
+            vector_count: 2,
+            k: 3,
+            offset: 1,
+            limit: 2,
+            expected_ids: &[2, 3],
+            expected_distance: ExpectedDistance::Absent,
+        },
+        WindowCase {
+            projection: &alias,
+            disable_scoring_autoprojection: false,
+            vector_count: 2,
+            k: 3,
+            offset: 1,
+            limit: 2,
+            expected_ids: &[2, 3],
+            expected_distance: ExpectedDistance::Float32(&[6.0, 8.0]),
+        },
+        WindowCase {
+            projection: &raw_distance,
+            disable_scoring_autoprojection: true,
+            vector_count: 2,
+            k: 3,
+            offset: 1,
+            limit: 2,
+            expected_ids: &[2, 3],
+            expected_distance: ExpectedDistance::Float32(&[6.0, 8.0]),
+        },
+        WindowCase {
+            projection: &negated_distance,
+            disable_scoring_autoprojection: false,
+            vector_count: 2,
+            k: 3,
+            offset: 1,
+            limit: 2,
+            expected_ids: &[2, 3],
+            expected_distance: ExpectedDistance::Float32(&[-6.0, -8.0]),
+        },
+        WindowCase {
+            projection: &negated_distance,
+            disable_scoring_autoprojection: true,
+            vector_count: 2,
+            k: 2,
+            offset: 1,
+            limit: 1,
+            expected_ids: &[2],
+            expected_distance: ExpectedDistance::Float32(&[-6.0]),
+        },
+        WindowCase {
+            projection: &int_distance,
+            disable_scoring_autoprojection: true,
+            vector_count: 2,
+            k: 3,
+            offset: 1,
+            limit: 2,
+            expected_ids: &[2, 3],
+            expected_distance: ExpectedDistance::Int32(&[-2, -3]),
+        },
+    ];
+
+    unsafe {
+        let dataset = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!dataset.is_null());
+        for case in &cases {
+            let (schema, batches) = run_window_case(dataset, &datum, &query, case);
+            assert_window_result(&schema, &batches, case.expected_ids, case.expected_distance);
+        }
+
+        let native_case = WindowCase {
+            projection: &negated_distance,
+            disable_scoring_autoprojection: true,
+            vector_count: 2,
+            k: 3,
+            offset: 1,
+            limit: 2,
+            expected_ids: &[2, 3],
+            expected_distance: ExpectedDistance::Float32(&[-6.0, -8.0]),
+        };
+        let (schema, batches) = run_window_case(dataset, &datum, &query, &native_case);
+        let (native_schema, native_batches) =
+            native_multivector_batches(uri.to_str().unwrap(), &negated_distance, 2, 3, 1, 2);
+        assert_eq!(
+            schema_signature(&schema),
+            schema_signature(&native_schema),
+            "multivector projection schema must match the native scanner"
+        );
+        assert_eq!(
+            float_rows(&schema, &batches),
+            float_rows(&native_schema, &native_batches),
+            "multivector projection rows must match the native scanner"
+        );
+
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn multivector_window_preserves_unset_and_explicit_empty_projections() {
+    let (_dir, uri) = fixture();
+    let datum = CString::new("vectors").unwrap();
+    let query = [1.0f32, 0., 0., 1.];
+
+    unsafe {
+        let dataset = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!dataset.is_null());
+
+        let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+        assert_eq!(lance_scanner_disable_scoring_autoprojection(scanner), 0);
+        assert_eq!(
+            lance_scanner_nearest_multivector(
+                scanner,
+                datum.as_ptr(),
+                query.as_ptr().cast(),
+                2,
+                2,
+                LanceDataType::Float32 as i32,
+                3,
+            ),
+            0
+        );
+        assert_eq!(lance_scanner_set_use_index(scanner, false), 0);
+        assert_eq!(lance_scanner_set_offset(scanner, 1), 0);
+        assert_eq!(lance_scanner_set_limit(scanner, 1), 0);
+        let (schema, batches) = collect_projected_batches(scanner);
+        lance_scanner_close(scanner);
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "vectors"]
+        );
+        let ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![2]);
+
+        let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+        set_projection(scanner, &[]);
+        assert_eq!(lance_scanner_disable_scoring_autoprojection(scanner), 0);
+        assert_eq!(
+            lance_scanner_nearest_multivector(
+                scanner,
+                datum.as_ptr(),
+                query.as_ptr().cast(),
+                2,
+                2,
+                LanceDataType::Float32 as i32,
+                3,
+            ),
+            0
+        );
+        assert_eq!(lance_scanner_set_use_index(scanner, false), 0);
+        assert_eq!(lance_scanner_set_offset(scanner, 1), 0);
+        assert_eq!(lance_scanner_set_limit(scanner, 2), 0);
+        let (schema, _) = collect_projected_batches(scanner);
+        lance_scanner_close(scanner);
+        assert_eq!(schema.fields().len(), 0);
+
+        let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+        set_projection(scanner, &[]);
+        assert_eq!(
+            lance_scanner_nearest_multivector(
+                scanner,
+                datum.as_ptr(),
+                query.as_ptr().cast(),
+                2,
+                2,
+                LanceDataType::Float32 as i32,
+                3,
+            ),
+            0
+        );
+        assert_eq!(lance_scanner_set_use_index(scanner, false), 0);
+        assert_eq!(lance_scanner_set_offset(scanner, 1), 0);
+        assert_eq!(lance_scanner_set_limit(scanner, 2), 0);
+        let (schema, batches) = collect_projected_batches(scanner);
+        lance_scanner_close(scanner);
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["_distance"]
+        );
+        let distances = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("_distance")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(distances, vec![6.0, 8.0]);
+
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn indexed_refined_projection_window_uses_native_distance() {
+    let rows = vec![
+        vec![Some(1.), Some(0.)],
+        vec![Some(1.), Some(1.)],
+        vec![Some(0.), Some(1.)],
+    ];
+    let (_dir, uri) = custom_fixture(rows, 2, true);
+    let datum = CString::new("vectors").unwrap();
+    let projection = [("id_alias", "id"), ("_distance", "-_distance")];
+    let query = [1.0f32, 0.];
+
+    unsafe {
+        let dataset = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!dataset.is_null());
+        let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+        set_projection(scanner, &projection);
+        assert_eq!(lance_scanner_disable_scoring_autoprojection(scanner), 0);
+        assert_eq!(
+            lance_scanner_nearest_multivector(
+                scanner,
+                datum.as_ptr(),
+                query.as_ptr().cast(),
+                2,
+                1,
+                LanceDataType::Float32 as i32,
+                3,
+            ),
+            0
+        );
+        assert_eq!(lance_scanner_set_use_index(scanner, true), 0);
+        assert_eq!(lance_scanner_set_metric(scanner, 1), 0);
+        assert_eq!(lance_scanner_set_refine_factor(scanner, 2), 0);
+        assert_eq!(lance_scanner_set_batch_size(scanner, 1), 0);
+        assert_eq!(lance_scanner_set_offset(scanner, 1), 0);
+        assert_eq!(lance_scanner_set_limit(scanner, 2), 0);
+        let (schema, batches) = collect_projected_batches(scanner);
+        lance_scanner_close(scanner);
+        lance_dataset_close(dataset);
+
+        let expected = -(1.0 - 0.5f32.sqrt());
+        let mut distances = Vec::new();
+        for batch in &batches {
+            let values = batch
+                .column_by_name("_distance")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            distances.extend(values.values().iter().copied());
+        }
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["id_alias", "_distance"]
+        );
+        assert_eq!(distances.len(), 2);
+        assert!((distances[0] - expected).abs() < 1e-6, "{distances:?}");
+        assert!((distances[1] + 1.0).abs() < 1e-6, "{distances:?}");
     }
 }
 
