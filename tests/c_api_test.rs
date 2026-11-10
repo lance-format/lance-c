@@ -19835,6 +19835,1098 @@ fn test_dataset_write_empty_stream_creates_empty_dataset() {
     unsafe { lance_dataset_close(ds) };
 }
 
+// ---------------------------------------------------------------------------
+// Native transactions
+// ---------------------------------------------------------------------------
+
+fn native_transaction_read_version(transaction: *const LanceTransaction) -> u64 {
+    let mut version = u64::MAX;
+    assert_eq!(
+        unsafe { lance_transaction_read_version(transaction, &mut version) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    version
+}
+
+fn native_transaction_uuid(transaction: *const LanceTransaction) -> String {
+    let uuid = unsafe { lance_transaction_uuid(transaction) };
+    assert!(!uuid.is_null(), "{}", take_last_error_message());
+    let value = unsafe { CStr::from_ptr(uuid) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { lance_free_string(uuid) };
+    value
+}
+
+fn native_transaction_tag(transaction: *const LanceTransaction) -> Option<String> {
+    let mut tag: *const c_char = ptr::null();
+    let present = unsafe { lance_transaction_tag(transaction, &mut tag) };
+    assert!(present >= 0, "{}", take_last_error_message());
+    if present == 0 {
+        assert!(tag.is_null());
+        return None;
+    }
+    assert!(!tag.is_null(), "present tag must be non-NULL");
+    let value = unsafe { CStr::from_ptr(tag) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { lance_free_string(tag) };
+    Some(value)
+}
+
+fn native_transaction_properties(
+    transaction: *const LanceTransaction,
+) -> (bool, BTreeMap<String, String>) {
+    let mut present = false;
+    assert_eq!(
+        unsafe { lance_transaction_has_properties(transaction, &mut present) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_transaction_property_count(transaction, &mut count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut properties = BTreeMap::new();
+    for index in 0..count as usize {
+        let key = unsafe { lance_transaction_property_key_at(transaction, index) };
+        assert!(!key.is_null(), "{}", take_last_error_message());
+        let value = unsafe { lance_transaction_property_value_at(transaction, index) };
+        assert!(!value.is_null(), "{}", take_last_error_message());
+        properties.insert(
+            unsafe { CStr::from_ptr(key) }
+                .to_string_lossy()
+                .into_owned(),
+            unsafe { CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned(),
+        );
+        unsafe {
+            lance_free_string(key);
+            lance_free_string(value);
+        }
+    }
+    (present, properties)
+}
+
+fn native_transaction_operation(transaction: *const LanceTransaction) -> *mut LanceOperation {
+    let mut operation = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_transaction_operation(transaction, &mut operation) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!operation.is_null());
+    operation
+}
+
+fn native_operation_kind(operation: *const LanceOperation) -> LanceOperationKind {
+    let mut kind = LanceOperationKind::Unknown;
+    assert_eq!(
+        unsafe { lance_operation_kind(operation, &mut kind) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    kind
+}
+
+fn native_operation_fragment_count(operation: *const LanceOperation) -> u64 {
+    let mut count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_fragment_count(operation, &mut count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    count
+}
+
+fn write_uncommitted_for_batch(
+    uri: &str,
+    batch: RecordBatch,
+    mode: LanceWriteMode,
+    options: *const LanceUncommittedWriteOptions,
+) -> *mut LanceTransaction {
+    let uri = c_str(uri);
+    let schema = batch.schema();
+    let ffi_schema = schema_to_ffi(&schema);
+    let mut stream = batch_to_ffi_stream(batch);
+    let mut transaction = ptr::null_mut();
+    let rc = unsafe {
+        lance_dataset_write_uncommitted_stream(
+            uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            mode as i32,
+            options,
+            ptr::null(),
+            ptr::null(),
+            &mut transaction,
+        )
+    };
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert!(!transaction.is_null());
+    transaction
+}
+
+fn commit_native_transaction(
+    uri: &str,
+    transaction: *const LanceTransaction,
+    options: *const LanceCommitOptions,
+) -> *mut LanceDataset {
+    let uri = c_str(uri);
+    let mut dataset = ptr::null_mut();
+    let rc = unsafe {
+        lance_transaction_commit(
+            uri.as_ptr(),
+            transaction,
+            options,
+            ptr::null(),
+            ptr::null(),
+            &mut dataset,
+        )
+    };
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert!(!dataset.is_null());
+    dataset
+}
+
+fn transaction_proto_bytes(transaction: *const LanceTransaction) -> Vec<u8> {
+    let mut bytes: *mut u8 = ptr::null_mut();
+    let mut len = 0usize;
+    assert_eq!(
+        unsafe { lance_transaction_to_proto(transaction, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null());
+    let out = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
+    unsafe { lance_free_bytes(bytes) };
+    out
+}
+
+fn transaction_from_proto_bytes(bytes: &[u8]) -> *mut LanceTransaction {
+    let transaction = unsafe { lance_transaction_from_proto(bytes.as_ptr(), bytes.len()) };
+    assert!(!transaction.is_null(), "{}", take_last_error_message());
+    transaction
+}
+
+#[test]
+fn test_native_transaction_create_append_and_overwrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("native_transaction_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = write_schema();
+
+    let property_engine = c_str("engine");
+    let property_engine_value = c_str("lance-c-test");
+    let property_mode = c_str("mode");
+    let property_mode_value = c_str("create");
+    let properties = [
+        property_engine.as_ptr(),
+        property_engine_value.as_ptr(),
+        property_mode.as_ptr(),
+        property_mode_value.as_ptr(),
+        ptr::null(),
+    ];
+    let mut uncommitted_options: LanceUncommittedWriteOptions = unsafe { std::mem::zeroed() };
+    uncommitted_options.write.params.max_rows_per_file = 1;
+    uncommitted_options.transaction_properties = properties.as_ptr();
+
+    let create_transaction = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        &uncommitted_options,
+    );
+
+    assert_eq!(
+        native_transaction_read_version(create_transaction),
+        0,
+        "create transactions read from version 0"
+    );
+    let create_uuid = native_transaction_uuid(create_transaction);
+    assert!(!create_uuid.is_empty());
+    assert_eq!(native_transaction_tag(create_transaction), None);
+    let (has_properties, properties) = native_transaction_properties(create_transaction);
+    assert!(has_properties);
+    assert_eq!(properties.len(), 2);
+    assert_eq!(
+        properties.get("engine").map(String::as_str),
+        Some("lance-c-test")
+    );
+    assert_eq!(properties.get("mode").map(String::as_str), Some("create"));
+
+    let create_operation = native_transaction_operation(create_transaction);
+    assert_eq!(
+        native_operation_kind(create_operation),
+        LanceOperationKind::Overwrite
+    );
+    let create_fragments = native_operation_fragment_count(create_operation);
+    assert!(
+        create_fragments > 1,
+        "max_rows_per_file=1 must produce multiple fragments"
+    );
+    let mut operation_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_operation_schema(create_operation, &mut operation_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let operation_schema = Schema::try_from(&operation_schema).unwrap();
+    assert_eq!(
+        schema_signature(&operation_schema),
+        schema_signature(&schema)
+    );
+    unsafe { lance_operation_close(create_operation) };
+
+    let before_commit = lance_c::runtime::block_on(Dataset::open(&uri));
+    assert!(
+        before_commit.is_err(),
+        "uncommitted create must not publish a manifest"
+    );
+
+    let serialized = transaction_proto_bytes(create_transaction);
+    let parsed_transaction = transaction_from_proto_bytes(&serialized);
+    unsafe { lance_transaction_close(create_transaction) };
+    assert_eq!(native_transaction_uuid(parsed_transaction), create_uuid);
+    let parsed_operation = native_transaction_operation(parsed_transaction);
+    assert_eq!(
+        native_operation_kind(parsed_operation),
+        LanceOperationKind::Overwrite
+    );
+    unsafe { lance_operation_close(parsed_operation) };
+
+    let dataset = commit_native_transaction(&uri, parsed_transaction, ptr::null());
+    unsafe { lance_transaction_close(parsed_transaction) };
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(dataset) }, 3);
+    assert_eq!(
+        unsafe { lance_dataset_fragment_count(dataset) },
+        create_fragments
+    );
+
+    let native_create = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let transaction = dataset.read_transaction().await.unwrap().unwrap();
+        (
+            dataset.version().version,
+            dataset.count_rows(None).await.unwrap(),
+            transaction,
+        )
+    });
+    assert_eq!(native_create.0, 1);
+    assert_eq!(native_create.1, 3);
+    assert_eq!(native_create.2.uuid, create_uuid);
+    assert_eq!(native_create.2.read_version, 0);
+    assert!(matches!(
+        native_create.2.operation,
+        lance::dataset::transaction::Operation::Overwrite { .. }
+    ));
+
+    let append_transaction = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![4, 5], vec![4.0, 5.0]),
+        LanceWriteMode::Append,
+        ptr::null(),
+    );
+    assert_eq!(native_transaction_read_version(append_transaction), 1);
+    let append_operation = native_transaction_operation(append_transaction);
+    assert_eq!(
+        native_operation_kind(append_operation),
+        LanceOperationKind::Append
+    );
+    unsafe { lance_operation_close(append_operation) };
+
+    let before_append = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        (
+            dataset.version().version,
+            dataset.count_rows(None).await.unwrap(),
+        )
+    });
+    assert_eq!(before_append, (1, 3));
+
+    let mut append_options: LanceCommitOptions = unsafe { std::mem::zeroed() };
+    append_options.has_max_retries = true;
+    append_options.max_retries = 0;
+    append_options.has_retry_timeout = true;
+    append_options.retry_timeout_seconds = 0;
+    append_options.timeout_mode = LanceCommitTimeoutMode::Disabled as i32;
+    let append_dataset = commit_native_transaction(&uri, append_transaction, &append_options);
+    unsafe { lance_transaction_close(append_transaction) };
+    assert_eq!(unsafe { lance_dataset_version(append_dataset) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(append_dataset) }, 5);
+    unsafe { lance_dataset_close(append_dataset) };
+
+    let overwrite_transaction = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![100, 200], vec![100.0, 200.0]),
+        LanceWriteMode::Overwrite,
+        ptr::null(),
+    );
+    assert_eq!(native_transaction_read_version(overwrite_transaction), 2);
+    let overwrite_operation = native_transaction_operation(overwrite_transaction);
+    assert_eq!(
+        native_operation_kind(overwrite_operation),
+        LanceOperationKind::Overwrite
+    );
+    unsafe { lance_operation_close(overwrite_operation) };
+
+    let overwrite_dataset = commit_native_transaction(&uri, overwrite_transaction, ptr::null());
+    unsafe { lance_transaction_close(overwrite_transaction) };
+    assert_eq!(unsafe { lance_dataset_version(overwrite_dataset) }, 3);
+    assert_eq!(unsafe { lance_dataset_count_rows(overwrite_dataset) }, 2);
+
+    let mut reopened_ids = Vec::new();
+    for batch in scan_all_rows(overwrite_dataset) {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        reopened_ids.extend(ids.values().iter().copied());
+    }
+    reopened_ids.sort_unstable();
+    assert_eq!(reopened_ids, vec![100, 200]);
+    unsafe { lance_dataset_close(overwrite_dataset) };
+
+    let native_history = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let version3 = dataset
+            .read_transaction_by_version(3)
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            dataset.version().version,
+            dataset.count_rows(None).await.unwrap(),
+            version3.operation,
+        )
+    });
+    assert_eq!(native_history.0, 3);
+    assert_eq!(native_history.1, 2);
+    assert!(matches!(
+        native_history.2,
+        lance::dataset::transaction::Operation::Overwrite { .. }
+    ));
+}
+
+#[test]
+fn test_native_transaction_protobuf_boundaries() {
+    use lance_table::format::pb;
+    use prost::Message;
+
+    let tagged_message = pb::Transaction {
+        read_version: 9,
+        uuid: "tagged-append".to_string(),
+        operation: Some(pb::transaction::Operation::Append(
+            pb::transaction::Append {
+                fragments: Vec::new(),
+            },
+        )),
+        tag: "release-9".to_string(),
+        transaction_properties: std::collections::HashMap::from([(
+            "engine".to_string(),
+            "native".to_string(),
+        )]),
+    };
+    let tagged_bytes = tagged_message.encode_to_vec();
+    let tagged = transaction_from_proto_bytes(&tagged_bytes);
+    assert_eq!(native_transaction_read_version(tagged), 9);
+    assert_eq!(native_transaction_uuid(tagged), "tagged-append");
+    assert_eq!(
+        native_transaction_tag(tagged),
+        Some("release-9".to_string())
+    );
+    let (has_properties, properties) = native_transaction_properties(tagged);
+    assert!(has_properties);
+    assert_eq!(properties.get("engine").map(String::as_str), Some("native"));
+    let tagged_operation = native_transaction_operation(tagged);
+    assert_eq!(
+        native_operation_kind(tagged_operation),
+        LanceOperationKind::Append
+    );
+    assert_eq!(native_operation_fragment_count(tagged_operation), 0);
+    unsafe { lance_operation_close(tagged_operation) };
+
+    let tagged_roundtrip = transaction_from_proto_bytes(&transaction_proto_bytes(tagged));
+    assert_eq!(
+        native_transaction_tag(tagged_roundtrip),
+        Some("release-9".to_string())
+    );
+    assert_eq!(
+        native_transaction_properties(tagged_roundtrip)
+            .1
+            .get("engine")
+            .map(String::as_str),
+        Some("native")
+    );
+    unsafe {
+        lance_transaction_close(tagged_roundtrip);
+        lance_transaction_close(tagged);
+    }
+
+    let message = pb::Transaction {
+        read_version: 17,
+        uuid: "future-operation".to_string(),
+        operation: None,
+        tag: String::new(),
+        transaction_properties: std::collections::HashMap::new(),
+    };
+    let bytes = message.encode_to_vec();
+    let transaction = transaction_from_proto_bytes(&bytes);
+    assert_eq!(native_transaction_read_version(transaction), 17);
+    assert_eq!(native_transaction_uuid(transaction), "future-operation");
+    assert_eq!(native_transaction_tag(transaction), None);
+    let (has_properties, properties) = native_transaction_properties(transaction);
+    assert!(!has_properties, "empty map normalizes to absent");
+    assert!(properties.is_empty());
+
+    let operation = native_transaction_operation(transaction);
+    assert_eq!(
+        native_operation_kind(operation),
+        LanceOperationKind::Unknown
+    );
+    let mut fragment_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_fragment_count(operation, &mut fragment_count) },
+        -1
+    );
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::NotSupported,
+        "Unknown has no typed fragment inspection"
+    );
+    unsafe { lance_operation_close(operation) };
+
+    let mut output_bytes: *mut u8 = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+    let mut output_len = usize::MAX;
+    assert_eq!(
+        unsafe { lance_transaction_to_proto(transaction, &mut output_bytes, &mut output_len) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(output_bytes as usize, 0xDEAD_BEEF);
+    assert_eq!(output_len, usize::MAX);
+    unsafe { lance_transaction_close(transaction) };
+
+    let native_empty = lance::dataset::transaction::Transaction::try_from(
+        pb::Transaction::decode(&[][..]).unwrap(),
+    )
+    .unwrap();
+    let storage = [0u8];
+    for bytes in [ptr::null(), storage.as_ptr()] {
+        let empty = unsafe { lance_transaction_from_proto(bytes, 0) };
+        assert!(!empty.is_null());
+        assert_eq!(
+            native_transaction_read_version(empty),
+            native_empty.read_version
+        );
+        assert_eq!(native_transaction_uuid(empty), native_empty.uuid);
+        let operation = native_transaction_operation(empty);
+        assert_eq!(
+            native_operation_kind(operation),
+            LanceOperationKind::Unknown
+        );
+        unsafe {
+            lance_operation_close(operation);
+            lance_transaction_close(empty);
+        }
+    }
+    assert!(
+        unsafe {
+            lance_transaction_from_proto(
+                ptr::NonNull::<u8>::dangling().as_ptr(),
+                isize::MAX as usize + 1,
+            )
+        }
+        .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_transaction_from_proto(ptr::null(), 1) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(unsafe { lance_transaction_from_proto([0xFFu8].as_ptr(), 1) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let invalid_uuid = unsafe { lance_transaction_uuid(ptr::null()) };
+    assert!(invalid_uuid.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
+fn test_native_transaction_property_option_distinction() {
+    let empty_properties = [ptr::null()];
+    let mut options: LanceUncommittedWriteOptions = unsafe { std::mem::zeroed() };
+    options.transaction_properties = empty_properties.as_ptr();
+
+    let explicit_empty = write_uncommitted_for_batch(
+        "memory://native-transaction-empty-properties",
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        &options,
+    );
+    let (present, values) = native_transaction_properties(explicit_empty);
+    assert!(present, "explicit empty properties remain Some(empty)");
+    assert!(values.is_empty());
+    unsafe { lance_transaction_close(explicit_empty) };
+
+    let omitted = write_uncommitted_for_batch(
+        "memory://native-transaction-omitted-properties",
+        write_batch(vec![2], vec![2.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    let (present, values) = native_transaction_properties(omitted);
+    assert!(!present, "omitted properties remain None");
+    assert!(values.is_empty());
+    unsafe { lance_transaction_close(omitted) };
+}
+
+#[test]
+fn test_native_transaction_batch_commit_and_rejections() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("native_transaction_batch")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = write_schema();
+    let initial = write_batch(vec![1, 2], vec![1.0, 2.0]);
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(initial)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let first = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![3], vec![3.0]),
+        LanceWriteMode::Append,
+        ptr::null(),
+    );
+    let second = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![4], vec![4.0]),
+        LanceWriteMode::Append,
+        ptr::null(),
+    );
+    let first_operation = native_transaction_operation(first);
+    let second_operation = native_transaction_operation(second);
+    let first_fragments = native_operation_fragment_count(first_operation);
+    let second_fragments = native_operation_fragment_count(second_operation);
+    unsafe {
+        lance_operation_close(first_operation);
+        lance_operation_close(second_operation);
+    }
+    let transactions = [
+        first as *const LanceTransaction,
+        second as *const LanceTransaction,
+    ];
+
+    let mut dataset = ptr::null_mut();
+    let mut merged = ptr::null_mut();
+    let uri_c = c_str(&uri);
+    let mut options: LanceCommitOptions = unsafe { std::mem::zeroed() };
+    options.timeout_mode = LanceCommitTimeoutMode::Disabled as i32;
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit_batch(
+                uri_c.as_ptr(),
+                transactions.as_ptr(),
+                transactions.len(),
+                &options,
+                ptr::null(),
+                ptr::null(),
+                &mut dataset,
+                &mut merged,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!dataset.is_null());
+    assert!(!merged.is_null());
+    unsafe {
+        lance_transaction_close(first);
+        lance_transaction_close(second);
+    }
+
+    assert_eq!(native_transaction_read_version(merged), 1);
+    let merged_uuid = native_transaction_uuid(merged);
+    let merged_operation = native_transaction_operation(merged);
+    assert_eq!(
+        native_operation_fragment_count(merged_operation),
+        first_fragments + second_fragments
+    );
+    unsafe { lance_operation_close(merged_operation) };
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(dataset) }, 4);
+
+    let native = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let transaction = dataset.read_transaction().await.unwrap().unwrap();
+        (dataset.count_rows(None).await.unwrap(), transaction)
+    });
+    assert_eq!(native.0, 4);
+    assert_eq!(native.1.uuid, merged_uuid);
+    assert_eq!(native.1.read_version, 1);
+    assert!(matches!(
+        native.1.operation,
+        lance::dataset::transaction::Operation::Append { .. }
+    ));
+
+    unsafe {
+        lance_dataset_close(dataset);
+        lance_transaction_close(merged);
+    }
+
+    let overwrite = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![9], vec![9.0]),
+        LanceWriteMode::Overwrite,
+        ptr::null(),
+    );
+    let overwrite_transactions = [overwrite as *const LanceTransaction];
+    let sentinel_dataset: *mut LanceDataset = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+    let sentinel_transaction: *mut LanceTransaction = std::ptr::without_provenance_mut(0xBEEF);
+    dataset = sentinel_dataset;
+    merged = sentinel_transaction;
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit_batch(
+                uri_c.as_ptr(),
+                overwrite_transactions.as_ptr(),
+                overwrite_transactions.len(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &mut dataset,
+                &mut merged,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(dataset, sentinel_dataset);
+    assert_eq!(merged, sentinel_transaction);
+    unsafe { lance_transaction_close(overwrite) };
+
+    dataset = sentinel_dataset;
+    merged = sentinel_transaction;
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit_batch(
+                uri_c.as_ptr(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &mut dataset,
+                &mut merged,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(dataset, sentinel_dataset);
+    assert_eq!(merged, sentinel_transaction);
+}
+
+#[test]
+fn test_native_transaction_detached_and_snapshot_ownership() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("native_transaction_detached")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = write_schema();
+    let initial = write_batch(vec![1, 2], vec![1.0, 2.0]);
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(initial)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let transaction = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![3], vec![3.0]),
+        LanceWriteMode::Append,
+        ptr::null(),
+    );
+    let transaction_uuid = native_transaction_uuid(transaction);
+    let mut options: LanceCommitOptions = unsafe { std::mem::zeroed() };
+    options.detached = true;
+    options.timeout_mode = LanceCommitTimeoutMode::Disabled as i32;
+    let detached_dataset = commit_native_transaction(&uri, transaction, &options);
+    unsafe { lance_transaction_close(transaction) };
+
+    let detached_version = unsafe { lance_dataset_version(detached_dataset) };
+    assert!(
+        lance_table::format::is_detached_version(detached_version),
+        "detached commit must use a detached version id, got {detached_version}"
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(detached_dataset) }, 3);
+
+    let mut current_transaction = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_read_transaction(detached_dataset, &mut current_transaction) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!current_transaction.is_null());
+    assert_eq!(
+        native_transaction_uuid(current_transaction),
+        transaction_uuid
+    );
+
+    let operation = native_transaction_operation(current_transaction);
+    unsafe {
+        lance_transaction_close(current_transaction);
+        lance_dataset_close(detached_dataset);
+    }
+    assert_eq!(
+        native_operation_kind(operation),
+        LanceOperationKind::Append,
+        "operation snapshot must survive its transaction and dataset"
+    );
+    unsafe { lance_operation_close(operation) };
+
+    let uri_c = c_str(&uri);
+    let latest = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!latest.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_dataset_version(latest) },
+        1,
+        "detached commits must not advance main history"
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(latest) }, 2);
+
+    let mut detached_transaction = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_read_transaction_by_version(
+                latest,
+                detached_version,
+                &mut detached_transaction,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!detached_transaction.is_null());
+    let detached_bytes = transaction_proto_bytes(detached_transaction);
+    unsafe {
+        lance_transaction_close(detached_transaction);
+        lance_dataset_close(latest);
+    }
+    let detached_again = transaction_from_proto_bytes(&detached_bytes);
+    assert_eq!(
+        native_transaction_uuid(detached_again),
+        transaction_uuid,
+        "transaction snapshots remain independent after parent close"
+    );
+    unsafe { lance_transaction_close(detached_again) };
+}
+
+#[test]
+fn test_native_transaction_conflict_and_commit_options() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("native_transaction_conflict")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = write_schema();
+    let initial = write_batch(vec![1, 2], vec![1.0, 2.0]);
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(initial)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let first = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![10], vec![10.0]),
+        LanceWriteMode::Overwrite,
+        ptr::null(),
+    );
+    let second = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![20], vec![20.0]),
+        LanceWriteMode::Overwrite,
+        ptr::null(),
+    );
+    let winner = commit_native_transaction(&uri, first, ptr::null());
+    assert_eq!(unsafe { lance_dataset_version(winner) }, 2);
+    unsafe { lance_dataset_close(winner) };
+
+    let mut zero_retries: LanceCommitOptions = unsafe { std::mem::zeroed() };
+    zero_retries.has_max_retries = true;
+    zero_retries.max_retries = 0;
+    let sentinel: *mut LanceDataset = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+    let mut out_dataset = sentinel;
+    let uri_c = c_str(&uri);
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                uri_c.as_ptr(),
+                second,
+                &zero_retries,
+                ptr::null(),
+                ptr::null(),
+                &mut out_dataset,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::CommitConflict);
+    assert_eq!(out_dataset, sentinel);
+
+    let mut zero_timeout: LanceCommitOptions = unsafe { std::mem::zeroed() };
+    zero_timeout.timeout_mode = LanceCommitTimeoutMode::Explicit as i32;
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                uri_c.as_ptr(),
+                second,
+                &zero_timeout,
+                ptr::null(),
+                ptr::null(),
+                &mut out_dataset,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out_dataset, sentinel);
+
+    let mut invalid_nanos: LanceCommitOptions = unsafe { std::mem::zeroed() };
+    invalid_nanos.has_retry_timeout = true;
+    invalid_nanos.retry_timeout_nanos = 1_000_000_000;
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                uri_c.as_ptr(),
+                second,
+                &invalid_nanos,
+                ptr::null(),
+                ptr::null(),
+                &mut out_dataset,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out_dataset, sentinel);
+    unsafe { lance_transaction_close(second) };
+
+    let first_append = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![30], vec![30.0]),
+        LanceWriteMode::Append,
+        ptr::null(),
+    );
+    let second_append = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![40], vec![40.0]),
+        LanceWriteMode::Append,
+        ptr::null(),
+    );
+    let append_winner = commit_native_transaction(&uri, first_append, ptr::null());
+    unsafe { lance_dataset_close(append_winner) };
+
+    let mut append_options: LanceCommitOptions = unsafe { std::mem::zeroed() };
+    append_options.has_max_retries = true;
+    append_options.max_retries = 0;
+    append_options.timeout_mode = LanceCommitTimeoutMode::Disabled as i32;
+    let append_rebased = commit_native_transaction(&uri, second_append, &append_options);
+    assert_eq!(
+        unsafe { lance_dataset_version(append_rebased) },
+        4,
+        "compatible appends rebase even with explicit zero retries"
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(append_rebased) }, 3);
+    unsafe {
+        lance_dataset_close(append_rebased);
+        lance_transaction_close(first);
+        lance_transaction_close(first_append);
+        lance_transaction_close(second_append);
+    }
+}
+
+#[test]
+fn test_native_transaction_input_validation_and_stream_consumption() {
+    let schema = write_schema();
+    let uri = c_str("memory://native-transaction-invalid");
+    let ffi_schema = schema_to_ffi(&schema);
+    let properties = [ptr::null()];
+    let mut options: LanceUncommittedWriteOptions = unsafe { std::mem::zeroed() };
+    options.transaction_properties = properties.as_ptr();
+
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let mut transaction: *mut LanceTransaction = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_uncommitted_stream(
+                ptr::null(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                &options,
+                ptr::null(),
+                ptr::null(),
+                &mut transaction,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+    assert_eq!(transaction as usize, 0xDEAD_BEEF);
+
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    transaction = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_uncommitted_stream(
+                uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                &options,
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    let mut invalid_options: LanceUncommittedWriteOptions = unsafe { std::mem::zeroed() };
+    invalid_options.write.params.data_storage_version = c_str("not-a-version").into_raw();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_uncommitted_stream(
+                uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                &invalid_options,
+                ptr::null(),
+                ptr::null(),
+                &mut transaction,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+    unsafe {
+        lance_free_string(invalid_options.write.params.data_storage_version);
+    }
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_uncommitted_stream(
+                uri.as_ptr(),
+                &ffi_schema,
+                ptr::null_mut(),
+                LanceWriteMode::Create as i32,
+                &options,
+                ptr::null(),
+                ptr::null(),
+                &mut transaction,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let empty = c_str("");
+    let (mut stream, drop_count) = make_counted_stream(&schema);
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_uncommitted_stream(
+                empty.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                &options,
+                ptr::null(),
+                ptr::null(),
+                &mut transaction,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&stream, &drop_count);
+
+    let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+    assert!(dataset.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    let mut read_transaction = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_read_transaction(ptr::null(), &mut read_transaction) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                uri.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+}
+
 #[test]
 fn test_fts_after_nearest_is_rejected() {
     let (_tmp, uri) = create_vector_dataset(64, 8);

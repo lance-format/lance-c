@@ -44,6 +44,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | Status | Component | Description |
 |--------|-----------|-------------|
 | [x] | Dataset write | Create / append / overwrite from ArrowArrayStream via `lance_dataset_write()`; tunable variant `lance_dataset_write_with_params()` for file/row-group sizing, Lance format version, and stable row IDs |
+| [x] | Native transactions | Uncommitted writer transaction handles, inspection/protobuf handoff, single and append-batch publication, and dataset history reads. Additional operation constructors remain issue #112 follow-up scope |
 | [x] | Fragment writer | Batch-at-a-time fragment file writing (no commit) via `lance_write_fragments()` |
 | [x] | Delete operations | Predicate-based deletion via `lance_dataset_delete()` |
 | [x] | Update operations | Expression-based row updates via `lance_dataset_update()` |
@@ -597,6 +598,68 @@ ds.scan()
   .to_arrow_stream(&stream);
 // consume stream...
 ```
+
+### Native transactions
+
+`Dataset::write_uncommitted` maps to `InsertBuilder::execute_uncommitted_stream`
+and returns an owned native transaction. The stream is consumed, but data files
+remain uncommitted until the transaction is published:
+
+```cpp
+ArrowArrayStream stream = source_stream();
+lance::UncommittedWriteOptions write_options;
+write_options.write.params.max_rows_per_file = 1;
+write_options.transaction_properties =
+    std::vector<std::pair<std::string, std::string>>{{"engine", "cpp"}};
+
+auto transaction = lance::Dataset::write_uncommitted(
+    "data.lance", &stream, lance::WriteMode::Append, write_options);
+auto operation = transaction.operation();
+assert(operation.kind() == lance::OperationKind::Append);
+assert(operation.fragment_count() > 0);
+
+auto bytes = transaction.to_proto();
+auto parsed = lance::Transaction::from_proto(bytes);
+auto dataset = lance::Dataset::commit("data.lance", parsed);
+auto committed = dataset.read_transaction();
+auto version_one = dataset.read_transaction_by_version(1);
+```
+
+Append batches use native `CommitBuilder::execute_batch` and return both the
+actual merged transaction and a new dataset:
+
+```cpp
+std::vector<std::reference_wrapper<const lance::Transaction>> batch{
+    std::cref(first), std::cref(second)};
+auto result = lance::Dataset::commit_batch("data.lance", batch);
+```
+
+The C entry points are `lance_dataset_write_uncommitted_stream`,
+`lance_transaction_commit`, `lance_transaction_commit_batch`,
+`lance_dataset_read_transaction`, and
+`lance_dataset_read_transaction_by_version`. Native defaults remain omitted in
+`LanceCommitOptions`; explicit zero retries, zero retry budget, disabled timeout
+and explicit timeout values are forwarded without reinterpretation.
+
+This first delivery exposes writer-generated Append and Overwrite operations.
+Typed Delete/Update/Merge/Restore/Clone/Rewrite/index/schema operation
+constructors and callback-based commit locks remain later issue #112 scope.
+Transaction values are independent snapshots: closing their source dataset,
+stream, or derived operation handle does not invalidate them.
+
+Native protobuf conversion is the transport contract. `Operation::Unknown`
+decodes but cannot be re-encoded or committed, empty tag/property maps normalize
+to absent, and the pinned core does not preserve Overwrite schema metadata
+through its separate protobuf field. The pinned core's CommitBuilder also does
+not apply its separate `with_transaction_properties` field in `execute` or
+`execute_batch`; this binding therefore carries properties on the uncommitted
+transaction.
+
+A failed commit performs no binding-side rollback. Data files may remain, and
+an I/O failure can leave publication uncertain. Reopen the URI to establish the
+actual version before retrying. Detached commits follow native behavior: they do
+not appear in main history, and the pinned core rejects using one to create a
+new dataset.
 
 ### Share metadata and index caches
 
