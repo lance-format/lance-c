@@ -10280,10 +10280,7 @@ fn test_prepared_fts_index_only_empty_segment_returns_empty_shard() {
     let (_tmp, uri) = create_test_dataset();
     lance_c::runtime::block_on(async {
         let mut dataset = Dataset::open(&uri).await.unwrap();
-        let params = InvertedIndexParams {
-            with_position: true,
-            ..Default::default()
-        };
+        let params = InvertedIndexParams::default().with_position(true);
         dataset
             .create_index_builder(&["name"], IndexType::Inverted, &params)
             .name("empty_name_fts".to_string())
