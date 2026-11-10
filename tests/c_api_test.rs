@@ -11712,7 +11712,7 @@ fn test_write_options_existing_dataset_keeps_persisted_policy() {
         older_than_nanos: 0,
     };
     let append_options = LanceWriteOptions {
-        params: LancWriteParams {
+        params: LanceWriteParams {
             max_rows_per_file: 2,
             ..default_write_params()
         },
@@ -12149,7 +12149,7 @@ fn test_write_options_rejects_invalid_auto_cleanup_without_clamping() {
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert!(
-        lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0).is_null(),
+        unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) }.is_null(),
         "failed writes must not leave a readable dataset"
     );
     let _ = take_last_error_message();
