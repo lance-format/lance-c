@@ -500,9 +500,7 @@ fn materialization_rejections_preserve_state_and_lifecycle() {
 }
 
 fn fast_search_fixture() -> (tempfile::TempDir, String) {
-    use lance::index::{
-        DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams,
-    };
+    use lance::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
 
