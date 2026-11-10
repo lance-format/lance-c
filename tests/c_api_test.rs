@@ -6891,6 +6891,39 @@ fn test_native_scalar_index_native_parameter_and_type_validation() {
 }
 
 #[test]
+fn test_native_zonemap_use_seeds_param() {
+    let (_tmp, uri) = create_native_scalar_index_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    let score = c_str("score");
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                score.as_ptr(),
+                c_str("score_zonemap_seeds").as_ptr(),
+                LanceScalarIndexType::ZoneMap as i32,
+                c_str(r#"{"rows_per_zone":2,"use_seeds":true}"#).as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+
+    let query_ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!query_ds.is_null(), "{}", take_last_error_message());
+    let (ids, stats) = scan_index_ids(query_ds, "score >= 100", true);
+    assert_eq!(ids, vec![10, 11, 12, 13, 14, 15, 17]);
+    assert!(stats.indices_loaded > 0);
+    unsafe { lance_dataset_close(query_ds) };
+}
+
+#[test]
 fn test_create_scalar_index_bitmap() {
     let (_tmp, uri) = create_test_dataset();
     let uri_c = c_str(&uri);
