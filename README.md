@@ -66,7 +66,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | Status | Component | Description |
 |--------|-----------|-------------|
 | [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
-| [x] | Dataset metadata | Version/count accessors plus JSON table metadata reads and native merge/replace updates for table and schema metadata |
+| [x] | Dataset metadata | Table/schema/field metadata updates plus native storage-version, stable-row-ID and field-ID inspection |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
 | [x] | Row prefilter | `lance_scanner_set_row_addr_allowlist()` / `lance_scanner_set_row_addr_blocklist()` restrict scans, nearest-neighbor and full-text searches to (or exclude) a set of `_rowid`s before ranking |
 | [x] | Native ordering | `lance_scanner_set_order_by()` and C++ `Scanner::order_by()` sort by one or more columns with direction and NULL placement |
@@ -109,6 +109,30 @@ prior view. Table and schema maps are independent.
 The exported Arrow schema is still the schema metadata read path. Use
 `lance_dataset_schema()` or `Dataset::schema()` to inspect the committed schema
 metadata; no duplicate C-side metadata cache is maintained.
+
+Field metadata uses one native batch and one commit. Each entry selects a field
+by ID or path and carries its own merge or replace mode:
+
+```cpp
+auto id = ds.resolve_field_id(lance::FieldReference::by_path("id"));
+ds.update_field_metadata({
+    {lance::FieldReference::by_id(id),
+     {{"owner", std::string("c++")}, {"empty", std::string("")}},
+     lance::MetadataUpdateMode::Merge},
+    {lance::FieldReference::by_path("profile.name"),
+     {{"nested", std::string("value")}},
+     lance::MetadataUpdateMode::Replace},
+});
+```
+
+A NULL value removes a key, an empty string remains a real value, and duplicate
+references to the same resolved field follow the native builder's
+last-update-wins behavior. Read field metadata through the Arrow schema's field
+metadata. `lance_dataset_data_storage_version()`,
+`lance_dataset_has_stable_row_ids()`, `lance_dataset_field_id_count()` /
+`lance_dataset_field_id_at()`, `lance_dataset_resolve_field_id()` and
+`lance_dataset_field_path()` expose the current native snapshot; the C++
+wrappers provide the corresponding `Dataset` methods.
 
 ## Scanner ordering
 

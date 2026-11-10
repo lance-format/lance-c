@@ -386,6 +386,132 @@ const char* lance_dataset_update_schema_metadata_json(
     LanceMetadataUpdateMode mode
 );
 
+/** Selects a field by numeric ID or by Lance field path. */
+typedef enum {
+    LANCE_FIELD_REFERENCE_ID   = 0,
+    LANCE_FIELD_REFERENCE_PATH = 1,
+} LanceFieldReferenceKind;
+
+/**
+ * A field reference for `lance_dataset_update_field_metadata` and
+ * `lance_dataset_resolve_field_id`.
+ *
+ * For `LANCE_FIELD_REFERENCE_ID`, `field_id` is used and `path` is ignored.
+ * For `LANCE_FIELD_REFERENCE_PATH`, `path` must be a non-NULL, NUL-terminated
+ * UTF-8 Lance field path (for example `profile.name`) and `field_id` is
+ * ignored.
+ */
+typedef struct LanceFieldReference {
+    LanceFieldReferenceKind kind;
+    int32_t field_id;
+    const char* path;
+} LanceFieldReference;
+
+/**
+ * One field's metadata update in a batch.
+ *
+ * `keys` and `values` are parallel arrays of length `count`. A NULL value
+ * removes its key; an empty string remains a real empty value. `mode` is
+ * applied independently to this field. `keys` and `values` may be NULL only
+ * when `count == 0`.
+ */
+typedef struct LanceFieldMetadataUpdate {
+    LanceFieldReference field;
+    const char* const* keys;
+    const char* const* values;
+    size_t count;
+    LanceMetadataUpdateMode mode;
+} LanceFieldMetadataUpdate;
+
+/**
+ * Apply a batch of field metadata updates and commit one native operation.
+ *
+ * Each `updates[i]` is resolved against the dataset's current schema when the
+ * call starts. A batch may mix field references, merge/replace modes and
+ * fields. If the same field is referenced more than once, the native builder's
+ * last update wins.
+ *
+ * The input array, keys, values and paths are borrowed only for this call and
+ * are copied before the native asynchronous operation starts. The native
+ * builder performs the commit and validation. The same dataset handle sees the
+ * new version; existing snapshots, scanners and independent handles keep their
+ * prior view. Read the resulting field metadata through the Arrow schema
+ * returned by `lance_dataset_schema()`.
+ *
+ * Returns 0 on success, -1 on error. Input, field lookup, validation and commit
+ * errors follow the native Lance core.
+ */
+int32_t lance_dataset_update_field_metadata(
+    LanceDataset* dataset,
+    const LanceFieldMetadataUpdate* updates,
+    size_t update_count
+);
+
+/**
+ * Return the current snapshot's canonical Lance data-storage version string
+ * (for example `"2.2"`). The value is the native manifest file-format version.
+ *
+ * Caller must free the returned string with `lance_free_string()`.
+ * Returns NULL on error.
+ */
+const char* lance_dataset_data_storage_version(const LanceDataset* dataset);
+
+/**
+ * Report whether the current snapshot uses stable row IDs.
+ * On success writes `*out_has_stable_row_ids` and returns 0; on error returns
+ * -1 and leaves the output untouched.
+ */
+int32_t lance_dataset_has_stable_row_ids(
+    const LanceDataset* dataset,
+    bool* out_has_stable_row_ids
+);
+
+/**
+ * Return the number of field IDs in the current snapshot's schema. IDs are
+ * available in native pre-order traversal through `lance_dataset_field_id_at`.
+ * On success writes `*out_count` and returns 0; on error returns -1 and leaves
+ * the output untouched.
+ */
+int32_t lance_dataset_field_id_count(
+    const LanceDataset* dataset,
+    size_t* out_count
+);
+
+/**
+ * Return the field ID at `index` in native pre-order traversal. Index 0 is the
+ * first top-level field; nested children follow their parent.
+ * On success writes `*out_field_id` and returns 0; on error returns -1 and
+ * leaves the output untouched.
+ */
+int32_t lance_dataset_field_id_at(
+    const LanceDataset* dataset,
+    size_t index,
+    int32_t* out_field_id
+);
+
+/**
+ * Resolve a field reference by ID or path against the current snapshot.
+ * Native `FieldRef` validation supplies the error for an unknown ID or path.
+ * On success writes `*out_field_id` and returns 0; on error returns -1 and
+ * leaves the output untouched.
+ */
+int32_t lance_dataset_resolve_field_id(
+    const LanceDataset* dataset,
+    const LanceFieldReference* field,
+    int32_t* out_field_id
+);
+
+/**
+ * Return the native minimal Lance field path for `field_id` in the current
+ * schema. The path round-trips through Lance field-path parsing and includes
+ * nested fields. Caller must free the returned string with
+ * `lance_free_string()`. Returns NULL on error, including an unknown ID.
+ */
+const char* lance_dataset_field_path(
+    const LanceDataset* dataset,
+    int32_t field_id
+);
+
 /* ─── Version history ─── */
 
 /**

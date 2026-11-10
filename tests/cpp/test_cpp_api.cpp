@@ -32,6 +32,79 @@
 #define TEST(name) printf("  %s... ", #name)
 #define PASS()     printf("OK\n")
 
+static const char* arrow_field_metadata_value(
+    const ArrowSchema* field,
+    const char* key,
+    size_t* value_len = nullptr) {
+    if (!field || !field->metadata) return nullptr;
+    const char* cursor = field->metadata;
+    int32_t pair_count = 0;
+    memcpy(&pair_count, cursor, sizeof(pair_count));
+    cursor += sizeof(pair_count);
+    for (int32_t i = 0; i < pair_count; ++i) {
+        int32_t key_len = 0;
+        memcpy(&key_len, cursor, sizeof(key_len));
+        cursor += sizeof(key_len);
+        const char* key_data = cursor;
+        cursor += key_len;
+        int32_t stored_value_len = 0;
+        memcpy(&stored_value_len, cursor, sizeof(stored_value_len));
+        cursor += sizeof(stored_value_len);
+        const char* value_data = cursor;
+        cursor += stored_value_len;
+        if (key_len == static_cast<int32_t>(strlen(key)) &&
+            memcmp(key_data, key, static_cast<size_t>(key_len)) == 0) {
+            if (value_len) *value_len = static_cast<size_t>(stored_value_len);
+            return value_data;
+        }
+    }
+    return nullptr;
+}
+
+static const ArrowSchema* arrow_field_at_path(
+    const ArrowSchema* schema,
+    const std::string& path) {
+    const ArrowSchema* field = schema;
+    size_t offset = 0;
+    while (offset < path.size()) {
+        const size_t dot = path.find('.', offset);
+        const size_t segment_len =
+            dot == std::string::npos ? path.size() - offset : dot - offset;
+        const ArrowSchema* child = nullptr;
+        for (int64_t i = 0; i < field->n_children; ++i) {
+            const ArrowSchema* candidate = field->children[i];
+            if (candidate && candidate->name &&
+                strlen(candidate->name) == segment_len &&
+                memcmp(candidate->name, path.data() + offset, segment_len) == 0) {
+                child = candidate;
+                break;
+            }
+        }
+        if (!child) return nullptr;
+        field = child;
+        if (dot == std::string::npos) break;
+        offset = dot + 1;
+    }
+    return field;
+}
+
+static void assert_field_metadata(
+    const ArrowSchema* field,
+    const char* key,
+    const std::string& expected) {
+    size_t value_len = 0;
+    const char* value = arrow_field_metadata_value(field, key, &value_len);
+    assert(value != nullptr);
+    assert(value_len == expected.size());
+    assert(memcmp(value, expected.data(), value_len) == 0);
+}
+
+static void assert_field_metadata_absent(
+    const ArrowSchema* field,
+    const char* key) {
+    assert(arrow_field_metadata_value(field, key) == nullptr);
+}
+
 struct ScanStatisticsCapture {
     uint64_t calls = 0;
     uint64_t bytes_read = 0;
@@ -1250,6 +1323,209 @@ static void test_dataset_metadata(const std::string& dst_uri) {
     PASS();
 }
 
+// Exercises batched field metadata updates and schema/snapshot inspection
+// through the C++17 wrappers on the nested two-fragment fixture.
+static void test_dataset_field_metadata(const std::string& uri) {
+    TEST(test_dataset_field_metadata);
+    using MetadataUpdates =
+        std::vector<std::pair<std::string, std::optional<std::string>>>;
+
+    auto old = lance::Dataset::open(uri);
+    auto ds = lance::Dataset::open(uri);
+    const uint64_t initial_version = ds.version();
+    assert(ds.fragment_count() == 2);
+    assert(ds.count_rows() == 8);
+    assert(ds.data_storage_version() == "2.2");
+    assert(!ds.has_stable_row_ids());
+
+    auto field_ids = ds.field_ids();
+    assert(field_ids.size() >= 4);
+    const int32_t id_field_id =
+        ds.resolve_field_id(lance::FieldReference::by_path("id"));
+    const int32_t name_field_id =
+        ds.resolve_field_id(lance::FieldReference::by_path("profile.name"));
+    const int32_t score_field_id =
+        ds.resolve_field_id(lance::FieldReference::by_path("profile.score"));
+    assert(ds.resolve_field_id(lance::FieldReference::by_id(name_field_id)) ==
+           name_field_id);
+    assert(ds.field_path(name_field_id) == "profile.name");
+    assert(std::find(field_ids.begin(), field_ids.end(), name_field_id) !=
+           field_ids.end());
+
+    ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ds.schema(&schema);
+    const ArrowSchema* field = arrow_field_at_path(&schema, "profile.name");
+    assert(field != nullptr);
+    assert_field_metadata_absent(field, "nested");
+    if (schema.release) schema.release(&schema);
+
+    bool caught = false;
+    try {
+        ds.update_field_metadata({lance::FieldMetadataUpdate{
+            lance::FieldReference::by_path("id"),
+            MetadataUpdates{{"bad", std::string("value")}},
+            static_cast<lance::MetadataUpdateMode>(99),
+        }});
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+    assert(ds.version() == initial_version);
+
+    caught = false;
+    try {
+        ds.update_field_metadata({lance::FieldMetadataUpdate{
+            lance::FieldReference::by_path("profile.missing"),
+            MetadataUpdates{{"bad", std::string("value")}},
+            lance::MetadataUpdateMode::Merge,
+        }});
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code != LANCE_OK);
+    }
+    assert(caught);
+    assert(ds.version() == initial_version);
+
+    uint64_t version_before = ds.version();
+    ds.update_field_metadata({
+        lance::FieldMetadataUpdate{
+            lance::FieldReference::by_id(id_field_id),
+            MetadataUpdates{
+                {"owner", std::string("c++")},
+                {"empty", std::string("")},
+                {"remove", std::string("temporary")},
+            },
+            lance::MetadataUpdateMode::Merge,
+        },
+        lance::FieldMetadataUpdate{
+            lance::FieldReference::by_path("profile.name"),
+            MetadataUpdates{
+                {"nested", std::string("value")},
+                {"empty", std::string("")},
+            },
+            lance::MetadataUpdateMode::Replace,
+        },
+        lance::FieldMetadataUpdate{
+            lance::FieldReference::by_id(score_field_id),
+            MetadataUpdates{
+                {"score", std::string("1.5")},
+                {"remove", std::nullopt},
+            },
+            lance::MetadataUpdateMode::Merge,
+        },
+    });
+    assert(ds.version() == version_before + 1);
+
+    memset(&schema, 0, sizeof(schema));
+    ds.schema(&schema);
+    const ArrowSchema* id_field = arrow_field_at_path(&schema, "id");
+    field = arrow_field_at_path(&schema, "profile.name");
+    const ArrowSchema* score_field = arrow_field_at_path(&schema, "profile.score");
+    assert(id_field != nullptr && field != nullptr && score_field != nullptr);
+    assert_field_metadata(id_field, "owner", "c++");
+    assert_field_metadata(id_field, "empty", "");
+    assert_field_metadata(field, "nested", "value");
+    assert_field_metadata(score_field, "score", "1.5");
+    assert_field_metadata_absent(score_field, "remove");
+    if (schema.release) schema.release(&schema);
+
+    ds.update_field_metadata({
+        lance::FieldMetadataUpdate{
+            lance::FieldReference::by_id(id_field_id),
+            MetadataUpdates{{"root", std::string("first")}},
+            lance::MetadataUpdateMode::Merge,
+        },
+        lance::FieldMetadataUpdate{
+            lance::FieldReference::by_path("id"),
+            MetadataUpdates{{"root", std::string("last")}},
+            lance::MetadataUpdateMode::Merge,
+        },
+    });
+    memset(&schema, 0, sizeof(schema));
+    ds.schema(&schema);
+    id_field = arrow_field_at_path(&schema, "id");
+    assert(id_field != nullptr);
+    assert_field_metadata(id_field, "root", "last");
+    assert_field_metadata_absent(id_field, "owner");
+    if (schema.release) schema.release(&schema);
+
+    ds.update_field_metadata({
+        lance::FieldMetadataUpdate{
+            lance::FieldReference::by_path("id"),
+            MetadataUpdates{
+                {"remove", std::string("temporary")},
+                {"empty", std::string("")},
+            },
+            lance::MetadataUpdateMode::Merge,
+        },
+    });
+    ds.update_field_metadata({
+        lance::FieldMetadataUpdate{
+            lance::FieldReference::by_id(id_field_id),
+            MetadataUpdates{{"remove", std::nullopt}},
+            lance::MetadataUpdateMode::Merge,
+        },
+    });
+    memset(&schema, 0, sizeof(schema));
+    ds.schema(&schema);
+    id_field = arrow_field_at_path(&schema, "id");
+    assert(id_field != nullptr);
+    assert_field_metadata(id_field, "root", "last");
+    assert_field_metadata(id_field, "empty", "");
+    assert_field_metadata_absent(id_field, "remove");
+    if (schema.release) schema.release(&schema);
+
+    ds.update_field_metadata({
+        lance::FieldMetadataUpdate{
+            lance::FieldReference::by_path("id"),
+            MetadataUpdates{},
+            lance::MetadataUpdateMode::Replace,
+        },
+    });
+    memset(&schema, 0, sizeof(schema));
+    ds.schema(&schema);
+    id_field = arrow_field_at_path(&schema, "id");
+    assert(id_field != nullptr);
+    assert_field_metadata_absent(id_field, "root");
+    if (schema.release) schema.release(&schema);
+
+    ds.update_field_metadata({});
+    ds.update_field_metadata({
+        lance::FieldMetadataUpdate{
+            lance::FieldReference::by_id(id_field_id),
+            MetadataUpdates{{"persist", std::string("yes")}},
+            lance::MetadataUpdateMode::Merge,
+        },
+        lance::FieldMetadataUpdate{
+            lance::FieldReference::by_path("profile.name"),
+            MetadataUpdates{{"persist", std::string("yes")}},
+            lance::MetadataUpdateMode::Merge,
+        },
+    });
+
+    memset(&schema, 0, sizeof(schema));
+    old.schema(&schema);
+    id_field = arrow_field_at_path(&schema, "id");
+    assert(id_field != nullptr);
+    assert_field_metadata_absent(id_field, "persist");
+    if (schema.release) schema.release(&schema);
+    assert(old.version() == initial_version);
+
+    auto reopened = lance::Dataset::open(uri);
+    memset(&schema, 0, sizeof(schema));
+    reopened.schema(&schema);
+    id_field = arrow_field_at_path(&schema, "id");
+    field = arrow_field_at_path(&schema, "profile.name");
+    assert(id_field != nullptr && field != nullptr);
+    assert_field_metadata(id_field, "persist", "yes");
+    assert_field_metadata(field, "persist", "yes");
+    if (schema.release) schema.release(&schema);
+
+    PASS();
+}
+
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::update`. Must run before `test_delete_rows`, which
 // empties the dataset.
@@ -2106,6 +2382,7 @@ int main(int argc, char** argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_data_statistics(write_uri);
     test_dataset_metadata(write_uri);
+    test_dataset_field_metadata(fragment_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);

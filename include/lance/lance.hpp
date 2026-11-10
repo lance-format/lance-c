@@ -187,6 +187,48 @@ enum class MetadataUpdateMode : int32_t {
     Replace = LANCE_METADATA_UPDATE_REPLACE,
 };
 
+enum class FieldReferenceKind : int32_t {
+    Id   = LANCE_FIELD_REFERENCE_ID,
+    Path = LANCE_FIELD_REFERENCE_PATH,
+};
+
+/// Owned field reference for field metadata updates and field-ID resolution.
+/// The wrapper keeps the path string alive for the duration of C calls.
+class FieldReference {
+    FieldReferenceKind kind_;
+    int32_t field_id_ = 0;
+    std::string path_;
+
+    FieldReference(FieldReferenceKind kind, int32_t field_id, std::string path)
+        : kind_(kind), field_id_(field_id), path_(std::move(path)) {}
+
+public:
+    static FieldReference by_id(int32_t field_id) {
+        return FieldReference(FieldReferenceKind::Id, field_id, {});
+    }
+
+    static FieldReference by_path(std::string path) {
+        return FieldReference(FieldReferenceKind::Path, 0, std::move(path));
+    }
+
+    LanceFieldReference c_handle() const {
+        return LanceFieldReference{
+            static_cast<LanceFieldReferenceKind>(kind_),
+            field_id_,
+            kind_ == FieldReferenceKind::Path ? path_.c_str() : nullptr,
+        };
+    }
+};
+
+/// One field's metadata update in a batch. A `std::nullopt` value removes its
+/// key; an empty string stores a real empty value. The mode applies only to
+/// this field.
+struct FieldMetadataUpdate {
+    FieldReference field;
+    std::vector<std::pair<std::string, std::optional<std::string>>> values;
+    MetadataUpdateMode mode = MetadataUpdateMode::Merge;
+};
+
 enum class FtsCoverageMode : int32_t {
     Strict    = LANCE_FTS_COVERAGE_STRICT,
     IndexOnly = LANCE_FTS_COVERAGE_INDEX_ONLY,
@@ -756,6 +798,39 @@ class Dataset {
         return out;
     }
 
+    static void run_field_metadata_update(
+        LanceDataset* dataset,
+        const std::vector<FieldMetadataUpdate>& updates) {
+
+        std::vector<std::vector<const char*>> keys(updates.size());
+        std::vector<std::vector<const char*>> values(updates.size());
+        std::vector<LanceFieldMetadataUpdate> raw;
+        raw.reserve(updates.size());
+
+        for (size_t i = 0; i < updates.size(); ++i) {
+            keys[i].reserve(updates[i].values.size());
+            values[i].reserve(updates[i].values.size());
+            for (const auto& [key, value] : updates[i].values) {
+                keys[i].push_back(key.c_str());
+                values[i].push_back(value ? value->c_str() : nullptr);
+            }
+            raw.push_back(LanceFieldMetadataUpdate{
+                updates[i].field.c_handle(),
+                keys[i].data(),
+                values[i].data(),
+                updates[i].values.size(),
+                static_cast<LanceMetadataUpdateMode>(updates[i].mode),
+            });
+        }
+
+        if (lance_dataset_update_field_metadata(
+                dataset,
+                updates.empty() ? nullptr : raw.data(),
+                updates.size()) != 0) {
+            check_error();
+        }
+    }
+
 public:
     /// Open a dataset at the given URI. Pass `version` = 0 (the default) for
     /// the latest, or a specific version id from `versions()` to check out
@@ -978,6 +1053,75 @@ public:
         MetadataUpdateMode mode = MetadataUpdateMode::Merge) {
         return run_metadata_update_json(
             handle_.get(), values, mode, /*schema_metadata=*/true);
+    }
+
+    /// Apply a batch of per-field metadata updates in one native commit.
+    /// Duplicate references to the same resolved field follow native
+    /// last-write-wins behavior. Read the committed field metadata through
+    /// `schema()`. Throws lance::Error on failure.
+    void update_field_metadata(const std::vector<FieldMetadataUpdate>& updates) {
+        run_field_metadata_update(handle_.get(), updates);
+    }
+
+    /// Current snapshot's canonical native Lance data-storage version string.
+    /// Throws lance::Error on failure.
+    std::string data_storage_version() const {
+        const char* version =
+            lance_dataset_data_storage_version(handle_.get());
+        if (!version) check_error();
+        std::string out(version);
+        lance_free_string(version);
+        return out;
+    }
+
+    /// Whether the current snapshot uses stable row IDs.
+    /// Throws lance::Error on failure.
+    bool has_stable_row_ids() const {
+        bool stable = false;
+        if (lance_dataset_has_stable_row_ids(handle_.get(), &stable) != 0) {
+            check_error();
+        }
+        return stable;
+    }
+
+    /// Field IDs in the current schema's native pre-order traversal.
+    /// Throws lance::Error on failure.
+    std::vector<int32_t> field_ids() const {
+        size_t count = 0;
+        if (lance_dataset_field_id_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::vector<int32_t> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            int32_t field_id = 0;
+            if (lance_dataset_field_id_at(handle_.get(), i, &field_id) != 0) {
+                check_error();
+            }
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Resolve a field reference against the current snapshot's schema.
+    /// Throws lance::Error on an unknown ID or path.
+    int32_t resolve_field_id(const FieldReference& field) const {
+        int32_t field_id = 0;
+        LanceFieldReference raw = field.c_handle();
+        if (lance_dataset_resolve_field_id(handle_.get(), &raw, &field_id) != 0) {
+            check_error();
+        }
+        return field_id;
+    }
+
+    /// Native minimal Lance field path for `field_id`, including nested fields.
+    /// Throws lance::Error on failure.
+    std::string field_path(int32_t field_id) const {
+        const char* path = lance_dataset_field_path(handle_.get(), field_id);
+        if (!path) check_error();
+        std::string out(path);
+        lance_free_string(path);
+        return out;
     }
 
     /// Snapshot the dataset's version history, ordered by version id.
