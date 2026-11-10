@@ -475,7 +475,10 @@ LanceDataset* lance_dataset_checkout_ref(
  *
  * `branch_name` must be UTF-8. `reference` must be an existing LanceRef.
  * Branch-name validation, reference resolution and duplicate detection are
- * performed by Lance's `Dataset::create_branch`.
+ * performed by Lance's `Dataset::create_branch`. Reusing an existing branch
+ * name may fail in the native shallow-clone phase instead of reaching the
+ * BranchContents conflict check; that native error is passed through rather
+ * than replaced with a synthesized conflict.
  *
  * `storage_opts` is NULL-terminated key-value pairs, or NULL. NULL passes
  * `None` to native, so the source dataset's store params are used. A non-NULL

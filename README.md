@@ -541,7 +541,8 @@ explicit empty object-store params. Native creation is a non-atomic shallow
 clone followed by a `BranchContents` write. If creation leaves a branch
 dataset without `BranchContents`, use `lance_dataset_branch_force_delete()` to
 remove it. Normal deletion still rejects branches referenced by a child branch
-or a tag.
+or a tag. Reusing an existing branch name may fail in the native shallow-clone
+phase rather than reaching the `BranchContents` conflict check.
 
 Branch JSON is the selected Lance core's serde representation, not a new C
 metadata model. The list is an object keyed by branch name; each
