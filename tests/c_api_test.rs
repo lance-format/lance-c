@@ -10945,10 +10945,10 @@ fn test_minhash_search_validation_copy_and_native_errors() {
     let native_message = lance_c::runtime::block_on(async {
         let dataset = Dataset::open(&uri).await.unwrap();
         let mut scanner = dataset.scan();
-        scanner
-            .minhash_search(NativeMinHashQuery::new(MINHASH_BASE, ""))
-            .unwrap_err()
-            .to_string()
+        match scanner.minhash_search(NativeMinHashQuery::new(MINHASH_BASE, "")) {
+            Ok(_) => panic!("empty MinHash column must fail natively"),
+            Err(error) => error.to_string(),
+        }
     });
     assert!(
         native_message.contains("column to search"),
