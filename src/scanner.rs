@@ -16,7 +16,8 @@ use datafusion::physical_plan::{ExecutionPlan, empty::EmptyExec};
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::scanner::{
-    DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts, MaterializationStyle,
+    ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
+    MaterializationStyle,
     RowAddrMask, RowAddrTreeMap,
 };
 use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
@@ -115,6 +116,34 @@ impl LanceMaterializationStyle {
     }
 }
 
+/// Sort direction for one scanner ordering key, mirroring the C enum
+/// `LanceOrderDirection`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceOrderDirection {
+    Ascending = 0,
+    Descending = 1,
+}
+
+/// NULL placement for one scanner ordering key, mirroring the C enum
+/// `LanceNullOrder`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceNullOrder {
+    NullsLast = 0,
+    NullsFirst = 1,
+}
+
+/// One native scanner ordering key, mirroring the C struct
+/// `LanceColumnOrdering`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LanceColumnOrdering {
+    pub column_name: *const c_char,
+    pub direction: i32,
+    pub null_order: i32,
+}
+
 /// Opaque scanner handle. Stores configuration until stream materialization.
 pub struct LanceScanner {
     dataset: Arc<Dataset>,
@@ -160,6 +189,7 @@ pub struct LanceScanner {
     fts_query: Option<FullTextSearchQuery>,
     fts_context: Option<Arc<FtsQueryContextInner>>,
     fts_index_segments: Option<Vec<Uuid>>,
+    order_by: Option<Vec<ColumnOrdering>>,
     // Set when a panic is caught in any operation on this scanner (issue #61):
     // once poisoned, every later `lance_scanner_*` call on this handle (except
     // `lance_scanner_close`, which must always free memory) fails with
@@ -363,6 +393,7 @@ impl LanceScanner {
             fts_query: None,
             fts_context: None,
             fts_index_segments: None,
+            order_by: None,
             poisoned: Arc::new(AtomicBool::new(false)),
             poll_wakers: PollWakerRegistry::default(),
             scan_statistics_callback: None,
@@ -480,6 +511,18 @@ impl LanceScanner {
             .nearest
             .as_ref()
             .is_some_and(|query| query.mode == NearestMode::MultiVector);
+        if multi_vector
+            && self
+                .order_by
+                .as_ref()
+                .is_some_and(|ordering| !ordering.is_empty())
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                "order_by is not supported with nearest_multivector because its result window is always distance-ordered"
+                    .into(),
+            ));
+        }
+        scanner.order_by(self.order_by.clone())?;
         if let Some(NearestQuery {
             mode: NearestMode::Batch { num_queries },
             k,
@@ -1590,6 +1633,101 @@ unsafe fn scanner_set_use_stats_inner(scanner: *mut LanceScanner, use_stats: boo
     scanner.ensure_scan_not_started("use_stats")?;
     scanner.use_stats = Some(use_stats);
     Ok(0)
+}
+
+/// Replace the native scan ordering.
+///
+/// `orderings == NULL` clears the ordering (Rust `None`). A non-NULL array,
+/// including `len == 0`, is an explicit ordering list (Rust `Some`); Lance
+/// treats an empty list as no ordering. Every entry and its column name are
+/// copied before this call returns. Column existence is validated by Lance
+/// when the scan is materialized.
+///
+/// Must be set before the scan starts. Invalid direction or NULL-order values
+/// are rejected without changing the previous ordering.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_order_by(
+    scanner: *mut LanceScanner,
+    orderings: *const LanceColumnOrdering,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_order_by_inner(scanner, orderings, len)
+    })
+}
+
+unsafe fn scanner_set_order_by_inner(
+    scanner: *mut LanceScanner,
+    orderings: *const LanceColumnOrdering,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("order_by")?;
+    if orderings.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "orderings is NULL but len > 0".into(),
+        ));
+    }
+
+    let parsed = if orderings.is_null() {
+        None
+    } else {
+        let specs = if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(orderings, len) }
+        };
+        let mut parsed = Vec::with_capacity(specs.len());
+        for spec in specs {
+            parsed.push(unsafe { parse_column_ordering(spec)? });
+        }
+        Some(parsed)
+    };
+    scanner.order_by = parsed;
+    Ok(0)
+}
+
+unsafe fn parse_column_ordering(spec: &LanceColumnOrdering) -> Result<ColumnOrdering> {
+    let column_name = unsafe { helpers::parse_c_string(spec.column_name)? }
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source("order_by column_name must not be NULL".into())
+        })?
+        .to_owned();
+    let ascending = match spec.direction {
+        0 => true,
+        1 => false,
+        other => {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "order_by direction must be 0 (LanceOrderDirection::Ascending) or 1 (LanceOrderDirection::Descending), got {other}"
+                )
+                .into(),
+            ));
+        }
+    };
+    let nulls_first = match spec.null_order {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "order_by null_order must be 0 (LanceNullOrder::NullsLast) or 1 (LanceNullOrder::NullsFirst), got {other}"
+                )
+                .into(),
+            ));
+        }
+    };
+    Ok(ColumnOrdering {
+        ascending,
+        nulls_first,
+        column_name,
+    })
 }
 
 /// Set how blob columns are materialized. `handling` is the C enum
