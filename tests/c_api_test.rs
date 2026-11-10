@@ -6,6 +6,7 @@
 //! These tests call the `extern "C"` functions directly from Rust,
 //! validating the C API contract without needing a C compiler.
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
@@ -4768,6 +4769,920 @@ fn test_dataset_metadata_invalid_inputs_preserve_state() {
     );
     assert_eq!(schema_metadata_via_c(ds), schema_before);
     unsafe { lance_dataset_close(ds) };
+}
+
+#[derive(Clone, Copy)]
+enum TestFieldReference<'a> {
+    Id(i32),
+    Path(&'a str),
+}
+
+struct TestFieldUpdate<'a> {
+    field: TestFieldReference<'a>,
+    entries: Vec<(&'a str, Option<&'a str>)>,
+    mode: i32,
+}
+
+fn update_field_metadata_via_c(dataset: *mut LanceDataset, updates: &[TestFieldUpdate<'_>]) -> i32 {
+    let paths: Vec<Option<CString>> = updates
+        .iter()
+        .map(|update| match update.field {
+            TestFieldReference::Id(_) => None,
+            TestFieldReference::Path(path) => Some(c_str(path)),
+        })
+        .collect();
+    let key_strings: Vec<Vec<CString>> = updates
+        .iter()
+        .map(|update| update.entries.iter().map(|(key, _)| c_str(key)).collect())
+        .collect();
+    let value_strings: Vec<Vec<Option<CString>>> = updates
+        .iter()
+        .map(|update| {
+            update
+                .entries
+                .iter()
+                .map(|(_, value)| value.map(c_str))
+                .collect()
+        })
+        .collect();
+    let key_ptrs: Vec<Vec<*const c_char>> = key_strings
+        .iter()
+        .map(|keys| keys.iter().map(|key| key.as_ptr()).collect())
+        .collect();
+    let value_ptrs: Vec<Vec<*const c_char>> = value_strings
+        .iter()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+                .collect()
+        })
+        .collect();
+    let raw: Vec<LanceFieldMetadataUpdate> = updates
+        .iter()
+        .enumerate()
+        .map(|(index, update)| {
+            let field = match update.field {
+                TestFieldReference::Id(field_id) => LanceFieldReference {
+                    kind: 0,
+                    field_id,
+                    path: ptr::null(),
+                },
+                TestFieldReference::Path(_) => LanceFieldReference {
+                    kind: 1,
+                    field_id: 0,
+                    path: paths[index].as_ref().unwrap().as_ptr(),
+                },
+            };
+            LanceFieldMetadataUpdate {
+                field,
+                keys: key_ptrs[index].as_ptr(),
+                values: value_ptrs[index].as_ptr(),
+                count: update.entries.len(),
+                mode: update.mode,
+            }
+        })
+        .collect();
+
+    unsafe {
+        lance_dataset_update_field_metadata(
+            dataset,
+            if raw.is_empty() {
+                ptr::null()
+            } else {
+                raw.as_ptr()
+            },
+            raw.len(),
+        )
+    }
+}
+
+fn arrow_field_at_path<'a>(schema: &'a Schema, path: &str) -> &'a Field {
+    fn descend<'a>(field: &'a Field, segments: &[&str]) -> &'a Field {
+        let Some((name, remaining)) = segments.split_first() else {
+            return field;
+        };
+        let DataType::Struct(children) = field.data_type() else {
+            panic!("field '{}' is not a struct", field.name());
+        };
+        let child = children
+            .iter()
+            .find(|child| child.name() == *name)
+            .map(|child| child.as_ref())
+            .unwrap_or_else(|| panic!("missing nested field {name}"));
+        descend(child, remaining)
+    }
+
+    let segments = path.split('.').collect::<Vec<_>>();
+    let (first, remaining) = segments
+        .split_first()
+        .expect("field path must not be empty");
+    let field = schema
+        .field_with_name(first)
+        .unwrap_or_else(|_| panic!("missing field {first}"));
+    descend(field, remaining)
+}
+
+fn field_metadata_via_c(dataset: *const LanceDataset, path: &str) -> BTreeMap<String, String> {
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_dataset_schema(dataset, &mut ffi_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let schema = Schema::try_from(&ffi_schema).unwrap();
+    arrow_field_at_path(&schema, path)
+        .metadata()
+        .clone()
+        .into_iter()
+        .collect()
+}
+
+fn native_field_metadata(dataset: &Dataset, path: &str) -> BTreeMap<String, String> {
+    dataset
+        .schema()
+        .field(path)
+        .unwrap_or_else(|| panic!("missing native field {path}"))
+        .metadata
+        .clone()
+        .into_iter()
+        .collect()
+}
+
+fn field_ids_via_c(dataset: *const LanceDataset) -> Vec<i32> {
+    let mut count = 0;
+    assert_eq!(
+        unsafe { lance_dataset_field_id_count(dataset, &mut count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    (0..count)
+        .map(|index| {
+            let mut field_id = 0;
+            assert_eq!(
+                unsafe { lance_dataset_field_id_at(dataset, index, &mut field_id) },
+                0,
+                "{}",
+                take_last_error_message()
+            );
+            field_id
+        })
+        .collect()
+}
+
+fn resolve_field_id_via_c(
+    dataset: *const LanceDataset,
+    kind: i32,
+    field_id: i32,
+    path: &CString,
+) -> i32 {
+    let field = LanceFieldReference {
+        kind,
+        field_id,
+        path: if path.as_bytes().is_empty() {
+            ptr::null()
+        } else {
+            path.as_ptr()
+        },
+    };
+    let mut resolved = 0;
+    assert_eq!(
+        unsafe { lance_dataset_resolve_field_id(dataset, &field, &mut resolved) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    resolved
+}
+
+fn field_path_via_c(dataset: *const LanceDataset, field_id: i32) -> String {
+    let raw_path = unsafe { lance_dataset_field_path(dataset, field_id) };
+    assert!(!raw_path.is_null(), "{}", take_last_error_message());
+    let path = unsafe { CStr::from_ptr(raw_path) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    unsafe { lance_free_string(raw_path) };
+    path
+}
+
+fn data_storage_version_via_c(dataset: *const LanceDataset) -> String {
+    let raw_version = unsafe { lance_dataset_data_storage_version(dataset) };
+    assert!(!raw_version.is_null(), "{}", take_last_error_message());
+    let version = unsafe { CStr::from_ptr(raw_version) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    unsafe { lance_free_string(raw_version) };
+    version
+}
+
+fn stable_row_ids_via_c(dataset: *const LanceDataset) -> bool {
+    let mut stable = false;
+    assert_eq!(
+        unsafe { lance_dataset_has_stable_row_ids(dataset, &mut stable) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    stable
+}
+
+fn assert_field_error(rc: i32, expected_message: &str) {
+    assert_eq!(rc, -1);
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+    let message = take_last_error_message();
+    assert!(
+        message.contains(expected_message),
+        "expected error containing {expected_message:?}, got {message:?}"
+    );
+}
+
+fn assert_field_invalid_argument(rc: i32, expected_message: &str) {
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains(expected_message),
+        "expected error containing {expected_message:?}, got {message:?}"
+    );
+}
+
+#[test]
+fn test_dataset_field_metadata_batch_matches_native_builder() {
+    let (_c_tmp, c_uri) = create_fragment_snapshot_dataset(false);
+    let (_native_tmp, native_uri) = create_fragment_snapshot_dataset(false);
+    let c_uri_c = c_str(&c_uri);
+    let ds = unsafe { lance_dataset_open(c_uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let mut native = lance_c::runtime::block_on(Dataset::open(&native_uri)).unwrap();
+
+    let c_field_ids = field_ids_via_c(ds);
+    assert_eq!(c_field_ids, native.schema().field_ids());
+    let id_field_id = resolve_field_id_via_c(ds, 1, 0, &c_str("id"));
+    let name_field_id = resolve_field_id_via_c(ds, 1, 0, &c_str("profile.name"));
+    let score_field_id = resolve_field_id_via_c(ds, 1, 0, &c_str("profile.score"));
+    assert_eq!(id_field_id, native.schema().field("id").unwrap().id);
+    assert_eq!(
+        name_field_id,
+        native.schema().field("profile.name").unwrap().id
+    );
+    assert_eq!(
+        score_field_id,
+        native.schema().field("profile.score").unwrap().id
+    );
+
+    let seed = [
+        TestFieldUpdate {
+            field: TestFieldReference::Path("profile.name"),
+            entries: vec![("stale", Some("old")), ("empty", Some("old"))],
+            mode: LanceMetadataUpdateMode::Merge as i32,
+        },
+        TestFieldUpdate {
+            field: TestFieldReference::Id(score_field_id),
+            entries: vec![("score", Some("old")), ("remove", Some("old"))],
+            mode: LanceMetadataUpdateMode::Merge as i32,
+        },
+    ];
+    assert_eq!(
+        update_field_metadata_via_c(ds, &seed),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    lance_c::runtime::block_on(async {
+        native
+            .update_field_metadata()
+            .update("profile.name", [("stale", "old"), ("empty", "old")])
+            .unwrap()
+            .update(score_field_id, [("score", "old"), ("remove", "old")])
+            .unwrap()
+            .await
+            .unwrap();
+    });
+
+    assert_eq!(
+        update_metadata_via_c(
+            ds,
+            &[("empty", Some("")), ("table", Some("keep"))],
+            LanceMetadataUpdateMode::Merge,
+            false,
+        ),
+        serde_json::json!({"empty": "", "table": "keep"})
+    );
+    assert_eq!(
+        update_metadata_via_c(
+            ds,
+            &[("schema", Some("keep"))],
+            LanceMetadataUpdateMode::Merge,
+            true,
+        ),
+        serde_json::json!({"schema": "keep"})
+    );
+
+    let batch = [
+        TestFieldUpdate {
+            field: TestFieldReference::Id(id_field_id),
+            entries: vec![
+                ("root", Some("first")),
+                ("empty", Some("")),
+                ("remove", Some("temporary")),
+            ],
+            mode: LanceMetadataUpdateMode::Merge as i32,
+        },
+        TestFieldUpdate {
+            field: TestFieldReference::Path("profile.name"),
+            entries: vec![("nested", Some("value")), ("empty", Some(""))],
+            mode: LanceMetadataUpdateMode::Replace as i32,
+        },
+        TestFieldUpdate {
+            field: TestFieldReference::Id(score_field_id),
+            entries: vec![("score", Some("1.5")), ("remove", None)],
+            mode: LanceMetadataUpdateMode::Merge as i32,
+        },
+        TestFieldUpdate {
+            field: TestFieldReference::Path("id"),
+            entries: vec![("root", Some("last"))],
+            mode: LanceMetadataUpdateMode::Replace as i32,
+        },
+    ];
+    let version_before = unsafe { lance_dataset_version(ds) };
+    assert_eq!(
+        update_field_metadata_via_c(ds, &batch),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(ds) },
+        version_before + 1,
+        "all field updates must share one native commit"
+    );
+
+    lance_c::runtime::block_on(async {
+        native
+            .update_field_metadata()
+            .update(
+                id_field_id,
+                [("root", "first"), ("empty", ""), ("remove", "temporary")],
+            )
+            .unwrap()
+            .replace("profile.name", [("nested", "value"), ("empty", "")])
+            .unwrap()
+            .update(score_field_id, [("score", Some("1.5")), ("remove", None)])
+            .unwrap()
+            .replace("id", [("root", "last")])
+            .unwrap()
+            .await
+            .unwrap();
+    });
+
+    assert_eq!(
+        field_metadata_via_c(ds, "id"),
+        BTreeMap::from([("root".to_string(), "last".to_string())]),
+        "a later update of the same resolved field replaces the earlier builder entry"
+    );
+    assert_eq!(
+        field_metadata_via_c(ds, "profile.name"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("nested".to_string(), "value".to_string()),
+        ])
+    );
+    assert_eq!(
+        field_metadata_via_c(ds, "profile.score"),
+        BTreeMap::from([("score".to_string(), "1.5".to_string())])
+    );
+    for path in ["id", "profile.name", "profile.score"] {
+        assert_eq!(
+            field_metadata_via_c(ds, path),
+            native_field_metadata(&native, path),
+            "C field metadata for {path} must match the native builder result"
+        );
+    }
+
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_metadata_json(ds) }),
+        serde_json::json!({"empty": "", "table": "keep"}),
+        "field metadata must not change table metadata"
+    );
+    assert_eq!(
+        schema_metadata_via_c(ds),
+        BTreeMap::from([("schema".to_string(), "keep".to_string())]),
+        "field metadata must not change schema metadata"
+    );
+    assert_eq!(
+        native_metadata_map(&c_uri, false),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("table".to_string(), "keep".to_string()),
+        ])
+    );
+    assert_eq!(
+        native_metadata_map(&c_uri, true),
+        BTreeMap::from([("schema".to_string(), "keep".to_string())])
+    );
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 8);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_dataset_field_metadata_semantics_errors_and_snapshots() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(false);
+    let c_uri = c_str(&uri);
+    let writer = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let old = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!writer.is_null() && !old.is_null());
+
+    let initial_version = unsafe { lance_dataset_version(writer) };
+    assert_eq!(initial_version, 2);
+    let id_field_id = resolve_field_id_via_c(writer, 1, 0, &c_str("id"));
+    let name_field_id = resolve_field_id_via_c(writer, 1, 0, &c_str("profile.name"));
+    let score_field_id = resolve_field_id_via_c(writer, 1, 0, &c_str("profile.score"));
+
+    let key = c_str("key");
+    let value = c_str("value");
+    let keys = [key.as_ptr()];
+    let values = [value.as_ptr()];
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_update_field_metadata(ptr::null_mut(), ptr::null(), 0) },
+        "dataset must not be NULL",
+    );
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_update_field_metadata(writer, ptr::null(), 1) },
+        "updates must not be NULL",
+    );
+    let null_keys = [LanceFieldMetadataUpdate {
+        field: LanceFieldReference {
+            kind: 0,
+            field_id: id_field_id,
+            path: ptr::null(),
+        },
+        keys: ptr::null(),
+        values: values.as_ptr(),
+        count: 1,
+        mode: LanceMetadataUpdateMode::Merge as i32,
+    }];
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_update_field_metadata(writer, null_keys.as_ptr(), null_keys.len()) },
+        "keys must not be NULL",
+    );
+    let null_values = [LanceFieldMetadataUpdate {
+        field: LanceFieldReference {
+            kind: 0,
+            field_id: id_field_id,
+            path: ptr::null(),
+        },
+        keys: keys.as_ptr(),
+        values: ptr::null(),
+        count: 1,
+        mode: LanceMetadataUpdateMode::Merge as i32,
+    }];
+    assert_field_invalid_argument(
+        unsafe {
+            lance_dataset_update_field_metadata(writer, null_values.as_ptr(), null_values.len())
+        },
+        "values must not be NULL",
+    );
+    let null_path = [LanceFieldMetadataUpdate {
+        field: LanceFieldReference {
+            kind: 1,
+            field_id: 0,
+            path: ptr::null(),
+        },
+        keys: keys.as_ptr(),
+        values: values.as_ptr(),
+        count: 1,
+        mode: LanceMetadataUpdateMode::Merge as i32,
+    }];
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_update_field_metadata(writer, null_path.as_ptr(), 1) },
+        "path must not be NULL",
+    );
+    let invalid_kind = [LanceFieldMetadataUpdate {
+        field: LanceFieldReference {
+            kind: 99,
+            field_id: id_field_id,
+            path: ptr::null(),
+        },
+        keys: keys.as_ptr(),
+        values: values.as_ptr(),
+        count: 1,
+        mode: LanceMetadataUpdateMode::Merge as i32,
+    }];
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_update_field_metadata(writer, invalid_kind.as_ptr(), 1) },
+        "field.kind",
+    );
+    assert_field_invalid_argument(
+        update_field_metadata_via_c(
+            writer,
+            &[TestFieldUpdate {
+                field: TestFieldReference::Path("id"),
+                entries: vec![("key", Some("value"))],
+                mode: 99,
+            }],
+        ),
+        "metadata update mode",
+    );
+    assert_field_invalid_argument(
+        update_field_metadata_via_c(
+            writer,
+            &[TestFieldUpdate {
+                field: TestFieldReference::Id(99_999),
+                entries: vec![("key", Some("value"))],
+                mode: LanceMetadataUpdateMode::Merge as i32,
+            }],
+        ),
+        "99999",
+    );
+    assert_field_error(
+        update_field_metadata_via_c(
+            writer,
+            &[TestFieldUpdate {
+                field: TestFieldReference::Path("profile.missing"),
+                entries: vec![("key", Some("value"))],
+                mode: LanceMetadataUpdateMode::Merge as i32,
+            }],
+        ),
+        "profile.missing",
+    );
+    assert_eq!(unsafe { lance_dataset_version(writer) }, initial_version);
+    assert!(field_metadata_via_c(writer, "id").is_empty());
+    assert!(field_metadata_via_c(writer, "profile.name").is_empty());
+    assert!(field_metadata_via_c(writer, "profile.score").is_empty());
+
+    assert_eq!(
+        update_field_metadata_via_c(
+            writer,
+            &[
+                TestFieldUpdate {
+                    field: TestFieldReference::Path("id"),
+                    entries: vec![
+                        ("empty", Some("")),
+                        ("remove", Some("gone")),
+                        ("persist", Some("yes")),
+                    ],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Id(name_field_id),
+                    entries: vec![("nested", Some("one"))],
+                    mode: LanceMetadataUpdateMode::Replace as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Id(score_field_id),
+                    entries: vec![("score", Some("one"))],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+            ],
+        ),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 1
+    );
+    assert_eq!(
+        field_metadata_via_c(writer, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "yes".to_string()),
+            ("remove".to_string(), "gone".to_string()),
+        ])
+    );
+    assert!(field_metadata_via_c(old, "id").is_empty());
+    assert!(field_metadata_via_c(old, "profile.name").is_empty());
+
+    assert_eq!(
+        update_field_metadata_via_c(
+            writer,
+            &[
+                TestFieldUpdate {
+                    field: TestFieldReference::Id(id_field_id),
+                    entries: vec![("remove", None)],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Path("profile.name"),
+                    entries: vec![("extra", Some("two"))],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+            ],
+        ),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 2
+    );
+    assert_eq!(
+        field_metadata_via_c(writer, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "yes".to_string()),
+        ])
+    );
+    assert_eq!(
+        field_metadata_via_c(writer, "profile.name"),
+        BTreeMap::from([
+            ("extra".to_string(), "two".to_string()),
+            ("nested".to_string(), "one".to_string()),
+        ])
+    );
+
+    assert_eq!(
+        update_field_metadata_via_c(
+            writer,
+            &[
+                TestFieldUpdate {
+                    field: TestFieldReference::Id(name_field_id),
+                    entries: Vec::new(),
+                    mode: LanceMetadataUpdateMode::Replace as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Path("profile.score"),
+                    entries: Vec::new(),
+                    mode: LanceMetadataUpdateMode::Replace as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Id(id_field_id),
+                    entries: Vec::new(),
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+            ],
+        ),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        initial_version + 3
+    );
+    assert!(field_metadata_via_c(writer, "profile.name").is_empty());
+    assert!(field_metadata_via_c(writer, "profile.score").is_empty());
+    assert_eq!(
+        field_metadata_via_c(writer, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "yes".to_string()),
+        ]),
+        "zero entries in merge mode must not change field metadata"
+    );
+
+    assert_eq!(
+        update_field_metadata_via_c(writer, &[]),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        field_metadata_via_c(writer, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "yes".to_string()),
+        ])
+    );
+
+    let version_before_final = unsafe { lance_dataset_version(writer) };
+    assert_eq!(
+        update_field_metadata_via_c(
+            writer,
+            &[
+                TestFieldUpdate {
+                    field: TestFieldReference::Path("id"),
+                    entries: vec![("persist", Some("latest"))],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+                TestFieldUpdate {
+                    field: TestFieldReference::Path("profile.name"),
+                    entries: vec![("nested", Some("persist"))],
+                    mode: LanceMetadataUpdateMode::Merge as i32,
+                },
+            ],
+        ),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(writer) },
+        version_before_final + 1
+    );
+
+    let historical =
+        unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), initial_version + 1) };
+    assert!(!historical.is_null());
+    assert_eq!(
+        field_metadata_via_c(historical, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "yes".to_string()),
+            ("remove".to_string(), "gone".to_string()),
+        ])
+    );
+    assert_eq!(
+        field_metadata_via_c(historical, "profile.name"),
+        BTreeMap::from([("nested".to_string(), "one".to_string())])
+    );
+    assert_eq!(
+        field_metadata_via_c(historical, "profile.score"),
+        BTreeMap::from([("score".to_string(), "one".to_string())])
+    );
+
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null());
+    assert_eq!(
+        field_metadata_via_c(reopened, "id"),
+        BTreeMap::from([
+            ("empty".to_string(), String::new()),
+            ("persist".to_string(), "latest".to_string()),
+        ])
+    );
+    assert_eq!(
+        field_metadata_via_c(reopened, "profile.name"),
+        BTreeMap::from([("nested".to_string(), "persist".to_string())])
+    );
+    assert!(field_metadata_via_c(reopened, "profile.score").is_empty());
+
+    unsafe {
+        lance_dataset_close(reopened);
+        lance_dataset_close(historical);
+        lance_dataset_close(old);
+        lance_dataset_close(writer);
+    }
+}
+
+#[test]
+fn test_dataset_snapshot_inspection_matches_native() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+
+    assert_eq!(
+        data_storage_version_via_c(ds),
+        native
+            .manifest()
+            .data_storage_format
+            .version
+            .to_manifest_string()
+    );
+    assert_eq!(
+        stable_row_ids_via_c(ds),
+        native.manifest().uses_stable_row_ids()
+    );
+    assert_eq!(field_ids_via_c(ds), native.schema().field_ids());
+
+    let nested_path = c_str("profile.name");
+    let nested_id = resolve_field_id_via_c(ds, 1, 0, &nested_path);
+    assert_eq!(nested_id, native.schema().field("profile.name").unwrap().id);
+    assert_eq!(
+        resolve_field_id_via_c(ds, 0, nested_id, &c_str("")),
+        nested_id
+    );
+    assert_eq!(field_path_via_c(ds, nested_id), "profile.name");
+    for field_id in field_ids_via_c(ds) {
+        assert_eq!(
+            field_path_via_c(ds, field_id),
+            native.schema().field_path_minimal(field_id).unwrap()
+        );
+    }
+
+    let stable = true;
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_has_stable_row_ids(ds, ptr::null_mut()) },
+        "out_has_stable_row_ids must not be NULL",
+    );
+    assert!(stable);
+    let count = usize::MAX;
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_field_id_count(ds, ptr::null_mut()) },
+        "out_count must not be NULL",
+    );
+    assert_eq!(count, usize::MAX);
+    let mut field_id = -123;
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_field_id_at(ds, 99_999, &mut field_id) },
+        "out of range",
+    );
+    assert_eq!(field_id, -123);
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_field_id_at(ds, 0, ptr::null_mut()) },
+        "out_field_id must not be NULL",
+    );
+    assert_field_invalid_argument(
+        unsafe { lance_dataset_resolve_field_id(ds, ptr::null(), &mut field_id) },
+        "field must not be NULL",
+    );
+    assert_field_invalid_argument(
+        unsafe {
+            lance_dataset_resolve_field_id(
+                ds,
+                &LanceFieldReference {
+                    kind: 0,
+                    field_id: nested_id,
+                    path: ptr::null(),
+                },
+                ptr::null_mut(),
+            )
+        },
+        "out_field_id must not be NULL",
+    );
+    assert_field_error(
+        unsafe {
+            lance_dataset_resolve_field_id(
+                ds,
+                &LanceFieldReference {
+                    kind: 1,
+                    field_id: 0,
+                    path: c_str("profile.missing").as_ptr(),
+                },
+                &mut field_id,
+            )
+        },
+        "profile.missing",
+    );
+    assert_eq!(field_id, -123);
+    let unknown_path = unsafe { lance_dataset_field_path(ds, 99_999) };
+    assert!(unknown_path.is_null());
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+    let _ = take_last_error_message();
+
+    let historical = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 2) };
+    assert!(!historical.is_null());
+    assert_eq!(
+        data_storage_version_via_c(historical),
+        data_storage_version_via_c(ds)
+    );
+    assert_eq!(stable_row_ids_via_c(historical), stable_row_ids_via_c(ds));
+    assert_eq!(field_ids_via_c(historical), field_ids_via_c(ds));
+    unsafe {
+        lance_dataset_close(historical);
+        lance_dataset_close(ds);
+    }
+
+    let (_stable_tmp, stable_uri) = create_multi_fragment_vector_dataset(2, 8, 8, true);
+    let stable_c_uri = c_str(&stable_uri);
+    let stable_ds = unsafe { lance_dataset_open(stable_c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!stable_ds.is_null());
+    let native_stable = lance_c::runtime::block_on(Dataset::open(&stable_uri)).unwrap();
+    assert!(stable_row_ids_via_c(stable_ds));
+    assert_eq!(
+        data_storage_version_via_c(stable_ds),
+        native_stable
+            .manifest()
+            .data_storage_format
+            .version
+            .to_manifest_string()
+    );
+    assert_eq!(
+        field_ids_via_c(stable_ds),
+        native_stable.schema().field_ids()
+    );
+    unsafe { lance_dataset_close(stable_ds) };
+
+    let legacy_tmp = tempfile::tempdir().unwrap();
+    let legacy_uri = legacy_tmp
+        .path()
+        .join("legacy_inspection")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let legacy_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let legacy_batch = RecordBatch::try_new(
+        legacy_schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(legacy_batch)], legacy_schema),
+            &legacy_uri,
+            Some(lance::dataset::WriteParams {
+                data_storage_version: Some(lance_file::version::LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+    let legacy_c_uri = c_str(&legacy_uri);
+    let legacy_ds = unsafe { lance_dataset_open(legacy_c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!legacy_ds.is_null());
+    assert_eq!(data_storage_version_via_c(legacy_ds), "0.1");
+    assert!(!stable_row_ids_via_c(legacy_ds));
+    unsafe { lance_dataset_close(legacy_ds) };
 }
 
 #[test]

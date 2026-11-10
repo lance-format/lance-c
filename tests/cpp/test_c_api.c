@@ -40,6 +40,85 @@
         }                                                                      \
     } while (0)
 
+static const char *arrow_field_metadata_value(
+    const struct ArrowSchema *field,
+    const char *key,
+    size_t *value_len) {
+    if (field == NULL || field->metadata == NULL) return NULL;
+    const char *cursor = field->metadata;
+    int32_t pair_count = 0;
+    memcpy(&pair_count, cursor, sizeof(pair_count));
+    cursor += sizeof(pair_count);
+    for (int32_t i = 0; i < pair_count; ++i) {
+        int32_t key_len = 0;
+        memcpy(&key_len, cursor, sizeof(key_len));
+        cursor += sizeof(key_len);
+        const char *key_data = cursor;
+        cursor += key_len;
+        int32_t stored_value_len = 0;
+        memcpy(&stored_value_len, cursor, sizeof(stored_value_len));
+        cursor += sizeof(stored_value_len);
+        const char *value_data = cursor;
+        cursor += stored_value_len;
+        if (key_len == (int32_t)strlen(key) &&
+            memcmp(key_data, key, (size_t)key_len) == 0) {
+            if (value_len != NULL) *value_len = (size_t)stored_value_len;
+            return value_data;
+        }
+    }
+    return NULL;
+}
+
+static const struct ArrowSchema *arrow_field_at_path(
+    const struct ArrowSchema *schema,
+    const char *path) {
+    const struct ArrowSchema *field = schema;
+    const char *segment = path;
+    while (*segment != '\0') {
+        const char *dot = strchr(segment, '.');
+        size_t segment_len = dot == NULL ? strlen(segment) : (size_t)(dot - segment);
+        const struct ArrowSchema *child = NULL;
+        for (int64_t i = 0; i < field->n_children; ++i) {
+            const struct ArrowSchema *candidate = field->children[i];
+            if (candidate != NULL && candidate->name != NULL &&
+                strlen(candidate->name) == segment_len &&
+                memcmp(candidate->name, segment, segment_len) == 0) {
+                child = candidate;
+                break;
+            }
+        }
+        if (child == NULL) return NULL;
+        field = child;
+        if (dot == NULL) break;
+        segment = dot + 1;
+    }
+    return field;
+}
+
+static void assert_field_metadata(
+    const struct ArrowSchema *field,
+    const char *key,
+    const char *expected) {
+    size_t value_len = 0;
+    const char *value = arrow_field_metadata_value(field, key, &value_len);
+    ASSERT(value != NULL, "expected field metadata key");
+    ASSERT(value_len == strlen(expected), "field metadata value length mismatch");
+    ASSERT(memcmp(value, expected, value_len) == 0, "field metadata value mismatch");
+}
+
+static void assert_field_metadata_absent(
+    const struct ArrowSchema *field,
+    const char *key) {
+    if (arrow_field_metadata_value(field, key, NULL) != NULL) {
+        fprintf(stderr,
+                "unexpected field metadata: field=%s key=%s\n",
+                field != NULL && field->name != NULL ? field->name : "<null>",
+                key);
+    }
+    ASSERT(arrow_field_metadata_value(field, key, NULL) == NULL,
+           "field metadata key should be absent");
+}
+
 typedef struct {
     uint64_t calls;
     uint64_t bytes_read;
@@ -1508,6 +1587,273 @@ static void test_dataset_metadata(const char *write_uri) {
     printf("OK\n");
 }
 
+/* Exercises batched native field metadata updates plus schema/snapshot
+ * inspection through the C ABI. */
+static void test_dataset_field_metadata(const char *fragment_uri) {
+    printf("  test_dataset_field_metadata... ");
+
+    LanceDataset *ds = lance_dataset_open(fragment_uri, NULL, 0);
+    LanceDataset *old = lance_dataset_open(fragment_uri, NULL, 0);
+    ASSERT(ds != NULL && old != NULL, "field metadata dataset open failed");
+
+    uint64_t initial_version = lance_dataset_version(ds);
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(ds) == 2,
+           "nested fixture must have two fragments");
+    ASSERT(lance_dataset_count_rows(ds) == 6,
+           "nested fixture must retain its logical rows");
+
+    const char *storage_version = lance_dataset_data_storage_version(ds);
+    ASSERT(storage_version != NULL, "data storage version read failed");
+    ASSERT(strcmp(storage_version, "2.2") == 0,
+           "fragment fixture should use native 2.2 storage");
+    lance_free_string(storage_version);
+
+    bool stable = true;
+    ASSERT(lance_dataset_has_stable_row_ids(ds, &stable) == 0,
+           "stable row ID read failed");
+    ASSERT(!stable, "fragment fixture must not use stable row IDs");
+
+    size_t field_count = 0;
+    ASSERT(lance_dataset_field_id_count(ds, &field_count) == 0,
+           "field ID count failed");
+    ASSERT(field_count >= 4, "nested fixture should expose four fields");
+
+    LanceFieldReference id_path = {LANCE_FIELD_REFERENCE_PATH, 0, "id"};
+    LanceFieldReference name_path = {LANCE_FIELD_REFERENCE_PATH, 0, "profile.name"};
+    LanceFieldReference score_path = {LANCE_FIELD_REFERENCE_PATH, 0, "profile.score"};
+    int32_t id_id = 0;
+    int32_t name_id = 0;
+    int32_t score_id = 0;
+    ASSERT(lance_dataset_resolve_field_id(ds, &id_path, &id_id) == 0,
+           "resolve id path failed");
+    ASSERT(lance_dataset_resolve_field_id(ds, &name_path, &name_id) == 0,
+           "resolve nested name path failed");
+    ASSERT(lance_dataset_resolve_field_id(ds, &score_path, &score_id) == 0,
+           "resolve nested score path failed");
+
+    const char *nested_path = lance_dataset_field_path(ds, name_id);
+    ASSERT(nested_path != NULL, "nested field path read failed");
+    ASSERT(strcmp(nested_path, "profile.name") == 0,
+           "nested field path mismatch");
+    lance_free_string(nested_path);
+
+    int32_t listed_nested_id = 0;
+    ASSERT(lance_dataset_field_id_at(ds, field_count - 1, &listed_nested_id) == 0,
+           "field ID traversal failed");
+    const char *traversed_path = lance_dataset_field_path(ds, listed_nested_id);
+    ASSERT(traversed_path != NULL, "traversed field path failed");
+    lance_free_string(traversed_path);
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0, "initial schema export failed");
+    const struct ArrowSchema *profile_name =
+        arrow_field_at_path(&schema, "profile.name");
+    ASSERT(profile_name != NULL, "nested Arrow field missing");
+    ASSERT(arrow_field_metadata_value(profile_name, "nested", NULL) == NULL,
+           "initial field metadata should be empty");
+    if (schema.release) schema.release(&schema);
+
+    /* Invalid inputs and native field lookup errors must not advance the
+     * version or change committed metadata. */
+    const char *bad_key[] = {"key"};
+    const char *bad_value[] = {"value"};
+    LanceFieldMetadataUpdate bad_updates[] = {
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "id"}, bad_key, bad_value, 1,
+         LANCE_METADATA_UPDATE_MERGE},
+    };
+    ASSERT(lance_dataset_update_field_metadata(NULL, bad_updates, 1) == -1,
+           "NULL dataset update must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL dataset update must return INVALID_ARGUMENT");
+    ASSERT(lance_dataset_update_field_metadata(ds, NULL, 1) == -1,
+           "NULL updates must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL updates must return INVALID_ARGUMENT");
+    bad_updates[0].keys = NULL;
+    ASSERT(lance_dataset_update_field_metadata(ds, bad_updates, 1) == -1,
+           "NULL keys must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL keys must return INVALID_ARGUMENT");
+    bad_updates[0].keys = bad_key;
+    bad_updates[0].mode = (LanceMetadataUpdateMode)99;
+    ASSERT(lance_dataset_update_field_metadata(ds, bad_updates, 1) == -1,
+           "invalid field update mode must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid field update mode must return INVALID_ARGUMENT");
+    bad_updates[0].mode = LANCE_METADATA_UPDATE_MERGE;
+    bad_updates[0].field.field_id = 99999;
+    bad_updates[0].field.kind = LANCE_FIELD_REFERENCE_ID;
+    ASSERT(lance_dataset_update_field_metadata(ds, bad_updates, 1) == -1,
+           "unknown field ID must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "unknown field ID must return INVALID_ARGUMENT");
+    bad_updates[0].field.kind = LANCE_FIELD_REFERENCE_PATH;
+    bad_updates[0].field.path = "profile.missing";
+    ASSERT(lance_dataset_update_field_metadata(ds, bad_updates, 1) == -1,
+           "unknown field path must fail");
+    ASSERT(lance_last_error_code() != LANCE_OK,
+           "unknown field path must set an error");
+    const char *path_error = lance_last_error_message();
+    ASSERT(path_error != NULL && strstr(path_error, "profile.missing") != NULL,
+           "unknown field path error must identify the path");
+    if (path_error) lance_free_string(path_error);
+    ASSERT(lance_dataset_version(ds) == initial_version,
+           "rejected field updates must not commit");
+
+    const char *id_keys[] = {"owner", "empty", "remove"};
+    const char *id_values[] = {"c-consumer", "", "temporary"};
+    const char *name_keys[] = {"nested", "empty"};
+    const char *name_values[] = {"value", ""};
+    const char *score_keys[] = {"score", "remove"};
+    const char *score_values[] = {"1.5", NULL};
+    LanceFieldMetadataUpdate updates[] = {
+        {{LANCE_FIELD_REFERENCE_ID, id_id, NULL}, id_keys, id_values, 3,
+         LANCE_METADATA_UPDATE_MERGE},
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "profile.name"}, name_keys, name_values, 2,
+         LANCE_METADATA_UPDATE_REPLACE},
+        {{LANCE_FIELD_REFERENCE_ID, score_id, NULL}, score_keys, score_values, 2,
+         LANCE_METADATA_UPDATE_MERGE},
+    };
+    uint64_t version_before = lance_dataset_version(ds);
+    ASSERT(lance_dataset_update_field_metadata(ds, updates, 3) == 0,
+           "batched field update failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(ds) == version_before + 1,
+           "batched field updates must share one commit");
+
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0, "updated schema export failed");
+    const struct ArrowSchema *id_field = arrow_field_at_path(&schema, "id");
+    profile_name = arrow_field_at_path(&schema, "profile.name");
+    const struct ArrowSchema *score_field =
+        arrow_field_at_path(&schema, "profile.score");
+    ASSERT(id_field != NULL && profile_name != NULL && score_field != NULL,
+           "updated Arrow fields missing");
+    assert_field_metadata(id_field, "owner", "c-consumer");
+    assert_field_metadata(id_field, "empty", "");
+    assert_field_metadata(id_field, "remove", "temporary");
+    assert_field_metadata(profile_name, "nested", "value");
+    assert_field_metadata(profile_name, "empty", "");
+    assert_field_metadata(score_field, "score", "1.5");
+    assert_field_metadata_absent(score_field, "remove");
+    if (schema.release) schema.release(&schema);
+
+    /* The native builder stores updates by resolved field ID; the last update
+     * for `id` wins even though it is reached through another reference form. */
+    const char *root_keys[] = {"root"};
+    const char *first_values[] = {"first"};
+    const char *last_values[] = {"last"};
+    LanceFieldMetadataUpdate duplicate_updates[] = {
+        {{LANCE_FIELD_REFERENCE_ID, id_id, NULL}, root_keys, first_values, 1,
+         LANCE_METADATA_UPDATE_MERGE},
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "id"}, root_keys, last_values, 1,
+         LANCE_METADATA_UPDATE_REPLACE},
+    };
+    version_before = lance_dataset_version(ds);
+    ASSERT(lance_dataset_update_field_metadata(ds, duplicate_updates, 2) == 0,
+           "duplicate field update failed");
+    ASSERT(lance_dataset_version(ds) == version_before + 1,
+           "duplicate field updates must share one commit");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0,
+           "duplicate update schema export failed");
+    id_field = arrow_field_at_path(&schema, "id");
+    ASSERT(id_field != NULL, "duplicate update id field missing");
+    assert_field_metadata(id_field, "root", "last");
+    assert_field_metadata_absent(id_field, "owner");
+    if (schema.release) schema.release(&schema);
+
+    const char *temp_keys[] = {"remove", "empty"};
+    const char *temp_values[] = {"temporary", ""};
+    const char *remove_keys[] = {"remove"};
+    const char *remove_values[] = {NULL};
+    LanceFieldMetadataUpdate temp_update[] = {
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "id"}, temp_keys, temp_values, 2,
+         LANCE_METADATA_UPDATE_MERGE},
+    };
+    LanceFieldMetadataUpdate remove_update[] = {
+        {{LANCE_FIELD_REFERENCE_ID, id_id, NULL}, remove_keys, remove_values, 1,
+         LANCE_METADATA_UPDATE_MERGE},
+    };
+    ASSERT(lance_dataset_update_field_metadata(ds, temp_update, 1) == 0,
+           "temporary field metadata update failed");
+    ASSERT(lance_dataset_update_field_metadata(ds, remove_update, 1) == 0,
+           "field metadata removal failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0,
+           "removal schema export failed");
+    id_field = arrow_field_at_path(&schema, "id");
+    ASSERT(id_field != NULL, "removal id field missing");
+    assert_field_metadata(id_field, "root", "last");
+    assert_field_metadata(id_field, "empty", "");
+    assert_field_metadata_absent(id_field, "remove");
+    if (schema.release) schema.release(&schema);
+
+    LanceFieldMetadataUpdate clear_update[] = {
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "id"}, NULL, NULL, 0,
+         LANCE_METADATA_UPDATE_REPLACE},
+    };
+    ASSERT(lance_dataset_update_field_metadata(ds, clear_update, 1) == 0,
+           "empty field replacement failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0, "clear schema export failed");
+    id_field = arrow_field_at_path(&schema, "id");
+    ASSERT(id_field != NULL, "clear id field missing");
+    ASSERT(arrow_field_metadata_value(id_field, "root", NULL) == NULL,
+           "empty replacement must clear field metadata");
+    if (schema.release) schema.release(&schema);
+
+    ASSERT(lance_dataset_update_field_metadata(ds, NULL, 0) == 0,
+           "empty field update batch must succeed");
+    CHECK_OK();
+
+    const char *persist_keys[] = {"persist"};
+    const char *persist_values[] = {"yes"};
+    LanceFieldMetadataUpdate persist_updates[] = {
+        {{LANCE_FIELD_REFERENCE_ID, id_id, NULL}, persist_keys, persist_values, 1,
+         LANCE_METADATA_UPDATE_MERGE},
+        {{LANCE_FIELD_REFERENCE_PATH, 0, "profile.name"}, persist_keys,
+         persist_values, 1, LANCE_METADATA_UPDATE_MERGE},
+    };
+    version_before = lance_dataset_version(ds);
+    ASSERT(lance_dataset_update_field_metadata(ds, persist_updates, 2) == 0,
+           "persistent field metadata update failed");
+    ASSERT(lance_dataset_version(ds) == version_before + 1,
+           "persistent field updates must share one commit");
+
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(old, &schema) == 0,
+           "old snapshot schema export failed");
+    id_field = arrow_field_at_path(&schema, "id");
+    ASSERT(id_field != NULL, "old snapshot id field missing");
+    ASSERT(arrow_field_metadata_value(id_field, "persist", NULL) == NULL,
+           "independent handle must keep its prior snapshot");
+    if (schema.release) schema.release(&schema);
+    ASSERT(lance_dataset_version(old) == initial_version,
+           "independent handle version must not advance");
+
+    lance_dataset_close(old);
+    lance_dataset_close(ds);
+
+    ds = lance_dataset_open(fragment_uri, NULL, 0);
+    ASSERT(ds != NULL, "field metadata reopen failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(ds, &schema) == 0,
+           "reopened schema export failed");
+    id_field = arrow_field_at_path(&schema, "id");
+    profile_name = arrow_field_at_path(&schema, "profile.name");
+    ASSERT(id_field != NULL && profile_name != NULL,
+           "reopened fields missing");
+    assert_field_metadata(id_field, "persist", "yes");
+    assert_field_metadata(profile_name, "persist", "yes");
+    if (schema.release) schema.release(&schema);
+    lance_dataset_close(ds);
+
+    printf("OK\n");
+}
+
 /* Re-opens the dataset just written by `test_dataset_write_roundtrip` and
  * exercises `lance_dataset_update`. Must run before `test_delete`, which
  * empties the dataset. */
@@ -2852,6 +3198,7 @@ int main(int argc, char **argv) {
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
     test_dataset_metadata(write_uri);
+    test_dataset_field_metadata(fragment_uri);
     test_update(write_uri);
     test_merge_insert(write_uri);
     test_alter_columns(write_uri);
