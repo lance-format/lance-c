@@ -9724,7 +9724,7 @@ fn test_typed_fts_query_matches_native_semantics() {
     let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!dataset.is_null(), "{}", take_last_error_message());
 
-    let exact = initialized_match_options();
+    let mut exact = initialized_match_options();
     let exact_c = typed_match("alpha", Some("title"), &exact);
     let exact_native = native_match_query("alpha", Some("title"), &exact);
     assert_scores_match(

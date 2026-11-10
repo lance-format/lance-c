@@ -214,7 +214,7 @@ fn create_typed_fts_dataset_on_disk() -> (tempfile::TempDir, String) {
             )
         };
         if rc != 0 {
-            let message = unsafe { lance_c::lance_last_error_message() };
+            let message = lance_c::lance_last_error_message();
             let message = if message.is_null() {
                 "unknown error".to_string()
             } else {
