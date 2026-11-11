@@ -46,9 +46,7 @@ use lance::dataset::mem_wal::{
 };
 use lance_index::mem_wal::{ShardingField, ShardingSpec};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::DistanceType;
-use lance_table::system_index::mem_wal::CompactedSsTable as NativeCompactedSsTable;
 use uuid::Uuid;
 
 use crate::batch::LanceBatch;
@@ -348,7 +346,10 @@ fn snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -> Shar
         sstables: manifest
             .sstables
             .into_iter()
-            .map(|sstable| SsTable::unmeasured(sstable.generation, sstable.path))
+            .map(|sstable| SsTable {
+                generation: sstable.generation,
+                path: sstable.path,
+            })
             .collect(),
     }
 }
@@ -1253,7 +1254,7 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_with_sstable(
             snapshot
                 .snapshot
                 .sstables
-                .push(SsTable::unmeasured(generation, path));
+                .push(SsTable { generation, path });
             snapshot.sync_paths()?;
             Ok(0)
         },
@@ -2299,7 +2300,7 @@ unsafe fn vector_planner_new_inner(
         base_schema.clone(),
         vector_column,
         distance,
-    )?
+    )
     .with_identity_schema(identity_schema)
     .with_dataset(native)
     .with_filter(filter_expr);
@@ -2530,12 +2531,6 @@ pub unsafe extern "C" fn lance_mem_wal_plan_to_arrow_stream(
             let batches = execute_plan_batches(&plan.plan)?;
             let schema = plan.plan.schema();
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-            let reader = GuardedReader::new(
-                reader,
-                plan.plan.schema(),
-                RT.handle().clone(),
-                Arc::new(AtomicBool::new(false)),
-            );
             write_ffi_stream(out, reader)?;
             Ok(0)
         },
