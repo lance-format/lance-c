@@ -158,6 +158,9 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
 fn create_native_schema_fixture(name: &str) -> (tempfile::TempDir, String) {
     use std::collections::HashMap;
 
+    use lance::dataset::WriteDestination;
+    use lance::dataset::transaction::Operation;
+
     fn field_with_id(
         name: &str,
         data_type: DataType,
@@ -270,32 +273,40 @@ fn create_native_schema_fixture(name: &str) -> (tempfile::TempDir, String) {
     let first = make_batch(&[1, 2, 3], &[0, 1, 2]);
     let second = make_batch(&[4, 5], &[1, 0]);
     let third = make_batch(&[6, 7, 8, 9], &[2, 2, 0, 1]);
+    let mut native_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+    native_schema.set_dictionary(&first).unwrap();
     lance_c::runtime::block_on(async {
-        let params = WriteParams {
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
-        let mut dataset = Dataset::write(
-            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
-            &uri,
-            Some(params),
+        // `Dataset::write` reassigns new-dataset field IDs; create through a
+        // native Overwrite commit to keep the explicit non-contiguous IDs.
+        let mut dataset = Dataset::commit(
+            WriteDestination::Uri(&uri),
+            Operation::Overwrite {
+                fragments: Vec::new(),
+                schema: native_schema,
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+            None,
+            None,
+            Default::default(),
+            false,
         )
         .await
         .unwrap();
-        dataset
-            .append(
-                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
-                None,
-            )
-            .await
-            .unwrap();
-        dataset
-            .append(
-                arrow::record_batch::RecordBatchIterator::new(vec![Ok(third)], schema),
-                None,
-            )
-            .await
-            .unwrap();
+        for batch in [first, second, third] {
+            dataset
+                .append(
+                    arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    Some(WriteParams {
+                        max_rows_per_file: 1024,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        dataset.migrate_to_stable_row_ids().await.unwrap();
         dataset.delete("id = 2").await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
     });

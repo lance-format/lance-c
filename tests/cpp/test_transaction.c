@@ -701,7 +701,7 @@ typedef struct RowPair {
 static size_t read_id_rowid_pairs(LanceDataset *dataset,
                                   RowPair *pairs,
                                   size_t capacity) {
-    const char *columns[] = {"id", "_rowid", NULL};
+    const char *columns[] = {"id", NULL};
     LanceScanner *scanner = lance_scanner_new(dataset, columns, NULL);
     ASSERT(scanner != NULL, "create schema fixture scanner");
     CHECK_OK();
@@ -957,6 +957,88 @@ static void test_native_schema(const char *uri) {
         ASSERT(after[i].rowid == before[i].rowid,
                "projected dataset row IDs unchanged");
     }
+
+    /* Two Project operations staged at the same version: the stale one must
+       report a native commit conflict, and its output slot must stay untouched. */
+    LanceSchema *winner_schema = clone_dataset_schema(reopened);
+    const char *winner_columns[] = {"name"};
+    LanceSchema *winner_projected = NULL;
+    ASSERT(lance_schema_project(winner_schema, winner_columns, 1,
+                                &winner_projected) == 0,
+           "project winner schema");
+    CHECK_OK();
+    lance_schema_close(winner_schema);
+    LanceOperation *winner_operation = NULL;
+    ASSERT(lance_operation_project_new(winner_projected, false,
+                                       &winner_operation) == 0,
+           "construct winner Project");
+    CHECK_OK();
+    lance_schema_close(winner_projected);
+    LanceTransaction *winner_transaction =
+        lance_transaction_new(old_version + 1, winner_operation, NULL);
+    ASSERT(winner_transaction != NULL, "construct winner transaction");
+    CHECK_OK();
+
+    LanceSchema *stale_schema = clone_dataset_schema(reopened);
+    const char *stale_columns[] = {"id"};
+    LanceSchema *stale_projected = NULL;
+    ASSERT(lance_schema_project(stale_schema, stale_columns, 1,
+                                &stale_projected) == 0,
+           "project stale schema");
+    CHECK_OK();
+    lance_schema_close(stale_schema);
+    LanceOperation *stale_operation = NULL;
+    ASSERT(lance_operation_project_new(stale_projected, false,
+                                       &stale_operation) == 0,
+           "construct stale Project");
+    CHECK_OK();
+    lance_schema_close(stale_projected);
+    LanceTransaction *stale_transaction =
+        lance_transaction_new(old_version + 1, stale_operation, NULL);
+    ASSERT(stale_transaction != NULL, "construct stale transaction");
+    CHECK_OK();
+
+    LanceCommitOptions zero_retries;
+    memset(&zero_retries, 0, sizeof(zero_retries));
+    zero_retries.has_max_retries = true;
+    zero_retries.max_retries = 0;
+    zero_retries.timeout_mode = LANCE_COMMIT_TIMEOUT_DISABLED;
+    LanceDataset *winner_dataset =
+        commit_transaction(uri, winner_transaction, &zero_retries);
+    ASSERT(lance_dataset_version(winner_dataset) == old_version + 2,
+           "winner Project version");
+    CHECK_OK();
+    lance_dataset_close(winner_dataset);
+
+    LanceDataset *conflict_sentinel = (LanceDataset *)(uintptr_t)0x4;
+    LanceDataset *conflict_output = conflict_sentinel;
+    ASSERT(lance_transaction_commit(uri, stale_transaction, &zero_retries,
+                                    NULL, NULL, &conflict_output) == -1,
+           "stale Project commit must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_COMMIT_CONFLICT,
+           "stale Project commit conflict code");
+    ASSERT(conflict_output == conflict_sentinel,
+           "stale Project commit leaves output unchanged");
+    lance_operation_close(winner_operation);
+    lance_transaction_close(winner_transaction);
+    lance_operation_close(stale_operation);
+    lance_transaction_close(stale_transaction);
+
+    LanceDataset *winner_reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(winner_reopened != NULL, "reopen winner Project dataset");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(winner_reopened) == old_version + 2,
+           "winner Project persisted version");
+    CHECK_OK();
+    LanceSchema *winner_schema_after = clone_dataset_schema(winner_reopened);
+    check_field_id(winner_schema_after, "name", 42);
+    int32_t id_after_conflict = -1;
+    ASSERT(lance_schema_field_id(winner_schema_after, "id",
+                                 &id_after_conflict) == -1,
+           "winner Project dropped id");
+    ASSERT(id_after_conflict == -1, "winner Project leaves field id untouched");
+    lance_schema_close(winner_schema_after);
+    lance_dataset_close(winner_reopened);
 
     /* The pre-commit snapshot remains readable with its original schema and
        deletion state. */
