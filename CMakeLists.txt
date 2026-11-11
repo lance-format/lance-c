@@ -47,7 +47,7 @@ if(NOT LANCE_C_USE_PREBUILT)
         # Keep the dylib export policy on the actual imported build target.
         corrosion_set_linker(lance_c
             "${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-macos-exports.sh")
-        corrosion_add_target_env_vars(lance_c
+        corrosion_set_env_vars(lance_c
             "LANCE_C_MACOS_LINKER=${CMAKE_C_COMPILER}")
     endif()
 endif()
