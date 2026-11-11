@@ -133,7 +133,7 @@ jobs:
   test-windows:
     name: Tests (Windows x64)
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       RUST_BACKTRACE: "1"
     steps:

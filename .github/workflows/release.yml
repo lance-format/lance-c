@@ -160,7 +160,7 @@ jobs:
   build-windows:
     name: Build (x86_64-pc-windows-msvc)
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       RUST_BACKTRACE: "1"
     steps:
