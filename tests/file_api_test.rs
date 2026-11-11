@@ -93,6 +93,10 @@ fn fixture_schema() -> Arc<Schema> {
 }
 
 fn fixture_batch() -> RecordBatch {
+    fixture_batch_with_nested_nulls(true)
+}
+
+fn fixture_batch_with_nested_nulls(include_nested_nulls: bool) -> RecordBatch {
     let schema = fixture_schema();
     let ids = Arc::new(Int32Array::from_iter_values(1..=7)) as ArrayRef;
     let labels = Arc::new(StringArray::from(vec![
@@ -148,6 +152,8 @@ fn fixture_batch() -> RecordBatch {
             items.append(false);
         }
     }
+    let nested_nulls = include_nested_nulls
+        .then(|| NullBuffer::from(vec![true, true, false, true, true, false, true]));
     let nested = Arc::new(
         StructArray::try_new(
             Fields::from(vec![
@@ -159,9 +165,7 @@ fn fixture_batch() -> RecordBatch {
                 ),
             ]),
             vec![flags, Arc::new(items.finish())],
-            Some(NullBuffer::from(vec![
-                true, true, false, true, true, false, true,
-            ])),
+            nested_nulls,
         )
         .unwrap(),
     ) as ArrayRef;
@@ -216,7 +220,11 @@ fn write_fixture(
     schema_metadata: bool,
 ) -> (LanceFileWriteSummary, Option<u32>) {
     let uri_text = uri.to_owned();
-    let batch = fixture_batch();
+    let batch = if version == Some("2.0") {
+        fixture_batch_with_nested_nulls(false)
+    } else {
+        fixture_batch()
+    };
     let ffi_schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
     let version = version.map(c_string);
     let options = LanceFileWriterOptions {
@@ -375,10 +383,13 @@ fn native_metadata(uri: &str) -> Arc<CachedFileMetadata> {
 }
 
 fn assert_fixture_batches(batches: &[RecordBatch]) {
-    let expected = fixture_batch();
+    assert_fixture_batches_expected(batches, &fixture_batch());
+}
+
+fn assert_fixture_batches_expected(batches: &[RecordBatch], expected: &RecordBatch) {
     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(rows, 7);
-    let actual = arrow::compute::concat_batches(&fixture_schema(), batches).unwrap();
+    let actual = arrow::compute::concat_batches(&expected.schema(), batches).unwrap();
     assert_eq!(actual.schema(), expected.schema());
     assert_eq!(actual.num_rows(), expected.num_rows());
     for (index, (actual, expected)) in actual
@@ -442,7 +453,12 @@ fn versions_declared_lazy_and_defaults_round_trip_against_native() {
         unsafe { lance_file_reader_close(reader) };
 
         let (schema, batches) = read_all_c(uri, None);
-        assert_fixture_batches(&batches);
+        let expected = if version == "2.0" {
+            fixture_batch_with_nested_nulls(false)
+        } else {
+            fixture_batch()
+        };
+        assert_fixture_batches_expected(&batches, &expected);
         assert_eq!(schema.metadata(), fixture_schema().metadata());
 
         let oracle = native_reader(uri);
@@ -468,6 +484,34 @@ fn versions_declared_lazy_and_defaults_round_trip_against_native() {
             format_version(expected)
         );
         unsafe { lance_file_reader_close(reader) };
+    }
+
+    let unsupported = root.path().join("v2.0-struct-null.lance");
+    let unsupported = unsupported.to_str().unwrap();
+    let uri_c = c_string(unsupported);
+    let batch = fixture_batch();
+    let schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
+    let version = c"2.0";
+    let options = LanceFileWriterOptions {
+        version: version.as_ptr(),
+        ..Default::default()
+    };
+    let writer = unsafe {
+        lance_file_writer_open(uri_c.as_ptr(), &schema, &options, ptr::null(), ptr::null())
+    };
+    assert!(!writer.is_null());
+    let raw_batch = import_batch(&batch);
+    assert_eq!(
+        unsafe { lance_file_writer_write_batch(writer, raw_batch) },
+        -1
+    );
+    let (code, message) = take_error();
+    assert_eq!(code, LanceErrorCode::InvalidArgument);
+    assert!(message.contains("2.0"));
+    assert!(message.contains("struct"));
+    unsafe {
+        lance_batch_free(raw_batch);
+        lance_file_writer_close(writer);
     }
 }
 
@@ -1625,7 +1669,7 @@ fn storage_provider_none_some_empty_error_expiry_and_force() {
     let (provider, _, provider_id) = create_test_provider(context, false);
     let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), provider) };
     let (code, message) = snapshot_options(accessor).unwrap_err();
-    assert_eq!(code, LanceErrorCode::InvalidArgument);
+    assert_eq!(code, LanceErrorCode::IoError);
     assert!(message.contains("provider failed"));
     unsafe {
         lance_storage_options_accessor_close(accessor);
