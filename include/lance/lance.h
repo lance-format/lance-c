@@ -3395,6 +3395,11 @@ int32_t lance_fragment_take(
  * and range checks. Commit the resulting overlay with the dataset read version
  * used to open this writer.
  *
+ * Native overlays are experimental. For release builds, set
+ * `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads or
+ * modifies an overlay dataset. Enable it before publication so all readers
+ * recognize the manifest feature.
+ *
  * @param fragment    Bound fragment snapshot. Must not be NULL.
  * @param schema      Native fragment schema, or a compatible subset.
  * @param out_writer  Receives the writer on success; unchanged on failure.
@@ -7519,6 +7524,10 @@ int32_t lance_data_overlay_group_overlay_at(
  * accepted only with a zero count. Empty group lists are retained because the
  * native operation permits them. Native commit owns fragment existence,
  * coverage validity, layout and ordering checks. Returns NULL on error.
+ *
+ * Native overlays are experimental. For release builds, set
+ * `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads or
+ * modifies an overlay dataset, including before publication.
  */
 LanceOperation* lance_operation_data_overlay_new(
     const LanceDataOverlayGroup* const* groups,

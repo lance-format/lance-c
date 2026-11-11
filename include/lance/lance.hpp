@@ -2810,6 +2810,9 @@ public:
     /// Open an overlay writer for this bound fragment. The schema may be a
     /// compatible subset of the fragment schema. Commit the resulting overlay
     /// with the dataset read version used to open the writer.
+    /// Native overlays are experimental. For release builds, set
+    /// `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads
+    /// or modifies an overlay dataset, including before publication.
     FragmentOverlayWriter write_overlay(const LanceSchema& schema) const;
 
     const LanceFragment* c_handle() const { return handle_.get(); }
