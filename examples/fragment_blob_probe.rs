@@ -113,7 +113,9 @@ unsafe fn last_error() -> String {
     if message.is_null() {
         return String::new();
     }
-    CStr::from_ptr(message).to_string_lossy().into_owned()
+    let text = CStr::from_ptr(message).to_string_lossy().into_owned();
+    lance_c::lance_free_string(message);
+    text
 }
 
 fn report_c(uri: &str, file: &str) {
