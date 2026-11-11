@@ -190,13 +190,13 @@ fn make_batch() -> (Arc<Schema>, RecordBatch) {
     (schema, batch)
 }
 
-fn write_namespace(
+fn write_namespace_result(
     namespace: *const LanceNamespace,
     table_id: &str,
     mode: i32,
     schema: &Schema,
     batch: RecordBatch,
-) -> *mut LanceDataset {
+) -> (i32, *mut LanceDataset) {
     let table_id = c_string(table_id);
     let ffi_schema = FFI_ArrowSchema::try_from(schema).unwrap();
     let reader =
@@ -218,6 +218,17 @@ fn write_namespace(
             &mut dataset,
         )
     };
+    (rc, dataset)
+}
+
+fn write_namespace(
+    namespace: *const LanceNamespace,
+    table_id: &str,
+    mode: i32,
+    schema: &Schema,
+    batch: RecordBatch,
+) -> *mut LanceDataset {
+    let (rc, dataset) = write_namespace_result(namespace, table_id, mode, schema, batch);
     assert_eq!(
         rc,
         0,
@@ -313,7 +324,56 @@ fn directory_lifecycle_dataset_versions_metrics_and_dispatch() {
     };
     assert!(!opened.is_null(), "namespace open failed: {}", last_error());
     assert_eq!(unsafe { lance_dataset_count_rows(opened) }, 3);
+    let read_version = unsafe { lance_dataset_version(opened) };
     unsafe { lance_dataset_close(opened) };
+
+    let predicate = c_string("id < 0");
+    let operation =
+        unsafe { lance_operation_delete_new(ptr::null(), 0, ptr::null(), 0, predicate.as_ptr()) };
+    assert!(
+        !operation.is_null(),
+        "delete operation failed: {}",
+        last_error()
+    );
+    let transaction = unsafe { lance_transaction_new(read_version, operation, ptr::null()) };
+    assert!(
+        !transaction.is_null(),
+        "transaction failed: {}",
+        last_error()
+    );
+    let location = c_string(described_json["location"].as_str().unwrap());
+    let mut committed = ptr::null_mut();
+    let rc = unsafe {
+        lance_transaction_commit_namespace_uri(
+            namespace,
+            table_id_c.as_ptr(),
+            location.as_ptr(),
+            transaction,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &mut committed,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "namespace URI commit failed: code={:?} error={}",
+        unsafe { lance_last_error_code() },
+        last_error()
+    );
+    assert!(!committed.is_null());
+    unsafe {
+        lance_dataset_close(committed);
+        lance_transaction_close(transaction);
+        lance_operation_close(operation);
+    }
+    let count = assert_call_ok(
+        namespace,
+        "count_table_rows",
+        r#"{"id":["workspace","numbers"]}"#,
+    );
+    assert_eq!(count.json().as_deref(), Some("3"));
 
     let versions = assert_call_ok(
         namespace,
@@ -468,6 +528,7 @@ fn custom_namespace_preserves_native_unsupported_for_all_54_operations() {
 struct DelegateContext {
     directory: *const LanceNamespace,
     describe_calls: AtomicUsize,
+    fail_next_version: AtomicUsize,
 }
 
 unsafe fn delegate_call(
@@ -480,6 +541,16 @@ unsafe fn delegate_call(
     let context = unsafe { &*(context.cast::<DelegateContext>()) };
     if operation == "describe_table" {
         context.describe_calls.fetch_add(1, Ordering::SeqCst);
+    }
+    if operation == "create_table_version"
+        && context.fail_next_version.swap(0, Ordering::SeqCst) > 0
+    {
+        unsafe {
+            (*error).code = LanceErrorCode::CommitConflict as i32;
+            (*error).message.data = owned_string("injected managed version conflict");
+            (*error).message.release = Some(free_owned_string);
+        }
+        return 1;
     }
     let operation = c_string(operation);
     let mut result = NamespaceResult::default();
@@ -575,6 +646,7 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
     let context = Box::into_raw(Box::new(DelegateContext {
         directory,
         describe_calls: AtomicUsize::new(0),
+        fail_next_version: AtomicUsize::new(0),
     })) as *mut c_void;
     let namespace_id = c_string("custom-managed");
     let spec = LanceNamespaceCustomClientSpec {
@@ -608,6 +680,28 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
     unsafe { lance_dataset_close(opened) };
     let delegate_context = unsafe { &*(context.cast::<DelegateContext>()) };
     assert!(delegate_context.describe_calls.load(Ordering::SeqCst) > 0);
+
+    delegate_context
+        .fail_next_version
+        .store(1, Ordering::SeqCst);
+    let (rc, failed) = write_namespace_result(custom, table_id, 1, &schema, batch);
+    assert_ne!(rc, 0, "conflicting managed version must fail");
+    assert!(failed.is_null(), "failed write must not publish a dataset");
+    assert_eq!(
+        unsafe { lance_last_error_code() },
+        LanceErrorCode::CommitConflict,
+        "{}",
+        last_error()
+    );
+    delegate_context
+        .fail_next_version
+        .store(1, Ordering::SeqCst);
+    let (rc, conflict_result) = call(custom, "create_table_version", r#"{}"#, None);
+    assert_ne!(rc, 0);
+    assert_eq!(
+        conflict_result.native_error(),
+        Some((14, "injected managed version conflict".to_owned()))
+    );
 
     close_namespace(custom);
     close_namespace(directory);
@@ -818,4 +912,43 @@ fn snapshot_value(snapshot: *const LanceStorageOptionsSnapshot, key: &str) -> St
         }
     }
     panic!("missing storage option {key}");
+}
+
+#[test]
+fn constructor_failures_release_foreign_contexts_exactly_once() {
+    let released = Arc::new(AtomicUsize::new(0));
+    let context = Box::into_raw(Box::new(released.clone())) as *mut c_void;
+    let namespace_id = c_string("incomplete");
+    let spec = LanceNamespaceCustomClientSpec {
+        describe_table: Some(unsupported_callback),
+        describe_table_version: Some(unsupported_callback),
+        create_table_version: Some(unsupported_callback),
+        list_table_versions: None,
+        release: Some(count_release),
+        client_ctx: context,
+        namespace_id: namespace_id.as_ptr(),
+    };
+    let namespace = unsafe { lance_namespace_custom_new(&spec) };
+    assert!(namespace.is_null(), "incomplete custom client must fail");
+    assert_eq!(
+        unsafe { lance_last_error_code() },
+        LanceErrorCode::InvalidArgument
+    );
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+
+    let provider_context = Box::into_raw(Box::new(released.clone())) as *mut c_void;
+    let provider_spec = LanceNamespaceContextProviderSpec {
+        provide_context: Some(dynamic_context),
+        release: Some(count_release),
+        provider_ctx: provider_context,
+    };
+    let invalid_properties = c_string("{not json");
+    let namespace =
+        unsafe { lance_namespace_rest_new(invalid_properties.as_ptr(), &provider_spec) };
+    assert!(namespace.is_null(), "invalid REST properties must fail");
+    assert_eq!(
+        unsafe { lance_last_error_code() },
+        LanceErrorCode::InvalidArgument
+    );
+    assert_eq!(released.load(Ordering::SeqCst), 2);
 }
