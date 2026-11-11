@@ -429,6 +429,12 @@ int main(int argc, char** argv) {
         check_history(committed2, 4, 1);
         check_history(committed2, 3, 2);
 
+        LanceCompactionOptions compaction{};
+        compaction.target_rows_per_fragment = 15;
+        auto metrics = committed2.compact_files(&compaction);
+        CHECK(metrics.fragments_removed >= 1);
+        CHECK(committed2.version() == 5);
+
         auto old = lance::Dataset::open(uri, 1);
         CHECK(old.version() == 1);
         auto old_fragment = old.open_fragment(old.fragment_ids()[0]);
@@ -454,7 +460,7 @@ int main(int argc, char** argv) {
         CHECK(conflict);
 
         auto reopened = lance::Dataset::open(uri);
-        CHECK(reopened.version() == 4);
+        CHECK(reopened.version() == 5);
         assert_row(reopened, 1, false, 9999, 211, before[1].rowid);
         assert_row(reopened, 2, false, 20, 200, before[2].rowid);
         assert_row(reopened, 3, true, 0, 212, before[3].rowid);

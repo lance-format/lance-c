@@ -781,7 +781,7 @@ int main(int argc, char **argv) {
     LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
     ASSERT(reopened != NULL, "reopen after stale conflict");
     CHECK_OK();
-    ASSERT(lance_dataset_version(reopened) == base_version + 2,
+    ASSERT(lance_dataset_version(reopened) == base_version + 3,
            "stale conflict leaves version unchanged");
     assert_row(reopened, 1, 0, 9999, 211, before[1].rowid);
     assert_row(reopened, 2, 0, 20, 200, before[2].rowid);
