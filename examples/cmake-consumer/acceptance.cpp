@@ -170,20 +170,18 @@ Int32Batch* make_batch() {
 }
 
 struct WriteStreamState {
-    Int32Schema* schema = nullptr;
     Int32Batch* batch = nullptr;
-    bool schema_taken = false;
     bool batch_taken = false;
 };
 
 int write_stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
     auto* state = static_cast<WriteStreamState*>(stream->private_data);
-    if (state == nullptr || state->schema == nullptr || state->schema_taken) {
-        return -1;
-    }
-    *out = state->schema->schema;
-    state->schema = nullptr;
-    state->schema_taken = true;
+    if (state == nullptr) return -1;
+    // get_schema may be called by the wrapper and again by the native
+    // writer. Export a fresh schema value for each call; the release
+    // callback owns the corresponding holder.
+    Int32Schema* schema = make_schema();
+    *out = schema->schema;
     return 0;
 }
 
@@ -207,10 +205,6 @@ const char* write_stream_last_error(ArrowArrayStream*) {
 void write_stream_release(ArrowArrayStream* stream) {
     auto* state = static_cast<WriteStreamState*>(stream->private_data);
     if (state == nullptr) return;
-    if (state->schema != nullptr && state->schema->schema.release != nullptr) {
-        state->schema->schema.release(&state->schema->schema);
-        state->schema = nullptr;
-    }
     if (state->batch != nullptr && state->batch->array.release != nullptr) {
         state->batch->array.release(&state->batch->array);
         state->batch = nullptr;
@@ -221,7 +215,6 @@ void write_stream_release(ArrowArrayStream* stream) {
 
 void write_dataset(const std::string& uri) {
     auto* state = new WriteStreamState;
-    state->schema = make_schema();
     state->batch = make_batch();
 
     ArrowArrayStream input{};
