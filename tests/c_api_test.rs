@@ -11343,7 +11343,7 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
         build_scalar_segment_via_c(
             dataset,
             "score",
-            "conflict_idx",
+            "score_zonemap_create",
             LanceScalarIndexType::ZoneMap,
             params,
             &[0, 1, 2, 3],
@@ -11426,13 +11426,12 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
         read_version + 1,
         "the losing transaction must not publish another version"
     );
-    assert_eq!(unsafe { lance_dataset_index_count(after_conflict) }, 1);
-    let missing_conflict = c_str("conflict_idx");
+    let mut after_conflict_uuids = dataset_segment_uuids(after_conflict, "score_zonemap_create");
+    after_conflict_uuids.sort();
     assert_eq!(
-        unsafe { lance_dataset_index_segment_count(after_conflict, missing_conflict.as_ptr()) },
-        0
+        after_conflict_uuids, expected_uuids,
+        "the losing transaction must not publish a duplicate segment"
     );
-    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
     let (ids, statistics) = scan_index_ids(after_conflict, "score = 70", true);
     assert_eq!(ids, vec![7]);
     assert!(
