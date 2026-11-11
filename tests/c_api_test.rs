@@ -43406,6 +43406,7 @@ fn mw_vector_dim() -> i32 {
 const MW_SHARDING_MANUAL: i32 = 0;
 const MW_SHARDING_UNSHARDED: i32 = 1;
 const MW_SHARDING_BUCKET: i32 = 2;
+const MW_SHARDING_IDENTITY: i32 = 3;
 const MW_DISTANCE_L2: i32 = 0;
 const MW_MERGE_UPDATE_ALL: i32 = 1;
 const MW_MERGE_INSERT_ALL: i32 = 0;
