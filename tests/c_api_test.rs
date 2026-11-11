@@ -43786,6 +43786,146 @@ fn test_memwal_sharding_values_match_native() {
 }
 
 #[test]
+fn test_memwal_composite_primary_key_lookup() {
+    let mut pk = HashMap::new();
+    pk.insert(
+        "lance-schema:unenforced-primary-key".to_string(),
+        "true".to_string(),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(pk.clone()),
+        Field::new("tenant", DataType::Utf8, false).with_metadata(pk),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+            Arc::new(StringArray::from(vec![Some("alice"), Some("bob")])),
+        ],
+    )
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("composite_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let ds = mw_open(&uri);
+    assert_eq!(
+        mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let id = c"id";
+    let tenant = c"tenant";
+    let pk_columns = [id.as_ptr(), tenant.as_ptr()];
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_new(
+                ds,
+                ptr::null(),
+                0,
+                1,
+                pk_columns.as_ptr(),
+                2,
+                &mut planner,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let key_fields = Fields::from(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("tenant", DataType::Utf8, false),
+    ]);
+    let keys = StructArray::try_new(
+        key_fields.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![2])),
+            Arc::new(StringArray::from(vec![Some("b")])),
+        ],
+        None,
+    )
+    .unwrap();
+    let key_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "pk",
+            DataType::Struct(key_fields),
+            false,
+        )])),
+        vec![Arc::new(keys)],
+    )
+    .unwrap();
+    let (mut array, key_schema) = ffi_record_batch(&key_batch);
+    let mut key = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &key_schema, &mut key) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let name = c"name";
+    let columns = [name.as_ptr()];
+    let mut plan = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key, 1, columns.as_ptr(), 1, &mut plan)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_to_batch(plan, &mut batch) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut ffi_array = arrow::ffi::FFI_ArrowArray::empty();
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_batch_to_arrow(batch, &mut ffi_array, &mut ffi_schema) },
+        0
+    );
+    let data = unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap();
+    let batch = RecordBatch::from(StructArray::from(data));
+    assert_eq!(batch.num_rows(), 1);
+    let names = batch
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "bob");
+
+    unsafe {
+        lance_batch_free(batch);
+        lance_mem_wal_plan_free(plan);
+        lance_batch_free(key);
+        lance_lsm_point_lookup_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
 fn test_memwal_writer_scan_mutation_and_durable_reopen() {
     let (_tmp, uri) = mw_create_dataset();
     let ds = mw_open(&uri);
