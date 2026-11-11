@@ -951,8 +951,7 @@ pub unsafe extern "C" fn lance_mem_wal_sharding_spec_new(
         unsafe {
             require_out(out, "out")?;
             crate::helpers::validate_slice_length::<*const LanceMemWalShardingField>(
-                num_fields,
-                "fields",
+                num_fields, "fields",
             )?;
             let mut cloned = Vec::with_capacity(num_fields);
             if num_fields > 0 {
