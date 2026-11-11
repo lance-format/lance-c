@@ -178,6 +178,19 @@ bool verify_stream(
     return rows == expected_rows;
 }
 
+template <typename Call>
+bool rejects_reader_stream_options(Call call, const char *option) {
+    try {
+        call();
+    } catch (const lance::Error &error) {
+        const std::string message = error.what();
+        return error.code == LANCE_ERR_INVALID_ARGUMENT &&
+               message.find(option) != std::string::npos &&
+               message.find("greater than 0") != std::string::npos;
+    }
+    return false;
+}
+
 #if defined(__unix__) || defined(__APPLE__)
 std::vector<uint8_t> read_local_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
@@ -352,6 +365,51 @@ int main(int argc, char **argv) {
                             .open_reader("cpp/data.lance", reader_options);
     auto range = range_reader.read_range(1, 1, 1, 1);
     CHECK(verify_stream(range, 1, 2), "range stream");
+
+    struct ZeroOptionCase {
+        uint32_t batch_size;
+        uint32_t batch_readahead;
+        const char *option;
+    };
+    const ZeroOptionCase zero_cases[] = {
+        {0, 2, "batch_size"},
+        {2, 0, "batch_readahead"},
+        {0, 0, "batch_size"},
+    };
+    const std::vector<uint32_t> indices{1, 2};
+    for (const auto &zero : zero_cases) {
+        CHECK(rejects_reader_stream_options(
+                  [&] { (void)range_reader.read_all(zero.batch_size,
+                                                    zero.batch_readahead); },
+                  zero.option),
+              "read_all rejects zero stream options");
+        CHECK(rejects_reader_stream_options(
+                  [&] { (void)range_reader.read_range(1, 1, zero.batch_size,
+                                                      zero.batch_readahead); },
+                  zero.option),
+              "read_range rejects zero stream options");
+        CHECK(rejects_reader_stream_options(
+                  [&] { (void)range_reader.read_indices(
+                            indices, zero.batch_size, zero.batch_readahead); },
+                  zero.option),
+              "read_indices rejects zero stream options");
+    }
+
+    auto index_stream = range_reader.read_indices(indices, 2, 1);
+    CHECK(verify_stream(index_stream, 2, 2), "index stream");
+
+    auto empty_range = range_reader.read_range(0, 0, 2, 1);
+    CHECK(verify_stream(empty_range, 0, 1), "empty range stream");
+    auto empty_indices = range_reader.read_indices({}, 2, 1);
+    CHECK(verify_stream(empty_indices, 0, 1), "empty indices stream");
+    CHECK(rejects_reader_stream_options(
+              [&] { (void)range_reader.read_range(0, 0, 0, 1); },
+              "batch_size"),
+          "empty read_range rejects zero batch_size");
+    CHECK(rejects_reader_stream_options(
+              [&] { (void)range_reader.read_indices({}, 2, 0); },
+              "batch_readahead"),
+          "empty read_indices rejects zero readahead");
 
     lance::FileSession reopened(base_uri, &storage);
     {

@@ -327,6 +327,43 @@ fn collect_c_stream(
     (schema, batches)
 }
 
+fn sentinel_c_stream() -> arrow::ffi_stream::FFI_ArrowArrayStream {
+    arrow::ffi_stream::FFI_ArrowArrayStream {
+        get_schema: None,
+        get_next: None,
+        get_last_error: None,
+        release: None,
+        private_data: ptr::dangling_mut::<c_void>(),
+    }
+}
+
+fn assert_zero_stream_option_rejected(
+    operation: &str,
+    status: i32,
+    out: &arrow::ffi_stream::FFI_ArrowArrayStream,
+    expected_option: &str,
+) {
+    assert_eq!(status, -1, "{operation} must reject the zero option");
+    let (code, message) = take_error();
+    assert_eq!(code, LanceErrorCode::InvalidArgument, "{operation}");
+    assert!(
+        message.contains(expected_option) && message.contains("greater than 0"),
+        "{operation}: {message}"
+    );
+    assert!(out.get_schema.is_none(), "{operation} wrote get_schema");
+    assert!(out.get_next.is_none(), "{operation} wrote get_next");
+    assert!(
+        out.get_last_error.is_none(),
+        "{operation} wrote get_last_error"
+    );
+    assert!(out.release.is_none(), "{operation} wrote release");
+    assert_eq!(
+        out.private_data,
+        ptr::dangling_mut::<c_void>(),
+        "{operation} modified the output stream on error"
+    );
+}
+
 fn read_all_c(
     uri: &str,
     options: Option<&LanceFileReaderOptions>,
@@ -1133,6 +1170,132 @@ fn reader_projection_range_indices_errors_and_io_stats() {
         )
     };
     assert!(unknown_reader.is_null());
+}
+
+#[test]
+fn reader_stream_options_require_positive_batch_values() {
+    let root = tempfile::tempdir().unwrap();
+    let uri = root.path().join("reader-zero-options.lance");
+    let uri = uri.to_str().unwrap();
+    write_fixture(uri, Some("2.2"), false, None, None, None, None, false);
+    let reader = open_c_reader(uri, None);
+
+    let indices = [0u32, 2, 6];
+    for (batch_size, batch_readahead, expected_option) in [
+        (0, 2, "batch_size"),
+        (2, 0, "batch_readahead"),
+        (0, 0, "batch_size"),
+    ] {
+        let mut out = sentinel_c_stream();
+        let status =
+            unsafe { lance_file_reader_read_all(reader, batch_size, batch_readahead, &mut out) };
+        assert_zero_stream_option_rejected("read_all", status, &out, expected_option);
+
+        let mut out = sentinel_c_stream();
+        let status = unsafe {
+            lance_file_reader_read_range(reader, 2, 3, batch_size, batch_readahead, &mut out)
+        };
+        assert_zero_stream_option_rejected("read_range", status, &out, expected_option);
+
+        let mut out = sentinel_c_stream();
+        let status = unsafe {
+            lance_file_reader_read_indices(
+                reader,
+                indices.as_ptr(),
+                indices.len(),
+                batch_size,
+                batch_readahead,
+                &mut out,
+            )
+        };
+        assert_zero_stream_option_rejected("read_indices", status, &out, expected_option);
+    }
+
+    let mut all = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_file_reader_read_all(reader, 2, 1, &mut all) },
+        0
+    );
+    let (_, all_batches) = collect_c_stream(all);
+    assert_fixture_batches(&all_batches);
+
+    let collect_ids = |batches: &[RecordBatch]| -> Vec<i32> {
+        let batch = arrow::compute::concat_batches(&fixture_schema(), batches).unwrap();
+        batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    };
+
+    let mut range = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_file_reader_read_range(reader, 2, 3, 2, 1, &mut range) },
+        0
+    );
+    let (_, range_batches) = collect_c_stream(range);
+    assert_eq!(collect_ids(&range_batches), vec![3, 4, 5]);
+
+    let mut selected = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe {
+            lance_file_reader_read_indices(
+                reader,
+                indices.as_ptr(),
+                indices.len(),
+                2,
+                1,
+                &mut selected,
+            )
+        },
+        0
+    );
+    let (_, selected_batches) = collect_c_stream(selected);
+    assert_eq!(collect_ids(&selected_batches), vec![1, 3, 7]);
+
+    let mut empty_range = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_file_reader_read_range(reader, 0, 0, 2, 1, &mut empty_range) },
+        0
+    );
+    let (_, empty_range_batches) = collect_c_stream(empty_range);
+    assert!(empty_range_batches.is_empty());
+
+    let mut empty_indices = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_file_reader_read_indices(reader, ptr::null(), 0, 2, 1, &mut empty_indices) },
+        0
+    );
+    let (_, empty_index_batches) = collect_c_stream(empty_indices);
+    assert!(empty_index_batches.is_empty());
+
+    for (batch_size, batch_readahead, expected_option) in
+        [(0, 1, "batch_size"), (1, 0, "batch_readahead")]
+    {
+        let mut out = sentinel_c_stream();
+        let status = unsafe {
+            lance_file_reader_read_range(reader, 0, 0, batch_size, batch_readahead, &mut out)
+        };
+        assert_zero_stream_option_rejected("empty read_range", status, &out, expected_option);
+
+        let mut out = sentinel_c_stream();
+        let status = unsafe {
+            lance_file_reader_read_indices(
+                reader,
+                ptr::null(),
+                0,
+                batch_size,
+                batch_readahead,
+                &mut out,
+            )
+        };
+        assert_zero_stream_option_rejected("empty read_indices", status, &out, expected_option);
+    }
+
+    unsafe { lance_file_reader_close(reader) };
 }
 
 #[test]
