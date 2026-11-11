@@ -893,6 +893,8 @@ fn test_raw_file_native_compilation_and_execution() {
         "C++ raw-file test compilation failed"
     );
     run_test_binary_with_dataset(&cpp_binary, base_path);
+    #[cfg(unix)]
+    run_test_binary_with_two_args(&cpp_binary, base_path, "write-failure");
 }
 
 /// A fresh C executable must initialize OpenDAL even when archive constructors are omitted.

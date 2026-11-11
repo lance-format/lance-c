@@ -10,6 +10,14 @@
 #include <string>
 #include <vector>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <csignal>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <sys/resource.h>
+#endif
+
 lance::FileSession open_file_test_session(
     const std::string& base_uri,
     const lance::StorageOptionsAccessor& storage);
@@ -147,9 +155,71 @@ bool verify_stream(
     return rows == expected_rows;
 }
 
+#if defined(__unix__) || defined(__APPLE__)
+int test_transfer_write_failures(const std::string& base_path) {
+    const auto directory = std::filesystem::path(base_path) / "write-failures";
+    std::filesystem::create_directories(directory);
+    const std::string expected(4096, 'x');
+    const auto download_path = directory / "download.bin";
+    const auto upload_path = directory / "upload.bin";
+    for (const auto& path : {download_path, upload_path}) {
+        std::ofstream output(path, std::ios::binary);
+        output << expected;
+        output.close();
+        CHECK(output.good(), "create complete write-failure fixture");
+    }
+    if (failures) return 1;
+    lance::FileSession files("file://" + directory.string());
+
+    struct rlimit original{};
+    if (getrlimit(RLIMIT_FSIZE, &original) != 0) return 2;
+    struct rlimit limited = original;
+    limited.rlim_cur = 1024;
+    const auto previous_handler = std::signal(SIGXFSZ, SIG_IGN);
+    if (previous_handler == SIG_ERR) return 2;
+    if (setrlimit(RLIMIT_FSIZE, &limited) != 0) return 2;
+
+    LanceErrorCode download_error = LANCE_OK;
+    try {
+        files.download_file("download.bin", download_path.string());
+    } catch (const lance::Error& error) {
+        download_error = error.code;
+    }
+    LanceErrorCode upload_error = LANCE_OK;
+    try {
+        files.upload_file(upload_path.string(), "upload.bin");
+    } catch (const lance::Error& error) {
+        upload_error = error.code;
+    }
+
+    if (setrlimit(RLIMIT_FSIZE, &original) != 0) return 2;
+    std::signal(SIGXFSZ, previous_handler);
+    const auto read_file = [](const std::filesystem::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+    const auto downloaded = read_file(download_path);
+    const auto uploaded = read_file(upload_path);
+    std::cout << "buffered transfer failures: download_error=" << download_error
+              << ", download_bytes=" << downloaded.size()
+              << ", upload_error=" << upload_error
+              << ", upload_bytes=" << uploaded.size() << std::endl;
+    CHECK(download_error == LANCE_ERR_IO_ERROR, "download reports buffered I/O failure");
+    CHECK(downloaded == expected, "failed download preserves original bytes");
+    CHECK(upload_error == LANCE_ERR_IO_ERROR, "upload reports buffered I/O failure");
+    CHECK(uploaded == expected, "failed upload preserves original bytes");
+    return failures == 0 ? 0 : 1;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char **argv) {
+#if defined(__unix__) || defined(__APPLE__)
+    if (argc == 3 && std::string(argv[2]) == "write-failure") {
+        return test_transfer_write_failures(argv[1]);
+    }
+#endif
     if (argc != 2) return 2;
     const std::string base_uri = std::string("file://") + argv[1];
 
