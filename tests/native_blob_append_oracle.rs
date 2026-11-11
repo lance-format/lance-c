@@ -87,7 +87,7 @@ fn native_manual_fragment_append_public_blob_path() {
     )
     .unwrap();
 
-    let dataset = lance_c::runtime::block_on(async {
+    let dataset = Arc::new(lance_c::runtime::block_on(async {
         Dataset::write(
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(initial)], schema.clone()),
             &uri,
@@ -99,7 +99,7 @@ fn native_manual_fragment_append_public_blob_path() {
         )
         .await
         .unwrap()
-    });
+    }));
     let old_snapshot = dataset.clone();
     let initial_fragments = dataset.fragments().len();
     let initial_rows = lance_c::runtime::block_on(dataset.count_rows(None)).unwrap();
@@ -202,8 +202,7 @@ fn native_manual_fragment_append_public_blob_path() {
         None,
     );
     let committed =
-        lance_c::runtime::block_on(CommitBuilder::new(Arc::new(dataset)).execute(transaction))
-            .unwrap();
+        lance_c::runtime::block_on(CommitBuilder::new(dataset).execute(transaction)).unwrap();
     assert_eq!(
         committed.version().version,
         old_snapshot.version().version + 1
@@ -214,7 +213,7 @@ fn native_manual_fragment_append_public_blob_path() {
         initial_rows + 5
     );
 
-    let reopened = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let reopened = Arc::new(lance_c::runtime::block_on(Dataset::open(&uri)).unwrap());
     assert_eq!(reopened.version().version, committed.version().version);
     assert_eq!(
         lance_c::runtime::block_on(reopened.count_rows(None)).unwrap(),
