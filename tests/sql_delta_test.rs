@@ -30,7 +30,6 @@ use lance_c::*;
 use lance_core::datatypes::BlobHandling;
 
 // Mirror of the C enum `LanceBlobHandling`; the FFI parameter is an int32.
-const BLOB_HANDLING_BLOBS_DESCRIPTIONS: i32 = 0;
 const BLOB_HANDLING_ALL_BINARY: i32 = 1;
 const BLOB_HANDLING_ALL_DESCRIPTIONS: i32 = 2;
 
@@ -864,6 +863,9 @@ enum DeltaStream {
     Deleted,
 }
 
+/// Configures a C delta builder in place before it is built.
+type DeltaConfig = Box<dyn Fn(*mut LanceDatasetDeltaBuilder)>;
+
 fn build_c_delta(
     ds: *const LanceDataset,
     configure: impl FnOnce(*mut LanceDatasetDeltaBuilder),
@@ -1251,7 +1253,7 @@ fn test_delta_streams_outlive_parents_and_build_errors() {
     // Builder validation is synchronous and classifies each native conflict
     // as invalid input; the dataset handle stays open.
     let ds = open_dataset(&uri, 0);
-    let cases: Vec<(&str, Box<dyn Fn(*mut LanceDatasetDeltaBuilder)>)> = vec![
+    let cases: Vec<(&str, DeltaConfig)> = vec![
         (
             "compared_against_version with a begin version",
             Box::new(|builder| {
