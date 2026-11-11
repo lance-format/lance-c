@@ -574,19 +574,19 @@ fn compile_c_test(source: &Path, output: &Path, include_dir: &Path, lib_path: &P
         .success()
 }
 
-/// Compile a C++ source file, linking against lance-c.
-fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: &Path) -> bool {
+/// Compile C++ translation units together, linking against lance-c.
+fn compile_cpp_test(sources: &[&Path], output: &Path, include_dir: &Path, lib_path: &Path) -> bool {
     let lib_dir = lib_path.parent().unwrap();
     let lib_name = "lance_c";
 
     let status = Command::new("c++")
+        .args(sources)
         .args([
             "-std=c++17",
             "-Wall",
             "-Wextra",
             "-o",
             output.to_str().unwrap(),
-            source.to_str().unwrap(),
             &format!("-I{}", include_dir.display()),
             &format!("-L{}", lib_dir.display()),
             &format!("-l{lib_name}"),
@@ -784,7 +784,7 @@ fn test_cpp_compilation_and_execution() {
     let binary = build_dir.path().join("test_cpp_api");
 
     assert!(
-        compile_cpp_test(&source, &binary, &include_dir, &lib_path),
+        compile_cpp_test(&[&source], &binary, &include_dir, &lib_path),
         "C++ test compilation failed"
     );
     let aggregate_plan_path = write_ordering_aggregate_plan(build_dir.path());
@@ -825,7 +825,7 @@ fn test_typed_fts_native_compilation_and_execution() {
     let cpp_source = tests_dir.join("test_fts_query.cpp");
     let cpp_binary = build_dir.path().join("test_fts_query_cpp");
     assert!(
-        compile_cpp_test(&cpp_source, &cpp_binary, &include_dir, &lib_path),
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ FTS test compilation failed"
     );
     run_test_binary_with_dataset(&cpp_binary, &dataset_uri);
@@ -855,10 +855,46 @@ fn test_native_transaction_compilation_and_execution() {
     let cpp_source = tests_dir.join("test_transaction.cpp");
     let cpp_binary = build_dir.path().join("test_transaction_cpp");
     assert!(
-        compile_cpp_test(&cpp_source, &cpp_binary, &include_dir, &lib_path),
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ transaction test compilation failed"
     );
     run_test_binary_with_two_args(&cpp_binary, &dataset_uri, base);
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_raw_file_native_compilation_and_execution"]
+fn test_raw_file_native_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let base = tempfile::tempdir().unwrap();
+    let base_path = base.path().to_str().unwrap();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_file_api.c");
+    let c_binary = build_dir.path().join("test_file_api_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C raw-file test compilation failed"
+    );
+    run_test_binary_with_dataset(&c_binary, base_path);
+
+    let cpp_source = tests_dir.join("test_file_api.cpp");
+    let cpp_session_source = tests_dir.join("test_file_session.cpp");
+    let cpp_binary = build_dir.path().join("test_file_api_cpp");
+    assert!(
+        compile_cpp_test(
+            &[&cpp_source, &cpp_session_source],
+            &cpp_binary,
+            &include_dir,
+            &lib_path,
+        ),
+        "C++ raw-file test compilation failed"
+    );
+    run_test_binary_with_dataset(&cpp_binary, base_path);
+    #[cfg(unix)]
+    run_test_binary_with_two_args(&cpp_binary, base_path, "write-failure");
 }
 
 /// A fresh C executable must initialize OpenDAL even when archive constructors are omitted.
