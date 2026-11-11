@@ -1858,9 +1858,9 @@ static void test_blob_writer_publication(const char *uri) {
     };
     const PublicationBlob replaced[] = {
         {"new-packed-0", 12, 0},
-        {"", 0, 0},
+        {NULL, 0, 1},
         {"new-dedicated-3", 15, 0},
-        {"new-dedicated-4", 15, 0},
+        {"", 0, 0},
         {"keep-c5", 7, 0},
         {"keep-c6", 7, 0},
     };
@@ -1917,7 +1917,7 @@ static void test_blob_writer_publication(const char *uri) {
     ASSERT(lance_packed_blob_writer_blob_id(packed) == 8101,
            "packed publication blob ID");
     CHECK_OK();
-    static const uint8_t packed_validity[] = {0x05};
+    static const uint8_t packed_validity[] = {0x03};
     static const int32_t packed_offsets[] = {0, 12, 12, 12};
     static const char packed_payloads[] = "new-packed-0";
     static const void *packed_buffers[3];
@@ -1982,7 +1982,7 @@ static void test_blob_writer_publication(const char *uri) {
     ASSERT(dedicated_b != NULL, "open second dedicated publication writer");
     CHECK_OK();
     ASSERT(lance_dedicated_blob_writer_write(
-               dedicated_b, (const uint8_t *)"new-dedicated-4", 15) == 0,
+               dedicated_b, (const uint8_t *)"", 0) == 0,
            "write second dedicated publication blob");
     CHECK_OK();
     struct ArrowArray dedicated_b_array = {0};

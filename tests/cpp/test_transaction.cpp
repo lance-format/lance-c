@@ -1018,7 +1018,7 @@ static void test_blob_writer_data_replacement(const std::string& blob_uri) {
     const std::string dedicated_name = "cpp-dedicated-publication.lance";
     lance::FileSession files("file://" + blob_uri + "/data");
 
-    std::vector<uint8_t> packed_validity(1, 0x05);
+    std::vector<uint8_t> packed_validity(1, 0x03);
     std::vector<int32_t> packed_offsets{0};
     std::vector<uint8_t> packed_data;
     auto append_packed = [&](const char* value) {
@@ -1073,7 +1073,7 @@ static void test_blob_writer_data_replacement(const std::string& blob_uri) {
         CHECK(dedicated_a.length == 1);
     }
     {
-        const std::string payload = "new-dedicated-4";
+        const std::string payload;
         auto writer =
             files.open_dedicated_blob_writer(dedicated_name, 7003);
         CHECK(writer.blob_id() == 7003);
@@ -1160,12 +1160,14 @@ static void test_blob_writer_data_replacement(const std::string& blob_uri) {
     CHECK(third.physical_rows() == 2);
     CHECK(third.logical_rows() == 2);
 
-    const auto after = read_publication_rows(committed);
+    auto reopened = lance::Dataset::open(blob_uri);
+    CHECK(reopened.version() == committed.version());
+    const auto after = read_publication_rows(reopened);
     CHECK(after.size() == 6);
     check_publication_blob(after, 0, "new-packed-0");
-    check_publication_blob(after, 2, "");
+    check_publication_null(after, 2);
     check_publication_blob(after, 3, "new-dedicated-3");
-    check_publication_blob(after, 4, "new-dedicated-4");
+    check_publication_blob(after, 4, "");
     check_publication_blob(after, 5, "keep-c5");
     check_publication_blob(after, 6, "keep-c6");
     for (const auto& row : before) {
@@ -1184,18 +1186,19 @@ static void test_blob_writer_data_replacement(const std::string& blob_uri) {
     check_publication_null(pristine_rows, 1);
 
     const std::vector<uint64_t> live_indices{0, 1, 2, 3, 4, 5};
-    auto blobs = committed.take_blobs_by_indices(
+    auto blobs = reopened.take_blobs_by_indices(
         live_indices.data(), live_indices.size(), "blob");
     CHECK(blobs.size() == 6);
-    const std::vector<std::string> expected{
-        "new-packed-0", "", "new-dedicated-3", "new-dedicated-4",
+    const std::vector<std::optional<std::string>> expected{
+        "new-packed-0", std::nullopt, "new-dedicated-3", "",
         "keep-c5", "keep-c6"};
     for (size_t i = 0; i < expected.size(); ++i) {
-        CHECK(blobs[i].has_value());
-        CHECK(blobs[i]->size() == expected[i].size());
+        CHECK(blobs[i].has_value() == expected[i].has_value());
+        if (!expected[i]) continue;
+        CHECK(blobs[i]->size() == expected[i]->size());
         const auto bytes = blobs[i]->read();
-        CHECK(bytes == std::vector<uint8_t>(expected[i].begin(),
-                                            expected[i].end()));
+        CHECK(bytes == std::vector<uint8_t>(expected[i]->begin(),
+                                            expected[i]->end()));
     }
     const std::vector<uint8_t> expected_range{'p', 'a', 'c', 'k', 'e', 'd', '-'};
     CHECK(blobs[0]->read_range(4, 7) == expected_range);
