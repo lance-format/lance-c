@@ -143,6 +143,11 @@ unsafe fn read_bitmaps(
     let bitmap_lens = unsafe { slice::from_raw_parts(bitmap_lens, bitmap_count) };
     let mut out = Vec::with_capacity(bitmap_count);
     for (position, (&bitmap, &len)) in bitmaps.iter().zip(bitmap_lens).enumerate() {
+        if len > isize::MAX as usize {
+            return Err(lance_core::Error::invalid_input(format!(
+                "coverage bitmap at index {position} has length {len}, exceeding isize::MAX"
+            )));
+        }
         if bitmap.is_null() {
             return Err(lance_core::Error::invalid_input_source(
                 format!("bitmap at index {position} must not be NULL").into(),
