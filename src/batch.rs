@@ -7,7 +7,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
-use arrow_array::{RecordBatch, RecordBatchOptions, StructArray};
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_schema::{DataType, Schema};
 use lance_core::{Error, Result};
 

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow_schema::Schema as ArrowSchema;
 use chrono::TimeDelta;
 use lance_core::Result;
 use lance_core::datatypes::Schema as LanceSchema;
@@ -159,7 +160,7 @@ pub unsafe fn parse_storage_options(ptr: *const *const c_char) -> Result<HashMap
 pub(crate) unsafe fn import_arrow_schema(
     schema: *const FFI_ArrowSchema,
     name: &str,
-) -> Result<Arc<LanceSchema>> {
+) -> Result<Arc<ArrowSchema>> {
     if schema.is_null() {
         return Err(lance_core::Error::invalid_input_source(
             format!("{name} must not be NULL").into(),
@@ -179,7 +180,7 @@ pub(crate) unsafe fn import_arrow_schema(
         ));
     }
 
-    match catch_unwind(AssertUnwindSafe(|| LanceSchema::try_from(schema))) {
+    match catch_unwind(AssertUnwindSafe(|| ArrowSchema::try_from(schema))) {
         Ok(Ok(schema)) => Ok(Arc::new(schema)),
         Ok(Err(error)) => Err(lance_core::Error::invalid_input_source(
             format!("{name} is not a valid Arrow schema: {error}").into(),
@@ -187,6 +188,27 @@ pub(crate) unsafe fn import_arrow_schema(
         Err(payload) => Err(lance_core::Error::invalid_input_source(
             format!(
                 "{name} triggered an Arrow validation panic: {}",
+                panic_payload_message(&*payload)
+            )
+            .into(),
+        )),
+    }
+}
+
+/// Import a borrowed Arrow schema and convert it to the native Lance schema.
+pub(crate) unsafe fn import_lance_schema(
+    schema: *const FFI_ArrowSchema,
+    name: &str,
+) -> Result<Arc<LanceSchema>> {
+    let schema = unsafe { import_arrow_schema(schema, name)? };
+    match catch_unwind(AssertUnwindSafe(|| LanceSchema::try_from(schema.as_ref()))) {
+        Ok(Ok(schema)) => Ok(Arc::new(schema)),
+        Ok(Err(error)) => Err(lance_core::Error::invalid_input_source(
+            format!("{name} is not a valid Lance schema: {error}").into(),
+        )),
+        Err(payload) => Err(lance_core::Error::invalid_input_source(
+            format!(
+                "{name} triggered a Lance schema validation panic: {}",
                 panic_payload_message(&*payload)
             )
             .into(),

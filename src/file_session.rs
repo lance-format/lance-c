@@ -591,8 +591,8 @@ unsafe fn file_session_upload_file_inner(
                     remote_path.as_ref()
                 ))
             })?;
-        writer.shutdown().await?;
-        Ok(())
+        Writer::shutdown(writer.as_mut()).await?;
+        Ok::<(), Error>(())
     })?;
     Ok(0)
 }
@@ -647,7 +647,7 @@ unsafe fn file_session_download_file_inner(
                 "failed to flush local file {local_path:?}: {error}"
             ))
         })?;
-        Ok(())
+        Ok::<(), Error>(())
     })?;
     Ok(0)
 }

@@ -17,7 +17,7 @@ use crate::file_session::{
     FileSessionInner, LanceSchedulerConfig, open_file_session_inner, shared_session_from_ffi,
     storage_options_from_ffi,
 };
-use crate::helpers::{import_arrow_schema, parse_c_string};
+use crate::helpers::{import_lance_schema, parse_c_string};
 use crate::runtime::block_on;
 use crate::session::LanceSession;
 use crate::storage_options::LanceStorageOptionsAccessor;
@@ -105,7 +105,7 @@ pub(crate) unsafe fn open_writer_at(
     let schema = if schema.is_null() {
         None
     } else {
-        Some(unsafe { import_arrow_schema(schema, "schema")? })
+        Some(unsafe { import_lance_schema(schema, "schema")? })
     };
     let object_writer = block_on(session.store.create(&path))?;
     let version = options.version.resolve();
