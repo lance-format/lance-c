@@ -11,6 +11,7 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::ffi::FFI_ArrowSchema;
@@ -278,7 +279,7 @@ fn close_namespace(namespace: *mut LanceNamespace) {
 }
 
 fn directory_namespace(root: &str) -> *mut LanceNamespace {
-    directory_namespace_with_session(root, ptr::null())
+    directory_namespace_with_session(root, ptr::null_mut())
 }
 
 fn directory_namespace_with_session(root: &str, session: *mut LanceSession) -> *mut LanceNamespace {
@@ -303,7 +304,7 @@ fn directory_lifecycle_dataset_versions_metrics_and_dispatch() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("namespace");
     std::fs::create_dir_all(&root).unwrap();
-    let session = unsafe { lance_session_new(0, 0) };
+    let session = lance_session_new(0, 0);
     assert!(!session.is_null(), "session: {}", last_error());
     let namespace = directory_namespace_with_session(root.to_str().unwrap(), session);
     // The native directory retains its own session Arc. Closing the C handle
@@ -423,6 +424,88 @@ fn directory_lifecycle_dataset_versions_metrics_and_dispatch() {
         r#"{"id":["workspace","numbers"]}"#,
     );
     assert!(versions.json().unwrap().contains("version"));
+
+    // Representative native table metadata, index, tag and branch families.
+    let tag = assert_call_ok(
+        namespace,
+        "create_table_tag",
+        r#"{"id":["workspace","numbers"],"tag":"v1","version":3}"#,
+    );
+    assert!(tag.json().is_some());
+    let tag = assert_call_ok(
+        namespace,
+        "get_table_tag_version",
+        r#"{"id":["workspace","numbers"],"tag":"v1"}"#,
+    );
+    assert!(tag.json().unwrap().contains("\"version\":3"));
+    let tags = assert_call_ok(
+        namespace,
+        "list_table_tags",
+        r#"{"id":["workspace","numbers"]}"#,
+    );
+    assert!(tags.json().unwrap().contains("v1"));
+    assert_call_ok(
+        namespace,
+        "update_table_tag",
+        r#"{"id":["workspace","numbers"],"tag":"v1","version":2}"#,
+    );
+    let tag = assert_call_ok(
+        namespace,
+        "get_table_tag_version",
+        r#"{"id":["workspace","numbers"],"tag":"v1"}"#,
+    );
+    assert!(tag.json().unwrap().contains("\"version\":2"));
+    assert_call_ok(
+        namespace,
+        "delete_table_tag",
+        r#"{"id":["workspace","numbers"],"tag":"v1"}"#,
+    );
+
+    assert_call_ok(
+        namespace,
+        "create_table_branch",
+        r#"{"id":["workspace","numbers"],"name":"dev","from_version":3}"#,
+    );
+    let branches = assert_call_ok(
+        namespace,
+        "list_table_branches",
+        r#"{"id":["workspace","numbers"]}"#,
+    );
+    assert!(branches.json().unwrap().contains("dev"));
+    assert_call_ok(
+        namespace,
+        "delete_table_branch",
+        r#"{"id":["workspace","numbers"],"name":"dev"}"#,
+    );
+
+    assert_call_ok(
+        namespace,
+        "create_table_index",
+        r#"{"id":["workspace","numbers"],"column":"id","index_type":"BTREE","name":"numbers_id_idx"}"#,
+    );
+    let indices = assert_call_ok(
+        namespace,
+        "list_table_indices",
+        r#"{"id":["workspace","numbers"]}"#,
+    );
+    assert!(indices.json().unwrap().contains("numbers_id_idx"));
+    assert_call_ok(
+        namespace,
+        "describe_table_index_stats",
+        r#"{"id":["workspace","numbers"],"index_name":"numbers_id_idx"}"#,
+    );
+    assert_call_ok(
+        namespace,
+        "drop_table_index",
+        r#"{"id":["workspace","numbers"],"index_name":"numbers_id_idx"}"#,
+    );
+
+    let metadata = assert_call_ok(
+        namespace,
+        "update_table_schema_metadata",
+        r#"{"id":["workspace","numbers"],"metadata":{"owner":"namespace-test"}}"#,
+    );
+    assert!(metadata.json().unwrap().contains("namespace-test"));
 
     let metrics = unsafe { lance_namespace_retrieve_ops_metrics(namespace) };
     assert!(!metrics.is_null(), "metrics failed: {}", last_error());
@@ -804,6 +887,41 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
     unsafe { lance_dataset_close(read_dataset) };
 }
 
+static CAPTURED_REQUESTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+unsafe extern "C" fn capture_describe(
+    _context: *mut c_void,
+    request: *const c_char,
+    response: *mut LanceOwnedString,
+    error: *mut LanceCallbackError,
+) -> i32 {
+    let request = unsafe { CStr::from_ptr(request) }.to_str().unwrap();
+    CAPTURED_REQUESTS.lock().unwrap().push(request.to_owned());
+    unsafe {
+        (*response).data = owned_string("{}");
+        (*response).release = Some(free_owned_string);
+        let _ = error;
+    }
+    0
+}
+
+unsafe extern "C" fn authorization_context(
+    context: *mut c_void,
+    _operation: *const c_char,
+    _object_id: *const c_char,
+    response: *mut LanceOwnedString,
+    error: *mut LanceCallbackError,
+) -> i32 {
+    let counter = unsafe { &*(context.cast::<Arc<AtomicUsize>>()) };
+    counter.fetch_add(1, Ordering::SeqCst);
+    unsafe {
+        (*response).data = owned_string(r#"{"headers.Authorization":"Bearer header-token"}"#);
+        (*response).release = Some(free_owned_string);
+        let _ = error;
+    }
+    0
+}
+
 unsafe extern "C" fn dynamic_context(
     context: *mut c_void,
     operation: *const c_char,
@@ -855,6 +973,9 @@ fn rest_adapter_client_context_headers_metrics_and_native_errors() {
     assert!(!adapter.is_null());
     let port = unsafe { lance_rest_adapter_port(adapter) };
     assert_ne!(port, 0, "ephemeral adapter port");
+    // The adapter owns a native backend Arc; closing the caller handle must not
+    // invalidate in-flight or subsequent requests.
+    close_namespace(backend);
 
     let calls = Arc::new(AtomicUsize::new(0));
     let context = Box::into_raw(Box::new(calls.clone())) as *mut c_void;
@@ -941,13 +1062,69 @@ fn rest_adapter_client_context_headers_metrics_and_native_errors() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
     assert_eq!(result.native_error().unwrap().0, 4);
 
+    // A dynamic context header reaches the native adapter as caller identity.
+    CAPTURED_REQUESTS.lock().unwrap().clear();
+    let capture_release = Arc::new(AtomicUsize::new(0));
+    let header_namespace_id = c_string("header-capture");
+    let capture_spec = LanceNamespaceCustomClientSpec {
+        describe_table: Some(capture_describe),
+        describe_table_version: Some(unsupported_callback),
+        create_table_version: Some(unsupported_callback),
+        list_table_versions: Some(unsupported_callback),
+        release: Some(count_release),
+        client_ctx: Box::into_raw(Box::new(capture_release.clone())).cast(),
+        namespace_id: header_namespace_id.as_ptr(),
+    };
+    let capture_namespace = unsafe { lance_namespace_custom_new(&capture_spec) };
+    assert!(
+        !capture_namespace.is_null(),
+        "capture namespace: {}",
+        last_error()
+    );
+    let mut capture_adapter = ptr::null_mut();
+    let rc = unsafe {
+        lance_rest_adapter_start(capture_namespace, host.as_ptr(), 0, &mut capture_adapter)
+    };
+    assert_eq!(rc, 0, "capture adapter: {}", last_error());
+    let capture_port = unsafe { lance_rest_adapter_port(capture_adapter) };
+    // The custom namespace context is released only after the adapter's final
+    // native Arc owner drops, not when the caller handle closes.
+    close_namespace(capture_namespace);
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let auth_spec = LanceNamespaceContextProviderSpec {
+        provide_context: Some(authorization_context),
+        release: Some(count_release),
+        provider_ctx: Box::into_raw(Box::new(call_count.clone())).cast(),
+    };
+    let capture_properties = c_string(&format!(r#"{{"uri":"http://127.0.0.1:{capture_port}"}}"#));
+    let capture_client =
+        unsafe { lance_namespace_rest_new(capture_properties.as_ptr(), &auth_spec) };
+    assert!(
+        !capture_client.is_null(),
+        "capture client: {}",
+        last_error()
+    );
+    assert_call_ok(
+        capture_client,
+        "describe_table",
+        r#"{"id":["workspace","header-table"]}"#,
+    );
+    let captured = CAPTURED_REQUESTS.lock().unwrap().join("\n");
+    assert!(
+        captured.contains("\"auth_token\":\"header-token\""),
+        "context header did not reach the adapter: {captured}"
+    );
+    assert!(call_count.load(Ordering::SeqCst) > 0);
+    unsafe { lance_rest_adapter_shutdown(capture_adapter) };
+    unsafe { lance_rest_adapter_close(capture_adapter) };
+    close_namespace(capture_client);
+
     let metrics = unsafe { lance_namespace_retrieve_ops_metrics(client) };
     assert!(!metrics.is_null());
     let _ = take_and_free(metrics);
     unsafe { lance_rest_adapter_shutdown(adapter) };
     unsafe { lance_rest_adapter_close(adapter) };
     close_namespace(client);
-    close_namespace(backend);
 }
 
 #[test]

@@ -7779,8 +7779,9 @@ public:
         const DynamicContextProvider* context_provider = nullptr) {
         auto json = namespace_detail::json_string_object(properties);
         auto spec = make_context_spec(context_provider);
+        auto* spec_ptr = context_provider ? &spec : nullptr;
         auto* raw = lance_namespace_directory_new(
-            json.c_str(), session ? session->c_handle() : nullptr, &spec);
+            json.c_str(), session ? session->c_handle() : nullptr, spec_ptr);
         if (!raw) check_error();
         return Namespace(raw);
     }
@@ -7790,7 +7791,8 @@ public:
         const DynamicContextProvider* context_provider = nullptr) {
         auto json = namespace_detail::json_string_object(properties);
         auto spec = make_context_spec(context_provider);
-        auto* raw = lance_namespace_rest_new(json.c_str(), &spec);
+        auto* spec_ptr = context_provider ? &spec : nullptr;
+        auto* raw = lance_namespace_rest_new(json.c_str(), spec_ptr);
         if (!raw) check_error();
         return Namespace(raw);
     }
@@ -7802,11 +7804,12 @@ public:
         const DynamicContextProvider* context_provider = nullptr) {
         auto json = namespace_detail::json_string_object(properties);
         auto spec = make_context_spec(context_provider);
+        auto* spec_ptr = context_provider ? &spec : nullptr;
         auto* raw = lance_namespace_connect_new(
             impl_name.c_str(),
             json.c_str(),
             session ? session->c_handle() : nullptr,
-            &spec);
+            spec_ptr);
         if (!raw) check_error();
         return Namespace(raw);
     }

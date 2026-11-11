@@ -840,11 +840,6 @@ unsafe fn dataset_write_namespace_inner(
 ) -> Result<i32> {
     let namespace = unsafe { namespace.as_ref() }
         .ok_or_else(|| Error::invalid_input_source("namespace must not be NULL".into()))?;
-    if out_dataset.is_null() {
-        return Err(Error::invalid_input_source(
-            "out_dataset must not be NULL".into(),
-        ));
-    }
     if stream.is_null() {
         return Err(Error::invalid_input_source(
             "stream must not be NULL".into(),
@@ -923,11 +918,9 @@ unsafe fn dataset_write_namespace_inner(
             Some(write_params),
         ))?
     };
-    unsafe {
-        ptr::write(
-            out_dataset,
-            Box::into_raw(Box::new(dataset_handle(dataset))),
-        );
+    if !out_dataset.is_null() {
+        let handle = Box::into_raw(Box::new(dataset_handle(dataset)));
+        unsafe { ptr::write(out_dataset, handle) };
     }
     Ok(0)
 }
