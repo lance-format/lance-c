@@ -35,9 +35,13 @@ impl LanceFragment {
     pub(crate) fn metadata(&self) -> &Fragment {
         self.inner.metadata()
     }
+
+    pub(crate) fn schema(&self) -> &LanceSchema {
+        self.inner.schema()
+    }
 }
 
-unsafe fn fragment_ref<'a>(fragment: *const LanceFragment) -> Result<&'a LanceFragment> {
+pub(crate) unsafe fn fragment_ref<'a>(fragment: *const LanceFragment) -> Result<&'a LanceFragment> {
     if fragment.is_null() {
         return Err(Error::invalid_input_source(
             "fragment must not be NULL".into(),

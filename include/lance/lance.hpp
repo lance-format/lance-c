@@ -164,6 +164,7 @@ public:
 class Scanner;
 class Dataset;
 class Fragment;
+class LanceSchema;
 class IndexModel;
 class IndexSegmentBuilder;
 class IndexSegmentMetadata;
@@ -751,6 +752,17 @@ public:
         return count;
     }
 
+    /// Native `preserves_nullability` assertion from a Merge or Project
+    /// operation. Other kinds throw LANCE_ERR_NOT_SUPPORTED.
+    bool preserves_nullability() const {
+        bool value = false;
+        if (lance_operation_preserves_nullability(
+                handle_.get(), &value) != 0) {
+            check_error();
+        }
+        return value;
+    }
+
     /// Construct an owned native Delete operation. The fragment handles are
     /// borrowed and their complete native metadata is copied. Deleted IDs and
     /// the predicate are copied. Native commit validation remains authoritative.
@@ -771,6 +783,13 @@ public:
     /// authoritative.
     static Operation make_data_replacement(
         const std::vector<const DataReplacementGroup*>& replacements);
+
+    /// Construct an owned native Project operation from a native schema.
+    /// `preserves_nullability` is stored unchanged as the caller's explicit
+    /// assertion that the projection does not tighten nullability; conflict
+    /// and rebase semantics belong to Lance core. The schema is cloned.
+    static Operation make_project(const LanceSchema& schema,
+                                  bool preserves_nullability = false);
 
     /// New-index metadata cloned from a CreateIndex operation. Each returned
     /// value is independent of this operation handle.
@@ -2391,6 +2410,9 @@ public:
         if (lance_fragment_schema(handle_.get(), out) != 0) check_error();
     }
 
+    /// Clone the fragment's native schema from its staged dataset snapshot.
+    LanceSchema native_schema() const;
+
     /// Physical row count, including deleted rows. May perform data-file I/O.
     uint64_t physical_rows() const {
         uint64_t value = 0;
@@ -2459,6 +2481,108 @@ inline std::optional<Fragment> Fragment::delete_if(
     }
     if (!raw) return std::nullopt;
     return Fragment(raw);
+}
+
+/// Move-only owner of a native Lance schema.
+///
+/// Unlike the Arrow export, a native schema preserves field and parent IDs,
+/// logical types, encodings, dictionary values, nested metadata, field order
+/// and nullability. A clone remains valid after the dataset, fragment or
+/// operation that produced it is closed.
+class LanceSchema {
+    Handle<::LanceSchema, lance_schema_close> handle_;
+
+public:
+    explicit LanceSchema(::LanceSchema* schema) : handle_(schema) {
+        if (!handle_) check_error();
+    }
+
+    LanceSchema(LanceSchema&&) noexcept = default;
+    LanceSchema& operator=(LanceSchema&&) noexcept = default;
+    LanceSchema(const LanceSchema&) = delete;
+    LanceSchema& operator=(const LanceSchema&) = delete;
+
+    /// Independently owned native clone.
+    LanceSchema clone() const {
+        ::LanceSchema* raw = lance_schema_clone(handle_.get());
+        if (!raw) check_error();
+        return LanceSchema(raw);
+    }
+
+    /// Clone the current snapshot schema of a dataset.
+    static LanceSchema from_dataset(const Dataset& dataset);
+
+    /// Clone the staged snapshot schema of a fragment.
+    static LanceSchema from_fragment(const Fragment& fragment);
+
+    /// Clone the in-memory schema of an Overwrite, Merge or Project operation.
+    /// Other kinds throw LANCE_ERR_NOT_SUPPORTED.
+    static LanceSchema from_operation(const Operation& operation);
+
+    /// Project onto ordered native column paths. Paths, order, unknown-column
+    /// errors and empty-selection behavior are native `Schema::project`.
+    static LanceSchema project(const LanceSchema& schema,
+                               const std::vector<std::string>& columns) {
+        std::vector<const char*> paths;
+        paths.reserve(columns.size());
+        for (const auto& column : columns) paths.push_back(column.c_str());
+        ::LanceSchema* raw = nullptr;
+        if (lance_schema_project(
+                schema.c_handle(), paths.empty() ? nullptr : paths.data(),
+                paths.size(), &raw) != 0) {
+            check_error();
+        }
+        return LanceSchema(raw);
+    }
+
+    /// Native Lance field ID for a column path. Throws when the path does not
+    /// resolve.
+    int32_t field_id(const std::string& column) const {
+        int32_t id = 0;
+        if (lance_schema_field_id(
+                handle_.get(), column.c_str(), &id) != 0) {
+            check_error();
+        }
+        return id;
+    }
+
+    /// Export an Arrow interoperability view. `out` is caller-owned and must
+    /// be released exactly once. Arrow cannot represent every native detail.
+    void to_arrow(ArrowSchema* out) const {
+        if (lance_schema_to_arrow(handle_.get(), out) != 0) check_error();
+    }
+
+    const ::LanceSchema* c_handle() const { return handle_.get(); }
+};
+
+inline LanceSchema Fragment::native_schema() const {
+    return LanceSchema::from_fragment(*this);
+}
+
+inline LanceSchema LanceSchema::from_fragment(const Fragment& fragment) {
+    ::LanceSchema* raw = nullptr;
+    if (lance_fragment_schema_clone(fragment.c_handle(), &raw) != 0) {
+        check_error();
+    }
+    return LanceSchema(raw);
+}
+
+inline LanceSchema LanceSchema::from_operation(const Operation& operation) {
+    ::LanceSchema* raw = nullptr;
+    if (lance_operation_schema_clone(operation.c_handle(), &raw) != 0) {
+        check_error();
+    }
+    return LanceSchema(raw);
+}
+
+inline Operation Operation::make_project(
+    const LanceSchema& schema, bool preserves_nullability) {
+    LanceOperation* raw = nullptr;
+    if (lance_operation_project_new(
+            schema.c_handle(), preserves_nullability, &raw) != 0) {
+        check_error();
+    }
+    return Operation(raw);
 }
 
 inline Operation Operation::make_delete(
@@ -5257,6 +5381,9 @@ public:
         return DataFile(file);
     }
 
+    /// Clone the current snapshot schema as an owned native value.
+    LanceSchema native_schema() const;
+
     /// Take rows by indices. `out` is caller-owned and its non-null `release`
     /// must be called exactly once. Deferred iteration/cleanup panics are
     /// contained by the exported stream guard.
@@ -5841,6 +5968,18 @@ public:
 private:
     explicit Dataset(LanceDataset* ptr) : handle_(ptr) {}
 };
+
+inline LanceSchema Dataset::native_schema() const {
+    return LanceSchema::from_dataset(*this);
+}
+
+inline LanceSchema LanceSchema::from_dataset(const Dataset& dataset) {
+    ::LanceSchema* raw = nullptr;
+    if (lance_dataset_schema_clone(dataset.c_handle(), &raw) != 0) {
+        check_error();
+    }
+    return LanceSchema(raw);
+}
 
 inline CompactionOptions CompactionOptions::from_dataset(
     const Dataset& dataset) {
