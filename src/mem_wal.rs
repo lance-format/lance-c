@@ -26,7 +26,8 @@ use std::time::Duration;
 use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use arrow::ffi::{FFI_ArrowArrayStream, FFI_ArrowSchema};
+use arrow::ffi::FFI_ArrowSchema;
+use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_array::RecordBatchReader;
 use datafusion::common::ScalarValue;
@@ -36,12 +37,13 @@ use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::mem_wal::scanner::{
-    LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, parse_filter_expr,
+    LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
+    parse_filter_expr,
 };
-use lance::dataset::mem_wal::write::SharedWriteStats;
+use lance::dataset::mem_wal::write::{SharedWriteStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
-    DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, ShardWriterConfig, SsTable,
-    WriteStatsSnapshot, arrow_schema_with_field_ids, evaluate_sharding_spec,
+    DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, ShardWriterConfig,
+    arrow_schema_with_field_ids, evaluate_sharding_spec,
 };
 use lance_index::mem_wal::{ShardingField, ShardingSpec};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -852,11 +854,11 @@ pub unsafe extern "C" fn lance_mem_wal_sharding_field_source_ids(
             require_out(out_count, "out_count")?;
             let field = field_ref(field)?;
             *out_count = field.field.source_ids.len();
-            if field.field.source_ids.is_empty() {
+            Ok(if field.field.source_ids.is_empty() {
                 std::ptr::null()
             } else {
                 field.field.source_ids.as_ptr()
-            }
+            })
         },
         std::ptr::null()
     )
@@ -1540,7 +1542,7 @@ unsafe fn writer_put_inner(
     // Consume the stream before touching the live writer: once a non-NULL
     // stream is accepted it is released exactly once on every return path.
     let reader = unsafe { take_arrow_array_stream(stream)? };
-    let batches: Vec<RecordBatch> = block_on(reader.try_collect())?;
+    let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
     let live = writer.live_mut_slot()?;
     let result = block_on(live.put(batches))?;
     if !out_result.is_null() {
@@ -1574,7 +1576,7 @@ unsafe fn writer_delete_inner(
 ) -> lance_core::Result<i32> {
     let writer = required_mut(writer, "writer")?;
     let reader = unsafe { take_arrow_array_stream(stream)? };
-    let batches: Vec<RecordBatch> = block_on(reader.try_collect())?;
+    let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
     let live = writer.live_mut_slot()?;
     let result = block_on(live.delete(batches))?;
     if !out_result.is_null() {
