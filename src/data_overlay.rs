@@ -133,9 +133,10 @@ unsafe fn read_bitmaps(
     }
     let max_lens = isize::MAX as usize / std::mem::size_of::<usize>();
     if bitmap_count > max_lens {
-        return Err(lance_core::Error::invalid_input_source(format!(
-            "bitmap_count {bitmap_count} exceeds the maximum addressable length slice"
-        )));
+        return Err(lance_core::Error::invalid_input_source(
+            format!("bitmap_count {bitmap_count} exceeds the maximum addressable length slice")
+                .into(),
+        ));
     }
 
     let bitmaps = unsafe { slice::from_raw_parts(bitmaps, bitmap_count) };
@@ -229,7 +230,7 @@ unsafe fn data_overlay_file_new_inner(
     };
 
     let inner = DataOverlayFile {
-        data_file: data_file.inner.clone(),
+        data_file: data_file.native().clone(),
         coverage,
         committed_version,
     };
