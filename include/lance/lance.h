@@ -1958,15 +1958,15 @@ int32_t lance_dataset_all_files_stream(
 );
 
 /**
- * Restore the dataset to an older version by committing a new manifest that
- * carries the fragments of `version`. If `version` is already the latest,
- * succeeds as a no-op without writing a new manifest.
+ * Restore the dataset by committing a new manifest that carries the fragments
+ * of `version`. A new version is committed even when `version` is already the
+ * latest. The input dataset handle remains unchanged.
  *
  * @param dataset  Open dataset (not consumed). Must not be NULL.
  * @param version  Target version id (>= 1). `0` is rejected since it is the
  *                 "latest" sentinel used by lance_dataset_open.
- * @return Fresh LanceDataset* positioned at the target version (caller closes
- *         with lance_dataset_close), or NULL on error. Possible error codes
+ * @return Fresh LanceDataset* positioned at the newly committed version
+ *         (caller closes with lance_dataset_close), or NULL on error. Error codes
  *         include LANCE_ERR_INVALID_ARGUMENT (NULL handle or version == 0),
  *         LANCE_ERR_NOT_FOUND (unknown version),
  *         LANCE_ERR_COMMIT_CONFLICT (concurrent writer).
