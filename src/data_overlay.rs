@@ -141,7 +141,7 @@ unsafe fn read_bitmaps(
 
     let bitmaps = unsafe { slice::from_raw_parts(bitmaps, bitmap_count) };
     let bitmap_lens = unsafe { slice::from_raw_parts(bitmap_lens, bitmap_count) };
-    let mut out = Vec::with_capacity(bitmap_count);
+    let mut out = Vec::new();
     for (position, (&bitmap, &len)) in bitmaps.iter().zip(bitmap_lens).enumerate() {
         if len > isize::MAX as usize {
             return Err(lance_core::Error::invalid_input(format!(
@@ -465,7 +465,7 @@ unsafe fn data_overlay_group_new_inner(
         ));
     }
 
-    let mut cloned = Vec::with_capacity(overlay_count);
+    let mut cloned = Vec::new();
     if overlay_count > 0 {
         let overlays = unsafe { slice::from_raw_parts(overlays, overlay_count) };
         for (position, &overlay) in overlays.iter().enumerate() {
