@@ -763,12 +763,12 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
     let stale_group = finish(stale_writer);
     let (stale_committed, stale_code) = commit(&fixture.uri, 1, &[stale_group]);
     assert!(stale_committed.is_null());
-    // DataOverlay commits are additive and do not conflict with other
-    // operations, but a real row-moving compaction removes the old fragment.
-    // Native manifest build then rejects the stale target.
+    // DataOverlay commits are additive, but a real row-moving compaction
+    // produces a concurrent Rewrite that preempts this stale snapshot. Native
+    // reports a retryable conflict; the wrapper must not retry or rebase.
     assert_eq!(
         stale_code,
-        LanceErrorCode::InvalidArgument,
+        LanceErrorCode::CommitConflict,
         "{:?}",
         take_error()
     );
