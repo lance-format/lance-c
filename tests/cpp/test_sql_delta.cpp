@@ -317,8 +317,10 @@ void test_delta_compared_version_transactions(const std::string& uri) {
     {
         auto transactions = delta.list_transactions();
         CHECK(transactions.size() == 3);
-        CHECK(transactions.front().read_version() == 3);
-        CHECK(transactions.back().read_version() == 5);
+        // A transaction records the version it read, so the transactions of
+        // versions 3, 4 and 5 read versions 2, 3 and 4.
+        CHECK(transactions.front().read_version() == 2);
+        CHECK(transactions.back().read_version() == 4);
         CHECK(!transactions.front().uuid().empty());
     }
 
@@ -334,7 +336,7 @@ void test_delta_compared_version_transactions(const std::string& uri) {
     transactions.shrink_to_fit();
     CHECK(adopted.size() == 3);
     for (size_t i = 0; i < adopted.size(); i++) {
-        CHECK(adopted[i].read_version() == i + 3);
+        CHECK(adopted[i].read_version() == i + 2);
         CHECK(!adopted[i].uuid().empty());
     }
     adopted.clear();
@@ -409,7 +411,9 @@ void test_delta_errors(const std::string& history_uri,
     auto message = error_message_of([&] { plain_delta.get_deleted_row_ids(); });
     CHECK(message.find("stable row ids") != std::string::npos);
     auto plain_inserted = plain_delta.get_inserted_rows();
-    CHECK(sorted(read_i32(plain_inserted, 0)).size() == 10);
+    // Row changes filter on row-version lineage, which a write without stable
+    // row ids does not record, so a plain dataset reports no changes.
+    CHECK(sorted(read_i32(plain_inserted, 0)).empty());
 }
 
 } // namespace

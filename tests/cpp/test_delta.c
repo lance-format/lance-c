@@ -305,7 +305,9 @@ static void test_transaction_list(const char *uri) {
         ASSERT(lance_transaction_read_version(transactions[i], &read_version) == 0,
                "read transaction version");
         CHECK_OK();
-        ASSERT(read_version == (uint64_t)i + 1,
+        /* A transaction records the version it read, which is the parent of
+         * the version it committed. */
+        ASSERT(read_version == (uint64_t)i,
                "transactions are listed in commit order");
         const char *uuid = lance_transaction_uuid(transactions[i]);
         ASSERT(uuid != NULL, "transaction uuid present");
@@ -454,10 +456,11 @@ static void test_reversed_and_unsupported(const char *history_uri,
     ASSERT(message != NULL && strstr(message, "stable row ids") != NULL,
            "native stable-row-id error surfaces");
     lance_free_string(message);
-    /* Row-change streams still work on the same delta. */
+    /* Row-change streams stay available on the same delta, but they filter on
+     * row-version lineage, which a write without stable row ids does not
+     * record, so a plain dataset reports no changes. */
     stream = inserted_rows(delta);
-    int32_t appended[] = {11, 12, 13, 14, 15, 16, 17, 18, 19, 20};
-    assert_i32_set("plain inserted", &stream, appended, 10);
+    assert_i32_set("plain inserted", &stream, NULL, 0);
     lance_dataset_delta_close(delta);
     lance_dataset_close(dataset);
 }

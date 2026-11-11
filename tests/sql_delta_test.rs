@@ -1168,7 +1168,13 @@ fn test_delta_transactions_ownership_and_reuse() {
         unsafe { lance_free_string(raw_uuid) };
         assert!(!uuid.is_empty(), "committed transactions carry a uuid");
     }
-    assert_eq!(read_versions, vec![1, 2, 3, 4, 5]);
+    // A transaction records the version it read, which is the parent of the
+    // version it committed: version 1's create reads version 0.
+    assert_eq!(
+        read_versions,
+        native.iter().map(|v| v.version - 1).collect::<Vec<u64>>()
+    );
+    assert_eq!(read_versions, vec![0, 1, 2, 3, 4]);
 
     // Releasing the array closes the remaining elements and the allocation;
     // the delta stays usable afterwards (nothing was consumed here).
@@ -1402,11 +1408,15 @@ fn test_delta_deleted_ids_require_stable_row_ids() {
         "native unsupported-case error should surface, got: {message}"
     );
 
-    // Row-change streams still work on the same delta.
+    // Row-change streams filter on row-version lineage, which a write without
+    // stable row ids does not record, so this dataset reports no changes —
+    // the native reader agrees.
     let inserted = c_delta_stream(delta, DeltaStream::Inserted);
-    assert_eq!(
-        ids_of(&inserted),
-        vec![11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    let native_inserted = native_delta(&uri, unchanged, DeltaStream::Inserted);
+    assert_eq!(ids_of(&native_inserted), ids_of(&inserted));
+    assert!(
+        ids_of(&inserted).is_empty(),
+        "row changes need row lineage, which a plain write does not record"
     );
 
     unsafe {
