@@ -1382,7 +1382,9 @@ unsafe fn create_vector_index_with_options_inner(
             builder = builder.name(index_name);
         }
         builder = builder.replace(replace).train(prepared.train);
-        block_on(builder.execute())
+        // `execute` is private in the pinned core, while `IntoFuture` is the
+        // public commit path and performs the same commit-plus-metadata reload.
+        block_on(std::future::IntoFuture::into_future(builder))
     })?;
     Ok(0)
 }

@@ -55,7 +55,7 @@ pub unsafe extern "C" fn lance_index_build_rq_model(
                     "dimension={dimension} cannot be represented as the native i32 dimension"
                 ))
             })?;
-            if dimension <= 0 || !dimension.is_multiple_of(u8::BITS as i32) {
+            if dimension <= 0 || dimension % (u8::BITS as i32) != 0 {
                 return Err(invalid_input(format!(
                     "dimension must be positive and divisible by 8 for IVF_RQ, got {dimension}"
                 )));

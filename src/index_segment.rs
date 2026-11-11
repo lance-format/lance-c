@@ -685,7 +685,7 @@ pub(crate) unsafe fn borrow_model_array(
         return Err(invalid_input(format!("{name} must not be NULL")));
     }
     let field = unsafe { validate_model_schema(schema, name)? };
-    let DataType::FixedSizeList(child_field, list_size) = field.data_type() else {
+    let DataType::FixedSizeList(_, list_size) = field.data_type() else {
         return Err(invalid_input(format!(
             "{name}_schema must describe FixedSizeList, got {:?}",
             field.data_type()
