@@ -14,12 +14,17 @@ use std::sync::Arc;
 
 use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::Schema as ArrowSchema;
-use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use lance::dataset::transaction::{
+    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder, UpdateMode,
+    UpdatedFragmentOffsets,
+};
 use lance_core::Result;
 use lance_core::datatypes::Schema;
-use lance_table::format::{BasePath, Fragment, IndexMetadata, pb};
+use lance_table::format::key_existence::{FilterType, KeyExistenceFilter};
+use lance_table::format::{BasePath, Fragment, IndexFile, IndexMetadata, pb};
 use lance_table::transaction::{DataOverlayGroup, DataReplacementGroup, UpdateMap};
 use prost::Message;
+use roaring::RoaringBitmap;
 
 use crate::base_paths::{
     LanceBasePath, LanceBasePathList, LanceBasePathView, OwnedBasePath, own_base_paths,
@@ -33,6 +38,7 @@ use crate::fragment::{LanceFragment, fragment_metadata_json};
 use crate::helpers;
 use crate::index::{LanceStringMap, parse_string_map};
 use crate::index_segment::{LanceIndexSegmentMetadata, metadata_handle};
+use crate::mem_wal::LanceCompactedSsTable;
 use crate::runtime::block_on;
 use crate::schema::{LanceSchema, schema_ref};
 use crate::update_map::{LanceUpdateMap, parse_update_map, update_map_at};
@@ -718,13 +724,14 @@ unsafe fn operation_create_index_new_inner(
 unsafe fn clone_fragment_array(
     fragments: *const *const LanceFragment,
     fragment_count: usize,
+    label: &str,
 ) -> Result<Vec<Fragment>> {
     if fragments.is_null() {
         if fragment_count == 0 {
             return Ok(Vec::new());
         }
         return Err(lance_core::Error::invalid_input_source(
-            format!("fragments must not be NULL when fragment_count = {fragment_count}").into(),
+            format!("{label} must not be NULL when {label}_count = {fragment_count}").into(),
         ));
     }
     if fragment_count == 0 {
@@ -749,10 +756,8 @@ unsafe fn clone_fragment_array(
     for (index, fragment) in fragments.iter().enumerate() {
         if fragment.is_null() {
             return Err(lance_core::Error::invalid_input_source(
-                format!(
-                    "fragments[{index}] must not be NULL when fragment_count = {fragment_count}"
-                )
-                .into(),
+                format!("{label}[{index}] must not be NULL when {label}_count = {fragment_count}")
+                    .into(),
             ));
         }
         cloned.push(unsafe { &**fragment }.metadata().clone());
@@ -783,7 +788,7 @@ unsafe fn operation_append_new_inner(
     fragments: *const *const LanceFragment,
     fragment_count: usize,
 ) -> Result<*mut LanceOperation> {
-    let fragments = unsafe { clone_fragment_array(fragments, fragment_count) }?;
+    let fragments = unsafe { clone_fragment_array(fragments, fragment_count, "fragments") }?;
     Ok(Box::into_raw(Box::new(LanceOperation::from_native(
         Operation::Append { fragments },
     ))))
@@ -3530,4 +3535,2253 @@ unsafe fn dataset_read_transaction_inner(
         ptr::write(out_transaction, transaction);
     }
     Ok(0)
+}
+
+// ─── Update, Rewrite and UpdateMemWalState operation values ──────────────────
+
+/// Native update mode for an Update operation. Values are pinned for the C ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LanceUpdateMode {
+    /// Rewrite whole rows (vertical update).
+    RewriteRows = 0,
+    /// Rewrite selected columns and record matched offsets (horizontal update).
+    RewriteColumns = 1,
+}
+
+/// Borrowed row offsets for one fragment in a `LanceUpdatedFragmentOffsets`.
+///
+/// `offsets` may be NULL only when `offset_count` is 0, which is a real empty
+/// bitmap entry rather than an absent one.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceFragmentOffsetsView {
+    pub fragment_id: u64,
+    pub offsets: *const u32,
+    pub offset_count: usize,
+}
+
+/// Borrowed index-file entry for a `LanceRewrittenIndex`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceIndexFile {
+    pub path: *const c_char,
+    pub size_bytes: u64,
+}
+
+/// Kind of a native key-existence filter. Values are pinned for the C ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LanceKeyExistenceFilterKind {
+    /// An explicit set of key hashes.
+    Exact = 0,
+    /// A bloom filter over key hashes.
+    Bloom = 1,
+}
+
+/// Owned native key-existence filter value.
+///
+/// The constructor that accepts protobuf bytes converts through native
+/// `TryFrom`, so absent bloom fields pick up the native defaults
+/// (`number_of_items = 8192`, `probability = 0.00057`) and an absent filter
+/// body becomes an empty exact set. `lance_key_existence_filter_to_proto`
+/// converts through native `From`, which is the encoding an Update operation
+/// persists.
+pub struct LanceKeyExistenceFilter {
+    pub(crate) inner: KeyExistenceFilter,
+}
+
+/// Owned native `UpdatedFragmentOffsets` value.
+///
+/// Native representation is `HashMap<fragment_id, RoaringBitmap>`. The ordered
+/// array constructor therefore keeps the last entry for a repeated fragment ID,
+/// and each entry's offsets are a set: repeated offsets collapse.
+pub struct LanceUpdatedFragmentOffsets {
+    pub(crate) inner: UpdatedFragmentOffsets,
+}
+
+/// Owned native `RewriteGroup` value.
+pub struct LanceRewriteGroup {
+    pub(crate) inner: RewriteGroup,
+}
+
+/// Owned native `RewrittenIndex` value.
+pub struct LanceRewrittenIndex {
+    pub(crate) inner: RewrittenIndex,
+}
+
+/// Complete input for `lance_operation_update_new`.
+///
+/// Every array is borrowed for the duration of the call and copied into native
+/// owned values. A NULL array is accepted only with a zero count. `NULL`
+/// `inserted_rows_filter` and `updated_fragment_offsets` map to native `None`;
+/// `has_update_mode == false` maps to native `None` as well. This struct is
+/// extended only by adding fields at the end.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceUpdateOperationOptions {
+    pub removed_fragment_ids: *const u64,
+    pub removed_fragment_count: usize,
+    pub updated_fragments: *const *const LanceFragment,
+    pub updated_fragment_count: usize,
+    pub new_fragments: *const *const LanceFragment,
+    pub new_fragment_count: usize,
+    pub fields_modified: *const u32,
+    pub fields_modified_count: usize,
+    pub compacted_sstables: *const LanceCompactedSsTable,
+    pub compacted_sstable_count: usize,
+    pub fields_for_preserving_frag_bitmap: *const u32,
+    pub fields_for_preserving_frag_bitmap_count: usize,
+    /// When false, native `update_mode` is `None` and `update_mode` is ignored.
+    pub has_update_mode: bool,
+    /// One of `LanceUpdateMode`; required when `has_update_mode` is true.
+    pub update_mode: i32,
+    /// Optional native `inserted_rows_filter`; NULL means `None`.
+    pub inserted_rows_filter: *const LanceKeyExistenceFilter,
+    /// Optional native `updated_fragment_offsets`; NULL means `None`.
+    pub updated_fragment_offsets: *const LanceUpdatedFragmentOffsets,
+}
+
+/// Copy a caller-supplied array into a borrowed slice after the shared checks.
+unsafe fn required_slice<'a, T>(
+    values: *const T,
+    count: usize,
+    label: &str,
+    count_label: &str,
+) -> Result<&'a [T]> {
+    if count == 0 {
+        return Ok(&[]);
+    }
+    if values.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{label} must not be NULL when {count_label} = {count}").into(),
+        ));
+    }
+    helpers::validate_slice_length::<T>(count, label)?;
+    Ok(unsafe { std::slice::from_raw_parts(values, count) })
+}
+
+fn parse_update_mode(value: i32) -> Result<UpdateMode> {
+    match value {
+        0 => Ok(UpdateMode::RewriteRows),
+        1 => Ok(UpdateMode::RewriteColumns),
+        other => Err(lance_core::Error::invalid_input_source(
+            format!(
+                "update_mode must be LANCE_UPDATE_MODE_REWRITE_ROWS (0) or \
+                 LANCE_UPDATE_MODE_REWRITE_COLUMNS (1) when has_update_mode is true, got {other}"
+            )
+            .into(),
+        )),
+    }
+}
+
+fn update_mode_code(mode: &UpdateMode) -> i32 {
+    match mode {
+        UpdateMode::RewriteRows => 0,
+        UpdateMode::RewriteColumns => 1,
+    }
+}
+
+fn update_kind_error(operation: &Operation) -> lance_core::Error {
+    lance_core::Error::not_supported_source(
+        format!(
+            "Update inspection is not supported for {} operations",
+            operation.name()
+        )
+        .into(),
+    )
+}
+
+fn rewrite_kind_error(operation: &Operation) -> lance_core::Error {
+    lance_core::Error::not_supported_source(
+        format!(
+            "Rewrite inspection is not supported for {} operations",
+            operation.name()
+        )
+        .into(),
+    )
+}
+
+fn update_mem_wal_state_kind_error(operation: &Operation) -> lance_core::Error {
+    lance_core::Error::not_supported_source(
+        format!(
+            "UpdateMemWalState inspection is not supported for {} operations",
+            operation.name()
+        )
+        .into(),
+    )
+}
+
+fn count_out(len: usize, out_count: *mut u64, label: &str) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{label} must not be NULL").into(),
+        ));
+    }
+    unsafe {
+        ptr::write(out_count, u64::try_from(len).unwrap_or(u64::MAX));
+    }
+    Ok(0)
+}
+
+unsafe fn fragment_out(fragment: &Fragment, out_fragment: *mut *mut LanceFragment) -> Result<i32> {
+    if out_fragment.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_fragment must not be NULL".into(),
+        ));
+    }
+    let handle = Box::into_raw(Box::new(LanceFragment::from_metadata(fragment.clone())));
+    unsafe {
+        ptr::write(out_fragment, handle);
+    }
+    Ok(0)
+}
+
+// ─── UpdatedFragmentOffsets ─────────────────────────────────────────────────
+
+/// Construct owned native `UpdatedFragmentOffsets` from ordered entries.
+///
+/// Entries are copied: each `offsets` array is read as a set of row offsets, and
+/// a repeated `fragment_id` replaces the earlier entry exactly as the native
+/// `HashMap` collection does. `Some(empty)` and an empty bitmap entry are both
+/// representable here; only an explicit protobuf round trip normalizes them to
+/// native `None`. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_updated_fragment_offsets_new(
+    entries: *const LanceFragmentOffsetsView,
+    entry_count: usize,
+) -> *mut LanceUpdatedFragmentOffsets {
+    ffi_try!(
+        (|| -> Result<*mut LanceUpdatedFragmentOffsets> {
+            let entries =
+                unsafe { required_slice(entries, entry_count, "entries", "entry_count")? };
+            let mut offsets = HashMap::with_capacity(entries.len());
+            for (index, entry) in entries.iter().enumerate() {
+                let values = unsafe {
+                    required_slice(
+                        entry.offsets,
+                        entry.offset_count,
+                        &format!("entries[{index}].offsets"),
+                        "offset_count",
+                    )?
+                };
+                offsets.insert(
+                    entry.fragment_id,
+                    RoaringBitmap::from_iter(values.iter().copied()),
+                );
+            }
+            Ok(Box::into_raw(Box::new(LanceUpdatedFragmentOffsets {
+                inner: UpdatedFragmentOffsets(offsets),
+            })))
+        })(),
+        null
+    )
+}
+
+/// Clone an owned native `UpdatedFragmentOffsets` value. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_updated_fragment_offsets_clone(
+    offsets: *const LanceUpdatedFragmentOffsets,
+) -> *mut LanceUpdatedFragmentOffsets {
+    ffi_try!(
+        (|| -> Result<*mut LanceUpdatedFragmentOffsets> {
+            if offsets.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "offsets must not be NULL".into(),
+                ));
+            }
+            let offsets = unsafe { &*offsets };
+            Ok(Box::into_raw(Box::new(LanceUpdatedFragmentOffsets {
+                inner: offsets.inner.clone(),
+            })))
+        })(),
+        null
+    )
+}
+
+/// Free an owned `UpdatedFragmentOffsets`. Safe to call with NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_updated_fragment_offsets_close(
+    offsets: *mut LanceUpdatedFragmentOffsets,
+) {
+    if !offsets.is_null() {
+        unsafe { drop(Box::from_raw(offsets)) };
+    }
+}
+
+/// Return the number of fragment entries in an `UpdatedFragmentOffsets`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_updated_fragment_offsets_count(
+    offsets: *const LanceUpdatedFragmentOffsets,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if offsets.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "offsets must not be NULL".into(),
+                ));
+            }
+            count_out(unsafe { &*offsets }.inner.0.len(), out_count, "out_count")
+        })(),
+        neg
+    )
+}
+
+/// Read one fragment ID by entry index. Entry order is unspecified.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_updated_fragment_offsets_fragment_id_at(
+    offsets: *const LanceUpdatedFragmentOffsets,
+    index: usize,
+    out_fragment_id: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if offsets.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "offsets must not be NULL".into(),
+                ));
+            }
+            if out_fragment_id.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_fragment_id must not be NULL".into(),
+                ));
+            }
+            let offsets = unsafe { &*offsets };
+            let fragment_id = offsets.inner.0.keys().nth(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "fragment entry index {index} is out of range for {} entries",
+                        offsets.inner.0.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe {
+                ptr::write(out_fragment_id, *fragment_id);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Return the number of offsets recorded for one entry index.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_updated_fragment_offsets_offset_count_at(
+    offsets: *const LanceUpdatedFragmentOffsets,
+    index: usize,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if offsets.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "offsets must not be NULL".into(),
+                ));
+            }
+            let offsets = unsafe { &*offsets };
+            let bitmap = offsets.inner.0.values().nth(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "fragment entry index {index} is out of range for {} entries",
+                        offsets.inner.0.len()
+                    )
+                    .into(),
+                )
+            })?;
+            count_out(
+                usize::try_from(bitmap.len()).unwrap_or(usize::MAX),
+                out_count,
+                "out_count",
+            )
+        })(),
+        neg
+    )
+}
+
+/// Read one offset by entry index and ascending offset position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_updated_fragment_offsets_offset_at(
+    offsets: *const LanceUpdatedFragmentOffsets,
+    index: usize,
+    position: usize,
+    out_offset: *mut u32,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if offsets.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "offsets must not be NULL".into(),
+                ));
+            }
+            if out_offset.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_offset must not be NULL".into(),
+                ));
+            }
+            let offsets = unsafe { &*offsets };
+            let bitmap = offsets.inner.0.values().nth(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "fragment entry index {index} is out of range for {} entries",
+                        offsets.inner.0.len()
+                    )
+                    .into(),
+                )
+            })?;
+            let offset = bitmap.iter().nth(position).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "offset position {position} is out of range for {} offsets",
+                        bitmap.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe {
+                ptr::write(out_offset, offset);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+// ─── KeyExistenceFilter ─────────────────────────────────────────────────────
+
+fn parse_key_existence_filter(
+    bytes: *const u8,
+    len: usize,
+    label: &str,
+) -> Result<KeyExistenceFilter> {
+    let bytes = unsafe { required_slice(bytes, len, label, "len") }?;
+    let message = pb::transaction::KeyExistenceFilter::decode(bytes).map_err(|error| {
+        lance_core::Error::invalid_input_source(
+            format!("{label} is not a native key-existence filter: {error}").into(),
+        )
+    })?;
+    KeyExistenceFilter::try_from(&message).map_err(|error| {
+        lance_core::Error::invalid_input_source(
+            format!("{label} is not a valid native key-existence filter: {error}").into(),
+        )
+    })
+}
+
+fn exact_keys(filter: &KeyExistenceFilter) -> Result<&std::collections::HashSet<u64>> {
+    match &filter.filter {
+        FilterType::ExactSet(keys) => Ok(keys),
+        FilterType::Bloom { .. } => Err(lance_core::Error::not_supported_source(
+            "exact key inspection is not supported for bloom filters".into(),
+        )),
+    }
+}
+
+struct BloomValues<'a> {
+    bitmap: &'a [u8],
+    num_bits: u32,
+    number_of_items: u64,
+    probability: f64,
+}
+
+fn bloom_values(filter: &KeyExistenceFilter) -> Result<BloomValues<'_>> {
+    match &filter.filter {
+        FilterType::Bloom {
+            bitmap,
+            num_bits,
+            number_of_items,
+            probability,
+        } => Ok(BloomValues {
+            bitmap,
+            num_bits: *num_bits,
+            number_of_items: *number_of_items,
+            probability: *probability,
+        }),
+        FilterType::ExactSet(_) => Err(lance_core::Error::not_supported_source(
+            "bloom inspection is not supported for exact-set filters".into(),
+        )),
+    }
+}
+
+/// Build an owned native key-existence filter from explicit protobuf bytes.
+///
+/// The bytes are one encoded `lance.table.transaction.KeyExistenceFilter`
+/// message, converted through native `TryFrom`: absent bloom fields take the
+/// native defaults and an absent filter body becomes an empty exact set. NULL
+/// bytes are accepted only with a zero length. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_key_existence_filter_from_proto(
+    bytes: *const u8,
+    len: usize,
+    out_filter: *mut *mut LanceKeyExistenceFilter,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_filter.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_filter must not be NULL".into(),
+                ));
+            }
+            let filter = parse_key_existence_filter(bytes, len, "bytes")?;
+            let handle = Box::into_raw(Box::new(LanceKeyExistenceFilter { inner: filter }));
+            unsafe {
+                ptr::write(out_filter, handle);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Clone an owned native key-existence filter. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_key_existence_filter_clone(
+    filter: *const LanceKeyExistenceFilter,
+) -> *mut LanceKeyExistenceFilter {
+    ffi_try!(
+        (|| -> Result<*mut LanceKeyExistenceFilter> {
+            if filter.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "filter must not be NULL".into(),
+                ));
+            }
+            let filter = unsafe { &*filter };
+            Ok(Box::into_raw(Box::new(LanceKeyExistenceFilter {
+                inner: filter.inner.clone(),
+            })))
+        })(),
+        null
+    )
+}
+
+/// Free an owned key-existence filter. Safe to call with NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_key_existence_filter_close(filter: *mut LanceKeyExistenceFilter) {
+    if !filter.is_null() {
+        unsafe { drop(Box::from_raw(filter)) };
+    }
+}
+
+/// Read the filter kind.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_key_existence_filter_kind(
+    filter: *const LanceKeyExistenceFilter,
+    out_kind: *mut LanceKeyExistenceFilterKind,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if filter.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "filter must not be NULL".into(),
+                ));
+            }
+            if out_kind.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_kind must not be NULL".into(),
+                ));
+            }
+            let filter = unsafe { &*filter };
+            let kind = match &filter.inner.filter {
+                FilterType::ExactSet(_) => LanceKeyExistenceFilterKind::Exact,
+                FilterType::Bloom { .. } => LanceKeyExistenceFilterKind::Bloom,
+            };
+            unsafe {
+                ptr::write(out_kind, kind);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Return the number of filter field IDs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_key_existence_filter_field_id_count(
+    filter: *const LanceKeyExistenceFilter,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if filter.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "filter must not be NULL".into(),
+                ));
+            }
+            count_out(
+                unsafe { &*filter }.inner.field_ids.len(),
+                out_count,
+                "out_count",
+            )
+        })(),
+        neg
+    )
+}
+
+/// Read one filter field ID by position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_key_existence_filter_field_id_at(
+    filter: *const LanceKeyExistenceFilter,
+    index: usize,
+    out_field_id: *mut i32,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if filter.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "filter must not be NULL".into(),
+                ));
+            }
+            if out_field_id.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_field_id must not be NULL".into(),
+                ));
+            }
+            let filter = unsafe { &*filter };
+            let field_id = filter.inner.field_ids.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "field ID index {index} is out of range for {} field IDs",
+                        filter.inner.field_ids.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe {
+                ptr::write(out_field_id, *field_id);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Return the number of keys in an exact-set filter.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_key_existence_filter_exact_count(
+    filter: *const LanceKeyExistenceFilter,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if filter.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "filter must not be NULL".into(),
+                ));
+            }
+            let filter = unsafe { &*filter };
+            count_out(exact_keys(&filter.inner)?.len(), out_count, "out_count")
+        })(),
+        neg
+    )
+}
+
+/// Read one exact key by ascending position.
+///
+/// Native exact sets are unordered, so keys are reported in ascending order to
+/// make repeated inspections stable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_key_existence_filter_exact_key_at(
+    filter: *const LanceKeyExistenceFilter,
+    index: usize,
+    out_key: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if filter.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "filter must not be NULL".into(),
+                ));
+            }
+            if out_key.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_key must not be NULL".into(),
+                ));
+            }
+            let filter = unsafe { &*filter };
+            let keys = exact_keys(&filter.inner)?;
+            let mut sorted: Vec<u64> = keys.iter().copied().collect();
+            sorted.sort_unstable();
+            let key = sorted.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "exact key index {index} is out of range for {} keys",
+                        sorted.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe {
+                ptr::write(out_key, *key);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Copy a bloom filter's bitmap and parameters.
+///
+/// The bitmap is allocated with `malloc` and released with `lance_free_bytes`.
+/// All output pointers are required and are written only on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_key_existence_filter_bloom(
+    filter: *const LanceKeyExistenceFilter,
+    out_bitmap: *mut *mut u8,
+    out_bitmap_len: *mut usize,
+    out_num_bits: *mut u32,
+    out_number_of_items: *mut u64,
+    out_probability: *mut f64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if filter.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "filter must not be NULL".into(),
+                ));
+            }
+            if out_bitmap.is_null()
+                || out_bitmap_len.is_null()
+                || out_num_bits.is_null()
+                || out_number_of_items.is_null()
+                || out_probability.is_null()
+            {
+                return Err(lance_core::Error::invalid_input_source(
+                    "bloom output pointers must not be NULL".into(),
+                ));
+            }
+            let filter = unsafe { &*filter };
+            let values = bloom_values(&filter.inner)?;
+            let len = values.bitmap.len();
+            let allocation = if len == 0 {
+                ptr::null_mut()
+            } else {
+                let allocation = unsafe { libc::malloc(len) }.cast::<u8>();
+                if allocation.is_null() {
+                    return Err(lance_core::Error::internal(format!(
+                        "failed to allocate {len} bitmap bytes"
+                    )));
+                }
+                unsafe { ptr::copy_nonoverlapping(values.bitmap.as_ptr(), allocation, len) };
+                allocation
+            };
+            unsafe {
+                ptr::write(out_bitmap, allocation);
+                ptr::write(out_bitmap_len, len);
+                ptr::write(out_num_bits, values.num_bits);
+                ptr::write(out_number_of_items, values.number_of_items);
+                ptr::write(out_probability, values.probability);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Encode a key-existence filter with the native protobuf conversion.
+///
+/// The bytes are allocated with `malloc` and released with `lance_free_bytes`.
+/// This is the same encoding an Update operation persists, so a filter that was
+/// built from protobuf bytes round-trips exactly.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_key_existence_filter_to_proto(
+    filter: *const LanceKeyExistenceFilter,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if filter.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "filter must not be NULL".into(),
+                ));
+            }
+            if out_bytes.is_null() || out_len.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_bytes and out_len must not be NULL".into(),
+                ));
+            }
+            let filter = unsafe { &*filter };
+            let message: pb::transaction::KeyExistenceFilter = (&filter.inner).into();
+            let encoded = message.encode_to_vec();
+            let len = encoded.len();
+            let allocation = if len == 0 {
+                ptr::null_mut()
+            } else {
+                let allocation = unsafe { libc::malloc(len) }.cast::<u8>();
+                if allocation.is_null() {
+                    return Err(lance_core::Error::internal(format!(
+                        "failed to allocate {len} filter bytes"
+                    )));
+                }
+                unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), allocation, len) };
+                allocation
+            };
+            unsafe {
+                ptr::write(out_bytes, allocation);
+                ptr::write(out_len, len);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+// ─── Update operation ───────────────────────────────────────────────────────
+
+/// Construct an owned native Update operation.
+///
+/// `options` is required. Every array in it is borrowed for this call and
+/// copied into native owned values; see `LanceUpdateOperationOptions` for the
+/// tri-state fields. No field is defaulted: an empty `fields_modified`,
+/// `compacted_sstables` or `removed_fragment_ids` means the caller supplied
+/// none. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_new(
+    options: *const LanceUpdateOperationOptions,
+) -> *mut LanceOperation {
+    ffi_try!(
+        (|| -> Result<*mut LanceOperation> {
+            if options.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "options must not be NULL".into(),
+                ));
+            }
+            let options = unsafe { &*options };
+            let removed_fragment_ids = unsafe {
+                required_slice(
+                    options.removed_fragment_ids,
+                    options.removed_fragment_count,
+                    "removed_fragment_ids",
+                    "removed_fragment_count",
+                )?
+            }
+            .to_vec();
+            let updated_fragments = unsafe {
+                clone_fragment_array(
+                    options.updated_fragments,
+                    options.updated_fragment_count,
+                    "updated_fragments",
+                )?
+            };
+            let new_fragments = unsafe {
+                clone_fragment_array(
+                    options.new_fragments,
+                    options.new_fragment_count,
+                    "new_fragments",
+                )?
+            };
+            let fields_modified = unsafe {
+                required_slice(
+                    options.fields_modified,
+                    options.fields_modified_count,
+                    "fields_modified",
+                    "fields_modified_count",
+                )?
+            }
+            .to_vec();
+            let compacted_sstables = unsafe {
+                crate::mem_wal::parse_compacted_sstables(
+                    options.compacted_sstables,
+                    options.compacted_sstable_count,
+                )?
+            };
+            let fields_for_preserving_frag_bitmap = unsafe {
+                required_slice(
+                    options.fields_for_preserving_frag_bitmap,
+                    options.fields_for_preserving_frag_bitmap_count,
+                    "fields_for_preserving_frag_bitmap",
+                    "fields_for_preserving_frag_bitmap_count",
+                )?
+            }
+            .to_vec();
+            let update_mode = if options.has_update_mode {
+                Some(parse_update_mode(options.update_mode)?)
+            } else {
+                None
+            };
+            let inserted_rows_filter = if options.inserted_rows_filter.is_null() {
+                None
+            } else {
+                Some(unsafe { &*options.inserted_rows_filter }.inner.clone())
+            };
+            let updated_fragment_offsets = if options.updated_fragment_offsets.is_null() {
+                None
+            } else {
+                Some(unsafe { &*options.updated_fragment_offsets }.inner.clone())
+            };
+            Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+                Operation::Update {
+                    removed_fragment_ids,
+                    updated_fragments,
+                    new_fragments,
+                    fields_modified,
+                    compacted_sstables,
+                    fields_for_preserving_frag_bitmap,
+                    update_mode,
+                    inserted_rows_filter,
+                    updated_fragment_offsets,
+                },
+            ))))
+        })(),
+        null
+    )
+}
+
+/// Return the number of removed fragment IDs in an Update operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_removed_fragment_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                removed_fragment_ids,
+                ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            count_out(removed_fragment_ids.len(), out_count, "out_count")
+        })(),
+        neg
+    )
+}
+
+/// Read one removed fragment ID by position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_removed_fragment_id_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_fragment_id: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_fragment_id.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_fragment_id must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                removed_fragment_ids,
+                ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            let fragment_id = removed_fragment_ids.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "removed fragment ID index {index} is out of range for {} entries",
+                        removed_fragment_ids.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe {
+                ptr::write(out_fragment_id, *fragment_id);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Return the number of updated fragments in an Update operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_updated_fragment_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                updated_fragments, ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            count_out(updated_fragments.len(), out_count, "out_count")
+        })(),
+        neg
+    )
+}
+
+/// Clone one updated fragment by position.
+///
+/// The returned handle owns a complete native fragment snapshot and remains
+/// valid after the operation handle is closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_updated_fragment_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_fragment: *mut *mut LanceFragment,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                updated_fragments, ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            let fragment = updated_fragments.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "updated fragment index {index} is out of range for {} fragments",
+                        updated_fragments.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe { fragment_out(fragment, out_fragment) }
+        })(),
+        neg
+    )
+}
+
+/// Return the number of new fragments in an Update operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_new_fragment_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::Update { new_fragments, .. } = &operation.inner else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            count_out(new_fragments.len(), out_count, "out_count")
+        })(),
+        neg
+    )
+}
+
+/// Clone one new fragment by position.
+///
+/// The returned handle owns a complete native fragment snapshot and remains
+/// valid after the operation handle is closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_new_fragment_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_fragment: *mut *mut LanceFragment,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::Update { new_fragments, .. } = &operation.inner else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            let fragment = new_fragments.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "new fragment index {index} is out of range for {} fragments",
+                        new_fragments.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe { fragment_out(fragment, out_fragment) }
+        })(),
+        neg
+    )
+}
+
+/// Return the number of modified field IDs in an Update operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_fields_modified_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                fields_modified, ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            count_out(fields_modified.len(), out_count, "out_count")
+        })(),
+        neg
+    )
+}
+
+/// Read one modified field ID by position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_fields_modified_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_field_id: *mut u32,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_field_id.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_field_id must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                fields_modified, ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            let field_id = fields_modified.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "modified field ID index {index} is out of range for {} entries",
+                        fields_modified.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe {
+                ptr::write(out_field_id, *field_id);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Return the number of compacted SSTables in an Update operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_compacted_sstable_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                compacted_sstables, ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            count_out(compacted_sstables.len(), out_count, "out_count")
+        })(),
+        neg
+    )
+}
+
+/// Copy one compacted SSTable entry by position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_compacted_sstable_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_sstable: *mut LanceCompactedSsTable,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_sstable.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_sstable must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                compacted_sstables, ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            let sstable = compacted_sstables.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "compacted SSTable index {index} is out of range for {} entries",
+                        compacted_sstables.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe {
+                ptr::write(out_sstable, LanceCompactedSsTable::from_native(sstable));
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Return the number of preserved-fragment-bitmap field IDs in an Update.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_fields_for_preserving_frag_bitmap_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                fields_for_preserving_frag_bitmap,
+                ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            count_out(
+                fields_for_preserving_frag_bitmap.len(),
+                out_count,
+                "out_count",
+            )
+        })(),
+        neg
+    )
+}
+
+/// Read one preserved-fragment-bitmap field ID by position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_fields_for_preserving_frag_bitmap_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_field_id: *mut u32,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_field_id.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_field_id must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                fields_for_preserving_frag_bitmap,
+                ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            let field_id = fields_for_preserving_frag_bitmap.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "preserved-fragment-bitmap field ID index {index} is out of range for {} entries",
+                        fields_for_preserving_frag_bitmap.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe {
+                ptr::write(out_field_id, *field_id);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Read the native update mode, distinguishing `None` from both variants.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_mode(
+    operation: *const LanceOperation,
+    out_present: *mut bool,
+    out_mode: *mut i32,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_present.is_null() || out_mode.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_present and out_mode must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Update { update_mode, .. } = &operation.inner else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            unsafe {
+                ptr::write(out_present, update_mode.is_some());
+                if let Some(update_mode) = update_mode {
+                    ptr::write(out_mode, update_mode_code(update_mode));
+                }
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Clone the inserted-rows key-existence filter of an Update operation.
+///
+/// Writes `false` and a NULL handle when the native field is `None`; otherwise
+/// writes `true` and an independently owned filter. On error both outputs are
+/// unchanged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_inserted_rows_filter(
+    operation: *const LanceOperation,
+    out_present: *mut bool,
+    out_filter: *mut *mut LanceKeyExistenceFilter,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_present.is_null() || out_filter.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_present and out_filter must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                inserted_rows_filter,
+                ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            let handle = inserted_rows_filter.as_ref().map(|filter| {
+                Box::into_raw(Box::new(LanceKeyExistenceFilter {
+                    inner: filter.clone(),
+                }))
+            });
+            unsafe {
+                ptr::write(out_present, handle.is_some());
+                ptr::write(out_filter, handle.unwrap_or(ptr::null_mut()));
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Clone the updated-fragment offsets of an Update operation.
+///
+/// Writes `false` and a NULL handle when the native field is `None`, preserving
+/// the distinction between `None` and `Some(empty)`; otherwise writes `true`
+/// and an independently owned offsets value. On error both outputs are
+/// unchanged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_updated_fragment_offsets(
+    operation: *const LanceOperation,
+    out_present: *mut bool,
+    out_offsets: *mut *mut LanceUpdatedFragmentOffsets,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_present.is_null() || out_offsets.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_present and out_offsets must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Update {
+                updated_fragment_offsets,
+                ..
+            } = &operation.inner
+            else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            let handle = updated_fragment_offsets.as_ref().map(|offsets| {
+                Box::into_raw(Box::new(LanceUpdatedFragmentOffsets {
+                    inner: offsets.clone(),
+                }))
+            });
+            unsafe {
+                ptr::write(out_present, handle.is_some());
+                ptr::write(out_offsets, handle.unwrap_or(ptr::null_mut()));
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+// ─── Rewrite operation ──────────────────────────────────────────────────────
+
+/// Construct an owned native `RewriteGroup` from two fragment arrays.
+///
+/// Every fragment handle is borrowed and copied, so the group owns complete
+/// native fragment metadata. NULL arrays are accepted only with a zero count.
+/// Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewrite_group_new(
+    old_fragments: *const *const LanceFragment,
+    old_fragment_count: usize,
+    new_fragments: *const *const LanceFragment,
+    new_fragment_count: usize,
+) -> *mut LanceRewriteGroup {
+    ffi_try!(
+        (|| -> Result<*mut LanceRewriteGroup> {
+            let old_fragments = unsafe {
+                clone_fragment_array(old_fragments, old_fragment_count, "old_fragments")?
+            };
+            let new_fragments = unsafe {
+                clone_fragment_array(new_fragments, new_fragment_count, "new_fragments")?
+            };
+            Ok(Box::into_raw(Box::new(LanceRewriteGroup {
+                inner: RewriteGroup {
+                    old_fragments,
+                    new_fragments,
+                },
+            })))
+        })(),
+        null
+    )
+}
+
+/// Clone an owned native `RewriteGroup`. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewrite_group_clone(
+    group: *const LanceRewriteGroup,
+) -> *mut LanceRewriteGroup {
+    ffi_try!(
+        (|| -> Result<*mut LanceRewriteGroup> {
+            if group.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "group must not be NULL".into(),
+                ));
+            }
+            let group = unsafe { &*group };
+            Ok(Box::into_raw(Box::new(LanceRewriteGroup {
+                inner: group.inner.clone(),
+            })))
+        })(),
+        null
+    )
+}
+
+/// Free an owned `RewriteGroup`. Safe to call with NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewrite_group_close(group: *mut LanceRewriteGroup) {
+    if !group.is_null() {
+        unsafe { drop(Box::from_raw(group)) };
+    }
+}
+
+/// Return the number of replaced fragments in a `RewriteGroup`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewrite_group_old_fragment_count(
+    group: *const LanceRewriteGroup,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if group.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "group must not be NULL".into(),
+                ));
+            }
+            count_out(
+                unsafe { &*group }.inner.old_fragments.len(),
+                out_count,
+                "out_count",
+            )
+        })(),
+        neg
+    )
+}
+
+/// Clone one replaced fragment of a `RewriteGroup` by position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewrite_group_old_fragment_at(
+    group: *const LanceRewriteGroup,
+    index: usize,
+    out_fragment: *mut *mut LanceFragment,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if group.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "group must not be NULL".into(),
+                ));
+            }
+            let group = unsafe { &*group };
+            let fragment = group.inner.old_fragments.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "old fragment index {index} is out of range for {} fragments",
+                        group.inner.old_fragments.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe { fragment_out(fragment, out_fragment) }
+        })(),
+        neg
+    )
+}
+
+/// Return the number of replacement fragments in a `RewriteGroup`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewrite_group_new_fragment_count(
+    group: *const LanceRewriteGroup,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if group.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "group must not be NULL".into(),
+                ));
+            }
+            count_out(
+                unsafe { &*group }.inner.new_fragments.len(),
+                out_count,
+                "out_count",
+            )
+        })(),
+        neg
+    )
+}
+
+/// Clone one replacement fragment of a `RewriteGroup` by position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewrite_group_new_fragment_at(
+    group: *const LanceRewriteGroup,
+    index: usize,
+    out_fragment: *mut *mut LanceFragment,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if group.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "group must not be NULL".into(),
+                ));
+            }
+            let group = unsafe { &*group };
+            let fragment = group.inner.new_fragments.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "new fragment index {index} is out of range for {} fragments",
+                        group.inner.new_fragments.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe { fragment_out(fragment, out_fragment) }
+        })(),
+        neg
+    )
+}
+
+unsafe fn required_uuid(value: *const u8, label: &str) -> Result<uuid::Uuid> {
+    if value.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{label} must not be NULL").into(),
+        ));
+    }
+    let mut bytes = [0_u8; 16];
+    unsafe { ptr::copy_nonoverlapping(value, bytes.as_mut_ptr(), bytes.len()) };
+    Ok(uuid::Uuid::from_bytes(bytes))
+}
+
+/// Construct an owned native `RewrittenIndex`.
+///
+/// `old_id` and `new_id` must each point to 16 canonical UUID bytes.
+/// `details_type_url` must not be NULL but may be empty, matching the native
+/// `prost_types::Any` field. `details_value` may be NULL only with a zero
+/// length. `has_index_files == false` maps to native `None` and requires a zero
+/// count; `has_index_files == true` with a zero count is the distinct
+/// `Some(empty)` state that older writers persisted. Returns NULL on error.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_rewritten_index_new(
+    old_id: *const u8,
+    new_id: *const u8,
+    details_type_url: *const c_char,
+    details_value: *const u8,
+    details_value_len: usize,
+    index_version: u32,
+    has_index_files: bool,
+    index_files: *const LanceIndexFile,
+    index_file_count: usize,
+) -> *mut LanceRewrittenIndex {
+    ffi_try!(
+        (|| -> Result<*mut LanceRewrittenIndex> {
+            let old_id = unsafe { required_uuid(old_id, "old_id") }?;
+            let new_id = unsafe { required_uuid(new_id, "new_id") }?;
+            let details_type_url = required_c_string(details_type_url, "details_type_url")?;
+            let details_value = unsafe {
+                required_slice(details_value, details_value_len, "details_value", "len")
+            }?
+            .to_vec();
+            if !has_index_files && index_file_count != 0 {
+                return Err(lance_core::Error::invalid_input_source(
+                    format!(
+                        "index_file_count must be 0 when has_index_files is false, got {index_file_count}"
+                    )
+                    .into(),
+                ));
+            }
+            let files = if !has_index_files {
+                None
+            } else {
+                let entries = unsafe {
+                    required_slice(
+                        index_files,
+                        index_file_count,
+                        "index_files",
+                        "index_file_count",
+                    )?
+                };
+                let mut files = Vec::with_capacity(entries.len());
+                for (index, entry) in entries.iter().enumerate() {
+                    if entry.path.is_null() {
+                        return Err(lance_core::Error::invalid_input_source(
+                            format!("index_files[{index}].path must not be NULL").into(),
+                        ));
+                    }
+                    let path = unsafe { std::ffi::CStr::from_ptr(entry.path) }
+                        .to_str()
+                        .map_err(|error| {
+                            lance_core::Error::invalid_input_source(
+                                format!("index_files[{index}].path is not valid UTF-8: {error}")
+                                    .into(),
+                            )
+                        })?;
+                    files.push(IndexFile {
+                        path: path.to_string(),
+                        size_bytes: entry.size_bytes,
+                    });
+                }
+                Some(files)
+            };
+            Ok(Box::into_raw(Box::new(LanceRewrittenIndex {
+                inner: RewrittenIndex {
+                    old_id,
+                    new_id,
+                    new_index_details: prost_types::Any {
+                        type_url: details_type_url.to_string(),
+                        value: details_value,
+                    },
+                    new_index_version: index_version,
+                    new_index_files: files,
+                },
+            })))
+        })(),
+        null
+    )
+}
+
+/// Clone an owned native `RewrittenIndex`. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_clone(
+    index: *const LanceRewrittenIndex,
+) -> *mut LanceRewrittenIndex {
+    ffi_try!(
+        (|| -> Result<*mut LanceRewrittenIndex> {
+            if index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "index must not be NULL".into(),
+                ));
+            }
+            let index = unsafe { &*index };
+            Ok(Box::into_raw(Box::new(LanceRewrittenIndex {
+                inner: index.inner.clone(),
+            })))
+        })(),
+        null
+    )
+}
+
+/// Free an owned `RewrittenIndex`. Safe to call with NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_close(index: *mut LanceRewrittenIndex) {
+    if !index.is_null() {
+        unsafe { drop(Box::from_raw(index)) };
+    }
+}
+
+/// Copy the old index UUID as 16 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_old_id(
+    index: *const LanceRewrittenIndex,
+    out_uuid: *mut u8,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "index must not be NULL".into(),
+                ));
+            }
+            let bytes = unsafe { &*index }.inner.old_id.as_bytes();
+            unsafe {
+                required_out_bytes(out_uuid, "out_uuid")?;
+                ptr::copy_nonoverlapping(bytes.as_ptr(), out_uuid, 16);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Copy the new index UUID as 16 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_new_id(
+    index: *const LanceRewrittenIndex,
+    out_uuid: *mut u8,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "index must not be NULL".into(),
+                ));
+            }
+            let bytes = unsafe { &*index }.inner.new_id.as_bytes();
+            unsafe {
+                required_out_bytes(out_uuid, "out_uuid")?;
+                ptr::copy_nonoverlapping(bytes.as_ptr(), out_uuid, 16);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+unsafe fn required_out_bytes(out: *mut u8, label: &str) -> Result<()> {
+    if out.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{label} must not be NULL").into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Copy the index-details type URL. The string is allocated with `malloc` and
+/// released with `lance_free_string`. Returns NULL on error or an embedded NUL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_details_type_url(
+    index: *const LanceRewrittenIndex,
+) -> *const c_char {
+    ffi_try!(
+        (|| -> Result<*const c_char> {
+            if index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "index must not be NULL".into(),
+                ));
+            }
+            let index = unsafe { &*index };
+            Ok(owned_c_string(
+                &index.inner.new_index_details.type_url,
+                "new_index_details.type_url",
+            )?
+            .into_raw())
+        })(),
+        ptr::null()
+    )
+}
+
+/// Copy the index-details value bytes. The buffer is allocated with `malloc`
+/// and released with `lance_free_bytes`; requirement rules match
+/// `lance_key_existence_filter_to_proto`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_details_value(
+    index: *const LanceRewrittenIndex,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "index must not be NULL".into(),
+                ));
+            }
+            if out_bytes.is_null() || out_len.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_bytes and out_len must not be NULL".into(),
+                ));
+            }
+            let index = unsafe { &*index };
+            let value = &index.inner.new_index_details.value;
+            let len = value.len();
+            let allocation = if len == 0 {
+                ptr::null_mut()
+            } else {
+                let allocation = unsafe { libc::malloc(len) }.cast::<u8>();
+                if allocation.is_null() {
+                    return Err(lance_core::Error::internal(format!(
+                        "failed to allocate {len} index-details bytes"
+                    )));
+                }
+                unsafe { ptr::copy_nonoverlapping(value.as_ptr(), allocation, len) };
+                allocation
+            };
+            unsafe {
+                ptr::write(out_bytes, allocation);
+                ptr::write(out_len, len);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Read the new index version.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_version(
+    index: *const LanceRewrittenIndex,
+    out_version: *mut u32,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "index must not be NULL".into(),
+                ));
+            }
+            if out_version.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_version must not be NULL".into(),
+                ));
+            }
+            unsafe {
+                ptr::write(out_version, (&*index).inner.new_index_version);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Report whether the rewritten index carries an index-file list.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_has_files(
+    index: *const LanceRewrittenIndex,
+    out_present: *mut bool,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "index must not be NULL".into(),
+                ));
+            }
+            if out_present.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_present must not be NULL".into(),
+                ));
+            }
+            unsafe {
+                ptr::write(out_present, (&*index).inner.new_index_files.is_some());
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Return the number of index files; 0 also when the native list is `None`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_file_count(
+    index: *const LanceRewrittenIndex,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "index must not be NULL".into(),
+                ));
+            }
+            let index = unsafe { &*index };
+            count_out(
+                index
+                    .inner
+                    .new_index_files
+                    .as_ref()
+                    .map(Vec::len)
+                    .unwrap_or(0),
+                out_count,
+                "out_count",
+            )
+        })(),
+        neg
+    )
+}
+
+/// Copy one index-file path. The string is allocated with `malloc` and released
+/// with `lance_free_string`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_file_path_at(
+    index: *const LanceRewrittenIndex,
+    position: usize,
+) -> *const c_char {
+    ffi_try!(
+        (|| -> Result<*const c_char> {
+            if index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "index must not be NULL".into(),
+                ));
+            }
+            let index = unsafe { &*index };
+            let files = index.inner.new_index_files.as_ref().ok_or_else(|| {
+                lance_core::Error::not_supported_source(
+                    "index file inspection requires a present index-file list".into(),
+                )
+            })?;
+            let file = files.get(position).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "index file index {position} is out of range for {} files",
+                        files.len()
+                    )
+                    .into(),
+                )
+            })?;
+            Ok(owned_c_string(&file.path, "index file path")?.into_raw())
+        })(),
+        ptr::null()
+    )
+}
+
+/// Read one index-file size by position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewritten_index_file_size_at(
+    index: *const LanceRewrittenIndex,
+    position: usize,
+    out_size: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "index must not be NULL".into(),
+                ));
+            }
+            if out_size.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_size must not be NULL".into(),
+                ));
+            }
+            let index = unsafe { &*index };
+            let files = index.inner.new_index_files.as_ref().ok_or_else(|| {
+                lance_core::Error::not_supported_source(
+                    "index file inspection requires a present index-file list".into(),
+                )
+            })?;
+            let file = files.get(position).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "index file index {position} is out of range for {} files",
+                        files.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe {
+                ptr::write(out_size, file.size_bytes);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Construct an owned native Rewrite operation.
+///
+/// Groups and rewritten indices are cloned from their handles. `frag_reuse_index`
+/// may be NULL for native `None`; otherwise the complete native index metadata is
+/// copied. The index is in-memory only: native serialization never writes it, so
+/// a protobuf round trip yields `None` (see
+/// `lance_operation_rewrite_frag_reuse_index`). Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_rewrite_new(
+    groups: *const *const LanceRewriteGroup,
+    group_count: usize,
+    rewritten_indices: *const *const LanceRewrittenIndex,
+    rewritten_index_count: usize,
+    frag_reuse_index: *const LanceIndexSegmentMetadata,
+) -> *mut LanceOperation {
+    ffi_try!(
+        (|| -> Result<*mut LanceOperation> {
+            let groups = unsafe { required_slice(groups, group_count, "groups", "group_count")? };
+            let mut cloned_groups = Vec::with_capacity(groups.len());
+            for (index, group) in groups.iter().enumerate() {
+                if group.is_null() {
+                    return Err(lance_core::Error::invalid_input_source(
+                        format!(
+                            "groups[{index}] must not be NULL when group_count = {}",
+                            groups.len()
+                        )
+                        .into(),
+                    ));
+                }
+                cloned_groups.push(unsafe { &**group }.inner.clone());
+            }
+            let rewritten_indices = unsafe {
+                required_slice(
+                    rewritten_indices,
+                    rewritten_index_count,
+                    "rewritten_indices",
+                    "rewritten_index_count",
+                )?
+            };
+            let mut cloned_indices = Vec::with_capacity(rewritten_indices.len());
+            for (index, rewritten) in rewritten_indices.iter().enumerate() {
+                if rewritten.is_null() {
+                    return Err(lance_core::Error::invalid_input_source(
+                        format!(
+                            "rewritten_indices[{index}] must not be NULL when rewritten_index_count = {}",
+                            rewritten_indices.len()
+                        )
+                        .into(),
+                    ));
+                }
+                cloned_indices.push(unsafe { &**rewritten }.inner.clone());
+            }
+            let frag_reuse_index = if frag_reuse_index.is_null() {
+                None
+            } else {
+                Some(unsafe { &*frag_reuse_index }.native_metadata().clone())
+            };
+            Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+                Operation::Rewrite {
+                    groups: cloned_groups,
+                    rewritten_indices: cloned_indices,
+                    frag_reuse_index,
+                },
+            ))))
+        })(),
+        null
+    )
+}
+
+/// Return the number of groups in a Rewrite operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_rewrite_group_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::Rewrite { groups, .. } = &operation.inner else {
+                return Err(rewrite_kind_error(&operation.inner));
+            };
+            count_out(groups.len(), out_count, "out_count")
+        })(),
+        neg
+    )
+}
+
+/// Clone one Rewrite group by position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_rewrite_group_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_group: *mut *mut LanceRewriteGroup,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_group.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_group must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Rewrite { groups, .. } = &operation.inner else {
+                return Err(rewrite_kind_error(&operation.inner));
+            };
+            let group = groups.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "rewrite group index {index} is out of range for {} groups",
+                        groups.len()
+                    )
+                    .into(),
+                )
+            })?;
+            let handle = Box::into_raw(Box::new(LanceRewriteGroup {
+                inner: group.clone(),
+            }));
+            unsafe {
+                ptr::write(out_group, handle);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Return the number of rewritten indices in a Rewrite operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_rewrite_rewritten_index_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::Rewrite {
+                rewritten_indices, ..
+            } = &operation.inner
+            else {
+                return Err(rewrite_kind_error(&operation.inner));
+            };
+            count_out(rewritten_indices.len(), out_count, "out_count")
+        })(),
+        neg
+    )
+}
+
+/// Clone one rewritten index by position.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_rewrite_rewritten_index_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_index: *mut *mut LanceRewrittenIndex,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_index.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_index must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Rewrite {
+                rewritten_indices, ..
+            } = &operation.inner
+            else {
+                return Err(rewrite_kind_error(&operation.inner));
+            };
+            let rewritten = rewritten_indices.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "rewritten index index {index} is out of range for {} entries",
+                        rewritten_indices.len()
+                    )
+                    .into(),
+                )
+            })?;
+            let handle = Box::into_raw(Box::new(LanceRewrittenIndex {
+                inner: rewritten.clone(),
+            }));
+            unsafe {
+                ptr::write(out_index, handle);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Clone the in-memory fragment-reuse index of a Rewrite operation.
+///
+/// Writes `false` and a NULL handle when the native field is `None`. The
+/// returned handle owns a complete native `IndexMetadata` snapshot, including
+/// fragment bitmap, index details and files.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_rewrite_frag_reuse_index(
+    operation: *const LanceOperation,
+    out_present: *mut bool,
+    out_metadata: *mut *mut LanceIndexSegmentMetadata,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_present.is_null() || out_metadata.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_present and out_metadata must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Rewrite {
+                frag_reuse_index, ..
+            } = &operation.inner
+            else {
+                return Err(rewrite_kind_error(&operation.inner));
+            };
+            let handle = match frag_reuse_index {
+                Some(metadata) => metadata_handle(metadata.clone())?,
+                None => ptr::null_mut(),
+            };
+            unsafe {
+                ptr::write(out_present, !handle.is_null());
+                ptr::write(out_metadata, handle);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+// ─── UpdateMemWalState operation ────────────────────────────────────────────
+
+/// Construct an owned native UpdateMemWalState operation.
+///
+/// `compacted_sstables` uses the shared `LanceCompactedSsTable` value and the
+/// same conversion as merge-insert compaction. A NULL array is accepted only
+/// with a zero count. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_mem_wal_state_new(
+    compacted_sstables: *const LanceCompactedSsTable,
+    compacted_sstable_count: usize,
+) -> *mut LanceOperation {
+    ffi_try!(
+        (|| -> Result<*mut LanceOperation> {
+            let compacted_sstables = unsafe {
+                crate::mem_wal::parse_compacted_sstables(
+                    compacted_sstables,
+                    compacted_sstable_count,
+                )?
+            };
+            Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+                Operation::UpdateMemWalState { compacted_sstables },
+            ))))
+        })(),
+        null
+    )
+}
+
+/// Return the number of compacted SSTables in an UpdateMemWalState operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_mem_wal_state_compacted_sstable_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let operation = operation_at(operation)?;
+            let Operation::UpdateMemWalState { compacted_sstables } = &operation.inner else {
+                return Err(update_mem_wal_state_kind_error(&operation.inner));
+            };
+            count_out(compacted_sstables.len(), out_count, "out_count")
+        })(),
+        neg
+    )
+}
+
+/// Copy one compacted SSTable entry of an UpdateMemWalState operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_mem_wal_state_compacted_sstable_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_sstable: *mut LanceCompactedSsTable,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_sstable.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_sstable must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::UpdateMemWalState { compacted_sstables } = &operation.inner else {
+                return Err(update_mem_wal_state_kind_error(&operation.inner));
+            };
+            let sstable = compacted_sstables.get(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "compacted SSTable index {index} is out of range for {} entries",
+                        compacted_sstables.len()
+                    )
+                    .into(),
+                )
+            })?;
+            unsafe {
+                ptr::write(out_sstable, LanceCompactedSsTable::from_native(sstable));
+            }
+            Ok(0)
+        })(),
+        neg
+    )
 }
