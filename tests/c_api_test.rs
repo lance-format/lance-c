@@ -14606,7 +14606,7 @@ fn test_dedicated_blob_writer_finish_array_matches_native_and_empty() {
     assert!(empty_bytes.is_empty());
     unsafe { lance_dedicated_blob_writer_close(empty_writer) };
 
-    let mut empty_native = lance_c::runtime::block_on(lance::DedicatedBlobWriter::try_new(
+    let empty_native = lance_c::runtime::block_on(lance::DedicatedBlobWriter::try_new(
         store.as_ref().clone(),
         base.child_path(&object_store::path::Path::from(empty_name)),
         52,
