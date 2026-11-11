@@ -5405,10 +5405,11 @@ typedef enum {
  * The callback is invoked from lance-c's internal tokio runtime worker
  * threads. Certain stages report progress concurrently from parallel worker
  * tasks, so the callback MUST be thread-safe. It must be non-blocking and must
- * not call any `lance_*` function, including operations on the dataset handle
- * being mutated. An ordinary build holds that dataset's mutation lock for the
+ * not call runtime-backed `lance_*` entry points or access the dataset handle
+ * being indexed. An ordinary build holds that dataset's mutation lock for the
  * duration of the call, so the callback must not synchronously re-enter the
  * same handle or start or block on a nested runtime.
+ * Non-runtime leaf utilities such as `lance_free_string` are unaffected.
  *
  * `callback_ctx` is opaque and may be NULL. The callback and context must
  * remain valid until the blocking call that installed them returns. lance-c

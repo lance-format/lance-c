@@ -8843,7 +8843,8 @@ public:
     /// A null callback disables observation. A non-null callback may run
     /// concurrently on internal runtime worker threads while this call holds
     /// the dataset mutation lock; it must be thread-safe, non-blocking, and
-    /// must not call any lance_* function or start a nested runtime. The
+    /// must not access this dataset, call runtime-backed lance_* entry points,
+    /// or start a nested runtime. Non-runtime leaf utilities are unaffected. The
     /// callback and context are borrowed only through this synchronous call
     /// and are retired before it returns. Native publication/reload errors can
     /// leave the returned state uncertain; reopen to inspect the version.
@@ -10317,8 +10318,9 @@ public:
     /// before execute_uncommitted; the builder is single-use. The callback is
     /// invoked from internal worker threads and may be called concurrently
     /// from parallel worker tasks, so it must be thread-safe, non-blocking,
-    /// and must not re-enter any lance_* function. It must return normally;
-    /// unwinding or throwing across this boundary can abort the host process.
+    /// and must not access the indexed dataset or call runtime-backed lance_*
+    /// entry points. Non-runtime leaf utilities are unaffected. Callbacks must
+    /// return normally: unwinding or throwing can abort the host process.
     /// Invocations occur only while execute_uncommitted runs, and this is
     /// enforced: lance-c disables the callback and drains in-flight
     /// invocations before that call returns, including on error, so a worker
