@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/clang -g -fsanitize=address,undefined -fno-omit-frame-pointer "$@"
