@@ -85,8 +85,8 @@ static void release_child_array(struct ArrowArray *array) {
 static void release_root_array(struct ArrowArray *array) {
     if (array->children) {
         for (int64_t i = 0; i < array->n_children; ++i) {
-            if (array->children[i].release) {
-                array->children[i].release(&array->children[i]);
+            if (array->children[i]->release) {
+                array->children[i]->release(array->children[i]);
             }
         }
         free(array->children);
@@ -136,7 +136,7 @@ static void init_overlay_batch(OverlayBatch *batch, size_t len, int with_a,
     batch->schema.format = "+s";
     batch->schema.name = "";
     batch->schema.n_children = (int64_t)children;
-    batch->schema.children = batch->schema_children;
+    batch->schema.children = &batch->schema_children[0];
     batch->schema.release = release_root_schema;
     init_child_schema(&batch->schema_children[0], "L", "_rowaddr", 0);
 
@@ -145,7 +145,7 @@ static void init_overlay_batch(OverlayBatch *batch, size_t len, int with_a,
     batch->array.buffers = calloc(1, sizeof(*batch->array.buffers));
     ASSERT(batch->array.buffers != NULL, "allocate struct buffers");
     batch->array.n_children = (int64_t)children;
-    batch->array.children = batch->array_children;
+    batch->array.children = &batch->array_children[0];
     batch->array.release = release_root_array;
     init_child_array(&batch->array_children[0], len, NULL, batch->rowaddrs);
 
