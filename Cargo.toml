@@ -52,7 +52,8 @@ libc = "0.2"
 opendal = { version = "=0.59.2", default-features = false, features = ["http-transport-reqwest"] }
 pin-project = "1.0"
 prost = "0.14"
-# Direct for escaping index and column names in the segment-listing JSON.
+# Direct JSON transport for native maintenance plan/task/result values.
+serde = "1"
 serde_json = "1"
 snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }

@@ -337,6 +337,28 @@ pub struct LanceIndexSegmentMetadata {
     fragment_ids: Vec<u32>,
 }
 
+pub(crate) fn metadata_handle(metadata: IndexMetadata) -> Result<*mut LanceIndexSegmentMetadata> {
+    let name = CString::new(metadata.name.as_str())
+        .map_err(|_| invalid_input("index metadata name contains an embedded NUL byte"))?;
+    let index_details_type_url = metadata
+        .index_details
+        .as_ref()
+        .map(|details| CString::new(details.type_url.as_str()))
+        .transpose()
+        .map_err(|_| invalid_input("index details type_url contains an embedded NUL byte"))?;
+    let fragment_ids = metadata
+        .fragment_bitmap
+        .as_ref()
+        .map(|bitmap| bitmap.iter().collect())
+        .unwrap_or_default();
+    Ok(Box::into_raw(Box::new(LanceIndexSegmentMetadata {
+        metadata,
+        name,
+        index_details_type_url,
+        fragment_ids,
+    })))
+}
+
 fn invalid_input(message: impl Into<String>) -> Error {
     lance_core::Error::invalid_input_source(message.into().into())
 }
@@ -1473,26 +1495,8 @@ unsafe fn parse_metadata_inner(
         )));
     }
     let metadata = decode_segment_metadata(unsafe { slice::from_raw_parts(bytes, len) })?;
-    let name = CString::new(metadata.name.as_str())
-        .map_err(|_| invalid_input("index metadata name contains an embedded NUL byte"))?;
-    let index_details_type_url = metadata
-        .index_details
-        .as_ref()
-        .map(|details| CString::new(details.type_url.as_str()))
-        .transpose()
-        .map_err(|_| invalid_input("index details type_url contains an embedded NUL byte"))?;
-    let fragment_ids = metadata
-        .fragment_bitmap
-        .as_ref()
-        .map(|bitmap| bitmap.iter().collect())
-        .unwrap_or_default();
-    let handle = LanceIndexSegmentMetadata {
-        metadata,
-        name,
-        index_details_type_url,
-        fragment_ids,
-    };
-    unsafe { ptr::write(out_metadata, Box::into_raw(Box::new(handle))) };
+    let handle = metadata_handle(metadata)?;
+    unsafe { ptr::write(out_metadata, handle) };
     Ok(0)
 }
 
