@@ -1963,6 +1963,122 @@ public:
     }
 };
 
+/// Move-only owner of a native packed blob writer.
+///
+/// The destructor frees the C allocation without finishing. `finish_array()`
+/// consumes the native writer but leaves this object allocation valid, so
+/// later calls throw `LANCE_ERR_INVALID_ARGUMENT`.
+class PackedBlobWriter {
+    Handle<LancePackedBlobWriter, lance_packed_blob_writer_close> handle_;
+
+public:
+    explicit PackedBlobWriter(LancePackedBlobWriter* writer) : handle_(writer) {}
+
+    PackedBlobWriter(PackedBlobWriter&&) noexcept = default;
+    PackedBlobWriter& operator=(PackedBlobWriter&&) noexcept = default;
+    PackedBlobWriter(const PackedBlobWriter&) = delete;
+    PackedBlobWriter& operator=(const PackedBlobWriter&) = delete;
+
+    /// Native blob ID. Throws when the writer is NULL or finished.
+    uint32_t blob_id() const {
+        uint32_t value = lance_packed_blob_writer_blob_id(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Native sidecar path. Throws when the writer is NULL or finished.
+    std::string path() const {
+        const char* raw = lance_packed_blob_writer_path(handle_.get());
+        if (!raw) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            raw, lance_free_string);
+        return std::string(raw);
+    }
+
+    /// Append one payload. A null pointer with zero length is valid.
+    void write_blob(const uint8_t* data, size_t len) {
+        if (lance_packed_blob_writer_write_blob(handle_.get(), data, len) != 0)
+            check_error();
+    }
+
+    void write_blob(const std::vector<uint8_t>& data) {
+        write_blob(data.empty() ? nullptr : data.data(), data.size());
+    }
+
+    /// Move one binary ArrowArray into the writer; `schema` is borrowed.
+    void write_blobs(ArrowArray* payloads, const ArrowSchema* schema) {
+        if (lance_packed_blob_writer_write_blobs(
+                handle_.get(), payloads, schema) != 0) {
+            check_error();
+        }
+    }
+
+    /// Consume the native writer and export caller-owned prepared parts.
+    void finish_array(
+        const std::string& field_name,
+        ArrowArray* out_array,
+        ArrowSchema* out_schema) {
+        if (lance_packed_blob_writer_finish_array(
+                handle_.get(), field_name.c_str(), out_array, out_schema) != 0) {
+            check_error();
+        }
+    }
+};
+
+/// Move-only owner of a native dedicated blob writer.
+///
+/// Repeated writes concatenate into one sidecar. The destructor frees the C
+/// allocation without finishing.
+class DedicatedBlobWriter {
+    Handle<LanceDedicatedBlobWriter, lance_dedicated_blob_writer_close> handle_;
+
+public:
+    explicit DedicatedBlobWriter(LanceDedicatedBlobWriter* writer)
+        : handle_(writer) {}
+
+    DedicatedBlobWriter(DedicatedBlobWriter&&) noexcept = default;
+    DedicatedBlobWriter& operator=(DedicatedBlobWriter&&) noexcept = default;
+    DedicatedBlobWriter(const DedicatedBlobWriter&) = delete;
+    DedicatedBlobWriter& operator=(const DedicatedBlobWriter&) = delete;
+
+    /// Native blob ID. Throws when the writer is NULL or finished.
+    uint32_t blob_id() const {
+        uint32_t value = lance_dedicated_blob_writer_blob_id(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Native sidecar path. Throws when the writer is NULL or finished.
+    std::string path() const {
+        const char* raw = lance_dedicated_blob_writer_path(handle_.get());
+        if (!raw) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            raw, lance_free_string);
+        return std::string(raw);
+    }
+
+    /// Append bytes. Repeated calls concatenate.
+    void write(const uint8_t* data, size_t len) {
+        if (lance_dedicated_blob_writer_write(handle_.get(), data, len) != 0)
+            check_error();
+    }
+
+    void write(const std::vector<uint8_t>& data) {
+        write(data.empty() ? nullptr : data.data(), data.size());
+    }
+
+    /// Consume the native writer and export caller-owned prepared parts.
+    void finish_array(
+        const std::string& field_name,
+        ArrowArray* out_array,
+        ArrowSchema* out_schema) {
+        if (lance_dedicated_blob_writer_finish_array(
+                handle_.get(), field_name.c_str(), out_array, out_schema) != 0) {
+            check_error();
+        }
+    }
+};
+
 /// Row selector for planned whole-blob and range reads.
 enum class BlobRowSelector : int32_t {
     None      = LANCE_BLOB_ROWS_NONE,
@@ -7677,6 +7793,24 @@ public:
         const std::string& relative_path,
         const ArrowSchema* schema,
         const FileWriterOptions& options = {}) const;
+
+    PackedBlobWriter open_packed_blob_writer(
+        const std::string& data_file_path,
+        uint32_t blob_id) const {
+        auto* raw = lance_file_session_open_packed_blob_writer(
+            handle_.get(), data_file_path.c_str(), blob_id);
+        if (!raw) check_error();
+        return PackedBlobWriter(raw);
+    }
+
+    DedicatedBlobWriter open_dedicated_blob_writer(
+        const std::string& data_file_path,
+        uint32_t blob_id) const {
+        auto* raw = lance_file_session_open_dedicated_blob_writer(
+            handle_.get(), data_file_path.c_str(), blob_id);
+        if (!raw) check_error();
+        return DedicatedBlobWriter(raw);
+    }
 
     bool contains(const std::string& relative_path) const {
         int32_t exists = 0;
