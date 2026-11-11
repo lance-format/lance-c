@@ -17,13 +17,14 @@ use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::Result;
 use lance_table::format::{BasePath, Fragment, IndexMetadata, pb};
-use lance_table::transaction::DataReplacementGroup;
+use lance_table::transaction::{DataOverlayGroup, DataReplacementGroup};
 use prost::Message;
 
 use crate::base_paths::{
     LanceBasePath, LanceBasePathView, OwnedBasePath, own_base_paths, parse_base_paths,
 };
 use crate::data_file::LanceDataFile;
+use crate::data_overlay::LanceDataOverlayGroup;
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::fragment::{LanceFragment, fragment_metadata_json};
@@ -403,6 +404,69 @@ unsafe fn operation_data_replacement_new_inner(
 
     Ok(Box::into_raw(Box::new(LanceOperation::from_native(
         Operation::DataReplacement { replacements },
+    ))))
+}
+
+/// Construct an owned native DataOverlay operation.
+///
+/// Group handles are borrowed and cloned in input order. A NULL array is
+/// accepted only with a zero count. Empty groups and empty group lists are
+/// retained because the native operation permits them. Native code owns
+/// fragment existence, field compatibility, coverage validity, layout, and
+/// ordering checks. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_data_overlay_new(
+    groups: *const *const LanceDataOverlayGroup,
+    group_count: usize,
+) -> *mut LanceOperation {
+    ffi_try!(
+        unsafe { operation_data_overlay_new_inner(groups, group_count) },
+        null
+    )
+}
+
+unsafe fn operation_data_overlay_new_inner(
+    groups: *const *const LanceDataOverlayGroup,
+    group_count: usize,
+) -> Result<*mut LanceOperation> {
+    if groups.is_null() && group_count > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("groups must not be NULL when group_count = {group_count}").into(),
+        ));
+    }
+    let max_groups = isize::MAX as usize / std::mem::size_of::<*const LanceDataOverlayGroup>();
+    if group_count > max_groups {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "group_count {group_count} exceeds the maximum addressable pointer slice length"
+            )
+            .into(),
+        ));
+    }
+
+    let groups = if group_count == 0 {
+        Vec::new()
+    } else {
+        let groups = unsafe { std::slice::from_raw_parts(groups, group_count) };
+        groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                if group.is_null() {
+                    return Err(lance_core::Error::invalid_input_source(
+                        format!(
+                            "groups[{index}] must not be NULL when group_count = {group_count}"
+                        )
+                        .into(),
+                    ));
+                }
+                Ok(unsafe { &**group }.inner.clone())
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+        Operation::DataOverlay { groups },
     ))))
 }
 
@@ -1514,6 +1578,99 @@ unsafe fn operation_data_replacement_at_inner(
         ptr::write(out_group, Box::into_raw(group));
     }
     Ok(0)
+}
+
+/// Read the number of data overlay groups.
+///
+/// Returns 0 on success, -1 on error. A non-DataOverlay operation returns
+/// `LANCE_ERR_NOT_SUPPORTED`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_data_overlay_group_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_data_overlay_group_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_data_overlay_group_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let groups = data_overlay_groups(operation)?;
+    unsafe {
+        ptr::write(out_count, groups.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Clone one data overlay group from a DataOverlay operation.
+///
+/// Returns 0 on success, -1 on error. The output is written only on success and
+/// must be closed independently. A wrong operation variant returns
+/// `LANCE_ERR_NOT_SUPPORTED`; an out-of-range index returns
+/// `LANCE_ERR_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_data_overlay_group_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_group: *mut *mut LanceDataOverlayGroup,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_data_overlay_group_at_inner(operation, index, out_group) },
+        neg
+    )
+}
+
+unsafe fn operation_data_overlay_group_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_group: *mut *mut LanceDataOverlayGroup,
+) -> Result<i32> {
+    if out_group.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_group must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let groups = data_overlay_groups(operation)?;
+    let group = groups.get(index).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "data overlay group index {index} is out of range for {} groups",
+                groups.len()
+            )
+            .into(),
+        )
+    })?;
+    let group = Box::new(LanceDataOverlayGroup {
+        inner: group.clone(),
+    });
+    unsafe {
+        ptr::write(out_group, Box::into_raw(group));
+    }
+    Ok(0)
+}
+
+fn data_overlay_groups(operation: &LanceOperation) -> Result<&[DataOverlayGroup]> {
+    match &operation.inner {
+        Operation::DataOverlay { groups } => Ok(groups),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "DataOverlay inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
 }
 
 fn append_operation_parts(operation: &LanceOperation) -> Result<&[Fragment]> {

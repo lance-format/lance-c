@@ -59,7 +59,7 @@ impl LanceFragment {
     }
 
     /// Return the dataset-bound fragment or reject a dataset-dependent read.
-    fn bound(&self) -> Result<&FileFragment> {
+    pub(crate) fn bound(&self) -> Result<&FileFragment> {
         match &self.inner {
             FragmentState::Bound(fragment) => Ok(fragment),
             FragmentState::Detached(_) => Err(Error::not_supported_source(

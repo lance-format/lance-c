@@ -179,6 +179,54 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Two-fragment fixture for data overlay consumers. Version 1 holds ids 1-20
+/// across ten-row fragments; version 2 deletes id 10. Values are `a = id * 10`
+/// and `b = id * 100`, with NULL `a` at ids 7 and 16.
+fn create_overlay_dataset_on_disk(name: &str) -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join(name).to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int32, true),
+    ]));
+    let ids: Vec<i32> = (1..=20).collect();
+    let a = ids
+        .iter()
+        .map(|id| {
+            if *id == 7 || *id == 16 {
+                None
+            } else {
+                Some(id * 10)
+            }
+        })
+        .collect::<Vec<_>>();
+    let b = ids.iter().map(|id| Some(id * 100)).collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Int32Array::from(a)),
+            Arc::new(Int32Array::from(b)),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id = 10").await.unwrap();
+    });
+    (tmp, uri)
+}
+
 /// Three-fragment, stable-row-ID fixture with non-contiguous field IDs, nested
 /// fields, a dictionary column, and root/field metadata. Arrow export loses
 /// these native details, so consumers use it as the native-schema oracle.
@@ -1249,6 +1297,34 @@ fn test_native_transaction_compilation_and_execution() {
             &cpp_blob_publication_uri,
         ],
     );
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_data_overlay_consumers"]
+fn test_native_data_overlay_consumers() {
+    let (lib_path, include_dir) = build_lance_c();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let (_c_tmp, c_uri) = create_overlay_dataset_on_disk("data_overlay_c");
+    let c_source = tests_dir.join("test_data_overlay.c");
+    let c_binary = build_dir.path().join("test_data_overlay_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C data overlay consumer failed to compile"
+    );
+    run_test_binary_with_dataset(&c_binary, &c_uri);
+
+    let (_cpp_tmp, cpp_uri) = create_overlay_dataset_on_disk("data_overlay_cpp");
+    let cpp_source = tests_dir.join("test_data_overlay.cpp");
+    let cpp_binary = build_dir.path().join("test_data_overlay_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "C++ data overlay consumer failed to compile"
+    );
+    run_test_binary_with_dataset(&cpp_binary, &cpp_uri);
 }
 
 #[test]
