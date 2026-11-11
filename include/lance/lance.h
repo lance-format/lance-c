@@ -7232,6 +7232,8 @@ typedef struct LanceFragmentCreateOptions {
  * required; an empty stream fails with the native "Input data was empty."
  * error. The native API accepts any `fragment_id`, including IDs already used
  * by existing metadata; duplicate detection happens at commit time.
+ * Non-NULL URI strings, including empty strings, are interpreted by native
+ * code. Native schema validation precedes target storage creation.
  *
  * The stream is consumed on every return path except a NULL `stream` pointer,
  * including validation failures and a NULL output slot. Passing a NULL stream
@@ -7292,7 +7294,8 @@ void lance_fragment_array_free(LanceFragment** fragments, size_t count);
  * Maps to native `FileFragment::create_from_file(filename, dataset_snapshot,
  * fragment_id as usize, physical_rows)`. `filename` is relative to the
  * dataset's data directory and keeps native file-version, schema
- * compatibility and physical-row validation. `physical_rows == NULL` maps to
+ * compatibility and physical-row validation. Non-NULL filenames, including
+ * empty strings, are passed through unchanged. `physical_rows == NULL` maps to
  * native `None`; a pointer to zero maps to `Some(0)`, which the current native
  * format may ignore. Values that do not fit the native `usize` are rejected.
  *

@@ -109,12 +109,10 @@ unsafe fn claim_stream(stream: *mut FFI_ArrowArrayStream) -> Result<ArrowArraySt
     unsafe { helpers::take_arrow_array_stream(stream) }
 }
 
-/// Parse the dataset URI, reusing the creating entry points' representation
-/// rules: NULL and empty are invalid arguments.
+/// Parse a required C string; native code interprets the URI, including empty.
 unsafe fn require_uri<'a>(dataset_uri: *const c_char) -> Result<&'a str> {
     unsafe { helpers::parse_c_string(dataset_uri)? }
-        .filter(|uri| !uri.is_empty())
-        .ok_or_else(|| Error::invalid_input("dataset_uri must not be empty"))
+        .ok_or_else(|| Error::invalid_input("dataset_uri must not be NULL"))
 }
 
 /// Build the native builder for one call.
@@ -346,8 +344,7 @@ unsafe fn fragment_create_from_file_inner(
         ));
     }
     let filename = unsafe { helpers::parse_c_string(filename)? }
-        .filter(|filename| !filename.is_empty())
-        .ok_or_else(|| Error::invalid_input("filename must not be empty"))?;
+        .ok_or_else(|| Error::invalid_input("filename must not be NULL"))?;
 
     // Only integer representability is checked here. Zero is a real native
     // `Some(0)` even though the current file format ignores the hint.

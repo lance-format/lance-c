@@ -52596,22 +52596,57 @@ fn test_fragment_create_stream_ownership_and_success_only_outputs() {
     assert_stream_consumed(&null_uri_stream.0, &null_uri_stream.1);
     assert_eq!(out as usize, 0x2345, "outputs are success-only");
 
-    let mut empty_uri_stream = make_counted_stream(&schema);
-    assert_eq!(
-        unsafe {
-            lance_fragment_create(
-                empty_uri.as_ptr(),
-                1,
-                &options,
-                &mut empty_uri_stream.0,
-                &mut out,
-            )
-        },
-        -1
-    );
-    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    assert_stream_consumed(&empty_uri_stream.0, &empty_uri_stream.1);
-    assert_eq!(out as usize, 0x2345);
+    // Native checks the empty schema before opening target storage. With
+    // default create options this exercises empty-URI forwarding without
+    // writing into the process's working directory.
+    for many in [false, true] {
+        let empty_schema = Arc::new(Schema::empty());
+        let native_reader =
+            arrow::record_batch::RecordBatchIterator::new(vec![], empty_schema.clone());
+        let native_error = lance_c::runtime::block_on(async {
+            let builder = lance::dataset::fragment::write::FragmentCreateBuilder::new("");
+            if many {
+                builder.write_fragments(native_reader).await.map(|_| ())
+            } else {
+                builder.write(native_reader, Some(1)).await.map(|_| ())
+            }
+        })
+        .unwrap_err();
+        assert!(
+            native_error
+                .to_string()
+                .contains("Cannot write with an empty schema.")
+        );
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut stream = FFI_ArrowArrayStream::new(Box::new(CountingReader {
+            inner: arrow::record_batch::RecordBatchIterator::new(vec![], empty_schema),
+            drop_count: dropped.clone(),
+        }));
+        let mut array = ptr::without_provenance_mut::<*mut LanceFragment>(0x3456);
+        let mut count = usize::MAX;
+        let rc = if many {
+            unsafe {
+                lance_fragment_create_many(
+                    empty_uri.as_ptr(),
+                    ptr::null(),
+                    &mut stream,
+                    &mut array,
+                    &mut count,
+                )
+            }
+        } else {
+            unsafe {
+                lance_fragment_create(empty_uri.as_ptr(), 1, ptr::null(), &mut stream, &mut out)
+            }
+        };
+        assert_eq!(rc, -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert_eq!(take_last_error_message(), native_error.to_string());
+        assert_stream_consumed(&stream, &dropped);
+        assert_eq!(out as usize, 0x2345);
+        assert_eq!(array as usize, 0x3456);
+        assert_eq!(count, usize::MAX);
+    }
 
     let mut bad_mode = fragment_create_options(ptr::null(), LanceWriteMode::Append, ptr::null());
     bad_mode.mode = 99;
@@ -52799,6 +52834,22 @@ fn test_fragment_create_from_file_publishes_external_raw_file() {
         -1
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // Empty filenames retain the native file-opening error and output semantics.
+    let native_error = lance_c::runtime::block_on(async {
+        let native = Dataset::open(&uri).await.unwrap();
+        lance::dataset::fragment::FileFragment::create_from_file("", &native, 1, None)
+            .await
+            .unwrap_err()
+    });
+    assert_eq!(
+        unsafe {
+            lance_fragment_create_from_file(dataset, c"".as_ptr(), 1, ptr::null(), &mut guard_out)
+        },
+        -1
+    );
+    assert_eq!(take_last_error_message(), native_error.to_string());
+    assert_eq!(guard_out as usize, 0x5678);
 
     // A non-NULL `physical_rows` pointer is a hint, not a validation gate: the
     // current (V2) reader path derives the real count from the file, so an
