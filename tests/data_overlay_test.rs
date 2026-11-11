@@ -647,12 +647,20 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
     match transaction.operation {
         Operation::DataOverlay { groups } => {
             assert_eq!(groups.len(), 2);
-            assert_eq!(groups[0].overlays[0].committed_version, 3);
-            assert_eq!(groups[1].overlays[0].committed_version, 3);
+            // Native transaction history preserves the submitted operation,
+            // including finish's placeholder version. The committed manifest
+            // stamps the actual version, verified from fragment metadata below.
+            assert_eq!(groups[0].overlays[0].committed_version, 0);
+            assert_eq!(groups[1].overlays[0].committed_version, 0);
             assert_eq!(groups[0].fragment_id, ids[0]);
             assert_eq!(groups[1].fragment_id, ids[1]);
         }
         other => panic!("unexpected history operation: {other:?}"),
+    }
+    for fragment_id in [ids[0], ids[1]] {
+        let fragment = committed_native.get_fragment(fragment_id as usize).unwrap();
+        assert_eq!(fragment.metadata().overlays.len(), 1);
+        assert_eq!(fragment.metadata().overlays[0].committed_version, 3);
     }
     unsafe { lance_dataset_close(committed) };
 
