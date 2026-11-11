@@ -912,3 +912,29 @@ fn test_static_oss_transport() {
         .expect("failed to run the static OSS transport test");
     assert!(status.success(), "static OSS HTTP transport test failed");
 }
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_namespace_compilation_and_execution"]
+fn test_native_namespace_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_namespace.c");
+    let c_binary = build_dir.path().join("test_namespace_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C native namespace test compilation failed"
+    );
+    run_test_binary(&c_binary);
+
+    let cpp_source = tests_dir.join("test_namespace.cpp");
+    let cpp_binary = build_dir.path().join("test_namespace_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "C++ native namespace test compilation failed"
+    );
+    run_test_binary(&cpp_binary);
+}
