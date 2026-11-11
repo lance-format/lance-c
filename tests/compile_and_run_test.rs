@@ -927,6 +927,107 @@ fn create_fragment_dataset_on_disk(enable_stable_row_ids: bool) -> (tempfile::Te
     (tmp, uri)
 }
 
+/// Create the three-fragment mutation fixture used by C and C++ publication
+/// callers. The dataset has stable row IDs, nested field metadata, a removed
+/// column that leaves an ID gap, and one deleted row in the first and third
+/// fragments.
+fn create_fragment_mutation_dataset_on_disk(name: &str) -> (tempfile::TempDir, String) {
+    use std::collections::HashMap;
+
+    fn metadata(key: &str, value: &str) -> HashMap<String, String> {
+        HashMap::from([(key.to_owned(), value.to_owned())])
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join(name).to_str().unwrap().to_owned();
+    let profile_fields = Fields::from(vec![
+        Field::new("score", DataType::Int32, true).with_metadata(metadata("nested", "score")),
+        Field::new("tag", DataType::Utf8, true),
+    ]);
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("id", DataType::Int64, false).with_metadata(metadata("role", "id")),
+            Field::new("value", DataType::Int32, true).with_metadata(metadata("role", "value")),
+            Field::new("stale", DataType::Utf8, true),
+            Field::new("profile", DataType::Struct(profile_fields.clone()), true)
+                .with_metadata(metadata("role", "nested")),
+        ],
+        metadata("fixture", "fragment-mutation"),
+    ));
+
+    let make_batch = |ids: &[i64]| {
+        let values = ids
+            .iter()
+            .map(|id| Some(*id as i32 * 10))
+            .collect::<Vec<_>>();
+        let scores = Arc::new(Int32Array::from(
+            ids.iter()
+                .map(|id| Some(*id as i32 * 100))
+                .collect::<Vec<_>>(),
+        ));
+        let tags = Arc::new(StringArray::from(
+            ids.iter().map(|id| format!("tag-{id}")).collect::<Vec<_>>(),
+        ));
+        let profile = Arc::new(StructArray::new(
+            profile_fields.clone(),
+            vec![scores, tags],
+            None,
+        ));
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Int32Array::from(values)),
+                Arc::new(StringArray::from(vec!["stale"; ids.len()])),
+                profile,
+            ],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(
+                vec![Ok(make_batch(&[1, 2, 3, 4]))],
+                schema.clone(),
+            ),
+            &uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for ids in [[5_i64, 6, 7, 8], [9, 10, 11, 12]] {
+            dataset
+                .append(
+                    arrow::record_batch::RecordBatchIterator::new(
+                        vec![Ok(make_batch(&ids))],
+                        schema.clone(),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        dataset.drop_columns(&["stale"]).await.unwrap();
+        assert_eq!(
+            dataset
+                .delete("id IN (2, 10)")
+                .await
+                .unwrap()
+                .num_deleted_rows,
+            2
+        );
+        assert_eq!(dataset.version().version, 5);
+        assert_eq!(dataset.get_fragments().len(), 3);
+    });
+    (tmp, uri)
+}
+
 /// Create a two-fragment Blob v2 dataset on disk and return (TempDir, path_string).
 ///
 /// Each fragment has five rows: blobs of 8, 128 and 1024 bytes (inline, packed
@@ -1452,6 +1553,54 @@ fn test_native_transaction_compilation_and_execution() {
             base,
             &cpp_schema_uri,
             &cpp_blob_publication_uri,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_fragment_mutation_consumers"]
+fn test_native_fragment_mutation_consumers() {
+    let (lib_path, include_dir) = build_lance_c();
+    let c_add = create_fragment_mutation_dataset_on_disk("c_fragment_mutation_add");
+    let c_merge = create_fragment_mutation_dataset_on_disk("c_fragment_mutation_merge");
+    let c_update = create_fragment_mutation_dataset_on_disk("c_fragment_mutation_update");
+    let c_write = create_fragment_mutation_dataset_on_disk("c_fragment_mutation_write");
+    let c_delete = create_fragment_mutation_dataset_on_disk("c_fragment_mutation_delete");
+    let cpp_add = create_fragment_mutation_dataset_on_disk("cpp_fragment_mutation_add");
+    let cpp_merge = create_fragment_mutation_dataset_on_disk("cpp_fragment_mutation_merge");
+    let cpp_update = create_fragment_mutation_dataset_on_disk("cpp_fragment_mutation_update");
+    let cpp_write = create_fragment_mutation_dataset_on_disk("cpp_fragment_mutation_write");
+    let cpp_delete = create_fragment_mutation_dataset_on_disk("cpp_fragment_mutation_delete");
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_fragment_mutation.c");
+    let c_binary = build_dir.path().join("test_fragment_mutation_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C fragment mutation consumer failed to compile"
+    );
+    run_test_binary_with_args(
+        &c_binary,
+        &[&c_add.1, &c_merge.1, &c_update.1, &c_write.1, &c_delete.1],
+    );
+
+    let cpp_source = tests_dir.join("test_fragment_mutation.cpp");
+    let cpp_binary = build_dir.path().join("test_fragment_mutation_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "C++ fragment mutation consumer failed to compile"
+    );
+    run_test_binary_with_args(
+        &cpp_binary,
+        &[
+            &cpp_add.1,
+            &cpp_merge.1,
+            &cpp_update.1,
+            &cpp_write.1,
+            &cpp_delete.1,
         ],
     );
 }
