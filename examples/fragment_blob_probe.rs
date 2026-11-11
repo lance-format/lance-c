@@ -66,9 +66,10 @@ fn plain_batch(schema: &Arc<Schema>, first_id: u32) -> RecordBatch {
         schema.clone(),
         vec![
             Arc::new(UInt32Array::from(vec![first_id, first_id + 1])),
-            Arc::new(BinaryArray::from_vec(
-                vec![b"a", b"bb", b"ccc"][..2].to_vec(),
-            )),
+            Arc::new(BinaryArray::from_vec(vec![
+                b"a".as_slice(),
+                b"bb".as_slice(),
+            ])),
         ],
     )
     .unwrap()
@@ -80,7 +81,12 @@ async fn data_files(uri: &str) -> Vec<String> {
     for fragment in dataset.get_fragments() {
         let metadata = fragment.metadata();
         for file in &metadata.files {
-            paths.push(file.path.clone());
+            let name = std::path::Path::new(&file.path)
+                .file_name()
+                .expect("data file path has a file name")
+                .to_string_lossy()
+                .into_owned();
+            paths.push(name);
         }
     }
     paths
@@ -94,7 +100,7 @@ fn report_native(uri: &str, file: &str) {
                 let metadata = fragment.metadata();
                 println!(
                     "native create_from_file OK file={file} id={} physical_rows={:?} files={:?}",
-                    fragment.id(),
+                    metadata.id,
                     metadata.physical_rows,
                     metadata
                         .files
