@@ -16897,7 +16897,7 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
     let column = c_str("embedding");
     let index_name = c_str("all_family_options_idx");
     let query: Vec<f32> = (0..8)
-        .map(|component| 5.0 + component as f32 / 8.0)
+        .map(|component| 5.25 + component as f32 / 8.0)
         .collect();
     let families = [
         (LanceVectorIndexType::IvfFlat, "IVF_FLAT", 1),
@@ -16957,10 +16957,39 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
 
         let (indexed_ids, indexed_statistics) =
             nearest_ids_and_statistics(dataset, "embedding", &query, true, 3);
+        let native_ids = lance_c::runtime::block_on(async {
+            use futures::TryStreamExt;
+
+            let native = Dataset::open(&uri).await.unwrap();
+            let mut scanner = native.scan();
+            let query = arrow_array::Float32Array::from(query.clone());
+            scanner.nearest("embedding", &query, 3).unwrap();
+            scanner.nprobs(2).refine(8).use_index(true);
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>()
+        });
         assert_eq!(
-            indexed_ids.first(),
-            Some(&5),
-            "{expected_type} must return the exact source row through the index"
+            indexed_ids, native_ids,
+            "{expected_type} must preserve native approximate query results"
         );
         assert!(
             indexed_statistics.index_partitions_loaded > 0,
@@ -16969,10 +16998,9 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
 
         let (flat_ids, flat_statistics) =
             nearest_ids_and_statistics(dataset, "embedding", &query, false, 3);
-        assert_eq!(
-            flat_ids, indexed_ids,
-            "{expected_type} indexed versus flat ids"
-        );
+        // These vectors differ only by their row ID, so the exact L2 order
+        // for query 5.25 is independent of index training and traversal.
+        assert_eq!(flat_ids, vec![5, 6, 4], "{expected_type} flat control");
         assert_eq!(
             (
                 flat_statistics.indices_loaded,
