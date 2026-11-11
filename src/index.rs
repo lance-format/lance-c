@@ -7,7 +7,7 @@
 //! scanners that already cloned the inner Arc keep their snapshot view.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::future::Future;
 use std::slice;
 use std::sync::Arc;
@@ -36,7 +36,10 @@ use uuid::Uuid;
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
-use crate::index_segment::{borrow_model_array, fixed_size_list_model};
+use crate::index_segment::{
+    LanceIndexBuildProgressCallback, ProgressCallbackBridge, borrow_model_array,
+    fixed_size_list_model,
+};
 use crate::runtime::{RT, block_on};
 use crate::stream_guard::GuardedReader;
 
@@ -148,6 +151,8 @@ pub unsafe extern "C" fn lance_dataset_create_scalar_index(
                 index_name,
                 index_type,
                 params_json,
+                None,
+                std::ptr::null_mut(),
                 replace,
             )
         },
@@ -155,12 +160,46 @@ pub unsafe extern "C" fn lance_dataset_create_scalar_index(
     )
 }
 
+/// Create a scalar index and optionally observe ordinary native build
+/// progress. A NULL callback preserves the legacy no-observer behavior.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_create_scalar_index_with_progress(
+    dataset: *mut LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    index_type: i32,
+    params_json: *const c_char,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
+    replace: bool,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            create_scalar_index_inner(
+                dataset,
+                column,
+                index_name,
+                index_type,
+                params_json,
+                callback,
+                callback_ctx,
+                replace,
+            )
+        },
+        neg
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_scalar_index_inner(
     dataset: *mut LanceDataset,
     column: *const c_char,
     index_name: *const c_char,
     index_type: i32,
     params_json: *const c_char,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
     replace: bool,
 ) -> Result<i32> {
     if dataset.is_null() || column.is_null() {
@@ -182,14 +221,19 @@ unsafe fn create_scalar_index_inner(
         params.params = Some(json.to_string());
     }
 
-    ds.with_mut(|d| {
-        block_on(d.create_index(
-            &[column_str],
-            scalar_type.to_index_type(),
-            name,
-            &params,
-            replace,
-        ))
+    let bridge = callback.map(|callback| ProgressCallbackBridge::new(callback, callback_ctx));
+    ds.with_mut(|dataset| {
+        let columns = [column_str];
+        let mut builder =
+            dataset.create_index_builder(&columns, scalar_type.to_index_type(), &params);
+        if let Some(name) = name.clone() {
+            builder = builder.name(name);
+        }
+        builder = builder.replace(replace).train(true);
+        if let Some(bridge) = &bridge {
+            builder = builder.progress(bridge.progress());
+        }
+        block_on(std::future::IntoFuture::into_future(builder))
     })?;
 
     Ok(0)
@@ -215,6 +259,41 @@ pub unsafe extern "C" fn lance_dataset_create_scalar_index_with_options(
                 index_type,
                 params_json,
                 options,
+                None,
+                std::ptr::null_mut(),
+                replace,
+            )
+        },
+        neg
+    )
+}
+
+/// Create a scalar index with native train controls and optional progress.
+/// A NULL callback preserves the legacy no-observer behavior.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_create_scalar_index_with_options_and_progress(
+    dataset: *mut LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    index_type: i32,
+    params_json: *const c_char,
+    options: *const LanceScalarIndexOptions,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
+    replace: bool,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            create_scalar_index_with_options_inner(
+                dataset,
+                column,
+                index_name,
+                index_type,
+                params_json,
+                options,
+                callback,
+                callback_ctx,
                 replace,
             )
         },
@@ -230,6 +309,8 @@ unsafe fn create_scalar_index_with_options_inner(
     index_type: i32,
     params_json: *const c_char,
     options: *const LanceScalarIndexOptions,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
     replace: bool,
 ) -> Result<i32> {
     if dataset.is_null() || column.is_null() {
@@ -252,6 +333,7 @@ unsafe fn create_scalar_index_with_options_inner(
     let mut params = ScalarIndexParams::for_builtin(scalar_type.to_builtin());
     params.params = params_json.map(str::to_string);
 
+    let bridge = callback.map(|callback| ProgressCallbackBridge::new(callback, callback_ctx));
     ds.with_mut(|dataset| {
         let columns = [column.as_str()];
         let mut builder =
@@ -260,6 +342,9 @@ unsafe fn create_scalar_index_with_options_inner(
             builder = builder.name(index_name);
         }
         builder = builder.replace(replace).train(train);
+        if let Some(bridge) = &bridge {
+            builder = builder.progress(bridge.progress());
+        }
         block_on(std::future::IntoFuture::into_future(builder))
     })?;
     Ok(0)
@@ -1946,7 +2031,47 @@ pub unsafe extern "C" fn lance_dataset_create_vector_index(
     replace: bool,
 ) -> i32 {
     ffi_try!(
-        unsafe { create_vector_index_inner(dataset, column, index_name, params, replace) },
+        unsafe {
+            create_vector_index_inner(
+                dataset,
+                column,
+                index_name,
+                params,
+                None,
+                std::ptr::null_mut(),
+                replace,
+            )
+        },
+        neg
+    )
+}
+
+/// Create a vector index from legacy parameters and optionally observe
+/// ordinary native build progress. A NULL callback preserves the legacy
+/// no-observer behavior.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_create_vector_index_with_progress(
+    dataset: *mut LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    params: *const LanceVectorIndexParams,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
+    replace: bool,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            create_vector_index_inner(
+                dataset,
+                column,
+                index_name,
+                params,
+                callback,
+                callback_ctx,
+                replace,
+            )
+        },
         neg
     )
 }
@@ -1967,17 +2092,58 @@ pub unsafe extern "C" fn lance_dataset_create_vector_index_with_options(
 ) -> i32 {
     ffi_try!(
         unsafe {
-            create_vector_index_with_options_inner(dataset, column, index_name, options, replace)
+            create_vector_index_with_options_inner(
+                dataset,
+                column,
+                index_name,
+                options,
+                None,
+                std::ptr::null_mut(),
+                replace,
+            )
         },
         neg
     )
 }
 
+/// Create a vector index from additive native options and optionally observe
+/// ordinary native build progress. A NULL callback preserves the legacy
+/// no-observer behavior.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_create_vector_index_with_options_and_progress(
+    dataset: *mut LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    options: *const LanceVectorIndexOptions,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
+    replace: bool,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            create_vector_index_with_options_inner(
+                dataset,
+                column,
+                index_name,
+                options,
+                callback,
+                callback_ctx,
+                replace,
+            )
+        },
+        neg
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_vector_index_inner(
     dataset: *mut LanceDataset,
     column: *const c_char,
     index_name: *const c_char,
     params: *const LanceVectorIndexParams,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
     replace: bool,
 ) -> Result<i32> {
     if dataset.is_null() || column.is_null() || params.is_null() {
@@ -1993,23 +2159,30 @@ unsafe fn create_vector_index_inner(
     let p = unsafe { &*params };
     let core_params = build_vector_params(p)?;
 
-    ds.with_mut(|d| {
-        block_on(d.create_index(
-            &[column_str],
-            IndexType::Vector,
-            name,
-            &core_params,
-            replace,
-        ))
+    let bridge = callback.map(|callback| ProgressCallbackBridge::new(callback, callback_ctx));
+    ds.with_mut(|dataset| {
+        let columns = [column_str];
+        let mut builder = dataset.create_index_builder(&columns, IndexType::Vector, &core_params);
+        if let Some(name) = name.clone() {
+            builder = builder.name(name);
+        }
+        builder = builder.replace(replace).train(true);
+        if let Some(bridge) = &bridge {
+            builder = builder.progress(bridge.progress());
+        }
+        block_on(std::future::IntoFuture::into_future(builder))
     })?;
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_vector_index_with_options_inner(
     dataset: *mut LanceDataset,
     column: *const c_char,
     index_name: *const c_char,
     options: *const LanceVectorIndexOptions,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
     replace: bool,
 ) -> Result<i32> {
     if dataset.is_null() || column.is_null() || options.is_null() {
@@ -2025,6 +2198,7 @@ unsafe fn create_vector_index_with_options_inner(
     let index_name = unsafe { helpers::parse_c_string(index_name)? }.map(str::to_string);
     let prepared = unsafe { prepare_vector_build(options)? };
 
+    let bridge = callback.map(|callback| ProgressCallbackBridge::new(callback, callback_ctx));
     ds.with_mut(|dataset| {
         let columns = [column.as_str()];
         let mut builder =
@@ -2035,6 +2209,9 @@ unsafe fn create_vector_index_with_options_inner(
         builder = builder.replace(replace).train(prepared.train);
         // `execute` is private in the pinned core, while `IntoFuture` is the
         // public commit path and performs the same commit-plus-metadata reload.
+        if let Some(bridge) = &bridge {
+            builder = builder.progress(bridge.progress());
+        }
         block_on(std::future::IntoFuture::into_future(builder))
     })?;
     Ok(0)

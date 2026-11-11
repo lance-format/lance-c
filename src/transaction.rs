@@ -3642,25 +3642,6 @@ pub struct LanceUpdateOperationOptions {
     pub updated_fragment_offsets: *const LanceUpdatedFragmentOffsets,
 }
 
-/// Copy a caller-supplied array into a borrowed slice after the shared checks.
-unsafe fn required_slice<'a, T>(
-    values: *const T,
-    count: usize,
-    label: &str,
-    count_label: &str,
-) -> Result<&'a [T]> {
-    if count == 0 {
-        return Ok(&[]);
-    }
-    if values.is_null() {
-        return Err(lance_core::Error::invalid_input_source(
-            format!("{label} must not be NULL when {count_label} = {count}").into(),
-        ));
-    }
-    helpers::validate_slice_length::<T>(count, label)?;
-    Ok(unsafe { std::slice::from_raw_parts(values, count) })
-}
-
 fn parse_update_mode(value: i32) -> Result<UpdateMode> {
     match value {
         0 => Ok(UpdateMode::RewriteRows),
@@ -3754,11 +3735,11 @@ pub unsafe extern "C" fn lance_updated_fragment_offsets_new(
     ffi_try!(
         (|| -> Result<*mut LanceUpdatedFragmentOffsets> {
             let entries =
-                unsafe { required_slice(entries, entry_count, "entries", "entry_count")? };
+                unsafe { helpers::required_slice(entries, entry_count, "entries", "entry_count")? };
             let mut offsets = HashMap::with_capacity(entries.len());
             for (index, entry) in entries.iter().enumerate() {
                 let values = unsafe {
-                    required_slice(
+                    helpers::required_slice(
                         entry.offsets,
                         entry.offset_count,
                         &format!("entries[{index}].offsets"),
@@ -3955,7 +3936,7 @@ fn parse_key_existence_filter(
     len: usize,
     label: &str,
 ) -> Result<KeyExistenceFilter> {
-    let bytes = unsafe { required_slice(bytes, len, label, "len") }?;
+    let bytes = unsafe { helpers::required_slice(bytes, len, label, "len") }?;
     let message = pb::transaction::KeyExistenceFilter::decode(bytes).map_err(|error| {
         lance_core::Error::invalid_input_source(
             format!("{label} is not a native key-existence filter: {error}").into(),
@@ -4348,7 +4329,7 @@ pub unsafe extern "C" fn lance_operation_update_new(
             }
             let options = unsafe { &*options };
             let removed_fragment_ids = unsafe {
-                required_slice(
+                helpers::required_slice(
                     options.removed_fragment_ids,
                     options.removed_fragment_count,
                     "removed_fragment_ids",
@@ -4371,7 +4352,7 @@ pub unsafe extern "C" fn lance_operation_update_new(
                 )?
             };
             let fields_modified = unsafe {
-                required_slice(
+                helpers::required_slice(
                     options.fields_modified,
                     options.fields_modified_count,
                     "fields_modified",
@@ -4386,7 +4367,7 @@ pub unsafe extern "C" fn lance_operation_update_new(
                 )?
             };
             let fields_for_preserving_frag_bitmap = unsafe {
-                required_slice(
+                helpers::required_slice(
                     options.fields_for_preserving_frag_bitmap,
                     options.fields_for_preserving_frag_bitmap_count,
                     "fields_for_preserving_frag_bitmap",
@@ -5098,7 +5079,7 @@ pub unsafe extern "C" fn lance_rewritten_index_new(
             let new_id = unsafe { required_uuid(new_id, "new_id") }?;
             let details_type_url = required_c_string(details_type_url, "details_type_url")?;
             let details_value = unsafe {
-                required_slice(details_value, details_value_len, "details_value", "len")
+                helpers::required_slice(details_value, details_value_len, "details_value", "len")
             }?
             .to_vec();
             if !has_index_files && index_file_count != 0 {
@@ -5113,7 +5094,7 @@ pub unsafe extern "C" fn lance_rewritten_index_new(
                 None
             } else {
                 let entries = unsafe {
-                    required_slice(
+                    helpers::required_slice(
                         index_files,
                         index_file_count,
                         "index_files",
@@ -5493,7 +5474,8 @@ pub unsafe extern "C" fn lance_operation_rewrite_new(
 ) -> *mut LanceOperation {
     ffi_try!(
         (|| -> Result<*mut LanceOperation> {
-            let groups = unsafe { required_slice(groups, group_count, "groups", "group_count")? };
+            let groups =
+                unsafe { helpers::required_slice(groups, group_count, "groups", "group_count")? };
             let mut cloned_groups = Vec::with_capacity(groups.len());
             for (index, group) in groups.iter().enumerate() {
                 if group.is_null() {
@@ -5508,7 +5490,7 @@ pub unsafe extern "C" fn lance_operation_rewrite_new(
                 cloned_groups.push(unsafe { &**group }.inner.clone());
             }
             let rewritten_indices = unsafe {
-                required_slice(
+                helpers::required_slice(
                     rewritten_indices,
                     rewritten_index_count,
                     "rewritten_indices",

@@ -51,6 +51,12 @@ impl LanceFragment {
         }
     }
 
+    pub(crate) fn from_native(fragment: FileFragment) -> Self {
+        Self {
+            inner: FragmentState::Bound(fragment),
+        }
+    }
+
     pub(crate) fn metadata(&self) -> &Fragment {
         match &self.inner {
             FragmentState::Bound(fragment) => fragment.metadata(),
@@ -261,6 +267,41 @@ unsafe fn fragment_is_bound_inner(
     let is_bound = matches!(fragment.inner, FragmentState::Bound(_));
     unsafe {
         ptr::write_unaligned(out_is_bound, is_bound);
+    }
+    Ok(0)
+}
+
+/// Return the dataset read version captured by a bound fragment.
+///
+/// This is the native dataset snapshot version carried by the fragment's
+/// `FileFragment` and is the value callers pass to generic transaction commit
+/// after staging fragment mutations. A detached metadata-only handle has no
+/// dataset snapshot and returns `LANCE_ERR_NOT_SUPPORTED`. The output slot is
+/// written only on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_fragment_read_version(
+    fragment: *const LanceFragment,
+    out_version: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { fragment_read_version_inner(fragment, out_version) },
+        neg
+    )
+}
+
+unsafe fn fragment_read_version_inner(
+    fragment: *const LanceFragment,
+    out_version: *mut u64,
+) -> Result<i32> {
+    let fragment = unsafe { fragment_ref(fragment) }?;
+    if out_version.is_null() {
+        return Err(Error::invalid_input_source(
+            "out_version must not be NULL".into(),
+        ));
+    }
+    let version = fragment.bound()?.dataset().version_id();
+    unsafe {
+        ptr::write_unaligned(out_version, version);
     }
     Ok(0)
 }

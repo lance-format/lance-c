@@ -186,7 +186,7 @@ pub type LanceIndexBuildProgressCallback = Option<
 /// retirement from a documentation contract into an enforced boundary: once
 /// `retire` returns, no callback invocation is in flight and every later
 /// entry becomes a no-op, so a detached clone can never touch the raw
-/// `callback`/`ctx` after the owning `execute_uncommitted` call has returned.
+/// `callback`/`ctx` after the owning blocking build call has returned.
 #[derive(Debug, Default)]
 struct ProgressCallbackGate {
     /// Set by `retire`; entries that observe it become no-ops.
@@ -289,12 +289,12 @@ struct SendIndexBuildProgressCallback {
 }
 
 // SAFETY: The C API requires the callback and its context to remain valid and
-// safe to invoke until `execute_uncommitted` returns, and the shared gate
-// guarantees no invocation is in flight — and no new one can start — once
-// that boundary is reached, so no invocation can touch the raw context after
-// retirement. Certain build stages report progress concurrently from parallel
-// worker tasks, so the callback may be invoked concurrently; the C contract
-// requires it to be thread-safe.
+// safe to invoke until the owning blocking build call returns, and the shared
+// gate guarantees no invocation is in flight — and no new one can start —
+// once that boundary is reached, so no invocation can touch the raw context
+// after retirement. Certain build stages report progress concurrently from
+// parallel worker tasks, so the callback may be invoked concurrently; the C
+// contract requires it to be thread-safe.
 unsafe impl Send for SendIndexBuildProgressCallback {}
 unsafe impl Sync for SendIndexBuildProgressCallback {}
 

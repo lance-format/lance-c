@@ -32,6 +32,37 @@ static void capture_progress(
     events->fetch_add(1, std::memory_order_relaxed);
 }
 
+struct OrdinaryProgressCapture {
+    std::atomic<uint64_t> events{0};
+    std::atomic<int> invalid{0};
+    std::atomic<int> late{0};
+    std::atomic<int> closed{0};
+    void* expected_ctx = nullptr;
+};
+
+static void capture_ordinary_index_progress(
+    void* callback_ctx,
+    int32_t event,
+    const char* stage,
+    uint64_t,
+    const char* unit,
+    uint64_t) {
+    auto* capture = static_cast<OrdinaryProgressCapture*>(callback_ctx);
+    if (!capture || !stage || !unit ||
+        event < LANCE_INDEX_BUILD_PROGRESS_STAGE_START ||
+        event > LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE) {
+        if (capture) capture->invalid.store(1, std::memory_order_relaxed);
+        return;
+    }
+    if (capture->expected_ctx && callback_ctx != capture->expected_ctx) {
+        capture->invalid.store(1, std::memory_order_relaxed);
+    }
+    if (capture->closed.load(std::memory_order_relaxed)) {
+        capture->late.store(1, std::memory_order_relaxed);
+    }
+    capture->events.fetch_add(1, std::memory_order_relaxed);
+}
+
 static int64_t count_stream(ArrowArrayStream* stream) {
     int64_t rows = 0;
     for (;;) {
@@ -234,6 +265,110 @@ static void test_distributed_metadata_publication(const std::string& uri,
     std::printf("Distributed inverted metadata publication C++ path passed\n");
 }
 
+static void test_ordinary_index_progress(const std::string& uri) {
+    auto dataset = lance::Dataset::open(uri);
+
+    lance::ScalarIndexOptions train;
+    train.train = true;
+    uint64_t version = dataset.version();
+    OrdinaryProgressCapture scalar_capture;
+    scalar_capture.expected_ctx = &scalar_capture;
+    dataset.create_scalar_index_with_options_and_progress(
+        "id", LANCE_SCALAR_BTREE, train, capture_ordinary_index_progress,
+        &scalar_capture, "cpp_btree_progress");
+    assert(dataset.version() == version + 1);
+    assert(scalar_capture.events.load(std::memory_order_relaxed) > 0);
+    assert(scalar_capture.invalid.load(std::memory_order_relaxed) == 0);
+    assert(scalar_capture.late.load(std::memory_order_relaxed) == 0);
+    scalar_capture.closed.store(1, std::memory_order_relaxed);
+
+    version = dataset.version();
+    OrdinaryProgressCapture scalar_replacement;
+    scalar_replacement.expected_ctx = &scalar_replacement;
+    dataset.create_scalar_index_with_options_and_progress(
+        "id", LANCE_SCALAR_BTREE, train, capture_ordinary_index_progress,
+        &scalar_replacement, "cpp_btree_progress", "", true);
+    assert(dataset.version() == version + 1);
+    assert(scalar_replacement.events.load(std::memory_order_relaxed) > 0);
+    assert(scalar_replacement.invalid.load(std::memory_order_relaxed) == 0);
+    assert(scalar_replacement.late.load(std::memory_order_relaxed) == 0);
+    scalar_replacement.closed.store(1, std::memory_order_relaxed);
+
+    version = dataset.version();
+    dataset.create_scalar_index_with_progress(
+        "id", LANCE_SCALAR_BTREE, nullptr,
+        reinterpret_cast<void*>(static_cast<uintptr_t>(1)),
+        "cpp_btree_progress", "", true);
+    assert(dataset.version() == version + 1);
+
+    lance::VectorIndexOptions vector = vector_options(2);
+    version = dataset.version();
+    OrdinaryProgressCapture vector_capture;
+    vector_capture.expected_ctx = &vector_capture;
+    dataset.create_vector_index_with_options_and_progress(
+        "embedding", vector, capture_ordinary_index_progress, &vector_capture,
+        "cpp_ivf_progress");
+    assert(dataset.version() == version + 1);
+    assert(vector_capture.events.load(std::memory_order_relaxed) > 0);
+    assert(vector_capture.invalid.load(std::memory_order_relaxed) == 0);
+    assert(vector_capture.late.load(std::memory_order_relaxed) == 0);
+    vector_capture.closed.store(1, std::memory_order_relaxed);
+
+    version = dataset.version();
+    OrdinaryProgressCapture vector_replacement;
+    vector_replacement.expected_ctx = &vector_replacement;
+    dataset.create_vector_index_with_options_and_progress(
+        "embedding", vector, capture_ordinary_index_progress,
+        &vector_replacement, "cpp_ivf_progress", true);
+    assert(dataset.version() == version + 1);
+    assert(vector_replacement.events.load(std::memory_order_relaxed) > 0);
+    assert(vector_replacement.invalid.load(std::memory_order_relaxed) == 0);
+    assert(vector_replacement.late.load(std::memory_order_relaxed) == 0);
+    vector_replacement.closed.store(1, std::memory_order_relaxed);
+
+    LanceVectorIndexParams legacy = {
+        LANCE_INDEX_IVF_FLAT, LANCE_METRIC_L2, 2, 0, 0, 10, 0, 0, 128,
+    };
+    version = dataset.version();
+    dataset.create_vector_index_with_progress(
+        "embedding", legacy, nullptr,
+        reinterpret_cast<void*>(static_cast<uintptr_t>(1)),
+        "cpp_ivf_progress", true);
+    assert(dataset.version() == version + 1);
+
+    version = dataset.version();
+    OrdinaryProgressCapture failed_capture;
+    failed_capture.expected_ctx = &failed_capture;
+    bool caught = false;
+    try {
+        dataset.create_vector_index_with_options_and_progress(
+            "no_such_vector_column", vector, capture_ordinary_index_progress,
+            &failed_capture, "cpp_ivf_progress_failure");
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    assert(caught);
+    assert(dataset.version() == version);
+    failed_capture.closed.store(1, std::memory_order_relaxed);
+    assert(failed_capture.late.load(std::memory_order_relaxed) == 0);
+
+    dataset = lance::Dataset::open(uri);
+    auto scalar_scanner = dataset.scan(
+        std::vector<std::string>{"id"}, std::string("id = 20"));
+    assert(collect_scanner_ids(scalar_scanner) == std::vector<int32_t>{20});
+    const float query[8] = {20.25f, 20.375f, 20.5f, 20.625f,
+                            20.75f, 20.875f, 21.0f, 21.125f};
+    auto vector_scanner = dataset.scan();
+    vector_scanner
+        .nearest("embedding", query, 8, LANCE_DTYPE_FLOAT32, 3)
+        .nprobes(2);
+    assert(collect_scanner_ids(vector_scanner) ==
+           std::vector<int32_t>({20, 21, 19}));
+    dataset.drop_index("cpp_btree_progress");
+    dataset.drop_index("cpp_ivf_progress");
+    std::printf("Ordinary index progress C++ path passed\n");
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         std::fprintf(stderr, "Usage: %s <dataset_uri>\n", argv[0]);
@@ -241,6 +376,7 @@ int main(int argc, char** argv) {
     }
     const std::string uri(argv[1]);
 
+    test_ordinary_index_progress(uri);
     auto dataset = lance::Dataset::open(uri);
     assert(dataset.describe_indices_json() == "[]");
 

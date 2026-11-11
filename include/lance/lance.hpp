@@ -165,6 +165,7 @@ class Scanner;
 class Dataset;
 class Fragment;
 class FragmentOverlayWriter;
+class FragmentUpdateColumnsResult;
 class LanceSchema;
 class Batch;
 struct Table;
@@ -199,6 +200,9 @@ class SqlQueryBuilder;
 class SqlQuery;
 class DatasetDeltaBuilder;
 class DatasetDelta;
+class StorageOptionsAccessor;
+class CommitLock;
+class Session;
 
 /// One native `BasePath` for `Dataset::add_bases` and `Operation`
 /// construction.
@@ -543,6 +547,34 @@ struct WriteOptions {
     bool                             skip_auto_cleanup = false;
 };
 
+/// Convert the shared C++ write-option value into the C representation.
+///
+/// `cleanup` must outlive the returned value. Both the legacy write entry
+/// points and the owned native options handle use this mapping so their
+/// defaults cannot drift.
+inline LanceWriteOptions to_c_write_options(
+    const WriteOptions& options,
+    LanceAutoCleanupParams& cleanup) {
+    LanceWriteOptions c_options = {};
+    c_options.params.max_rows_per_file = options.params.max_rows_per_file;
+    c_options.params.max_rows_per_group = options.params.max_rows_per_group;
+    c_options.params.max_bytes_per_file = options.params.max_bytes_per_file;
+    c_options.params.data_storage_version =
+        options.params.data_storage_version
+            ? options.params.data_storage_version->c_str()
+            : nullptr;
+    c_options.params.enable_stable_row_ids =
+        options.params.enable_stable_row_ids;
+    c_options.skip_auto_cleanup = options.skip_auto_cleanup;
+    if (options.auto_cleanup) {
+        cleanup.interval = options.auto_cleanup->interval;
+        cleanup.older_than_seconds = options.auto_cleanup->older_than_seconds;
+        cleanup.older_than_nanos = options.auto_cleanup->older_than_nanos;
+        c_options.auto_cleanup = &cleanup;
+    }
+    return c_options;
+}
+
 /// A native duration expressed as whole seconds plus a subsecond nanosecond
 /// component. Nanoseconds must be less than 1,000,000,000.
 struct CommitDuration {
@@ -581,6 +613,119 @@ struct UncommittedWriteOptions {
     WriteOptions write;
     std::optional<std::vector<std::pair<std::string, std::string>>>
         transaction_properties;
+};
+
+enum class ExternalBlobMode : int32_t {
+    Reference = LANCE_EXTERNAL_BLOB_REFERENCE,
+    Ingest    = LANCE_EXTERNAL_BLOB_INGEST,
+};
+
+/// Native current-format file-writer options for a dataset write.
+///
+/// Dataset file-version selection belongs in `WriteParams::data_storage_version`;
+/// the raw-file `version` field is intentionally absent.
+struct DatasetFileWriterOptions {
+    std::optional<uint64_t> data_cache_bytes;
+    std::optional<uint64_t> max_page_bytes;
+    std::optional<bool>     keep_original_array;
+};
+
+/// One per-base native `ObjectStoreParams` value.
+///
+/// `base_path` is the exact key used by native `WriteParams::base_store_params`.
+/// The accessor is borrowed only during `NativeWriteOptions` construction.
+struct DatasetBaseStoreParams {
+    std::string                    base_path;
+    const StorageOptionsAccessor*  storage_options_accessor = nullptr;
+    std::optional<uint64_t>        block_size;
+    std::optional<CommitDuration>  s3_credentials_refresh_offset;
+    std::optional<bool>            use_constant_size_upload_parts;
+    std::optional<bool>            list_is_lexically_ordered;
+};
+
+/// Cumulative native write statistics.
+struct NativeWriteStats {
+    uint64_t bytes_written = 0;
+    uint64_t rows_written = 0;
+    uint32_t files_written = 0;
+};
+
+/// Native fragment progress payload.
+struct FragmentWriteProgressInfo {
+    uint64_t                    fragment_id = 0;
+    std::optional<uint64_t>     physical_rows;
+    uint64_t                    file_count = 0;
+};
+
+/// C++ progress callbacks for a dataset write.
+///
+/// Fragment callbacks may throw `lance::Error` or another exception; the
+/// wrapper converts it to a native callback error. The stats callback has no
+/// native error channel, so exceptions from it are swallowed to keep the C ABI
+/// boundary sound. Callbacks may run concurrently from native worker threads.
+struct NativeWriteProgress {
+    using FragmentCallback =
+        std::function<void(const FragmentWriteProgressInfo&)>;
+    using StatsCallback = std::function<void(const NativeWriteStats&)>;
+
+    FragmentCallback begin_fragment;
+    FragmentCallback complete_fragment;
+    StatsCallback    write_stats;
+};
+
+/// Configuration for an owned `NativeWriteOptions` handle.
+struct NativeWriteOptionsSpec {
+    WriteOptions write;
+    std::optional<std::vector<std::pair<std::string, std::string>>>
+        transaction_properties;
+    std::optional<bool> enable_v2_manifest_paths;
+    std::optional<std::vector<BasePath>> initial_bases;
+    std::optional<std::vector<uint32_t>> target_bases;
+    std::optional<std::vector<std::string>> target_base_names_or_paths;
+    std::optional<bool> target_all_bases;
+    std::optional<std::vector<DatasetBaseStoreParams>> base_store_params;
+    bool allow_external_blob_outside_bases = false;
+    ExternalBlobMode external_blob_mode = ExternalBlobMode::Reference;
+    std::optional<uint64_t> blob_pack_file_size_threshold;
+    std::optional<DatasetFileWriterOptions> file_writer_options;
+    const Session* session = nullptr;
+    const StorageOptionsAccessor* storage_options_accessor = nullptr;
+    const CommitLock* commit_lock = nullptr;
+    NativeWriteProgress progress;
+};
+
+/// Owned native-backed dataset write options. Move-only.
+///
+/// The handle copies or clones every value from `NativeWriteOptionsSpec`.
+/// Source Session, accessor and commit-lock wrappers may be destroyed after
+/// construction. Destroy this object only after all writes that borrowed it
+/// have returned; callback captures are released from the destructor.
+class NativeWriteOptions {
+    Handle<LanceNativeWriteOptions, lance_native_write_options_close> handle_;
+
+public:
+    explicit NativeWriteOptions(const NativeWriteOptionsSpec& spec);
+
+    NativeWriteOptions(NativeWriteOptions&&) noexcept = default;
+    NativeWriteOptions& operator=(NativeWriteOptions&&) noexcept = default;
+    NativeWriteOptions(const NativeWriteOptions&) = delete;
+    NativeWriteOptions& operator=(const NativeWriteOptions&) = delete;
+
+    const LanceNativeWriteOptions* c_handle() const { return handle_.get(); }
+};
+
+/// Options for native fragment creation.
+///
+/// `schema == nullptr` leaves native schema inference in place; in Append mode
+/// native inference may reuse the existing dataset's schema and field IDs. A
+/// non-null schema is borrowed for the call and cloned by the C API before the
+/// asynchronous write starts. `write` maps through the same native option
+/// conversion as `Dataset::write_with_options`, so a default-constructed value
+/// selects native `WriteParams::default()`.
+struct FragmentCreateOptions {
+    const LanceSchema* schema = nullptr;
+    WriteMode          mode = WriteMode::Create;
+    WriteOptions       write;
 };
 
 // ─── Native transactions ─────────────────────────────────────────────────────
@@ -2553,6 +2698,79 @@ inline int32_t insert_fragment_trampoline(
     }
 }
 
+/// Complete call-scoped state for one native BatchUDF invocation.
+///
+/// The raw callback table points only into this object. Keep it on the stack
+/// for the duration of the synchronous add-columns call; it is neither movable
+/// nor copyable.
+struct BatchUDFCall {
+    std::optional<std::vector<std::string>> read_columns;
+    std::vector<const char*> read_column_ptrs;
+    uint32_t batch_size_value = 0;
+    const char* const* read_columns_ptr = nullptr;
+    const uint32_t* batch_size_ptr = nullptr;
+    MapperContext mapper_context{};
+    CheckpointContext checkpoint_context{};
+    LanceUDFCheckpointStore raw_store{};
+    LanceBatchUDF raw{};
+
+    BatchUDFCall(const BatchUDF& udf,
+                 std::optional<std::vector<std::string>> columns,
+                 std::optional<uint32_t> batch_size)
+        : read_columns(std::move(columns)) {
+        if (!udf.mapper) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT, "BatchUDF mapper must not be empty");
+        }
+        if (udf.output_schema == nullptr) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "BatchUDF output_schema must not be null");
+        }
+
+        const UDFCheckpointStore* store = nullptr;
+        if (udf.checkpoint_store) {
+            store = &*udf.checkpoint_store;
+            if (!store->get_batch || !store->insert_batch ||
+                !store->get_fragment || !store->insert_fragment) {
+                throw Error(
+                    LANCE_ERR_INVALID_ARGUMENT,
+                    "UDFCheckpointStore must provide all four callbacks");
+            }
+            checkpoint_context.store = store;
+            raw_store.get_batch = &get_batch_trampoline;
+            raw_store.insert_batch = &insert_batch_trampoline;
+            raw_store.get_fragment = &get_fragment_trampoline;
+            raw_store.insert_fragment = &insert_fragment_trampoline;
+            raw_store.callback_ctx = &checkpoint_context;
+        }
+
+        mapper_context.udf = &udf;
+        raw.mapper = &mapper_trampoline;
+        raw.mapper_ctx = &mapper_context;
+        raw.output_schema = udf.output_schema;
+        raw.checkpoint_store = store == nullptr ? nullptr : &raw_store;
+
+        if (read_columns) {
+            read_column_ptrs.reserve(read_columns->size() + 1);
+            for (const auto& column : *read_columns) {
+                read_column_ptrs.push_back(column.c_str());
+            }
+            read_column_ptrs.push_back(nullptr);
+            read_columns_ptr = read_column_ptrs.data();
+        }
+        if (batch_size) {
+            batch_size_value = *batch_size;
+            batch_size_ptr = &batch_size_value;
+        }
+    }
+
+    BatchUDFCall(const BatchUDFCall&) = delete;
+    BatchUDFCall& operator=(const BatchUDFCall&) = delete;
+    BatchUDFCall(BatchUDFCall&&) = delete;
+    BatchUDFCall& operator=(BatchUDFCall&&) = delete;
+};
+
 }  // namespace callback_detail
 
 // ─── Commit lock ─────────────────────────────────────────────────────────────
@@ -3050,6 +3268,331 @@ public:
 
     const LanceSession* c_handle() const { return handle_.get(); }
 };
+
+// ─── Owned native dataset-write options ─────────────────────────────────────
+
+namespace native_write_options_detail {
+
+struct ProgressContext {
+    NativeWriteProgress progress;
+};
+
+inline int32_t invoke_fragment(
+    const NativeWriteProgress::FragmentCallback& callback,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error,
+    const char* context) noexcept {
+    try {
+        FragmentWriteProgressInfo progress{};
+        if (info != nullptr) {
+            progress.fragment_id = info->fragment_id;
+            if (info->has_physical_rows != 0) {
+                progress.physical_rows = info->physical_rows;
+            }
+            progress.file_count = info->file_count;
+        }
+        callback(progress);
+        return 0;
+    } catch (const lance::Error& exception) {
+        callback_detail::set_callback_error(
+            error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, context);
+        return -1;
+    }
+}
+
+extern "C" inline int32_t begin_fragment_trampoline(
+    void* callback_ctx,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error) noexcept {
+    auto* context = static_cast<ProgressContext*>(callback_ctx);
+    return invoke_fragment(
+        context->progress.begin_fragment,
+        info,
+        error,
+        "unknown C++ exception in write fragment begin callback");
+}
+
+extern "C" inline int32_t complete_fragment_trampoline(
+    void* callback_ctx,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error) noexcept {
+    auto* context = static_cast<ProgressContext*>(callback_ctx);
+    return invoke_fragment(
+        context->progress.complete_fragment,
+        info,
+        error,
+        "unknown C++ exception in write fragment complete callback");
+}
+
+extern "C" inline void write_stats_trampoline(
+    void* callback_ctx,
+    const LanceWriteStats* stats) noexcept {
+    auto* context = static_cast<ProgressContext*>(callback_ctx);
+    try {
+        NativeWriteStats value{};
+        if (stats != nullptr) {
+            value.bytes_written = stats->bytes_written;
+            value.rows_written = stats->rows_written;
+            value.files_written = stats->files_written;
+        }
+        context->progress.write_stats(value);
+    } catch (...) {
+        // Native write progress has no error channel. Swallowing keeps the C
+        // ABI boundary sound; use fragment callbacks for fallible progress.
+    }
+}
+
+extern "C" inline void release_progress_context(void* callback_ctx) noexcept {
+    delete static_cast<ProgressContext*>(callback_ctx);
+}
+
+struct BuildState {
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions write{};
+
+    bool has_transaction_properties = false;
+    std::vector<const char*> property_keys;
+    std::vector<const char*> property_values;
+    LanceTransactionProperties properties{};
+
+    std::vector<std::string> base_paths;
+    std::vector<std::optional<std::string>> base_names;
+    std::vector<LanceBasePath> base_views;
+    LanceBasePath empty_base{};
+    LanceBasePathList base_list{};
+
+    std::vector<uint32_t> target_ids;
+    LanceUInt32List target_list{};
+
+    std::vector<std::string> target_names;
+    std::vector<const char*> target_name_ptrs;
+    LanceStringList target_name_list{};
+
+    std::vector<std::string> base_store_paths;
+    std::vector<LanceBaseStoreParams> base_store_views;
+    LanceBaseStoreParamsList base_store_list{};
+
+    LanceFileWriterOptions file_options{};
+
+    std::unique_ptr<ProgressContext> progress_ctx;
+    LanceNativeWriteProgress progress{};
+};
+
+inline void build_initial_bases(
+    const std::optional<std::vector<BasePath>>& initial_bases,
+    BuildState& state) {
+    if (!initial_bases) return;
+    state.base_paths.reserve(initial_bases->size());
+    state.base_names.reserve(initial_bases->size());
+    state.base_views.reserve(initial_bases->size());
+    for (const auto& base : *initial_bases) {
+        state.base_paths.push_back(base.path);
+        state.base_names.push_back(base.name);
+    }
+    for (std::size_t index = 0; index < state.base_paths.size(); ++index) {
+        LanceBasePath view{};
+        view.id = (*initial_bases)[index].id;
+        view.path = state.base_paths[index].c_str();
+        view.name = state.base_names[index]
+                        ? state.base_names[index]->c_str()
+                        : nullptr;
+        view.is_dataset_root = (*initial_bases)[index].is_dataset_root;
+        state.base_views.push_back(view);
+    }
+    state.base_list.items =
+        state.base_views.empty() ? &state.empty_base : state.base_views.data();
+    state.base_list.count = state.base_views.size();
+}
+
+inline void build_base_store_params(
+    const std::optional<std::vector<DatasetBaseStoreParams>>& base_store_params,
+    BuildState& state) {
+    if (!base_store_params) return;
+    state.base_store_paths.reserve(base_store_params->size());
+    state.base_store_views.reserve(base_store_params->size());
+    for (const auto& entry : *base_store_params) {
+        state.base_store_paths.push_back(entry.base_path);
+    }
+    for (std::size_t index = 0; index < base_store_params->size(); ++index) {
+        const auto& entry = (*base_store_params)[index];
+        LanceBaseStoreParams view{};
+        view.base_path = state.base_store_paths[index].c_str();
+        view.storage_options_accessor =
+            entry.storage_options_accessor
+                ? entry.storage_options_accessor->c_handle()
+                : nullptr;
+        if (entry.block_size) {
+            view.has_block_size = 1;
+            view.block_size = *entry.block_size;
+        }
+        if (entry.s3_credentials_refresh_offset) {
+            view.has_s3_credentials_refresh_offset = 1;
+            view.s3_credentials_refresh_seconds =
+                entry.s3_credentials_refresh_offset->seconds;
+            view.s3_credentials_refresh_nanos =
+                entry.s3_credentials_refresh_offset->nanos;
+        }
+        if (entry.use_constant_size_upload_parts) {
+            view.has_use_constant_size_upload_parts = 1;
+            view.use_constant_size_upload_parts =
+                *entry.use_constant_size_upload_parts;
+        }
+        if (entry.list_is_lexically_ordered) {
+            view.has_list_is_lexically_ordered = 1;
+            view.list_is_lexically_ordered =
+                *entry.list_is_lexically_ordered;
+        }
+        state.base_store_views.push_back(view);
+    }
+    state.base_store_list.items = state.base_store_views.empty()
+                                      ? nullptr
+                                      : state.base_store_views.data();
+    state.base_store_list.count = state.base_store_views.size();
+}
+
+}  // namespace native_write_options_detail
+
+inline NativeWriteOptions::NativeWriteOptions(
+    const NativeWriteOptionsSpec& spec)
+    : handle_(nullptr) {
+    using namespace native_write_options_detail;
+
+    BuildState state;
+    state.write = lance::to_c_write_options(spec.write, state.cleanup);
+
+    if (spec.transaction_properties) {
+        state.has_transaction_properties = true;
+        state.property_keys.reserve(spec.transaction_properties->size());
+        state.property_values.reserve(spec.transaction_properties->size());
+        for (const auto& [key, value] : *spec.transaction_properties) {
+            state.property_keys.push_back(key.c_str());
+            state.property_values.push_back(value.c_str());
+        }
+        state.properties.keys = state.property_keys.empty()
+                                    ? nullptr
+                                    : state.property_keys.data();
+        state.properties.values = state.property_values.empty()
+                                      ? nullptr
+                                      : state.property_values.data();
+        state.properties.count = spec.transaction_properties->size();
+    }
+
+    build_initial_bases(spec.initial_bases, state);
+
+    if (spec.target_bases) {
+        state.target_ids = *spec.target_bases;
+        state.target_list.items = state.target_ids.empty()
+                                      ? nullptr
+                                      : state.target_ids.data();
+        state.target_list.count = state.target_ids.size();
+    }
+
+    if (spec.target_base_names_or_paths) {
+        state.target_names = *spec.target_base_names_or_paths;
+        state.target_name_ptrs.reserve(state.target_names.size());
+        for (const auto& value : state.target_names) {
+            state.target_name_ptrs.push_back(value.c_str());
+        }
+        state.target_name_list.items = state.target_name_ptrs.empty()
+                                           ? nullptr
+                                           : state.target_name_ptrs.data();
+        state.target_name_list.count = state.target_name_ptrs.size();
+    }
+
+    build_base_store_params(spec.base_store_params, state);
+
+    if (spec.file_writer_options) {
+        if (spec.file_writer_options->data_cache_bytes) {
+            state.file_options.has_data_cache_bytes = 1;
+            state.file_options.data_cache_bytes =
+                *spec.file_writer_options->data_cache_bytes;
+        }
+        if (spec.file_writer_options->max_page_bytes) {
+            state.file_options.has_max_page_bytes = 1;
+            state.file_options.max_page_bytes =
+                *spec.file_writer_options->max_page_bytes;
+        }
+        if (spec.file_writer_options->keep_original_array) {
+            state.file_options.has_keep_original_array = 1;
+            state.file_options.keep_original_array =
+                *spec.file_writer_options->keep_original_array ? 1 : 0;
+        }
+    }
+
+    const bool has_progress =
+        static_cast<bool>(spec.progress.begin_fragment) ||
+        static_cast<bool>(spec.progress.complete_fragment) ||
+        static_cast<bool>(spec.progress.write_stats);
+    if (has_progress) {
+        state.progress_ctx = std::make_unique<ProgressContext>();
+        state.progress_ctx->progress = spec.progress;
+        if (spec.progress.begin_fragment) {
+            state.progress.begin_fragment = &begin_fragment_trampoline;
+        }
+        if (spec.progress.complete_fragment) {
+            state.progress.complete_fragment = &complete_fragment_trampoline;
+        }
+        if (spec.progress.write_stats) {
+            state.progress.write_stats = &write_stats_trampoline;
+        }
+        state.progress.release = &release_progress_context;
+        state.progress.callback_ctx = state.progress_ctx.get();
+    }
+
+    LanceNativeWriteOptionsSpec c_spec{};
+    c_spec.write_options = &state.write;
+    c_spec.transaction_properties =
+        state.has_transaction_properties ? &state.properties : nullptr;
+    c_spec.has_enable_v2_manifest_paths =
+        spec.enable_v2_manifest_paths ? 1 : 0;
+    c_spec.enable_v2_manifest_paths =
+        spec.enable_v2_manifest_paths.value_or(false);
+    c_spec.initial_bases =
+        spec.initial_bases ? &state.base_list : nullptr;
+    c_spec.target_bases =
+        spec.target_bases ? &state.target_list : nullptr;
+    c_spec.target_base_names_or_paths =
+        spec.target_base_names_or_paths ? &state.target_name_list : nullptr;
+    c_spec.has_target_all_bases = spec.target_all_bases ? 1 : 0;
+    c_spec.target_all_bases = spec.target_all_bases.value_or(false);
+    c_spec.base_store_params =
+        spec.base_store_params ? &state.base_store_list : nullptr;
+    c_spec.allow_external_blob_outside_bases =
+        spec.allow_external_blob_outside_bases;
+    c_spec.external_blob_mode =
+        static_cast<int32_t>(spec.external_blob_mode);
+    c_spec.has_blob_pack_file_size_threshold =
+        spec.blob_pack_file_size_threshold ? 1 : 0;
+    c_spec.blob_pack_file_size_threshold =
+        spec.blob_pack_file_size_threshold.value_or(0);
+    c_spec.file_writer_options =
+        spec.file_writer_options ? &state.file_options : nullptr;
+    c_spec.session = spec.session ? spec.session->c_handle() : nullptr;
+    c_spec.storage_options_accessor =
+        spec.storage_options_accessor
+            ? spec.storage_options_accessor->c_handle()
+            : nullptr;
+    c_spec.commit_lock =
+        spec.commit_lock ? spec.commit_lock->c_handle() : nullptr;
+    c_spec.progress = has_progress ? &state.progress : nullptr;
+
+    auto* raw = lance_native_write_options_new(&c_spec);
+    if (raw == nullptr) {
+        // Ownership of the progress context transfers only on success.
+        check_error();
+    }
+    handle_ = Handle<LanceNativeWriteOptions, lance_native_write_options_close>(
+        raw);
+    (void)state.progress_ctx.release();
+}
 
 // ─── Process-local FTS query context ────────────────────────────────────────
 
@@ -3887,6 +4430,14 @@ public:
         return value;
     }
 
+    /// Dataset read version captured by this bound fragment.
+    uint64_t read_version() const {
+        uint64_t value = 0;
+        if (lance_fragment_read_version(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
     /// Start a scanner over this fragment's owned snapshot.
     Scanner scan() const;
 
@@ -3919,6 +4470,59 @@ public:
     /// deletion returns `std::nullopt`.
     std::optional<Fragment> delete_if(const std::string& predicate) const;
 
+    /// Add SQL-derived columns to this bound fragment.
+    ///
+    /// `batch_size == std::nullopt` maps to native `None`; an engaged zero is
+    /// forwarded as `Some(0)`. Returns detached fragment metadata and the
+    /// complete native final schema for a later Merge operation.
+    std::pair<Fragment, LanceSchema> add_columns_sql(
+        const std::vector<SqlColumn>& columns,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
+    /// Add all-null columns described by a borrowed Arrow schema.
+    std::pair<Fragment, LanceSchema> add_columns_nulls(
+        const ArrowSchema* columns) const;
+
+    /// Add columns from a consumed Arrow stream using Native Reader semantics.
+    std::pair<Fragment, LanceSchema> add_columns_reader(
+        ArrowArrayStream* stream,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
+    /// Add columns through the shared BatchUDF callback adapter.
+    std::pair<Fragment, LanceSchema> add_columns_batch_udf(
+        const BatchUDF& udf,
+        std::optional<std::vector<std::string>> read_columns = std::nullopt,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
+    /// Merge a consumed right-hand Arrow stream into this bound fragment.
+    std::pair<Fragment, LanceSchema> merge_columns(
+        ArrowArrayStream* stream,
+        const std::string& left_on,
+        const std::string& right_on) const;
+
+    /// Rewrite existing columns through a native join and return matched
+    /// physical offsets with the updated metadata.
+    FragmentUpdateColumnsResult update_columns(
+        ArrowArrayStream* stream,
+        const std::string& left_on,
+        const std::string& right_on) const;
+
+    /// Stage a replacement data file using the manifest's default version.
+    DataReplacementGroup write_columns(
+        const LanceSchema& schema,
+        ArrowArrayStream* stream) const;
+
+    /// Stage a replacement data file using an explicit native file version.
+    DataReplacementGroup write_column_with_version(
+        const LanceSchema& schema,
+        ArrowArrayStream* stream,
+        LanceFileFormatVersion file_version) const;
+
+    /// Add physical row offsets to a clone and return updated bound metadata.
+    /// A full deletion returns `std::nullopt`.
+    std::optional<Fragment> delete_rows(
+        const std::vector<uint32_t>& offsets) const;
+
     /// Open an overlay writer for this bound fragment. The schema may be a
     /// compatible subset of the fragment schema. Commit the resulting overlay
     /// with the dataset read version used to open the writer.
@@ -3926,6 +4530,55 @@ public:
     /// `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads
     /// or modifies an overlay dataset, including before publication.
     FragmentOverlayWriter write_overlay(const LanceSchema& schema) const;
+
+    /// Create one fragment without publishing a version.
+    ///
+    /// Maps to native `FragmentCreateBuilder::write(source, Some(fragment_id))`.
+    /// Native owns schema inference and compatibility, file format, physical row
+    /// counts and error semantics; an empty input fails with the native "Input
+    /// data was empty." error. The stream is consumed on every return path,
+    /// including a null stream pointer (which is rejected unconsumed) and local
+    /// conversion failures. A null `options.schema` keeps native inference.
+    ///
+    /// Returns independently owned detached metadata that stays valid after the
+    /// source dataset, schema and session are closed. Closing it never deletes
+    /// the written data file; publish the fragment with an Append transaction.
+    static Fragment create(
+        const std::string& dataset_uri,
+        ArrowArrayStream* stream,
+        uint64_t fragment_id,
+        const FragmentCreateOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
+
+    /// Create zero or more fragments without publishing a version.
+    ///
+    /// Maps to native `FragmentCreateBuilder::write_fragments`, so
+    /// `options.write.params.max_rows_per_file` splitting and fragment ID
+    /// assignment stay native. The stream follows the same consumption contract
+    /// as `create`; an empty input returns an empty vector.
+    static std::vector<Fragment> create_many(
+        const std::string& dataset_uri,
+        ArrowArrayStream* stream,
+        const FragmentCreateOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
+
+    /// Create one fragment from an existing Lance data file in `dataset`'s data
+    /// directory.
+    ///
+    /// Maps to native `FileFragment::create_from_file`. `filename` is relative
+    /// to the dataset's data directory. `physical_rows == std::nullopt` maps to
+    /// native `None`; an engaged value maps to `Some(value)`. Native owns file
+    /// version, schema compatibility and physical-row validation. The dataset
+    /// supplies the target snapshot and is not modified. A file whose stored
+    /// schema native cannot project to the dataset schema is rejected, as with
+    /// Blob v2 data files.
+    static Fragment create_from_file(
+        const Dataset& dataset,
+        const std::string& filename,
+        uint64_t fragment_id,
+        std::optional<uint64_t> physical_rows = std::nullopt);
 
     const LanceFragment* c_handle() const { return handle_.get(); }
 };
@@ -3959,6 +4612,99 @@ inline std::optional<Fragment> Fragment::delete_if(
     if (!raw) return std::nullopt;
     return Fragment(raw);
 }
+
+/// Move-only owner of a native `FragmentUpdateColumnsResult`.
+class FragmentUpdateColumnsResult {
+    Handle<LanceFragmentUpdateColumnsResult,
+           lance_fragment_update_columns_result_close>
+        handle_;
+
+public:
+    explicit FragmentUpdateColumnsResult(LanceFragmentUpdateColumnsResult* result)
+        : handle_(result) {
+        if (!handle_) check_error();
+    }
+
+    FragmentUpdateColumnsResult(FragmentUpdateColumnsResult&&) noexcept = default;
+    FragmentUpdateColumnsResult& operator=(
+        FragmentUpdateColumnsResult&&) noexcept = default;
+    FragmentUpdateColumnsResult(const FragmentUpdateColumnsResult&) = delete;
+    FragmentUpdateColumnsResult& operator=(
+        const FragmentUpdateColumnsResult&) = delete;
+
+    /// Independent detached fragment metadata.
+    Fragment fragment() const {
+        LanceFragment* raw = nullptr;
+        if (lance_fragment_update_columns_result_fragment(
+                handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        if (!raw) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "update-columns result fragment getter returned null");
+        }
+        return Fragment(raw);
+    }
+
+    /// Native modified field IDs in result order.
+    std::vector<uint32_t> fields_modified() const {
+        uint64_t count = 0;
+        if (lance_fragment_update_columns_result_fields_modified_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::vector<uint32_t> out;
+        out.reserve(static_cast<std::size_t>(count));
+        for (uint64_t i = 0; i < count; ++i) {
+            uint32_t field_id = 0;
+            if (lance_fragment_update_columns_result_fields_modified_at(
+                    handle_.get(), static_cast<std::size_t>(i),
+                    &field_id) != 0) {
+                check_error();
+            }
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Matched physical row offsets in their native u32 domain, copied in one pass.
+    std::vector<uint32_t> matched_offsets() const {
+        uint64_t count = 0;
+        if (lance_fragment_update_columns_result_matched_offset_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::vector<uint32_t> out;
+        if (count > out.max_size()) {
+            throw std::length_error("matched offset count exceeds vector max_size");
+        }
+        out.resize(static_cast<std::size_t>(count));
+        if (lance_fragment_update_columns_result_matched_offsets(
+                handle_.get(), out.data(), out.size()) != 0) {
+            check_error();
+        }
+        return out;
+    }
+
+    /// Portable Roaring interoperability export. Normal Update construction
+    /// should use matched_offsets() directly.
+    std::vector<uint8_t> matched_offsets_serialized() const {
+        uint8_t* bytes = nullptr;
+        std::size_t len = 0;
+        if (lance_fragment_update_columns_result_matched_offsets_serialize(
+                handle_.get(), &bytes, &len) != 0) {
+            check_error();
+        }
+        std::unique_ptr<uint8_t, void (*)(uint8_t*)> guard(
+            bytes, lance_free_bytes);
+        if (bytes == nullptr) return {};
+        return std::vector<uint8_t>(bytes, bytes + len);
+    }
+
+    const LanceFragmentUpdateColumnsResult* c_handle() const {
+        return handle_.get();
+    }
+};
 
 /// Move-only owner of a native Lance schema.
 ///
@@ -4040,6 +4786,166 @@ public:
 
 inline LanceSchema Fragment::native_schema() const {
     return LanceSchema::from_fragment(*this);
+}
+
+namespace fragment_mutation_detail {
+
+inline std::pair<Fragment, LanceSchema> take_fragment_schema_pair(
+    ::LanceFragment* fragment, ::LanceSchema* schema) {
+    if (!fragment || !schema) {
+        if (fragment) lance_fragment_close(fragment);
+        if (schema) lance_schema_close(schema);
+        throw Error(LANCE_ERR_INTERNAL,
+                    "fragment mutation returned a null success output");
+    }
+    return std::pair<Fragment, LanceSchema>(
+        Fragment(fragment), LanceSchema(schema));
+}
+
+inline DataReplacementGroup take_replacement_group(
+    LanceDataReplacementGroup* group) {
+    if (!group) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "fragment write_columns returned a null group");
+    }
+    return DataReplacementGroup(group);
+}
+
+}  // namespace fragment_mutation_detail
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_sql(
+    const std::vector<SqlColumn>& columns,
+    std::optional<uint32_t> batch_size) const {
+    std::vector<LanceSqlColumn> raw;
+    raw.reserve(columns.size());
+    for (const auto& column : columns) {
+        LanceSqlColumn entry{};
+        entry.name = column.name.c_str();
+        entry.expression = column.expression.c_str();
+        raw.push_back(entry);
+    }
+    const uint32_t batch_size_value = batch_size.value_or(0);
+    const uint32_t* batch_size_ptr = batch_size ? &batch_size_value : nullptr;
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_sql(
+            handle_.get(), raw.empty() ? nullptr : raw.data(), raw.size(),
+            batch_size_ptr, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_nulls(
+    const ArrowSchema* columns) const {
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_nulls(
+            handle_.get(), columns, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_reader(
+    ArrowArrayStream* stream, std::optional<uint32_t> batch_size) const {
+    const uint32_t batch_size_value = batch_size.value_or(0);
+    const uint32_t* batch_size_ptr = batch_size ? &batch_size_value : nullptr;
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_stream(
+            handle_.get(), stream, batch_size_ptr, &out_fragment,
+            &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_batch_udf(
+    const BatchUDF& udf,
+    std::optional<std::vector<std::string>> read_columns,
+    std::optional<uint32_t> batch_size) const {
+    callback_detail::BatchUDFCall call(
+        udf, std::move(read_columns), batch_size);
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_batch_udf(
+            handle_.get(), &call.raw, call.read_columns_ptr,
+            call.batch_size_ptr, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::merge_columns(
+    ArrowArrayStream* stream,
+    const std::string& left_on,
+    const std::string& right_on) const {
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_merge_columns(
+            handle_.get(), stream, left_on.c_str(), right_on.c_str(),
+            &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline FragmentUpdateColumnsResult Fragment::update_columns(
+    ArrowArrayStream* stream,
+    const std::string& left_on,
+    const std::string& right_on) const {
+    LanceFragmentUpdateColumnsResult* result = nullptr;
+    if (lance_fragment_update_columns(
+            handle_.get(), stream, left_on.c_str(), right_on.c_str(),
+            &result) != 0) {
+        check_error();
+    }
+    if (!result) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "fragment update_columns returned a null result");
+    }
+    return FragmentUpdateColumnsResult(result);
+}
+
+inline DataReplacementGroup Fragment::write_columns(
+    const LanceSchema& schema, ArrowArrayStream* stream) const {
+    LanceDataReplacementGroup* group = nullptr;
+    if (lance_fragment_write_columns(
+            handle_.get(), schema.c_handle(), stream, &group) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_replacement_group(group);
+}
+
+inline DataReplacementGroup Fragment::write_column_with_version(
+    const LanceSchema& schema,
+    ArrowArrayStream* stream,
+    LanceFileFormatVersion file_version) const {
+    LanceDataReplacementGroup* group = nullptr;
+    if (lance_fragment_write_column_with_version(
+            handle_.get(), schema.c_handle(), stream,
+            static_cast<int32_t>(file_version), &group) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_replacement_group(group);
+}
+
+inline std::optional<Fragment> Fragment::delete_rows(
+    const std::vector<uint32_t>& offsets) const {
+    LanceFragment* raw = nullptr;
+    if (lance_fragment_delete_rows(
+            handle_.get(), offsets.empty() ? nullptr : offsets.data(),
+            offsets.size(), &raw) != 0) {
+        check_error();
+    }
+    if (!raw) return std::nullopt;
+    return Fragment(raw);
 }
 
 inline LanceSchema LanceSchema::from_fragment(const Fragment& fragment) {
@@ -6162,25 +7068,7 @@ class Dataset {
     static LanceWriteOptions to_c_write_options(
         const WriteOptions& options,
         LanceAutoCleanupParams& cleanup) {
-        LanceWriteOptions c_options = {};
-        c_options.params.max_rows_per_file = options.params.max_rows_per_file;
-        c_options.params.max_rows_per_group = options.params.max_rows_per_group;
-        c_options.params.max_bytes_per_file = options.params.max_bytes_per_file;
-        c_options.params.data_storage_version =
-            options.params.data_storage_version
-                ? options.params.data_storage_version->c_str()
-                : nullptr;
-        c_options.params.enable_stable_row_ids =
-            options.params.enable_stable_row_ids;
-        c_options.skip_auto_cleanup = options.skip_auto_cleanup;
-        if (options.auto_cleanup) {
-            cleanup.interval = options.auto_cleanup->interval;
-            cleanup.older_than_seconds =
-                options.auto_cleanup->older_than_seconds;
-            cleanup.older_than_nanos = options.auto_cleanup->older_than_nanos;
-            c_options.auto_cleanup = &cleanup;
-        }
-        return c_options;
+        return lance::to_c_write_options(options, cleanup);
     }
 
     static LanceUncommittedWriteOptions to_c_uncommitted_write_options(
@@ -6926,6 +7814,76 @@ public:
                 "success with null out_dataset");
         }
         return Dataset(out);
+    }
+
+    /// Write with an owned native-backed options handle.
+    ///
+    /// The handle supplies native write defaults plus the session, storage
+    /// accessor, commit lock, base placement, blob policy, file-writer options
+    /// and progress callbacks. The handle is borrowed only for this call. The
+    /// stream is consumed on every return path. Throws `lance::Error` on
+    /// failure.
+    static Dataset write_with_native_options(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const NativeWriteOptions& options) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceDataset* out = nullptr;
+        if (lance_dataset_write_with_native_options(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                options.c_handle(),
+                &out) != 0) {
+            check_error();
+        }
+        if (!out) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_with_native_options returned success "
+                "with null out_dataset");
+        }
+        return Dataset(out);
+    }
+
+    /// Stage an Arrow stream with an owned native-backed options handle.
+    ///
+    /// The returned transaction owns uncommitted data-file metadata and does
+    /// not retain the options handle. Publication naming remains controlled by
+    /// `Dataset::commit` / `Transaction` commit options. The stream is consumed
+    /// on every return path. Throws `lance::Error` on failure; a failed stage
+    /// does not publish a version.
+    static Transaction write_uncommitted_with_native_options(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const NativeWriteOptions& options) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceTransaction* transaction = nullptr;
+        if (lance_dataset_write_uncommitted_stream_with_native_options(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                options.c_handle(),
+                &transaction) != 0) {
+            check_error();
+        }
+        if (!transaction) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_uncommitted_stream_with_native_options "
+                "returned success with null out_transaction");
+        }
+        return Transaction(transaction);
     }
 
     /// Open through a native namespace. Namespace location/storage options and
@@ -8363,57 +9321,12 @@ public:
         const BatchUDF& udf,
         std::optional<std::vector<std::string>> read_columns = std::nullopt,
         std::optional<uint32_t> batch_size = std::nullopt) {
-        if (!udf.mapper) {
-            throw Error(
-                LANCE_ERR_INVALID_ARGUMENT, "BatchUDF mapper must not be empty");
-        }
-        if (udf.output_schema == nullptr) {
-            throw Error(
-                LANCE_ERR_INVALID_ARGUMENT,
-                "BatchUDF output_schema must not be null");
-        }
-
-        callback_detail::MapperContext mapper_context{&udf};
-        callback_detail::CheckpointContext checkpoint_context{nullptr};
-        LanceUDFCheckpointStore raw_store{};
-        const UDFCheckpointStore* store = nullptr;
-        if (udf.checkpoint_store) {
-            store = &*udf.checkpoint_store;
-            if (!store->get_batch || !store->insert_batch ||
-                !store->get_fragment || !store->insert_fragment) {
-                throw Error(
-                    LANCE_ERR_INVALID_ARGUMENT,
-                    "UDFCheckpointStore must provide all four callbacks");
-            }
-            checkpoint_context.store = store;
-            raw_store.get_batch = &callback_detail::get_batch_trampoline;
-            raw_store.insert_batch = &callback_detail::insert_batch_trampoline;
-            raw_store.get_fragment = &callback_detail::get_fragment_trampoline;
-            raw_store.insert_fragment = &callback_detail::insert_fragment_trampoline;
-            raw_store.callback_ctx = &checkpoint_context;
-        }
-
-        LanceBatchUDF raw{};
-        raw.mapper = &callback_detail::mapper_trampoline;
-        raw.mapper_ctx = &mapper_context;
-        raw.output_schema = udf.output_schema;
-        raw.checkpoint_store = store == nullptr ? nullptr : &raw_store;
-
-        std::vector<const char*> read_column_ptrs;
-        if (read_columns) {
-            read_column_ptrs.reserve(read_columns->size() + 1);
-            for (const auto& column : *read_columns) {
-                read_column_ptrs.push_back(column.c_str());
-            }
-            read_column_ptrs.push_back(nullptr);
-        }
-        const uint32_t batch_size_value = batch_size.value_or(0);
-        const char* const* read_columns_ptr =
-            read_columns ? read_column_ptrs.data() : nullptr;
-        const uint32_t* batch_size_ptr = batch_size ? &batch_size_value : nullptr;
+        callback_detail::BatchUDFCall call(
+            udf, std::move(read_columns), batch_size);
 
         if (lance_dataset_add_columns_batch_udf(
-                handle_.get(), &raw, read_columns_ptr, batch_size_ptr) != 0) {
+                handle_.get(), &call.raw, call.read_columns_ptr,
+                call.batch_size_ptr) != 0) {
             check_error();
         }
     }
@@ -8775,6 +9688,30 @@ public:
             check_error();
     }
 
+    /// Create a vector index from legacy parameters with optional progress.
+    ///
+    /// A null callback disables observation. A non-null callback may run
+    /// concurrently on internal runtime worker threads while this call holds
+    /// the dataset mutation lock; it must be thread-safe, non-blocking, and
+    /// must not access this dataset, call runtime-backed lance_* entry points,
+    /// or start a nested runtime. Non-runtime leaf utilities are unaffected. The
+    /// callback and context are borrowed only through this synchronous call
+    /// and are retired before it returns. Native publication/reload errors can
+    /// leave the returned state uncertain; reopen to inspect the version.
+    void create_vector_index_with_progress(
+        const std::string& column,
+        const LanceVectorIndexParams& params,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
+        const std::string& name = "",
+        bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        if (lance_dataset_create_vector_index_with_progress(
+                handle_.get(), column.c_str(), name_c, &params, callback,
+                callback_ctx, replace) != 0)
+            check_error();
+    }
+
     /// Create a vector index from additive native options.
     ///
     /// Native Lance performs the commit before reloading index metadata. An
@@ -8783,6 +9720,17 @@ public:
     void create_vector_index_with_options(
         const std::string& column,
         const VectorIndexOptions& options,
+        const std::string& name = "",
+        bool replace = false);
+
+    /// Create a vector index from additive native options with optional
+    /// progress. See create_vector_index_with_progress for the callback and
+    /// publication-error contract.
+    void create_vector_index_with_options_and_progress(
+        const std::string& column,
+        const VectorIndexOptions& options,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
         const std::string& name = "",
         bool replace = false);
 
@@ -8797,6 +9745,25 @@ public:
         if (lance_dataset_create_scalar_index(handle_.get(), column.c_str(),
                                                name_c, index_type,
                                                json_c, replace) != 0)
+            check_error();
+    }
+
+    /// Create a scalar index with optional progress. A null callback disables
+    /// observation; a non-null callback has the same synchronous lifetime and
+    /// non-reentrancy rules as create_vector_index_with_progress.
+    void create_scalar_index_with_progress(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
+        const std::string& name = "",
+        const std::string& params_json = "",
+        bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        if (lance_dataset_create_scalar_index_with_progress(
+                handle_.get(), column.c_str(), name_c, index_type, json_c,
+                callback, callback_ctx, replace) != 0)
             check_error();
     }
 
@@ -8818,6 +9785,32 @@ public:
         if (lance_dataset_create_scalar_index_with_options(
                 handle_.get(), column.c_str(), name_c, index_type, json_c,
                 &scalar_options, replace) != 0)
+            check_error();
+    }
+
+    /// Create a scalar index with native train controls and optional progress.
+    /// A null callback disables observation. The callback follows the same
+    /// synchronous lifetime and non-reentrancy rules as
+    /// create_vector_index_with_progress.
+    void create_scalar_index_with_options_and_progress(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        const ScalarIndexOptions& options,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
+        const std::string& index_name = "",
+        const std::string& params_json = "",
+        bool replace = false) {
+        const char* name_c = index_name.empty() ? nullptr : index_name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        LanceScalarIndexOptions scalar_options{};
+        if (options.train) {
+            scalar_options.has_train = true;
+            scalar_options.train = *options.train;
+        }
+        if (lance_dataset_create_scalar_index_with_options_and_progress(
+                handle_.get(), column.c_str(), name_c, index_type, json_c,
+                &scalar_options, callback, callback_ctx, replace) != 0)
             check_error();
     }
 
@@ -9080,6 +10073,8 @@ public:
 
     /// Access the underlying C handle (does not transfer ownership).
     const LanceDataset* c_handle() const { return handle_.get(); }
+
+    friend class Fragment;
 
 private:
     explicit Dataset(LanceDataset* ptr) : handle_(ptr) {}
@@ -10173,8 +11168,9 @@ public:
     /// before execute_uncommitted; the builder is single-use. The callback is
     /// invoked from internal worker threads and may be called concurrently
     /// from parallel worker tasks, so it must be thread-safe, non-blocking,
-    /// and must not re-enter any lance_* function. It must return normally;
-    /// unwinding or throwing across this boundary can abort the host process.
+    /// and must not access the indexed dataset or call runtime-backed lance_*
+    /// entry points. Non-runtime leaf utilities are unaffected. Callbacks must
+    /// return normally: unwinding or throwing can abort the host process.
     /// Invocations occur only while execute_uncommitted runs, and this is
     /// enforced: lance-c disables the callback and drains in-flight
     /// invocations before that call returns, including on error, so a worker
@@ -10262,6 +11258,22 @@ inline void Dataset::create_vector_index_with_options(
     const char* name_c = name.empty() ? nullptr : name.c_str();
     if (lance_dataset_create_vector_index_with_options(
             handle_.get(), column.c_str(), name_c, storage.get(), replace) != 0) {
+        check_error();
+    }
+}
+
+inline void Dataset::create_vector_index_with_options_and_progress(
+    const std::string& column,
+    const VectorIndexOptions& options,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
+    const std::string& name,
+    bool replace) {
+    detail::VectorIndexOptionsStorage storage(options);
+    const char* name_c = name.empty() ? nullptr : name.c_str();
+    if (lance_dataset_create_vector_index_with_options_and_progress(
+            handle_.get(), column.c_str(), name_c, storage.get(), callback,
+            callback_ctx, replace) != 0) {
         check_error();
     }
 }
@@ -11065,6 +12077,120 @@ inline void Fragment::take(
             handle_.get(), indices, num_indices, nullptr, out) != 0) {
         check_error();
     }
+}
+
+inline Fragment Fragment::create(
+    const std::string& dataset_uri,
+    ArrowArrayStream* stream,
+    uint64_t fragment_id,
+    const FragmentCreateOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+    // Native reads the stream schema itself, so this guard deliberately skips
+    // `read_schema()` and only owns the stream until the C call takes it.
+    Dataset::ArrowStreamInput input(stream);
+
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions c_write =
+        Dataset::to_c_write_options(options.write, cleanup);
+    auto kv = Dataset::to_c_key_values(storage_opts);
+    LanceFragmentCreateOptions c_options{};
+    c_options.schema = options.schema ? options.schema->c_handle() : nullptr;
+    c_options.mode = static_cast<int32_t>(options.mode);
+    c_options.write = &c_write;
+    c_options.storage_opts = storage_opts.empty() ? nullptr : kv.data();
+    c_options.session = session ? session->c_handle() : nullptr;
+
+    LanceFragment* out = nullptr;
+    auto* owned_stream = input.consume();
+    if (lance_fragment_create(
+            dataset_uri.c_str(), fragment_id, &c_options, owned_stream,
+            &out) != 0) {
+        check_error();
+    }
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_fragment_create returned success with null out_fragment");
+    }
+    return Fragment(out);
+}
+
+inline std::vector<Fragment> Fragment::create_many(
+    const std::string& dataset_uri,
+    ArrowArrayStream* stream,
+    const FragmentCreateOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+    Dataset::ArrowStreamInput input(stream);
+
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions c_write =
+        Dataset::to_c_write_options(options.write, cleanup);
+    auto kv = Dataset::to_c_key_values(storage_opts);
+    LanceFragmentCreateOptions c_options{};
+    c_options.schema = options.schema ? options.schema->c_handle() : nullptr;
+    c_options.mode = static_cast<int32_t>(options.mode);
+    c_options.write = &c_write;
+    c_options.storage_opts = storage_opts.empty() ? nullptr : kv.data();
+    c_options.session = session ? session->c_handle() : nullptr;
+
+    LanceFragment** raw = nullptr;
+    size_t count = 0;
+    auto* owned_stream = input.consume();
+    if (lance_fragment_create_many(
+            dataset_uri.c_str(), &c_options, owned_stream, &raw, &count) !=
+        0) {
+        check_error();
+    }
+    if (count > 0 && !raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_fragment_create_many returned success with a null "
+                    "fragment array");
+    }
+
+    std::vector<Fragment> fragments;
+    try {
+        // Reserve before adopting: `Fragment` only moves a pointer, so once
+        // the capacity exists `emplace_back` cannot reallocate. Each slot is
+        // cleared right after adoption, which leaves `raw` holding exactly the
+        // handles this vector does not own.
+        fragments.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            fragments.emplace_back(raw[i]);
+            raw[i] = nullptr;
+        }
+    } catch (...) {
+        // Frees every slot that was not adopted; adopted slots are null.
+        lance_fragment_array_free(raw, count);
+        throw;
+    }
+    lance_fragment_array_free(raw, count);
+    return fragments;
+}
+
+inline Fragment Fragment::create_from_file(
+    const Dataset& dataset,
+    const std::string& filename,
+    uint64_t fragment_id,
+    std::optional<uint64_t> physical_rows) {
+    uint64_t rows = physical_rows.value_or(0);
+    LanceFragment* out = nullptr;
+    if (lance_fragment_create_from_file(
+            dataset.c_handle(),
+            filename.c_str(),
+            fragment_id,
+            physical_rows ? &rows : nullptr,
+            &out) != 0) {
+        check_error();
+    }
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_fragment_create_from_file returned success with null "
+            "out_fragment");
+    }
+    return Fragment(out);
 }
 
 inline Scanner Dataset::scan() const {
@@ -12177,12 +13303,20 @@ class Namespace {
         std::function<std::string(const std::string&)> list_table_versions;
     };
 
+    struct CustomDispatchContext {
+        std::function<std::string(const std::string&, const std::string&)> dispatch;
+    };
+
     static void context_provider_release(void* ctx) noexcept {
         delete static_cast<ContextProviderContext*>(ctx);
     }
 
     static void custom_client_release(void* ctx) noexcept {
         delete static_cast<CustomClientContext*>(ctx);
+    }
+
+    static void custom_dispatch_release(void* ctx) noexcept {
+        delete static_cast<CustomDispatchContext*>(ctx);
     }
 
     static int32_t context_provider_call(
@@ -12222,13 +13356,12 @@ class Namespace {
         return 1;
     }
 
+    template <typename Callback>
     static int32_t invoke_custom(
-        CustomClientContext* ctx,
-        std::function<std::string(const std::string&)>& callback,
+        Callback&& callback,
         const char* request_json,
         LanceOwnedString* out_json,
         LanceCallbackError* out_error) noexcept {
-        (void)ctx;
         try {
             std::string response = callback(request_json ? request_json : "{}");
             namespace_detail::set_owned_string(out_json, std::move(response));
@@ -12251,22 +13384,41 @@ class Namespace {
     static int32_t custom_describe_table(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->describe_table, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->describe_table(request);
+        }, req, out, err);
     }
     static int32_t custom_describe_table_version(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->describe_table_version, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->describe_table_version(request);
+        }, req, out, err);
     }
     static int32_t custom_create_table_version(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->create_table_version, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->create_table_version(request);
+        }, req, out, err);
     }
     static int32_t custom_list_table_versions(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->list_table_versions, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->list_table_versions(request);
+        }, req, out, err);
+    }
+    static int32_t custom_dispatch_call(
+        void* ctx,
+        const char* operation,
+        const char* req,
+        LanceOwnedString* out,
+        LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomDispatchContext*>(ctx);
+        return invoke_custom([client, operation](const char* request) {
+            return client->dispatch(operation ? operation : "", request);
+        }, req, out, err);
     }
 
     static LanceNamespaceContextProviderSpec make_context_spec(
@@ -12292,6 +13444,16 @@ public:
         std::function<std::string(const std::string&)> describe_table_version;
         std::function<std::string(const std::string&)> create_table_version;
         std::function<std::string(const std::string&)> list_table_versions;
+        /// Empty assigns a unique identity stable for this client's lifetime.
+        std::string namespace_id;
+    };
+
+    /// Foreign client using one callback for the same four managed-version
+    /// operations. The callback receives the exact native snake_case operation
+    /// name and native request JSON; both strings are borrowed for the call
+    /// only. Other operations keep native Unsupported.
+    struct CustomDispatchSpec {
+        std::function<std::string(const std::string&, const std::string&)> dispatch;
         /// Empty assigns a unique identity stable for this client's lifetime.
         std::string namespace_id;
     };
@@ -12364,6 +13526,26 @@ public:
         c_spec.client_ctx = ctx;
         c_spec.namespace_id = spec.namespace_id.c_str();
         auto* raw = lance_namespace_custom_new(&c_spec);
+        // The C constructor consumes the context on every invocation.
+        guard.release();
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    static Namespace custom_dispatch(const CustomDispatchSpec& spec) {
+        if (!spec.dispatch) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "custom dispatch namespace requires a dispatch callback");
+        }
+        auto* ctx = new CustomDispatchContext{spec.dispatch};
+        std::unique_ptr<CustomDispatchContext> guard(ctx);
+        LanceNamespaceCustomClientDispatchSpec c_spec{};
+        c_spec.dispatch = &custom_dispatch_call;
+        c_spec.release = &custom_dispatch_release;
+        c_spec.client_ctx = ctx;
+        c_spec.namespace_id = spec.namespace_id.c_str();
+        auto* raw = lance_namespace_custom_dispatch_new(&c_spec);
         // The C constructor consumes the context on every invocation.
         guard.release();
         if (!raw) check_error();

@@ -368,6 +368,7 @@ typedef struct LanceFtsTokenList LanceFtsTokenList;
 typedef struct LanceBlobFile LanceBlobFile;
 typedef struct LanceBlobDescriptorArrayBuilder LanceBlobDescriptorArrayBuilder;
 typedef struct LanceDataFile LanceDataFile;
+typedef struct LanceDataReplacementGroup LanceDataReplacementGroup;
 typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
@@ -375,6 +376,7 @@ typedef struct LanceUpdateMap LanceUpdateMap;
 typedef struct LanceDataOverlayFile LanceDataOverlayFile;
 typedef struct LanceDataOverlayGroup LanceDataOverlayGroup;
 typedef struct LanceFragmentOverlayWriter LanceFragmentOverlayWriter;
+typedef struct LanceFragmentUpdateColumnsResult LanceFragmentUpdateColumnsResult;
 typedef struct LanceUpdatedFragmentOffsets LanceUpdatedFragmentOffsets;
 typedef struct LanceKeyExistenceFilter LanceKeyExistenceFilter;
 typedef struct LanceRewriteGroup LanceRewriteGroup;
@@ -3444,6 +3446,22 @@ int32_t lance_fragment_is_bound(
 );
 
 /**
+ * Return the dataset read version captured by a bound fragment.
+ *
+ * This is the native snapshot version carried by the fragment's
+ * `FileFragment`. Pass it as the read version when committing fragment
+ * mutations through the generic transaction API. A detached metadata-only
+ * handle has no dataset snapshot and returns LANCE_ERR_NOT_SUPPORTED. The
+ * output slot is written only on success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_read_version(
+    const LanceFragment* fragment,
+    uint64_t* out_version
+);
+
+/**
  * Clone one native base data file from the fragment metadata.
  *
  * `index` addresses the native `Fragment::files` array. The returned handle
@@ -3743,6 +3761,295 @@ int32_t lance_fragment_delete(
     const LanceFragment* fragment,
     const char* predicate,
     LanceFragment** out_fragment
+);
+
+/* ─── Fragment mutation and staging ─── */
+
+/**
+ * Add columns computed from SQL expressions to one bound fragment.
+ *
+ * This calls Native `FileFragment::add_columns` with
+ * `NewColumnTransform::SqlExpressions`. `columns` is borrowed and copied;
+ * a NULL array is accepted only when `column_count == 0`. Native validates the
+ * expressions, names, schema and row alignment.
+ *
+ * `batch_size == NULL` maps to native `None`; a non-NULL pointer is forwarded
+ * as `Some(value)`, including zero.
+ *
+ * On success both outputs are written and own detached fragment metadata plus
+ * the complete native final schema. A detached input fragment returns
+ * LANCE_ERR_NOT_SUPPORTED. Both output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_sql(
+    const LanceFragment* fragment,
+    const LanceSqlColumn* columns,
+    size_t column_count,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add all-null columns described by a borrowed Arrow schema.
+ *
+ * This maps to `NewColumnTransform::AllNulls`. The Arrow schema supplies the
+ * logical new-column definitions; Native allocates new field identities and
+ * returns the complete final native schema. The schema is borrowed and its
+ * release callback is never called.
+ *
+ * On success both outputs are written and own detached fragment metadata plus
+ * the complete native final schema. Both output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_nulls(
+    const LanceFragment* fragment,
+    const struct ArrowSchema* columns,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add columns read from an Arrow stream with Native `Reader` semantics.
+ *
+ * This follows Python's fragment `add_columns_from_reader` mapping: the native
+ * `read_columns` argument is `None`. A non-NULL stream is consumed exactly once
+ * on every return path after ownership transfer. `batch_size == NULL` maps to
+ * native `None`; a non-NULL pointer is forwarded as `Some(value)`, including
+ * zero. Both outputs are success-only and contain detached fragment metadata
+ * plus the complete native final schema.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_stream(
+    const LanceFragment* fragment,
+    struct ArrowArrayStream* stream,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add columns through a borrowed BatchUDF declaration.
+ *
+ * The mapper, all four checkpoint callbacks, output-schema ownership and
+ * `block_in_place` behavior are shared with the dataset add-columns path.
+ * `read_columns == NULL` maps to native `None`; a non-NULL NULL-terminated
+ * array maps to `Some`, including an immediately terminated empty array.
+ * `batch_size == NULL` maps to `None`; zero remains `Some(0)`.
+ *
+ * Callback contexts remain borrowed until this synchronous call returns.
+ * Callbacks may read through independent dataset handles or existing snapshots;
+ * they must not use a closed handle. Both outputs are success-only.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_batch_udf(
+    const LanceFragment* fragment,
+    const LanceBatchUDF* udf,
+    const char* const* read_columns,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Merge a right-hand Arrow stream into one bound fragment with a native join.
+ *
+ * The bound fragment is cloned before Native `FileFragment::merge_columns`.
+ * Native owns left/right column validation, the left join, schema merge,
+ * nullability behavior and final field identities. A non-NULL stream is
+ * consumed exactly once.
+ *
+ * On success both outputs are written and own detached fragment metadata plus
+ * the complete native final schema. Both output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_merge_columns(
+    const LanceFragment* fragment,
+    struct ArrowArrayStream* stream,
+    const char* left_on,
+    const char* right_on,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Rewrite existing columns in one bound fragment through a native join.
+ *
+ * This calls Native `FileFragment::update_columns_with_offsets` on a cloned
+ * bound fragment. The result owns complete updated fragment metadata, the
+ * native modified field IDs and the native RoaringBitmap of matched physical
+ * row offsets. A non-NULL stream is consumed exactly once.
+ *
+ * On success `*out_result` receives an independently owned result. Close it
+ * with `lance_fragment_update_columns_result_close`. The output slot is
+ * unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns(
+    const LanceFragment* fragment,
+    struct ArrowArrayStream* stream,
+    const char* left_on,
+    const char* right_on,
+    LanceFragmentUpdateColumnsResult** out_result
+);
+
+/**
+ * Stage a replacement data file for existing fragment columns.
+ *
+ * The native schema is borrowed and forwarded unchanged. The consumed Arrow
+ * stream must produce the fragment's physical rows, including deleted slots.
+ * Native owns file-version, schema/layout, Blob preparation, row-alignment and
+ * failure-cleanup behavior. On success `*out_group` receives an independently
+ * owned `DataReplacementGroup`; the output slot is unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_write_columns(
+    const LanceFragment* fragment,
+    const LanceSchema* schema,
+    struct ArrowArrayStream* stream,
+    LanceDataReplacementGroup** out_group
+);
+
+/**
+ * Stage a replacement data file using an explicit file-format version.
+ *
+ * `file_version` uses the `LanceFileFormatVersion` discriminants:
+ * V1=0, V2_0=1, V2_1=2, V2_2=3, V2_3=4. Native `write_column_with_version`
+ * owns V1 rejection, V2 compatibility and all layout checks. Stream ownership
+ * and output behavior match `lance_fragment_write_columns`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_write_column_with_version(
+    const LanceFragment* fragment,
+    const LanceSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t file_version,
+    LanceDataReplacementGroup** out_group
+);
+
+/**
+ * Add physical row offsets to a clone of one bound fragment.
+ *
+ * Offsets are forwarded unchanged to Native `FileFragment::extend_deletions`.
+ * No binding-side range, sort, duplicate or full-deletion policy is added.
+ * The source handle remains usable. On success a partial deletion returns an
+ * independently owned bound fragment and a full deletion returns NULL. The
+ * output slot is unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_delete_rows(
+    const LanceFragment* fragment,
+    const uint32_t* offsets,
+    size_t offset_count,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Close an update-columns result. NULL-safe.
+ */
+void lance_fragment_update_columns_result_close(
+    LanceFragmentUpdateColumnsResult* result
+);
+
+/**
+ * Clone the updated fragment metadata into an independent handle.
+ *
+ * The returned handle is detached and owns complete metadata. The output slot
+ * is written only on success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_fragment(
+    const LanceFragmentUpdateColumnsResult* result,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the number of modified field IDs.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_fields_modified_count(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint64_t* out_count
+);
+
+/**
+ * Read one modified field ID in native result order.
+ *
+ * @return 0 on success, -1 on error. The output is unchanged on error.
+ */
+int32_t lance_fragment_update_columns_result_fields_modified_at(
+    const LanceFragmentUpdateColumnsResult* result,
+    size_t index,
+    uint32_t* out_field_id
+);
+
+/**
+ * Read the number of matched physical row offsets.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offset_count(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint64_t* out_count
+);
+
+/**
+ * Read one matched physical row offset in stable bitmap order.
+ *
+ * Values remain in their native u32 domain. For all offsets, prefer
+ * lance_fragment_update_columns_result_matched_offsets() to avoid restarting
+ * the bitmap traversal for each index.
+ *
+ * @return 0 on success, -1 on error. The output is unchanged on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offset_at(
+    const LanceFragmentUpdateColumnsResult* result,
+    size_t index,
+    uint32_t* out_offset
+);
+
+/**
+ * Serialize the matched offsets with the portable Roaring format.
+ *
+ * This optional interoperability export is separate from typed Update
+ * construction. The malloc-compatible buffer is allocated on success and must
+ * be released with `lance_free_bytes`; a zero-length encoding yields NULL.
+ * Both outputs are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offsets_serialize(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Copy all matched physical row offsets in one native bitmap traversal.
+ *
+ * The caller owns out_offsets, with count writable uint32_t elements. count
+ * must equal the value written by
+ * lance_fragment_update_columns_result_matched_offset_count().
+ * NULL out_offsets is valid for an empty result with count == 0. Values retain
+ * native bitmap order and remain valid after the result handle is closed.
+ *
+ * @return 0 on success, -1 on error. The output buffer is unchanged on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offsets(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint32_t* out_offsets,
+    size_t count
 );
 
 /* ─── Random access ─── */
@@ -5367,6 +5674,70 @@ int32_t lance_write_fragments(
     const char* const* storage_opts
 );
 
+/**
+ * Event codes for LanceIndexBuildProgressCallback, passed as the `event`
+ * argument. Exactly one stage is active at a time: a stage's
+ * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE is always delivered before the
+ * next stage's LANCE_INDEX_BUILD_PROGRESS_STAGE_START.
+ */
+typedef enum {
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_START = 0,
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS = 1,
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE = 2,
+} LanceIndexBuildProgressEvent;
+
+/**
+ * Receives progress from an ordinary index creation or an uncommitted segment
+ * build.
+ *
+ * `stage` is non-NULL, NUL-terminated, and borrowed: it is valid only for the
+ * duration of this call. `unit` is non-NULL and NUL-terminated, but is the
+ * empty string ("") for LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS and
+ * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE. The parameter mapping is:
+ *
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_START: `stage` is the stage name,
+ *    `total` is the number of work units (0 = unknown), `unit` describes what
+ *    is being counted (e.g. "partitions", "batches", "rows"; "" = unknown),
+ *    and `completed` is 0.
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS: `total` is 0, `unit` is "",
+ *    and `completed` is the number of units completed so far.
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE: `total` is 0, `unit` is "",
+ *    and `completed` is 0.
+ *
+ * Stage names are index-type-specific (for example "train_ivf", "shuffle",
+ * "merge_partitions" and "load_data") and are diagnostic-only: they are not a
+ * stable cross-version contract, so consumers must treat them as opaque
+ * strings.
+ *
+ * The callback is invoked from lance-c's internal tokio runtime worker
+ * threads. Certain stages report progress concurrently from parallel worker
+ * tasks, so the callback MUST be thread-safe. It must be non-blocking and must
+ * not call runtime-backed `lance_*` entry points or access the dataset handle
+ * being indexed. An ordinary build holds that dataset's mutation lock for the
+ * duration of the call, so the callback must not synchronously re-enter the
+ * same handle or start or block on a nested runtime.
+ * Non-runtime leaf utilities such as `lance_free_string` are unaffected.
+ *
+ * `callback_ctx` is opaque and may be NULL. The callback and context must
+ * remain valid until the blocking call that installed them returns. lance-c
+ * disables the callback and drains in-flight invocations through a retirement
+ * gate before returning, including on error, so no invocation remains after
+ * that boundary. Progress reporting is advisory and cannot affect the build
+ * outcome or cancel the build.
+ *
+ * The callback is invoked without a panic guard: it must return normally,
+ * because unwinding or throwing across this boundary can abort the host
+ * process.
+ */
+typedef void (*LanceIndexBuildProgressCallback)(
+    void* callback_ctx,
+    int32_t event,
+    const char* stage,
+    uint64_t total,
+    const char* unit,
+    uint64_t completed
+);
+
 /* ─── Index lifecycle (Phase 2) ─── */
 
 /**
@@ -5383,6 +5754,33 @@ int32_t lance_dataset_create_vector_index(
     const char* column,
     const char* index_name,
     const LanceVectorIndexParams* params,
+    bool replace
+);
+
+/**
+ * Create a vector index from legacy parameters with optional progress.
+ *
+ * This is the legacy `LanceVectorIndexParams` entry point plus an observer.
+ * A NULL `callback` disables observation and preserves the legacy behavior;
+ * a non-NULL callback follows LanceIndexBuildProgressCallback's contract and
+ * is retired before this blocking call returns. Parameters, name generation,
+ * replacement and native errors are the same as
+ * lance_dataset_create_vector_index().
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_vector_index_with_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexParams* params,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
     bool replace
 );
 
@@ -5407,6 +5805,32 @@ int32_t lance_dataset_create_vector_index_with_options(
 );
 
 /**
+ * Create a vector index from additive native options with optional progress.
+ *
+ * This is lance_dataset_create_vector_index_with_options() plus an observer.
+ * A NULL `callback` disables observation and preserves the legacy behavior;
+ * a non-NULL callback follows LanceIndexBuildProgressCallback's contract and
+ * is retired before this blocking call returns. All option forms, train
+ * controls, name generation, replacement and native errors are unchanged.
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_vector_index_with_options_and_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexOptions* options,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
+    bool replace
+);
+
+/**
  * Create a scalar index on a column.
  * @param params_json Optional JSON params forwarded unchanged to the native
  *                    Lance scalar-index plugin, or NULL for plugin defaults.
@@ -5427,6 +5851,33 @@ int32_t lance_dataset_create_scalar_index(
 );
 
 /**
+ * Create a scalar index with optional ordinary native build progress.
+ *
+ * This is the legacy scalar entry point plus an observer. A NULL `callback`
+ * disables observation and preserves the legacy behavior; a non-NULL callback
+ * follows LanceIndexBuildProgressCallback's contract and is retired before
+ * this blocking call returns. `params_json`, name generation, replacement and
+ * native errors are unchanged.
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_scalar_index_with_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    LanceScalarIndexType index_type,
+    const char* params_json,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
+    bool replace
+);
+
+/**
  * Create a scalar index with the additive native train control.
  *
  * `options == NULL` or `options->has_train == false` preserves the native
@@ -5439,6 +5890,34 @@ int32_t lance_dataset_create_scalar_index_with_options(
     LanceScalarIndexType index_type,
     const char* params_json,
     const LanceScalarIndexOptions* options,
+    bool replace
+);
+
+/**
+ * Create a scalar index with native train controls and optional progress.
+ *
+ * This is lance_dataset_create_scalar_index_with_options() plus an observer.
+ * A NULL `callback` disables observation and preserves the legacy behavior;
+ * a non-NULL callback follows LanceIndexBuildProgressCallback's contract and
+ * is retired before this blocking call returns. `options == NULL` or
+ * `options->has_train == false` still preserves the native train default.
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_scalar_index_with_options_and_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    LanceScalarIndexType index_type,
+    const char* params_json,
+    const LanceScalarIndexOptions* options,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
     bool replace
 );
 
@@ -5767,61 +6246,6 @@ int32_t lance_index_segment_builder_execute_uncommitted(
 );
 
 /**
- * Event codes for LanceIndexBuildProgressCallback, passed as the `event`
- * argument. Exactly one stage is active at a time: a stage's
- * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE is always delivered before the
- * next stage's LANCE_INDEX_BUILD_PROGRESS_STAGE_START.
- */
-typedef enum {
-    LANCE_INDEX_BUILD_PROGRESS_STAGE_START = 0,
-    LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS = 1,
-    LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE = 2,
-} LanceIndexBuildProgressEvent;
-
-/**
- * Receives index build progress events while
- * lance_index_segment_builder_execute_uncommitted runs.
- *
- * `stage` is non-NULL, NUL-terminated, and borrowed: it is valid only for the
- * duration of this call. `unit` is non-NULL and NUL-terminated, but is the
- * empty string ("") for LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS and
- * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE. The parameter mapping is:
- *
- *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_START: `stage` is the stage name,
- *    `total` is the number of work units (0 = unknown), `unit` describes what
- *    is being counted (e.g. "partitions", "batches", "rows"; "" = unknown),
- *    and `completed` is 0.
- *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS: `total` is 0, `unit` is "",
- *    and `completed` is the number of units completed so far.
- *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE: `total` is 0, `unit` is "",
- *    and `completed` is 0.
- *
- * Stage names are index-type-specific (e.g. "train_ivf", "shuffle",
- * "merge_partitions" for vector indices; "load_data" for scalar indices) and
- * are diagnostic-only: they are not a stable cross-version contract, so
- * consumers must treat them as opaque strings.
- *
- * The callback is invoked from lance-c's internal tokio runtime worker
- * threads. Certain stages report progress concurrently from parallel worker
- * tasks, so the callback MUST be thread-safe and reentrant. It must be
- * non-blocking and must not call back into any `lance_*` function (no
- * reentrancy).
- *
- * The callback is invoked without a panic guard: it must return normally,
- * because unwinding or throwing across this boundary can abort the host
- * process. The callback cannot abort the build; progress reporting is
- * advisory and diagnostic and cannot affect the build outcome.
- */
-typedef void (*LanceIndexBuildProgressCallback)(
-    void* callback_ctx,
-    int32_t event,
-    const char* stage,
-    uint64_t total,
-    const char* unit,
-    uint64_t completed
-);
-
-/**
  * Register the index-build progress callback for a segment builder.
  *
  * Must be called before the builder is executed; the builder is single-use,
@@ -5838,7 +6262,7 @@ typedef void (*LanceIndexBuildProgressCallback)(
  * afterwards. `callback` and `callback_ctx` must therefore remain valid and
  * safe to invoke until lance_index_segment_builder_execute_uncommitted
  * returns. See LanceIndexBuildProgressCallback for the full threading and
- * reentrancy contract.
+ * lifetime contract.
  *
  * @return 0 on success, -1 on error.
  */
@@ -7282,6 +7706,424 @@ int32_t lance_dataset_write_with_options_with_commit_lock(
     const LanceSession* session,
     const LanceCommitLock* commit_lock,
     LanceDataset** out_dataset
+);
+
+/* ─── Owned native dataset-write options ─── */
+
+/**
+ * Opaque owner of one native `WriteParams` plus retained native owners.
+ *
+ * The handle is immutable after construction. It may be used by concurrent
+ * write calls, but `lance_native_write_options_close` must not run while any
+ * call that borrows the handle is still in flight.
+ */
+typedef struct LanceNativeWriteOptions LanceNativeWriteOptions;
+
+/**
+ * Native external blob handling for a dataset write.
+ *
+ * The FFI field is a fixed-width `int32_t`; out-of-range values are rejected
+ * with `LANCE_ERR_INVALID_ARGUMENT`.
+ */
+typedef enum {
+    LANCE_EXTERNAL_BLOB_REFERENCE = 0,
+    LANCE_EXTERNAL_BLOB_INGEST    = 1,
+} LanceExternalBlobMode;
+
+/**
+ * Borrowed list of native `u32` values.
+ *
+ * A NULL pointer maps to native `None`. A non-NULL pointer with `count == 0`
+ * maps to native `Some(empty)`. Values are copied by
+ * `lance_native_write_options_new`.
+ */
+typedef struct LanceUInt32List {
+    const uint32_t* items;
+    size_t          count;
+} LanceUInt32List;
+
+/**
+ * Borrowed list of NUL-terminated UTF-8 strings.
+ *
+ * A NULL pointer maps to native `None`. A non-NULL pointer with `count == 0`
+ * maps to native `Some(empty)`. Values are copied by
+ * `lance_native_write_options_new`.
+ */
+typedef struct LanceStringList {
+    const char* const* items;
+    size_t             count;
+} LanceStringList;
+
+/**
+ * One native `ObjectStoreParams` value for `WriteParams::base_store_params`.
+ *
+ * `base_path` is the exact map key. `storage_options_accessor` is cloned into
+ * the native params; a NULL handle or an accessor without an inner owner
+ * selects native `None`. Scalar fields use `has_*` flags so omitted values
+ * keep the native `ObjectStoreParams` defaults.
+ *
+ * Native object-store and wrapper trait hooks (`object_store`,
+ * `object_store_wrapper`) and feature-gated AWS credential providers have no
+ * C representation here. Use a `StorageOptionsAccessor` for static or
+ * provider-backed storage options.
+ */
+typedef struct LanceBaseStoreParams {
+    const char* base_path;
+    const LanceStorageOptionsAccessor* storage_options_accessor;
+    int32_t     has_block_size;
+    uint64_t    block_size;
+    int32_t     has_s3_credentials_refresh_offset;
+    uint64_t    s3_credentials_refresh_seconds;
+    uint32_t    s3_credentials_refresh_nanos;
+    int32_t     has_use_constant_size_upload_parts;
+    bool        use_constant_size_upload_parts;
+    int32_t     has_list_is_lexically_ordered;
+    bool        list_is_lexically_ordered;
+} LanceBaseStoreParams;
+
+/**
+ * Borrowed per-base storage parameter list.
+ *
+ * A NULL pointer maps to native `None`. A non-NULL pointer with `count == 0`
+ * maps to native `Some(empty)`. Duplicate `base_path` keys use native
+ * `HashMap` last-write-wins semantics.
+ */
+typedef struct LanceBaseStoreParamsList {
+    const LanceBaseStoreParams* items;
+    size_t                      count;
+} LanceBaseStoreParamsList;
+
+/**
+ * Native cumulative `WriteStats` passed to the write-stats callback.
+ *
+ * `bytes_written` and `rows_written` are cumulative. `files_written` counts
+ * completed native data files/fragments. Values describe actual native
+ * progress, not wrapper estimates.
+ */
+typedef struct LanceWriteStats {
+    uint64_t bytes_written;
+    uint64_t rows_written;
+    uint32_t files_written;
+} LanceWriteStats;
+
+/**
+ * Native fragment progress payload, borrowed for one callback invocation.
+ *
+ * `physical_rows` is present for complete-fragment events and normally absent
+ * for begin-fragment events, matching the native fragment state at each call.
+ */
+typedef struct LanceWriteFragmentProgressInfo {
+    uint64_t fragment_id;
+    int32_t  has_physical_rows;
+    uint64_t physical_rows;
+    uint64_t file_count;
+} LanceWriteFragmentProgressInfo;
+
+/**
+ * Report native begin/complete fragment progress.
+ *
+ * Return 0 on success. A nonzero status reports failure through `error`; the
+ * write then follows native cleanup and no-commit behavior. Callbacks may run
+ * concurrently from native worker threads and must be thread-safe. `info` is
+ * borrowed and must not be retained. `error` is zero-initialized before every
+ * invocation; `LanceCallbackError` uses the same code/message ownership rules
+ * as other callback APIs.
+ */
+typedef int32_t (*LanceWriteFragmentProgressCallback)(
+    void* callback_ctx,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error
+);
+
+/**
+ * Receive cumulative native `WriteStats`.
+ *
+ * Native write progress has no error channel. The callback must be cheap,
+ * non-blocking, thread-safe and must not unwind.
+ */
+typedef void (*LanceWriteStatsCallback)(
+    void* callback_ctx,
+    const LanceWriteStats* stats
+);
+
+/**
+ * Release a progress callback context exactly once.
+ *
+ * The final native progress owner invokes this callback, which may happen
+ * after the write entry point returns or while the options handle is closed.
+ * It may run on a native worker thread and must not unwind.
+ */
+typedef void (*LanceNativeWriteProgressRelease)(void* callback_ctx);
+
+/**
+ * Foreign dataset-write progress callbacks and their owned context.
+ *
+ * Ownership of `callback_ctx` transfers only when
+ * `lance_native_write_options_new` succeeds. `release` is required whenever
+ * this descriptor is supplied. Omitted callbacks leave the corresponding
+ * native progress hook at its default.
+ */
+typedef struct LanceNativeWriteProgress {
+    LanceWriteFragmentProgressCallback begin_fragment;
+    LanceWriteFragmentProgressCallback complete_fragment;
+    LanceWriteStatsCallback            write_stats;
+    LanceNativeWriteProgressRelease    release;
+    void*                              callback_ctx;
+} LanceNativeWriteProgress;
+
+/**
+ * Borrowed configuration for `lance_native_write_options_new`.
+ *
+ * Every pointer is read only during that constructor call. Values, strings,
+ * native owners and callback contexts are copied or cloned into the returned
+ * handle. Presence flags preserve native `None` versus `Some(empty)` and
+ * explicit `false` values.
+ *
+ * Field mapping to native `WriteParams`:
+ * - `write_options` supplies max rows/bytes, data storage version,
+ *   `enable_stable_row_ids`, auto-cleanup and `skip_auto_cleanup`.
+ * - `transaction_properties` maps to native `None`/`Some(map)` directly.
+ * - `enable_v2_manifest_paths` maps to the create-time native field; omitted
+ *   keeps the native default. Native ignores it for existing datasets.
+ * - `initial_bases`, `target_bases`, `target_base_names_or_paths` and
+ *   `target_all_bases` map directly, including primary-base ID 0 and
+ *   dataset-URI references. Empty explicit target lists remain `Some(empty)`
+ *   and are rejected by native resolution, not by this binding.
+ * - `base_store_params` maps exact base-path keys to native
+ *   `ObjectStoreParams` using the representable fields above. The primary
+ *   base is not a registered `BasePath`, so its storage comes from the
+ *   write-level accessor; native target resolution owns that rule.
+ * - `allow_external_blob_outside_bases`, `external_blob_mode` and
+ *   `blob_pack_file_size_threshold` map directly. Native validates
+ *   incompatible combinations such as ingest plus allow-outside-bases.
+ * - `file_writer_options` maps to native `FileWriterOptions`; its raw-file
+ *   `version` field must be NULL because dataset file-version selection
+ *   belongs in `write_options.params.data_storage_version`.
+ * - `session`, `storage_options_accessor` and `commit_lock` are cloned into
+ *   the handle. The caller may close the source handles after construction.
+ * - `progress` maps to native `WriteParams::progress` and `write_progress`.
+ *   No wrapper-generated events are emitted.
+ */
+typedef struct LanceNativeWriteOptionsSpec {
+    const LanceWriteOptions*             write_options;
+    const LanceTransactionProperties*    transaction_properties;
+    int32_t                              has_enable_v2_manifest_paths;
+    bool                                 enable_v2_manifest_paths;
+    const LanceBasePathList*             initial_bases;
+    const LanceUInt32List*               target_bases;
+    const LanceStringList*               target_base_names_or_paths;
+    int32_t                              has_target_all_bases;
+    bool                                 target_all_bases;
+    const LanceBaseStoreParamsList*      base_store_params;
+    bool                                 allow_external_blob_outside_bases;
+    int32_t                              external_blob_mode;
+    int32_t                              has_blob_pack_file_size_threshold;
+    uint64_t                             blob_pack_file_size_threshold;
+    const struct LanceFileWriterOptions* file_writer_options;
+    const LanceSession*                  session;
+    const LanceStorageOptionsAccessor*   storage_options_accessor;
+    const LanceCommitLock*               commit_lock;
+    const LanceNativeWriteProgress*      progress;
+} LanceNativeWriteOptionsSpec;
+
+/**
+ * Create an owned native-backed dataset write-options handle.
+ *
+ * `spec == NULL` selects native `WriteParams::default()`. The write mode is
+ * supplied by the later entry point, not by this handle.
+ *
+ * Ownership of `spec->progress->callback_ctx` transfers only on success. On
+ * failure the caller retains it and `release` is not called. On success the
+ * callback context is released exactly once when the final native owner drops;
+ * this may happen inside `lance_native_write_options_close` or later on a
+ * native worker thread.
+ *
+ * Native validation of option combinations remains authoritative. This
+ * constructor rejects only values that cannot be parsed or represented at the
+ * C boundary. Returns NULL on error.
+ */
+LanceNativeWriteOptions* lance_native_write_options_new(
+    const LanceNativeWriteOptionsSpec* spec
+);
+
+/**
+ * Close an owned native write-options handle.
+ *
+ * Native writes clone the values they need. Close the handle only after all
+ * calls that borrowed it have returned. Closing drops the retained session,
+ * storage accessors, commit lock and progress context; the progress release
+ * callback may run from this call. NULL-safe.
+ */
+void lance_native_write_options_close(LanceNativeWriteOptions* options);
+
+/**
+ * Write with an owned native-backed options handle.
+ *
+ * `options == NULL` selects native `WriteParams::default()`. The handle
+ * supplies every native dataset-write option, including session, storage
+ * accessor, commit lock, base placement, blob policy, file-writer options and
+ * progress callbacks. The stream is consumed on every return path except a
+ * NULL `stream`. `out_dataset` follows the same success-only contract as
+ * `lance_dataset_write`. Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_write_with_native_options(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceNativeWriteOptions* options,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Stage an Arrow stream with an owned native-backed options handle.
+ *
+ * `options == NULL` selects native `WriteParams::default()`. The handle
+ * supplies session, storage accessor, commit lock, base placement, blob
+ * policy, file-writer options and progress callbacks. The stream is consumed
+ * on every return path except a NULL `stream`.
+ *
+ * The returned transaction owns metadata and uncommitted data-file
+ * references. It does not retain the options handle, its session, accessor or
+ * commit lock; pass those to the later commit entry point when commit I/O
+ * needs them.
+ * Publication naming remains controlled by the commit entry point's
+ * `LanceCommitOptions`. Returns 0 on success, -1 on error; a failed stage is
+ * guaranteed not to publish a version.
+ */
+int32_t lance_dataset_write_uncommitted_stream_with_native_options(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceNativeWriteOptions* options,
+    LanceTransaction** out_transaction
+);
+
+/* ─── Native fragment creation ─── */
+
+/**
+ * Options for the native fragment creation entry points.
+ *
+ * `schema == NULL` leaves native schema inference in place. In APPEND mode
+ * native inference may use the existing dataset's schema, including its field
+ * IDs. A non-NULL schema is borrowed for the call and cloned before the write
+ * starts, so closing the handle during the call is not allowed.
+ *
+ * `mode` is a `LanceWriteMode` value. `write == NULL` selects the native
+ * `WriteParams::default()` writer options. `storage_opts == NULL` and
+ * `session == NULL` keep the native defaults.
+ */
+typedef struct LanceFragmentCreateOptions {
+    /* Native schema to write with. NULL uses native inference. */
+    const LanceSchema*      schema;
+    /* LanceWriteMode: LANCE_WRITE_CREATE, LANCE_WRITE_APPEND or
+     * LANCE_WRITE_OVERWRITE. */
+    int32_t                 mode;
+    /* Native write options. NULL uses native defaults. */
+    const LanceWriteOptions* write;
+    /* NULL-terminated [key, value, ..., NULL] storage options. */
+    const char* const*      storage_opts;
+    /* Shared session for caches and store configuration. NULL means default. */
+    const LanceSession*     session;
+} LanceFragmentCreateOptions;
+
+/**
+ * Create one fragment at `dataset_uri` without publishing a version.
+ *
+ * Maps to native `FragmentCreateBuilder::write(source, Some(fragment_id))`.
+ * Native code owns schema inference and compatibility, file format selection,
+ * the physical row count and all error semantics. A non-empty input is
+ * required; an empty stream fails with the native "Input data was empty."
+ * error. The native API accepts any `fragment_id`, including IDs already used
+ * by existing metadata; duplicate detection happens at commit time.
+ * Non-NULL URI strings, including empty strings, are interpreted by native
+ * code. Native schema validation precedes target storage creation.
+ *
+ * The stream is consumed on every return path except a NULL `stream` pointer,
+ * including validation failures and a NULL output slot. Passing a NULL stream
+ * is an invalid argument and leaves it untouched.
+ *
+ * On success `*out_fragment` receives an independently owned detached
+ * metadata handle that remains valid after the dataset, schema and session
+ * handles are closed. Closing the handle never deletes the written data file.
+ * The output is written only on success.
+ *
+ * @return 0 on success, -1 on error. Errors include
+ *         LANCE_ERR_INVALID_ARGUMENT (NULL stream/uri/output, invalid mode,
+ *         empty input), native schema mismatches, storage errors and
+ *         commit-less I/O failures.
+ */
+int32_t lance_fragment_create(
+    const char* dataset_uri,
+    uint64_t fragment_id,
+    const LanceFragmentCreateOptions* options,
+    struct ArrowArrayStream* stream,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Create zero or more fragments without publishing a version.
+ *
+ * Maps to native `FragmentCreateBuilder::write_fragments`. Native
+ * `max_rows_per_file` splitting, fragment ID assignment, file format and
+ * schema handling apply; the binding implements no splitting of its own.
+ *
+ * The stream follows the same consumption contract as `lance_fragment_create`,
+ * and both output slots are written only on success. On success `*out_fragments`
+ * is a library-allocated array of `*out_count` independently owned detached
+ * handles. Release it with `lance_fragment_array_free(*out_fragments,
+ * *out_count)`, which closes every remaining non-NULL element. A successful
+ * empty result writes NULL and 0.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_create_many(
+    const char* dataset_uri,
+    const LanceFragmentCreateOptions* options,
+    struct ArrowArrayStream* stream,
+    LanceFragment*** out_fragments,
+    size_t* out_count
+);
+
+/**
+ * Close every non-NULL fragment in an array from `lance_fragment_create_many`,
+ * then release the array allocation. NULL-safe. `count` must be the count
+ * returned by `create_many`; slots already cleared by a wrapper are skipped.
+ */
+void lance_fragment_array_free(LanceFragment** fragments, size_t count);
+
+/**
+ * Create one fragment from an existing Lance data file.
+ *
+ * Maps to native `FileFragment::create_from_file(filename, dataset_snapshot,
+ * fragment_id as usize, physical_rows)`. `filename` is relative to the
+ * dataset's data directory and keeps native file-version, schema
+ * compatibility and physical-row validation. Non-NULL filenames, including
+ * empty strings, are passed through unchanged. `physical_rows == NULL` maps to
+ * native `None`; a pointer to zero maps to `Some(0)`, which the current native
+ * format may ignore. Values that do not fit the native `usize` are rejected.
+ *
+ * Native validates the file schema against the dataset snapshot, so a file
+ * whose stored schema is a physical representation that the native version
+ * cannot project to the dataset schema is rejected. Blob v2 data files are
+ * one such case: they store descriptor columns where the dataset schema has
+ * `blob.uri` and `blob.data`, and both the native and the C entry points
+ * report the same schema-mismatch error for them.
+ *
+ * The dataset handle supplies the target snapshot and is not modified. The
+ * output owns complete detached metadata and remains valid after the dataset
+ * is closed; it is written only on success. Closing the handle never deletes
+ * the file.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_create_from_file(
+    const LanceDataset* dataset,
+    const char* filename,
+    uint64_t fragment_id,
+    const uint64_t* physical_rows,
+    LanceFragment** out_fragment
 );
 
 /* ─── Native data files ─── */
@@ -10085,6 +10927,48 @@ typedef struct LanceNamespaceCustomClientSpec {
 
 LanceNamespace* lance_namespace_custom_new(
     const LanceNamespaceCustomClientSpec* spec
+);
+
+/**
+ * Shared dispatch callback for the same four managed table/version operations.
+ *
+ * `operation` is one of the exact native snake_case names
+ * "describe_table", "describe_table_version", "create_table_version", or
+ * "list_table_versions". It is borrowed for this callback only and must not be
+ * retained. `request_json` has the same call-scoped lifetime. Response JSON
+ * ownership, callback errors, reentrant blocking behavior, and unsupported
+ * operations are identical to the per-operation callbacks above.
+ */
+typedef int32_t (*LanceNamespaceCustomDispatchFn)(
+    void* client_ctx,
+    const char* operation,
+    const char* request_json,
+    LanceOwnedString* out_response_json,
+    LanceCallbackError* out_error
+);
+
+/**
+ * Foreign client with one dispatch callback for the four managed
+ * table/version operations.
+ *
+ * Ownership of `client_ctx` and `release` transfers when this spec is passed
+ * to `lance_namespace_custom_dispatch_new`, including on construction failure.
+ * The context is released exactly once after the final native namespace Arc
+ * drops. `namespace_id` follows the same copied identity and cache semantics as
+ * LanceNamespaceCustomClientSpec. All operations other than the four listed
+ * above keep native Unsupported behavior.
+ */
+typedef struct LanceNamespaceCustomClientDispatchSpec {
+    LanceNamespaceCustomDispatchFn dispatch;
+    void (*release)(void* client_ctx);
+    void* client_ctx;
+    /** Copied identity used in native storage-provider cache keys. NULL or
+     * empty assigns a unique identity stable for this client's lifetime. */
+    const char* namespace_id;
+} LanceNamespaceCustomClientDispatchSpec;
+
+LanceNamespace* lance_namespace_custom_dispatch_new(
+    const LanceNamespaceCustomClientDispatchSpec* spec
 );
 
 /* ─── Raw Lance-file session ──────────────────────────────────────────────── */
