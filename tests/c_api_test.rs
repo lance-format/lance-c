@@ -14272,6 +14272,565 @@ fn take_last_error_message() -> String {
     message
 }
 
+fn open_blob_test_session(base_uri: &str) -> *mut LanceFileSession {
+    let uri = c_str(base_uri);
+    let session =
+        unsafe { lance_file_session_new(uri.as_ptr(), ptr::null(), ptr::null(), ptr::null()) };
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    session
+}
+
+fn c_string_value(value: *const c_char) -> String {
+    assert!(!value.is_null());
+    let owned = unsafe { CStr::from_ptr(value) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { lance_free_string(value) };
+    owned
+}
+
+fn output_parts(array: FFI_ArrowArray, schema: FFI_ArrowSchema) -> (Field, arrow_array::ArrayRef) {
+    let field = Field::try_from(&schema).unwrap();
+    let data = unsafe { from_ffi(array, &schema) }.unwrap();
+    (field, make_array(data))
+}
+
+fn native_descriptor_parts(
+    field_name: &str,
+    descriptors: impl IntoIterator<Item = lance::BlobDescriptor>,
+) -> (Field, arrow_array::ArrayRef) {
+    let mut builder = lance::BlobDescriptorArrayBuilder::new(field_name);
+    builder.extend(descriptors).unwrap();
+    builder.finish().unwrap().into_parts()
+}
+
+fn read_blob_sidecar(
+    store: &lance_io::object_store::ObjectStore,
+    path: &object_store::path::Path,
+) -> Vec<u8> {
+    let size = lance_c::runtime::block_on(store.size(path)).unwrap();
+    if size == 0 {
+        return Vec::new();
+    }
+    let size = usize::try_from(size).unwrap();
+    lance_c::runtime::block_on(store.read_one_range(path, 0..size))
+        .unwrap()
+        .to_vec()
+}
+
+fn expected_payload_bytes(rows: &[Option<Vec<u8>>]) -> Vec<u8> {
+    rows.iter()
+        .filter_map(Option::as_deref)
+        .flatten()
+        .copied()
+        .collect()
+}
+
+fn binary_payload_cases() -> Vec<(
+    &'static str,
+    Field,
+    arrow_array::ArrayRef,
+    Vec<Option<Vec<u8>>>,
+)> {
+    let binary = BinaryArray::from(vec![
+        Some(b"ignored".as_slice()),
+        Some(b"alpha".as_slice()),
+        None,
+        Some(b"".as_slice()),
+        Some(b"omega".as_slice()),
+    ]);
+    let binary = binary.slice(1, 4);
+    let binary_field = Field::new("payload", binary.data_type().clone(), true);
+
+    let large = LargeBinaryArray::from(vec![
+        Some(b"ignored".as_slice()),
+        Some(b"large-alpha".as_slice()),
+        None,
+        Some(b"".as_slice()),
+        Some(b"large-omega".as_slice()),
+    ]);
+    let large = large.slice(1, 4);
+    let large_field = Field::new("payload", large.data_type().clone(), true);
+
+    let view = arrow_array::BinaryViewArray::from(vec![
+        Some(b"ignored".as_slice()),
+        Some(b"view-alpha".as_slice()),
+        None,
+        Some(b"".as_slice()),
+        Some(b"view-omega".as_slice()),
+    ]);
+    let view = view.slice(1, 4);
+    let view_field = Field::new("payload", view.data_type().clone(), true);
+
+    let fixed = arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        [
+            Some(b"skip".as_slice()),
+            Some(b"abcd".as_slice()),
+            None,
+            Some(b"wxyz".as_slice()),
+        ]
+        .into_iter(),
+        4,
+    )
+    .unwrap();
+    let fixed = fixed.slice(1, 3);
+    let fixed_field = Field::new("payload", fixed.data_type().clone(), true);
+
+    vec![
+        (
+            "binary",
+            binary_field,
+            binary,
+            vec![
+                Some(b"alpha".to_vec()),
+                None,
+                Some(Vec::new()),
+                Some(b"omega".to_vec()),
+            ],
+        ),
+        (
+            "large-binary",
+            large_field,
+            large,
+            vec![
+                Some(b"large-alpha".to_vec()),
+                None,
+                Some(Vec::new()),
+                Some(b"large-omega".to_vec()),
+            ],
+        ),
+        (
+            "binary-view",
+            view_field,
+            view,
+            vec![
+                Some(b"view-alpha".to_vec()),
+                None,
+                Some(Vec::new()),
+                Some(b"view-omega".to_vec()),
+            ],
+        ),
+        (
+            "fixed-size-binary",
+            fixed_field,
+            fixed,
+            vec![Some(b"abcd".to_vec()), None, Some(b"wxyz".to_vec())],
+        ),
+    ]
+}
+
+#[test]
+fn test_packed_blob_writer_c_matches_native_binary_types_and_descriptor_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}", tmp.path().display());
+    let (store, base) =
+        lance_c::runtime::block_on(lance_io::object_store::ObjectStore::from_uri(&uri)).unwrap();
+    let session = open_blob_test_session(&uri);
+
+    for (case_name, field, payloads, rows) in binary_payload_cases() {
+        let data_file_name = format!("{case_name}.lance");
+        let data_file_path =
+            base.child_path(&object_store::path::Path::from(data_file_name.as_str()));
+        let data_file_path_c = c_str(&data_file_name);
+        let blob_id = 41;
+        let writer = unsafe {
+            lance_file_session_open_packed_blob_writer(session, data_file_path_c.as_ptr(), blob_id)
+        };
+        assert!(!writer.is_null(), "{}", take_last_error_message());
+        assert_eq!(unsafe { lance_packed_blob_writer_blob_id(writer) }, blob_id);
+        let c_path = c_string_value(unsafe { lance_packed_blob_writer_path(writer) });
+
+        let mut input = FFI_ArrowArray::new(&payloads.to_data());
+        let input_schema = FFI_ArrowSchema::try_from(&field).unwrap();
+        assert!(input.release.is_some());
+        assert_eq!(
+            unsafe { lance_packed_blob_writer_write_blobs(writer, &mut input, &input_schema) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert!(
+            input.release.is_none(),
+            "the source array must be released on success"
+        );
+        assert!(
+            input_schema.release.is_some(),
+            "the source schema remains borrowed"
+        );
+
+        let mut out_array = FFI_ArrowArray::empty();
+        let mut out_schema = FFI_ArrowSchema::empty();
+        assert_eq!(
+            unsafe {
+                lance_packed_blob_writer_finish_array(
+                    writer,
+                    c"blob".as_ptr(),
+                    &mut out_array,
+                    &mut out_schema,
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let (c_field, c_array) = output_parts(out_array, out_schema);
+        let c_bytes = read_blob_sidecar(&store, &object_store::path::Path::from(c_path.as_str()));
+        assert_eq!(c_bytes, expected_payload_bytes(&rows));
+        unsafe { lance_packed_blob_writer_close(writer) };
+
+        let mut native = lance_c::runtime::block_on(lance::PackedBlobWriter::try_new(
+            store.as_ref().clone(),
+            data_file_path,
+            blob_id,
+        ))
+        .unwrap();
+        assert_eq!(native.blob_id(), blob_id);
+        assert_eq!(native.path().as_ref(), c_path);
+        let row_refs = rows.iter().map(Option::as_deref).collect::<Vec<_>>();
+        lance_c::runtime::block_on(native.write_packed_blobs(row_refs)).unwrap();
+        let native_path = native.path().clone();
+        let descriptors = lance_c::runtime::block_on(native.finish()).unwrap();
+        let (native_field, native_array) = native_descriptor_parts("blob", descriptors);
+        assert_eq!(c_field, native_field, "{case_name} prepared field");
+        assert_eq!(
+            c_array.to_data(),
+            native_array.to_data(),
+            "{case_name} prepared descriptors"
+        );
+        assert_eq!(
+            read_blob_sidecar(&store, &native_path),
+            c_bytes,
+            "{case_name} sidecar bytes"
+        );
+    }
+
+    unsafe { lance_file_session_close(session) };
+}
+
+#[test]
+fn test_dedicated_blob_writer_finish_array_matches_native_and_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}", tmp.path().display());
+    let (store, base) =
+        lance_c::runtime::block_on(lance_io::object_store::ObjectStore::from_uri(&uri)).unwrap();
+    let session = open_blob_test_session(&uri);
+
+    let data_file_name = "dedicated.lance";
+    let data_file_path_c = c_str(data_file_name);
+    let writer = unsafe {
+        lance_file_session_open_dedicated_blob_writer(session, data_file_path_c.as_ptr(), 51)
+    };
+    assert!(!writer.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dedicated_blob_writer_blob_id(writer) }, 51);
+    let c_path = c_string_value(unsafe { lance_dedicated_blob_writer_path(writer) });
+    for bytes in [b"alpha".as_slice(), b"".as_slice(), b"omega".as_slice()] {
+        assert_eq!(
+            unsafe { lance_dedicated_blob_writer_write(writer, bytes.as_ptr(), bytes.len()) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+    }
+    let mut out_array = FFI_ArrowArray::empty();
+    let mut out_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_dedicated_blob_writer_finish_array(
+                writer,
+                c"blob".as_ptr(),
+                &mut out_array,
+                &mut out_schema,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let (c_field, c_array) = output_parts(out_array, out_schema);
+    let c_bytes = read_blob_sidecar(&store, &object_store::path::Path::from(c_path.as_str()));
+    assert_eq!(c_bytes, b"alphaomega");
+    assert_eq!(c_array.len(), 1);
+    unsafe { lance_dedicated_blob_writer_close(writer) };
+
+    let native_path = base.child_path(&object_store::path::Path::from(data_file_name));
+    let mut native = lance_c::runtime::block_on(lance::DedicatedBlobWriter::try_new(
+        store.as_ref().clone(),
+        native_path,
+        51,
+    ))
+    .unwrap();
+    assert_eq!(native.path().as_ref(), c_path);
+    lance_c::runtime::block_on(native.write(b"alpha")).unwrap();
+    lance_c::runtime::block_on(native.write(b"")).unwrap();
+    lance_c::runtime::block_on(native.write(b"omega")).unwrap();
+    let native_path = native.path().clone();
+    let descriptor = lance_c::runtime::block_on(native.finish()).unwrap();
+    let (native_field, native_array) = native_descriptor_parts("blob", [descriptor]);
+    assert_eq!(c_field, native_field);
+    assert_eq!(c_array.to_data(), native_array.to_data());
+    assert_eq!(read_blob_sidecar(&store, &native_path), c_bytes);
+
+    let empty_name = "dedicated-empty.lance";
+    let empty_name_c = c_str(empty_name);
+    let empty_writer = unsafe {
+        lance_file_session_open_dedicated_blob_writer(session, empty_name_c.as_ptr(), 52)
+    };
+    assert!(!empty_writer.is_null(), "{}", take_last_error_message());
+    let empty_path = c_string_value(unsafe { lance_dedicated_blob_writer_path(empty_writer) });
+    let mut empty_array = FFI_ArrowArray::empty();
+    let mut empty_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_dedicated_blob_writer_finish_array(
+                empty_writer,
+                c"".as_ptr(),
+                &mut empty_array,
+                &mut empty_schema,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let (empty_field, empty_array) = output_parts(empty_array, empty_schema);
+    assert_eq!(empty_field.name(), "");
+    let empty_bytes =
+        read_blob_sidecar(&store, &object_store::path::Path::from(empty_path.as_str()));
+    assert!(empty_bytes.is_empty());
+    unsafe { lance_dedicated_blob_writer_close(empty_writer) };
+
+    let mut empty_native = lance_c::runtime::block_on(lance::DedicatedBlobWriter::try_new(
+        store.as_ref().clone(),
+        base.child_path(&object_store::path::Path::from(empty_name)),
+        52,
+    ))
+    .unwrap();
+    let empty_native_path = empty_native.path().clone();
+    let empty_descriptor = lance_c::runtime::block_on(empty_native.finish()).unwrap();
+    let (empty_native_field, empty_native_array) = native_descriptor_parts("", [empty_descriptor]);
+    assert_eq!(empty_field, empty_native_field);
+    assert_eq!(empty_array.to_data(), empty_native_array.to_data());
+    assert!(
+        read_blob_sidecar(&store, &empty_native_path).is_empty(),
+        "a dedicated writer with no writes publishes an empty object"
+    );
+
+    unsafe { lance_file_session_close(session) };
+}
+
+fn sentinel_ffi_outputs(sentinel: *mut c_void) -> (FFI_ArrowArray, FFI_ArrowSchema) {
+    let mut array = FFI_ArrowArray::empty();
+    array.length = 19;
+    array.offset = 3;
+    array.private_data = sentinel;
+    let mut schema = FFI_ArrowSchema::empty();
+    schema.flags = 7;
+    schema.private_data = sentinel;
+    (array, schema)
+}
+
+fn assert_ffi_outputs_untouched(
+    array: &FFI_ArrowArray,
+    schema: &FFI_ArrowSchema,
+    sentinel: *mut c_void,
+) {
+    assert_eq!(array.private_data, sentinel);
+    assert_eq!(array.length, 19);
+    assert_eq!(array.offset, 3);
+    assert!(array.release.is_none());
+    assert_eq!(schema.private_data, sentinel);
+    assert_eq!(schema.flags, 7);
+    assert!(schema.release.is_none());
+}
+
+#[test]
+fn test_blob_writer_arrow_ownership_validation_and_finish_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}", tmp.path().display());
+    let session = open_blob_test_session(&uri);
+    let writer = unsafe {
+        lance_file_session_open_packed_blob_writer(session, c"ownership.lance".as_ptr(), 61)
+    };
+    assert!(!writer.is_null(), "{}", take_last_error_message());
+
+    unsafe { lance_file_session_close(session) };
+    assert_eq!(
+        unsafe { lance_packed_blob_writer_write_blob(writer, ptr::null(), 0) },
+        0,
+        "NULL plus zero length is a valid empty packed payload"
+    );
+    assert_eq!(
+        unsafe { lance_packed_blob_writer_write_blob(writer, ptr::null(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("must not be NULL"));
+    assert_eq!(
+        unsafe { lance_packed_blob_writer_write_blob(writer, b"first".as_ptr(), 5) },
+        0,
+        "validation errors before native invocation leave the writer usable"
+    );
+
+    let non_binary = Int32Array::from(vec![1, 2, 3]);
+    let non_binary_field = Field::new("payload", DataType::Int32, true);
+    let mut non_binary_array = FFI_ArrowArray::new(&non_binary.to_data());
+    let non_binary_schema = FFI_ArrowSchema::try_from(&non_binary_field).unwrap();
+    assert_eq!(
+        unsafe {
+            lance_packed_blob_writer_write_blobs(writer, &mut non_binary_array, &non_binary_schema)
+        },
+        -1
+    );
+    assert!(non_binary_array.release.is_none());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("expected Binary"));
+
+    let binary = BinaryArray::from(vec![Some(b"payload".as_slice())]);
+    let binary_field = Field::new("payload", DataType::Binary, true);
+    let mut released_schema_array = FFI_ArrowArray::new(&binary.to_data());
+    let released_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_packed_blob_writer_write_blobs(
+                writer,
+                &mut released_schema_array,
+                &released_schema,
+            )
+        },
+        -1
+    );
+    assert!(released_schema_array.release.is_none());
+    assert!(take_last_error_message().contains("uninitialised or already released"));
+
+    let mut null_schema_array = FFI_ArrowArray::new(&binary.to_data());
+    assert_eq!(
+        unsafe {
+            lance_packed_blob_writer_write_blobs(writer, &mut null_schema_array, ptr::null())
+        },
+        -1
+    );
+    assert!(null_schema_array.release.is_none());
+    assert!(take_last_error_message().contains("schema must not be NULL"));
+
+    let binary_schema = FFI_ArrowSchema::try_from(&binary_field).unwrap();
+    let mut malformed = FFI_ArrowArray::new(&binary.to_data());
+    malformed.offset = 100;
+    assert_eq!(
+        unsafe { lance_packed_blob_writer_write_blobs(writer, &mut malformed, &binary_schema) },
+        -1
+    );
+    assert!(malformed.release.is_none());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("failed validation"));
+
+    assert_eq!(
+        unsafe { lance_packed_blob_writer_write_blobs(writer, ptr::null_mut(), &binary_schema,) },
+        -1
+    );
+    assert!(take_last_error_message().contains("payloads must not be NULL"));
+
+    let base = BinaryArray::from(vec![Some(b"left".as_slice()), Some(b"right".as_slice())]);
+    let empty = base.slice(2, 0);
+    let mut empty_array = FFI_ArrowArray::new(&empty.to_data());
+    empty_array.offset = 123;
+    assert_eq!(
+        unsafe { lance_packed_blob_writer_write_blobs(writer, &mut empty_array, &binary_schema) },
+        0,
+        "zero-length input must not observe its unused slice offset: {}",
+        take_last_error_message()
+    );
+    assert!(empty_array.release.is_none());
+
+    let sentinel = 0x5a5a_usize as *mut c_void;
+    let (mut untouched_array, mut untouched_schema) = sentinel_ffi_outputs(sentinel);
+    assert_eq!(
+        unsafe {
+            lance_packed_blob_writer_finish_array(
+                writer,
+                ptr::null(),
+                &mut untouched_array,
+                &mut untouched_schema,
+            )
+        },
+        -1
+    );
+    assert_ffi_outputs_untouched(&untouched_array, &untouched_schema, sentinel);
+    assert!(take_last_error_message().contains("field_name must not be NULL"));
+
+    let (mut array_only, mut schema_only) = sentinel_ffi_outputs(sentinel);
+    assert_eq!(
+        unsafe {
+            lance_packed_blob_writer_finish_array(
+                writer,
+                c"blob".as_ptr(),
+                ptr::null_mut(),
+                &mut schema_only,
+            )
+        },
+        -1
+    );
+    assert_eq!(schema_only.private_data, sentinel);
+    assert_eq!(
+        unsafe {
+            lance_packed_blob_writer_finish_array(
+                writer,
+                c"blob".as_ptr(),
+                &mut array_only,
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    assert_eq!(array_only.private_data, sentinel);
+    assert!(take_last_error_message().contains("out_array and out_schema"));
+
+    let mut out_array = FFI_ArrowArray::empty();
+    let mut out_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_packed_blob_writer_finish_array(
+                writer,
+                c"blob".as_ptr(),
+                &mut out_array,
+                &mut out_schema,
+            )
+        },
+        0,
+        "preflight failures leave the active writer available: {}",
+        take_last_error_message()
+    );
+    let (field, array) = output_parts(out_array, out_schema);
+    assert_eq!(field.name(), "blob");
+    assert_eq!(array.len(), 2);
+
+    let (mut repeated_array, mut repeated_schema) = sentinel_ffi_outputs(sentinel);
+    assert_eq!(
+        unsafe {
+            lance_packed_blob_writer_finish_array(
+                writer,
+                c"blob".as_ptr(),
+                &mut repeated_array,
+                &mut repeated_schema,
+            )
+        },
+        -1
+    );
+    assert_ffi_outputs_untouched(&repeated_array, &repeated_schema, sentinel);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("already finished"));
+    assert_eq!(unsafe { lance_packed_blob_writer_blob_id(writer) }, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("already finished"));
+    assert!(unsafe { lance_packed_blob_writer_path(writer) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("already finished"));
+
+    unsafe {
+        lance_packed_blob_writer_close(writer);
+        lance_packed_blob_writer_close(ptr::null_mut());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedCleanupCandidate {
     path: String,

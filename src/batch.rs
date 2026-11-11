@@ -176,7 +176,7 @@ unsafe fn batch_from_arrow_inner(
     Ok(0)
 }
 
-unsafe fn claim_arrow_array(array: *mut FFI_ArrowArray) -> FFI_ArrowArray {
+pub(crate) unsafe fn claim_arrow_array(array: *mut FFI_ArrowArray) -> FFI_ArrowArray {
     // SAFETY: the caller transfers ownership of the initialized source slot.
     let owned = unsafe { FFI_ArrowArray::from_raw(array) };
     // Leave a canonical released value in the source slot so a caller that

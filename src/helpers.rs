@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{Field, Schema as ArrowSchema};
 use chrono::TimeDelta;
 use lance_core::Result;
 use lance_core::datatypes::Schema as LanceSchema;
@@ -184,6 +184,50 @@ pub(crate) unsafe fn import_arrow_schema(
         Ok(Ok(schema)) => Ok(Arc::new(schema)),
         Ok(Err(error)) => Err(lance_core::Error::invalid_input_source(
             format!("{name} is not a valid Arrow schema: {error}").into(),
+        )),
+        Err(payload) => Err(lance_core::Error::invalid_input_source(
+            format!(
+                "{name} triggered an Arrow validation panic: {}",
+                panic_payload_message(&*payload)
+            )
+            .into(),
+        )),
+    }
+}
+
+/// Import one borrowed Arrow field without taking release ownership.
+///
+/// A C Data Interface field uses the same ArrowSchema layout as a one-field
+/// schema. Complete field metadata is preserved. Arrow can assert on malformed
+/// child pointers, so deterministic validation panics are contained and
+/// reported as invalid input.
+pub(crate) unsafe fn import_arrow_field(
+    schema: *const FFI_ArrowSchema,
+    name: &str,
+) -> Result<Field> {
+    if schema.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{name} must not be NULL").into(),
+        ));
+    }
+    // SAFETY: caller supplies a live ArrowSchema for this call.
+    let schema = unsafe { &*schema };
+    if schema.release.is_none() || schema.format.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{name} is uninitialised or already released").into(),
+        ));
+    }
+    // SAFETY: `format` is non-NULL and follows the C Data Interface invariant.
+    if unsafe { CStr::from_ptr(schema.format) }.to_str().is_err() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{name} format is not valid UTF-8").into(),
+        ));
+    }
+
+    match catch_unwind(AssertUnwindSafe(|| Field::try_from(schema))) {
+        Ok(Ok(field)) => Ok(field),
+        Ok(Err(error)) => Err(lance_core::Error::invalid_input_source(
+            format!("{name} is not a valid Arrow field: {error}").into(),
         )),
         Err(payload) => Err(lance_core::Error::invalid_input_source(
             format!(

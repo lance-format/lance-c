@@ -8,6 +8,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -108,6 +109,28 @@ struct BatchFixture {
     }
 };
 
+struct BinaryFixture {
+    const char values[9] = "skipbeta";
+    const int32_t offsets[4] = {0, 4, 4, 8};
+    const uint8_t validity[1] = {0x05};
+    const void *buffers[3] = {validity, offsets, values};
+    ArrowArray payloads{};
+    ArrowSchema schema{};
+
+    BinaryFixture() {
+        payloads.length = 2;
+        payloads.offset = 1;
+        payloads.n_buffers = 3;
+        payloads.buffers = buffers;
+        payloads.release = &release_array;
+
+        schema.format = "z";
+        schema.name = "payload";
+        schema.flags = 2;
+        schema.release = &release_schema;
+    }
+};
+
 const char *label_at(const ArrowArray &array, int64_t index) {
     static char output[16];
     const auto *validity = static_cast<const uint8_t *>(array.buffers[0]);
@@ -156,6 +179,20 @@ bool verify_stream(
 }
 
 #if defined(__unix__) || defined(__APPLE__)
+std::vector<uint8_t> read_local_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return std::vector<uint8_t>(
+        std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>());
+}
+
+std::filesystem::path object_path_on_disk(const std::string& object_path) {
+    if (!object_path.empty() && object_path.front() == '/') {
+        return std::filesystem::path(object_path);
+    }
+    return std::filesystem::path("/") / object_path;
+}
+
 int test_transfer_write_failures(const std::string& base_path) {
     const auto directory = std::filesystem::path(base_path) / "write-failures";
     std::filesystem::create_directories(directory);
@@ -191,6 +228,62 @@ int test_transfer_write_failures(const std::string& base_path) {
     } catch (const lance::Error& error) {
         upload_error = error.code;
     }
+
+    auto failed_writer =
+        files.open_packed_blob_writer("blob-write-failure.lance", 73);
+    bool first_blob_write_threw = false;
+    LanceErrorCode first_blob_write_error = LANCE_OK;
+    try {
+        failed_writer.write_blob(
+            std::vector<uint8_t>(16 * 1024, static_cast<uint8_t>('x')));
+    } catch (const lance::Error& error) {
+        first_blob_write_threw = true;
+        first_blob_write_error = error.code;
+    }
+    bool second_blob_write_threw = false;
+    bool second_blob_write_reports_lost_upload = false;
+    try {
+        failed_writer.write_blob(std::vector<uint8_t>{'y'});
+    } catch (const lance::Error& error) {
+        second_blob_write_threw = true;
+        second_blob_write_reports_lost_upload =
+            std::string(error.what()).find("no active upload") !=
+            std::string::npos;
+    }
+    const auto sentinel = reinterpret_cast<void*>(
+        static_cast<uintptr_t>(0x5a5a));
+    ArrowArray failed_array{};
+    failed_array.private_data = sentinel;
+    ArrowSchema failed_schema{};
+    failed_schema.private_data = sentinel;
+    bool blob_finish_threw = false;
+    try {
+        failed_writer.finish_array(
+            "blob", &failed_array, &failed_schema);
+    } catch (const lance::Error& error) {
+        blob_finish_threw = true;
+        std::cout << "packed blob finish error=" << error.code << ": "
+                  << error.what() << std::endl;
+    }
+    std::cout << "packed blob write failure: first_error="
+              << first_blob_write_error
+              << ", first_threw=" << first_blob_write_threw
+              << ", second_threw=" << second_blob_write_threw
+              << ", finish_threw=" << blob_finish_threw << std::endl;
+    CHECK(first_blob_write_threw,
+          "packed writer reports a native write failure");
+    CHECK(second_blob_write_threw &&
+              second_blob_write_reports_lost_upload,
+          "packed failed write leaves native state without an active upload");
+    CHECK(blob_finish_threw, "packed finish after write failure reports error");
+    CHECK(failed_array.private_data == sentinel &&
+              failed_array.release == nullptr,
+          "failed packed finish leaves array output untouched");
+    CHECK(failed_schema.private_data == sentinel &&
+              failed_schema.release == nullptr,
+          "failed packed finish leaves schema output untouched");
+    if (failed_array.release) failed_array.release(&failed_array);
+    if (failed_schema.release) failed_schema.release(&failed_schema);
 
     if (setrlimit(RLIMIT_FSIZE, &original) != 0) return 2;
     std::signal(SIGXFSZ, previous_handler);
@@ -296,6 +389,85 @@ int main(int argc, char **argv) {
         }
         CHECK(threw, "lazy writer without data must fail finish");
     }
+
+    static_assert(!std::is_copy_constructible_v<lance::PackedBlobWriter>);
+    static_assert(!std::is_copy_constructible_v<lance::DedicatedBlobWriter>);
+
+    auto packed = [&]() {
+        lance::FileSession owner(base_uri, &storage);
+        return owner.open_packed_blob_writer("cpp/packed-blob.lance", 71);
+    }();
+    auto packed_writer = std::move(packed);
+    CHECK(packed_writer.blob_id() == 71, "packed blob writer id");
+    const auto packed_path = packed_writer.path();
+    BinaryFixture payloads;
+    packed_writer.write_blobs(&payloads.payloads, &payloads.schema);
+    CHECK(payloads.payloads.release == nullptr, "packed payloads consumed");
+    CHECK(payloads.schema.release != nullptr, "packed schema borrowed");
+    packed_writer.write_blob(nullptr, 0);
+    ArrowArray packed_array{};
+    ArrowSchema packed_schema{};
+    packed_writer.finish_array("blob", &packed_array, &packed_schema);
+    CHECK(packed_array.release != nullptr, "packed prepared array");
+    CHECK(packed_schema.release != nullptr, "packed prepared field");
+    CHECK(packed_array.length == 3, "packed prepared rows");
+    CHECK(packed_schema.name != nullptr &&
+              std::string(packed_schema.name) == "blob",
+          "packed prepared field name");
+#if defined(__unix__) || defined(__APPLE__)
+    CHECK(read_local_file(object_path_on_disk(packed_path)) ==
+              std::vector<uint8_t>{'b', 'e', 't', 'a'},
+          "packed sidecar survives session close");
+#endif
+    bool packed_repeated_finish_threw = false;
+    try {
+        (void)packed_writer.blob_id();
+    } catch (const lance::Error& error) {
+        packed_repeated_finish_threw =
+            error.code == LANCE_ERR_INVALID_ARGUMENT &&
+            std::string(error.what()).find("already finished") !=
+                std::string::npos;
+    }
+    CHECK(packed_repeated_finish_threw,
+          "finished packed writer reports its state");
+    if (packed_array.release) packed_array.release(&packed_array);
+    if (packed_schema.release) packed_schema.release(&packed_schema);
+
+    auto dedicated = [&]() {
+        lance::FileSession owner(base_uri, &storage);
+        return owner.open_dedicated_blob_writer("cpp/dedicated-blob.lance", 72);
+    }();
+    auto dedicated_writer = std::move(dedicated);
+    CHECK(dedicated_writer.blob_id() == 72, "dedicated blob writer id");
+    const auto dedicated_path = dedicated_writer.path();
+    dedicated_writer.write(std::vector<uint8_t>{'a', 'l', 'p', 'h', 'a'});
+    dedicated_writer.write(std::vector<uint8_t>{});
+    dedicated_writer.write(std::vector<uint8_t>{'o', 'm', 'e', 'g', 'a'});
+    ArrowArray dedicated_array{};
+    ArrowSchema dedicated_schema{};
+    dedicated_writer.finish_array("blob", &dedicated_array, &dedicated_schema);
+    CHECK(dedicated_array.release != nullptr, "dedicated prepared array");
+    CHECK(dedicated_schema.release != nullptr, "dedicated prepared field");
+    CHECK(dedicated_array.length == 1, "dedicated prepared rows");
+#if defined(__unix__) || defined(__APPLE__)
+    CHECK(read_local_file(object_path_on_disk(dedicated_path)) ==
+              std::vector<uint8_t>(
+                  {'a', 'l', 'p', 'h', 'a', 'o', 'm', 'e', 'g', 'a'}),
+          "dedicated writes concatenate");
+#endif
+    bool dedicated_write_after_finish_threw = false;
+    try {
+        dedicated_writer.write(std::vector<uint8_t>{'x'});
+    } catch (const lance::Error& error) {
+        dedicated_write_after_finish_threw =
+            error.code == LANCE_ERR_INVALID_ARGUMENT &&
+            std::string(error.what()).find("already finished") !=
+                std::string::npos;
+    }
+    CHECK(dedicated_write_after_finish_threw,
+          "finished dedicated writer reports its state");
+    if (dedicated_array.release) dedicated_array.release(&dedicated_array);
+    if (dedicated_schema.release) dedicated_schema.release(&dedicated_schema);
 
     std::unique_ptr<lance::StorageOptionsAccessor> dynamic_accessor;
     {

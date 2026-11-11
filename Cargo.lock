@@ -3709,6 +3709,7 @@ dependencies = [
  "futures",
  "half",
  "lance",
+ "lance-arrow",
  "lance-core",
  "lance-datafusion",
  "lance-datagen",
