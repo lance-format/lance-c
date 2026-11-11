@@ -6775,6 +6775,13 @@ fn scrub_fragment_paths(value: &mut serde_json::Value) {
                     scrub_fragment_paths(value);
                 }
             }
+            if let Some(serde_json::Value::Object(deletion_file)) = values.get_mut("deletion_file")
+            {
+                deletion_file.insert(
+                    "id".to_string(),
+                    serde_json::Value::String("<generated>".to_string()),
+                );
+            }
         }
         _ => {}
     }
