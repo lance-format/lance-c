@@ -555,6 +555,34 @@ The macOS dylib is a thin `arm64` Mach-O binary with install name
 `SystemConfiguration`, `libobjc.A.dylib`, `IOKit`, `CoreFoundation`,
 `Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`.
 
+Release builds produced by the current workflow strip the staged shared
+library and restrict its defined dynamic exports to the public `lance_*` C
+ABI. The static archive is not stripped: it keeps the symbol table required
+for static linking. Archive names and layout above are unchanged, and no
+standalone shared-only artifact is added.
+
+A release-candidate x86_64 Linux build from this change measured:
+
+| Artifact | Bytes |
+| --- | --- |
+| baseline `liblance_c.so` (main `6b5c55f`) | 385,778,240 |
+| candidate `liblance_c.so` before stripping | 385,614,104 |
+| candidate `liblance_c.so` after stripping | 321,793,408 |
+| `liblance_c.a` | 1,073,016,964 |
+
+This is a candidate measurement, not a published release. The stripped
+library exported 846 `lance_*` symbols and no dependency symbols. The
+baseline shared library exported 872 symbols, including 26 `crc_fast_*`
+symbols. The static archive was byte-identical to the baseline. The
+aarch64 and macOS rows use the same policy; their sizes are produced by the
+release matrix and are not claimed by this x86_64 measurement. The v0.1.9
+table and archive labels above are historical.
+
+All Linux rows also verify the staged shared library's direct `DT_NEEDED`
+entries before the consumer and archive steps. Only glibc/toolchain SONAMEs
+(including the legacy `libpthread` and `libdl` names) are accepted;
+`libssl` and `libcrypto` are rejected.
+
 The highest GLIBC symbol reference records a dynamic-loader requirement.
 The Mach-O `minos` field records the binary's declared deployment target.
 Runtime compatibility requires consumer verification on the intended OS.
@@ -1092,6 +1120,7 @@ back.
 ## Releasing
 
 Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds five prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, and macOS arm64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. Intel macOS consumers use the source build described above.
+Before the consumer smoke test and archive upload, the build rows strip the staged shared library, verify its exports, and verify the Linux direct runtime dependencies.
 
 ### Recommended: cut a release via Actions UI
 

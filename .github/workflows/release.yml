@@ -89,12 +89,16 @@ jobs:
             curl \
             git \
             libprotobuf-dev \
-            libssl-dev \
             perl \
             pkg-config \
             protobuf-compiler \
             xz-utils \
             zstd
+          # TLS stays on rustls; Cargo.lock has no openssl-sys or native-tls.
+          # openssl-probe only discovers certificate locations; it does not
+          # link OpenSSL.
+          # libssl-dev must not be installed here: an accidental libssl or
+          # libcrypto DT_NEEDED breaks dlopen in minimal Linux images.
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git (container)
         if: matrix.container != ''
@@ -128,6 +132,17 @@ jobs:
           cmake --build build --parallel
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
+      - name: Strip release shared library
+        run: bash .github/scripts/strip-release-shared.sh stage ${{ matrix.os_label }}
+      - name: Verify Linux shared-library exports
+        if: matrix.os_label == 'linux'
+        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.so stage/include/lance/lance.h linux
+      - name: Verify macOS shared-library exports
+        if: matrix.os_label == 'macos'
+        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.dylib stage/include/lance/lance.h macos
+      - name: Verify Linux staged runtime dependencies
+        if: matrix.os_label == 'linux'
+        run: bash .github/scripts/verify-linux-staging.sh stage ${{ matrix.target }}
       - name: Verify macOS staged libraries
         if: matrix.os_label == 'macos'
         run: bash .github/scripts/verify-macos-staging.sh stage arm64
