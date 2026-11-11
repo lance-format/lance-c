@@ -19818,16 +19818,24 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
 
 #[test]
 fn test_vector_index_ivf_rq_dot_query_reopen_and_native_oracle() {
-    let (_tmp, uri) = create_multi_fragment_vector_dataset(1, 64, 8, false);
+    let dim = 8_usize;
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(1, 64, dim as i32, false);
     let uri_c = c_str(&uri);
     let column = c_str("embedding");
     let index_name = c_str("rq_dot_idx");
     // Row 63 is (63 + component / 8). Lance's DOT distance is 1 - dot.
-    let query: Vec<f32> = (0..8)
-        .map(|component| 63.0 + component as f32 / 8.0)
+    let query: Vec<f32> = (0..dim)
+        .map(|component| 63.0 + component as f32 / dim as f32)
         .collect();
     let expected_ids = vec![63, 62, 61];
-    let expected_distances = vec![-32194.1875, -31686.6875, -31179.1875];
+    let expected_distances = expected_ids
+        .iter()
+        .map(|&id| {
+            1.0 - (0..dim)
+                .map(|component| query[component] * (id as f32 + component as f32 / dim as f32))
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
 
     let mut options = vector_index_options(LanceVectorIndexType::IvfRq, LanceMetricType::Dot);
     options.num_partitions = set_option(2);
