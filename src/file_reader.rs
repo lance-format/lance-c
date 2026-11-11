@@ -637,6 +637,9 @@ unsafe fn file_reader_get_io_stats_inner(
 }
 
 /// Stream all rows as Arrow C Data.
+///
+/// `batch_size` and `batch_readahead` must both be greater than zero; zero is
+/// rejected with `LANCE_ERR_INVALID_ARGUMENT` rather than replaced by a default.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_file_reader_read_all(
     reader: *const LanceFileReader,
@@ -659,6 +662,9 @@ pub unsafe extern "C" fn lance_file_reader_read_all(
 }
 
 /// Stream a checked native row range.
+///
+/// `batch_size` and `batch_readahead` must both be greater than zero; zero is
+/// rejected with `LANCE_ERR_INVALID_ARGUMENT` rather than replaced by a default.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_file_reader_read_range(
     reader: *const LanceFileReader,
@@ -705,6 +711,9 @@ unsafe fn file_reader_read_range_inner(
 }
 
 /// Stream native u32 row indices in the supplied order.
+///
+/// `batch_size` and `batch_readahead` must both be greater than zero; zero is
+/// rejected with `LANCE_ERR_INVALID_ARGUMENT` rather than replaced by a default.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_file_reader_read_indices(
     reader: *const LanceFileReader,
@@ -754,6 +763,16 @@ unsafe fn export_reader_stream(
     let reader = checked_reader(reader)?;
     if out.is_null() {
         return Err(Error::invalid_input("out must not be NULL"));
+    }
+    if batch_size == 0 {
+        return Err(Error::invalid_input(format!(
+            "batch_size must be greater than 0, got {batch_size}"
+        )));
+    }
+    if batch_readahead == 0 {
+        return Err(Error::invalid_input(format!(
+            "batch_readahead must be greater than 0, got {batch_readahead}"
+        )));
     }
     let stream = block_on(reader.inner.read_stream(
         params,
