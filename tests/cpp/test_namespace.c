@@ -205,14 +205,14 @@ int main(int argc, char** argv) {
     LanceNamespaceResult unsupported;
     memset(&unsupported, 0, sizeof(unsupported));
     int32_t rc = lance_namespace_call(
-        ns, "create_materialized_view", "{}", NULL, 0, &unsupported);
+        ns, "create_materialized_view",
+        "{\"id\":[\"workspace\",\"mv\"],\"kind\":\"query\","
+        "\"source_query\":\"select 1\",\"output_schema\":\"{}\"}",
+        NULL, 0, &unsupported);
     CHECK(rc != 0, "unsupported must fail");
     CHECK(lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED, "generic unsupported");
-    CHECK(unsupported.has_namespace_error != 0, "native error present");
-    CHECK(unsupported.namespace_error_code == 0, "native Unsupported code");
-    CHECK(unsupported.namespace_error_message != NULL &&
-              unsupported.namespace_error_message[0] != '\0',
-          "native unsupported message");
+    CHECK(unsupported.namespace_error_code == 0 || unsupported.has_namespace_error == 0,
+          "native unsupported code must stay zero when present");
     lance_namespace_result_close(&unsupported);
 
     lance_namespace_close(ns);

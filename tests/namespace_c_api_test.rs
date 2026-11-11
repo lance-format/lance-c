@@ -161,6 +161,13 @@ fn unsupported_request(operation: &str) -> &'static str {
         "alter_table_alter_columns" => r#"{"id":["workspace"],"alterations":[{"path":"x"}]}"#,
         "alter_table_drop_columns" => r#"{"id":["workspace"],"columns":["x"]}"#,
         "alter_table_backfill_columns" => r#"{"id":["workspace"],"column":"x"}"#,
+        "update_table" => r#"{"id":["workspace"],"updates":[]}"#,
+        "delete_from_table" => r#"{"id":["workspace"],"predicate":"true"}"#,
+        "register_table" => r#"{"id":["workspace"],"location":"x"}"#,
+        "restore_table" => r#"{"id":["workspace"],"version":1}"#,
+        "rename_table" => r#"{"id":["workspace"],"new_table_name":"x"}"#,
+        "alter_transaction" => r#"{"id":["workspace"],"actions":[]}"#,
+        "batch_commit_tables" => r#"{"operations":[]}"#,
         "create_table_version" => r#"{"id":["workspace"],"version":1,"manifest_path":"x"}"#,
         "batch_delete_table_versions" => {
             r#"{"id":["workspace"],"ranges":[{"start_version":0,"end_version":1}]}"#
@@ -271,13 +278,17 @@ fn close_namespace(namespace: *mut LanceNamespace) {
 }
 
 fn directory_namespace(root: &str) -> *mut LanceNamespace {
+    directory_namespace_with_session(root, ptr::null())
+}
+
+fn directory_namespace_with_session(root: &str, session: *mut LanceSession) -> *mut LanceNamespace {
     let properties = format!(
         r#"{{"root":"{}","manifest_enabled":"true","table_version_tracking_enabled":"true","ops_metrics_enabled":"true"}}"#,
         root.replace('\\', "\\\\").replace('"', "\\\"")
     );
     let properties = c_string(&properties);
     let namespace =
-        unsafe { lance_namespace_directory_new(properties.as_ptr(), ptr::null(), ptr::null()) };
+        unsafe { lance_namespace_directory_new(properties.as_ptr(), session, ptr::null()) };
     assert!(
         !namespace.is_null(),
         "directory namespace failed: {:?} {}",
@@ -292,7 +303,12 @@ fn directory_lifecycle_dataset_versions_metrics_and_dispatch() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("namespace");
     std::fs::create_dir_all(&root).unwrap();
-    let namespace = directory_namespace(root.to_str().unwrap());
+    let session = unsafe { lance_session_new(0, 0) };
+    assert!(!session.is_null(), "session: {}", last_error());
+    let namespace = directory_namespace_with_session(root.to_str().unwrap(), session);
+    // The native directory retains its own session Arc. Closing the C handle
+    // here must not invalidate later namespace operations.
+    unsafe { lance_session_close(session) };
 
     let id = unsafe { lance_namespace_id(namespace) };
     assert!(!id.is_null());
@@ -809,6 +825,21 @@ unsafe extern "C" fn dynamic_context(
     0
 }
 
+unsafe extern "C" fn failing_dynamic_context(
+    _context: *mut c_void,
+    _operation: *const c_char,
+    _object_id: *const c_char,
+    _response: *mut LanceOwnedString,
+    error: *mut LanceCallbackError,
+) -> i32 {
+    unsafe {
+        (*error).code = LanceErrorCode::Internal as i32;
+        (*error).message.data = owned_string("context provider failure");
+        (*error).message.release = Some(free_owned_string);
+    }
+    6
+}
+
 #[test]
 fn rest_adapter_client_context_headers_metrics_and_native_errors() {
     let tmp = tempfile::tempdir().unwrap();
@@ -866,6 +897,27 @@ fn rest_adapter_client_context_headers_metrics_and_native_errors() {
         calls.load(Ordering::SeqCst) > 0,
         "context provider must run"
     );
+
+    // DynamicContextProvider is infallible: a foreign context failure is
+    // logged natively and the request continues with an empty context map.
+    let failing_spec = LanceNamespaceContextProviderSpec {
+        provide_context: Some(failing_dynamic_context),
+        release: Some(count_release),
+        provider_ctx: Box::into_raw(Box::new(Arc::new(AtomicUsize::new(0)))).cast(),
+    };
+    let failing_client = unsafe { lance_namespace_rest_new(properties.as_ptr(), &failing_spec) };
+    assert!(
+        !failing_client.is_null(),
+        "REST namespace with failing context failed: {}",
+        last_error()
+    );
+    let count = assert_call_ok(
+        failing_client,
+        "count_table_rows",
+        r#"{"id":["workspace","rest-table"]}"#,
+    );
+    assert_eq!(count.json().as_deref(), Some("3"));
+    close_namespace(failing_client);
 
     let table_id_c = c_string(table_id);
     let opened = unsafe {
