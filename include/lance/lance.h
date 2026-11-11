@@ -285,6 +285,29 @@ typedef struct LanceVectorIndexOptions {
     bool train;
 } LanceVectorIndexOptions;
 
+/**
+ * Additive standalone IVF/PQ trainer controls. Zero-initialize this structure.
+ *
+ * An absent field preserves the native trainer default. A present value is
+ * forwarded verbatim, including zero, and native validation and failure
+ * behavior apply.
+ */
+typedef struct LanceIndexTrainerOptions {
+    LanceOptionalU64 sample_rate;
+    LanceOptionalU64 max_iters;
+} LanceIndexTrainerOptions;
+
+/**
+ * Additive scalar-index build controls.
+ *
+ * `has_train == false` preserves the native default (`train=true`). When true,
+ * `train` is forwarded exactly to the native `CreateIndexBuilder`.
+ */
+typedef struct LanceScalarIndexOptions {
+    bool has_train;
+    bool train;
+} LanceScalarIndexOptions;
+
 /** Return the error code from the last failed operation on this thread. */
 LanceErrorCode lance_last_error_code(void);
 
@@ -318,6 +341,7 @@ typedef struct LanceBlobDescriptorArrayBuilder LanceBlobDescriptorArrayBuilder;
 typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
+typedef struct LanceIvfModel LanceIvfModel;
 
 /* ─── Shared session ─── */
 
@@ -4354,6 +4378,22 @@ int32_t lance_dataset_create_scalar_index(
     bool replace
 );
 
+/**
+ * Create a scalar index with the additive native train control.
+ *
+ * `options == NULL` or `options->has_train == false` preserves the native
+ * default. `params_json` remains the native plugin parameter object.
+ */
+int32_t lance_dataset_create_scalar_index_with_options(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    LanceScalarIndexType index_type,
+    const char* params_json,
+    const LanceScalarIndexOptions* options,
+    bool replace
+);
+
 /* ─── Uncommitted index segment build ─── */
 
 /**
@@ -4465,6 +4505,20 @@ LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar(
 );
 
 /**
+ * Create a scalar segment builder with the additive native train control.
+ * `scalar_options == NULL` or an unset `has_train` preserves native defaults.
+ */
+LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar_with_options(
+    const LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    int32_t index_type,
+    const char* params_json,
+    const LanceScalarIndexOptions* scalar_options,
+    const LanceIndexSegmentBuildOptions* options
+);
+
+/**
  * Create a single-use vector index segment builder. Model arrays and schemas
  * are borrowed synchronously; arrays may be replaced but remain live and
  * caller-owned. When no model set is supplied, AUTO trains locally. PQ
@@ -4516,6 +4570,23 @@ int32_t lance_index_train_ivf_model(
 );
 
 /**
+ * Train IVF centroids with native sample-rate and iteration controls.
+ * `options == NULL` is equivalent to both fields absent. A present zero is
+ * forwarded to Lance; this binding does not add a zero-value policy.
+ */
+int32_t lance_index_train_ivf_model_with_options(
+    const LanceDataset* dataset,
+    const char* column,
+    uint32_t num_partitions,
+    int32_t metric,
+    const uint32_t* fragment_ids,
+    size_t fragment_count,
+    const LanceIndexTrainerOptions* options,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
  * Train a PQ codebook, exporting
  * FixedSizeList<Float32>[dimension / num_sub_vectors] with
  * num_sub_vectors * 2^num_bits rows. `num_bits` must be 4 or 8. The IVF
@@ -4537,6 +4608,83 @@ int32_t lance_index_train_pq_model(
     const struct ArrowSchema* ivf_centroids_schema,
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema
+);
+
+/**
+ * Train a PQ codebook with native sample-rate and iteration controls.
+ * The IVF centroids and Arrow output otherwise follow
+ * lance_index_train_pq_model.
+ */
+int32_t lance_index_train_pq_model_with_options(
+    const LanceDataset* dataset,
+    const char* column,
+    uint32_t num_sub_vectors,
+    uint32_t num_bits,
+    int32_t metric,
+    const uint32_t* fragment_ids,
+    size_t fragment_count,
+    struct ArrowArray* ivf_centroids,
+    const struct ArrowSchema* ivf_centroids_schema,
+    const LanceIndexTrainerOptions* options,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Open the first physical vector segment named `index_name` and return an
+ * owned clone of its IVF model. The handle does not borrow the dataset.
+ *
+ * Returns NULL on error. `index_name` must be non-NULL and non-empty.
+ */
+LanceIvfModel* lance_dataset_get_ivf_model(
+    const LanceDataset* dataset,
+    const char* index_name
+);
+
+/** Free an IVF model. NULL-safe. */
+void lance_ivf_model_free(LanceIvfModel* model);
+
+/** Whether the model contains centroids. NULL sets INVALID_ARGUMENT. */
+bool lance_ivf_model_has_centroids(const LanceIvfModel* model);
+
+/**
+ * Export an owned Arrow copy of the centroids. Both output structs must be
+ * zero-initialized and are unchanged on error. A model without centroids
+ * returns LANCE_ERR_NOT_FOUND.
+ */
+int32_t lance_ivf_model_export_centroids(
+    const LanceIvfModel* model,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Native partition count, dimension, and per-partition row count.
+ *
+ * These return 0 on an error sentinel; check lance_last_error_code(). An
+ * absent partition also returns 0 from lance_ivf_model_partition_size(),
+ * preserving IvfModel::partition_size for every representable usize.
+ */
+uint64_t lance_ivf_model_num_partitions(const LanceIvfModel* model);
+uint64_t lance_ivf_model_dimension(const LanceIvfModel* model);
+uint64_t lance_ivf_model_partition_size(
+    const LanceIvfModel* model,
+    uint64_t partition_id
+);
+
+/**
+ * Read one logical IVF partition across every physical segment.
+ *
+ * The returned ArrowArrayStream owns its native snapshot and remains valid
+ * after the source dataset is closed. The caller releases it once with its
+ * Arrow release callback.
+ */
+int32_t lance_dataset_read_index_partition(
+    const LanceDataset* dataset,
+    const char* index_name,
+    uint64_t partition_id,
+    bool with_vector,
+    struct ArrowArrayStream* out_stream
 );
 
 /**
@@ -4648,6 +4796,33 @@ typedef void (*LanceIndexBuildProgressCallback)(
  */
 int32_t lance_index_segment_builder_set_progress_callback(
     LanceIndexSegmentBuilder* builder,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx
+);
+
+/**
+ * Merge distributed Inverted index files for `index_uuid` into one root
+ * artifact. This call writes/merges files only: it does not commit a dataset
+ * version or return metadata. On error, partial files may remain.
+ *
+ * `index_uuid` points to 16 RFC 4122 bytes. `index_type` is parsed by native
+ * Lance; at this pin only "Inverted" is supported by this merge path. Other
+ * native index types return their native errors. `has_batch_readhead` absent
+ * maps to None; true forwards Some(batch_readhead), including zero. The
+ * selected core currently ignores this parameter.
+ *
+ * A non-NULL callback follows LanceIndexBuildProgressCallback's threading and
+ * lifetime contract. Callback retirement is enforced before this blocking
+ * call returns.
+ *
+ * Complete publication requires a separate CreateIndex operation.
+ */
+int32_t lance_dataset_merge_index_metadata(
+    const LanceDataset* dataset,
+    const uint8_t index_uuid[16],
+    const char* index_type,
+    bool has_batch_readhead,
+    size_t batch_readhead,
     LanceIndexBuildProgressCallback callback,
     void* callback_ctx
 );
@@ -4806,6 +4981,54 @@ int32_t lance_dataset_commit_index_segments(
 );
 
 /**
+ * Merge existing uncommitted physical segments into one uncommitted segment.
+ *
+ * Every input is a protobuf-encoded native IndexMetadata. Native Lance owns
+ * all compatibility, replay, stale-fragment, coverage and type-family rules.
+ * An empty set is passed to native validation. On success, `*out_bytes` and
+ * `*out_len` receive a library-owned metadata buffer to free with
+ * lance_free_bytes(); publication still requires
+ * lance_dataset_commit_index_segments(). This call does not commit or mutate
+ * the in-memory dataset snapshot.
+ */
+int32_t lance_dataset_merge_index_segments(
+    const LanceDataset* dataset,
+    const uint8_t* const* segment_metadata_bytes,
+    const size_t* segment_metadata_lens,
+    size_t segment_count,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Native prewarm controls.
+ *
+ * When `has_segment_selection` is false, the UUID pointer and count are
+ * ignored and map to native None. When true, count 0 maps to Some(empty) and
+ * performs no segment work; a positive count requires `segment_uuids` to point
+ * at `segment_count * 16` bytes of concatenated RFC 4122 UUIDs. Unknown
+ * segment UUIDs return LANCE_ERR_NOT_FOUND.
+ */
+typedef struct LanceIndexPrewarmOptions {
+    bool with_position;
+    bool has_segment_selection;
+    const uint8_t* segment_uuids;
+    size_t segment_count;
+} LanceIndexPrewarmOptions;
+
+/**
+ * Synchronously prewarm selected physical segments with native FTS position
+ * controls. `options == NULL` preserves the legacy all-segment behavior.
+ * Existing index-name/schema-column collision handling applies. Cache entries
+ * remain evictable; no residency or latency guarantee is made.
+ */
+int32_t lance_dataset_prewarm_index_with_options(
+    const LanceDataset* dataset,
+    const char* index_name,
+    const LanceIndexPrewarmOptions* options
+);
+
+/**
  * Synchronously prewarm a logical index in the dataset's session index cache.
  *
  * Delegates to the Rust SDK's prewarm_index for all segments with index_name
@@ -4841,6 +5064,34 @@ uint64_t lance_dataset_index_count(const LanceDataset* dataset);
  * Returns NULL on error.
  */
 const char* lance_dataset_index_list_json(const LanceDataset* dataset);
+
+/**
+ * JSON array of every native IndexDescription, including system indexes.
+ *
+ * Each entry carries the native name/type URL/index type, keyed field IDs,
+ * resolved field paths, approximate indexed-row count, native details JSON,
+ * total size (null when any segment lacks file sizes), and segment metadata.
+ * Native details conversion and field-path errors are returned as errors; the
+ * binding does not substitute `{}` or fabricated field paths. For each
+ * segment, fragment_ids is null for unknown coverage and [] for known-empty
+ * coverage. An empty dataset returns [].
+ *
+ * Caller must free the returned string with lance_free_string().
+ */
+const char* lance_dataset_describe_indices_json(const LanceDataset* dataset);
+
+/**
+ * Return the native index-family-specific statistics JSON unchanged.
+ *
+ * An absent index or empty name returns LANCE_ERR_NOT_FOUND. On old corrupt
+ * fragment coverage the native path may publish a migration version before
+ * returning; this handle is not automatically refreshed. Caller must free the
+ * returned string with lance_free_string().
+ */
+const char* lance_dataset_index_statistics_json(
+    LanceDataset* dataset,
+    const char* index_name
+);
 
 /**
  * JSON array describing non-system physical index segments visible to the
@@ -5018,6 +5269,20 @@ int32_t lance_scanner_set_minimum_nprobes(
 int32_t lance_scanner_set_maximum_nprobes(
     LanceScanner* scanner,
     uint32_t maximum_nprobes
+);
+
+/**
+ * Set the native continuous IVF search effort.
+ *
+ * The value must be finite and in [0, 1]. Any explicit value, including 0.5,
+ * ignores a fixed nprobes count while explicit minimum and maximum bounds
+ * remain effective, regardless of setter order. Invalid values are rejected
+ * without changing the previous configuration. Must be set before scanning.
+ * A scanner without nearest() fails when materialized.
+ */
+int32_t lance_scanner_set_search_effort(
+    LanceScanner* scanner,
+    double effort
 );
 
 /**

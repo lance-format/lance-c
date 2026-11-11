@@ -18,7 +18,8 @@ use lance::Dataset;
 use lance::index::DatasetIndexExt;
 use lance::index::vector::{StageParams, VectorIndexParams as LanceCoreVectorIndexParams};
 use lance_core::{Error, Result};
-use lance_index::progress::IndexBuildProgress;
+use lance_index::IndexType;
+use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::scalar::ScalarIndexParams;
 use lance_table::format::{IndexMetadata, pb};
 use prost::Message;
@@ -28,8 +29,9 @@ use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::helpers;
 use crate::index::{
-    LanceMetricType, LanceScalarIndexType, LanceVectorIndexOptions, LanceVectorIndexParams,
-    LanceVectorIndexType, build_vector_params_with_models, prepare_vector_build,
+    LanceMetricType, LanceScalarIndexOptions, LanceScalarIndexType, LanceVectorIndexOptions,
+    LanceVectorIndexParams, LanceVectorIndexType, build_vector_params_with_models,
+    prepare_vector_build, scalar_train,
 };
 use crate::runtime::block_on;
 
@@ -128,6 +130,7 @@ enum SegmentKind {
     Scalar {
         scalar_type: LanceScalarIndexType,
         params_json: Option<String>,
+        train: bool,
     },
     Vector {
         params: LanceCoreVectorIndexParams,
@@ -231,6 +234,41 @@ struct ProgressRetireGuard(Arc<ProgressCallbackGate>);
 impl Drop for ProgressRetireGuard {
     fn drop(&mut self) {
         self.0.retire();
+    }
+}
+
+/// Callback bridge that retires when the blocking native call returns.
+pub(crate) struct ProgressCallbackBridge {
+    callback: Arc<SendIndexBuildProgressCallback>,
+    _retire: ProgressRetireGuard,
+}
+
+impl ProgressCallbackBridge {
+    pub(crate) fn new(
+        callback: unsafe extern "C" fn(
+            callback_ctx: *mut c_void,
+            event: i32,
+            stage: *const c_char,
+            total: u64,
+            unit: *const c_char,
+            completed: u64,
+        ),
+        ctx: *mut c_void,
+    ) -> Self {
+        let callback = Arc::new(SendIndexBuildProgressCallback {
+            callback,
+            ctx,
+            gate: Arc::new(ProgressCallbackGate::default()),
+        });
+        let retire = ProgressRetireGuard(Arc::clone(&callback.gate));
+        Self {
+            callback,
+            _retire: retire,
+        }
+    }
+
+    pub(crate) fn progress(&self) -> Arc<dyn IndexBuildProgress> {
+        self.callback.clone()
     }
 }
 
@@ -461,6 +499,7 @@ pub unsafe extern "C" fn lance_index_segment_builder_new_scalar(
                 index_type,
                 params_json,
                 options,
+                true,
             )
         },
         null
@@ -474,6 +513,7 @@ unsafe fn new_scalar_builder_inner(
     index_type: i32,
     params_json: *const c_char,
     options: *const LanceIndexSegmentBuildOptions,
+    train: bool,
 ) -> Result<*mut LanceIndexSegmentBuilder> {
     if dataset.is_null() || column.is_null() {
         return Err(invalid_input("dataset and column must not be NULL"));
@@ -496,12 +536,64 @@ unsafe fn new_scalar_builder_inner(
         kind: SegmentKind::Scalar {
             scalar_type,
             params_json,
+            train,
         },
         fragment_ids: parsed.fragment_ids,
         index_uuid: parsed.index_uuid,
         progress: None,
         executed: false,
     })))
+}
+
+/// Create a scalar index segment builder with native train control.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_builder_new_scalar_with_options(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    index_type: i32,
+    params_json: *const c_char,
+    scalar_options: *const LanceScalarIndexOptions,
+    options: *const LanceIndexSegmentBuildOptions,
+) -> *mut LanceIndexSegmentBuilder {
+    ffi_try!(
+        unsafe {
+            new_scalar_builder_with_options_inner(
+                dataset,
+                column,
+                index_name,
+                index_type,
+                params_json,
+                scalar_options,
+                options,
+            )
+        },
+        ptr::null_mut()
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn new_scalar_builder_with_options_inner(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    index_type: i32,
+    params_json: *const c_char,
+    scalar_options: *const LanceScalarIndexOptions,
+    options: *const LanceIndexSegmentBuildOptions,
+) -> Result<*mut LanceIndexSegmentBuilder> {
+    let train = scalar_train(scalar_options)?;
+    unsafe {
+        new_scalar_builder_inner(
+            dataset,
+            column,
+            index_name,
+            index_type,
+            params_json,
+            options,
+            train,
+        )
+    }
 }
 
 /// Create a vector index segment builder bound to the dataset's current snapshot.
@@ -1265,6 +1357,7 @@ unsafe fn execute_uncommitted_inner(
         SegmentKind::Scalar {
             scalar_type,
             params_json,
+            train,
         } => {
             let mut params = ScalarIndexParams::for_builtin(scalar_type.to_builtin());
             params.params.clone_from(params_json);
@@ -1285,7 +1378,7 @@ unsafe fn execute_uncommitted_inner(
             if let Some(progress) = builder.progress.clone() {
                 core_builder = core_builder.progress(Arc::new(progress));
             }
-            block_on(core_builder.execute_uncommitted())
+            block_on(core_builder.train(*train).execute_uncommitted())
         }
         SegmentKind::Vector { params, train } => {
             let mut core_builder = builder.dataset.create_index_builder(
@@ -1309,7 +1402,16 @@ unsafe fn execute_uncommitted_inner(
         }
     };
     let metadata = result?;
-    let bytes = pb::IndexMetadata::from(&metadata).encode_to_vec();
+    unsafe { export_index_metadata(&metadata, out_bytes, out_len)? };
+    Ok(0)
+}
+
+unsafe fn export_index_metadata(
+    metadata: &IndexMetadata,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> Result<()> {
+    let bytes = pb::IndexMetadata::from(metadata).encode_to_vec();
     let allocation = unsafe { libc::malloc(bytes.len()) }.cast::<u8>();
     if allocation.is_null() {
         return Err(Error::internal(format!(
@@ -1322,7 +1424,7 @@ unsafe fn execute_uncommitted_inner(
         ptr::write(out_bytes, allocation);
         ptr::write(out_len, bytes.len());
     }
-    Ok(0)
+    Ok(())
 }
 
 /// Install (or replace) the index-build progress callback for a segment
@@ -1485,6 +1587,154 @@ unsafe fn commit_index_segments_inner(
     ds.with_mut(|dataset| {
         block_on(dataset.commit_existing_index_segments(index_name, column, segments))
     })?;
+    Ok(0)
+}
+
+/// Merge distributed Inverted index files into a single root artifact.
+///
+/// This writes and merges index files only. It does not commit a dataset
+/// version; publication requires the separate native CreateIndex operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_merge_index_metadata(
+    dataset: *const LanceDataset,
+    index_uuid: *const u8,
+    index_type: *const c_char,
+    has_batch_readhead: bool,
+    batch_readhead: usize,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            merge_index_metadata_inner(
+                dataset,
+                index_uuid,
+                index_type,
+                has_batch_readhead,
+                batch_readhead,
+                callback,
+                callback_ctx,
+            )
+        },
+        neg
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn merge_index_metadata_inner(
+    dataset: *const LanceDataset,
+    index_uuid: *const u8,
+    index_type: *const c_char,
+    has_batch_readhead: bool,
+    batch_readhead: usize,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
+) -> Result<i32> {
+    if dataset.is_null() || index_uuid.is_null() {
+        return Err(invalid_input("dataset and index_uuid must not be NULL"));
+    }
+    let index_type = unsafe { helpers::parse_c_string(index_type)? }
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_input("index_type must not be NULL or empty"))?;
+    let index_type = IndexType::try_from(index_type)?;
+    let uuid = Uuid::from_bytes(
+        unsafe { slice::from_raw_parts(index_uuid, 16) }
+            .try_into()
+            .expect("fixed-length UUID slice"),
+    );
+    let snapshot = unsafe { &*dataset }.snapshot();
+    let bridge = callback.map(|callback| ProgressCallbackBridge::new(callback, callback_ctx));
+    let progress = bridge
+        .as_ref()
+        .map(ProgressCallbackBridge::progress)
+        .unwrap_or_else(noop_progress);
+    block_on(snapshot.merge_index_metadata(
+        &uuid,
+        index_type,
+        has_batch_readhead.then_some(batch_readhead),
+        progress,
+    ))?;
+    Ok(0)
+}
+
+/// Merge existing uncommitted physical segments into one uncommitted segment.
+///
+/// Native Lance validates UUID uniqueness, coverage, type compatibility,
+/// current-snapshot replay and staleness rules. The returned bytes still need
+/// `lance_dataset_commit_index_segments` to publish them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_merge_index_segments(
+    dataset: *const LanceDataset,
+    segment_metadata_bytes: *const *const u8,
+    segment_metadata_lens: *const usize,
+    segment_count: usize,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            merge_index_segments_inner(
+                dataset,
+                segment_metadata_bytes,
+                segment_metadata_lens,
+                segment_count,
+                out_bytes,
+                out_len,
+            )
+        },
+        neg
+    )
+}
+
+unsafe fn merge_index_segments_inner(
+    dataset: *const LanceDataset,
+    segment_metadata_bytes: *const *const u8,
+    segment_metadata_lens: *const usize,
+    segment_count: usize,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> Result<i32> {
+    if dataset.is_null() || out_bytes.is_null() || out_len.is_null() {
+        return Err(invalid_input(
+            "dataset, out_bytes, and out_len must not be NULL",
+        ));
+    }
+    let mut segments = Vec::with_capacity(segment_count);
+    if segment_count > 0 {
+        if segment_metadata_bytes.is_null() || segment_metadata_lens.is_null() {
+            return Err(invalid_input(format!(
+                "segment_metadata_bytes and segment_metadata_lens must not be NULL when segment_count is {segment_count}"
+            )));
+        }
+        if segment_count > isize::MAX as usize / std::mem::size_of::<*const u8>() {
+            return Err(invalid_input(format!(
+                "segment_count {segment_count} exceeds the maximum addressable pointer slice length"
+            )));
+        }
+        let byte_ptrs = unsafe { slice::from_raw_parts(segment_metadata_bytes, segment_count) };
+        let lens = unsafe { slice::from_raw_parts(segment_metadata_lens, segment_count) };
+        for (position, (&bytes, &len)) in byte_ptrs.iter().zip(lens.iter()).enumerate() {
+            if bytes.is_null() || len == 0 {
+                return Err(invalid_input(format!(
+                    "segment_metadata_bytes[{position}] must be non-NULL and segment_metadata_lens[{position}] must be > 0; bytes={bytes:p}, len={len}"
+                )));
+            }
+            if len > isize::MAX as usize {
+                return Err(invalid_input(format!(
+                    "segment_metadata_lens[{position}]={len} exceeds the maximum addressable byte slice length"
+                )));
+            }
+            segments.push(
+                decode_segment_metadata(unsafe { slice::from_raw_parts(bytes, len) }).map_err(
+                    |error| invalid_input(format!("segment_metadata_bytes[{position}]: {error}")),
+                )?,
+            );
+        }
+    }
+
+    let snapshot = unsafe { &*dataset }.snapshot();
+    let merged = block_on(snapshot.merge_existing_index_segments(segments))?;
+    unsafe { export_index_metadata(&merged, out_bytes, out_len)? };
     Ok(0)
 }
 
