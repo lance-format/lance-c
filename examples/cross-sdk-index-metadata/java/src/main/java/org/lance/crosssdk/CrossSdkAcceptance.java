@@ -58,6 +58,8 @@ public final class CrossSdkAcceptance {
   private static final int VECTOR_BITS = 4;
   private static final int VECTOR_REFINE_FACTOR = 256;
   private static final int VECTOR_K = 4;
+  private static final int[] VECTOR_MULTIPLIERS = {3, 5, 7, 11, 13, 17, 19, 23};
+  private static final int[] VECTOR_MODULI = {29, 31, 37, 41, 43, 47, 53, 59};
 
   private CrossSdkAcceptance() {}
 
@@ -378,10 +380,9 @@ public final class CrossSdkAcceptance {
 
   private static float[] fixtureVector(int id) {
     float[] vector = new float[VECTOR_DIMENSION];
-    vector[0] = (id * 3) % 29;
-    vector[1] = (id * 5) % 31;
-    vector[2] = (id * 7) % 37;
-    vector[3] = (id * 11) % 41;
+    for (int component = 0; component < VECTOR_DIMENSION; ++component) {
+      vector[component] = (id * VECTOR_MULTIPLIERS[component]) % VECTOR_MODULI[component];
+    }
     return vector;
   }
 
@@ -805,9 +806,9 @@ public final class CrossSdkAcceptance {
           List<VectorQueryCase> cases =
               List.of(
                   new VectorQueryCase(
-                      1, List.of(1, 176, 213, 224), List.of(0.0f, 78.0f, 81.0f, 103.0f)),
+                      1, List.of(1, 255, 101, 34), List.of(0.0f, 232.0f, 403.0f, 516.0f)),
                   new VectorQueryCase(
-                      77, List.of(77, 114, 66, 182), List.of(0.0f, 35.0f, 78.0f, 94.0f)));
+                      199, List.of(199, 163, 124, 232), List.of(0.0f, 400.0f, 596.0f, 661.0f)));
           runVectorQueries(reopened, baseline, cases);
         }
       }

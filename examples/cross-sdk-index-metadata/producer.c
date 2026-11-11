@@ -293,18 +293,9 @@ static int vector_source_get_schema(struct ArrowArrayStream *stream,
 }
 
 static float fixture_vector_component(int32_t id, size_t component) {
-    switch (component) {
-    case 0:
-        return (float)((id * 3) % 29);
-    case 1:
-        return (float)((id * 5) % 31);
-    case 2:
-        return (float)((id * 7) % 37);
-    case 3:
-        return (float)((id * 11) % 41);
-    default:
-        return 0.0f;
-    }
+    static const int32_t multipliers[VECTOR_DIM] = {3, 5, 7, 11, 13, 17, 19, 23};
+    static const int32_t moduli[VECTOR_DIM] = {29, 31, 37, 41, 43, 47, 53, 59};
+    return (float)((id * multipliers[component]) % moduli[component]);
 }
 
 static int vector_source_get_next(struct ArrowArrayStream *stream,
