@@ -437,7 +437,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use lance::Dataset;
-    use lance::dataset::WriteDestination;
+    use lance::dataset::WriteParams;
     use lance_core::datatypes::Schema as NativeSchema;
 
     use super::*;
@@ -446,22 +446,15 @@ mod tests {
     use crate::runtime::block_on;
 
     const FIXTURE_FIELD_IDS: &[(&str, i32)] = &[
-        ("id", 10),
-        ("name", 42),
-        ("profile", 70),
-        ("profile.score", 71),
-        ("profile.tags", 72),
+        ("id", 0),
+        ("name", 2),
+        ("profile", 3),
+        ("profile.score", 4),
+        ("profile.tags", 5),
     ];
 
-    fn field_with_id(
-        name: &str,
-        data_type: DataType,
-        nullable: bool,
-        id: i32,
-        extra: &[(&str, &str)],
-    ) -> Field {
+    fn field(name: &str, data_type: DataType, nullable: bool, extra: &[(&str, &str)]) -> Field {
         let mut metadata = HashMap::new();
-        metadata.insert("lance:field_id".to_string(), id.to_string());
         for (key, value) in extra {
             metadata.insert((*key).to_string(), (*value).to_string());
         }
@@ -469,46 +462,37 @@ mod tests {
     }
 
     fn fixture_arrow_schema() -> Arc<ArrowSchema> {
-        let score = field_with_id(
+        let score = field(
             "score",
             DataType::Int32,
             true,
-            71,
             &[("fixture_role", "nested-score")],
         );
-        let tags = field_with_id(
+        let tags = field(
             "tags",
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             true,
-            72,
             &[("fixture_role", "nested-tags")],
         );
-        let profile = field_with_id(
+        let profile = field(
             "profile",
             DataType::Struct(Fields::from(vec![score, tags])),
             true,
-            70,
             &[("fixture_role", "profile")],
         );
-        let id = field_with_id(
-            "id",
-            DataType::Int64,
-            false,
-            10,
-            &[("fixture_role", "row-id")],
-        );
-        let name = field_with_id(
+        let id = field("id", DataType::Int64, false, &[("fixture_role", "row-id")]);
+        let name = field(
             "name",
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
             true,
-            42,
             &[("fixture_role", "dictionary-name")],
         );
+        let drop_me = field("drop_me", DataType::Utf8, true, &[]);
         let mut metadata = HashMap::new();
         metadata.insert("fixture".to_string(), "native-schema".to_string());
         metadata.insert("owner".to_string(), "lance-c".to_string());
         Arc::new(ArrowSchema::new_with_metadata(
-            vec![id, name, profile],
+            vec![id, drop_me, name, profile],
             metadata,
         ))
     }
@@ -547,15 +531,21 @@ mod tests {
             .collect();
         let tag_refs: Vec<&[&str]> = tag_rows.iter().map(|tags| tags.as_slice()).collect();
         let tags = tags_list(&tag_refs);
-        let profile_fields = match &arrow_schema.field(2).data_type() {
+        let profile_fields = match &arrow_schema.field(3).data_type() {
             DataType::Struct(fields) => fields.clone(),
             other => panic!("profile must be a struct, got {other:?}"),
         };
         let profile =
             Arc::new(StructArray::try_new(profile_fields, vec![scores, tags], None).unwrap());
+        let drop_me = Arc::new(StringArray::from(vec!["drop"; ids.len()]));
         RecordBatch::try_new(
             arrow_schema.clone(),
-            vec![Arc::new(Int64Array::from(ids.to_vec())), names, profile],
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                drop_me,
+                names,
+                profile,
+            ],
         )
         .unwrap()
     }
@@ -572,42 +562,36 @@ mod tests {
         let first = fixture_batch(&arrow_schema, &[1, 2, 3], &[0, 1, 2]);
         let second = fixture_batch(&arrow_schema, &[4, 5], &[1, 0]);
         let third = fixture_batch(&arrow_schema, &[6, 7, 8, 9], &[2, 2, 0, 1]);
-        // A regular new-dataset write reassigns field IDs to a dense range.
-        // Create the empty dataset through a native Overwrite commit instead so
-        // the explicit non-contiguous IDs survive, then append existing-schema
-        // batches, which inherit the dataset's field IDs.
-        let mut native_schema = NativeSchema::try_from(arrow_schema.as_ref()).unwrap();
-        native_schema.set_dictionary(&first).unwrap();
+        // Writing a new dataset assigns dense field IDs; dropping `drop_me`
+        // leaves a real gap, so the surviving IDs are non-contiguous without
+        // fabricating them in a binding.
         let dataset = block_on(async {
-            let mut dataset = Dataset::commit(
-                WriteDestination::Uri(&uri),
-                Operation::Overwrite {
-                    fragments: Vec::new(),
-                    schema: native_schema,
-                    config_upsert_values: None,
-                    initial_bases: None,
-                },
-                None,
-                None,
-                None,
-                Default::default(),
-                false,
+            let params = WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            };
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(first)], arrow_schema.clone()),
+                &uri,
+                Some(params),
             )
             .await
             .unwrap();
-            for batch in [first, second, third] {
-                dataset
-                    .append(
-                        RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone()),
-                        Some(lance::dataset::WriteParams {
-                            max_rows_per_file: 1024,
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap();
-            }
-            dataset.migrate_to_stable_row_ids().await.unwrap();
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(second)], arrow_schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(third)], arrow_schema),
+                    None,
+                )
+                .await
+                .unwrap();
+            dataset.drop_columns(&["drop_me"]).await.unwrap();
             dataset.delete("id = 2").await.unwrap();
             assert_eq!(dataset.get_fragments().len(), 3);
             assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
@@ -647,7 +631,7 @@ mod tests {
             name.metadata.get("fixture_role").map(String::as_str),
             Some("dictionary-name")
         );
-        assert_eq!(expected.field("profile.tags").unwrap().parent_id, 70);
+        assert_eq!(expected.field("profile.tags").unwrap().parent_id, 3);
 
         let dataset = block_on(Dataset::open(&uri)).unwrap();
         let handle = Box::new(LanceDataset {
@@ -669,9 +653,9 @@ mod tests {
         let schema = schema_handle(expected.clone());
         let clone = unsafe { cloned_schema(schema) };
         assert_eq!(clone, expected);
-        assert_eq!(clone.field_id("profile.tags").unwrap(), 72);
-        assert_eq!(clone.field_id("id").unwrap(), 10);
-        assert_eq!(clone.field_id("name").unwrap(), 42);
+        assert_eq!(clone.field_id("profile.tags").unwrap(), 5);
+        assert_eq!(clone.field_id("id").unwrap(), 0);
+        assert_eq!(clone.field_id("name").unwrap(), 2);
 
         for (path, id) in FIXTURE_FIELD_IDS {
             let mut out = -1;
@@ -722,7 +706,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["profile", "id"]
         );
-        assert_eq!(projected_value.field_id("profile.tags").unwrap(), 72);
+        assert_eq!(projected_value.field_id("profile.tags").unwrap(), 5);
         assert_eq!(
             projected_value.metadata.get("fixture").map(String::as_str),
             Some("native-schema")

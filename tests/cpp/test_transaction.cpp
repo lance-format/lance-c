@@ -98,11 +98,11 @@ static void test_native_schema(const std::string& uri) {
     CHECK(old_dataset.has_stable_row_ids());
 
     auto schema = old_dataset.native_schema();
-    CHECK(schema.field_id("id") == 10);
-    CHECK(schema.field_id("name") == 42);
-    CHECK(schema.field_id("profile") == 70);
-    CHECK(schema.field_id("profile.score") == 71);
-    CHECK(schema.field_id("profile.tags") == 72);
+    CHECK(schema.field_id("id") == 0);
+    CHECK(schema.field_id("name") == 2);
+    CHECK(schema.field_id("profile") == 3);
+    CHECK(schema.field_id("profile.score") == 4);
+    CHECK(schema.field_id("profile.tags") == 5);
 
     ArrowSchema arrow;
     std::memset(&arrow, 0, sizeof(arrow));
@@ -127,8 +127,8 @@ static void test_native_schema(const std::string& uri) {
 
     auto projected =
         lance::LanceSchema::project(schema, {"id", "name"});
-    CHECK(projected.field_id("id") == 10);
-    CHECK(projected.field_id("name") == 42);
+    CHECK(projected.field_id("id") == 0);
+    CHECK(projected.field_id("name") == 2);
     threw = false;
     try {
         (void)projected.field_id("profile.tags");
@@ -147,9 +147,9 @@ static void test_native_schema(const std::string& uri) {
     CHECK(operation.kind() == lance::OperationKind::Project);
     CHECK(operation.preserves_nullability());
     auto operation_schema = lance::LanceSchema::from_operation(operation);
-    CHECK(operation_schema.field_id("name") == 42);
+    CHECK(operation_schema.field_id("name") == 2);
     auto operation_schema_clone = operation_schema.clone();
-    CHECK(operation_schema_clone.field_id("id") == 10);
+    CHECK(operation_schema_clone.field_id("id") == 0);
 
     lance::CommitOptions commit_options;
     commit_options.max_retries = 0;
@@ -162,19 +162,19 @@ static void test_native_schema(const std::string& uri) {
     CHECK(committed.version() == old_version + 1);
     CHECK(committed.count_rows() == 8);
     CHECK(committed.fragment_count() == 3);
-    CHECK(committed.native_schema().field_id("name") == 42);
+    CHECK(committed.native_schema().field_id("name") == 2);
 
     // The pre-commit snapshot keeps its original schema and rows.
     CHECK(old_dataset.count_rows() == 8);
-    CHECK(old_dataset.native_schema().field_id("profile.tags") == 72);
+    CHECK(old_dataset.native_schema().field_id("profile.tags") == 5);
 
     auto reopened = lance::Dataset::open(uri);
     CHECK(reopened.version() == old_version + 1);
     CHECK(reopened.count_rows() == 8);
     CHECK(reopened.fragment_count() == 3);
     auto reopened_schema = reopened.native_schema();
-    CHECK(reopened_schema.field_id("id") == 10);
-    CHECK(reopened_schema.field_id("name") == 42);
+    CHECK(reopened_schema.field_id("id") == 0);
+    CHECK(reopened_schema.field_id("name") == 2);
     ArrowSchema reopened_arrow;
     std::memset(&reopened_arrow, 0, sizeof(reopened_arrow));
     reopened_schema.to_arrow(&reopened_arrow);

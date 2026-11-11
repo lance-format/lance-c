@@ -770,11 +770,11 @@ static void test_native_schema(const char *uri) {
     CHECK_OK();
 
     LanceSchema *schema = clone_dataset_schema(old_dataset);
-    check_field_id(schema, "id", 10);
-    check_field_id(schema, "name", 42);
-    check_field_id(schema, "profile", 70);
-    check_field_id(schema, "profile.score", 71);
-    check_field_id(schema, "profile.tags", 72);
+    check_field_id(schema, "id", 0);
+    check_field_id(schema, "name", 2);
+    check_field_id(schema, "profile", 3);
+    check_field_id(schema, "profile.score", 4);
+    check_field_id(schema, "profile.tags", 5);
 
     struct ArrowSchema arrow = {0};
     ASSERT(lance_schema_to_arrow(schema, &arrow) == 0,
@@ -804,7 +804,7 @@ static void test_native_schema(const char *uri) {
     CHECK_OK();
     lance_fragment_close(fragment);
     /* The clone must outlive its fragment owner. */
-    check_field_id(fragment_schema, "profile.tags", 72);
+    check_field_id(fragment_schema, "profile.tags", 5);
     lance_schema_close(fragment_schema);
 
     RowPair before[16] = {0};
@@ -816,8 +816,8 @@ static void test_native_schema(const char *uri) {
     ASSERT(lance_schema_project(schema, project_columns, 2, &projected) == 0,
            "project native schema");
     CHECK_OK();
-    check_field_id(projected, "id", 10);
-    check_field_id(projected, "name", 42);
+    check_field_id(projected, "id", 0);
+    check_field_id(projected, "name", 2);
     int32_t missing_id = -7;
     const char *missing_column = "profile.tags";
     ASSERT(lance_schema_field_id(projected, missing_column, &missing_id) == -1,
@@ -830,7 +830,7 @@ static void test_native_schema(const char *uri) {
     ASSERT(clone != NULL, "clone native schema value");
     CHECK_OK();
     lance_schema_close(schema);
-    check_field_id(clone, "profile.score", 71);
+    check_field_id(clone, "profile.score", 4);
     struct ArrowSchema clone_arrow = {0};
     ASSERT(lance_schema_to_arrow(clone, &clone_arrow) == 0,
            "arrow export from independent native schema clone");
@@ -861,7 +861,7 @@ static void test_native_schema(const char *uri) {
                                         &operation_schema) == 0,
            "clone Project operation schema");
     CHECK_OK();
-    check_field_id(operation_schema, "name", 42);
+    check_field_id(operation_schema, "name", 2);
     lance_schema_close(operation_schema);
     lance_operation_close(project_operation);
 
@@ -919,8 +919,8 @@ static void test_native_schema(const char *uri) {
            "projected dataset persisted rows");
     CHECK_OK();
     schema = clone_dataset_schema(reopened);
-    check_field_id(schema, "id", 10);
-    check_field_id(schema, "name", 42);
+    check_field_id(schema, "id", 0);
+    check_field_id(schema, "name", 2);
     int32_t dropped_id = -9;
     ASSERT(lance_schema_field_id(schema, "profile.tags", &dropped_id) == -1,
            "projected dataset dropped profile");
@@ -1031,7 +1031,7 @@ static void test_native_schema(const char *uri) {
            "winner Project persisted version");
     CHECK_OK();
     LanceSchema *winner_schema_after = clone_dataset_schema(winner_reopened);
-    check_field_id(winner_schema_after, "name", 42);
+    check_field_id(winner_schema_after, "name", 2);
     int32_t id_after_conflict = -1;
     ASSERT(lance_schema_field_id(winner_schema_after, "id",
                                  &id_after_conflict) == -1,
@@ -1046,7 +1046,7 @@ static void test_native_schema(const char *uri) {
            "old snapshot rows unchanged");
     CHECK_OK();
     LanceSchema *old_schema = clone_dataset_schema(old_dataset);
-    check_field_id(old_schema, "profile.tags", 72);
+    check_field_id(old_schema, "profile.tags", 5);
     lance_schema_close(old_schema);
     lance_dataset_close(old_dataset);
     lance_dataset_close(reopened);

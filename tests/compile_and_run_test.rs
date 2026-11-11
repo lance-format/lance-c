@@ -158,18 +158,8 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
 fn create_native_schema_fixture(name: &str) -> (tempfile::TempDir, String) {
     use std::collections::HashMap;
 
-    use lance::dataset::WriteDestination;
-    use lance::dataset::transaction::Operation;
-
-    fn field_with_id(
-        name: &str,
-        data_type: DataType,
-        nullable: bool,
-        id: i32,
-        extra: &[(&str, &str)],
-    ) -> Field {
+    fn field(name: &str, data_type: DataType, nullable: bool, extra: &[(&str, &str)]) -> Field {
         let mut metadata = HashMap::new();
-        metadata.insert("lance:field_id".to_string(), id.to_string());
         for (key, value) in extra {
             metadata.insert((*key).to_string(), (*value).to_string());
         }
@@ -195,14 +185,13 @@ fn create_native_schema_fixture(name: &str) -> (tempfile::TempDir, String) {
 
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().join(name).to_str().unwrap().to_string();
-    let score = field_with_id(
+    let score = field(
         "score",
         DataType::Int32,
         true,
-        71,
         &[("fixture_role", "nested-score")],
     );
-    let tags = field_with_id(
+    let tags = field(
         "tags",
         DataType::List(std::sync::Arc::new(Field::new(
             "item",
@@ -210,34 +199,29 @@ fn create_native_schema_fixture(name: &str) -> (tempfile::TempDir, String) {
             true,
         ))),
         true,
-        72,
         &[("fixture_role", "nested-tags")],
     );
-    let profile = field_with_id(
+    let profile = field(
         "profile",
         DataType::Struct(Fields::from(vec![score, tags])),
         true,
-        70,
         &[("fixture_role", "profile")],
     );
-    let id = field_with_id(
-        "id",
-        DataType::Int64,
-        false,
-        10,
-        &[("fixture_role", "row-id")],
-    );
-    let name = field_with_id(
+    let id = field("id", DataType::Int64, false, &[("fixture_role", "row-id")]);
+    let name = field(
         "name",
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         true,
-        42,
         &[("fixture_role", "dictionary-name")],
     );
+    let drop_me = field("drop_me", DataType::Utf8, true, &[]);
     let mut metadata = HashMap::new();
     metadata.insert("fixture".to_string(), "native-schema".to_string());
     metadata.insert("owner".to_string(), "lance-c".to_string());
-    let schema = std::sync::Arc::new(Schema::new_with_metadata(vec![id, name, profile], metadata));
+    let schema = std::sync::Arc::new(Schema::new_with_metadata(
+        vec![id, drop_me, name, profile],
+        metadata,
+    ));
 
     let make_batch = |ids: &[i64], name_keys: &[i32]| {
         let names = dictionary_names(name_keys);
@@ -252,17 +236,19 @@ fn create_native_schema_fixture(name: &str) -> (tempfile::TempDir, String) {
             .collect();
         let tag_refs: Vec<&[&str]> = tag_rows.iter().map(|tags| tags.as_slice()).collect();
         let tags = tags_list(&tag_refs);
-        let profile_fields = match &schema.field(2).data_type() {
+        let profile_fields = match &schema.field(3).data_type() {
             DataType::Struct(fields) => fields.clone(),
             other => panic!("profile must be a struct, got {other:?}"),
         };
         let profile = std::sync::Arc::new(
             StructArray::try_new(profile_fields, vec![scores, tags], None).unwrap(),
         );
+        let drop_me = std::sync::Arc::new(StringArray::from(vec!["drop"; ids.len()]));
         RecordBatch::try_new(
             schema.clone(),
             vec![
                 std::sync::Arc::new(Int64Array::from(ids.to_vec())),
+                drop_me,
                 names,
                 profile,
             ],
@@ -273,40 +259,34 @@ fn create_native_schema_fixture(name: &str) -> (tempfile::TempDir, String) {
     let first = make_batch(&[1, 2, 3], &[0, 1, 2]);
     let second = make_batch(&[4, 5], &[1, 0]);
     let third = make_batch(&[6, 7, 8, 9], &[2, 2, 0, 1]);
-    let mut native_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
-    native_schema.set_dictionary(&first).unwrap();
     lance_c::runtime::block_on(async {
-        // `Dataset::write` reassigns new-dataset field IDs; create through a
-        // native Overwrite commit to keep the explicit non-contiguous IDs.
-        let mut dataset = Dataset::commit(
-            WriteDestination::Uri(&uri),
-            Operation::Overwrite {
-                fragments: Vec::new(),
-                schema: native_schema,
-                config_upsert_values: None,
-                initial_bases: None,
-            },
-            None,
-            None,
-            None,
-            Default::default(),
-            false,
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            Some(params),
         )
         .await
         .unwrap();
-        for batch in [first, second, third] {
-            dataset
-                .append(
-                    arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-                    Some(WriteParams {
-                        max_rows_per_file: 1024,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
-        }
-        dataset.migrate_to_stable_row_ids().await.unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(third)], schema),
+                None,
+            )
+            .await
+            .unwrap();
+        // Dropping `drop_me` leaves a real gap in the surviving field IDs.
+        dataset.drop_columns(&["drop_me"]).await.unwrap();
         dataset.delete("id = 2").await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
     });
