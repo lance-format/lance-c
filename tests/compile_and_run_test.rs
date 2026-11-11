@@ -929,7 +929,7 @@ fn test_native_index_capabilities_consumers() {
     let cpp_source = tests_dir.join("test_index_capabilities.cpp");
     let cpp_binary = build_dir.path().join("test_index_capabilities_cpp");
     assert!(
-        compile_cpp_test(&cpp_source, &cpp_binary, &include_dir, &lib_path),
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "focused C++ index capability consumer failed to compile"
     );
     run_test_binary_with_dataset(&cpp_binary, &cpp_uri);
