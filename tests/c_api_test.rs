@@ -11459,6 +11459,101 @@ fn native_rtree_ids(uri: &str, filter: &str, use_scalar_index: bool) -> Vec<i32>
     })
 }
 
+#[test]
+fn test_rtree_reloaded_nonfinite_bounds_keep_finite_matches() {
+    use geo_types::{LineString, coord};
+    use geoarrow_array::{GeoArrowArray, builder::LineStringBuilder};
+    use geoarrow_schema::{Dimension, LineStringType};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("rtree_nonfinite");
+    let uri = uri.to_str().unwrap();
+    let geometry_type = LineStringType::new(Dimension::XY, Default::default());
+    let mut geometries = LineStringBuilder::new(geometry_type.clone());
+    for coordinates in [
+        Some(vec![(f64::NEG_INFINITY, 1.0), (2.0, 3.0)]),
+        Some(vec![(10.0, 10.0), (11.0, 11.0)]),
+        Some(vec![(20.0, 20.0), (21.0, 21.0)]),
+        None,
+        Some(Vec::new()),
+        Some(vec![(50.0, 50.0), (51.0, 51.0)]),
+    ] {
+        let geometry = coordinates.map(|coordinates| {
+            LineString::new(
+                coordinates
+                    .into_iter()
+                    .map(|(x, y)| coord! { x: x, y: y })
+                    .collect(),
+            )
+        });
+        geometries.push_line_string(geometry.as_ref()).unwrap();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        geometry_type.to_field("geometry", true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..6)),
+            geometries.finish().to_array_ref(),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+    });
+
+    let uri_c = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                c_str("geometry").as_ptr(),
+                c_str("nonfinite_rtree").as_ptr(),
+                LanceScalarIndexType::RTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let filter = "ST_Intersects(geometry, ST_GeomFromWKT('POINT (10 10)'))";
+    let (ffi_indexed, _, plan) = scan_geometry_ids(dataset, filter, true);
+    let (ffi_flat, _, _) = scan_geometry_ids(dataset, filter, false);
+    let native_indexed = native_rtree_ids(uri, filter, true);
+    let native_flat = native_rtree_ids(uri, filter, false);
+    unsafe { lance_dataset_close(dataset) };
+
+    eprintln!(
+        "nonfinite RTree: ffi_indexed={ffi_indexed:?}, ffi_flat={ffi_flat:?}, native_indexed={native_indexed:?}, native_flat={native_flat:?}; plan={plan}"
+    );
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert_eq!(native_flat, vec![1]);
+    assert_eq!(ffi_flat, vec![1]);
+    assert_eq!(native_indexed, vec![1]);
+    assert_eq!(ffi_indexed, vec![1]);
+}
+
 fn scan_used_rtree(stats: &CapturedScanStatistics) -> bool {
     stats.indices_loaded > 0
         || stats.metrics.iter().any(|(name, _, value)| {
