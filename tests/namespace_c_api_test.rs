@@ -1140,6 +1140,58 @@ fn rest_adapter_client_context_headers_metrics_and_native_errors() {
 }
 
 #[test]
+fn default_custom_clients_have_isolated_and_stable_provider_identity() {
+    let table_id = c_string(r#"["workspace","shared-table"]"#);
+    let empty_id = c_string("");
+    let mut identities = Vec::new();
+    for namespace_id in [ptr::null(), ptr::null(), empty_id.as_ptr()] {
+        let spec = LanceNamespaceCustomClientSpec {
+            describe_table: Some(unsupported_callback),
+            describe_table_version: Some(unsupported_callback),
+            create_table_version: Some(unsupported_callback),
+            list_table_versions: Some(unsupported_callback),
+            release: None,
+            client_ctx: ptr::null_mut(),
+            namespace_id,
+        };
+        let namespace = unsafe { lance_namespace_custom_new(&spec) };
+        assert!(!namespace.is_null(), "{}", last_error());
+        let id = take_and_free(unsafe { lance_namespace_id(namespace) });
+        assert!(!id.is_empty());
+        assert_eq!(id, take_and_free(unsafe { lance_namespace_id(namespace) }));
+        let mut provider_ids = Vec::new();
+        for _ in 0..2 {
+            let provider = unsafe {
+                lance_namespace_storage_options_provider_new(namespace, table_id.as_ptr())
+            };
+            assert!(!provider.is_null(), "{}", last_error());
+            provider_ids.push(take_and_free(unsafe {
+                lance_storage_options_provider_id(provider)
+            }));
+            unsafe { lance_storage_options_provider_close(provider) };
+        }
+        close_namespace(namespace);
+        assert_eq!(
+            provider_ids[0], provider_ids[1],
+            "providers for the same client and table must share their native identity"
+        );
+        identities.push((id, provider_ids.remove(0)));
+    }
+    for (index, (namespace_id, provider_id)) in identities.iter().enumerate() {
+        for (other_namespace_id, other_provider_id) in &identities[index + 1..] {
+            assert_ne!(
+                namespace_id, other_namespace_id,
+                "independent default clients must have different namespace identities"
+            );
+            assert_ne!(
+                provider_id, other_provider_id,
+                "independent default clients must isolate native provider cache identities"
+            );
+        }
+    }
+}
+
+#[test]
 fn namespace_provider_identity_and_forced_refresh() {
     let fetch_count = Arc::new(AtomicUsize::new(0));
     // A custom namespace's describe callback returns changing storage options.

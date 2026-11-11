@@ -179,6 +179,14 @@ int main(int argc, char** argv) {
         custom_spec.list_table_versions = [](const std::string&) {
             return std::string(R"({"versions":[]})");
         };
+        {
+            auto first = lance::Namespace::custom(custom_spec);
+            auto second = lance::Namespace::custom(custom_spec);
+            const auto first_id = first.id();
+            require(!first_id.empty(), "default custom identity is nonempty");
+            require(first.id() == first_id, "default custom identity is stable");
+            require(first_id != second.id(), "default custom clients have distinct identities");
+        }
         custom_spec.namespace_id = "custom-cpp";
         lance::Namespace custom = lance::Namespace::custom(custom_spec);
         require(custom.id() == "custom-cpp", "custom id");
