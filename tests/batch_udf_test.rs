@@ -147,7 +147,6 @@ enum MapperMode {
 #[derive(Clone, Debug)]
 struct MapperEvent {
     input_fields: Vec<String>,
-    input_metadata: HashMap<String, String>,
     rows: usize,
 }
 
@@ -166,17 +165,6 @@ enum StoreMethod {
     GetBatch,
     InsertBatch,
     InsertFragment,
-}
-
-impl StoreMethod {
-    fn label(self) -> &'static str {
-        match self {
-            Self::GetFragment => "get_fragment",
-            Self::GetBatch => "get_batch",
-            Self::InsertBatch => "insert_batch",
-            Self::InsertFragment => "insert_fragment",
-        }
-    }
 }
 
 struct Failure {
@@ -361,7 +349,6 @@ unsafe extern "C" fn mapper_callback(
             .iter()
             .map(|field| field.name().clone())
             .collect(),
-        input_metadata: input_schema.metadata().clone(),
         rows,
     });
 
@@ -573,7 +560,7 @@ fn run_batch_udf(
     };
 
     let raw_store = checkpoint_store(context);
-    let mut raw = LanceBatchUDF {
+    let raw = LanceBatchUDF {
         mapper: Some(mapper_callback),
         mapper_ctx: (context as *const CallbackContext).cast_mut().cast(),
         output_schema: declared_schema,
@@ -586,7 +573,7 @@ fn run_batch_udf(
     unsafe {
         lance_dataset_add_columns_batch_udf(
             dataset,
-            &mut raw,
+            &raw,
             read_ptrs
                 .as_ref()
                 .map_or(ptr::null(), |columns| columns.as_ptr()),
@@ -670,6 +657,17 @@ fn count_data_files(uri: &str) -> usize {
         .count()
 }
 
+fn checkpoint_file_exists(uri: &str, path: &str) -> bool {
+    let relative = path.trim_start_matches("./");
+    let root = std::path::Path::new(uri);
+    root.join(relative).exists()
+        || root.join("data").join(relative).exists()
+        || root
+            .join("data")
+            .join(std::path::Path::new(relative).file_name().unwrap())
+            .exists()
+}
+
 #[test]
 fn test_batch_udf_native_oracle_metadata_and_retained_payloads() {
     let tmp = tempfile::tempdir().unwrap();
@@ -699,6 +697,12 @@ fn test_batch_udf_native_oracle_metadata_and_retained_payloads() {
 
     let dataset = open(&c_uri);
     let baseline = unsafe { lance_dataset_version(dataset) };
+    let fragment_ids = lance_c::runtime::block_on(Dataset::open(&c_uri))
+        .unwrap()
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
     let ffi_schema = schema_to_ffi(&declared);
     let (mapper, store, context) = make_context(declared.clone(), MapperMode::Constant(42));
     assert_eq!(
@@ -726,11 +730,37 @@ fn test_batch_udf_native_oracle_metadata_and_retained_payloads() {
             event.input_fields,
             vec!["id".to_owned(), "label".to_owned()]
         );
-        assert_eq!(
-            event.input_metadata.get("dataset-key").map(String::as_str),
-            Some("dataset-value")
-        );
         assert_eq!(event.rows, 4);
+    }
+    let events = store.events.lock().unwrap().clone();
+    for fragment_id in fragment_ids {
+        let get_fragment = events
+            .iter()
+            .position(|event| event == &format!("get_fragment:{fragment_id}"))
+            .unwrap();
+        let get_batch = events
+            .iter()
+            .position(|event| event == &format!("get_batch:{fragment_id}:0"))
+            .unwrap();
+        let mapper = events
+            .iter()
+            .enumerate()
+            .skip(get_batch + 1)
+            .find(|(_, event)| *event == "mapper")
+            .map(|(index, _)| index)
+            .unwrap();
+        let insert_batch = events
+            .iter()
+            .position(|event| event == &format!("insert_batch:{fragment_id}:0"))
+            .unwrap();
+        let insert_fragment = events
+            .iter()
+            .position(|event| event == &format!("insert_fragment:{fragment_id}"))
+            .unwrap();
+        assert!(get_fragment < get_batch);
+        assert!(get_batch < mapper);
+        assert!(mapper < insert_batch);
+        assert!(insert_batch < insert_fragment);
     }
 
     let inserted_fragments = store.inserted_fragments.lock().unwrap().clone();
@@ -808,18 +838,47 @@ fn test_batch_udf_zero_columns_and_null_context() {
     };
     assert_eq!(
         unsafe { lance_dataset_add_columns_batch_udf(dataset, &raw, ptr::null(), ptr::null(),) },
-        0,
-        "zero-column BatchUDF failed: {:?}",
-        take_error()
+        -1,
+    );
+    let (code, message) = take_error();
+    assert_eq!(code, LanceErrorCode::InvalidArgument);
+    assert!(
+        message.contains("does not contain any fields"),
+        "native must reject the fieldless data file, got: {message}"
     );
     assert_eq!(unsafe { lance_dataset_count_rows(dataset) }, rows_before);
-    assert!(unsafe { lance_dataset_version(dataset) } >= baseline);
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, baseline);
     unsafe { lance_dataset_close(dataset) };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = fixture_uri(&tmp, "zero-checkpoint");
+    create_batch_udf_dataset(&uri, false);
+    let declared = empty_output_schema();
+    let ffi_schema = schema_to_ffi(&declared);
+    let dataset = open(&uri);
+    let baseline = unsafe { lance_dataset_version(dataset) };
+    let (mapper, store, context) = make_context(declared, MapperMode::ZeroColumns);
+    assert_eq!(
+        run_batch_udf(dataset, &ffi_schema, &context, None, None, true),
+        -1,
+    );
+    assert_eq!(take_error().0, LanceErrorCode::InvalidArgument);
+    assert_eq!(mapper.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, baseline);
+    let stored = std::mem::take(&mut *store.inserted_batches.lock().unwrap());
+    assert_eq!(stored.len(), 2);
+    unsafe { lance_dataset_close(dataset) };
+    for stored in stored {
+        let batch = import_stored(stored);
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 4);
+    }
 }
 
 #[test]
 fn test_batch_udf_read_columns_and_batch_options() {
-    let cases: Vec<(Option<Vec<&str>>, Vec<String>, Option<u32>, usize)> = vec![
+    type ReadColumnsCase = (Option<Vec<&str>>, Vec<String>, Option<u32>, usize);
+    let cases: Vec<ReadColumnsCase> = vec![
         (None, vec!["id".into(), "label".into()], None, 2),
         (Some(Vec::new()), vec!["_rowaddr".into()], None, 2),
         (Some(vec!["id"]), vec!["id".into()], None, 2),
@@ -877,7 +936,7 @@ fn test_batch_udf_read_columns_and_batch_options() {
         );
         if read_columns == vec!["missing"] {
             assert_eq!(rc, -1);
-            assert_eq!(take_error().0, LanceErrorCode::InvalidArgument);
+            assert_eq!(take_error().0, LanceErrorCode::Internal);
             assert_eq!(mapper.calls.load(Ordering::SeqCst), 0);
         } else {
             assert_eq!(rc, 0, "_rowid should be accepted: {:?}", take_error());
@@ -1224,7 +1283,7 @@ fn test_batch_udf_checkpoint_failures_cleanup_and_preserve() {
         let fragment: Fragment = serde_json::from_str(&inserted[0].1).unwrap();
         for file in fragment.files {
             assert!(
-                std::path::Path::new(&uri).join(&file.path).exists(),
+                checkpoint_file_exists(&uri, &file.path),
                 "checkpoint-owned file {} must be preserved",
                 file.path
             );
@@ -1257,5 +1316,114 @@ fn test_batch_udf_checkpoint_failures_cleanup_and_preserve() {
         assert_eq!(mapper.calls.load(Ordering::SeqCst), 0);
         assert_eq!(unsafe { lance_dataset_version(dataset) }, baseline);
         unsafe { lance_dataset_close(dataset) };
+    }
+}
+
+#[test]
+fn test_batch_udf_snapshots_reopen_and_commit_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = fixture_uri(&tmp, "snapshots");
+    create_batch_udf_dataset(&uri, false);
+    let dataset = open(&uri);
+    let old_handle = open(&uri);
+    let baseline = unsafe { lance_dataset_version(dataset) };
+    let old_scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!old_scanner.is_null());
+    let mut fragment_ids = vec![0u64; unsafe { lance_dataset_fragment_count(dataset) } as usize];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let fragment_id = fragment_ids[0];
+    let old_fragment = unsafe { lance_dataset_open_fragment(dataset, fragment_id) };
+    assert!(!old_fragment.is_null());
+
+    let declared = output_schema();
+    let ffi_schema = schema_to_ffi(&declared);
+    let (_mapper, _store, context) = make_context(declared, MapperMode::Constant(77));
+    assert_eq!(
+        run_batch_udf(dataset, &ffi_schema, &context, None, None, false),
+        0,
+        "snapshot mutation failed: {:?}",
+        take_error()
+    );
+    assert!(unsafe { lance_dataset_version(dataset) } > baseline);
+    assert_eq!(unsafe { lance_dataset_version(old_handle) }, baseline);
+    assert!(
+        exported_schema(old_handle)
+            .field_with_name("derived")
+            .is_err()
+    );
+
+    let mut old_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(old_scanner, &mut old_stream) },
+        0
+    );
+    let old_reader = unsafe { ArrowArrayStreamReader::from_raw(&mut old_stream) }.unwrap();
+    assert!(old_reader.schema().field_with_name("derived").is_err());
+    assert_eq!(
+        old_reader
+            .map(Result::unwrap)
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        8
+    );
+    let mut fragment_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_fragment_schema(old_fragment, &mut fragment_schema) },
+        0
+    );
+    assert!(
+        Schema::try_from(&fragment_schema)
+            .unwrap()
+            .field_with_name("derived")
+            .is_err()
+    );
+    let reopened = open(&uri);
+    assert!(exported_schema(reopened).field_with_name("derived").is_ok());
+    assert_eq!(derive_map(reopened, "derived").len(), 8);
+
+    let stale = open(&uri);
+    let writer = open(&uri);
+    let conflict_baseline = unsafe { lance_dataset_version(stale) };
+    let name = c_string("writer_column");
+    let expression = c_string("id * 10");
+    let column = LanceSqlColumn {
+        name: name.as_ptr(),
+        expression: expression.as_ptr(),
+    };
+    assert_eq!(
+        unsafe { lance_dataset_add_columns_sql(writer, &column, 1, 0) },
+        0
+    );
+    assert!(unsafe { lance_dataset_version(writer) } > conflict_baseline);
+    let conflict_schema = Arc::new(Schema::new(vec![Field::new(
+        "conflict_column",
+        DataType::Int64,
+        true,
+    )]));
+    let conflict_ffi = schema_to_ffi(&conflict_schema);
+    let (_mapper, _store, context) = make_context(conflict_schema, MapperMode::Constant(1));
+    assert_eq!(
+        run_batch_udf(stale, &conflict_ffi, &context, None, None, false),
+        -1
+    );
+    assert_eq!(take_error().0, LanceErrorCode::CommitConflict);
+    assert_eq!(unsafe { lance_dataset_version(stale) }, conflict_baseline);
+    let latest = open(&uri);
+    let latest_schema = exported_schema(latest);
+    assert!(latest_schema.field_with_name("writer_column").is_ok());
+    assert!(latest_schema.field_with_name("conflict_column").is_err());
+
+    unsafe {
+        lance_dataset_close(latest);
+        lance_dataset_close(writer);
+        lance_dataset_close(stale);
+        lance_dataset_close(reopened);
+        lance_fragment_close(old_fragment);
+        lance_scanner_close(old_scanner);
+        lance_dataset_close(old_handle);
+        lance_dataset_close(dataset);
     }
 }

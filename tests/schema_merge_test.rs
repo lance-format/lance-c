@@ -521,6 +521,15 @@ fn test_merge_row_id_and_row_addr_keys() {
         for (id, value) in actual {
             assert_eq!(value, i64::from(id) + 1000);
         }
+        if key == "_rowid" {
+            let before = rows.iter().copied().collect::<BTreeMap<_, _>>();
+            let (after_rows, _, _) = collect_row_keys(&c_uri, true);
+            let after = after_rows.iter().copied().collect::<BTreeMap<_, _>>();
+            assert_eq!(
+                after, before,
+                "stable _rowid values must survive a native merge rewrite"
+            );
+        }
         unsafe { lance_dataset_close(dataset) };
     }
 }
