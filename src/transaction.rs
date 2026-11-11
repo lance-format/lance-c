@@ -663,7 +663,7 @@ unsafe fn operation_append_new_inner(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_operation_restore_new(version: u64) -> *mut LanceOperation {
     ffi_try!(
-        unsafe {
+        {
             Ok(Box::into_raw(Box::new(LanceOperation::from_native(
                 Operation::Restore { version },
             )?)))

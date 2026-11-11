@@ -43202,8 +43202,8 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
                 data_file_snapshot(file),
                 (
                     native_file.path.clone(),
-                    native_file.fields.clone(),
-                    native_file.column_indices.clone(),
+                    native_file.fields.to_vec(),
+                    native_file.column_indices.to_vec(),
                     (
                         native_file.file_major_version,
                         native_file.file_minor_version,
@@ -43232,8 +43232,8 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
                 data_file_snapshot(field_file),
                 (
                     expected_file.path.clone(),
-                    expected_file.fields.clone(),
-                    expected_file.column_indices.clone(),
+                    expected_file.fields.to_vec(),
+                    expected_file.column_indices.to_vec(),
                     (
                         expected_file.file_major_version,
                         expected_file.file_minor_version,

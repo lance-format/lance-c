@@ -358,6 +358,7 @@ typedef struct LanceFtsQueryContext LanceFtsQueryContext;
 typedef struct LanceFtsQuery LanceFtsQuery;
 typedef struct LanceBlobFile LanceBlobFile;
 typedef struct LanceBlobDescriptorArrayBuilder LanceBlobDescriptorArrayBuilder;
+typedef struct LanceDataFile LanceDataFile;
 typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
@@ -6706,7 +6707,6 @@ int32_t lance_dataset_write_with_options(
 /* ─── Native data files ─── */
 
 /** Owned native `DataFile` metadata snapshot. */
-typedef struct LanceDataFile LanceDataFile;
 
 /**
  * Create native data-file metadata from an existing Lance file.
