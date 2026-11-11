@@ -80,7 +80,7 @@ pub struct LanceStorageOptionsProviderSpec {
 }
 
 pub struct LanceStorageOptionsProvider {
-    pub(crate) inner: Arc<FfiStorageOptionsProvider>,
+    inner: Arc<FfiStorageOptionsProvider>,
 }
 
 pub struct LanceStorageOptionsAccessor {

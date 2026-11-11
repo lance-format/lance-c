@@ -12,7 +12,7 @@ use arrow_array::UInt32Array;
 use arrow_schema::Schema as ArrowSchema;
 use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
-use lance_encoding::decoder::{DecoderConfig, DecoderPlugins, FilterExpression};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::format::pbfile;
 use lance_file::reader::{
     CachedFileMetadata, ColumnStatistics, FileReader, FileReaderOptions, FileStatistics,
@@ -22,7 +22,6 @@ use lance_file::version::ConcreteFileVersion;
 use lance_file::versions;
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::IoStats;
-use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 
@@ -177,7 +176,7 @@ pub struct LanceFileMetadata {
     inner: Arc<CachedFileMetadata>,
     info: LanceFileMetadataInfo,
     global_buffers: Vec<LanceBufferDescriptor>,
-    columns: Vec<ColumnBacking>,
+    _columns: Vec<ColumnBacking>,
     column_headers: Vec<LanceColumnMetadata>,
 }
 
@@ -186,7 +185,7 @@ pub struct LanceFileStatistics {
 }
 
 struct EncodingBacking {
-    direct_bytes: Vec<u8>,
+    _direct_bytes: Vec<u8>,
     header: LanceEncodingDescriptor,
 }
 
@@ -222,16 +221,16 @@ impl EncodingBacking {
             header.direct_bytes_len = direct_bytes.len();
         }
         Self {
-            direct_bytes,
+            _direct_bytes: direct_bytes,
             header,
         }
     }
 }
 
 struct PageBacking {
-    buffers: Vec<LanceBufferDescriptor>,
-    description: CString,
-    encoding: EncodingBacking,
+    _buffers: Vec<LanceBufferDescriptor>,
+    _description: CString,
+    _encoding: EncodingBacking,
     header: LancePageMetadata,
 }
 
@@ -253,19 +252,19 @@ impl PageBacking {
             encoding_description: description.as_ptr(),
         };
         Ok(Self {
-            buffers,
-            description,
-            encoding,
+            _buffers: buffers,
+            _description: description,
+            _encoding: encoding,
             header,
         })
     }
 }
 
 struct ColumnBacking {
-    buffers: Vec<LanceBufferDescriptor>,
-    pages: Vec<PageBacking>,
-    page_headers: Vec<LancePageMetadata>,
-    encoding: EncodingBacking,
+    _buffers: Vec<LanceBufferDescriptor>,
+    _pages: Vec<PageBacking>,
+    _page_headers: Vec<LancePageMetadata>,
+    _encoding: EncodingBacking,
     header: LanceColumnMetadata,
 }
 
@@ -287,10 +286,10 @@ impl ColumnBacking {
             encoding: encoding.header,
         };
         Ok(Self {
-            buffers,
-            pages,
-            page_headers,
-            encoding,
+            _buffers: buffers,
+            _pages: pages,
+            _page_headers: page_headers,
+            _encoding: encoding,
             header,
         })
     }
@@ -521,7 +520,7 @@ unsafe fn file_reader_num_rows_inner(
     reader: *const LanceFileReader,
     out_rows: *mut u64,
 ) -> Result<i32> {
-    let reader = unsafe { checked_reader(reader)? };
+    let reader = checked_reader(reader)?;
     if out_rows.is_null() {
         return Err(Error::invalid_input("out_rows must not be NULL"));
     }
@@ -545,7 +544,7 @@ unsafe fn file_reader_get_metadata_inner(
     reader: *const LanceFileReader,
     out_metadata: *mut *mut LanceFileMetadata,
 ) -> Result<i32> {
-    let reader = unsafe { checked_reader(reader)? };
+    let reader = checked_reader(reader)?;
     if out_metadata.is_null() {
         return Err(Error::invalid_input("out_metadata must not be NULL"));
     }
@@ -570,7 +569,7 @@ unsafe fn file_reader_get_statistics_inner(
     reader: *const LanceFileReader,
     out_statistics: *mut *mut LanceFileStatistics,
 ) -> Result<i32> {
-    let reader = unsafe { checked_reader(reader)? };
+    let reader = checked_reader(reader)?;
     if out_statistics.is_null() {
         return Err(Error::invalid_input("out_statistics must not be NULL"));
     }
@@ -599,7 +598,7 @@ unsafe fn file_reader_read_global_buffer_inner(
     index: u32,
     out_bytes: *mut *mut LanceByteBuffer,
 ) -> Result<i32> {
-    let reader = unsafe { checked_reader(reader)? };
+    let reader = checked_reader(reader)?;
     if out_bytes.is_null() {
         return Err(Error::invalid_input("out_bytes must not be NULL"));
     }
@@ -624,7 +623,7 @@ unsafe fn file_reader_get_io_stats_inner(
     reader: *const LanceFileReader,
     out_stats: *mut LanceScanStats,
 ) -> Result<i32> {
-    let reader = unsafe { checked_reader(reader)? };
+    let reader = checked_reader(reader)?;
     if out_stats.is_null() {
         return Err(Error::invalid_input("out_stats must not be NULL"));
     }
@@ -747,7 +746,7 @@ unsafe fn export_reader_stream(
     batch_readahead: u32,
     out: *mut FFI_ArrowArrayStream,
 ) -> Result<i32> {
-    let reader = unsafe { checked_reader(reader)? };
+    let reader = checked_reader(reader)?;
     if out.is_null() {
         return Err(Error::invalid_input("out must not be NULL"));
     }
@@ -811,7 +810,7 @@ impl LanceFileMetadata {
             inner,
             info,
             global_buffers,
-            columns,
+            _columns: columns,
             column_headers,
         })
     }

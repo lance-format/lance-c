@@ -15,7 +15,7 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
 };
 use lance_io::scheduler::{ScanScheduler, ScanStats, SchedulerConfig};
-use lance_io::traits::{Reader, Writer};
+use lance_io::traits::Writer;
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 

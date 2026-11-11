@@ -9,7 +9,6 @@
 
 use std::ffi::{CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::ptr;
 use std::sync::Arc;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
@@ -20,7 +19,7 @@ use lance_core::{Error, Result};
 use lance_table::format::Fragment;
 
 use crate::callback::{
-    CallbackString, LanceCallbackError, LanceOwnedString, callback_error, release_message_only,
+    LanceCallbackError, LanceOwnedString, callback_error, release_message_only,
     release_owned_string_slot, take_owned_string,
 };
 use crate::dataset::LanceDataset;
