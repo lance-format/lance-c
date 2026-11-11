@@ -4062,6 +4062,38 @@ static void test_native_scalar_indexes(const std::string& uri) {
     PASS();
 }
 
+// Index names are JSON strings; the C++ wrapper must return complete escaping
+// and own the underlying C string until it has copied it.
+static void test_index_list_json_escaping(const std::string& uri) {
+    TEST(test_index_list_json_escaping);
+
+    auto ds = lance::Dataset::open(uri);
+    const std::vector<std::string> names = {
+        "cpp_index\\q",
+        "cpp_index\\n",
+        "cpp_index\"quote",
+        "cpp_index\nline\ttab",
+        "cpp_索引列",
+    };
+    for (const auto& name : names) {
+        ds.create_scalar_index("id", LANCE_SCALAR_BTREE, name);
+    }
+
+    auto json = ds.list_indices_json();
+    assert(json.find("\"name\":\"cpp_index\\\\q\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_index\\\\n\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_index\\\"quote\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_index\\nline\\ttab\"") !=
+           std::string::npos);
+    assert(json.find("\"name\":\"cpp_索引列\"") != std::string::npos);
+
+    for (const auto& name : names) {
+        ds.drop_index(name);
+    }
+
+    PASS();
+}
+
 static int collect_minhash_alice(ArrowArrayStream& stream) {
     ArrowSchema schema{};
     assert(stream.get_schema(&stream, &schema) == 0);
@@ -4777,6 +4809,69 @@ static void test_diagnostics(const std::string& uri) {
     PASS();
 }
 
+
+static void test_dataset_deep_clone(const std::string& feature_uri) {
+    TEST(test_dataset_deep_clone);
+
+    // The nested fragment fixture has nullable struct fields, stable row ids,
+    // two fragments and deletions. Earlier tests advance its head, so the
+    // selected snapshot is whatever this handle pinned, and v1 keeps 4 rows.
+    auto source = lance::Dataset::open(feature_uri);
+    const uint64_t source_version = source.version();
+    const uint64_t source_rows = source.count_rows();
+    assert(source_rows > 0 && source_rows <= 6);
+
+    // Tag and branch creation commit to the same storage; `create_branch`
+    // replaces the handle's dataset with the branch, so use a separate handle
+    // and keep `source` pinned to its original snapshot.
+    auto ref_source = lance::Dataset::open(feature_uri);
+    auto v1 = lance::Ref::version_number(1);
+    ref_source.create_tag("deep-clone-cpp-v1", v1);
+    auto tag = lance::Ref::tag("deep-clone-cpp-v1");
+    ref_source.create_branch("deep-clone-cpp-branch", v1);
+    auto branch_ref =
+        lance::Ref::version("deep-clone-cpp-branch", std::nullopt);
+
+    const std::string target_a = feature_uri + ".deep-clone-cpp-a";
+    const std::string target_b = feature_uri + ".deep-clone-cpp-b";
+    const std::string target_c = feature_uri + ".deep-clone-cpp-c";
+    const std::string target_d = feature_uri + ".deep-clone-cpp-d";
+
+    {
+        lance::StorageOptionsAccessor accessor(std::nullopt, nullptr);
+        auto cloned = source.deep_clone(target_a, nullptr, &accessor);
+        // Native clone commits preserve the cloned snapshot version id.
+        assert(cloned.version() == source_version);
+        assert(cloned.count_rows() == source_rows);
+    }
+
+    auto from_version = source.deep_clone(target_b, &v1);
+    assert(from_version.version() == 1);
+    assert(from_version.count_rows() == 4);
+
+    auto from_tag = source.deep_clone(target_c, &tag);
+    assert(from_tag.count_rows() == 4);
+
+    auto from_branch = source.deep_clone(target_d, &branch_ref);
+    assert(from_branch.count_rows() == 4);
+
+    bool threw = false;
+    try {
+        (void)source.deep_clone(target_a);
+    } catch (const lance::Error&) {
+        threw = true;
+    }
+    assert(threw);
+
+    // Reopen the independent target with a fresh session.
+    lance::Session session(0, 0);
+    auto reopened = lance::Dataset::open_with_session(session, target_a);
+    assert(reopened.version() == source_version);
+    assert(reopened.count_rows() == source_rows);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 12) {
         fprintf(stderr,
@@ -4831,6 +4926,7 @@ int main(int argc, char** argv) {
     test_error_exception(uri);
     test_index_lifecycle(uri);
     test_native_scalar_indexes(uri);
+    test_index_list_json_escaping(uri);
     test_minhash_lsh(uri);
     test_batch_nearest(uri);
     test_scanner_materialization_fast_search(uri);
@@ -4844,6 +4940,7 @@ int main(int argc, char** argv) {
     test_commit_index_segments(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_dataset_deep_clone(fragment_read_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
     test_diagnostics(uri);

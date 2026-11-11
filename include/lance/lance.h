@@ -1367,6 +1367,67 @@ LanceDataset* lance_dataset_checkout_ref(
     const LanceRef* reference
 );
 
+/**
+ * Deep clone a dataset snapshot into a new dataset at `target_path`.
+ *
+ * The whole operation is performed by Lance's native
+ * `Dataset::deep_clone` on a private clone of the source handle's snapshot.
+ * The source handle is not modified and no source write lock is held while
+ * files are copied.
+ *
+ * `reference == NULL` clones the source handle's current snapshot: its branch
+ * and version id are pinned into `Ref::Version(branch, Some(version))`. Treat
+ * it as "clone this exact snapshot", not "clone the latest head". Pass an
+ * explicit `LanceRef` from `lance_ref_version(NULL, false, 0)` to clone the
+ * current head of the default branch.
+ *
+ * `target_storage_options` is an existing storage-options accessor, or NULL.
+ * Its native accessor Arc is forwarded into `ObjectStoreParams` without
+ * resolving, snapshotting, or copying credentials, so a dynamic provider keeps
+ * its refresh behavior. NULL passes native `None`; a non-NULL accessor that
+ * holds static options and/or a provider contributes its native `Arc`, while
+ * an accessor created with neither contributes native `None`.
+ *
+ * Files are copied and the target dataset is published by native Lance. The
+ * out handle is written only on success. On failure the out parameter is
+ * untouched. A copy or commit error does not guarantee that the target remains
+ * unpublished. Object-store copies are not transactional: partial objects may
+ * remain under `target_path` and are not rolled back. Reopen the target to
+ * check its state after an error. A target that already contains a published
+ * dataset is rejected by the native preflight before any copy.
+ *
+ * The returned dataset is a normal LanceDataset whose manifest keeps the
+ * cloned snapshot's version id (native clone commit semantics), so its
+ * `lance_dataset_version` is the cloned version rather than always 1.
+ *
+ * Native clone commits resolve the target URI through the default object-store
+ * registry, so `target_path` must use a scheme that registry knows (for
+ * example `file`, `memory`, `s3`, `gs`, `az`, or another built-in). A scheme
+ * registered only on a custom session registry is not visible to the clone
+ * commit. Use `lance_dataset_write`/`lance_dataset_branch_create` with an
+ * explicit session for those schemes.
+ *
+ * For datasets with additional base paths, native deep clone reads every
+ * collected file through the source dataset's object store; per-base distinct
+ * source credentials are not supported. This call does not create extra
+ * providers, caches, registries, or per-base credential sets.
+ *
+ * Caller closes the returned handle with lance_dataset_close().
+ * @param dataset source dataset handle (must not be NULL)
+ * @param target_path UTF-8 target dataset URI (must not be NULL)
+ * @param reference snapshot ref, or NULL for the source handle's snapshot
+ * @param target_storage_options target accessor, or NULL for native None
+ * @param out receives the new dataset handle on success (must not be NULL)
+ * @return 0 on success, -1 on error; the out handle is not written on error
+ */
+int32_t lance_dataset_deep_clone(
+    const LanceDataset* dataset,
+    const char* target_path,
+    const LanceRef* reference,
+    const LanceStorageOptionsAccessor* target_storage_options,
+    LanceDataset** out
+);
+
 /* ─── Branches ─── */
 
 /**
@@ -3304,7 +3365,7 @@ uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
  */
 int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_ids);
 
-/* ─── Read-only fragment snapshots ─── */
+/* ─── Fragment handles ─── */
 
 /**
  * Resolve a fragment by ID from this dataset snapshot.
@@ -3322,6 +3383,34 @@ int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_id
 LanceFragment* lance_dataset_open_fragment(
     const LanceDataset* dataset,
     uint64_t fragment_id
+);
+
+/**
+ * Construct detached native Fragment metadata.
+ *
+ * Starts from native `Fragment::new(fragment_id)`, clones each borrowed
+ * `LanceDataFile` in input order, and optionally sets the native
+ * `physical_rows` value. Deletion-file, overlay, row-ID and row-version
+ * metadata retain their native `Fragment::new` defaults. The binding does not
+ * infer or independently validate schema coverage or row counts; native
+ * commit remains authoritative for publication.
+ *
+ * `data_files` may be NULL only when `data_file_count == 0`. A non-NULL array
+ * must contain only non-NULL handles. `physical_rows` is optional: NULL maps
+ * to native `None`, while a non-NULL value must fit the platform `usize`.
+ * A fragment_id of zero requests native commit-time allocation, matching the
+ * native Append contract.
+ *
+ * The returned detached handle retains independent copies of the data-file
+ * metadata and may outlive those handles. It supports metadata inspection and
+ * operation construction but rejects dataset-bound reads. On success the
+ * caller closes it with `lance_fragment_close()`. Returns NULL on error.
+ */
+LanceFragment* lance_fragment_new(
+    uint64_t fragment_id,
+    const LanceDataFile* const* data_files,
+    size_t data_file_count,
+    const uint64_t* physical_rows
 );
 
 /** Close and free a fragment handle. Safe to call with NULL. */

@@ -1868,6 +1868,25 @@ static void check_row_ids_preserved(
     }
 }
 
+static void check_existing_row_ids_preserved(
+    const PublicationRow *before,
+    uint64_t before_count,
+    const PublicationRow *after,
+    uint64_t after_count) {
+    for (uint64_t i = 0; i < before_count; i++) {
+        int found = 0;
+        for (uint64_t j = 0; j < after_count; j++) {
+            if (before[i].id == after[j].id) {
+                ASSERT(before[i].row_id == after[j].row_id,
+                       "stable row ID changed across append");
+                found = 1;
+                break;
+            }
+        }
+        ASSERT(found, "existing row must survive append");
+    }
+}
+
 static void check_fragment_shape(
     const LanceDataset *dataset,
     uint64_t fragment_id,
@@ -2227,6 +2246,315 @@ static void test_blob_writer_publication(const char *uri) {
     lance_dataset_close(dataset);
     printf("OK\n");
     printf("C blob writer publication OK\n");
+}
+
+static void test_blob_writer_append(const char *uri) {
+    printf("  test_blob_writer_append... ");
+    const PublicationBlob pristine[] = {
+        {"old-packed-0", 12, 0},
+        {NULL, 0, 1},
+        {"", 0, 0},
+        {"old-dedicated-3", 15, 0},
+        {"old-dedicated-4", 15, 0},
+        {"keep-c5", 7, 0},
+        {"keep-c6", 7, 0},
+    };
+    const PublicationBlob appended[] = {
+        {"old-packed-0", 12, 0},
+        {NULL, 0, 1},
+        {"", 0, 0},
+        {"old-dedicated-3", 15, 0},
+        {"old-dedicated-4", 15, 0},
+        {"keep-c5", 7, 0},
+        {"keep-c6", 7, 0},
+        {"append-packed-7", 15, 0},
+        {NULL, 0, 1},
+        {"", 0, 0},
+        {"append-dedicated-10", 19, 0},
+        {"", 0, 0},
+    };
+
+    LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "open blob append dataset");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == 3,
+           "blob append fixture version");
+    ASSERT(lance_dataset_count_rows(dataset) == 7,
+           "blob append fixture rows");
+    ASSERT(lance_dataset_fragment_count(dataset) == 3,
+           "blob append fixture fragments");
+    CHECK_OK();
+
+    uint64_t before_fragments[3] = {0};
+    ASSERT(lance_dataset_fragment_ids(dataset, before_fragments) == 0,
+           "blob append initial fragment IDs");
+    CHECK_OK();
+    uint64_t max_fragment_id = 0;
+    for (size_t i = 0; i < 3; i++) {
+        if (before_fragments[i] > max_fragment_id) {
+            max_fragment_id = before_fragments[i];
+        }
+    }
+    PublicationRow before[7];
+    ASSERT(collect_publication_rows(uri, 3, before, 7) == 7,
+           "blob append initial row IDs");
+    check_publication_payloads(uri, 3, pristine, 7);
+
+    char data_uri[4096];
+    snprintf(data_uri, sizeof(data_uri), "file://%s/data", uri);
+    LanceFileSession *session =
+        lance_file_session_new(data_uri, NULL, NULL, NULL);
+    ASSERT(session != NULL, "open blob append session");
+    CHECK_OK();
+
+    const char *packed_name = "c11-packed-append.lance";
+    const char *dedicated_name = "c11-dedicated-append.lance";
+    static const uint8_t packed_validity[] = {0x05};
+    static const int32_t packed_offsets[] = {0, 15, 15, 15};
+    static const char packed_payloads[] = "append-packed-7";
+    static const void *packed_buffers[3];
+    packed_buffers[0] = packed_validity;
+    packed_buffers[1] = packed_offsets;
+    packed_buffers[2] = packed_payloads;
+    struct ArrowArray packed_payload_array;
+    memset(&packed_payload_array, 0, sizeof(packed_payload_array));
+    packed_payload_array.length = 3;
+    packed_payload_array.null_count = 1;
+    packed_payload_array.n_buffers = 3;
+    packed_payload_array.buffers = packed_buffers;
+    packed_payload_array.release = release_publication_array_leaf;
+    struct ArrowSchema packed_payload_schema;
+    memset(&packed_payload_schema, 0, sizeof(packed_payload_schema));
+    packed_payload_schema.format = "z";
+    packed_payload_schema.name = "payload";
+    packed_payload_schema.flags = 2;
+    packed_payload_schema.release = release_publication_schema_leaf;
+
+    LancePackedBlobWriter *packed =
+        lance_file_session_open_packed_blob_writer(session, packed_name, 9101);
+    ASSERT(packed != NULL, "open packed append writer");
+    CHECK_OK();
+    ASSERT(lance_packed_blob_writer_write_blobs(
+               packed, &packed_payload_array, &packed_payload_schema) == 0,
+           "write packed append blobs");
+    CHECK_OK();
+    packed_payload_schema.release(&packed_payload_schema);
+    struct ArrowArray packed_array = {0};
+    struct ArrowSchema packed_schema = {0};
+    ASSERT(lance_packed_blob_writer_finish_array(
+               packed, "blob", &packed_array, &packed_schema) == 0,
+           "finish packed append writer");
+    CHECK_OK();
+    lance_packed_blob_writer_close(packed);
+
+    LanceDedicatedBlobWriter *dedicated_a =
+        lance_file_session_open_dedicated_blob_writer(
+            session, dedicated_name, 9102);
+    ASSERT(dedicated_a != NULL, "open first dedicated append writer");
+    CHECK_OK();
+    ASSERT(lance_dedicated_blob_writer_write(
+               dedicated_a, (const uint8_t *)"append-dedicated-10", 19) == 0,
+           "write first dedicated append blob");
+    CHECK_OK();
+    struct ArrowArray dedicated_a_array = {0};
+    struct ArrowSchema dedicated_a_schema = {0};
+    ASSERT(lance_dedicated_blob_writer_finish_array(
+               dedicated_a, "blob", &dedicated_a_array,
+               &dedicated_a_schema) == 0,
+           "finish first dedicated append writer");
+    CHECK_OK();
+    lance_dedicated_blob_writer_close(dedicated_a);
+
+    LanceDedicatedBlobWriter *dedicated_b =
+        lance_file_session_open_dedicated_blob_writer(
+            session, dedicated_name, 9103);
+    ASSERT(dedicated_b != NULL, "open second dedicated append writer");
+    CHECK_OK();
+    ASSERT(lance_dedicated_blob_writer_write(
+               dedicated_b, (const uint8_t *)"", 0) == 0,
+           "write second dedicated append blob");
+    CHECK_OK();
+    struct ArrowArray dedicated_b_array = {0};
+    struct ArrowSchema dedicated_b_schema = {0};
+    ASSERT(lance_dedicated_blob_writer_finish_array(
+               dedicated_b, "blob", &dedicated_b_array,
+               &dedicated_b_schema) == 0,
+           "finish second dedicated append writer");
+    CHECK_OK();
+    lance_dedicated_blob_writer_close(dedicated_b);
+
+    struct ArrowSchema id_schema;
+    memset(&id_schema, 0, sizeof(id_schema));
+    id_schema.format = "I";
+    id_schema.name = "id";
+    id_schema.release = release_publication_schema_leaf;
+    struct ArrowSchema root_schema;
+    init_publication_root_schema(&root_schema, &id_schema, &packed_schema);
+
+    LanceFileWriter *packed_writer =
+        open_publication_writer(session, packed_name, &root_schema);
+    const uint32_t packed_ids[3] = {7, 8, 9};
+    write_publication_batch(
+        packed_writer, packed_ids, 3, &packed_array, &root_schema);
+    LanceFileWriteSummary packed_summary = {0};
+    ASSERT(lance_file_writer_finish(packed_writer, &packed_summary) == 0,
+           "finish packed append data file");
+    CHECK_OK();
+    ASSERT(packed_summary.num_rows == 3,
+           "packed append data file rows");
+    lance_file_writer_close(packed_writer);
+
+    LanceFileWriter *dedicated_writer =
+        open_publication_writer(session, dedicated_name, &root_schema);
+    const uint32_t dedicated_id_a = 10;
+    write_publication_batch(
+        dedicated_writer, &dedicated_id_a, 1, &dedicated_a_array,
+        &root_schema);
+    const uint32_t dedicated_id_b = 11;
+    write_publication_batch(
+        dedicated_writer, &dedicated_id_b, 1, &dedicated_b_array,
+        &root_schema);
+    LanceFileWriteSummary dedicated_summary = {0};
+    ASSERT(lance_file_writer_finish(dedicated_writer, &dedicated_summary) == 0,
+           "finish dedicated append data file");
+    CHECK_OK();
+    ASSERT(dedicated_summary.num_rows == 2,
+           "dedicated append data file rows");
+    lance_file_writer_close(dedicated_writer);
+    lance_file_session_close(session);
+    root_schema.release(&root_schema);
+    if (dedicated_a_schema.release) dedicated_a_schema.release(&dedicated_a_schema);
+    if (dedicated_b_schema.release) dedicated_b_schema.release(&dedicated_b_schema);
+
+    LanceDataFile *packed_file = NULL;
+    ASSERT(lance_dataset_create_data_file(
+               dataset, packed_name, NULL, &packed_file) == 0,
+           "create packed append data file");
+    CHECK_OK();
+    LanceDataFile *dedicated_file = NULL;
+    ASSERT(lance_dataset_create_data_file(
+               dataset, dedicated_name, NULL, &dedicated_file) == 0,
+           "create dedicated append data file");
+    CHECK_OK();
+
+    const LanceDataFile *packed_files[] = {packed_file};
+    const LanceDataFile *dedicated_files[] = {dedicated_file};
+    uint64_t packed_rows = 3;
+    uint64_t dedicated_rows = 2;
+    LanceFragment *packed_fragment =
+        lance_fragment_new(0, packed_files, 1, &packed_rows);
+    ASSERT(packed_fragment != NULL, "construct packed append fragment");
+    CHECK_OK();
+    LanceFragment *dedicated_fragment =
+        lance_fragment_new(0, dedicated_files, 1, &dedicated_rows);
+    ASSERT(dedicated_fragment != NULL, "construct dedicated append fragment");
+    CHECK_OK();
+    ASSERT(lance_fragment_id(packed_fragment) == 0 &&
+               lance_fragment_data_file_count(packed_fragment) == 1,
+           "packed append fragment metadata");
+    bool is_bound = true;
+    ASSERT(lance_fragment_is_bound(packed_fragment, &is_bound) == 0 &&
+               !is_bound,
+           "packed append fragment is detached");
+    CHECK_OK();
+    const char *packed_json = lance_fragment_metadata_json(packed_fragment);
+    ASSERT(packed_json != NULL &&
+               strstr(packed_json, "\"physical_rows\":3") != NULL &&
+               strstr(packed_json, "\"deletion_file\"") == NULL,
+           "packed append fragment native defaults");
+    lance_free_string(packed_json);
+
+    lance_data_file_close(packed_file);
+    lance_data_file_close(dedicated_file);
+    LanceDataFile *packed_clone = NULL;
+    ASSERT(lance_fragment_data_file_at(
+               packed_fragment, 0, &packed_clone) == 0,
+           "packed append fragment owns data-file clone");
+    CHECK_OK();
+    ASSERT(strcmp(lance_data_file_path(packed_clone), packed_name) == 0,
+           "packed append cloned path");
+    CHECK_OK();
+    lance_data_file_close(packed_clone);
+
+    const LanceFragment *append_fragments[] = {
+        packed_fragment, dedicated_fragment};
+    LanceOperation *append =
+        lance_operation_append_new(append_fragments, 2);
+    ASSERT(append != NULL, "construct blob append operation");
+    CHECK_OK();
+    lance_fragment_close(packed_fragment);
+    lance_fragment_close(dedicated_fragment);
+
+    uint64_t append_count = UINT64_MAX;
+    ASSERT(lance_operation_append_fragment_count(append, &append_count) == 0 &&
+               append_count == 2,
+           "blob append fragment count");
+    CHECK_OK();
+    LanceFragment *appended_fragment = NULL;
+    ASSERT(lance_operation_append_fragment_at(
+               append, 1, &appended_fragment) == 0,
+           "clone appended fragment from operation");
+    CHECK_OK();
+    LanceDataFile *appended_file = NULL;
+    ASSERT(lance_fragment_data_file_at(
+               appended_fragment, 0, &appended_file) == 0,
+           "append operation owns data-file metadata");
+    CHECK_OK();
+    ASSERT(strcmp(lance_data_file_path(appended_file), dedicated_name) == 0,
+           "append operation cloned path");
+    CHECK_OK();
+    lance_data_file_close(appended_file);
+    lance_fragment_close(appended_fragment);
+
+    LanceTransaction *transaction =
+        lance_transaction_new(lance_dataset_version(dataset), append, NULL);
+    ASSERT(transaction != NULL, "construct blob append transaction");
+    CHECK_OK();
+    lance_operation_close(append);
+    LanceDataset *committed = commit_transaction(uri, transaction, NULL);
+    lance_transaction_close(transaction);
+    ASSERT(lance_dataset_version(committed) == 4,
+           "blob append commit version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(committed) == 12,
+           "blob append commit rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(committed) == 5,
+           "blob append commit fragments");
+    CHECK_OK();
+
+    uint64_t committed_fragments[5] = {0};
+    ASSERT(lance_dataset_fragment_ids(committed, committed_fragments) == 0,
+           "blob append committed fragment IDs");
+    CHECK_OK();
+    uint64_t new_fragments[2];
+    size_t new_count = 0;
+    for (size_t i = 0; i < 5; i++) {
+        if (committed_fragments[i] > max_fragment_id) {
+            ASSERT(new_count < 2, "unexpected appended fragment count");
+            new_fragments[new_count++] = committed_fragments[i];
+        }
+    }
+    ASSERT(new_count == 2, "append must create two fragments");
+    check_fragment_shape(committed, new_fragments[0], 3, 0);
+    check_fragment_shape(committed, new_fragments[1], 2, 0);
+
+    PublicationRow after[12];
+    ASSERT(collect_publication_rows(uri, 4, after, 12) == 12,
+           "blob append committed row IDs");
+    check_existing_row_ids_preserved(before, 7, after, 12);
+    check_publication_payloads(uri, 4, appended, 12);
+    check_publication_payloads(uri, 3, pristine, 7);
+
+    ASSERT(lance_dataset_version(dataset) == 3 &&
+               lance_dataset_count_rows(dataset) == 7,
+           "old append snapshot remains unchanged");
+    CHECK_OK();
+
+    lance_dataset_close(committed);
+    lance_dataset_close(dataset);
+    printf("OK\n");
+    printf("C blob writer append OK\n");
 }
 
 static void test_native_operation_construction(const char *src_uri,
@@ -4011,10 +4339,11 @@ static void test_fragment_creation(const char *src_uri, const char *base) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
+    if (argc != 6) {
         fprintf(stderr,
                 "usage: %s <source-dataset-uri> <base-path> "
-                "<native-schema-uri> <blob-publication-uri>\n",
+                "<native-schema-uri> <blob-publication-uri> "
+                "<blob-append-uri>\n",
                 argv[0]);
         return 2;
     }
@@ -4027,6 +4356,7 @@ int main(int argc, char **argv) {
 
     test_native_schema(argv[3]);
     test_blob_writer_publication(argv[4]);
+    test_blob_writer_append(argv[5]);
     test_native_operation_construction(argv[1], argv[2]);
     test_native_typed_operations(argv[1], argv[2]);
     test_update_rewrite_operations(argv[1], argv[2]);

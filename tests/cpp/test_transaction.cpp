@@ -1234,6 +1234,187 @@ static void test_blob_writer_data_replacement(const std::string& blob_uri) {
     std::printf("C++ blob writer publication OK\n");
 }
 
+static void test_blob_writer_append(const std::string& blob_uri) {
+    auto dataset = lance::Dataset::open(blob_uri);
+    CHECK(dataset.version() == 3);
+    CHECK(dataset.count_rows() == 7);
+    CHECK(dataset.fragment_count() == 3);
+    const auto before_ids = dataset.fragment_ids();
+    const auto max_before_id =
+        *std::max_element(before_ids.begin(), before_ids.end());
+
+    const auto before = read_publication_rows(dataset);
+    CHECK(before.size() == 7);
+    check_publication_blob(before, 0, "old-packed-0");
+    check_publication_null(before, 1);
+    check_publication_blob(before, 2, "");
+    check_publication_blob(before, 3, "old-dedicated-3");
+    check_publication_blob(before, 4, "old-dedicated-4");
+    check_publication_blob(before, 5, "keep-c5");
+    check_publication_blob(before, 6, "keep-c6");
+
+    const std::string packed_name = "cpp-packed-append.lance";
+    const std::string dedicated_name = "cpp-dedicated-append.lance";
+    lance::FileSession files("file://" + blob_uri + "/data");
+
+    std::vector<uint8_t> packed_validity(1, 0x05);
+    std::vector<int32_t> packed_offsets{0};
+    std::vector<uint8_t> packed_data;
+    auto append_packed = [&](const char* value) {
+        packed_data.insert(packed_data.end(), value, value + std::strlen(value));
+        packed_offsets.push_back(static_cast<int32_t>(packed_data.size()));
+    };
+    append_packed("append-packed-7");
+    packed_offsets.push_back(static_cast<int32_t>(packed_data.size()));
+    packed_offsets.push_back(static_cast<int32_t>(packed_data.size()));
+    const void* packed_buffers[3] = {
+        packed_validity.data(), packed_offsets.data(), packed_data.data()};
+    ArrowArray packed_payloads{};
+    packed_payloads.length = 3;
+    packed_payloads.null_count = 1;
+    packed_payloads.n_buffers = 3;
+    packed_payloads.buffers = packed_buffers;
+    packed_payloads.release = &publication_release_array;
+    ArrowSchema packed_payload_schema{};
+    packed_payload_schema.format = "z";
+    packed_payload_schema.name = "blob";
+    packed_payload_schema.flags = 2;
+    packed_payload_schema.release = &publication_release_schema;
+
+    auto packed_writer = files.open_packed_blob_writer(packed_name, 9101);
+    packed_writer.write_blobs(&packed_payloads, &packed_payload_schema);
+    ArrowArray packed_array{};
+    ArrowSchema packed_field{};
+    packed_writer.finish_array("blob", &packed_array, &packed_field);
+    CHECK(packed_array.length == 3);
+
+    ArrowArray dedicated_a{};
+    ArrowSchema dedicated_a_field{};
+    ArrowArray dedicated_b{};
+    ArrowSchema dedicated_b_field{};
+    {
+        const std::string payload = "append-dedicated-10";
+        auto writer = files.open_dedicated_blob_writer(dedicated_name, 9102);
+        writer.write(reinterpret_cast<const uint8_t*>(payload.data()),
+                     payload.size());
+        writer.finish_array("blob", &dedicated_a, &dedicated_a_field);
+        CHECK(dedicated_a.length == 1);
+    }
+    {
+        const std::string payload;
+        auto writer = files.open_dedicated_blob_writer(dedicated_name, 9103);
+        writer.write(reinterpret_cast<const uint8_t*>(payload.data()),
+                     payload.size());
+        writer.finish_array("blob", &dedicated_b, &dedicated_b_field);
+        CHECK(dedicated_b.length == 1);
+    }
+
+    write_blob_replacement_file(
+        blob_uri, packed_name, &packed_field,
+        {ReplacementBatch{{7, 8, 9}, &packed_array}});
+    write_blob_replacement_file(
+        blob_uri, dedicated_name, &dedicated_a_field,
+        {ReplacementBatch{{10}, &dedicated_a},
+         ReplacementBatch{{11}, &dedicated_b}});
+    if (packed_field.release) packed_field.release(&packed_field);
+    if (dedicated_a_field.release) {
+        dedicated_a_field.release(&dedicated_a_field);
+    }
+    if (dedicated_b_field.release) {
+        dedicated_b_field.release(&dedicated_b_field);
+    }
+
+    std::optional<lance::Fragment> packed_fragment;
+    std::optional<lance::Fragment> dedicated_fragment;
+    {
+        auto packed_file = dataset.create_data_file(packed_name);
+        auto dedicated_file = dataset.create_data_file(dedicated_name);
+        CHECK(packed_file.file_version() ==
+              std::make_pair(uint32_t{2}, uint32_t{2}));
+        CHECK(dedicated_file.file_version() ==
+              std::make_pair(uint32_t{2}, uint32_t{2}));
+
+        packed_fragment.emplace(
+            lance::Fragment::from_data_files(0, {&packed_file}, 3));
+        dedicated_fragment.emplace(
+            lance::Fragment::from_data_files(0, {&dedicated_file}, 2));
+        CHECK(packed_fragment->id() == 0);
+        CHECK(!packed_fragment->is_bound());
+        CHECK(packed_fragment->data_file_count() == 1);
+        CHECK(dedicated_fragment->id() == 0);
+        CHECK(!dedicated_fragment->is_bound());
+        CHECK(dedicated_fragment->data_file_count() == 1);
+        auto metadata = packed_fragment->metadata_json();
+        CHECK(metadata.find("\"physical_rows\":3") != std::string::npos);
+        CHECK(metadata.find("\"deletion_file\"") == std::string::npos);
+    }
+
+    // The detached fragments own cloned DataFile metadata after the source
+    // DataFile handles have closed.
+    CHECK(packed_fragment->data_file_at(0).path() == packed_name);
+    CHECK(dedicated_fragment->data_file_at(0).path() == dedicated_name);
+
+    auto append = lance::Operation::make_append(
+        {&*packed_fragment, &*dedicated_fragment});
+    CHECK(append.kind() == lance::OperationKind::Append);
+    CHECK(append.append_fragment_count() == 2);
+    packed_fragment.reset();
+    dedicated_fragment.reset();
+    auto appended_fragment = append.append_fragment_at(1);
+    CHECK(appended_fragment.data_file_at(0).path() == dedicated_name);
+
+    auto transaction =
+        lance::Transaction::from_operation(dataset.version(), append);
+    auto committed = lance::Dataset::commit(blob_uri, transaction);
+    CHECK(committed.version() == 4);
+    CHECK(committed.count_rows() == 12);
+    CHECK(committed.fragment_count() == 5);
+
+    const auto after_ids = committed.fragment_ids();
+    std::vector<uint64_t> new_fragment_ids;
+    for (const auto fragment_id : after_ids) {
+        if (fragment_id > max_before_id) {
+            new_fragment_ids.push_back(fragment_id);
+        }
+    }
+    CHECK(new_fragment_ids.size() == 2);
+    CHECK(committed.open_fragment(new_fragment_ids[0]).physical_rows() == 3);
+    CHECK(committed.open_fragment(new_fragment_ids[1]).physical_rows() == 2);
+
+    auto reopened = lance::Dataset::open(blob_uri);
+    CHECK(reopened.version() == 4);
+    const auto after = read_publication_rows(reopened);
+    CHECK(after.size() == 12);
+    for (const auto& row : before) {
+        CHECK(publication_row(after, row.id).row_id == row.row_id);
+    }
+    check_publication_blob(after, 0, "old-packed-0");
+    check_publication_null(after, 1);
+    check_publication_blob(after, 2, "");
+    check_publication_blob(after, 3, "old-dedicated-3");
+    check_publication_blob(after, 4, "old-dedicated-4");
+    check_publication_blob(after, 5, "keep-c5");
+    check_publication_blob(after, 6, "keep-c6");
+    check_publication_blob(after, 7, "append-packed-7");
+    check_publication_null(after, 8);
+    check_publication_blob(after, 9, "");
+    check_publication_blob(after, 10, "append-dedicated-10");
+    check_publication_blob(after, 11, "");
+
+    auto old_snapshot = lance::Dataset::open(blob_uri, {}, 3);
+    CHECK(old_snapshot.version() == 3);
+    CHECK(old_snapshot.count_rows() == 7);
+    const auto old_rows = read_publication_rows(old_snapshot);
+    CHECK(old_rows.size() == 7);
+    check_publication_blob(old_rows, 0, "old-packed-0");
+    check_publication_null(old_rows, 1);
+    check_publication_blob(old_rows, 3, "old-dedicated-3");
+    CHECK(dataset.version() == 3);
+    CHECK(dataset.count_rows() == 7);
+
+    std::printf("C++ blob writer append OK\n");
+}
+
 
 static void test_native_operations(const std::string& source_uri,
                                    const std::string& base) {
@@ -2230,10 +2411,11 @@ static void test_fragment_creation(const std::string& src_uri,
 }
 
 int main(int argc, char** argv) {
-    if (argc != 5) {
+    if (argc != 6) {
         std::fprintf(stderr,
                      "usage: %s <source-dataset-uri> <base-path> "
-                     "<native-schema-uri> <blob-publication-uri>\n",
+                     "<native-schema-uri> <blob-publication-uri> "
+                     "<blob-append-uri>\n",
                      argv[0]);
         return 2;
     }
@@ -2248,6 +2430,7 @@ int main(int argc, char** argv) {
 
         test_native_schema(argv[3]);
         test_blob_writer_data_replacement(argv[4]);
+        test_blob_writer_append(argv[5]);
         test_native_operations(argv[1], argv[2]);
         test_typed_native_operations(argv[1], argv[2]);
         test_update_rewrite_operations(argv[1], argv[2]);

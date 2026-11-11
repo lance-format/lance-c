@@ -1420,6 +1420,8 @@ fn test_native_transaction_compilation_and_execution() {
         create_blob_publication_dataset_on_disk();
     let (_cpp_blob_publication_tmp, cpp_blob_publication_uri) =
         create_blob_publication_dataset_on_disk();
+    let (_c_blob_append_tmp, c_blob_append_uri) = create_blob_publication_dataset_on_disk();
+    let (_cpp_blob_append_tmp, cpp_blob_append_uri) = create_blob_publication_dataset_on_disk();
     let base = tmp.path().join("native_transactions");
     std::fs::create_dir_all(&base).unwrap();
     let base = base.to_str().unwrap();
@@ -1436,7 +1438,13 @@ fn test_native_transaction_compilation_and_execution() {
     );
     run_test_binary_with_args(
         &c_binary,
-        &[&dataset_uri, base, &c_schema_uri, &c_blob_publication_uri],
+        &[
+            &dataset_uri,
+            base,
+            &c_schema_uri,
+            &c_blob_publication_uri,
+            &c_blob_append_uri,
+        ],
     );
 
     let cpp_source = tests_dir.join("test_transaction.cpp");
@@ -1452,6 +1460,7 @@ fn test_native_transaction_compilation_and_execution() {
             base,
             &cpp_schema_uri,
             &cpp_blob_publication_uri,
+            &cpp_blob_append_uri,
         ],
     );
 }
