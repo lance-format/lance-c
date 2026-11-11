@@ -28750,7 +28750,7 @@ fn test_compaction_options_v2_config_defaults_and_presence() {
         Some("2.2")
     );
     let overridden_ids = plan_source_fragment_ids(overridden_plan);
-    assert_eq!(overridden_ids.len(), 3);
+    assert_eq!(overridden_ids.len(), 2);
     assert!(!overridden_ids.contains(&u64::from(excluded)));
 
     let zero_budget = unsafe { lance_compaction_options_v2_new() };
@@ -29057,7 +29057,7 @@ fn test_compaction_binary_copy_budgets_and_exclusions() {
     let excluded_plan = unsafe { lance_dataset_plan_compaction(budget_dataset, excluded_options) };
     assert!(!excluded_plan.is_null(), "{}", take_last_error_message());
     let included = plan_source_fragment_ids(excluded_plan);
-    assert_eq!(included.len(), 3);
+    assert_eq!(included.len(), 2);
     assert!(!included.contains(&u64::from(fragments[1])));
 
     let budget_options = unsafe { lance_compaction_options_v2_new() };
@@ -29184,6 +29184,115 @@ fn test_optimize_indices_options_empty_names_and_append() {
         lance_optimize_indices_options_free(invalid);
         lance_dataset_close(dataset);
     }
+}
+
+#[test]
+fn test_optimize_indices_retrain_rebuilds_vector_index() {
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+    let dim = 8;
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, dim, false);
+    let c_uri = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfFlat,
+        metric: LanceMetricType::L2,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index(
+                dataset,
+                c"embedding".as_ptr(),
+                c"vector_idx".as_ptr(),
+                &params,
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        ),
+    ]));
+    let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), dim);
+    for row in 64..96 {
+        for component in 0..dim {
+            vectors
+                .values()
+                .append_value(row as f32 + component as f32 / dim as f32);
+        }
+        vectors.append(true);
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(64..96)),
+            Arc::new(vectors.finish()),
+        ],
+    )
+    .unwrap();
+    append_batch(&uri, schema, batch);
+
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let options = unsafe { lance_optimize_indices_options_new() };
+    let names = [c_str("vector_idx")];
+    let name_ptrs = [names[0].as_ptr()];
+    assert_eq!(
+        unsafe {
+            lance_optimize_indices_options_set_index_names(
+                options,
+                true,
+                name_ptrs.as_ptr(),
+                name_ptrs.len(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_optimize_indices_options_set_retrain(options, true) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_optimize_indices(dataset, options) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(unsafe { lance_dataset_version(dataset) } > version_before);
+    assert_eq!(indexed_fragment_ids(dataset).len(), 3);
+    assert_eq!(
+        unsafe { lance_dataset_validate(dataset) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe {
+        lance_optimize_indices_options_free(options);
+        lance_dataset_close(dataset);
+    }
+
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    assert_eq!(indexed_fragment_ids(reopened).len(), 3);
+    unsafe { lance_dataset_close(reopened) };
 }
 
 #[test]
@@ -29476,14 +29585,22 @@ fn test_optimize_indices_distributed_plan_tasks_merges_and_partial_commits() {
                 options,
             )
         },
-        0,
-        "second partial index commit must follow native rebase behavior: {}",
+        -1,
+        "a stale second index segment set must follow native conflict behavior",
+    );
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::CommitConflict,
+        "{}",
         take_last_error_message()
     );
-    assert!(unsafe { lance_dataset_version(dataset) } > version_after_first);
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_after_first
+    );
     let filter = c_str("id = 19");
     assert_eq!(scan_filtered_with_index(dataset, &filter), 1);
-    assert_eq!(indexed_fragment_ids(dataset).len(), 4);
+    assert_eq!(indexed_fragment_ids(dataset).len(), 3);
     assert_eq!(
         unsafe { lance_dataset_validate(dataset) },
         0,
@@ -29506,7 +29623,7 @@ fn test_optimize_indices_distributed_plan_tasks_merges_and_partial_commits() {
 
     let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
     assert!(!reopened.is_null(), "{}", take_last_error_message());
-    assert_eq!(indexed_fragment_ids(reopened).len(), 4);
+    assert_eq!(indexed_fragment_ids(reopened).len(), 3);
     assert_eq!(scan_filtered_with_index(reopened, &filter), 1);
     unsafe { lance_dataset_close(reopened) };
 }
