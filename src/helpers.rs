@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
 
+use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use chrono::TimeDelta;
 use lance_core::Result;
 
@@ -43,6 +44,54 @@ pub unsafe fn parse_c_string_array(ptr: *const *const c_char) -> Result<Option<V
         i += 1;
     }
     Ok(Some(result))
+}
+
+/// Take ownership of a caller-provided Arrow C stream.
+///
+/// A NULL pointer is rejected without consuming anything. Once a non-NULL
+/// pointer is accepted, the stream is released exactly once on every outcome,
+/// including malformed stream callbacks and `get_schema` failures.
+pub(crate) unsafe fn take_arrow_array_stream(
+    stream: *mut FFI_ArrowArrayStream,
+) -> Result<ArrowArrayStreamReader> {
+    if stream.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "stream must not be NULL".into(),
+        ));
+    }
+
+    // `ArrowArrayStreamReader` only guards against a NULL `release`. Reject a
+    // stream missing `get_schema` or `get_next` before arrow-rs can reach an
+    // `unwrap()` in a non-unwinding callback.
+    let (release, has_schema_cb, has_next_cb) = unsafe {
+        let raw = &*stream;
+        (
+            raw.release,
+            raw.get_schema.is_some(),
+            raw.get_next.is_some(),
+        )
+    };
+    if release.is_none() || !has_schema_cb || !has_next_cb {
+        if let Some(release_fn) = release {
+            // Claim ownership before invoking foreign cleanup. Clearing the
+            // release slot also leaves the caller's struct in the canonical
+            // released state.
+            unsafe {
+                (*stream).release = None;
+                release_fn(stream);
+            }
+        }
+        return Err(lance_core::Error::invalid_input_source(
+            "stream is uninitialised, already released, or missing a \
+             required get_schema/get_next/release callback"
+                .into(),
+        ));
+    }
+
+    // `from_raw` moves the complete stream into Rust. A later `get_schema`
+    // failure is still owned and released by the returned error path.
+    unsafe { ArrowArrayStreamReader::from_raw(stream) }
+        .map_err(|error| lance_core::Error::invalid_input_source(error.to_string().into()))
 }
 
 /// Parse NULL-terminated key-value pairs into a `HashMap`.
