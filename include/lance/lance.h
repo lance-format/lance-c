@@ -7021,7 +7021,7 @@ void lance_namespace_result_close(LanceNamespaceResult* result);
 /**
  * Copy the native namespace identifier. Free with lance_free_string().
  */
-char* lance_namespace_id(const LanceNamespace* namespace);
+char* lance_namespace_id(const LanceNamespace* ns);
 
 /**
  * Retrieve native operation counters as a JSON object of integer values.
@@ -7029,10 +7029,10 @@ char* lance_namespace_id(const LanceNamespace* namespace);
  * native implementation's counters. Connected and custom handles return
  * LANCE_ERR_NOT_SUPPORTED because they have no concrete native counter store.
  */
-char* lance_namespace_retrieve_ops_metrics(const LanceNamespace* namespace);
+char* lance_namespace_retrieve_ops_metrics(const LanceNamespace* ns);
 
 /** Reset the native operation counters. */
-int32_t lance_namespace_reset_ops_metrics(const LanceNamespace* namespace);
+int32_t lance_namespace_reset_ops_metrics(const LanceNamespace* ns);
 
 /**
  * Synchronous, infallible dynamic context provider.
@@ -7107,7 +7107,7 @@ LanceNamespace* lance_namespace_connect_new(
  * their own native Arc ownership; foreign contexts are released after the
  * final native owner drops.
  */
-void lance_namespace_close(LanceNamespace* namespace);
+void lance_namespace_close(LanceNamespace* ns);
 
 /**
  * Invoke one of the 54 native namespace trait operations.
@@ -7126,7 +7126,7 @@ void lance_namespace_close(LanceNamespace* namespace);
  *         not already own resources.
  */
 int32_t lance_namespace_call(
-    const LanceNamespace* namespace,
+    const LanceNamespace* ns,
     const char* operation,
     const char* request_json,
     const uint8_t* request_bytes,
@@ -7143,7 +7143,7 @@ int32_t lance_namespace_call(
  * strings.
  */
 LanceStorageOptionsProvider* lance_namespace_storage_options_provider_new(
-    const LanceNamespace* namespace,
+    const LanceNamespace* ns,
     const char* table_id_json
 );
 
@@ -7155,7 +7155,7 @@ LanceStorageOptionsProvider* lance_namespace_storage_options_provider_new(
  * the native refresh provider stays attached. version 0 selects latest.
  */
 LanceDataset* lance_dataset_open_namespace(
-    const LanceNamespace* namespace,
+    const LanceNamespace* ns,
     const char* table_id_json,
     const char* storage_options_json,
     uint64_t version,
@@ -7174,7 +7174,7 @@ LanceDataset* lance_dataset_open_namespace(
  * been accepted. `out_dataset` may be NULL to discard the result.
  */
 int32_t lance_dataset_write_namespace(
-    const LanceNamespace* namespace,
+    const LanceNamespace* ns,
     const char* table_id_json,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -7197,7 +7197,7 @@ int32_t lance_dataset_write_namespace(
  * dataset keeps its native commit handler.
  */
 int32_t lance_transaction_commit_namespace_uri(
-    const LanceNamespace* namespace,
+    const LanceNamespace* ns,
     const char* table_id_json,
     const char* uri,
     const LanceTransaction* transaction,
@@ -7215,7 +7215,7 @@ int32_t lance_transaction_commit_namespace_uri(
  * backend and its server task; close or shutdown releases them.
  */
 int32_t lance_rest_adapter_start(
-    const LanceNamespace* namespace,
+    const LanceNamespace* ns,
     const char* host,
     uint16_t port,
     LanceRestAdapter** out_adapter

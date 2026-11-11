@@ -10,12 +10,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+static void fail_check(const char* message, int line) {
+    const char* error = lance_last_error_message();
+    fprintf(stderr, "FAIL: %s (line %d): %s\n", message, line,
+            error != NULL ? error : "");
+    exit(1);
+}
+
 #define CHECK(cond, message)                                                   \
     do {                                                                       \
         if (!(cond)) {                                                         \
-            fprintf(stderr, "FAIL: %s (line %d): %s\n", message, __LINE__,     \
-                    lance_last_error_message() ? lance_last_error_message() : ""); \
-            exit(1);                                                           \
+            fail_check(message, __LINE__);                                     \
         }                                                                      \
     } while (0)
 
