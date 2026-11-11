@@ -219,7 +219,12 @@ static void test_distributed_metadata_publication(const std::string& uri,
         scanner.full_text_search(query);
     }
     const auto explain = scanner.explain_plan();
-    assert(explain.find("PhraseQueryExec") != std::string::npos);
+    if (explain.find("PhraseQuery:") == std::string::npos) {
+        std::fprintf(stderr,
+                     "C++ phrase plan did not contain PhraseQuery:\n%s\n",
+                     explain.c_str());
+    }
+    assert(explain.find("PhraseQuery:") != std::string::npos);
     auto ids = collect_scanner_ids(scanner);
     assert(ids.size() == 48);
     std::sort(ids.begin(), ids.end());

@@ -231,7 +231,10 @@ static size_t collect_phrase_ids(LanceDataset *dataset, const char *column,
 
     const char *explain = lance_scanner_explain_plan(scanner, false);
     ASSERT(explain != NULL, "phrase plan explanation failed");
-    ASSERT(strstr(explain, "PhraseQueryExec") != NULL,
+    if (strstr(explain, "PhraseQuery:") == NULL) {
+        fprintf(stderr, "phrase plan did not contain PhraseQuery:\n%s\n", explain);
+    }
+    ASSERT(strstr(explain, "PhraseQuery:") != NULL,
            "phrase plan did not select an inverted phrase execution");
     lance_free_string(explain);
 
