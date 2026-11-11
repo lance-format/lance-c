@@ -203,6 +203,17 @@ typedef struct {
 } LanceOptionalU64;
 
 /**
+ * Presence-aware timestamp split into whole Unix seconds and nanoseconds.
+ * When `is_set` is false the native option is absent and the other fields are
+ * zero.
+ */
+typedef struct {
+    bool is_set;
+    int64_t unix_seconds;
+    uint32_t nanos; /* 0..999999999 */
+} LanceOptionalTimestamp;
+
+/**
  * Borrowed UTF-8 key/value arrays with `count` entries. Keys and values may
  * not be NULL when count is non-zero. Duplicate keys use Rust HashMap
  * last-write-wins semantics; the last value for a key is retained.
@@ -5222,6 +5233,103 @@ int32_t lance_index_segment_metadata_fragment_ids(
     size_t* out_count
 );
 
+/**
+ * Clone parsed index metadata into an independent handle.
+ *
+ * The clone copies the complete in-memory native value, including optional
+ * index details, fragment bitmap, created_at, base_id and files. It does not
+ * re-encode through protobuf, so an in-memory Some(empty) files vector remains
+ * distinct from None even though the protobuf decoder normalizes it.
+ * Returns NULL on error.
+ */
+LanceIndexSegmentMetadata* lance_index_segment_metadata_clone(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/**
+ * Return the number of covering field IDs. Returns 0 on error; zero is also a
+ * valid count, so check lance_last_error_code().
+ */
+size_t lance_index_segment_metadata_covering_field_count(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/**
+ * Copy one covering field ID in metadata order.
+ * Returns 0 on success, -1 on error; `*out_field_id` is unchanged on error.
+ */
+int32_t lance_index_segment_metadata_covering_field_id_at(
+    const LanceIndexSegmentMetadata* metadata,
+    size_t index,
+    int32_t* out_field_id
+);
+
+/**
+ * Return the borrowed native `index_details.value` bytes.
+ *
+ * The pointer remains valid until the metadata handle is freed. A present but
+ * empty value returns a non-NULL pointer and writes `*out_len = 0`. Absent
+ * index details return NULL with LANCE_ERR_NOT_FOUND. `*out_len` is unchanged
+ * on error.
+ */
+const uint8_t* lance_index_segment_metadata_index_details_value(
+    const LanceIndexSegmentMetadata* metadata,
+    size_t* out_len
+);
+
+/**
+ * Return the number of files recorded in the metadata. Returns 0 on error or
+ * when the native `files` option is absent; check lance_last_error_code() to
+ * distinguish.
+ */
+size_t lance_index_segment_metadata_file_count(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/**
+ * Return one recorded file path, borrowed from the metadata handle. Returns
+ * NULL on error, including an out-of-range index.
+ */
+const char* lance_index_segment_metadata_file_path_at(
+    const LanceIndexSegmentMetadata* metadata,
+    size_t index
+);
+
+/**
+ * Copy one recorded file size. Returns 0 on success, -1 on error; `*out_size`
+ * is unchanged on error.
+ */
+int32_t lance_index_segment_metadata_file_size_at(
+    const LanceIndexSegmentMetadata* metadata,
+    size_t index,
+    uint64_t* out_size
+);
+
+/**
+ * Read the optional native `created_at` timestamp.
+ *
+ * On success, absent is reported with `is_set == false` and zeroed fields;
+ * present is reported with `is_set == true`. The output is unchanged on error.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_index_segment_metadata_created_at(
+    const LanceIndexSegmentMetadata* metadata,
+    LanceOptionalTimestamp* out_timestamp
+);
+
+/**
+ * Read the optional native `base_id`.
+ *
+ * On success, absent is reported with `is_set == false` and `base_id == 0`;
+ * present is reported with `is_set == true`. Both outputs are unchanged on
+ * error. Returns 0 on success, -1 on error.
+ */
+int32_t lance_index_segment_metadata_base_id(
+    const LanceIndexSegmentMetadata* metadata,
+    bool* out_is_set,
+    uint32_t* out_base_id
+);
+
 /** Free parsed segment metadata. NULL-safe. */
 void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
 
@@ -6409,6 +6517,26 @@ LanceOperation* lance_operation_delete_new(
 );
 
 /**
+ * Construct an owned native CreateIndex operation.
+ *
+ * `new_indices` and `removed_indices` are arrays of borrowed metadata handles
+ * whose complete native `IndexMetadata` values are copied. A NULL array is
+ * valid only when its count is zero; a non-NULL array with a zero count is
+ * ignored. Each non-NULL entry is required when the count is non-zero.
+ *
+ * Native `Operation::CreateIndex` owns index replacement, name handling and
+ * coverage validation. This constructor does not add binding-side non-empty,
+ * sorting, de-duplication, name or coverage checks. Returns an owned operation,
+ * or NULL on error.
+ */
+LanceOperation* lance_operation_create_index_new(
+    const LanceIndexSegmentMetadata* const* new_indices,
+    size_t new_index_count,
+    const LanceIndexSegmentMetadata* const* removed_indices,
+    size_t removed_index_count
+);
+
+/**
  * Construct an owned native transaction from an operation.
  *
  * The operation is cloned and remains usable. `options == NULL` selects a
@@ -6508,6 +6636,50 @@ int32_t lance_operation_kind(
 int32_t lance_operation_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
+);
+
+/**
+ * Read the number of new metadata entries in a CreateIndex operation.
+ * Returns 0 on success, -1 on error (including a different operation kind).
+ */
+int32_t lance_operation_create_index_new_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one new metadata entry from a CreateIndex operation.
+ *
+ * On success `*out_metadata` receives an independently owned handle that
+ * remains valid after the operation is closed. Returns 0 on success, -1 on
+ * error; the output slot is unchanged on error.
+ */
+int32_t lance_operation_create_index_new_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceIndexSegmentMetadata** out_metadata
+);
+
+/**
+ * Read the number of removed metadata entries in a CreateIndex operation.
+ * Returns 0 on success, -1 on error (including a different operation kind).
+ */
+int32_t lance_operation_create_index_removed_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one removed metadata entry from a CreateIndex operation.
+ *
+ * On success `*out_metadata` receives an independently owned handle that
+ * remains valid after the operation is closed. Returns 0 on success, -1 on
+ * error; the output slot is unchanged on error.
+ */
+int32_t lance_operation_create_index_removed_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceIndexSegmentMetadata** out_metadata
 );
 
 /**

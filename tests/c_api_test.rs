@@ -10549,6 +10549,1267 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
     assert_eq!(metadata, sentinel);
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompleteIndexMetadata {
+    uuid: [u8; 16],
+    name: String,
+    fields: Vec<i32>,
+    covering_fields: Vec<i32>,
+    dataset_version: u64,
+    fragment_ids: Vec<u32>,
+    index_version: i32,
+    index_type: i32,
+    index_details_type_url: Option<String>,
+    index_details_value: Vec<u8>,
+    files: Vec<(String, u64)>,
+    created_at: Option<(i64, u32)>,
+    base_id: Option<u32>,
+}
+
+fn inspect_index_metadata_via_c(
+    metadata: *const LanceIndexSegmentMetadata,
+) -> CompleteIndexMetadata {
+    assert!(!metadata.is_null());
+    let mut uuid = [0_u8; 16];
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_uuid(metadata, uuid.as_mut_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let name = unsafe { CStr::from_ptr(lance_index_segment_metadata_name(metadata)) }
+        .to_string_lossy()
+        .into_owned();
+    let field_count = unsafe { lance_index_segment_metadata_field_count(metadata) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut fields = vec![0_i32; field_count];
+    let mut written = 0_usize;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_field_ids(
+                metadata,
+                fields.as_mut_ptr(),
+                fields.len(),
+                &mut written,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    fields.truncate(written);
+
+    let covering_count = unsafe { lance_index_segment_metadata_covering_field_count(metadata) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut covering_fields = Vec::with_capacity(covering_count);
+    for index in 0..covering_count {
+        let mut field_id = i32::MIN;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_metadata_covering_field_id_at(metadata, index, &mut field_id)
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        covering_fields.push(field_id);
+    }
+
+    let fragment_count = unsafe { lance_index_segment_metadata_fragment_count(metadata) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut fragment_ids = vec![0_u32; fragment_count];
+    let mut written = 0_usize;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_fragment_ids(
+                metadata,
+                fragment_ids.as_mut_ptr(),
+                fragment_ids.len(),
+                &mut written,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    fragment_ids.truncate(written);
+
+    let type_url_ptr = unsafe { lance_index_segment_metadata_index_details_type_url(metadata) };
+    let index_details_type_url = if type_url_ptr.is_null() {
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(type_url_ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+
+    let mut details_len = usize::MAX;
+    let details_ptr =
+        unsafe { lance_index_segment_metadata_index_details_value(metadata, &mut details_len) };
+    let index_details_value = if details_ptr.is_null() {
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+        assert_eq!(details_len, usize::MAX);
+        Vec::new()
+    } else {
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+        unsafe { std::slice::from_raw_parts(details_ptr, details_len) }.to_vec()
+    };
+
+    let file_count = unsafe { lance_index_segment_metadata_file_count(metadata) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut files = Vec::with_capacity(file_count);
+    for index in 0..file_count {
+        let path = unsafe { lance_index_segment_metadata_file_path_at(metadata, index) };
+        assert!(!path.is_null(), "{}", take_last_error_message());
+        let mut size = u64::MAX;
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_file_size_at(metadata, index, &mut size) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        files.push((
+            unsafe { CStr::from_ptr(path) }
+                .to_string_lossy()
+                .into_owned(),
+            size,
+        ));
+    }
+    files.sort();
+
+    let mut timestamp = LanceOptionalTimestamp {
+        is_set: false,
+        unix_seconds: i64::MIN,
+        nanos: u32::MAX,
+    };
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_created_at(metadata, &mut timestamp) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let created_at = timestamp
+        .is_set
+        .then_some((timestamp.unix_seconds, timestamp.nanos));
+
+    let mut base_id_is_set = true;
+    let mut base_id = u32::MAX;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_base_id(metadata, &mut base_id_is_set, &mut base_id)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let base_id = base_id_is_set.then_some(base_id);
+
+    CompleteIndexMetadata {
+        uuid,
+        name,
+        fields,
+        covering_fields,
+        dataset_version: unsafe {
+            let version = lance_index_segment_metadata_dataset_version(metadata);
+            assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+            version
+        },
+        fragment_ids,
+        index_version: unsafe {
+            let version = lance_index_segment_metadata_index_version(metadata);
+            assert!(version >= 0, "{}", take_last_error_message());
+            version
+        },
+        index_type: unsafe {
+            let index_type = lance_index_segment_metadata_index_type(metadata);
+            assert!(index_type >= 0, "{}", take_last_error_message());
+            index_type
+        },
+        index_details_type_url,
+        index_details_value,
+        files,
+        created_at,
+        base_id,
+    }
+}
+
+fn native_index_metadata_files(
+    metadata: &lance_table::format::IndexMetadata,
+) -> Vec<(String, u64)> {
+    let mut files = metadata
+        .files
+        .as_ref()
+        .map(|files| {
+            files
+                .iter()
+                .map(|file| (file.path.clone(), file.size_bytes))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+fn assert_complete_metadata_matches_native_oracle(
+    actual: &CompleteIndexMetadata,
+    oracle: &lance_table::format::IndexMetadata,
+    expected_index_type: i32,
+) {
+    assert_eq!(actual.uuid, *oracle.uuid.as_bytes());
+    assert_eq!(actual.name, oracle.name);
+    assert_eq!(actual.fields, oracle.fields);
+    assert_eq!(actual.covering_fields, oracle.covering_fields);
+    assert_eq!(actual.dataset_version, oracle.dataset_version);
+    assert_eq!(
+        actual.fragment_ids,
+        oracle
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.iter().collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    assert_eq!(actual.index_version, oracle.index_version);
+    assert_eq!(actual.index_type, expected_index_type);
+    assert_eq!(
+        actual.index_details_type_url.as_deref(),
+        oracle
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.as_str())
+    );
+    assert_eq!(
+        actual.index_details_value,
+        oracle
+            .index_details
+            .as_ref()
+            .map(|details| details.value.clone())
+            .unwrap_or_default()
+    );
+    assert_eq!(actual.files, native_index_metadata_files(oracle));
+    assert_eq!(actual.base_id, oracle.base_id);
+    assert_eq!(actual.created_at.is_some(), oracle.created_at.is_some());
+}
+
+fn create_create_index_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("create_index_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("score", DataType::Int32, false),
+    ]));
+    let ids = (0..18).collect::<Vec<_>>();
+    let scores = ids.iter().map(|id| id * 10).collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Int32Array::from(scores)),
+        ],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 5,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id = 4").await.unwrap();
+        assert_eq!(dataset.version().version, 2);
+        assert_eq!(dataset.get_fragments().len(), 4);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 17);
+    });
+
+    (tmp, uri)
+}
+
+unsafe fn build_scalar_segment_via_c(
+    dataset: *const LanceDataset,
+    column: &str,
+    index_name: &str,
+    scalar_type: LanceScalarIndexType,
+    params_json: &str,
+    fragment_ids: &[u32],
+    uuid: Option<[u8; 16]>,
+) -> *mut LanceIndexSegmentMetadata {
+    let column = c_str(column);
+    let index_name = c_str(index_name);
+    let params_json = c_str(params_json);
+    let params_json_ptr = if params_json.as_bytes().is_empty() {
+        ptr::null()
+    } else {
+        params_json.as_ptr()
+    };
+    let uuid_ptr = uuid.as_ref().map_or(ptr::null(), |uuid| uuid.as_ptr());
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: fragment_ids.as_ptr(),
+        fragment_count: fragment_ids.len(),
+        index_uuid: uuid_ptr,
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            index_name.as_ptr(),
+            scalar_type as i32,
+            params_json_ptr,
+            &options,
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    let mut bytes = ptr::null_mut();
+    let mut len = 0_usize;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+    }
+    metadata
+}
+
+fn build_native_zone_map_segment(
+    dataset: &mut Dataset,
+    fragment_ids: &[u32],
+    uuid: [u8; 16],
+    index_name: &str,
+    params_json: &str,
+) -> lance_table::format::IndexMetadata {
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use uuid::Uuid;
+
+    let mut params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+    params.params = Some(params_json.to_string());
+    let mut builder =
+        dataset.create_index_builder(&["score"], lance_index::IndexType::ZoneMap, &params);
+    builder = builder
+        .name(index_name.to_string())
+        .index_uuid(Uuid::from_bytes(uuid))
+        .fragments(fragment_ids.to_vec());
+    lance_c::runtime::block_on(builder.execute_uncommitted()).unwrap()
+}
+
+fn dataset_segment_uuids(dataset: *const LanceDataset, index_name: &str) -> Vec<[u8; 16]> {
+    let index_name = c_str(index_name);
+    let count = unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut uuids = vec![0_u8; count as usize * 16];
+    let mut written = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                uuids.as_mut_ptr(),
+                count as usize,
+                &mut written,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(written, count);
+    uuids.as_chunks::<16>().0.to_vec()
+}
+
+fn metadata_from_operation(
+    operation: *const LanceOperation,
+    removed: bool,
+    index: usize,
+) -> *mut LanceIndexSegmentMetadata {
+    let mut metadata = ptr::null_mut();
+    let rc = unsafe {
+        if removed {
+            lance_operation_create_index_removed_at(operation, index, &mut metadata)
+        } else {
+            lance_operation_create_index_new_at(operation, index, &mut metadata)
+        }
+    };
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert!(!metadata.is_null());
+    metadata
+}
+
+#[test]
+fn test_index_metadata_complete_inspection_clone_and_native_oracle() {
+    use chrono::Utc;
+    use lance_table::format::pb;
+    use prost::Message;
+    use uuid::Uuid;
+
+    let (_tmp, uri) = create_create_index_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, 2);
+    assert_eq!(unsafe { lance_dataset_fragment_count(dataset) }, 4);
+
+    let uuid = [
+        0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe,
+        0x0f,
+    ];
+    let params_json = r#"{"rows_per_zone":2,"use_seeds":false}"#;
+    let before_ms = Utc::now().timestamp_millis();
+    let metadata = unsafe {
+        build_scalar_segment_via_c(
+            dataset,
+            "score",
+            "score_zonemap_create",
+            LanceScalarIndexType::ZoneMap,
+            params_json,
+            &[0, 1],
+            Some(uuid),
+        )
+    };
+    let after_ms = Utc::now().timestamp_millis();
+    let actual = inspect_index_metadata_via_c(metadata);
+
+    let mut native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let oracle = build_native_zone_map_segment(
+        &mut native,
+        &[0, 1],
+        uuid,
+        "score_zonemap_create",
+        params_json,
+    );
+    assert_complete_metadata_matches_native_oracle(
+        &actual,
+        &oracle,
+        LanceScalarIndexType::ZoneMap as i32,
+    );
+    assert_eq!(actual.fragment_ids, vec![0, 1]);
+    assert!(actual.covering_fields.is_empty());
+    assert!(actual.created_at.is_some());
+    assert!(actual.base_id.is_none());
+    assert!(!actual.files.is_empty());
+    assert!(actual.files.iter().all(|(_, size)| *size > 0));
+    let created_ms = actual
+        .created_at
+        .map(|(seconds, nanos)| seconds * 1000 + i64::from(nanos / 1_000_000))
+        .unwrap();
+    assert!(
+        (before_ms..=after_ms).contains(&created_ms),
+        "created_at {created_ms} must be recorded during this build ({before_ms}..={after_ms})"
+    );
+    let details =
+        lance_index::pbold::ZoneMapIndexDetails::decode(actual.index_details_value.as_slice())
+            .unwrap();
+    assert_eq!(details.rows_per_zone, Some(2));
+    assert_eq!(details.use_seeds, Some(false));
+
+    let cloned = unsafe { lance_index_segment_metadata_clone(metadata) };
+    assert!(!cloned.is_null(), "{}", take_last_error_message());
+    unsafe { lance_index_segment_metadata_free(metadata) };
+    let cloned_actual = inspect_index_metadata_via_c(cloned);
+    assert_eq!(cloned_actual, actual, "clone must be lossless in memory");
+    unsafe { lance_index_segment_metadata_free(cloned) };
+
+    let bitmap_uuid = [
+        0xf0, 0xed, 0xdc, 0xcb, 0xba, 0xa9, 0x98, 0x87, 0x76, 0x65, 0x54, 0x43, 0x32, 0x21, 0x10,
+        0x01,
+    ];
+    let bitmap = unsafe {
+        build_scalar_segment_via_c(
+            dataset,
+            "id",
+            "id_bitmap_empty_details",
+            LanceScalarIndexType::Bitmap,
+            "",
+            &[2],
+            Some(bitmap_uuid),
+        )
+    };
+    let mut details_len = usize::MAX;
+    let details_ptr =
+        unsafe { lance_index_segment_metadata_index_details_value(bitmap, &mut details_len) };
+    assert!(
+        !details_ptr.is_null(),
+        "a present empty Any value must remain distinguishable from absence"
+    );
+    assert_eq!(details_len, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    unsafe { lance_index_segment_metadata_free(bitmap) };
+
+    let absent_details_bytes = pb::IndexMetadata {
+        uuid: Some(pb::Uuid {
+            uuid: Uuid::new_v4().as_bytes().to_vec(),
+        }),
+        fields: vec![0],
+        name: "absent_details".to_string(),
+        dataset_version: 2,
+        fragment_bitmap: Vec::new(),
+        index_details: None,
+        index_version: Some(0),
+        created_at: None,
+        base_id: None,
+        files: Vec::new(),
+        covering_fields: Vec::new(),
+        clustering_id: None,
+        metadata: Default::default(),
+    }
+    .encode_to_vec();
+    let mut absent_details = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_parse(
+                absent_details_bytes.as_ptr(),
+                absent_details_bytes.len(),
+                &mut absent_details,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut untouched_len = usize::MAX;
+    assert!(
+        unsafe {
+            lance_index_segment_metadata_index_details_value(absent_details, &mut untouched_len)
+        }
+        .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    assert_eq!(untouched_len, usize::MAX);
+    let mut untouched_size = u64::MAX;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_file_size_at(absent_details, 0, &mut untouched_size)
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(untouched_size, u64::MAX);
+    unsafe { lance_index_segment_metadata_free(absent_details) };
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_create_index_operation_constructor_validation_and_ownership() {
+    let (_tmp, uri) = create_create_index_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let metadata = unsafe {
+        build_scalar_segment_via_c(
+            dataset,
+            "score",
+            "duplicate_segments",
+            LanceScalarIndexType::ZoneMap,
+            r#"{"rows_per_zone":2,"use_seeds":false}"#,
+            &[0, 1],
+            Some([0x42; 16]),
+        )
+    };
+
+    let duplicate_entries = [metadata as *const LanceIndexSegmentMetadata; 2];
+    let operation = unsafe {
+        lance_operation_create_index_new(
+            duplicate_entries.as_ptr(),
+            duplicate_entries.len(),
+            ptr::null(),
+            0,
+        )
+    };
+    assert!(!operation.is_null(), "{}", take_last_error_message());
+    let mut kind = LanceOperationKind::Unknown;
+    assert_eq!(
+        unsafe { lance_operation_kind(operation, &mut kind) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(kind, LanceOperationKind::CreateIndex);
+    let mut new_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_create_index_new_count(operation, &mut new_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(new_count, 2, "constructor must not de-duplicate entries");
+    let mut removed_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_create_index_removed_count(operation, &mut removed_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(removed_count, 0);
+
+    unsafe { lance_index_segment_metadata_free(metadata) };
+    let first = metadata_from_operation(operation, false, 0);
+    let second = metadata_from_operation(operation, false, 1);
+    unsafe { lance_operation_close(operation) };
+    let first_value = inspect_index_metadata_via_c(first);
+    let second_value = inspect_index_metadata_via_c(second);
+    assert_eq!(first_value, second_value);
+    assert_eq!(first_value.uuid, [0x42; 16]);
+    unsafe {
+        lance_index_segment_metadata_free(first);
+        lance_index_segment_metadata_free(second);
+    }
+
+    let empty = unsafe { lance_operation_create_index_new(ptr::null(), 0, ptr::null(), 0) };
+    assert!(!empty.is_null(), "{}", take_last_error_message());
+    let non_null_empty = [ptr::null::<LanceIndexSegmentMetadata>()];
+    let empty_with_non_null_arrays = unsafe {
+        lance_operation_create_index_new(non_null_empty.as_ptr(), 0, non_null_empty.as_ptr(), 0)
+    };
+    assert!(
+        !empty_with_non_null_arrays.is_null(),
+        "non-NULL arrays with zero counts must be accepted: {}",
+        take_last_error_message()
+    );
+    for operation in [empty, empty_with_non_null_arrays] {
+        let mut count = u64::MAX;
+        assert_eq!(
+            unsafe { lance_operation_create_index_new_count(operation, &mut count) },
+            0
+        );
+        assert_eq!(count, 0);
+        assert_eq!(
+            unsafe { lance_operation_create_index_removed_count(operation, &mut count) },
+            0
+        );
+        assert_eq!(count, 0);
+        unsafe { lance_operation_close(operation) };
+    }
+
+    let null_entry = [ptr::null::<LanceIndexSegmentMetadata>()];
+    assert!(
+        unsafe { lance_operation_create_index_new(null_entry.as_ptr(), 1, ptr::null(), 0) }
+            .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("new_indices[0]") && message.contains("NULL"),
+        "{message}"
+    );
+    assert!(unsafe { lance_operation_create_index_new(ptr::null(), 1, ptr::null(), 0) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("new_indices") && message.contains("NULL"),
+        "{message}"
+    );
+    assert!(
+        unsafe { lance_operation_create_index_new(ptr::null(), 0, null_entry.as_ptr(), 1) }
+            .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("removed_indices[0]") && message.contains("NULL"),
+        "{message}"
+    );
+
+    unsafe { lance_dataset_close(dataset) };
+
+    let transaction = write_uncommitted_for_batch(
+        "memory://create-index-wrong-kind",
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    let wrong_operation = native_transaction_operation(transaction);
+    assert_eq!(
+        native_operation_kind(wrong_operation),
+        LanceOperationKind::Overwrite
+    );
+    let sentinel = std::ptr::dangling_mut::<LanceIndexSegmentMetadata>();
+    let mut untouched = sentinel;
+    assert_eq!(
+        unsafe { lance_operation_create_index_new_at(wrong_operation, 0, &mut untouched) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(untouched, sentinel);
+    let mut untouched_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_create_index_new_count(wrong_operation, &mut untouched_count) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(untouched_count, u64::MAX);
+    assert_eq!(
+        unsafe { lance_operation_create_index_removed_at(wrong_operation, 0, &mut untouched) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(untouched, sentinel);
+    unsafe {
+        lance_operation_close(wrong_operation);
+        lance_transaction_close(transaction);
+    }
+}
+
+#[test]
+fn test_create_index_commit_replace_conflict_history_and_query() {
+    let (_tmp, uri) = create_create_index_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let read_version = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(read_version, 2);
+    assert_eq!(unsafe { lance_dataset_fragment_count(dataset) }, 4);
+
+    let params = r#"{"rows_per_zone":2,"use_seeds":false}"#;
+    let uuid_a = [0xa1; 16];
+    let uuid_b = [0xb2; 16];
+    let uuid_conflict = [0xc3; 16];
+    let uuid_replacement = [0xd4; 16];
+    let segment_a = unsafe {
+        build_scalar_segment_via_c(
+            dataset,
+            "score",
+            "score_zonemap_create",
+            LanceScalarIndexType::ZoneMap,
+            params,
+            &[0, 1],
+            Some(uuid_a),
+        )
+    };
+    let segment_b = unsafe {
+        build_scalar_segment_via_c(
+            dataset,
+            "score",
+            "score_zonemap_create",
+            LanceScalarIndexType::ZoneMap,
+            params,
+            &[2, 3],
+            Some(uuid_b),
+        )
+    };
+    let segment_a_value = inspect_index_metadata_via_c(segment_a);
+    let segment_b_value = inspect_index_metadata_via_c(segment_b);
+    assert_eq!(segment_a_value.fragment_ids, vec![0, 1]);
+    assert_eq!(segment_b_value.fragment_ids, vec![2, 3]);
+
+    let new_segments = [
+        segment_a as *const LanceIndexSegmentMetadata,
+        segment_b as *const LanceIndexSegmentMetadata,
+    ];
+    let create_operation = unsafe {
+        lance_operation_create_index_new(new_segments.as_ptr(), new_segments.len(), ptr::null(), 0)
+    };
+    assert!(!create_operation.is_null(), "{}", take_last_error_message());
+    let create_transaction =
+        unsafe { lance_transaction_new(read_version, create_operation, ptr::null()) };
+    assert!(
+        !create_transaction.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+
+    let conflict_segment = unsafe {
+        build_scalar_segment_via_c(
+            dataset,
+            "score",
+            "score_zonemap_create",
+            LanceScalarIndexType::ZoneMap,
+            params,
+            &[0, 1, 2, 3],
+            Some(uuid_conflict),
+        )
+    };
+    let conflict_segments = [conflict_segment as *const LanceIndexSegmentMetadata];
+    let conflict_operation =
+        unsafe { lance_operation_create_index_new(conflict_segments.as_ptr(), 1, ptr::null(), 0) };
+    assert!(
+        !conflict_operation.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let conflict_transaction =
+        unsafe { lance_transaction_new(read_version, conflict_operation, ptr::null()) };
+    assert!(
+        !conflict_transaction.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let replacement_segment = unsafe {
+        build_scalar_segment_via_c(
+            dataset,
+            "score",
+            "score_zonemap_create",
+            LanceScalarIndexType::ZoneMap,
+            params,
+            &[0, 1, 2, 3],
+            Some(uuid_replacement),
+        )
+    };
+    let replacement_value = inspect_index_metadata_via_c(replacement_segment);
+    assert_eq!(replacement_value.fragment_ids, vec![0, 1, 2, 3]);
+
+    unsafe {
+        lance_index_segment_metadata_free(segment_a);
+        lance_index_segment_metadata_free(segment_b);
+        lance_index_segment_metadata_free(conflict_segment);
+        lance_operation_close(create_operation);
+        lance_operation_close(conflict_operation);
+        lance_dataset_close(dataset);
+    }
+
+    let mut commit_options: LanceCommitOptions = unsafe { std::mem::zeroed() };
+    commit_options.has_max_retries = true;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = LanceCommitTimeoutMode::Disabled as i32;
+    let committed = commit_native_transaction(&uri, create_transaction, &commit_options);
+    assert_eq!(
+        unsafe { lance_dataset_version(committed) },
+        read_version + 1
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(committed) }, 17);
+    let mut committed_uuids = dataset_segment_uuids(committed, "score_zonemap_create");
+    committed_uuids.sort();
+    let mut expected_uuids = vec![uuid_a, uuid_b];
+    expected_uuids.sort();
+    assert_eq!(committed_uuids, expected_uuids);
+    unsafe { lance_dataset_close(committed) };
+
+    let sentinel_dataset = std::ptr::dangling_mut::<LanceDataset>();
+    let mut failed_output = sentinel_dataset;
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                uri_c.as_ptr(),
+                conflict_transaction,
+                &commit_options,
+                ptr::null(),
+                ptr::null(),
+                &mut failed_output,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::CommitConflict,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        failed_output, sentinel_dataset,
+        "a losing CreateIndex commit must not write a dataset output"
+    );
+    unsafe { lance_transaction_close(conflict_transaction) };
+
+    let after_conflict = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!after_conflict.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_dataset_version(after_conflict) },
+        read_version + 1,
+        "the losing transaction must not publish another version"
+    );
+    let mut after_conflict_uuids = dataset_segment_uuids(after_conflict, "score_zonemap_create");
+    after_conflict_uuids.sort();
+    assert_eq!(
+        after_conflict_uuids, expected_uuids,
+        "the losing transaction must not publish a duplicate segment"
+    );
+    let (ids, statistics) = scan_index_ids(after_conflict, "score = 70", true);
+    assert_eq!(ids, vec![7]);
+    assert!(
+        statistics.indices_loaded > 0,
+        "the committed ZoneMap index must be used by the query"
+    );
+
+    let mut transaction_at_commit = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_read_transaction(after_conflict, &mut transaction_at_commit) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!transaction_at_commit.is_null());
+    let committed_operation = native_transaction_operation(transaction_at_commit);
+    assert_eq!(
+        native_operation_kind(committed_operation),
+        LanceOperationKind::CreateIndex
+    );
+    let mut new_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_create_index_new_count(committed_operation, &mut new_count) },
+        0
+    );
+    assert_eq!(new_count, 2);
+    let mut removed_count = u64::MAX;
+    assert_eq!(
+        unsafe {
+            lance_operation_create_index_removed_count(committed_operation, &mut removed_count)
+        },
+        0
+    );
+    assert_eq!(removed_count, 0);
+    let history_a = metadata_from_operation(committed_operation, false, 0);
+    let history_b = metadata_from_operation(committed_operation, false, 1);
+    assert_eq!(
+        inspect_index_metadata_via_c(history_a),
+        segment_a_value,
+        "persisted history must retain the complete new-index metadata"
+    );
+    assert_eq!(inspect_index_metadata_via_c(history_b), segment_b_value);
+    let committed_proto = transaction_proto_bytes(transaction_at_commit);
+    unsafe {
+        lance_operation_close(committed_operation);
+        lance_transaction_close(transaction_at_commit);
+        lance_dataset_close(after_conflict);
+    }
+    assert_eq!(
+        inspect_index_metadata_via_c(history_a),
+        segment_a_value,
+        "metadata cloned from an operation must outlive the parent handles"
+    );
+
+    let parsed_committed = transaction_from_proto_bytes(&committed_proto);
+    let parsed_committed_operation = native_transaction_operation(parsed_committed);
+    let parsed_a = metadata_from_operation(parsed_committed_operation, false, 0);
+    let parsed_b = metadata_from_operation(parsed_committed_operation, false, 1);
+    assert_eq!(inspect_index_metadata_via_c(parsed_a), segment_a_value);
+    assert_eq!(inspect_index_metadata_via_c(parsed_b), segment_b_value);
+    unsafe {
+        lance_operation_close(parsed_committed_operation);
+        lance_transaction_close(parsed_committed);
+        lance_index_segment_metadata_free(parsed_a);
+        lance_index_segment_metadata_free(parsed_b);
+    }
+
+    let replacement_version = read_version + 1;
+
+    let replacement_new = [replacement_segment as *const LanceIndexSegmentMetadata];
+    let removed = [
+        history_a as *const LanceIndexSegmentMetadata,
+        history_b as *const LanceIndexSegmentMetadata,
+    ];
+    let replacement_operation = unsafe {
+        lance_operation_create_index_new(
+            replacement_new.as_ptr(),
+            1,
+            removed.as_ptr(),
+            removed.len(),
+        )
+    };
+    assert!(
+        !replacement_operation.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let replacement_transaction =
+        unsafe { lance_transaction_new(replacement_version, replacement_operation, ptr::null()) };
+    assert!(
+        !replacement_transaction.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    unsafe {
+        lance_operation_close(replacement_operation);
+        lance_index_segment_metadata_free(replacement_segment);
+        lance_index_segment_metadata_free(history_a);
+        lance_index_segment_metadata_free(history_b);
+    }
+    let replaced = commit_native_transaction(&uri, replacement_transaction, &commit_options);
+    assert_eq!(
+        unsafe { lance_dataset_version(replaced) },
+        replacement_version + 1
+    );
+    let replaced_uuids = dataset_segment_uuids(replaced, "score_zonemap_create");
+    assert_eq!(replaced_uuids, vec![uuid_replacement]);
+    let (ids, statistics) = scan_index_ids(replaced, "score = 70", true);
+    assert_eq!(ids, vec![7]);
+    assert!(statistics.indices_loaded > 0);
+
+    let mut replacement_history = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_read_transaction(replaced, &mut replacement_history) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!replacement_history.is_null());
+    let replacement_history_operation = native_transaction_operation(replacement_history);
+    let mut replaced_new_count = u64::MAX;
+    assert_eq!(
+        unsafe {
+            lance_operation_create_index_new_count(
+                replacement_history_operation,
+                &mut replaced_new_count,
+            )
+        },
+        0
+    );
+    assert_eq!(replaced_new_count, 1);
+    let mut replaced_removed_count = u64::MAX;
+    assert_eq!(
+        unsafe {
+            lance_operation_create_index_removed_count(
+                replacement_history_operation,
+                &mut replaced_removed_count,
+            )
+        },
+        0
+    );
+    assert_eq!(replaced_removed_count, 2);
+    let persisted_replacement = metadata_from_operation(replacement_history_operation, false, 0);
+    assert_eq!(
+        inspect_index_metadata_via_c(persisted_replacement),
+        replacement_value
+    );
+    let persisted_removed_a = metadata_from_operation(replacement_history_operation, true, 0);
+    let persisted_removed_b = metadata_from_operation(replacement_history_operation, true, 1);
+    let mut persisted_removed = [
+        inspect_index_metadata_via_c(persisted_removed_a).uuid,
+        inspect_index_metadata_via_c(persisted_removed_b).uuid,
+    ];
+    persisted_removed.sort();
+    let mut original_removed = [uuid_a, uuid_b];
+    original_removed.sort();
+    assert_eq!(persisted_removed, original_removed);
+    assert_eq!(
+        inspect_index_metadata_via_c(persisted_removed_a),
+        segment_a_value
+    );
+    assert_eq!(
+        inspect_index_metadata_via_c(persisted_removed_b),
+        segment_b_value
+    );
+    let replacement_proto = transaction_proto_bytes(replacement_history);
+    unsafe {
+        lance_operation_close(replacement_history_operation);
+        lance_transaction_close(replacement_history);
+        lance_index_segment_metadata_free(persisted_replacement);
+        lance_index_segment_metadata_free(persisted_removed_a);
+        lance_index_segment_metadata_free(persisted_removed_b);
+        lance_dataset_close(replaced);
+    }
+
+    let parsed_replacement = transaction_from_proto_bytes(&replacement_proto);
+    let parsed_replacement_operation = native_transaction_operation(parsed_replacement);
+    let parsed_new = metadata_from_operation(parsed_replacement_operation, false, 0);
+    let parsed_removed_a = metadata_from_operation(parsed_replacement_operation, true, 0);
+    let parsed_removed_b = metadata_from_operation(parsed_replacement_operation, true, 1);
+    assert_eq!(inspect_index_metadata_via_c(parsed_new), replacement_value);
+    assert_eq!(
+        inspect_index_metadata_via_c(parsed_removed_a),
+        segment_a_value
+    );
+    assert_eq!(
+        inspect_index_metadata_via_c(parsed_removed_b),
+        segment_b_value
+    );
+
+    let removal_indices = [parsed_new as *const LanceIndexSegmentMetadata];
+    let removal_operation = unsafe {
+        lance_operation_create_index_new(
+            ptr::null(),
+            0,
+            removal_indices.as_ptr(),
+            removal_indices.len(),
+        )
+    };
+    assert!(
+        !removal_operation.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let removal_transaction =
+        unsafe { lance_transaction_new(replacement_version + 1, removal_operation, ptr::null()) };
+    assert!(
+        !removal_transaction.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_operation_close(removal_operation) };
+    let removed_dataset = commit_native_transaction(&uri, removal_transaction, &commit_options);
+    assert_eq!(
+        unsafe { lance_dataset_version(removed_dataset) },
+        replacement_version + 2
+    );
+    let removal_name = c_str("score_zonemap_create");
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(removed_dataset, removal_name.as_ptr()) },
+        0
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    let (ids, statistics) = scan_index_ids(removed_dataset, "score = 70", false);
+    assert_eq!(ids, vec![7]);
+    assert_eq!(statistics.indices_loaded, 0);
+    let mut removal_history = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_read_transaction(removed_dataset, &mut removal_history) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!removal_history.is_null());
+    let removal_history_operation = native_transaction_operation(removal_history);
+    let mut removal_new_count = u64::MAX;
+    let mut removal_removed_count = u64::MAX;
+    assert_eq!(
+        unsafe {
+            lance_operation_create_index_new_count(
+                removal_history_operation,
+                &mut removal_new_count,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_operation_create_index_removed_count(
+                removal_history_operation,
+                &mut removal_removed_count,
+            )
+        },
+        0
+    );
+    assert_eq!(removal_new_count, 0);
+    assert_eq!(removal_removed_count, 1);
+    let removal_metadata = metadata_from_operation(removal_history_operation, true, 0);
+    assert_eq!(
+        inspect_index_metadata_via_c(removal_metadata),
+        replacement_value
+    );
+    unsafe {
+        lance_operation_close(removal_history_operation);
+        lance_transaction_close(removal_history);
+        lance_transaction_close(removal_transaction);
+        lance_index_segment_metadata_free(removal_metadata);
+        lance_dataset_close(removed_dataset);
+    }
+
+    unsafe {
+        lance_operation_close(parsed_replacement_operation);
+        lance_transaction_close(parsed_replacement);
+        lance_transaction_close(create_transaction);
+        lance_transaction_close(replacement_transaction);
+        lance_index_segment_metadata_free(parsed_new);
+        lance_index_segment_metadata_free(parsed_removed_a);
+        lance_index_segment_metadata_free(parsed_removed_b);
+    }
+}
+
+#[test]
+fn test_create_index_native_validation_stays_in_core() {
+    let (_tmp, uri) = create_create_index_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let version = unsafe { lance_dataset_version(dataset) };
+
+    let btree = unsafe {
+        build_scalar_segment_via_c(
+            dataset,
+            "id",
+            "mixed_domain_idx",
+            LanceScalarIndexType::BTree,
+            "",
+            &[0, 1],
+            None,
+        )
+    };
+    let bitmap = unsafe {
+        build_scalar_segment_via_c(
+            dataset,
+            "id",
+            "mixed_domain_idx",
+            LanceScalarIndexType::Bitmap,
+            "",
+            &[2, 3],
+            Some([0x22; 16]),
+        )
+    };
+    let btree_value = inspect_index_metadata_via_c(btree);
+    let bitmap_value = inspect_index_metadata_via_c(bitmap);
+    assert_eq!(btree_value.index_type, LanceScalarIndexType::BTree as i32);
+    assert_eq!(bitmap_value.index_type, LanceScalarIndexType::Bitmap as i32);
+
+    let entries = [
+        btree as *const LanceIndexSegmentMetadata,
+        bitmap as *const LanceIndexSegmentMetadata,
+    ];
+    let operation = unsafe {
+        lance_operation_create_index_new(entries.as_ptr(), entries.len(), ptr::null(), 0)
+    };
+    assert!(!operation.is_null(), "{}", take_last_error_message());
+    let transaction = unsafe { lance_transaction_new(version, operation, ptr::null()) };
+    assert!(!transaction.is_null(), "{}", take_last_error_message());
+    unsafe {
+        lance_operation_close(operation);
+        lance_index_segment_metadata_free(btree);
+        lance_index_segment_metadata_free(bitmap);
+        lance_dataset_close(dataset);
+    }
+
+    let mut options: LanceCommitOptions = unsafe { std::mem::zeroed() };
+    options.has_max_retries = true;
+    options.max_retries = 0;
+    options.timeout_mode = LanceCommitTimeoutMode::Disabled as i32;
+    let sentinel = std::ptr::dangling_mut::<LanceDataset>();
+    let mut output = sentinel;
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                uri_c.as_ptr(),
+                transaction,
+                &options,
+                ptr::null(),
+                ptr::null(),
+                &mut output,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("mixes row-ID and row-address segments"),
+        "{message}"
+    );
+    assert_eq!(output, sentinel);
+    unsafe { lance_transaction_close(transaction) };
+
+    let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null());
+    assert_eq!(unsafe { lance_dataset_version(reopened) }, version);
+    assert_eq!(unsafe { lance_dataset_index_count(reopened) }, 0);
+    unsafe { lance_dataset_close(reopened) };
+}
+
 /// Helper: create a dataset with a List<Utf8> column for LabelList index testing.
 fn create_label_list_dataset() -> (tempfile::TempDir, String) {
     use arrow_array::ListArray;

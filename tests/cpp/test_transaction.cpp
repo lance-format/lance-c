@@ -3,6 +3,8 @@
 
 #include "lance/lance.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -353,6 +355,139 @@ static void test_fragment_delete(const std::string& source_uri,
     std::printf("C++ fragment delete OK\n");
 }
 
+static void test_create_index_operation(const std::string& source_uri,
+                                        const std::string& base) {
+    const std::string uri = base + "/cpp_create_index";
+    lance::UncommittedWriteOptions write_options;
+    write_options.write.params.max_rows_per_file = 5;
+    write_options.write.params.enable_stable_row_ids = true;
+    auto create =
+        write_uncommitted(source_uri, uri, lance::WriteMode::Create, write_options);
+    auto dataset = lance::Dataset::commit(uri, create);
+    CHECK(dataset.version() == 1);
+    CHECK(dataset.fragment_count() == 4);
+
+    auto fragment_ids = dataset.fragment_ids();
+    CHECK(fragment_ids.size() >= 2);
+    const uint64_t version = dataset.version();
+    const char* params = "{\"rows_per_zone\":2,\"use_seeds\":false}";
+    const std::array<uint8_t, 16> first_uuid = {
+        0x51, 0x62, 0x73, 0x84, 0x95, 0xa6, 0x47, 0xb8,
+        0xc9, 0xda, 0xeb, 0xfc, 0x0d, 0x1e, 0x2f, 0x30,
+    };
+    const std::array<uint8_t, 16> second_uuid = {
+        0x41, 0x52, 0x63, 0x74, 0x85, 0x96, 0xa7, 0xb8,
+        0xc9, 0xda, 0xeb, 0xfc, 0x0d, 0x1e, 0x2f, 0x30,
+    };
+
+    std::optional<lance::Operation> held_operation;
+    std::array<uint8_t, 16> first_committed_uuid{};
+    std::array<uint8_t, 16> second_committed_uuid{};
+    std::vector<lance::IndexSegmentFile> first_files;
+    std::vector<uint8_t> first_details;
+    std::optional<lance::IndexTimestamp> first_created_at;
+    {
+        uint32_t first_fragment = static_cast<uint32_t>(fragment_ids[0]);
+        uint32_t second_fragment = static_cast<uint32_t>(fragment_ids[1]);
+        LanceIndexSegmentBuildOptions first_options = {};
+        first_options.fragment_ids = &first_fragment;
+        first_options.fragment_count = 1;
+        first_options.index_uuid = first_uuid.data();
+        first_options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+        auto first_builder = dataset.new_scalar_index_segment_builder(
+            "score", LANCE_SCALAR_ZONE_MAP, "cpp_create_index_zonemap",
+            params, &first_options);
+        auto first_bytes = first_builder.execute_uncommitted();
+        auto first = lance::IndexSegmentMetadata::parse(first_bytes);
+
+        LanceIndexSegmentBuildOptions second_options = {};
+        second_options.fragment_ids = &second_fragment;
+        second_options.fragment_count = 1;
+        second_options.index_uuid = second_uuid.data();
+        second_options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+        auto second_builder = dataset.new_scalar_index_segment_builder(
+            "score", LANCE_SCALAR_ZONE_MAP, "cpp_create_index_zonemap",
+            params, &second_options);
+        auto second_bytes = second_builder.execute_uncommitted();
+        auto second = lance::IndexSegmentMetadata::parse(second_bytes);
+
+        auto cloned = first.clone();
+        CHECK(cloned.uuid() == first_uuid);
+        CHECK(cloned.covering_field_ids().empty());
+        CHECK(!cloned.index_details_value().empty());
+        CHECK(cloned.created_at().has_value());
+        CHECK(!cloned.base_id().has_value());
+        CHECK(cloned.files().size() == first.files().size());
+
+        first_committed_uuid = first.uuid();
+        second_committed_uuid = second.uuid();
+        first_files = first.files();
+        first_details = first.index_details_value();
+        first_created_at = first.created_at();
+        CHECK(!first_files.empty());
+        CHECK(std::all_of(first_files.begin(), first_files.end(),
+                          [](const lance::IndexSegmentFile& file) {
+                              return !file.path.empty() && file.size_bytes > 0;
+                          }));
+        CHECK(first_created_at->unix_seconds > 0);
+
+        held_operation.emplace(
+            lance::Operation::make_create_index({&first, &second}, {}));
+    }
+
+    CHECK(held_operation->kind() == lance::OperationKind::CreateIndex);
+    auto new_metadata = held_operation->create_index_new();
+    CHECK(new_metadata.size() == 2);
+    CHECK(new_metadata[0].uuid() == first_committed_uuid);
+    CHECK(new_metadata[1].uuid() == second_committed_uuid);
+    CHECK(new_metadata[0].name() == "cpp_create_index_zonemap");
+    CHECK(new_metadata[0].index_details_value() == first_details);
+    CHECK(new_metadata[0].files().size() == first_files.size());
+    CHECK(held_operation->create_index_removed().empty());
+
+    auto transaction =
+        lance::Transaction::from_operation(version, *held_operation);
+    auto proto = transaction.to_proto();
+    auto parsed = lance::Transaction::from_proto(proto);
+    auto parsed_metadata = parsed.operation().create_index_new();
+    CHECK(parsed_metadata.size() == 2);
+    CHECK(parsed_metadata[0].uuid() == first_committed_uuid);
+    CHECK(parsed_metadata[1].uuid() == second_committed_uuid);
+
+    lance::CommitOptions commit_options;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = lance::CommitTimeoutMode::Disabled;
+    auto committed =
+        lance::Dataset::commit(uri, transaction, commit_options);
+    CHECK(committed.version() == version + 1);
+    CHECK(committed.index_segment_count("cpp_create_index_zonemap") == 2);
+    CHECK(committed.count_rows("score = 80") == 1);
+
+    auto history = committed.read_transaction();
+    CHECK(history.has_value());
+    auto history_operation = history->operation();
+    CHECK(history_operation.kind() == lance::OperationKind::CreateIndex);
+    auto history_metadata = history_operation.create_index_new();
+    CHECK(history_metadata.size() == 2);
+    CHECK(history_metadata[0].uuid() == first_committed_uuid);
+    CHECK(history_metadata[1].uuid() == second_committed_uuid);
+    CHECK(history_metadata[0].index_details_value() == first_details);
+    CHECK(history_metadata[0].files() == first_files);
+    CHECK(history_metadata[0].created_at().has_value());
+    CHECK(history_metadata[0].created_at()->unix_seconds ==
+          first_created_at->unix_seconds);
+    CHECK(history_metadata[0].created_at()->nanos == first_created_at->nanos);
+    CHECK(history_operation.create_index_removed().empty());
+
+    held_operation.reset();
+    new_metadata.clear();
+    history.reset();
+    committed = lance::Dataset::open(uri);
+    CHECK(committed.version() == version + 1);
+    CHECK(committed.index_segment_count("cpp_create_index_zonemap") == 2);
+    std::printf("C++ CreateIndex transaction OK\n");
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) {
         std::fprintf(stderr,
@@ -363,6 +498,7 @@ int main(int argc, char** argv) {
         test_create_append_overwrite_and_batch(argv[1], argv[2]);
         test_detached_conflict_and_errors(argv[1], argv[2]);
         test_fragment_delete(argv[1], argv[2]);
+        test_create_index_operation(argv[1], argv[2]);
     } catch (const lance::Error& error) {
         std::fprintf(stderr, "lance::Error(%d): %s\n",
                      static_cast<int>(error.code), error.what());

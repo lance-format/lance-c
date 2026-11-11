@@ -340,12 +340,28 @@ impl IndexBuildProgress for SendIndexBuildProgressCallback {
     }
 }
 
+/// Presence-aware timestamp split into whole Unix seconds and nanoseconds.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LanceOptionalTimestamp {
+    pub is_set: bool,
+    pub unix_seconds: i64,
+    pub nanos: u32,
+}
+
 /// Opaque parsed index segment metadata.
 pub struct LanceIndexSegmentMetadata {
     metadata: IndexMetadata,
     name: CString,
     index_details_type_url: Option<CString>,
     fragment_ids: Vec<u32>,
+    file_paths: Vec<CString>,
+}
+
+impl LanceIndexSegmentMetadata {
+    pub(crate) fn native_metadata(&self) -> &IndexMetadata {
+        &self.metadata
+    }
 }
 
 pub(crate) fn metadata_handle(metadata: IndexMetadata) -> Result<*mut LanceIndexSegmentMetadata> {
@@ -362,11 +378,27 @@ pub(crate) fn metadata_handle(metadata: IndexMetadata) -> Result<*mut LanceIndex
         .as_ref()
         .map(|bitmap| bitmap.iter().collect())
         .unwrap_or_default();
+    let file_paths = metadata
+        .files
+        .as_ref()
+        .map(|files| {
+            files
+                .iter()
+                .map(|file| {
+                    CString::new(file.path.as_str()).map_err(|_| {
+                        invalid_input("index metadata file path contains an embedded NUL byte")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(Box::into_raw(Box::new(LanceIndexSegmentMetadata {
         metadata,
         name,
         index_details_type_url,
         fragment_ids,
+        file_paths,
     })))
 }
 
@@ -1838,6 +1870,257 @@ unsafe fn metadata_fragment_ids_inner(
     Ok(0)
 }
 
+/// Clone parsed index metadata into an independent handle.
+///
+/// The clone copies the complete in-memory native value, including optional
+/// `index_details`, `fragment_bitmap`, `created_at`, `base_id`, and `files`.
+/// It does not re-encode through protobuf. Safe to call with NULL; that returns
+/// NULL with an error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_clone(
+    metadata: *const LanceIndexSegmentMetadata,
+) -> *mut LanceIndexSegmentMetadata {
+    ffi_try!(
+        (|| -> Result<*mut LanceIndexSegmentMetadata> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata must not be NULL"));
+            }
+            metadata_handle(unsafe { (*metadata).metadata.clone() })
+        })(),
+        ptr::null_mut()
+    )
+}
+
+/// Return the number of covering field IDs. Returns 0 on error; zero is also a
+/// valid count, so check lance_last_error_code().
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_covering_field_count(
+    metadata: *const LanceIndexSegmentMetadata,
+) -> usize {
+    ffi_try!(
+        (|| -> Result<usize> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            Ok(unsafe { (*metadata).metadata.covering_fields.len() })
+        })(),
+        0
+    )
+}
+
+/// Copy one covering field ID in metadata order. Output is success-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_covering_field_id_at(
+    metadata: *const LanceIndexSegmentMetadata,
+    index: usize,
+    out_field_id: *mut i32,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_field_id.is_null() {
+                return Err(invalid_input("out_field_id must not be NULL"));
+            }
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let covering_fields = unsafe { &(*metadata).metadata.covering_fields };
+            let field_id = covering_fields.get(index).ok_or_else(|| {
+                invalid_input(format!(
+                    "covering field index {index} is out of range for {} covering fields",
+                    covering_fields.len()
+                ))
+            })?;
+            unsafe { ptr::write(out_field_id, *field_id) };
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Return the borrowed `index_details.value` bytes.
+///
+/// The pointer remains valid until the metadata handle is freed. A present but
+/// empty value returns a non-NULL pointer and writes `*out_len = 0`. Absent
+/// `index_details` returns NULL with LANCE_ERR_NOT_FOUND. `*out_len` is
+/// unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_index_details_value(
+    metadata: *const LanceIndexSegmentMetadata,
+    out_len: *mut usize,
+) -> *const u8 {
+    ffi_try!(
+        (|| -> Result<*const u8> {
+            if out_len.is_null() {
+                return Err(invalid_input("out_len must not be NULL"));
+            }
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let details = unsafe { &(*metadata).metadata }
+                .index_details
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::index_not_found("index metadata does not contain index_details")
+                })?;
+            unsafe { ptr::write(out_len, details.value.len()) };
+            Ok(details.value.as_ptr())
+        })(),
+        ptr::null()
+    )
+}
+
+/// Return the number of recorded files. Returns 0 on error or when the native
+/// `files` option is absent; check lance_last_error_code() to distinguish.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_file_count(
+    metadata: *const LanceIndexSegmentMetadata,
+) -> usize {
+    ffi_try!(
+        (|| -> Result<usize> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            Ok(unsafe { &(*metadata).metadata }
+                .files
+                .as_ref()
+                .map(|files| files.len())
+                .unwrap_or(0))
+        })(),
+        0
+    )
+}
+
+/// Return one file path, borrowed until the metadata handle is freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_file_path_at(
+    metadata: *const LanceIndexSegmentMetadata,
+    index: usize,
+) -> *const c_char {
+    ffi_try!(
+        (|| -> Result<*const c_char> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let metadata = unsafe { &*metadata };
+            let files = metadata.metadata.files.as_ref().ok_or_else(|| {
+                invalid_input(format!(
+                    "index metadata file index {index} is out of range because files are absent"
+                ))
+            })?;
+            let path = metadata.file_paths.get(index).ok_or_else(|| {
+                invalid_input(format!(
+                    "index metadata file index {index} is out of range for {} files",
+                    files.len()
+                ))
+            })?;
+            Ok(path.as_ptr())
+        })(),
+        ptr::null()
+    )
+}
+
+/// Copy one recorded file size. Output is success-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_file_size_at(
+    metadata: *const LanceIndexSegmentMetadata,
+    index: usize,
+    out_size: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_size.is_null() {
+                return Err(invalid_input("out_size must not be NULL"));
+            }
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let files = unsafe { &(*metadata).metadata }
+                .files
+                .as_ref()
+                .ok_or_else(|| {
+                    invalid_input(format!(
+                        "index metadata file index {index} is out of range because files are absent"
+                    ))
+                })?;
+            let file = files.get(index).ok_or_else(|| {
+                invalid_input(format!(
+                    "index metadata file index {index} is out of range for {} files",
+                    files.len()
+                ))
+            })?;
+            unsafe { ptr::write(out_size, file.size_bytes) };
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Read the optional native `created_at` timestamp.
+///
+/// On success, absent is reported with `is_set == false` and zeroed fields;
+/// present is reported with `is_set == true`. The output is unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_created_at(
+    metadata: *const LanceIndexSegmentMetadata,
+    out_timestamp: *mut LanceOptionalTimestamp,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_timestamp.is_null() {
+                return Err(invalid_input("out_timestamp must not be NULL"));
+            }
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let timestamp = unsafe { &mut *out_timestamp };
+            match unsafe { (*metadata).metadata.created_at } {
+                Some(created_at) => {
+                    timestamp.is_set = true;
+                    timestamp.unix_seconds = created_at.timestamp();
+                    timestamp.nanos = created_at.timestamp_subsec_nanos();
+                }
+                None => {
+                    timestamp.is_set = false;
+                    timestamp.unix_seconds = 0;
+                    timestamp.nanos = 0;
+                }
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Read the optional native `base_id`.
+///
+/// On success, absent is reported with `is_set == false` and `base_id == 0`;
+/// present is reported with `is_set == true`. Both outputs are unchanged on
+/// error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_base_id(
+    metadata: *const LanceIndexSegmentMetadata,
+    out_is_set: *mut bool,
+    out_base_id: *mut u32,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_is_set.is_null() || out_base_id.is_null() {
+                return Err(invalid_input("out_is_set and out_base_id must not be NULL"));
+            }
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let base_id = unsafe { (*metadata).metadata.base_id };
+            unsafe {
+                ptr::write(out_is_set, base_id.is_some());
+                ptr::write(out_base_id, base_id.unwrap_or(0));
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
 /// Free parsed index metadata. Safe to call with NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_index_segment_metadata_free(
@@ -1855,6 +2138,37 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn metadata_clone_preserves_in_memory_optionals_without_protobuf() {
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "optional_presence".to_string(),
+            fields: vec![3, 7],
+            covering_fields: vec![7],
+            dataset_version: 42,
+            fragment_bitmap: Some([1, 4, 9].into_iter().collect()),
+            index_details: None,
+            index_version: 5,
+            created_at: None,
+            base_id: Some(13),
+            files: Some(Vec::new()),
+        };
+        let original = metadata_handle(metadata.clone()).unwrap();
+        let cloned = unsafe { lance_index_segment_metadata_clone(original) };
+        assert!(!cloned.is_null());
+        assert_eq!(unsafe { (*cloned).native_metadata() }, &metadata);
+        assert_eq!(
+            unsafe { (*cloned).native_metadata().files.as_ref() }.map(Vec::len),
+            Some(0),
+            "an in-memory Some(empty) files value must not normalize to None"
+        );
+
+        unsafe {
+            lance_index_segment_metadata_free(cloned);
+            lance_index_segment_metadata_free(original);
+        }
+    }
 
     struct LateCallState {
         entered_after_retire: AtomicBool,
