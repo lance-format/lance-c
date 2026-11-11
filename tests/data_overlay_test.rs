@@ -589,12 +589,11 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
             lance_data_overlay_group_close(group);
         }
     }
+    let (committed, _) = commit(&fixture.uri, 2, &[group0, group1]);
     unsafe {
         lance_data_overlay_group_close(group0);
         lance_data_overlay_group_close(group1);
     }
-
-    let (committed, _) = commit(&fixture.uri, 2, &[group0, group1]);
     if committed.is_null() {
         panic!("commit failed: {:?}", take_error());
     }
@@ -804,10 +803,10 @@ fn data_overlay_validation_errors() {
     assert!(take_error().1.contains("coverage_kind"));
 
     assert!(
-        unsafe { lance_data_overlay_file_new(data_file, 1, ptr::null(), ptr::null(), 0, 0) }
+        unsafe { lance_data_overlay_file_new(data_file, 1, ptr::null(), ptr::null(), 1, 0) }
             .is_null()
     );
-    assert!(take_error().1.contains("per-field"));
+    assert!(take_error().1.contains("bitmaps and bitmap_lens"));
 
     assert!(unsafe { lance_data_overlay_file_new(data_file, 0, &pointer, &len, 2, 0) }.is_null());
     assert!(take_error().1.contains("shared"));
