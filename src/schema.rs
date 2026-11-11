@@ -20,7 +20,7 @@ use lance_core::datatypes::Schema as NativeSchema;
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::fragment::{LanceFragment, fragment_ref};
-use crate::helpers::parse_c_string;
+use crate::helpers::{import_lance_schema, parse_c_string};
 use crate::transaction::{LanceOperation, operation_at};
 
 /// Opaque handle owning a native Lance schema.
@@ -64,6 +64,38 @@ unsafe fn schema_clone_inner(schema: *const LanceSchema) -> Result<*mut LanceSch
     Ok(Box::into_raw(Box::new(LanceSchema {
         inner: schema.inner.clone(),
     })))
+}
+
+/// Create a native schema from an Arrow C Data Interface schema.
+///
+/// The input is borrowed and not consumed. Native conversion preserves
+/// `lance:field_id` metadata and assigns fresh consecutive IDs to fields
+/// without one, then validates the resulting schema including primary-key
+/// metadata.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_schema_from_arrow(
+    schema: *const FFI_ArrowSchema,
+    out_schema: *mut *mut LanceSchema,
+) -> i32 {
+    ffi_try!(unsafe { schema_from_arrow_inner(schema, out_schema) }, neg)
+}
+
+unsafe fn schema_from_arrow_inner(
+    schema: *const FFI_ArrowSchema,
+    out_schema: *mut *mut LanceSchema,
+) -> Result<i32> {
+    if out_schema.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_schema must not be NULL".into(),
+        ));
+    }
+    let inner = unsafe { import_lance_schema(schema, "schema") }?;
+    unsafe {
+        *out_schema = Box::into_raw(Box::new(LanceSchema {
+            inner: (*inner).clone(),
+        }));
+    }
+    Ok(0)
 }
 
 /// Clone the current snapshot schema of `dataset` into an owned native handle.
