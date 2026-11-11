@@ -575,7 +575,7 @@ int main(int argc, char **argv) {
         }
     }
     ASSERT(!before[10].found, "deleted row absent");
-    ASSERT(before[1].rowid != 0, "row ids populated");
+    ASSERT(before[1].rowid != before[2].rowid, "row ids populated");
 
     LanceFragment *fragment0 = open_fragment(dataset, fragment_ids[0]);
     LanceFragment *fragment1 = open_fragment(dataset, fragment_ids[1]);
