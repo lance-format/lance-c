@@ -1206,6 +1206,83 @@ static void test_blob_writer_data_replacement(const std::string& blob_uri) {
     std::printf("C++ blob writer publication OK\n");
 }
 
+static void test_dynamic_storage_accessor(
+    const std::string& source_uri,
+    const std::string& base) {
+    const std::string create_uri = base + "/cpp_accessor_create";
+    const std::string batch_uri = base + "/cpp_accessor_batch";
+
+    lance::StorageOptionsAccessor accessor(
+        lance::StorageOptions{{"block_size", "4096"}});
+    const auto snapshot = accessor.snapshot();
+    CHECK(snapshot.has_value());
+    CHECK(snapshot->at("block_size") == "4096");
+
+    auto opened = lance::Dataset::open_with_options(
+        source_uri, lance::DatasetOpenOptions{0, &accessor});
+    CHECK(opened.count_rows() > 0);
+    CHECK(opened.version() > 0);
+
+    // Explicit defaults must stay unambiguous with Dataset::open(uri, {}).
+    auto defaulted =
+        lance::Dataset::open_with_options(source_uri, {}, nullptr);
+    CHECK(defaulted.count_rows() == opened.count_rows());
+
+    {
+        ArrowArrayStream stream = source_stream(source_uri);
+        auto written = lance::Dataset::write_with_accessor(
+            create_uri, &stream, lance::WriteMode::Create, accessor);
+        CHECK(written.version() == 1);
+        CHECK(written.count_rows() == opened.count_rows());
+    }
+    {
+        ArrowArrayStream stream = source_stream(source_uri);
+        auto appended = lance::Dataset::write_with_params_and_accessor(
+            create_uri, &stream, lance::WriteMode::Append,
+            lance::WriteParams{}, accessor);
+        CHECK(appended.version() == 2);
+        CHECK(appended.count_rows() == opened.count_rows() * 2);
+    }
+    {
+        ArrowArrayStream stream = source_stream(source_uri);
+        auto transaction = lance::Dataset::write_uncommitted_with_accessor(
+            create_uri, &stream, lance::WriteMode::Append, accessor);
+        auto committed = lance::Dataset::commit_with_accessor(
+            create_uri, transaction, accessor);
+        CHECK(committed.version() == 3);
+        CHECK(committed.count_rows() == opened.count_rows() * 3);
+    }
+    {
+        ArrowArrayStream stream = source_stream(source_uri);
+        auto transaction = lance::Dataset::write_uncommitted_with_accessor(
+            batch_uri, &stream, lance::WriteMode::Create, accessor);
+        auto seeded = lance::Dataset::commit_with_accessor(
+            batch_uri, transaction, accessor);
+        CHECK(seeded.version() == 1);
+    }
+    auto append_source = [&]() {
+        ArrowArrayStream stream = source_stream(source_uri);
+        return lance::Dataset::write_uncommitted_with_accessor(
+            batch_uri, &stream, lance::WriteMode::Append, accessor);
+    };
+    auto batch_left = append_source();
+    auto batch_right = append_source();
+    std::vector<std::reference_wrapper<const lance::Transaction>> batch{
+        std::cref(batch_left), std::cref(batch_right)};
+    auto result = lance::Dataset::commit_batch_with_accessor(
+        batch_uri, batch, accessor);
+    CHECK(result.dataset.version() == 2);
+    CHECK(result.dataset.count_rows() == opened.count_rows() * 3);
+    CHECK(result.transaction.operation().kind() ==
+          lance::OperationKind::Append);
+
+    auto reopened = lance::Dataset::open(create_uri);
+    CHECK(reopened.version() == 3);
+    CHECK(reopened.count_rows() == opened.count_rows() * 3);
+
+    std::printf("C++ dynamic storage accessor OK\n");
+}
+
 int main(int argc, char** argv) {
     if (argc != 5) {
         std::fprintf(stderr,
@@ -1216,6 +1293,7 @@ int main(int argc, char** argv) {
     }
     try {
         test_create_append_overwrite_and_batch(argv[1], argv[2]);
+        test_dynamic_storage_accessor(argv[1], argv[2]);
         test_detached_conflict_and_errors(argv[1], argv[2]);
         test_fragment_delete(argv[1], argv[2]);
         test_create_index_operation(argv[1], argv[2]);
