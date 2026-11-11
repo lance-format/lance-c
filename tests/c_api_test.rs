@@ -43122,6 +43122,13 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
     let version_after_delete = unsafe { lance_dataset_version(dataset) };
     assert_eq!(version_after_delete, 2);
     let fragments_after_delete = unsafe { lance_dataset_fragment_count(dataset) };
+    let mut ids_after_delete = vec![u64::MAX; fragments_after_delete as usize];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, ids_after_delete.as_mut_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
     unsafe { lance_dataset_close(dataset) };
 
     let staged = write_uncommitted_for_batch(
@@ -43415,10 +43422,10 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
     );
     let appended_ids = committed_fragments
         .iter()
-        .filter(|fragment| fragment.id > 2)
+        .filter(|fragment| !ids_after_delete.contains(&fragment.id))
         .map(|fragment| fragment.id)
         .collect::<Vec<_>>();
-    assert_eq!(appended_ids.len(), 3);
+    assert_eq!(appended_ids.len(), append_count as usize);
     assert!(
         appended_ids.windows(2).all(|ids| ids[1] == ids[0] + 1),
         "native append must assign contiguous fragment ids: {appended_ids:?}"
