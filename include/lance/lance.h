@@ -371,6 +371,9 @@ typedef struct LanceDataFile LanceDataFile;
 typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
+typedef struct LanceDataOverlayFile LanceDataOverlayFile;
+typedef struct LanceDataOverlayGroup LanceDataOverlayGroup;
+typedef struct LanceFragmentOverlayWriter LanceFragmentOverlayWriter;
 typedef struct LanceIvfModel LanceIvfModel;
 typedef struct LanceSchema LanceSchema;
 typedef struct LanceNamespace LanceNamespace;
@@ -3380,6 +3383,83 @@ int32_t lance_fragment_take(
     size_t num_indices,
     const char* const* columns,
     struct ArrowArrayStream* out
+);
+
+/**
+ * Open an overlay writer for a bound fragment.
+ *
+ * The fragment must belong to a dataset (a detached fragment returns
+ * LANCE_ERR_NOT_SUPPORTED). The writer captures the fragment's current native
+ * snapshot and the supplied schema. The schema may be a subset of the dataset
+ * schema; native code owns field compatibility, row layout, type, nullability
+ * and range checks. Commit the resulting overlay with the dataset read version
+ * used to open this writer.
+ *
+ * Native overlays are experimental. For release builds, set
+ * `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads or
+ * modifies an overlay dataset. Enable it before publication so all readers
+ * recognize the manifest feature.
+ *
+ * @param fragment    Bound fragment snapshot. Must not be NULL.
+ * @param schema      Native fragment schema, or a compatible subset.
+ * @param out_writer  Receives the writer on success; unchanged on failure.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_overlay_writer_new(
+    const LanceFragment* fragment,
+    const LanceSchema* schema,
+    LanceFragmentOverlayWriter** out_writer
+);
+
+/**
+ * Write one batch of overlay values to a writer.
+ *
+ * The batch is borrowed for the duration of the call and may be closed
+ * afterwards. Rows are keyed by `_rowaddr`; each covered cell supplies a dense
+ * value in ascending fragment-offset order. Native validation owns missing or
+ * nullable `_rowaddr`, repeated or descending offsets, wrong fragment, wrong
+ * types and out-of-range offsets.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_fragment_overlay_writer_write_batch(
+    LanceFragmentOverlayWriter* writer,
+    const LanceBatch* batch
+);
+
+/**
+ * Finish an overlay writer.
+ *
+ * Consumes the writer allocation on every return, including errors. On success
+ * `out_group` receives an owned group, or NULL when the staged coverage was
+ * empty (native `None`). `out_group` is written only on success and a non-NULL
+ * result must be closed with `lance_data_overlay_group_close`. Returns 0 on
+ * success, -1 on error.
+ */
+int32_t lance_fragment_overlay_writer_finish(
+    LanceFragmentOverlayWriter* writer,
+    LanceDataOverlayGroup** out_group
+);
+
+/**
+ * Abort an overlay writer.
+ *
+ * Consumes the writer allocation and discards staged data best-effort. This is
+ * the native abort path, not a finish or publication. NULL-safe. No error is
+ * reported.
+ */
+void lance_fragment_overlay_writer_abort(
+    LanceFragmentOverlayWriter* writer
+);
+
+/**
+ * Close an overlay writer without finishing or publishing it.
+ *
+ * Consumes the writer allocation and drops the native writer, matching ordinary
+ * Rust drop. NULL-safe.
+ */
+void lance_fragment_overlay_writer_close(
+    LanceFragmentOverlayWriter* writer
 );
 
 /**
@@ -7287,6 +7367,174 @@ LanceOperation* lance_operation_data_replacement_new(
 );
 
 /**
+ * Coverage layout for a data overlay.
+ *
+ * `LANCE_DATA_OVERLAY_COVERAGE_SHARED` stores one bitmap covering every field
+ * in the overlay data file. `LANCE_DATA_OVERLAY_COVERAGE_PER_FIELD` stores one
+ * bitmap per field in `data_file.fields` order. The FFI takes the integer value
+ * so unknown kinds are rejected with a descriptive error.
+ */
+typedef enum LanceDataOverlayCoverageKind {
+    LANCE_DATA_OVERLAY_COVERAGE_SHARED = 0,
+    LANCE_DATA_OVERLAY_COVERAGE_PER_FIELD = 1,
+} LanceDataOverlayCoverageKind;
+
+/**
+ * Create an owned native data overlay value.
+ *
+ * `data_file` is borrowed and its complete native metadata is copied.
+ * `coverage_kind` is 0 (shared, exactly one bitmap) or 1 (per-field, bitmaps in
+ * `data_file.fields` order). Each bitmap is portable 32-bit Roaring
+ * serialization and is borrowed for the duration of the call; empty per-field
+ * coverage is retained. `committed_version` is copied unchanged. Native code
+ * owns field compatibility, coverage validity, row layout and publication
+ * checks; this constructor adds no policy.
+ *
+ * Returns an owned overlay, or NULL on error. Close it exactly once with
+ * `lance_data_overlay_file_close`.
+ */
+LanceDataOverlayFile* lance_data_overlay_file_new(
+    const LanceDataFile* data_file,
+    int32_t coverage_kind,
+    const uint8_t* const* bitmaps,
+    const size_t* bitmap_lens,
+    size_t bitmap_count,
+    uint64_t committed_version
+);
+
+/** Close a data overlay value. NULL-safe. */
+void lance_data_overlay_file_close(LanceDataOverlayFile* file);
+
+/**
+ * Clone a data overlay value into an independent snapshot.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceDataOverlayFile* lance_data_overlay_file_clone(
+    const LanceDataOverlayFile* file
+);
+
+/**
+ * Clone the complete data file metadata owned by the overlay. The output is
+ * written only on success and must be closed independently.
+ * Returns an owned data file, or NULL on error.
+ */
+LanceDataFile* lance_data_overlay_file_data_file(
+    const LanceDataOverlayFile* file
+);
+
+/**
+ * Read the coverage kind (0 shared, 1 per-field). Returns 0 on success, -1 on
+ * error; `out_kind` is unchanged on failure.
+ */
+int32_t lance_data_overlay_file_coverage_kind(
+    const LanceDataOverlayFile* file,
+    int32_t* out_kind
+);
+
+/**
+ * Read the number of coverage bitmaps (1 for shared, field count for
+ * per-field). Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_file_bitmap_count(
+    const LanceDataOverlayFile* file,
+    uint64_t* out_count
+);
+
+/**
+ * Serialize one coverage bitmap to a caller-owned buffer.
+ *
+ * `index` is 0 for shared coverage and the field position for per-field
+ * coverage. On success `out_bytes` receives a `libc::malloc` allocation of
+ * `out_len` bytes; release it exactly once with `lance_free_bytes`. Outputs are
+ * written only on success. Parity is bitmap semantics: the native writer may
+ * re-serialize with a different optimized container layout.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_file_bitmap_at(
+    const LanceDataOverlayFile* file,
+    size_t index,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Read the overlay's committed-version stamp. Returns 0 on success, -1 on
+ * error; zero is a valid pre-commit placeholder.
+ */
+int32_t lance_data_overlay_file_committed_version(
+    const LanceDataOverlayFile* file,
+    uint64_t* out_version
+);
+
+/**
+ * Construct an owned native data overlay group.
+ *
+ * Overlay handles are borrowed and cloned in input order. A NULL array is
+ * accepted only with a zero count. Empty groups are retained because the
+ * native operation permits them. Returns NULL on error.
+ */
+LanceDataOverlayGroup* lance_data_overlay_group_new(
+    uint64_t fragment_id,
+    const LanceDataOverlayFile* const* overlays,
+    size_t overlay_count
+);
+
+/** Close a data overlay group. NULL-safe. */
+void lance_data_overlay_group_close(LanceDataOverlayGroup* group);
+
+/**
+ * Clone a data overlay group into an independent snapshot.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceDataOverlayGroup* lance_data_overlay_group_clone(
+    const LanceDataOverlayGroup* group
+);
+
+/**
+ * Read the target fragment ID. Returns 0 on success, -1 on error; fragment ID
+ * 0 is valid.
+ */
+int32_t lance_data_overlay_group_fragment_id(
+    const LanceDataOverlayGroup* group,
+    uint64_t* out_fragment_id
+);
+
+/**
+ * Read the number of overlays in the group. Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_group_overlay_count(
+    const LanceDataOverlayGroup* group,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one overlay from the group. The output is written only on success and
+ * must be closed independently. Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_group_overlay_at(
+    const LanceDataOverlayGroup* group,
+    size_t index,
+    LanceDataOverlayFile** out_overlay
+);
+
+/**
+ * Construct an owned native DataOverlay operation.
+ *
+ * Group handles are borrowed and cloned in input order. A NULL array is
+ * accepted only with a zero count. Empty group lists are retained because the
+ * native operation permits them. Native commit owns fragment existence,
+ * coverage validity, layout and ordering checks. Returns NULL on error.
+ *
+ * Native overlays are experimental. For release builds, set
+ * `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads or
+ * modifies an overlay dataset, including before publication.
+ */
+LanceOperation* lance_operation_data_overlay_new(
+    const LanceDataOverlayGroup* const* groups,
+    size_t group_count
+);
+
+/**
  * Read the native transaction read version.
  * Returns 0 on success, -1 on error. Zero is valid for an uncommitted create.
  */
@@ -7668,6 +7916,27 @@ int32_t lance_operation_data_replacement_at(
     const LanceOperation* operation,
     size_t index,
     LanceDataReplacementGroup** out_group
+);
+
+/**
+ * Read the number of data overlay groups. A non-DataOverlay operation returns
+ * LANCE_ERR_NOT_SUPPORTED. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_data_overlay_group_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one data overlay group. A wrong operation variant returns
+ * LANCE_ERR_NOT_SUPPORTED; an out-of-range index returns
+ * LANCE_ERR_INVALID_ARGUMENT. The output is written only on success and must
+ * be closed independently. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_data_overlay_group_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceDataOverlayGroup** out_group
 );
 
 /**
