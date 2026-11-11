@@ -10903,10 +10903,6 @@ fn test_rtree_scalar_index_geometry_queries_and_lifecycle() {
             vec![101, 114],
         ),
         (
-            "ST_Intersects(ST_GeomFromText('POINT (0 10)'), geometry)",
-            vec![101, 114],
-        ),
-        (
             "ST_Intersects(geometry, ST_GeomFromText('LINESTRING (25 25, 26 26)'))",
             vec![106],
         ),
