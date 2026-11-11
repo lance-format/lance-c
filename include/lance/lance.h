@@ -1319,6 +1319,13 @@ LanceDataset* lance_dataset_checkout_ref(
  * cloned snapshot's version id (native clone commit semantics), so its
  * `lance_dataset_version` is the cloned version rather than always 1.
  *
+ * Native clone commits resolve the target URI through the default object-store
+ * registry, so `target_path` must use a scheme that registry knows (for
+ * example `file`, `memory`, `s3`, `gs`, `az`, or another built-in). A scheme
+ * registered only on a custom session registry is not visible to the clone
+ * commit. Use `lance_dataset_write`/`lance_dataset_branch_create` with an
+ * explicit session for those schemes.
+ *
  * For datasets with additional base paths, source credentials come from the
  * source dataset's native session and per-base store binding. This call does
  * not create extra providers, caches, registries, or per-base credential sets.

@@ -44458,9 +44458,14 @@ fn test_native_dataset_deep_clone_cross_store() {
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
     let src_uri = src_dir.path().join("source.lance");
-    let dst_uri = dst_dir.path().join("nested").join("target.lance");
+    // A second, independent native backing store: `shared-memory` keeps its
+    // bytes in a process-global pool keyed by URL authority and is served by a
+    // different provider than the local source store.
+    let dst_uri = format!(
+        "shared-memory://deep-clone-{}/nested/target.lance",
+        uuid::Uuid::new_v4().simple()
+    );
     let src_uri = src_uri.to_str().unwrap().to_string();
-    let dst_uri = dst_uri.to_str().unwrap().to_string();
 
     let source = deep_clone_source(&src_uri);
     assert!(source.manifest.config.is_empty());
@@ -44519,13 +44524,17 @@ fn test_native_dataset_deep_clone_cross_store() {
     unsafe { lance_storage_options_accessor_close(accessor) };
     assert_eq!(rc, 0, "{}", take_last_error_message());
     assert!(!cloned.is_null());
-    assert_eq!(unsafe { lance_dataset_version(cloned) }, 1);
+    // Native deep clone keeps the pinned snapshot's version id.
+    assert_eq!(unsafe { lance_dataset_version(cloned) }, source_version);
     assert_eq!(unsafe { lance_dataset_count_rows(cloned) }, 5);
     assert_eq!(deep_clone_take_ids(cloned, 5), vec![0, 1, 2, 4, 5]);
 
     let mut exported = FFI_ArrowSchema::empty();
     assert_eq!(unsafe { lance_dataset_schema(cloned, &mut exported) }, 0);
     let exported_schema = Schema::try_from(&exported).unwrap();
+    if let Some(release) = exported.release {
+        unsafe { release(&mut exported) };
+    }
     assert_eq!(exported_schema, expected_schema);
     assert_eq!(
         deep_clone_config(cloned),
@@ -44613,7 +44622,7 @@ fn test_native_dataset_deep_clone_cross_store() {
     std::fs::remove_dir_all(src_dir.path()).unwrap();
     assert!(!std::path::Path::new(&src_uri).exists());
     assert!(
-        !src_dir.path().join("target.lance").exists(),
+        !src_dir.path().join("target.lance").exists() && !src_dir.path().join("nested").exists(),
         "source store received target objects"
     );
 
@@ -44622,7 +44631,10 @@ fn test_native_dataset_deep_clone_cross_store() {
     let reopened =
         unsafe { lance_dataset_open_with_session(target_c.as_ptr(), ptr::null(), 0, session) };
     assert!(!reopened.is_null(), "{}", take_last_error_message());
-    assert_eq!(unsafe { lance_dataset_version(reopened) }, 2);
+    assert_eq!(
+        unsafe { lance_dataset_version(reopened) },
+        source_version + 1
+    );
     assert_eq!(unsafe { lance_dataset_count_rows(reopened) }, 6);
     assert_eq!(deep_clone_take_ids(reopened, 6), vec![0, 1, 2, 4, 5, 9]);
     assert_eq!(

@@ -51,6 +51,10 @@ fn invalid(message: impl Into<String>) -> lance_core::Error {
 /// cloned snapshot's version id (native clone commit semantics), so its version
 /// is the cloned version, not necessarily 1.
 ///
+/// Native clone commits resolve `target_path` through the default object-store
+/// registry, so the target must use a scheme that registry knows. Schemes
+/// registered only on a custom session registry are not visible here.
+///
 /// For datasets with additional base paths, source credentials come from the
 /// source dataset's native session and per-base store binding. This function
 /// does not construct extra providers, caches, registries, or per-base
@@ -133,7 +137,6 @@ mod tests {
     use lance::dataset::builder::DatasetBuilder;
     use lance::dataset::refs::Ref;
     use lance::session::Session;
-    use lance_io::object_store::providers::shared_memory::SharedMemoryStoreProvider;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use object_store::path::Path as ObjectPath;
     use uuid::Uuid;
@@ -149,10 +152,12 @@ mod tests {
         lance_ref_close, lance_ref_tag, lance_ref_version, lance_ref_version_number,
     };
 
-    const SRC_SCHEME: &str = "clone-src";
-    const DST_SCHEME: &str = "clone-dst";
-    const BLOB_SRC_SCHEME: &str = "clone-blob-src";
-    const BLOB_DST_SCHEME: &str = "clone-blob-dst";
+    /// Native deep-clone commits resolve `WriteDestination::Uri` and the
+    /// cloned `ref_path` through a *default* `Session` registry, so source and
+    /// target URIs must use schemes known to `ObjectStoreRegistry::default()`.
+    /// These tests use local `file` sources and `shared-memory` targets, whose
+    /// backing bytes are keyed by URL authority and survive a session swap.
+    const DST_SCHEME: &str = "shared-memory";
 
     fn last_error() -> String {
         let ptr = crate::error::lance_last_error_message();
@@ -170,12 +175,12 @@ mod tests {
         CString::new(value).unwrap()
     }
 
-    fn registry_with(schemes: &[&str]) -> ObjectStoreRegistry {
-        let registry = ObjectStoreRegistry::default();
-        for scheme in schemes {
-            registry.insert(scheme, Arc::new(SharedMemoryStoreProvider::default()));
-        }
-        registry
+    fn default_session() -> Arc<Session> {
+        Arc::new(Session::new(0, 0, Arc::new(ObjectStoreRegistry::default())))
+    }
+
+    fn memory_uri(authority: &str, name: &str) -> String {
+        uri(DST_SCHEME, authority, name)
     }
 
     fn uri(scheme: &str, authority: &str, name: &str) -> String {
@@ -353,11 +358,16 @@ mod tests {
     #[test]
     fn deep_clone_cross_store_defaults_to_source_snapshot() {
         let suffix = Uuid::new_v4().simple().to_string();
-        let src_uri = uri(SRC_SCHEME, &format!("src-{suffix}"), "source.lance");
-        let dst_uri = uri(DST_SCHEME, &format!("dst-{suffix}"), "target.lance");
+        let src_dir = tempfile::tempdir().unwrap();
+        let src_uri = src_dir
+            .path()
+            .join("source.lance")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let dst_uri = memory_uri(&format!("dst-{suffix}"), "target.lance");
 
-        let registry = Arc::new(registry_with(&[SRC_SCHEME, DST_SCHEME]));
-        let session = Arc::new(Session::new(0, 0, registry.clone()));
+        let session = default_session();
         let source = write_source(session.clone(), &src_uri);
         let source_version = source.version_id();
         let expected = rows(&source);
@@ -366,22 +376,10 @@ mod tests {
         assert!(!dataset.is_null(), "source open failed");
         // Advance the source after the C handle was opened. The handle keeps
         // its snapshot; a NULL reference must clone that snapshot, not latest.
-        let appended_schema = Arc::new(Schema::from(source.schema()));
         let mut advanced = Dataset::clone(&source);
-        block_on(advanced.append(
-            RecordBatchIterator::new(
-                vec![Ok(batch(
-                    appended_schema.clone(),
-                    vec![10],
-                    vec![Some("z")],
-                    vec![Some(10)],
-                ))],
-                appended_schema,
-            ),
-            None,
-        ))
-        .unwrap();
-        assert_eq!(block_on(advanced.count_rows(None)).unwrap(), 6);
+        block_on(advanced.delete("id = 5")).unwrap();
+        assert_eq!(block_on(advanced.count_rows(None)).unwrap(), 4);
+        assert_eq!(advanced.version_id(), source_version + 1);
         assert_eq!(unsafe { lance_dataset_version(dataset) }, source_version);
 
         let dst_c = c_string(&dst_uri);
@@ -395,41 +393,16 @@ mod tests {
                 &mut cloned,
             )
         };
-        assert_eq!(rc, 0, "clone failed");
+        assert_eq!(rc, 0, "clone failed: {}", last_error());
         assert!(!cloned.is_null());
-        // A fresh target publishes its own first version.
         // Native clone commits preserve the cloned snapshot's version id.
         assert_eq!(unsafe { lance_dataset_version(cloned) }, source_version);
         assert_eq!(unsafe { lance_dataset_count_rows(cloned) }, 5);
         assert_eq!(unsafe { lance_dataset_version(dataset) }, source_version);
 
-        // Close both handles, then reopen the target through a fresh session
-        // that cannot resolve the source scheme.
-        unsafe {
-            lance_dataset_close(cloned);
-            lance_dataset_close(dataset);
-        }
-        let fresh = Arc::new(Session::new(0, 0, Arc::new(registry_with(&[DST_SCHEME]))));
-        let reopened = open_with(&dst_uri, fresh.clone());
-        assert_eq!(reopened.version_id(), source_version + 1);
-        assert_eq!(block_on(reopened.count_rows(None)).unwrap(), 5);
-        assert_eq!(rows(&reopened), expected);
-        assert_eq!(
-            Schema::from(reopened.schema()).metadata(),
-            Schema::from(source.schema()).metadata()
-        );
-        assert!(
-            block_on(
-                DatasetBuilder::from_uri(&src_uri)
-                    .with_session(fresh)
-                    .load()
-            )
-            .is_err(),
-            "fresh session must not resolve the source scheme"
-        );
-
-        // Native control on the same source snapshot.
-        let control_uri = uri(DST_SCHEME, &format!("control-{suffix}"), "control.lance");
+        // Native control on the same source snapshot, while the source is
+        // still reachable.
+        let control_uri = memory_uri(&format!("control-{suffix}"), "control.lance");
         let mut control_source = Dataset::clone(&source);
         let control = block_on(control_source.deep_clone(
             &control_uri,
@@ -440,19 +413,32 @@ mod tests {
         assert_eq!(block_on(control.count_rows(None)).unwrap(), 5);
         assert_eq!(rows(&control), expected);
 
-        let store_a = store(registry.clone(), &src_uri);
-        let store_b = store(registry, &dst_uri);
-        let target_prefix = ObjectPath::from("target.lance");
-        let source_prefix = ObjectPath::from("source.lance");
-        assert!(
-            list_objects(&store_a, &target_prefix).is_empty(),
-            "source store has target objects"
+        // Close both handles, delete the isolated source store, then reopen
+        // the target with a fresh default-registry session. Reads can only be
+        // satisfied by the target store.
+        unsafe {
+            lance_dataset_close(cloned);
+            lance_dataset_close(dataset);
+        }
+        drop(source);
+        drop(advanced);
+        drop(control_source);
+        std::fs::remove_dir_all(src_dir.path()).unwrap();
+        assert!(!std::path::Path::new(&src_uri).exists());
+
+        let fresh = default_session();
+        let reopened = open_with(&dst_uri, fresh);
+        assert_eq!(reopened.version_id(), source_version);
+        assert_eq!(block_on(reopened.count_rows(None)).unwrap(), 5);
+        assert_eq!(rows(&reopened), expected);
+        assert_eq!(
+            Schema::from(reopened.schema()).metadata().get("fixture"),
+            Some(&"deep-clone".to_string()),
+            "cloned schema metadata missing"
         );
-        assert!(
-            !list_objects(&store_a, &source_prefix).is_empty(),
-            "source objects missing"
-        );
-        let target_objects = list_objects(&store_b, &target_prefix);
+
+        let store_b = store(Arc::new(ObjectStoreRegistry::default()), &dst_uri);
+        let target_objects = list_objects(&store_b, &ObjectPath::from("target.lance"));
         assert!(
             target_objects.len() >= 2,
             "target store lacks manifest+data: {target_objects:?}"
@@ -466,10 +452,15 @@ mod tests {
     #[test]
     fn deep_clone_refs_and_errors_are_native() {
         let suffix = Uuid::new_v4().simple().to_string();
-        let src_uri = uri(SRC_SCHEME, &format!("src-{suffix}"), "source.lance");
+        let src_dir = tempfile::tempdir().unwrap();
+        let src_uri = src_dir
+            .path()
+            .join("source.lance")
+            .to_str()
+            .unwrap()
+            .to_string();
         let dst_root = format!("dst-{suffix}");
-        let registry = Arc::new(registry_with(&[SRC_SCHEME, DST_SCHEME]));
-        let session = Arc::new(Session::new(0, 0, registry));
+        let session = default_session();
         let source = write_source(session.clone(), &src_uri);
         assert_eq!(source.version_id(), 2);
 
@@ -478,7 +469,7 @@ mod tests {
 
         // Explicit version ref clones that historical snapshot.
         let version_ref = unsafe { lance_ref_version_number(1) };
-        let dst_v1 = uri(DST_SCHEME, &dst_root, "v1.lance");
+        let dst_v1 = memory_uri(&dst_root, "v1.lance");
         let dst_v1_c = c_string(&dst_v1);
         let mut out_v1: *mut LanceDataset = std::ptr::null_mut();
         assert_eq!(
@@ -491,14 +482,16 @@ mod tests {
                     &mut out_v1,
                 )
             },
-            0
+            0,
+            "version clone failed: {}",
+            last_error()
         );
         assert_eq!(unsafe { lance_dataset_count_rows(out_v1) }, 6);
         assert_eq!(unsafe { lance_dataset_version(out_v1) }, 1);
 
         // Explicit main head ref (Version(None, None)).
         let main_head = unsafe { lance_ref_version(std::ptr::null(), false, 0) };
-        let dst_head = uri(DST_SCHEME, &dst_root, "head.lance");
+        let dst_head = memory_uri(&dst_root, "head.lance");
         let dst_head_c = c_string(&dst_head);
         let mut out_head: *mut LanceDataset = std::ptr::null_mut();
         assert_eq!(
@@ -511,7 +504,9 @@ mod tests {
                     &mut out_head,
                 )
             },
-            0
+            0,
+            "main-head clone failed: {}",
+            last_error()
         );
         assert_eq!(unsafe { lance_dataset_version(out_head) }, 2);
         assert_eq!(
@@ -522,7 +517,7 @@ mod tests {
         // Missing tag fails through the native ref resolver.
         let missing = c_string("missing");
         let bad_tag = unsafe { lance_ref_tag(missing.as_ptr()) };
-        let dst_bad = uri(DST_SCHEME, &dst_root, "bad.lance");
+        let dst_bad = memory_uri(&dst_root, "bad.lance");
         let dst_bad_c = c_string(&dst_bad);
         let mut sentinel: *mut LanceDataset = std::ptr::null_mut();
         let rc = unsafe {
@@ -713,14 +708,16 @@ mod tests {
     #[test]
     fn deep_clone_collects_blob_sidecars() {
         let suffix = Uuid::new_v4().simple().to_string();
-        let src_uri = uri(BLOB_SRC_SCHEME, &format!("src-{suffix}"), "blob.lance");
-        let dst_uri = uri(BLOB_DST_SCHEME, &format!("dst-{suffix}"), "blob.lance");
+        let src_dir = tempfile::tempdir().unwrap();
+        let src_uri = src_dir
+            .path()
+            .join("blob.lance")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let dst_uri = memory_uri(&format!("dst-{suffix}"), "blob.lance");
 
-        let src_session = Arc::new(Session::new(
-            0,
-            0,
-            Arc::new(registry_with(&[BLOB_SRC_SCHEME, BLOB_DST_SCHEME])),
-        ));
+        let src_session = default_session();
         write_blob_source(src_session.clone(), &src_uri);
 
         let dataset = open_c(&src_uri, &src_session);
@@ -756,9 +753,12 @@ mod tests {
             lance_dataset_close(dataset);
         }
         drop(src_session);
+        // Remove the source store, then reopen the target with a fresh
+        // session: blob payloads must come from the cloned sidecars.
+        std::fs::remove_dir_all(src_dir.path()).unwrap();
+        assert!(!std::path::Path::new(&src_uri).exists());
 
-        // Reopen with a session that can only resolve the target scheme.
-        let dst_session = Session::new(0, 0, Arc::new(registry_with(&[BLOB_DST_SCHEME])));
+        let dst_session = default_session();
         let reopened = open_c(&dst_uri, &dst_session);
         assert!(!reopened.is_null());
         assert_eq!(unsafe { lance_dataset_count_rows(reopened) }, 10);
@@ -769,8 +769,13 @@ mod tests {
         );
         assert_eq!(
             read_blob_by_index(reopened, 7),
+            Some(blob_payload(1024, 100)),
+            "second fragment blob sidecar missing from the clone"
+        );
+        assert_eq!(
+            read_blob_by_index(reopened, 6),
             Some(blob_payload(128, 100)),
-            "packed blob sidecar missing from the clone"
+            "packed blob payload missing from the cloned data file"
         );
         unsafe { lance_dataset_close(reopened) };
     }

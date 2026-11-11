@@ -4890,6 +4890,8 @@ public:
     /// the cloned snapshot's version id (native clone commit semantics), so
     /// `version()` is not necessarily 1. On failure the target is not
     /// published, but partial objects may remain under `target_path`.
+    /// The target URI must use a scheme known to the default object-store
+    /// registry, because native clone commits resolve it there.
     Dataset deep_clone(
         const std::string& target_path,
         const Ref* reference = nullptr,

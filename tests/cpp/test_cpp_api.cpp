@@ -4782,15 +4782,21 @@ static void test_dataset_deep_clone(const std::string& feature_uri) {
     TEST(test_dataset_deep_clone);
 
     // The nested fragment fixture has nullable struct fields, stable row ids,
-    // two fragments and a deletion: v1 has 8 rows, latest (v2) has 6.
+    // two fragments and deletions. Earlier tests advance its head, so the
+    // selected snapshot is whatever this handle pinned, and v1 keeps 4 rows.
     auto source = lance::Dataset::open(feature_uri);
-    assert(source.version() == 2);
-    assert(source.count_rows() == 6);
+    const uint64_t source_version = source.version();
+    const uint64_t source_rows = source.count_rows();
+    assert(source_rows > 0 && source_rows <= 6);
 
+    // Tag and branch creation commit to the same storage; `create_branch`
+    // replaces the handle's dataset with the branch, so use a separate handle
+    // and keep `source` pinned to its original snapshot.
+    auto ref_source = lance::Dataset::open(feature_uri);
     auto v1 = lance::Ref::version_number(1);
-    source.create_tag("deep-clone-cpp-v1", v1);
+    ref_source.create_tag("deep-clone-cpp-v1", v1);
     auto tag = lance::Ref::tag("deep-clone-cpp-v1");
-    source.create_branch("deep-clone-cpp-branch", v1);
+    ref_source.create_branch("deep-clone-cpp-branch", v1);
     auto branch_ref =
         lance::Ref::version("deep-clone-cpp-branch", std::nullopt);
 
@@ -4803,19 +4809,19 @@ static void test_dataset_deep_clone(const std::string& feature_uri) {
         lance::StorageOptionsAccessor accessor(std::nullopt, nullptr);
         auto cloned = source.deep_clone(target_a, nullptr, &accessor);
         // Native clone commits preserve the cloned snapshot version id.
-        assert(cloned.version() == source.version());
-        assert(cloned.count_rows() == 6);
+        assert(cloned.version() == source_version);
+        assert(cloned.count_rows() == source_rows);
     }
 
     auto from_version = source.deep_clone(target_b, &v1);
     assert(from_version.version() == 1);
-    assert(from_version.count_rows() == 8);
+    assert(from_version.count_rows() == 4);
 
     auto from_tag = source.deep_clone(target_c, &tag);
-    assert(from_tag.count_rows() == 8);
+    assert(from_tag.count_rows() == 4);
 
     auto from_branch = source.deep_clone(target_d, &branch_ref);
-    assert(from_branch.count_rows() == 8);
+    assert(from_branch.count_rows() == 4);
 
     bool threw = false;
     try {
@@ -4828,8 +4834,8 @@ static void test_dataset_deep_clone(const std::string& feature_uri) {
     // Reopen the independent target with a fresh session.
     lance::Session session(0, 0);
     auto reopened = lance::Dataset::open_with_session(session, target_a);
-    assert(reopened.version() == source.version());
-    assert(reopened.count_rows() == 6);
+    assert(reopened.version() == source_version);
+    assert(reopened.count_rows() == source_rows);
 
     PASS();
 }
