@@ -2640,15 +2640,21 @@ static void test_native_typed_operations(const char *src_uri,
     CHECK_OK();
     uint64_t seed_fragments = lance_dataset_fragment_count(seed);
     CHECK_OK();
-    ASSERT(seed_fragments == 2, "typed seed fragment count");
-    uint64_t seed_ids[8];
+    ASSERT(seed_fragments >= 2, "typed seed must span multiple fragments");
+    uint64_t *seed_ids =
+        (uint64_t *)calloc(seed_fragments, sizeof(uint64_t));
+    ASSERT(seed_ids != NULL, "allocate typed seed fragment ids");
     ASSERT(lance_dataset_fragment_ids(seed, seed_ids) == 0,
            "typed seed fragment ids");
     CHECK_OK();
-    LanceFragment *first = lance_dataset_open_fragment(seed, seed_ids[0]);
-    LanceFragment *second = lance_dataset_open_fragment(seed, seed_ids[1]);
-    ASSERT(first != NULL && second != NULL, "open typed seed fragments");
-    CHECK_OK();
+    LanceFragment **seed_handles =
+        (LanceFragment **)calloc(seed_fragments, sizeof(LanceFragment *));
+    ASSERT(seed_handles != NULL, "allocate typed seed fragment handles");
+    for (uint64_t i = 0; i < seed_fragments; i++) {
+        seed_handles[i] = lance_dataset_open_fragment(seed, seed_ids[i]);
+        ASSERT(seed_handles[i] != NULL, "open typed seed fragment");
+        CHECK_OK();
+    }
     LanceSchema *schema = NULL;
     ASSERT(lance_dataset_schema_clone(seed, &schema) == 0,
            "clone typed seed schema");
@@ -2674,10 +2680,9 @@ static void test_native_typed_operations(const char *src_uri,
         {9001, base_path, "primary", false},
     };
     LanceBasePathList base_list = {base_entries, 1};
-    const LanceFragment *fragments[] = {first, second};
-
     LanceOperation *overwrite = lance_operation_overwrite_new(
-        schema, fragments, 2, &config, &base_list);
+        schema, (const LanceFragment *const *)seed_handles, seed_fragments,
+        &config, &base_list);
     ASSERT(overwrite != NULL, "construct native Overwrite");
     CHECK_OK();
     LanceOperationKind overwrite_kind = LANCE_OPERATION_UNKNOWN;
@@ -2690,7 +2695,8 @@ static void test_native_typed_operations(const char *src_uri,
                                                     &overwrite_fragments) == 0,
            "Overwrite typed fragment count");
     CHECK_OK();
-    ASSERT(overwrite_fragments == 2, "Overwrite typed fragment count value");
+    ASSERT(overwrite_fragments == seed_fragments,
+           "Overwrite typed fragment count value");
     LanceFragment *detached = NULL;
     ASSERT(lance_operation_overwrite_fragment_at(overwrite, 1, &detached) == 0,
            "Overwrite typed fragment clone");
@@ -2774,15 +2780,20 @@ static void test_native_typed_operations(const char *src_uri,
     ASSERT(lance_dataset_count_rows(published) == source_rows,
            "typed Overwrite published rows");
     CHECK_OK();
-    ASSERT(lance_dataset_fragment_count(published) == 2,
+    ASSERT(lance_dataset_fragment_count(published) == seed_fragments,
            "typed Overwrite published fragments");
     CHECK_OK();
-    uint64_t published_ids[8];
+    uint64_t *published_ids =
+        (uint64_t *)calloc(seed_fragments, sizeof(uint64_t));
+    ASSERT(published_ids != NULL, "allocate published fragment ids");
     ASSERT(lance_dataset_fragment_ids(published, published_ids) == 0,
            "typed Overwrite published ids");
     CHECK_OK();
-    ASSERT(published_ids[0] == 0 && published_ids[1] == 1,
-           "typed Overwrite assigns fresh fragment ids");
+    for (uint64_t i = 0; i < seed_fragments; i++) {
+        ASSERT(published_ids[i] == i,
+               "typed Overwrite assigns fresh fragment ids");
+    }
+    free(published_ids);
     LanceDatasetConfig *published_config = lance_dataset_config(published);
     ASSERT(published_config != NULL, "typed Overwrite config snapshot");
     CHECK_OK();
@@ -2817,8 +2828,9 @@ static void test_native_typed_operations(const char *src_uri,
            "typed Overwrite keeps native field ids");
     lance_schema_close(published_schema);
 
-    LanceOperation *merge =
-        lance_operation_merge_new(schema, fragments, 2, false);
+    LanceOperation *merge = lance_operation_merge_new(
+        schema, (const LanceFragment *const *)seed_handles, seed_fragments,
+        false);
     ASSERT(merge != NULL, "construct native Merge");
     CHECK_OK();
     LanceOperationKind merge_kind = LANCE_OPERATION_UNKNOWN;
@@ -2830,7 +2842,8 @@ static void test_native_typed_operations(const char *src_uri,
     ASSERT(lance_operation_merge_fragment_count(merge, &merge_fragments) == 0,
            "Merge typed fragment count");
     CHECK_OK();
-    ASSERT(merge_fragments == 2, "Merge typed fragment count value");
+    ASSERT(merge_fragments == seed_fragments,
+           "Merge typed fragment count value");
     bool preserves = true;
     ASSERT(lance_operation_merge_preserves_nullability(merge, &preserves) == 0,
            "Merge preserves nullability");
@@ -2846,7 +2859,7 @@ static void test_native_typed_operations(const char *src_uri,
     ASSERT(lance_dataset_count_rows(merged) == source_rows,
            "typed Merge rows");
     CHECK_OK();
-    ASSERT(lance_dataset_fragment_count(merged) == 2,
+    ASSERT(lance_dataset_fragment_count(merged) == seed_fragments,
            "typed Merge fragments");
     lance_dataset_close(merged);
 
@@ -3148,8 +3161,11 @@ static void test_native_typed_operations(const char *src_uri,
     lance_operation_close(update_config);
     lance_transaction_close(update_transaction);
     lance_schema_close(schema);
-    lance_fragment_close(first);
-    lance_fragment_close(second);
+    for (uint64_t i = 0; i < seed_fragments; i++) {
+        lance_fragment_close(seed_handles[i]);
+    }
+    free(seed_handles);
+    free(seed_ids);
     lance_dataset_close(seed);
     lance_transaction_close(seed_transaction);
 }

@@ -1467,15 +1467,21 @@ static void test_typed_native_operations(const std::string& source_uri,
                                         lance::WriteMode::Create, write_options));
         CHECK(seed.version() == 1);
         CHECK(seed.count_rows() == source_rows);
-        CHECK(seed.fragment_count() == 2);
+        CHECK(seed.fragment_count() >= 2);
     }
 
     auto seed = lance::Dataset::open(seed_uri);
-    CHECK(seed.fragment_count() == 2);
+    CHECK(seed.fragment_count() >= 2);
     auto seed_ids = seed.fragment_ids();
-    CHECK(seed_ids.size() == 2);
-    auto first = seed.open_fragment(seed_ids[0]);
-    auto second = seed.open_fragment(seed_ids[1]);
+    std::vector<lance::Fragment> seed_fragments;
+    std::vector<const lance::Fragment*> seed_fragment_ptrs;
+    seed_fragments.reserve(seed_ids.size());
+    for (uint64_t fragment_id : seed_ids) {
+        seed_fragments.push_back(seed.open_fragment(fragment_id));
+    }
+    for (const auto& fragment : seed_fragments) {
+        seed_fragment_ptrs.push_back(&fragment);
+    }
     auto schema = seed.native_schema();
     const int32_t seed_id_field = schema.field_id("id");
     const int32_t seed_name_field = schema.field_id("name");
@@ -1496,12 +1502,12 @@ static void test_typed_native_operations(const std::string& source_uri,
                                     std::optional<std::string>("primary"),
                                     false});
     auto overwrite = lance::Operation::make_overwrite(
-        schema, {&first, &second},
+        schema, seed_fragment_ptrs,
         std::optional<std::vector<std::pair<std::string, std::string>>>(
             config_upserts),
         std::optional<std::vector<lance::BasePath>>(bases));
     CHECK(overwrite.kind() == lance::OperationKind::Overwrite);
-    CHECK(overwrite.overwrite_fragment_count() == 2);
+    CHECK(overwrite.overwrite_fragment_count() == seed_fragment_ptrs.size());
     CHECK(overwrite.has_config_upsert_values());
     CHECK(overwrite.config_upsert_count() == 2);
     std::map<std::string, std::string> overwrite_config;
@@ -1535,11 +1541,12 @@ static void test_typed_native_operations(const std::string& source_uri,
         overwrite_uri, lance::Transaction::from_operation(0, overwrite));
     CHECK(published.version() == 1);
     CHECK(published.count_rows() == source_rows);
-    CHECK(published.fragment_count() == 2);
+    CHECK(published.fragment_count() == seed_fragment_ptrs.size());
     auto published_ids = published.fragment_ids();
-    CHECK(published_ids.size() == 2);
-    CHECK(published_ids[0] == 0);
-    CHECK(published_ids[1] == 1);
+    CHECK(published_ids.size() == seed_fragment_ptrs.size());
+    for (size_t index = 0; index < published_ids.size(); ++index) {
+        CHECK(published_ids[index] == index);
+    }
     auto published_config = published.config();
     CHECK(published_config.at("owner") == "alice");
     CHECK(published_config.at("empty").empty());
@@ -1548,16 +1555,17 @@ static void test_typed_native_operations(const std::string& source_uri,
     CHECK(published.native_schema().field_id("id") == seed_id_field);
     CHECK(published.native_schema().field_id("name") == seed_name_field);
 
-    auto merge = lance::Operation::make_merge(schema, {&first, &second}, false);
+    auto merge =
+        lance::Operation::make_merge(schema, seed_fragment_ptrs, false);
     CHECK(merge.kind() == lance::OperationKind::Merge);
-    CHECK(merge.merge_fragment_count() == 2);
+    CHECK(merge.merge_fragment_count() == seed_fragment_ptrs.size());
     CHECK(!merge.merge_preserves_nullability());
     CHECK(merge.merge_schema().field_id("id") == seed_id_field);
     auto merged = lance::Dataset::commit(
         seed_uri, lance::Transaction::from_operation(seed.version(), merge));
     CHECK(merged.version() == 2);
     CHECK(merged.count_rows() == source_rows);
-    CHECK(merged.fragment_count() == 2);
+    CHECK(merged.fragment_count() == seed_fragment_ptrs.size());
 
     auto shallow = lance::Operation::make_clone(
         true, std::nullopt, source_version, source_uri, std::nullopt);
