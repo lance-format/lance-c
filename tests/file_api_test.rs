@@ -204,6 +204,7 @@ fn import_batch(batch: &RecordBatch) -> *mut LanceBatch {
     imported
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_fixture(
     uri: &str,
     version: Option<&str>,
@@ -830,7 +831,7 @@ fn batch_import_export_preserves_schema_and_zero_column_rows() {
     }
 
     let mut consumed = ffi_pair(&batch).0;
-    let mut sentinel = 1usize as *mut LanceBatch;
+    let mut sentinel = ptr::dangling_mut::<LanceBatch>();
     let original_sentinel = sentinel;
     assert_eq!(
         unsafe { lance_batch_from_arrow(&mut consumed, ptr::null(), &mut sentinel) },
@@ -1975,7 +1976,7 @@ fn shared_session_cache_is_explicit_and_streams_outlive_parents() {
     let root = tempfile::tempdir().unwrap();
     let base_uri = format!("file://{}", root.path().display());
     let base_uri_c = c_string(&base_uri);
-    let cache_session = unsafe { lance_session_new(8 * 1024 * 1024, 8 * 1024 * 1024) };
+    let cache_session = lance_session_new(8 * 1024 * 1024, 8 * 1024 * 1024);
     assert!(!cache_session.is_null());
     let file_session = unsafe {
         lance_file_session_new(base_uri_c.as_ptr(), ptr::null(), cache_session, ptr::null())
