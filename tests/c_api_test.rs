@@ -29092,6 +29092,214 @@ fn test_compaction_binary_copy_budgets_and_exclusions() {
     }
 }
 
+fn data_file_page_payloads(uri: &str) -> Vec<Vec<u8>> {
+    use lance_file::reader::{CachedFileMetadata, FileReader as LanceFileReader};
+    use lance_io::object_store::ObjectStore;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+
+    let uri = uri.to_owned();
+    lance_c::runtime::block_on(async move {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let (object_store, _) = ObjectStore::from_uri(&uri).await.unwrap();
+        let scan_scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let mut payloads = Vec::new();
+        for fragment in dataset.get_fragments().iter() {
+            for data_file in &fragment.metadata().files {
+                let full_uri = format!("{}/{}", uri.trim_end_matches('/'), data_file.path);
+                let object_path =
+                    ObjectStore::extract_path_from_uri(Arc::new(Default::default()), &full_uri)
+                        .unwrap();
+                let file_scheduler = scan_scheduler
+                    .open_file(&object_path, &data_file.file_size_bytes)
+                    .await
+                    .unwrap();
+                let metadata: CachedFileMetadata =
+                    LanceFileReader::read_all_metadata(&file_scheduler)
+                        .await
+                        .unwrap();
+                let file_bytes =
+                    std::fs::read(std::path::Path::new(&uri).join(&data_file.path)).unwrap();
+                for column in &metadata.column_infos {
+                    for page in &column.page_infos {
+                        let mut payload = Vec::new();
+                        for &(offset, size) in page.buffer_offsets_and_sizes.iter() {
+                            let start = usize::try_from(offset).unwrap();
+                            let end = start + usize::try_from(size).unwrap();
+                            payload.extend_from_slice(&file_bytes[start..end]);
+                        }
+                        payloads.push(payload);
+                    }
+                }
+            }
+        }
+        payloads
+    })
+}
+
+#[test]
+fn test_compaction_force_binary_copy_preserves_page_payloads() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let source_pages = data_file_page_payloads(&uri);
+    assert!(!source_pages.is_empty());
+    let source_page_count = source_pages.len();
+
+    let c_uri = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let options = unsafe { lance_compaction_options_v2_new() };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_target_rows_per_fragment(options, 100) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_compaction_options_v2_set_compaction_mode(
+                options,
+                true,
+                LanceCompactionMode::ForceBinaryCopy as i32,
+            )
+        },
+        0
+    );
+    let mut metrics = LanceCompactionMetrics::default();
+    assert_eq!(
+        unsafe { lance_dataset_compact_files_v2(dataset, options, &mut metrics) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(metrics.fragments_added, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(dataset) }, 6);
+    assert_eq!(unsafe { lance_dataset_fragment_count(dataset) }, 1);
+    unsafe {
+        lance_compaction_options_v2_free(options);
+        lance_dataset_close(dataset);
+    }
+
+    let compacted_pages = data_file_page_payloads(&uri);
+    assert_eq!(compacted_pages.len(), source_page_count);
+    assert_eq!(compacted_pages, source_pages);
+
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(reopened) }, 6);
+    unsafe { lance_dataset_close(reopened) };
+}
+
+fn add_btree_index(uri: &str) {
+    let c_uri = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                c"id".as_ptr(),
+                c"id_idx".as_ptr(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_compaction_eager_and_deferred_index_remap() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+
+    let (_eager_tmp, eager_uri) = create_many_small_fragments(4);
+    add_btree_index(&eager_uri);
+    let eager_c_uri = c_str(&eager_uri);
+    let eager_dataset = unsafe { lance_dataset_open(eager_c_uri.as_ptr(), ptr::null(), 0) };
+    let eager_options = unsafe { lance_compaction_options_v2_new() };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_target_rows_per_fragment(eager_options, 4) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_compact_files_v2(eager_dataset, eager_options, ptr::null_mut()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let eager_filter = c_str("id = 1");
+    assert_eq!(scan_filtered_with_index(eager_dataset, &eager_filter), 1);
+    let live_eager_fragments: std::collections::BTreeSet<u32> =
+        dataset_fragment_ids(eager_dataset).into_iter().collect();
+    assert_eq!(indexed_fragment_ids(eager_dataset), live_eager_fragments);
+    assert_eq!(
+        unsafe { lance_dataset_validate(eager_dataset) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe {
+        lance_compaction_options_v2_free(eager_options);
+        lance_dataset_close(eager_dataset);
+    }
+
+    let (_deferred_tmp, deferred_uri) = create_many_small_fragments(4);
+    add_btree_index(&deferred_uri);
+    let deferred_c_uri = c_str(&deferred_uri);
+    let deferred_dataset = unsafe { lance_dataset_open(deferred_c_uri.as_ptr(), ptr::null(), 0) };
+    let deferred_options = unsafe { lance_compaction_options_v2_new() };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_target_rows_per_fragment(deferred_options, 4,) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_defer_index_remap(deferred_options, true) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_dataset_compact_files_v2(deferred_dataset, deferred_options, ptr::null_mut())
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let deferred_filter = c_str("id = 1");
+    assert_eq!(
+        scan_filtered_with_index(deferred_dataset, &deferred_filter),
+        1
+    );
+    assert_eq!(
+        unsafe { lance_dataset_validate(deferred_dataset) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    lance_c::runtime::block_on(async {
+        let native = Dataset::open(&deferred_uri).await.unwrap();
+        let indices = native.load_indices().await.unwrap();
+        assert!(
+            indices
+                .iter()
+                .any(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        );
+    });
+    unsafe {
+        lance_compaction_options_v2_free(deferred_options);
+        lance_dataset_close(deferred_dataset);
+    }
+
+    let reopened = unsafe { lance_dataset_open(deferred_c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    assert_eq!(scan_filtered_with_index(reopened, &deferred_filter), 1);
+    unsafe { lance_dataset_close(reopened) };
+}
+
 fn prepare_partially_indexed_dataset(uri: &str) {
     let c_uri = c_str(uri);
     let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
