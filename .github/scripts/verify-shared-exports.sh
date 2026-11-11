@@ -6,6 +6,7 @@
 # declared by the installed header.
 
 set -euo pipefail
+export LC_ALL=C
 
 if [ "$#" -ne 3 ]; then
     echo "usage: $0 <library> <header> <linux|macos>" >&2

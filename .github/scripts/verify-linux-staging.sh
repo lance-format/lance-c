@@ -6,6 +6,7 @@
 # dependencies justified by the supported glibc toolchains.
 
 set -euo pipefail
+export LC_ALL=C
 
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <install-prefix> <target>" >&2
@@ -107,4 +108,4 @@ while IFS= read -r dependency; do
 done <<<"$needed"
 
 echo "Verified Linux runtime dependencies for $target:"
-printf '  %s\n' $needed
+printf '%s\n' "$needed" | sed 's/^/  /'
