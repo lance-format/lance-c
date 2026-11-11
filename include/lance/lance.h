@@ -356,6 +356,7 @@ typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
 typedef struct LanceFtsQuery LanceFtsQuery;
+typedef struct LanceFtsTokenList LanceFtsTokenList;
 typedef struct LanceBlobFile LanceBlobFile;
 typedef struct LanceBlobDescriptorArrayBuilder LanceBlobDescriptorArrayBuilder;
 typedef struct LanceFragment LanceFragment;
@@ -8071,6 +8072,98 @@ int32_t lance_file_writer_abort(LanceFileWriter* writer);
  * finalization and does not replace an explicit fallible finish.
  */
 void lance_file_writer_close(LanceFileWriter* writer);
+
+/* ─── Native diagnostics and FTS tokenization ─────────────────────────────── */
+
+/**
+ * Borrowed view of one token produced by `lance_fts_tokenize`.
+ *
+ * `text` is not NUL-terminated and may contain embedded NUL bytes; read
+ * exactly `text_len` bytes. The pointer remains valid until the owning
+ * `LanceFtsTokenList` is closed. `position` is the native normalized token
+ * position after Lance removes leading gaps.
+ */
+typedef struct LanceFtsTokenView {
+    const char* text;
+    size_t text_len;
+    uint32_t position;
+} LanceFtsTokenView;
+
+/**
+ * Tokenize text with the native Lance inverted-index analyzer.
+ *
+ * `text` is an explicit UTF-8 byte range, not a C string. It may contain
+ * embedded NUL bytes. `text` may be NULL only when `text_len` is 0; NULL with a
+ * nonzero length, invalid UTF-8, or an oversized length is rejected.
+ *
+ * `params_json` is a NULL-terminated JSON document using native
+ * `InvertedIndexParams` fields and defaults. NULL selects the native defaults.
+ * Field presence, optional null values, analyzer selection, validation, and
+ * error messages come from the native deserializer and builder.
+ *
+ * Returns an owned token list, or NULL on error. Free it with
+ * `lance_fts_token_list_close`. Query-token positions match native
+ * `collect_query_tokens`; there is no binding-side tokenizer or position
+ * algorithm.
+ */
+LanceFtsTokenList* lance_fts_tokenize(
+    const char* text, size_t text_len, const char* params_json);
+
+/** Number of tokens in `tokens`. Returns 0 and sets an error for NULL. */
+uint64_t lance_fts_token_list_count(const LanceFtsTokenList* tokens);
+
+/**
+ * Borrow token `index` into `out`. Returns 0 on success or -1 on a NULL
+ * handle/out pointer or an out-of-range index. `out` is written only on
+ * success. The view remains valid until the list is closed.
+ */
+int32_t lance_fts_token_list_get(
+    const LanceFtsTokenList* tokens, size_t index, LanceFtsTokenView* out);
+
+/** Close and free a token list. Safe to call with NULL. */
+void lance_fts_token_list_close(LanceFtsTokenList* tokens);
+
+/**
+ * Return native `lance_core::utils::cpu::simd_info()` as a JSON object with
+ * exactly `tier` (native Display string), `target_arch`, and `host_features`
+ * (native order). No C-side detection or cache is involved. The returned
+ * string is owned by the caller; free it with `lance_free_string()`.
+ */
+const char* lance_simd_info_json(void);
+
+/**
+ * Native process-wide object-store IOPS counter. This reads the same native
+ * counter as `lance::io::iops_counter()` and has no reset semantics.
+ */
+uint64_t lance_process_iops_counter(void);
+
+/**
+ * Native process-wide object-store bytes-read counter. This reads the same
+ * native counter as `lance::io::bytes_read_counter()` and has no reset
+ * semantics.
+ */
+uint64_t lance_process_bytes_read_counter(void);
+
+/**
+ * Snapshot the dataset's native object-store I/O counters without resetting.
+ *
+ * The counters come from `Dataset::object_store(None)` and the native store
+ * accumulator. They are the current accumulator without resetting it; a
+ * preceding incremental call resets those counters to zero. Returns 0 on
+ * success or -1 on a NULL handle/out pointer or native failure. `out_stats`
+ * is written only on success.
+ */
+int32_t lance_dataset_io_stats_snapshot(
+    const LanceDataset* dataset, LanceObjectStoreIoStats* out_stats);
+
+/**
+ * Return dataset object-store counters accumulated since the previous
+ * incremental call and reset the native accumulator. This binding keeps no
+ * delta baseline. Returns 0 on success or -1 on a NULL handle/out pointer or
+ * native failure. `out_stats` is written only on success.
+ */
+int32_t lance_dataset_io_stats_incremental(
+    const LanceDataset* dataset, LanceObjectStoreIoStats* out_stats);
 
 /* ─── Owned raw-file path and byte snapshots ──────────────────────────────── */
 

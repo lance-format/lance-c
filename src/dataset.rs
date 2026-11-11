@@ -17,6 +17,7 @@ use lance_core::Result;
 
 use crate::data_file::LanceDataFile;
 use crate::error::{ffi_try, swallow_unwind};
+use crate::file_session::LanceObjectStoreIoStats;
 use crate::helpers;
 use crate::runtime::block_on;
 use crate::session::LanceSession;
@@ -456,6 +457,76 @@ unsafe fn dataset_latest_version_inner(dataset: *const LanceDataset) -> Result<u
     }
     let ds = unsafe { &*dataset };
     block_on(ds.snapshot().latest_version_id())
+}
+
+/// Snapshot the dataset's native object-store I/O counters.
+///
+/// The counters are the current native accumulator and are not reset by this
+/// call. They come from the same native store tracker used by
+/// `Dataset::object_store(None)`, so the semantics match the native Python
+/// `io_stats_snapshot` binding. A preceding incremental call resets the
+/// accumulator. Returns 0 on
+/// success or -1 on a NULL handle/out pointer or native failure. `out_stats` is
+/// written only on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_io_stats_snapshot(
+    dataset: *const LanceDataset,
+    out_stats: *mut LanceObjectStoreIoStats,
+) -> i32 {
+    ffi_try!(
+        unsafe { dataset_io_stats_inner(dataset, out_stats, false) },
+        neg
+    )
+}
+
+/// Return the dataset's native object-store I/O counters accumulated since the
+/// previous incremental call, then reset that accumulator to zero.
+///
+/// The reset is owned by the native store tracker. This binding keeps no
+/// baseline or cached counters. Returns 0 on success or -1 on a NULL
+/// handle/out pointer or native failure. `out_stats` is written only on
+/// success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_io_stats_incremental(
+    dataset: *const LanceDataset,
+    out_stats: *mut LanceObjectStoreIoStats,
+) -> i32 {
+    ffi_try!(
+        unsafe { dataset_io_stats_inner(dataset, out_stats, true) },
+        neg
+    )
+}
+
+unsafe fn dataset_io_stats_inner(
+    dataset: *const LanceDataset,
+    out_stats: *mut LanceObjectStoreIoStats,
+    incremental: bool,
+) -> Result<i32> {
+    if dataset.is_null() || out_stats.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset and out_stats must not be NULL".into(),
+        ));
+    }
+    let ds = unsafe { &*dataset };
+    let snapshot = ds.snapshot();
+    let store = block_on(snapshot.object_store(None))?;
+    let stats = if incremental {
+        store.io_stats_incremental()
+    } else {
+        store.io_stats_snapshot()
+    };
+    unsafe {
+        ptr::write(
+            out_stats,
+            LanceObjectStoreIoStats {
+                read_iops: stats.read_iops,
+                read_bytes: stats.read_bytes,
+                write_iops: stats.write_iops,
+                written_bytes: stats.written_bytes,
+            },
+        );
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ mod data_file;
 mod data_statistics;
 mod dataset;
 mod delete;
+mod diagnostics;
 mod drop_columns;
 mod error;
 mod file_reader;
@@ -88,6 +89,7 @@ pub use data_file::*;
 pub use data_statistics::*;
 pub use dataset::*;
 pub use delete::*;
+pub use diagnostics::*;
 pub use drop_columns::*;
 pub use error::{
     LanceErrorCode, lance_free_string, lance_last_error_code, lance_last_error_message,
