@@ -2347,8 +2347,8 @@ int32_t lance_fragment_count_rows(
  *
  * This calls native `FileFragment::delete`. The input fragment is borrowed and
  * internally cloned, so it remains usable on every return path. The deletion
- * file is written immediately, but the dataset manifest is unchanged until the
- * caller publishes the returned metadata in a Delete transaction.
+ * file, when needed, is written during this call. The dataset manifest changes
+ * when the caller publishes the returned metadata in a Delete transaction.
  *
  * On success, `out_fragment` receives:
  * - a new independently owned fragment with the updated deletion-file
@@ -2366,7 +2366,7 @@ int32_t lance_fragment_count_rows(
  *
  * @param fragment      Fragment snapshot. Must not be NULL.
  * @param predicate     SQL predicate. Must not be NULL.
- * @param out_fragment  Success-only optional output. Must not be NULL.
+ * @param out_fragment  Receives the fragment or NULL on success. Must not be NULL.
  * @return 0 on success, -1 on error.
  */
 int32_t lance_fragment_delete(
