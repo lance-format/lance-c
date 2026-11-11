@@ -439,21 +439,20 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
     };
     let mut udf_fragment = ptr::null_mut();
     let mut udf_schema_out = ptr::null_mut();
-    assert_eq!(
-        unsafe {
-            lance_fragment_add_columns_batch_udf(
-                fragment,
-                &udf,
-                read_columns.as_ptr(),
-                &udf_batch_size,
-                &mut udf_fragment,
-                &mut udf_schema_out,
-            )
-        },
-        0,
-        "BatchUDF add_columns failed: {:?}",
-        take_error()
-    );
+    let udf_status = unsafe {
+        lance_fragment_add_columns_batch_udf(
+            fragment,
+            &udf,
+            read_columns.as_ptr(),
+            &udf_batch_size,
+            &mut udf_fragment,
+            &mut udf_schema_out,
+        )
+    };
+    if udf_status != 0 {
+        eprintln!("BatchUDF add_columns failed: {:?}", take_error());
+    }
+    assert_eq!(udf_status, 0);
     assert!(schema_field_id(udf_schema_out, "udf_value") > 5);
     assert!(state.calls.load(Ordering::SeqCst) > 0);
     assert_eq!(
