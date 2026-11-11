@@ -383,7 +383,7 @@ fn data_overlay_value_and_operation_lifetimes() {
     let fixture = lance_c::runtime::block_on(Fixture::new());
     let fragment_count = unsafe { lance_dataset_fragment_count(fixture.dataset) };
     assert_eq!(fragment_count, 2);
-    let mut ids = vec![0u64; fragment_count];
+    let mut ids = vec![0u64; fragment_count as usize];
     assert_eq!(
         unsafe { lance_dataset_fragment_ids(fixture.dataset, ids.as_mut_ptr()) },
         0,
