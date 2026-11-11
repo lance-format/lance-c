@@ -162,6 +162,7 @@ fn create_index_capability_dataset_on_disk(name: &str) -> (tempfile::TempDir, St
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("text", DataType::Utf8, false),
+        Field::new("dist_text", DataType::Utf8, false),
         Field::new(
             "embedding",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), DIM),
@@ -185,6 +186,7 @@ fn create_index_capability_dataset_on_disk(name: &str) -> (tempfile::TempDir, St
                 })
                 .collect::<Vec<_>>();
             let text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+            let dist_text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
             let values = ids
                 .iter()
                 .flat_map(|id| (0..DIM).map(move |component| *id as f32 + component as f32 / 10.0))
@@ -201,6 +203,7 @@ fn create_index_capability_dataset_on_disk(name: &str) -> (tempfile::TempDir, St
                 vec![
                     Arc::new(Int32Array::from(ids)),
                     Arc::new(StringArray::from(text_refs)),
+                    Arc::new(StringArray::from(dist_text_refs)),
                     Arc::new(embeddings),
                 ],
             )

@@ -11119,6 +11119,181 @@ fn test_index_metadata_complete_inspection_clone_and_native_oracle() {
 }
 
 #[test]
+fn test_index_metadata_clone_with_fragment_ids_and_encode() {
+    use chrono::{TimeZone, Utc};
+    use lance_table::format::{IndexFile, IndexMetadata, pb};
+    use prost::Message;
+    use uuid::Uuid;
+
+    let created_at = Utc
+        .timestamp_millis_opt(1_700_000_123_456)
+        .single()
+        .unwrap();
+    let native = IndexMetadata {
+        uuid: Uuid::from_u128(0x102132435465768798a9bacbdcedfe0f),
+        name: "coverage_clone".to_string(),
+        fields: vec![1, 2],
+        covering_fields: vec![2],
+        dataset_version: 9,
+        fragment_bitmap: Some([2_u32, 5].into_iter().collect()),
+        index_details: Some(std::sync::Arc::new(prost_types::Any {
+            type_url: "/lance.table.InvertedIndexDetails".to_string(),
+            value: b"index details payload".to_vec(),
+        })),
+        index_version: 3,
+        created_at: Some(created_at),
+        base_id: Some(7),
+        files: Some(vec![
+            IndexFile {
+                path: "index.idx".to_string(),
+                size_bytes: 101,
+            },
+            IndexFile {
+                path: "metadata.idx".to_string(),
+                size_bytes: 202,
+            },
+        ]),
+    };
+    let encoded_source = pb::IndexMetadata::from(&native).encode_to_vec();
+    let mut source = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_parse(
+                encoded_source.as_ptr(),
+                encoded_source.len(),
+                &mut source,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let source_before = inspect_index_metadata_via_c(source);
+    assert_eq!(
+        source_before.created_at,
+        Some((created_at.timestamp(), created_at.timestamp_subsec_nanos()))
+    );
+
+    let replacement = [7_u32, 1, 7, 3];
+    let combined = unsafe {
+        lance_index_segment_metadata_clone_with_fragment_ids(
+            source,
+            true,
+            replacement.as_ptr(),
+            replacement.len(),
+        )
+    };
+    assert!(!combined.is_null(), "{}", take_last_error_message());
+    let mut expected = source_before.clone();
+    expected.fragment_ids = vec![1, 3, 7];
+    assert_eq!(inspect_index_metadata_via_c(combined), expected);
+    assert_eq!(
+        inspect_index_metadata_via_c(source),
+        source_before,
+        "cloning must not modify the source handle"
+    );
+
+    let dangling = std::ptr::NonNull::<u32>::dangling().as_ptr();
+    let unchanged = unsafe {
+        lance_index_segment_metadata_clone_with_fragment_ids(source, false, dangling, usize::MAX)
+    };
+    assert!(
+        !unchanged.is_null(),
+        "inactive fragment IDs must be ignored: {}",
+        take_last_error_message()
+    );
+    assert_eq!(inspect_index_metadata_via_c(unchanged), source_before);
+
+    let empty = unsafe {
+        lance_index_segment_metadata_clone_with_fragment_ids(source, true, ptr::null(), 0)
+    };
+    assert!(!empty.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        inspect_index_metadata_via_c(empty).fragment_ids,
+        Vec::<u32>::new()
+    );
+
+    let oversized = usize::MAX / std::mem::size_of::<u32>() + 1;
+    assert!(
+        unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(source, true, dangling, oversized)
+        }
+        .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("fragment_count"), "{message}");
+    assert!(message.contains(&oversized.to_string()), "{message}");
+
+    assert!(
+        unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(ptr::null(), false, ptr::null(), 0)
+        }
+        .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+
+    let mut encoded = ptr::null_mut();
+    let mut encoded_len = usize::MAX;
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_encode(combined, &mut encoded, &mut encoded_len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!encoded.is_null() && encoded_len > 0);
+    let mut reparsed = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(encoded, encoded_len, &mut reparsed) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(inspect_index_metadata_via_c(reparsed), expected);
+
+    let sentinel = std::ptr::NonNull::<u8>::dangling().as_ptr();
+    let mut sentinel_bytes = sentinel;
+    let mut sentinel_len = usize::MAX;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_encode(ptr::null(), &mut sentinel_bytes, &mut sentinel_len)
+        },
+        -1
+    );
+    assert_eq!(sentinel_bytes, sentinel);
+    assert_eq!(sentinel_len, usize::MAX);
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_encode(combined, ptr::null_mut(), &mut sentinel_len)
+        },
+        -1
+    );
+    assert_eq!(sentinel_len, usize::MAX);
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_encode(combined, &mut sentinel_bytes, ptr::null_mut())
+        },
+        -1
+    );
+    assert_eq!(sentinel_bytes, sentinel);
+
+    unsafe {
+        lance_index_segment_metadata_free(source);
+        assert_eq!(
+            inspect_index_metadata_via_c(combined),
+            expected,
+            "an owned clone must remain usable after the source is freed"
+        );
+        lance_free_bytes(encoded);
+        lance_index_segment_metadata_free(empty);
+        lance_index_segment_metadata_free(unchanged);
+        lance_index_segment_metadata_free(combined);
+        lance_index_segment_metadata_free(reparsed);
+    }
+}
+
+#[test]
 fn test_create_index_operation_constructor_validation_and_ownership() {
     let (_tmp, uri) = create_create_index_dataset();
     let uri_c = c_str(&uri);
@@ -41337,7 +41512,7 @@ fn test_prewarm_scalar_train_and_index_merge_lifecycle() {
         0xcd,
     ];
     let mut metadata = Vec::new();
-    for fragment_id in &fragment_ids[..2] {
+    for fragment_id in &fragment_ids[..3] {
         let fragment_id = *fragment_id as u32;
         let options = LanceIndexSegmentBuildOptions {
             fragment_ids: &fragment_id,
@@ -41591,6 +41766,85 @@ fn test_prewarm_scalar_train_and_index_merge_lifecycle() {
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     let _ = take_last_error_message();
+
+    let mut partial_metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_parse(metadata[0].0, metadata[0].1, &mut partial_metadata)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let coverage = fragment_ids
+        .iter()
+        .map(|fragment_id| *fragment_id as u32)
+        .collect::<Vec<_>>();
+    let combined_metadata = unsafe {
+        lance_index_segment_metadata_clone_with_fragment_ids(
+            partial_metadata,
+            true,
+            coverage.as_ptr(),
+            coverage.len(),
+        )
+    };
+    assert!(
+        !combined_metadata.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let mut combined_bytes = ptr::null_mut();
+    let mut combined_len = 0_usize;
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_encode(
+                combined_metadata,
+                &mut combined_bytes,
+                &mut combined_len,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let publication_version = unsafe { lance_dataset_version(dataset) };
+    let combined_pointer = combined_bytes as *const u8;
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                c_str("idx_caps_dist_published").as_ptr(),
+                c_str("text").as_ptr(),
+                &combined_pointer,
+                &combined_len,
+                1,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        publication_version + 1
+    );
+    let publication_description =
+        take_json_value(unsafe { lance_dataset_describe_indices_json(dataset) });
+    let published_index = publication_description
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "idx_caps_dist_published")
+        .unwrap();
+    assert_eq!(
+        published_index["segments"][0]["fragment_ids"],
+        serde_json::json!([0, 1, 2])
+    );
+    unsafe {
+        lance_index_segment_metadata_free(partial_metadata);
+        lance_index_segment_metadata_free(combined_metadata);
+        lance_free_bytes(combined_bytes);
+    }
 
     unsafe {
         lance_index_segment_metadata_free(merged_metadata);

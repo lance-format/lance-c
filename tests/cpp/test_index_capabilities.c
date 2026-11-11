@@ -72,6 +72,207 @@ static int64_t count_stream_rows(struct ArrowArrayStream *stream) {
     return rows;
 }
 
+#define METADATA_MAX_FIELDS 8
+#define METADATA_MAX_FILES 16
+#define METADATA_MAX_DETAILS 4096
+#define METADATA_MAX_NAME 128
+#define METADATA_MAX_PATH 256
+
+typedef struct {
+    uint8_t uuid[16];
+    char name[METADATA_MAX_NAME];
+    int32_t fields[METADATA_MAX_FIELDS];
+    size_t field_count;
+    int32_t covering_fields[METADATA_MAX_FIELDS];
+    size_t covering_field_count;
+    uint64_t dataset_version;
+    int32_t index_version;
+    int32_t index_type;
+    char type_url[METADATA_MAX_NAME];
+    uint8_t details[METADATA_MAX_DETAILS];
+    size_t details_len;
+    size_t file_count;
+    char file_paths[METADATA_MAX_FILES][METADATA_MAX_PATH];
+    uint64_t file_sizes[METADATA_MAX_FILES];
+    bool created_is_set;
+    int64_t created_seconds;
+    uint32_t created_nanos;
+    bool base_id_is_set;
+    uint32_t base_id;
+    uint32_t fragments[METADATA_MAX_FIELDS];
+    size_t fragment_count;
+} MetadataSnapshot;
+
+static void snapshot_metadata(const LanceIndexSegmentMetadata *metadata,
+                              MetadataSnapshot *out) {
+    ASSERT(metadata != NULL, "metadata handle is NULL");
+    memset(out, 0, sizeof(*out));
+    ASSERT(lance_index_segment_metadata_uuid(metadata, out->uuid) == 0,
+           "metadata uuid access failed");
+
+    const char *name = lance_index_segment_metadata_name(metadata);
+    ASSERT(name != NULL, "metadata name access failed");
+    ASSERT(strlen(name) < sizeof(out->name), "metadata name is too long");
+    strcpy(out->name, name);
+
+    out->field_count = lance_index_segment_metadata_field_count(metadata);
+    ASSERT(lance_last_error_code() == LANCE_OK, "metadata field count failed");
+    ASSERT(out->field_count <= METADATA_MAX_FIELDS,
+           "metadata field count exceeds test capacity");
+    size_t written = 0;
+    ASSERT(lance_index_segment_metadata_field_ids(
+               metadata, out->fields, METADATA_MAX_FIELDS, &written) == 0,
+           "metadata field ids access failed");
+    ASSERT(written == out->field_count, "metadata field count changed");
+
+    size_t covering_count =
+        lance_index_segment_metadata_covering_field_count(metadata);
+    ASSERT(lance_last_error_code() == LANCE_OK,
+           "metadata covering field count failed");
+    ASSERT(covering_count <= METADATA_MAX_FIELDS,
+           "metadata covering field count exceeds test capacity");
+    for (size_t i = 0; i < covering_count; ++i) {
+        ASSERT(lance_index_segment_metadata_covering_field_id_at(
+                   metadata, i, &out->covering_fields[i]) == 0,
+               "metadata covering field access failed");
+    }
+    out->covering_field_count = covering_count;
+
+    out->fragment_count =
+        lance_index_segment_metadata_fragment_count(metadata);
+    ASSERT(lance_last_error_code() == LANCE_OK,
+           "metadata fragment count failed");
+    ASSERT(out->fragment_count <= METADATA_MAX_FIELDS,
+           "metadata fragment count exceeds test capacity");
+    written = 0;
+    ASSERT(lance_index_segment_metadata_fragment_ids(
+               metadata, out->fragments, METADATA_MAX_FIELDS, &written) == 0,
+           "metadata fragment ids access failed");
+    ASSERT(written == out->fragment_count, "metadata fragment count changed");
+
+    out->dataset_version =
+        lance_index_segment_metadata_dataset_version(metadata);
+    ASSERT(lance_last_error_code() == LANCE_OK,
+           "metadata dataset version access failed");
+    out->index_version =
+        lance_index_segment_metadata_index_version(metadata);
+    ASSERT(out->index_version >= 0, "metadata index version access failed");
+    out->index_type = lance_index_segment_metadata_index_type(metadata);
+    ASSERT(out->index_type >= 0, "metadata index type access failed");
+
+    const char *type_url =
+        lance_index_segment_metadata_index_details_type_url(metadata);
+    ASSERT(type_url != NULL, "metadata index details type_url access failed");
+    ASSERT(strlen(type_url) < sizeof(out->type_url),
+           "metadata type_url is too long");
+    strcpy(out->type_url, type_url);
+    const uint8_t *details =
+        lance_index_segment_metadata_index_details_value(metadata,
+                                                         &out->details_len);
+    ASSERT(details != NULL, "metadata index details value access failed");
+    ASSERT(out->details_len <= METADATA_MAX_DETAILS,
+           "metadata details exceed test capacity");
+    memcpy(out->details, details, out->details_len);
+
+    out->file_count = lance_index_segment_metadata_file_count(metadata);
+    ASSERT(lance_last_error_code() == LANCE_OK, "metadata file count failed");
+    ASSERT(out->file_count <= METADATA_MAX_FILES,
+           "metadata file count exceeds test capacity");
+    for (size_t i = 0; i < out->file_count; ++i) {
+        const char *path =
+            lance_index_segment_metadata_file_path_at(metadata, i);
+        ASSERT(path != NULL, "metadata file path access failed");
+        ASSERT(strlen(path) < sizeof(out->file_paths[i]),
+               "metadata file path is too long");
+        strcpy(out->file_paths[i], path);
+        ASSERT(lance_index_segment_metadata_file_size_at(
+                   metadata, i, &out->file_sizes[i]) == 0,
+               "metadata file size access failed");
+    }
+
+    LanceOptionalTimestamp timestamp = {0};
+    ASSERT(lance_index_segment_metadata_created_at(metadata, &timestamp) == 0,
+           "metadata created_at access failed");
+    out->created_is_set = timestamp.is_set;
+    out->created_seconds = timestamp.unix_seconds;
+    out->created_nanos = timestamp.nanos;
+
+    ASSERT(lance_index_segment_metadata_base_id(
+               metadata, &out->base_id_is_set, &out->base_id) == 0,
+           "metadata base_id access failed");
+}
+
+static void assert_metadata_equal_except_fragments(
+    const MetadataSnapshot *left, const MetadataSnapshot *right) {
+    MetadataSnapshot expected = *left;
+    MetadataSnapshot actual = *right;
+    expected.fragment_count = 0;
+    actual.fragment_count = 0;
+    memset(expected.fragments, 0, sizeof(expected.fragments));
+    memset(actual.fragments, 0, sizeof(actual.fragments));
+    ASSERT(memcmp(&expected, &actual, sizeof(expected)) == 0,
+           "coverage clone changed unrelated native metadata");
+}
+
+static size_t collect_phrase_ids(LanceDataset *dataset, const char *column,
+                                 int32_t *ids, size_t capacity) {
+    LanceFtsPhraseOptions options;
+    lance_fts_query_phrase_options_init(&options);
+    LanceFtsQuery *query =
+        lance_fts_query_phrase_new("alpha beta", column, &options);
+    ASSERT(query != NULL, "phrase query construction failed");
+
+    LanceScanner *scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "phrase scanner creation failed");
+    CHECK_OK();
+    ASSERT(lance_scanner_set_fts_query(scanner, query) == 0,
+           "phrase query attachment failed");
+    lance_fts_query_close(query);
+
+    const char *explain = lance_scanner_explain_plan(scanner, false);
+    ASSERT(explain != NULL, "phrase plan explanation failed");
+    ASSERT(strstr(explain, "PhraseQueryExec") != NULL,
+           "phrase plan did not select an inverted phrase execution");
+    lance_free_string(explain);
+
+    size_t count = 0;
+    for (;;) {
+        LanceBatch *batch = NULL;
+        int rc = lance_scanner_next(scanner, &batch);
+        if (rc == 1) break;
+        ASSERT(rc == 0, "phrase scan failed");
+        CHECK_OK();
+        ASSERT(batch != NULL, "phrase scan returned a NULL batch");
+
+        struct ArrowArray array = {0};
+        struct ArrowSchema schema = {0};
+        ASSERT(lance_batch_to_arrow(batch, &array, &schema) == 0,
+               "phrase batch Arrow export failed");
+        int64_t id_index = -1;
+        for (int64_t child = 0; child < schema.n_children; ++child) {
+            if (schema.children[child]->name != NULL &&
+                strcmp(schema.children[child]->name, "id") == 0) {
+                id_index = child;
+                break;
+            }
+        }
+        ASSERT(id_index >= 0, "phrase output omitted the id column");
+        const struct ArrowArray *id_array = array.children[id_index];
+        ASSERT(id_array->buffers[1] != NULL,
+               "phrase id column has no data buffer");
+        const int32_t *id_values = (const int32_t *)id_array->buffers[1];
+        for (int64_t row = 0; row < array.length; ++row) {
+            ASSERT(count < capacity, "phrase result exceeds test capacity");
+            ids[count++] = id_values[id_array->offset + row];
+        }
+        if (array.release) array.release(&array);
+        if (schema.release) schema.release(&schema);
+        lance_batch_free(batch);
+    }
+    lance_scanner_close(scanner);
+    return count;
+}
+
 static LanceVectorIndexOptions vector_options(uint32_t partitions) {
     LanceVectorIndexOptions options;
     memset(&options, 0, sizeof(options));
@@ -340,6 +541,214 @@ static void test_physical_merge(LanceDataset *dataset) {
     for (size_t i = 0; i < 2; ++i) lance_free_bytes(physical_metadata[i]);
 }
 
+static void test_distributed_metadata_publication(LanceDataset *dataset,
+                                                  const char *uri) {
+    const char *params =
+        "{\"base_tokenizer\":\"simple\",\"language\":\"English\","
+        "\"with_position\":true}";
+    const uint8_t index_uuid[16] = {
+        0x50, 0x55, 0x42, 0x4c, 0x49, 0x53, 0x48, 0x45,
+        0x44, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+    };
+    uint64_t fragment_count = lance_dataset_fragment_count(dataset);
+    CHECK_OK();
+    ASSERT(fragment_count >= 2 && fragment_count <= METADATA_MAX_FIELDS,
+           "distributed publication requires 2..8 fragments");
+    uint64_t fragment_ids_u64[METADATA_MAX_FIELDS] = {0};
+    uint32_t fragment_ids_u32[METADATA_MAX_FIELDS] = {0};
+    ASSERT(lance_dataset_fragment_ids(dataset, fragment_ids_u64) == 0,
+           "fragment id listing failed");
+    CHECK_OK();
+    for (size_t i = 0; i < fragment_count; ++i) {
+        fragment_ids_u32[i] = (uint32_t)fragment_ids_u64[i];
+    }
+
+    uint8_t *staged[METADATA_MAX_FIELDS] = {0};
+    size_t staged_lens[METADATA_MAX_FIELDS] = {0};
+    LanceScalarIndexOptions train = {true, true};
+    for (size_t i = 0; i < fragment_count; ++i) {
+        LanceIndexSegmentBuildOptions build;
+        memset(&build, 0, sizeof(build));
+        build.fragment_ids = &fragment_ids_u32[i];
+        build.fragment_count = 1;
+        build.index_uuid = index_uuid;
+        build.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+        LanceIndexSegmentBuilder *builder =
+            lance_index_segment_builder_new_scalar_with_options(
+                dataset, "dist_text", "c_dist_text_publish",
+                LANCE_SCALAR_INVERTED, params, &train, &build);
+        ASSERT(builder != NULL, "distributed publication builder failed");
+        CHECK_OK();
+        ASSERT(lance_index_segment_builder_execute_uncommitted(
+                   builder, &staged[i], &staged_lens[i]) == 0,
+               "distributed publication segment build failed");
+        CHECK_OK();
+        lance_index_segment_builder_free(builder);
+    }
+
+    uint64_t version_before = lance_dataset_version(dataset);
+    CHECK_OK();
+    ProgressCapture capture = {0};
+    ASSERT(lance_dataset_merge_index_metadata(
+               dataset, index_uuid, "Inverted", true, 0, capture_progress,
+               &capture) == 0,
+           "distributed metadata merge failed");
+    CHECK_OK();
+    ASSERT(atomic_load(&capture.events) > 0,
+           "distributed metadata merge reported no progress");
+    ASSERT(atomic_load(&capture.invalid) == 0,
+           "distributed metadata merge callback contract violated");
+    ASSERT(lance_dataset_version(dataset) == version_before,
+           "metadata merge must not publish a version");
+
+    LanceIndexSegmentMetadata *partial = NULL;
+    ASSERT(lance_index_segment_metadata_parse(
+               staged[0], staged_lens[0], &partial) == 0,
+           "partial metadata parse failed");
+    CHECK_OK();
+    MetadataSnapshot partial_snapshot;
+    snapshot_metadata(partial, &partial_snapshot);
+    ASSERT(partial_snapshot.fragment_count == 1,
+           "a fragment-scoped build must cover one fragment");
+
+    LanceIndexSegmentMetadata *combined =
+        lance_index_segment_metadata_clone_with_fragment_ids(
+            partial, true, fragment_ids_u32, (size_t)fragment_count);
+    ASSERT(combined != NULL, "complete coverage clone failed");
+    CHECK_OK();
+    MetadataSnapshot combined_snapshot;
+    snapshot_metadata(combined, &combined_snapshot);
+    ASSERT(combined_snapshot.fragment_count == fragment_count,
+           "complete metadata snapshot has the wrong fragment count");
+    for (size_t i = 0; i < fragment_count; ++i) {
+        ASSERT(combined_snapshot.fragments[i] == fragment_ids_u32[i],
+               "complete metadata snapshot has the wrong fragment ids");
+    }
+    assert_metadata_equal_except_fragments(&partial_snapshot,
+                                           &combined_snapshot);
+    ASSERT(lance_index_segment_metadata_fragment_count(partial) == 1,
+           "cloning must leave the source metadata usable");
+
+    uint8_t *encoded = NULL;
+    size_t encoded_len = 0;
+    ASSERT(lance_index_segment_metadata_encode(
+               combined, &encoded, &encoded_len) == 0,
+           "complete metadata encode failed");
+    CHECK_OK();
+    ASSERT(encoded != NULL && encoded_len > 0,
+           "complete metadata encode returned no bytes");
+    ASSERT(lance_dataset_version(dataset) == version_before,
+           "metadata representation work must not publish a version");
+
+    ASSERT(lance_index_segment_metadata_clone_with_fragment_ids(
+               NULL, false, NULL, 0) == NULL,
+           "NULL metadata clone must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL metadata clone error code");
+    {
+        const char *message = lance_last_error_message();
+        if (message) lance_free_string(message);
+    }
+    LanceIndexSegmentMetadata *inactive =
+        lance_index_segment_metadata_clone_with_fragment_ids(
+            partial, false, (const uint32_t *)(uintptr_t)1, SIZE_MAX);
+    ASSERT(inactive != NULL,
+           "inactive fragment payload must be ignored");
+    CHECK_OK();
+    MetadataSnapshot inactive_snapshot;
+    snapshot_metadata(inactive, &inactive_snapshot);
+    assert_metadata_equal_except_fragments(&partial_snapshot,
+                                           &inactive_snapshot);
+    ASSERT(lance_index_segment_metadata_clone_with_fragment_ids(
+               partial, true, (const uint32_t *)(uintptr_t)1, SIZE_MAX) == NULL,
+           "oversized fragment count must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "oversized fragment count error code");
+    {
+        const char *message = lance_last_error_message();
+        ASSERT(message != NULL && strstr(message, "fragment_count") != NULL,
+               "oversized fragment count diagnostic");
+        if (message) lance_free_string(message);
+    }
+    uint8_t *sentinel_bytes = (uint8_t *)(uintptr_t)1;
+    size_t sentinel_len = 12345;
+    ASSERT(lance_index_segment_metadata_encode(
+               NULL, &sentinel_bytes, &sentinel_len) == -1,
+           "NULL metadata encode must fail");
+    ASSERT(sentinel_bytes == (uint8_t *)(uintptr_t)1 &&
+               sentinel_len == 12345,
+           "failed encode must leave outputs unchanged");
+    {
+        const char *message = lance_last_error_message();
+        if (message) lance_free_string(message);
+    }
+
+    const uint8_t *encoded_ptr = encoded;
+    ASSERT(lance_dataset_commit_index_segments(
+               dataset, "c_dist_text_published", "dist_text", &encoded_ptr,
+               &encoded_len, 1) == 0,
+           "distributed FTS publication commit failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == version_before + 1,
+           "distributed FTS publication must advance exactly one version");
+
+    const char *description = lance_dataset_describe_indices_json(dataset);
+    ASSERT(description != NULL, "published index description failed");
+    ASSERT(strstr(description, "\"name\":\"c_dist_text_published\"") != NULL,
+           "published index is absent from the description");
+    char coverage_substring[128];
+    size_t offset = 0;
+    int written = snprintf(coverage_substring, sizeof(coverage_substring),
+                           "\"fragment_ids\":[");
+    ASSERT(written > 0, "coverage substring formatting failed");
+    offset = (size_t)written;
+    for (size_t i = 0; i < fragment_count; ++i) {
+        written = snprintf(coverage_substring + offset,
+                           sizeof(coverage_substring) - offset, "%s%u",
+                           i == 0 ? "" : ",", fragment_ids_u32[i]);
+        ASSERT(written > 0 &&
+                   offset + (size_t)written < sizeof(coverage_substring),
+               "coverage substring formatting overflow");
+        offset += (size_t)written;
+    }
+    written = snprintf(coverage_substring + offset,
+                       sizeof(coverage_substring) - offset, "]");
+    ASSERT(written > 0 &&
+               offset + (size_t)written < sizeof(coverage_substring),
+           "coverage substring terminator overflow");
+    ASSERT(strstr(description, coverage_substring) != NULL,
+           "published index does not record complete fragment coverage");
+    lance_free_string(description);
+    CHECK_OK();
+
+    LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(reopened != NULL, "published dataset reopen failed");
+    CHECK_OK();
+    int32_t ids[192] = {0};
+    size_t id_count = collect_phrase_ids(reopened, "dist_text", ids, 192);
+    ASSERT(id_count == 48,
+           "published FTS index returned the wrong number of rows");
+    bool seen[192] = {false};
+    for (size_t i = 0; i < id_count; ++i) {
+        ASSERT(ids[i] >= 0 && ids[i] < 192 && ids[i] % 4 == 0,
+               "published FTS index returned an unexpected row id");
+        ASSERT(!seen[ids[i]], "published FTS index returned a duplicate row");
+        seen[ids[i]] = true;
+    }
+    for (int32_t id = 0; id < 192; id += 4) {
+        ASSERT(seen[id], "published FTS index omitted an expected row id");
+    }
+    lance_dataset_close(reopened);
+
+    lance_index_segment_metadata_free(partial);
+    lance_index_segment_metadata_free(combined);
+    lance_index_segment_metadata_free(inactive);
+    lance_free_bytes(encoded);
+    for (size_t i = 0; i < fragment_count; ++i) {
+        lance_free_bytes(staged[i]);
+    }
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -530,6 +939,7 @@ int main(int argc, char **argv) {
     lance_index_segment_builder_free(defined_builder);
 
     test_physical_merge(dataset);
+    test_distributed_metadata_publication(dataset, argv[1]);
     lance_ivf_model_free(model);
     lance_dataset_close(dataset);
 
