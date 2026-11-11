@@ -45018,6 +45018,133 @@ fn mw_int32_values(batches: &[RecordBatch], column: &str) -> Vec<i32> {
 }
 
 #[test]
+fn test_memwal_free_releases_active_batch_without_close() {
+    use arrow::buffer::{Buffer, ScalarBuffer};
+    use std::ptr::NonNull;
+
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let writer = mw_writer_open(ds, "00000000-0000-0000-0000-000000000000");
+
+    let owner = Arc::new(vec![42_i32]);
+    let weak = Arc::downgrade(&owner);
+    let data = unsafe {
+        Buffer::from_custom_allocation(
+            NonNull::new(owner.as_ptr() as *mut u8).unwrap(),
+            std::mem::size_of::<i32>(),
+            owner,
+        )
+    };
+    let tracked = Int32Array::new(ScalarBuffer::new(data, 0, 1), None);
+    let template = mw_batch(&[42], &[Some("tracked")], &[[0.0; 4]]);
+    let mut columns = template.columns().to_vec();
+    columns[0] = Arc::new(tracked);
+    mw_put(
+        writer,
+        RecordBatch::try_new(template.schema(), columns).unwrap(),
+    );
+    assert!(weak.upgrade().is_some());
+
+    unsafe { lance_shard_writer_free(writer) };
+    let released = weak.upgrade().is_none();
+    unsafe { lance_dataset_close(ds) };
+    assert!(released, "freed writer still retains active batch");
+}
+
+#[test]
+fn test_memwal_plan_stream_rejects_unexportable_schema() {
+    const CHILD_ENV: &str = "LANCE_C_TEST_MEMWAL_PLAN_SCHEMA_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "test_memwal_plan_stream_rejects_unexportable_schema",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "schema subprocess failed ({:?})\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("nul_schema").to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        mw_schema().field(0).clone(),
+        Field::new("bad\0name", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![2])),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(Dataset::write(
+        arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &uri,
+        None,
+    ))
+    .unwrap();
+
+    let ds = mw_open(&uri);
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_new(ds, ptr::null(), 0, 0, ptr::null(), 0, &mut planner)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let key = mw_batch(&[1], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let (mut array, schema) = ffi_record_batch(&key);
+    let mut key_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut key_batch) },
+        0
+    );
+    let mut plan = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key_batch, 0, ptr::null(), 0, &mut plan)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { lance_mem_wal_plan_to_arrow_stream(plan, &mut stream) };
+    if rc == 0 {
+        let mut schema = FFI_ArrowSchema::empty();
+        unsafe { stream.get_schema.unwrap()(&mut stream, &mut schema) };
+        panic!("unexportable schema reached the C callback");
+    }
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    assert!(take_last_error_message().contains("panic exporting Arrow schema"));
+    assert!(stream.release.is_none());
+    assert!(stream.get_schema.is_none());
+    assert!(stream.get_next.is_none());
+    unsafe {
+        lance_mem_wal_plan_free(plan);
+        lance_batch_free(key_batch);
+        lance_lsm_point_lookup_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
 fn test_memwal_initialize_and_details() {
     let (_tmp, uri) = mw_create_dataset();
     let ds = mw_open(&uri);
