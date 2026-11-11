@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
@@ -21,13 +21,15 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;
+use arrow_array::make_array;
 use arrow_array::types::{Int8Type, Int32Type};
 use arrow_array::{
     Array, BinaryArray, DictionaryArray, Float32Array, Int32Array, Int64Array, LargeBinaryArray,
     RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
-use futures::TryStreamExt;
+use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::files::TrackedFilesOptions as NativeTrackedFilesOptions;
 use lance::dataset::refs::BranchContents;
@@ -35585,6 +35587,1568 @@ fn test_blob_close_keeps_the_pending_error_readable() {
         .collect::<Vec<_>>();
     close_blob_handles(&rest);
     unsafe { lance_dataset_close(ds) };
+}
+
+const BLOB_SELECTOR_NONE: i32 = 0;
+const BLOB_SELECTOR_IDS: i32 = 1;
+const BLOB_SELECTOR_ADDRESSES: i32 = 2;
+const BLOB_SELECTOR_INDICES: i32 = 3;
+const BLOB_ORDER_PRESERVE: i32 = 0;
+const BLOB_ORDER_UNORDERED: i32 = 1;
+
+type WholeBlobResult = (u64, Option<Vec<u8>>);
+type BlobRangeResult = (usize, u64, u64, u64, Option<Vec<u8>>);
+
+fn c_blob_read_options(io_buffer_size: Option<u64>, preserve_order: bool) -> LanceBlobReadOptions {
+    LanceBlobReadOptions {
+        has_io_buffer_size: io_buffer_size.is_some(),
+        io_buffer_size: io_buffer_size.unwrap_or(0),
+        order: if preserve_order {
+            BLOB_ORDER_PRESERVE
+        } else {
+            BLOB_ORDER_UNORDERED
+        },
+    }
+}
+
+fn c_read_blobs(
+    dataset: *const LanceDataset,
+    column: &str,
+    selector: i32,
+    rows: &[u64],
+    options: &LanceBlobReadOptions,
+) -> (i32, FFI_ArrowArrayStream) {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let column = c_str(column);
+    let rows_ptr = if selector == BLOB_SELECTOR_NONE {
+        ptr::null()
+    } else {
+        rows.as_ptr()
+    };
+    let rc = unsafe {
+        lance_dataset_read_blobs(
+            dataset,
+            column.as_ptr(),
+            selector,
+            rows_ptr,
+            rows.len(),
+            options,
+            &mut stream,
+        )
+    };
+    (rc, stream)
+}
+
+fn c_read_blob_ranges(
+    dataset: *const LanceDataset,
+    column: &str,
+    selector: i32,
+    requests: &[LanceBlobRangeRequest],
+    options: &LanceBlobReadOptions,
+) -> (i32, FFI_ArrowArrayStream) {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let column = c_str(column);
+    let requests_ptr = if selector == BLOB_SELECTOR_NONE {
+        ptr::null()
+    } else {
+        requests.as_ptr()
+    };
+    let rc = unsafe {
+        lance_dataset_read_blob_ranges(
+            dataset,
+            column.as_ptr(),
+            selector,
+            requests_ptr,
+            requests.len(),
+            options,
+            &mut stream,
+        )
+    };
+    (rc, stream)
+}
+
+fn collect_whole_blob_stream(mut stream: FFI_ArrowArrayStream) -> (Schema, Vec<RecordBatch>) {
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let schema = reader.schema().as_ref().clone();
+    let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+    (schema, batches)
+}
+
+fn whole_blob_values(batches: &[RecordBatch]) -> Vec<WholeBlobResult> {
+    let mut values = Vec::new();
+    for batch in batches {
+        assert_eq!(batch.num_rows(), 1, "one native result must be one record");
+        let row_addresses = batch
+            .column_by_name("row_address")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let data = batch
+            .column_by_name("data")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        values.push((
+            row_addresses.value(0),
+            (!data.is_null(0)).then(|| data.value(0).to_vec()),
+        ));
+    }
+    values
+}
+
+fn collect_blob_range_stream(mut stream: FFI_ArrowArrayStream) -> (Schema, Vec<RecordBatch>) {
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let schema = reader.schema().as_ref().clone();
+    let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+    (schema, batches)
+}
+
+fn blob_range_values(batches: &[RecordBatch]) -> Vec<BlobRangeResult> {
+    let mut values = Vec::new();
+    for batch in batches {
+        assert_eq!(batch.num_rows(), 1, "one native result must be one record");
+        let request_index = batch
+            .column_by_name("request_index")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let row_address = batch
+            .column_by_name("row_address")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let offset = batch
+            .column_by_name("offset")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let length = batch
+            .column_by_name("length")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let data = batch
+            .column_by_name("data")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        values.push((
+            usize::try_from(request_index.value(0)).unwrap(),
+            row_address.value(0),
+            offset.value(0),
+            length.value(0),
+            (!data.is_null(0)).then(|| data.value(0).to_vec()),
+        ));
+    }
+    values
+}
+
+fn native_whole_blob_values(
+    uri: &str,
+    column: &str,
+    selector: i32,
+    rows: &[u64],
+    io_buffer_size: Option<u64>,
+    preserve_order: bool,
+) -> Vec<WholeBlobResult> {
+    lance_c::runtime::block_on(async {
+        let dataset = Arc::new(Dataset::open(uri).await.unwrap());
+        let builder = dataset.read_blobs(column).unwrap();
+        let builder = match selector {
+            BLOB_SELECTOR_NONE => builder,
+            BLOB_SELECTOR_IDS => builder.with_row_ids(rows.to_vec()),
+            BLOB_SELECTOR_ADDRESSES => builder.with_row_addresses(rows.to_vec()),
+            BLOB_SELECTOR_INDICES => builder.with_row_indices(rows.to_vec()),
+            other => panic!("unknown selector {other}"),
+        };
+        let builder = match io_buffer_size {
+            Some(size) => builder.with_io_buffer_size_bytes(size),
+            None => builder,
+        };
+        builder
+            .preserve_order(preserve_order)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .map(|result| {
+                let result = result.unwrap();
+                (result.row_address, result.data.map(|bytes| bytes.to_vec()))
+            })
+            .collect::<Vec<_>>()
+            .await
+    })
+}
+
+fn native_blob_range_values(
+    uri: &str,
+    column: &str,
+    selector: i32,
+    requests: &[(u64, u64, u64)],
+    io_buffer_size: Option<u64>,
+    preserve_order: bool,
+) -> Vec<BlobRangeResult> {
+    lance_c::runtime::block_on(async {
+        let dataset = Arc::new(Dataset::open(uri).await.unwrap());
+        let native_requests = requests
+            .iter()
+            .map(|(row, offset, length)| {
+                lance::dataset::BlobRangeRequest::new(*row, *offset, *length)
+            })
+            .collect::<Vec<_>>();
+        let builder = dataset.read_blob_ranges(column).unwrap();
+        let builder = match selector {
+            BLOB_SELECTOR_NONE => builder,
+            BLOB_SELECTOR_IDS => builder.with_row_ids(native_requests),
+            BLOB_SELECTOR_ADDRESSES => builder.with_row_addresses(native_requests),
+            BLOB_SELECTOR_INDICES => builder.with_row_indices(native_requests),
+            other => panic!("unknown selector {other}"),
+        };
+        let builder = match io_buffer_size {
+            Some(size) => builder.with_io_buffer_size_bytes(size),
+            None => builder,
+        };
+        builder
+            .preserve_order(preserve_order)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .map(|result| {
+                let result = result.unwrap();
+                (
+                    result.request_index,
+                    result.row_address,
+                    result.range.offset,
+                    result.range.length,
+                    result.data.map(|bytes| bytes.to_vec()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .await
+    })
+}
+
+fn assert_whole_stream_identity(schema: &Schema, batches: &[RecordBatch]) {
+    assert_eq!(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["row_address", "data"]
+    );
+    assert_eq!(schema.field(0).data_type(), &DataType::UInt64);
+    assert!(!schema.field(0).is_nullable());
+    assert_eq!(schema.field(1).data_type(), &DataType::LargeBinary);
+    assert!(schema.field(1).is_nullable());
+    assert_eq!(whole_blob_values(batches).len(), batches.len());
+}
+
+fn assert_range_stream_identity(schema: &Schema, batches: &[RecordBatch]) {
+    assert_eq!(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["request_index", "row_address", "offset", "length", "data"]
+    );
+    for field in &schema.fields()[..4] {
+        assert_eq!(field.data_type(), &DataType::UInt64);
+        assert!(!field.is_nullable());
+    }
+    assert_eq!(schema.field(4).data_type(), &DataType::LargeBinary);
+    assert!(schema.field(4).is_nullable());
+    assert_eq!(blob_range_values(batches).len(), batches.len());
+}
+
+fn empty_ffi_stream_with_sentinel(sentinel: *mut c_void) -> FFI_ArrowArrayStream {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    stream.private_data = sentinel;
+    stream
+}
+
+fn assert_ffi_stream_untouched(stream: &FFI_ArrowArrayStream, sentinel: *mut c_void) {
+    assert_eq!(stream.private_data, sentinel);
+    assert!(stream.get_schema.is_none());
+    assert!(stream.get_next.is_none());
+    assert!(stream.get_last_error.is_none());
+    assert!(stream.release.is_none());
+}
+
+fn finish_descriptor_builder(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+) -> (Field, arrow_array::ArrayRef) {
+    let mut array = FFI_ArrowArray::empty();
+    let mut schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_finish(builder, &mut array, &mut schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let field = Field::try_from(&schema).unwrap();
+    let data = unsafe { from_ffi(array, &schema) }.unwrap();
+    (field, make_array(data))
+}
+
+fn ffi_descriptor_stream(
+    field: Field,
+    array: arrow_array::ArrayRef,
+    schema_metadata: Option<HashMap<String, String>>,
+) -> (FFI_ArrowSchema, FFI_ArrowArrayStream) {
+    let schema = Arc::new(match schema_metadata {
+        Some(metadata) => Schema::new_with_metadata(vec![field], metadata),
+        None => Schema::new(vec![field]),
+    });
+    let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+    let ffi_schema = FFI_ArrowSchema::try_from(schema.as_ref()).unwrap();
+    let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let stream = FFI_ArrowArrayStream::new(Box::new(reader));
+    (ffi_schema, stream)
+}
+
+fn write_descriptor_dataset(
+    uri: &str,
+    mode: i32,
+    schema: &FFI_ArrowSchema,
+    stream: FFI_ArrowArrayStream,
+) -> i32 {
+    let params = LanceWriteParams {
+        max_rows_per_file: 0,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 0,
+        data_storage_version: c"2.2".as_ptr(),
+        enable_stable_row_ids: false,
+    };
+    let mut stream = stream;
+    let mut dataset = ptr::null_mut();
+    let uri = c_str(uri);
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            uri.as_ptr(),
+            schema,
+            &mut stream,
+            mode,
+            &params,
+            ptr::null(),
+            &mut dataset,
+        )
+    };
+    if rc == 0 {
+        assert!(!dataset.is_null());
+        unsafe { lance_dataset_close(dataset) };
+    }
+    rc
+}
+
+fn managed_metadata() -> HashMap<String, String> {
+    HashMap::from([("lance.blob.managed".to_string(), "true".to_string())])
+}
+
+#[test]
+fn test_blob_field_exports_native_metadata_and_checked_options() {
+    let mut ffi = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_blob_field(c"blob".as_ptr(), true, &mut ffi) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let field = Field::try_from(&ffi).unwrap();
+    assert_eq!(field, lance::blob_field("blob", true));
+    assert!(field.is_nullable());
+    assert_eq!(
+        field
+            .metadata()
+            .get("ARROW:extension:name")
+            .map(String::as_str),
+        Some("lance.blob.v2")
+    );
+
+    let options = LanceBlobFieldOptions {
+        has_inline_size_threshold: true,
+        inline_size_threshold: 0,
+        has_dedicated_size_threshold: true,
+        dedicated_size_threshold: 256,
+    };
+    let mut ffi = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_blob_field_with_options(c"thresholds".as_ptr(), false, &options, &mut ffi) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let field = Field::try_from(&ffi).unwrap();
+    let expected = lance::blob_field_with_options(
+        "thresholds",
+        false,
+        lance::BlobFieldOptions {
+            inline_size_threshold: Some(0),
+            dedicated_size_threshold: std::num::NonZeroUsize::new(256),
+        },
+    );
+    assert_eq!(field, expected);
+    assert!(!field.is_nullable());
+    assert_eq!(
+        field
+            .metadata()
+            .get("lance-encoding:blob-inline-size-threshold")
+            .map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        field
+            .metadata()
+            .get("lance-encoding:blob-dedicated-size-threshold")
+            .map(String::as_str),
+        Some("256")
+    );
+
+    let invalid_zero = LanceBlobFieldOptions {
+        has_dedicated_size_threshold: true,
+        dedicated_size_threshold: 0,
+        ..LanceBlobFieldOptions::default()
+    };
+    let mut untouched = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_blob_field_with_options(c"invalid".as_ptr(), true, &invalid_zero, &mut untouched)
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("greater than 0"));
+    assert!(untouched.release.is_none(), "error must not write output");
+    assert!(untouched.format.is_null(), "error must not write output");
+
+    assert_eq!(
+        unsafe { lance_blob_field(ptr::null(), true, &mut untouched) },
+        -1
+    );
+    assert!(take_last_error_message().contains("name must not be NULL"));
+    assert_eq!(
+        unsafe { lance_blob_field(c"blob".as_ptr(), true, ptr::null_mut()) },
+        -1
+    );
+    assert!(take_last_error_message().contains("out must not be NULL"));
+}
+
+#[test]
+fn test_blob_descriptor_array_builder_matches_native_all_kinds() {
+    use lance::{BlobDescriptor, BlobRange as NativeRange};
+
+    let builder = unsafe { lance_blob_descriptor_array_builder_new(c"blob".as_ptr()) };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+
+    let mut field_before = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_field(builder, &mut field_before) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let inline = b"inline payload";
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_inline(
+                builder,
+                inline.as_ptr(),
+                inline.len(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_append_null(builder) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_append_packed(builder, 7, 100, 8) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_append_dedicated(builder, 9, 1024) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_managed(
+                builder,
+                c"data/a.blob".as_ptr(),
+                2,
+                3,
+                false,
+                0,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_managed(
+                builder,
+                c"data/b.blob".as_ptr(),
+                4,
+                5,
+                true,
+                0,
+            )
+        },
+        0
+    );
+    let packed_ranges = [
+        LanceBlobRange {
+            offset: 1,
+            length: 2,
+        },
+        LanceBlobRange {
+            offset: 3,
+            length: 4,
+        },
+    ];
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_extend_packed(
+                builder,
+                11,
+                packed_ranges.as_ptr(),
+                packed_ranges.len(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_push_external(
+                builder,
+                c"file:///tmp/external.bin".as_ptr(),
+                true,
+                7,
+                9,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_external(
+                builder,
+                3,
+                c"s3://bucket/object".as_ptr(),
+                11,
+                13,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_append_inline(builder, ptr::null(), 0) },
+        0,
+        "NULL plus zero length is a valid empty inline blob"
+    );
+
+    let mut field_after = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_field(builder, &mut field_after) },
+        0
+    );
+    assert_eq!(
+        Field::try_from(&field_before).unwrap(),
+        Field::try_from(&field_after).unwrap()
+    );
+
+    let mut native = lance::BlobDescriptorArrayBuilder::new("blob");
+    native.push_inline(Bytes::copy_from_slice(inline)).unwrap();
+    native.push_null().unwrap();
+    native
+        .push_packed(
+            7,
+            NativeRange {
+                offset: 100,
+                size: 8,
+            },
+        )
+        .unwrap();
+    native.push_dedicated(9, 1024).unwrap();
+    native
+        .push(BlobDescriptor::Managed {
+            base_id: None,
+            uri: "data/a.blob".to_string(),
+            offset: 2,
+            size: 3,
+        })
+        .unwrap();
+    native
+        .push(BlobDescriptor::Managed {
+            base_id: Some(0),
+            uri: "data/b.blob".to_string(),
+            offset: 4,
+            size: 5,
+        })
+        .unwrap();
+    native
+        .extend_packed(
+            11,
+            [
+                NativeRange { offset: 1, size: 2 },
+                NativeRange { offset: 3, size: 4 },
+            ],
+        )
+        .unwrap();
+    native
+        .push_external(
+            "file:///tmp/external.bin".to_string(),
+            Some(NativeRange { offset: 7, size: 9 }),
+        )
+        .unwrap();
+    native
+        .push(BlobDescriptor::External {
+            base_id: 3,
+            uri: "s3://bucket/object".to_string(),
+            offset: 11,
+            size: 13,
+        })
+        .unwrap();
+    native.push_inline(Bytes::new()).unwrap();
+    let (native_field, native_array) = native.finish().unwrap().into_parts();
+
+    let (field, array) = finish_descriptor_builder(builder);
+    assert_eq!(field, native_field);
+    assert_eq!(array.to_data(), native_array.to_data());
+
+    // Native finish is consuming. The field stays available, appends fail.
+    let mut post_finish_field = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_field(builder, &mut post_finish_field) },
+        0,
+        "field must remain exportable after finish"
+    );
+    assert_eq!(Field::try_from(&post_finish_field).unwrap(), native_field);
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_append_null(builder) },
+        -1
+    );
+    assert!(take_last_error_message().contains("already finished"));
+    unsafe { lance_blob_descriptor_array_builder_close(builder) };
+}
+
+#[test]
+fn test_blob_descriptor_array_builder_native_validation_and_partial_progress() {
+    let builder = unsafe { lance_blob_descriptor_array_builder_new(c"blob".as_ptr()) };
+    assert!(!builder.is_null());
+    let ranges = [
+        LanceBlobRange {
+            offset: 1,
+            length: 2,
+        },
+        LanceBlobRange {
+            offset: u64::MAX,
+            length: 2,
+        },
+    ];
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_extend_packed(
+                builder,
+                7,
+                ranges.as_ptr(),
+                ranges.len(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("overflows"));
+
+    // The valid prefix remains, matching native incremental push behavior.
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_append_null(builder) },
+        0,
+        "a failed range must not poison the builder"
+    );
+    let (field, array) = finish_descriptor_builder(builder);
+    unsafe { lance_blob_descriptor_array_builder_close(builder) };
+
+    let mut native = lance::BlobDescriptorArrayBuilder::new("blob");
+    native
+        .push_packed(7, lance::BlobRange { offset: 1, size: 2 })
+        .unwrap();
+    native.push_null().unwrap();
+    let (native_field, native_array) = native.finish().unwrap().into_parts();
+    assert_eq!(field, native_field);
+    assert_eq!(array.to_data(), native_array.to_data());
+
+    let builder = unsafe { lance_blob_descriptor_array_builder_new(c"blob".as_ptr()) };
+    assert!(!builder.is_null());
+    for (uri, offset, length) in [
+        ("", 0, 1),
+        ("/absolute", 0, 1),
+        ("data/../escape", 0, 1),
+        ("data/./same", 0, 1),
+        ("s3://bucket/object", 0, 1),
+        ("data\\windows", 0, 1),
+        ("data/a.blob/", 0, 1),
+        ("data/a.blob", u64::MAX, 1),
+    ] {
+        let uri = c_str(uri);
+        assert_eq!(
+            unsafe {
+                lance_blob_descriptor_array_builder_append_managed(
+                    builder,
+                    uri.as_ptr(),
+                    offset,
+                    length,
+                    false,
+                    0,
+                )
+            },
+            -1,
+            "managed URI {uri:?} must be rejected by native validation"
+        );
+        let message = take_last_error_message();
+        assert!(
+            message.contains("Managed blob_uri") || message.contains("overflows"),
+            "{message}"
+        );
+    }
+
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_append_inline(builder, ptr::null(), 1) },
+        -1
+    );
+    assert!(take_last_error_message().contains("data must not be NULL"));
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_append_dedicated(builder, 0, 4) },
+        -1
+    );
+    assert!(take_last_error_message().contains("Blob id 0 is reserved"));
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_extend_packed(builder, 7, ptr::null(), 1,) },
+        -1
+    );
+    assert!(take_last_error_message().contains("ranges must not be NULL"));
+
+    // Failed appends added nothing. A valid NULL is the only row.
+    assert_eq!(
+        unsafe { lance_blob_descriptor_array_builder_append_null(builder) },
+        0
+    );
+    let (_, array) = finish_descriptor_builder(builder);
+    unsafe { lance_blob_descriptor_array_builder_close(builder) };
+    assert_eq!(array.len(), 1);
+    assert!(array.is_null(0));
+}
+
+#[test]
+fn test_dataset_read_blobs_all_selectors_and_native_identity() {
+    let (_tmp, uri) = create_blob_v2_dataset(true);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+
+    let all_row_ids = scan_blob_row_ids(dataset);
+    assert_eq!(all_row_ids.len(), 2 * BLOB_ROW_SIZES.len());
+    let indices = [7usize, 2, 2, 9, 0];
+    let row_ids = indices
+        .iter()
+        .map(|index| all_row_ids[*index])
+        .collect::<Vec<_>>();
+    let addresses = indices
+        .iter()
+        .map(|index| blob_row_address(*index))
+        .collect::<Vec<_>>();
+    assert!(
+        row_ids
+            .iter()
+            .zip(&addresses)
+            .any(|(row_id, address)| row_id != address),
+        "stable row IDs must be distinguishable from physical row addresses"
+    );
+    let expected = indices
+        .iter()
+        .map(|index| (blob_row_address(*index), expected_blob(*index)))
+        .collect::<Vec<_>>();
+    let index_rows = indices.map(|index| index as u64);
+    let options = c_blob_read_options(None, true);
+
+    for (selector, rows) in [
+        (BLOB_SELECTOR_IDS, row_ids.as_slice()),
+        (BLOB_SELECTOR_ADDRESSES, addresses.as_slice()),
+        (BLOB_SELECTOR_INDICES, index_rows.as_slice()),
+    ] {
+        let (rc, stream) = c_read_blobs(dataset, "blob", selector, rows, &options);
+        assert_eq!(rc, 0, "{}", take_last_error_message());
+        let (schema, batches) = collect_whole_blob_stream(stream);
+        assert_whole_stream_identity(&schema, &batches);
+        let values = whole_blob_values(&batches);
+        assert_eq!(values, expected, "selector {selector}");
+        assert_eq!(
+            values,
+            native_whole_blob_values(&uri, "blob", selector, rows, None, true),
+            "selector {selector} must match the native stream"
+        );
+    }
+
+    // Unordered reads keep native row-address identity and accepted options.
+    let unique_indices = [7usize, 2, 9, 0];
+    let unique_rows = unique_indices
+        .iter()
+        .map(|index| *index as u64)
+        .collect::<Vec<_>>();
+    let (rc, stream) = c_read_blobs(
+        dataset,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &unique_rows,
+        &c_blob_read_options(Some(64), false),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = collect_whole_blob_stream(stream);
+    let mut unordered = whole_blob_values(&batches);
+    unordered.sort_by_key(|(address, _)| *address);
+    let mut expected_unique = unique_indices
+        .iter()
+        .map(|index| (blob_row_address(*index), expected_blob(*index)))
+        .collect::<Vec<_>>();
+    expected_unique.sort_by_key(|(address, _)| *address);
+    assert_eq!(unordered, expected_unique);
+    let mut native_unordered = native_whole_blob_values(
+        &uri,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &unique_rows,
+        Some(64),
+        false,
+    );
+    native_unordered.sort_by_key(|(address, _)| *address);
+    assert_eq!(unordered, native_unordered);
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_dataset_read_blobs_empty_none_errors_and_ownership() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let options = c_blob_read_options(None, true);
+
+    // Explicit empty selection is a real native selection and yields no rows.
+    let (rc, stream) = c_read_blobs(dataset, "blob", BLOB_SELECTOR_IDS, &[], &options);
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (schema, batches) = collect_whole_blob_stream(stream);
+    assert_whole_stream_identity(&schema, &batches);
+    assert!(batches.is_empty());
+
+    let sentinel = ptr::without_provenance_mut::<c_void>(0xDEAD_BEEF);
+    let mut stream = empty_ffi_stream_with_sentinel(sentinel);
+    assert_eq!(
+        unsafe {
+            lance_dataset_read_blobs(
+                dataset,
+                c"blob".as_ptr(),
+                BLOB_SELECTOR_NONE,
+                ptr::null(),
+                0,
+                &options,
+                &mut stream,
+            )
+        },
+        -1
+    );
+    assert!(take_last_error_message().contains("requires a row selection"));
+    assert_ffi_stream_untouched(&stream, sentinel);
+
+    let mut stream = empty_ffi_stream_with_sentinel(sentinel);
+    assert_eq!(
+        unsafe {
+            lance_dataset_read_blobs(
+                dataset,
+                c"blob".as_ptr(),
+                BLOB_SELECTOR_INDICES,
+                [0u64].as_ptr(),
+                1,
+                &c_blob_read_options(Some(0), true),
+                &mut stream,
+            )
+        },
+        -1
+    );
+    assert!(take_last_error_message().contains("greater than 0"));
+    assert_ffi_stream_untouched(&stream, sentinel);
+
+    let mut stream = empty_ffi_stream_with_sentinel(sentinel);
+    assert_eq!(
+        unsafe {
+            lance_dataset_read_blobs(
+                dataset,
+                c"does_not_exist".as_ptr(),
+                BLOB_SELECTOR_NONE,
+                ptr::null(),
+                0,
+                &options,
+                &mut stream,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    assert!(take_last_error_message().contains("does_not_exist"));
+    assert_ffi_stream_untouched(&stream, sentinel);
+
+    let mut stream = empty_ffi_stream_with_sentinel(sentinel);
+    assert_eq!(
+        unsafe {
+            lance_dataset_read_blobs(
+                dataset,
+                c"raw".as_ptr(),
+                BLOB_SELECTOR_NONE,
+                ptr::null(),
+                0,
+                &options,
+                &mut stream,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("not a blob column"));
+    assert_ffi_stream_untouched(&stream, sentinel);
+
+    let mut stream = empty_ffi_stream_with_sentinel(sentinel);
+    let mut invalid_options = options;
+    invalid_options.order = 99;
+    assert_eq!(
+        unsafe {
+            lance_dataset_read_blobs(
+                dataset,
+                c"blob".as_ptr(),
+                BLOB_SELECTOR_INDICES,
+                [0u64].as_ptr(),
+                1,
+                &invalid_options,
+                &mut stream,
+            )
+        },
+        -1
+    );
+    assert!(take_last_error_message().contains("invalid blob read order"));
+    assert_ffi_stream_untouched(&stream, sentinel);
+
+    // A planned stream owns its snapshot and stays incremental after the
+    // dataset handle closes.
+    let (rc, stream) = c_read_blobs(
+        dataset,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &[0, 1, 3, 4],
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    unsafe { lance_dataset_close(dataset) };
+    let (schema, batches) = collect_whole_blob_stream(stream);
+    assert_whole_stream_identity(&schema, &batches);
+    assert_eq!(batches.len(), 4);
+    let values = whole_blob_values(&batches);
+    assert_eq!(values[0], (blob_row_address(0), expected_blob(0)));
+    assert_eq!(values[2], (blob_row_address(3), Some(Vec::new())));
+    assert_eq!(values[3], (blob_row_address(4), None));
+}
+
+#[test]
+fn test_dataset_read_blob_ranges_identity_nulls_and_options() {
+    let (_tmp, uri) = create_blob_v2_dataset(true);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+
+    let all_row_ids = scan_blob_row_ids(dataset);
+    let base_requests = [
+        (7usize, 100u64, 20u64),
+        (7, 108, 20),
+        (2, 128, 0),
+        (9, 40, 16),
+        (2, 100, 8),
+        (9, 127, 1),
+        (3, 0, 0),
+        // Native NULL blobs skip logical bounds checks.
+        (4, 1000, 100),
+        (0, 0, 8),
+    ];
+    let expected = base_requests
+        .iter()
+        .enumerate()
+        .map(|(request_index, (row, offset, length))| {
+            let data = match expected_blob(*row) {
+                None => None,
+                Some(payload) => {
+                    let start = *offset as usize;
+                    let end = start + *length as usize;
+                    Some(payload[start..end].to_vec())
+                }
+            };
+            (
+                request_index,
+                blob_row_address(*row),
+                *offset,
+                *length,
+                data,
+            )
+        })
+        .collect::<Vec<_>>();
+    let options = c_blob_read_options(None, true);
+
+    for selector in [
+        BLOB_SELECTOR_IDS,
+        BLOB_SELECTOR_ADDRESSES,
+        BLOB_SELECTOR_INDICES,
+    ] {
+        let requests = base_requests
+            .iter()
+            .map(|(row, offset, length)| LanceBlobRangeRequest {
+                row: match selector {
+                    BLOB_SELECTOR_IDS => all_row_ids[*row],
+                    BLOB_SELECTOR_ADDRESSES => blob_row_address(*row),
+                    BLOB_SELECTOR_INDICES => *row as u64,
+                    _ => unreachable!(),
+                },
+                offset: *offset,
+                length: *length,
+            })
+            .collect::<Vec<_>>();
+        let native_requests = requests
+            .iter()
+            .map(|request| (request.row, request.offset, request.length))
+            .collect::<Vec<_>>();
+        let (rc, stream) = c_read_blob_ranges(dataset, "blob", selector, &requests, &options);
+        assert_eq!(rc, 0, "{}", take_last_error_message());
+        let (schema, batches) = collect_blob_range_stream(stream);
+        assert_range_stream_identity(&schema, &batches);
+        assert_eq!(blob_range_values(&batches), expected, "selector {selector}");
+        assert_eq!(
+            blob_range_values(&batches),
+            native_blob_range_values(&uri, "blob", selector, &native_requests, None, true),
+            "selector {selector} must match the native stream"
+        );
+    }
+
+    let unordered_requests = base_requests
+        .iter()
+        .map(|(row, offset, length)| LanceBlobRangeRequest {
+            row: *row as u64,
+            offset: *offset,
+            length: *length,
+        })
+        .collect::<Vec<_>>();
+    let unordered_native = unordered_requests
+        .iter()
+        .map(|request| (request.row, request.offset, request.length))
+        .collect::<Vec<_>>();
+    let (rc, stream) = c_read_blob_ranges(
+        dataset,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &unordered_requests,
+        &c_blob_read_options(Some(32), false),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = collect_blob_range_stream(stream);
+    let mut actual = blob_range_values(&batches);
+    actual.sort_by_key(|value| value.0);
+    let mut native = native_blob_range_values(
+        &uri,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &unordered_native,
+        Some(32),
+        false,
+    );
+    native.sort_by_key(|value| value.0);
+    assert_eq!(actual, native);
+    assert_eq!(actual, expected);
+
+    // Explicit empty selection remains distinct from native no-selection.
+    let (rc, stream) = c_read_blob_ranges(dataset, "blob", BLOB_SELECTOR_INDICES, &[], &options);
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (schema, batches) = collect_blob_range_stream(stream);
+    assert_range_stream_identity(&schema, &batches);
+    assert!(batches.is_empty());
+
+    let sentinel = ptr::without_provenance_mut::<c_void>(0xDEAD_BEEF);
+    for (requests, expected_fragment) in [
+        (
+            vec![LanceBlobRangeRequest {
+                row: 1,
+                offset: 127,
+                length: 2,
+            }],
+            "invalid",
+        ),
+        (
+            vec![LanceBlobRangeRequest {
+                row: 0,
+                offset: u64::MAX,
+                length: 2,
+            }],
+            "overflow",
+        ),
+    ] {
+        let mut stream = empty_ffi_stream_with_sentinel(sentinel);
+        assert_eq!(
+            unsafe {
+                lance_dataset_read_blob_ranges(
+                    dataset,
+                    c"blob".as_ptr(),
+                    BLOB_SELECTOR_INDICES,
+                    requests.as_ptr(),
+                    requests.len(),
+                    &options,
+                    &mut stream,
+                )
+            },
+            -1
+        );
+        let message = take_last_error_message();
+        assert!(
+            message.to_lowercase().contains(expected_fragment)
+                || message.contains("exceeds blob size"),
+            "{message}"
+        );
+        assert_ffi_stream_untouched(&stream, sentinel);
+    }
+
+    let mut stream = empty_ffi_stream_with_sentinel(sentinel);
+    assert_eq!(
+        unsafe {
+            lance_dataset_read_blob_ranges(
+                dataset,
+                c"blob".as_ptr(),
+                BLOB_SELECTOR_NONE,
+                ptr::null(),
+                0,
+                &options,
+                &mut stream,
+            )
+        },
+        -1
+    );
+    assert!(take_last_error_message().contains("requires requests"));
+    assert_ffi_stream_untouched(&stream, sentinel);
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_dataset_read_blobs_respects_deletions_and_duplicate_indices() {
+    let (_tmp, uri) = create_blob_v2_dataset(true);
+    lance_c::runtime::block_on(async {
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .delete("id = 1")
+            .await
+            .unwrap();
+    });
+
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let row_ids = scan_blob_row_ids(dataset);
+    assert_eq!(row_ids.len(), 9);
+    let options = c_blob_read_options(None, true);
+    let selected_indices = [0usize, 1, 5, 5, 8];
+    let selected_rows = [0usize, 2, 6, 6, 9];
+    let selected_ids = selected_indices
+        .iter()
+        .map(|index| row_ids[*index])
+        .collect::<Vec<_>>();
+    let expected = selected_rows
+        .iter()
+        .map(|row| (blob_row_address(*row), expected_blob(*row)))
+        .collect::<Vec<_>>();
+
+    let (rc, stream) = c_read_blobs(dataset, "blob", BLOB_SELECTOR_IDS, &selected_ids, &options);
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = collect_whole_blob_stream(stream);
+    assert_eq!(whole_blob_values(&batches), expected);
+
+    let selected_logical = selected_indices
+        .iter()
+        .map(|index| *index as u64)
+        .collect::<Vec<_>>();
+    let (rc, stream) = c_read_blobs(
+        dataset,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &selected_logical,
+        &options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = collect_whole_blob_stream(stream);
+    assert_eq!(
+        whole_blob_values(&batches),
+        native_whole_blob_values(
+            &uri,
+            "blob",
+            BLOB_SELECTOR_INDICES,
+            &selected_logical,
+            None,
+            true,
+        )
+    );
+    assert_eq!(whole_blob_values(&batches)[2], expected[2]);
+    assert_eq!(whole_blob_values(&batches)[3], expected[3]);
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_managed_blob_descriptor_append_reuse_reopen_and_base_validation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("managed_blob")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let no_opt_in_uri = tmp
+        .path()
+        .join("managed_no_opt_in")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let unknown_base_uri = tmp
+        .path()
+        .join("managed_unknown_base")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let relative_path = "_blobs/managed.bin";
+
+    let builder = unsafe { lance_blob_descriptor_array_builder_new(c"blob".as_ptr()) };
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_managed(
+                builder,
+                c_str(relative_path).as_ptr(),
+                1,
+                5,
+                false,
+                0,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let (field, array) = finish_descriptor_builder(builder);
+    unsafe { lance_blob_descriptor_array_builder_close(builder) };
+    let (schema, stream) =
+        ffi_descriptor_stream(field.clone(), array.clone(), Some(managed_metadata()));
+    assert_eq!(
+        write_descriptor_dataset(&uri, LanceWriteMode::Create as i32, &schema, stream,),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    // The managed target is an immutable reference. Missing payload files are
+    // a late stream error, not a factory/planning error.
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let (rc, mut stream) = c_read_blobs(
+        dataset,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &[0],
+        &c_blob_read_options(None, true),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let mut arrow_array = FFI_ArrowArray::empty();
+    let get_next = stream.get_next.unwrap();
+    let next_status = unsafe { get_next(&mut stream, &mut arrow_array) };
+    assert_ne!(
+        next_status, 0,
+        "the missing managed payload must fail while consuming the stream"
+    );
+    let get_last_error = stream.get_last_error.unwrap();
+    let error = unsafe { get_last_error(&mut stream) };
+    assert!(!error.is_null());
+    let error = unsafe { CStr::from_ptr(error) }.to_string_lossy();
+    assert!(
+        error.to_lowercase().contains("not found")
+            || error.to_lowercase().contains("no such file")
+            || error.contains("managed.bin"),
+        "{error}"
+    );
+    if let Some(release) = stream.release {
+        unsafe { release(&mut stream) };
+    }
+    unsafe { lance_dataset_close(dataset) };
+
+    let object_path = std::path::Path::new(&uri).join(relative_path);
+    std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+    std::fs::write(&object_path, b"0123456789").unwrap();
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let (rc, stream) = c_read_blobs(
+        dataset,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &[0],
+        &c_blob_read_options(None, true),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = collect_whole_blob_stream(stream);
+    assert_eq!(
+        whole_blob_values(&batches),
+        vec![(blob_row_address(0), Some(b"12345".to_vec()))]
+    );
+    let first_version = unsafe { lance_dataset_version(dataset) };
+    unsafe { lance_dataset_close(dataset) };
+
+    // Reuse the same immutable reference with a different range in an append.
+    let builder = unsafe { lance_blob_descriptor_array_builder_new(c"blob".as_ptr()) };
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_managed(
+                builder,
+                c_str(relative_path).as_ptr(),
+                5,
+                3,
+                false,
+                0,
+            )
+        },
+        0
+    );
+    let (field, array) = finish_descriptor_builder(builder);
+    unsafe { lance_blob_descriptor_array_builder_close(builder) };
+    let (schema, stream) = ffi_descriptor_stream(field, array, Some(managed_metadata()));
+    assert_eq!(
+        write_descriptor_dataset(&uri, LanceWriteMode::Append as i32, &schema, stream,),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let (rc, stream) = c_read_blobs(
+        dataset,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &[0, 1],
+        &c_blob_read_options(None, true),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = collect_whole_blob_stream(stream);
+    assert_eq!(
+        whole_blob_values(&batches),
+        vec![
+            (blob_row_address(0), Some(b"12345".to_vec())),
+            (((1u64) << 32), Some(b"567".to_vec())),
+        ]
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    // The old snapshot still resolves the first immutable reference.
+    let old = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), first_version) };
+    assert!(!old.is_null());
+    let (rc, stream) = c_read_blobs(
+        old,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &[0],
+        &c_blob_read_options(None, true),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = collect_whole_blob_stream(stream);
+    assert_eq!(
+        whole_blob_values(&batches),
+        vec![(blob_row_address(0), Some(b"12345".to_vec()))]
+    );
+    unsafe { lance_dataset_close(old) };
+
+    // Register an additional base, then append a ManagedWithBase reference.
+    let base_dir = tmp.path().join("managed_base");
+    let base_object = base_dir.join("_blobs/base.bin");
+    std::fs::create_dir_all(base_object.parent().unwrap()).unwrap();
+    std::fs::write(&base_object, b"0123456789").unwrap();
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let base_uri = c_str(base_dir.to_str().unwrap());
+    let base = LanceBasePath {
+        id: 7,
+        path: base_uri.as_ptr(),
+        name: ptr::null(),
+        is_dataset_root: false,
+    };
+    assert_eq!(
+        unsafe { lance_dataset_add_bases(dataset, &base, 1, ptr::null()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let builder = unsafe { lance_blob_descriptor_array_builder_new(c"blob".as_ptr()) };
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_managed(
+                builder,
+                c"_blobs/base.bin".as_ptr(),
+                2,
+                4,
+                true,
+                7,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let (field, array) = finish_descriptor_builder(builder);
+    unsafe { lance_blob_descriptor_array_builder_close(builder) };
+    let (schema, stream) = ffi_descriptor_stream(field, array, Some(managed_metadata()));
+    assert_eq!(
+        write_descriptor_dataset(&uri, LanceWriteMode::Append as i32, &schema, stream,),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let (rc, stream) = c_read_blobs(
+        dataset,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &[2],
+        &c_blob_read_options(None, true),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = collect_whole_blob_stream(stream);
+    assert_eq!(
+        whole_blob_values(&batches),
+        vec![(((2u64) << 32), Some(b"2345".to_vec()))]
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    // A prepared External descriptor can share the same registered base and
+    // immutable object without introducing a second payload owner.
+    let builder = unsafe { lance_blob_descriptor_array_builder_new(c"blob".as_ptr()) };
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_external(
+                builder,
+                7,
+                c"_blobs/base.bin".as_ptr(),
+                1,
+                3,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let (field, array) = finish_descriptor_builder(builder);
+    unsafe { lance_blob_descriptor_array_builder_close(builder) };
+    let (schema, stream) = ffi_descriptor_stream(field, array, Some(managed_metadata()));
+    assert_eq!(
+        write_descriptor_dataset(&uri, LanceWriteMode::Append as i32, &schema, stream,),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let (rc, stream) = c_read_blobs(
+        dataset,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &[3],
+        &c_blob_read_options(None, true),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = collect_whole_blob_stream(stream);
+    assert_eq!(
+        whole_blob_values(&batches),
+        vec![(((3u64) << 32), Some(b"123".to_vec()))]
+    );
+    unsafe { lance_dataset_close(dataset) };
+    assert_eq!(std::fs::read(&object_path).unwrap(), b"0123456789");
+    assert_eq!(std::fs::read(&base_object).unwrap(), b"0123456789");
+
+    // The native schema opt-in remains mandatory.
+    let builder = unsafe { lance_blob_descriptor_array_builder_new(c"blob".as_ptr()) };
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_managed(
+                builder,
+                c"data/no-opt-in.blob".as_ptr(),
+                0,
+                1,
+                false,
+                0,
+            )
+        },
+        0
+    );
+    let (field, array) = finish_descriptor_builder(builder);
+    unsafe { lance_blob_descriptor_array_builder_close(builder) };
+    let (schema, stream) = ffi_descriptor_stream(field, array, None);
+    assert_eq!(
+        write_descriptor_dataset(
+            &no_opt_in_uri,
+            LanceWriteMode::Create as i32,
+            &schema,
+            stream,
+        ),
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("lance.blob.managed=true"));
+
+    // Unknown registered bases are rejected by native write preprocessing.
+    let builder = unsafe { lance_blob_descriptor_array_builder_new(c"blob".as_ptr()) };
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_managed(
+                builder,
+                c"data/unknown-base.blob".as_ptr(),
+                0,
+                1,
+                true,
+                999,
+            )
+        },
+        0
+    );
+    let (field, array) = finish_descriptor_builder(builder);
+    unsafe { lance_blob_descriptor_array_builder_close(builder) };
+    let (schema, stream) = ffi_descriptor_stream(field, array, Some(managed_metadata()));
+    assert_eq!(
+        write_descriptor_dataset(
+            &unknown_base_uri,
+            LanceWriteMode::Create as i32,
+            &schema,
+            stream,
+        ),
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("unknown base_id 999"));
 }
 
 #[test]
