@@ -6079,6 +6079,177 @@ fn test_fragment_snapshot_metadata_schema_and_counts() {
 }
 
 #[test]
+fn test_fragment_new_clones_data_files_and_keeps_native_defaults() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+    let source = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    assert!(!source.is_null());
+    let mut file = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_fragment_data_file_at(source, 0, &mut file) },
+        0
+    );
+    assert!(!file.is_null());
+    let path = unsafe { CStr::from_ptr(lance_data_file_path(file)) }
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let files = [file as *const LanceDataFile];
+    let mut physical_rows = 4_u64;
+    let fragment = unsafe { lance_fragment_new(41, files.as_ptr(), files.len(), &physical_rows) };
+    assert!(!fragment.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_fragment_id(fragment) }, 41);
+    assert_eq!(unsafe { lance_fragment_data_file_count(fragment) }, 1);
+    let mut is_bound = true;
+    assert_eq!(
+        unsafe { lance_fragment_is_bound(fragment, &mut is_bound) },
+        0
+    );
+    assert!(!is_bound);
+
+    let metadata = take_json_value(unsafe { lance_fragment_metadata_json(fragment) });
+    assert_eq!(metadata["id"].as_u64(), Some(41));
+    assert_eq!(metadata["physical_rows"].as_u64(), Some(4));
+    assert_eq!(metadata["files"].as_array().unwrap().len(), 1);
+    assert_eq!(metadata["files"][0]["path"].as_str(), Some(path.as_str()));
+    assert!(metadata.get("deletion_file").is_none());
+    assert!(metadata.get("overlays").is_none());
+    assert!(metadata.get("row_id_meta").is_none());
+    assert!(metadata.get("last_updated_at_version_meta").is_none());
+    assert!(metadata.get("created_at_version_meta").is_none());
+
+    let no_physical_rows =
+        unsafe { lance_fragment_new(42, files.as_ptr(), files.len(), ptr::null()) };
+    assert!(!no_physical_rows.is_null());
+    assert_eq!(unsafe { lance_fragment_id(no_physical_rows) }, 42);
+    let metadata = take_json_value(unsafe { lance_fragment_metadata_json(no_physical_rows) });
+    assert!(metadata["physical_rows"].is_null());
+
+    // The data-file handle may close immediately after fragment construction;
+    // the detached fragment owns an independent native DataFile clone.
+    unsafe { lance_data_file_close(file) };
+    let mut cloned_file = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_fragment_data_file_at(fragment, 0, &mut cloned_file) },
+        0
+    );
+    assert!(!cloned_file.is_null());
+    assert_eq!(
+        unsafe { CStr::from_ptr(lance_data_file_path(cloned_file)) }
+            .to_str()
+            .unwrap(),
+        path
+    );
+    unsafe { lance_data_file_close(cloned_file) };
+
+    physical_rows = u64::MAX;
+    assert_eq!(
+        unsafe { lance_fragment_physical_rows(fragment, &mut physical_rows) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert!(take_last_error_message().contains("fragment is detached"));
+
+    let empty = unsafe { lance_fragment_new(0, ptr::null(), 0, ptr::null()) };
+    assert!(!empty.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_fragment_id(empty) }, 0);
+    assert_eq!(unsafe { lance_fragment_data_file_count(empty) }, 0);
+    let metadata = take_json_value(unsafe { lance_fragment_metadata_json(empty) });
+    assert_eq!(metadata["files"].as_array().unwrap().len(), 0);
+    assert!(metadata["physical_rows"].is_null());
+
+    unsafe { lance_fragment_close(empty) };
+    unsafe { lance_fragment_close(no_physical_rows) };
+    unsafe { lance_fragment_close(fragment) };
+    unsafe { lance_fragment_close(source) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fragment_new_validates_inputs_and_append_owns_a_clone() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+    let source = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    assert!(!source.is_null());
+    let mut file = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_fragment_data_file_at(source, 0, &mut file) },
+        0
+    );
+
+    assert!(
+        unsafe { lance_fragment_new(1, ptr::null(), 1, ptr::null()) }.is_null(),
+        "NULL data-file array with a nonzero count must fail"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("data_files must not be NULL"));
+    assert!(message.contains("data_file_count = 1"));
+
+    let null_files = [ptr::null::<LanceDataFile>()];
+    assert!(
+        unsafe { lance_fragment_new(1, null_files.as_ptr(), 1, ptr::null()) }.is_null(),
+        "NULL data-file element must fail"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("data_files[0] must not be NULL"));
+
+    let files = [file as *const LanceDataFile];
+    let oversized_count = isize::MAX as usize / std::mem::size_of::<*const LanceDataFile>() + 1;
+    assert!(
+        unsafe { lance_fragment_new(1, files.as_ptr(), oversized_count, ptr::null()) }.is_null(),
+        "pointer-slice length overflow must fail"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("maximum addressable pointer slice length"));
+
+    let physical_rows = 4_u64;
+    let fragment = unsafe { lance_fragment_new(0, files.as_ptr(), files.len(), &physical_rows) };
+    assert!(!fragment.is_null(), "{}", take_last_error_message());
+    let append_fragments = [fragment as *const LanceFragment];
+    let operation =
+        unsafe { lance_operation_append_new(append_fragments.as_ptr(), append_fragments.len()) };
+    assert!(!operation.is_null(), "{}", take_last_error_message());
+    unsafe { lance_data_file_close(file) };
+    unsafe { lance_fragment_close(fragment) };
+
+    let mut appended = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_at(operation, 0, &mut appended) },
+        0
+    );
+    assert!(!appended.is_null());
+    assert_eq!(unsafe { lance_fragment_id(appended) }, 0);
+    assert_eq!(unsafe { lance_fragment_data_file_count(appended) }, 1);
+    let metadata = take_json_value(unsafe { lance_fragment_metadata_json(appended) });
+    assert_eq!(metadata["physical_rows"].as_u64(), Some(4));
+    assert_eq!(metadata["files"].as_array().unwrap().len(), 1);
+
+    unsafe { lance_fragment_close(appended) };
+    unsafe { lance_operation_close(operation) };
+    unsafe { lance_fragment_close(source) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_fragment_snapshot_survives_close_and_later_update() {
     let (_tmp, uri) = create_fragment_snapshot_dataset(false);
     let c_uri = c_str(&uri);
