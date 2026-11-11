@@ -651,6 +651,99 @@ fn create_blob_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a Blob v2 dataset with three fragments for publication tests.
+///
+/// The first fragment has three rows (`old-packed-0`, a null and an empty
+/// blob), the second has two rows that are later replaced by dedicated
+/// sidecars, and the third has two rows that stay untouched. Stable row IDs
+/// and V2.2 make the C++ caller replace base data files in place and verify
+/// that row IDs survive the replacement.
+fn create_blob_publication_dataset_on_disk() -> (tempfile::TempDir, String) {
+    use lance::BlobArrayBuilder;
+
+    enum BlobValue {
+        Bytes(&'static [u8]),
+        Empty,
+        Null,
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("blob_publication_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        lance::blob_field_with_options(
+            "blob",
+            true,
+            lance::BlobFieldOptions {
+                inline_size_threshold: Some(16),
+                dedicated_size_threshold: std::num::NonZeroUsize::new(256),
+            },
+        ),
+    ]));
+
+    let fragments: Vec<Vec<(u32, BlobValue)>> = vec![
+        vec![
+            (0, BlobValue::Bytes(b"old-packed-0")),
+            (1, BlobValue::Null),
+            (2, BlobValue::Empty),
+        ],
+        vec![
+            (3, BlobValue::Bytes(b"old-dedicated-3")),
+            (4, BlobValue::Bytes(b"old-dedicated-4")),
+        ],
+        vec![
+            (5, BlobValue::Bytes(b"keep-c5")),
+            (6, BlobValue::Bytes(b"keep-c6")),
+        ],
+    ];
+
+    lance_c::runtime::block_on(async {
+        for (index, rows) in fragments.iter().enumerate() {
+            let mut blobs = BlobArrayBuilder::new(rows.len());
+            let mut ids = Vec::with_capacity(rows.len());
+            for (id, value) in rows {
+                ids.push(*id);
+                match value {
+                    BlobValue::Bytes(bytes) => blobs.push_bytes(bytes.to_vec()).unwrap(),
+                    BlobValue::Empty => blobs.push_empty().unwrap(),
+                    BlobValue::Null => blobs.push_null().unwrap(),
+                }
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(UInt32Array::from(ids)), blobs.finish().unwrap()],
+            )
+            .unwrap();
+            let params = WriteParams {
+                mode: if index == 0 {
+                    WriteMode::Create
+                } else {
+                    WriteMode::Append
+                },
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                enable_stable_row_ids: true,
+                ..Default::default()
+            };
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                &uri,
+                Some(params),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    (tmp, uri)
+}
+
 /// Compile a C source file, linking against lance-c.
 fn compile_c_test(source: &Path, output: &Path, include_dir: &Path, lib_path: &Path) -> bool {
     let lib_dir = lib_path.parent().unwrap();
@@ -795,10 +888,9 @@ fn run_test_binary_with_dataset(binary: &Path, dataset_uri: &str) {
     );
 }
 
-fn run_test_binary_with_two_args(binary: &Path, first: &str, second: &str) {
+fn run_test_binary_with_args(binary: &Path, args: &[&str]) {
     let output = Command::new(binary)
-        .arg(first)
-        .arg(second)
+        .args(args)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -816,6 +908,10 @@ fn run_test_binary_with_two_args(binary: &Path, first: &str, second: &str) {
         stdout,
         stderr
     );
+}
+
+fn run_test_binary_with_two_args(binary: &Path, first: &str, second: &str) {
+    run_test_binary_with_args(binary, &[first, second]);
 }
 
 #[test]
@@ -967,6 +1063,7 @@ fn test_native_index_capabilities_consumers() {
 fn test_native_transaction_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
     let (tmp, dataset_uri) = create_test_dataset_on_disk();
+    let (_blob_publication_tmp, blob_publication_uri) = create_blob_publication_dataset_on_disk();
     let base = tmp.path().join("native_transactions");
     std::fs::create_dir_all(&base).unwrap();
     let base = base.to_str().unwrap();
@@ -989,7 +1086,7 @@ fn test_native_transaction_compilation_and_execution() {
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ transaction test compilation failed"
     );
-    run_test_binary_with_two_args(&cpp_binary, &dataset_uri, base);
+    run_test_binary_with_args(&cpp_binary, &[&dataset_uri, base, &blob_publication_uri]);
 }
 
 #[test]
