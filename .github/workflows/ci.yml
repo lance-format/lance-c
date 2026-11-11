@@ -124,6 +124,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: brew install protobuf
+      - name: Test macOS export linker arguments
+        run: python3 .github/scripts/test-macos-exports.py
       - name: Build library artifacts
         run: cargo build --lib
       - name: Verify shared-library exports

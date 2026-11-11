@@ -31,20 +31,32 @@ if [ "$(basename "${output:-}")" != "liblance_c.dylib" ]; then
     exec "$real_linker" "${args[@]}"
 fi
 
-rewritten=0
-for ((i = 0; i < ${#args[@]}; i++)); do
-    case "${args[$i]}" in
+# Normalize compiler-driver forwarding before inspecting linker arguments.
+# rustc can place the flag and filename in separate -Wl arguments.
+linker_args=()
+for arg in "${args[@]}"; do
+    case "$arg" in
         -Wl,*)
-            IFS=',' read -r -a parts <<<"${args[$i]}"
-            for ((j = 0; j < ${#parts[@]}; j++)); do
-                if [ "${parts[$j]}" = "-exported_symbols_list" ] &&
-                    [ $((j + 1)) -lt "${#parts[@]}" ]; then
-                    printf '_lance_*\n' >"${parts[$((j + 1))]}"
-                    rewritten=$((rewritten + 1))
-                fi
-            done
+            IFS=',' read -r -a parts <<<"${arg#-Wl,}"
+            linker_args+=("${parts[@]}")
             ;;
+        -Xlinker) ;;
+        *) linker_args+=("$arg") ;;
     esac
+done
+
+rewritten=0
+for ((i = 0; i < ${#linker_args[@]}; i++)); do
+    if [ "${linker_args[$i]}" = "-exported_symbols_list" ] &&
+        [ $((i + 1)) -lt "${#linker_args[@]}" ]; then
+        export_list="${linker_args[$((i + 1))]}"
+        if [ ! -f "$export_list" ]; then
+            echo "error: exported-symbol list does not exist: $export_list" >&2
+            exit 1
+        fi
+        printf '_lance_*\n' >"$export_list"
+        rewritten=$((rewritten + 1))
+    fi
 done
 
 if [ "$rewritten" -eq 0 ]; then
