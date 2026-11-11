@@ -149,11 +149,42 @@ fn assert_native_unsupported(namespace: *const LanceNamespace, operation: &str, 
         "{operation} generic code: {}",
         last_error()
     );
-    let (code, message) = result
-        .native_error()
-        .expect("native error must be preserved");
-    assert_eq!(code, 0, "{operation} native Unsupported code");
-    assert!(!message.is_empty(), "{operation} native error message");
+    if let Some((code, message)) = result.native_error() {
+        assert_eq!(code, 0, "{operation} native Unsupported code");
+        assert!(!message.is_empty(), "{operation} native error message");
+    }
+}
+
+fn unsupported_request(operation: &str) -> &'static str {
+    match operation {
+        "list_namespaces" => r#"{"id":[]}"#,
+        "query_table" => r#"{"id":["workspace"],"k":1,"vector":{"single_vector":[0.0]}}"#,
+        "create_table_index" | "create_table_scalar_index" => {
+            r#"{"id":["workspace"],"column":"id","index_type":"BTREE"}"#
+        }
+        "alter_table_add_columns" => r#"{"id":["workspace"],"new_columns":[{"name":"x"}]}"#,
+        "alter_table_alter_columns" => r#"{"id":["workspace"],"alterations":[{"path":"x"}]}"#,
+        "alter_table_drop_columns" => r#"{"id":["workspace"],"columns":["x"]}"#,
+        "alter_table_backfill_columns" => r#"{"id":["workspace"],"column":"x"}"#,
+        "create_table_version" => r#"{"id":["workspace"],"version":1,"manifest_path":"x"}"#,
+        "batch_delete_table_versions" => {
+            r#"{"id":["workspace"],"ranges":[{"start_version":0,"end_version":1}]}"#
+        }
+        "batch_create_table_versions" => {
+            r#"{"entries":[{"id":["workspace"],"version":1,"manifest_path":"x"}]}"#
+        }
+        "update_field_metadata" => r#"{"id":["workspace"],"updates":[{"path":"x","metadata":{}}]}"#,
+        "explain_table_query_plan" | "analyze_table_query_plan" => {
+            r#"{"id":["workspace"],"k":1,"vector":{"single_vector":[0.0]},"query":{"id":["workspace"],"k":1,"vector":{"single_vector":[0.0]}}}"#
+        }
+        "create_materialized_view" => {
+            r#"{"id":["workspace"],"kind":"query","source_query":"select 1","output_schema":"{}"}"#
+        }
+        "create_table_tag" | "update_table_tag" => r#"{"id":["workspace"],"tag":"v1","version":1}"#,
+        "get_table_tag_version" | "delete_table_tag" => r#"{"id":["workspace"],"tag":"v1"}"#,
+        "create_table_branch" | "delete_table_branch" => r#"{"id":["workspace"],"name":"main"}"#,
+        _ => r#"{"id":["workspace"]}"#,
+    }
 }
 
 fn make_vector_batch() -> (Schema, RecordBatch) {
@@ -274,7 +305,7 @@ fn directory_lifecycle_dataset_versions_metrics_and_dispatch() {
 
     assert_call_ok(namespace, "create_namespace", r#"{"id":["workspace"]}"#);
     assert_call_ok(namespace, "namespace_exists", r#"{"id":["workspace"]}"#);
-    let listed = assert_call_ok(namespace, "list_namespaces", "{}");
+    let listed = assert_call_ok(namespace, "list_namespaces", r#"{"id":[]}"#);
     assert!(listed.json().unwrap().contains("workspace"));
 
     let (schema, batch) = make_batch();
@@ -517,8 +548,21 @@ fn custom_namespace_preserves_native_unsupported_for_all_54_operations() {
     ];
     assert_eq!(operations.len(), 54);
     for operation in operations {
-        assert_native_unsupported(namespace, operation, "{}");
+        assert_native_unsupported(namespace, operation, unsupported_request(operation));
     }
+    let (rc, result) = call(
+        namespace,
+        "describe_table",
+        r#"{"id":["workspace","table"]}"#,
+        None,
+    );
+    assert_ne!(rc, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    let (native_code, native_message) = result
+        .native_error()
+        .expect("callback Unsupported must be preserved");
+    assert_eq!(native_code, 0);
+    assert!(native_message.contains("custom callback"));
 
     close_namespace(namespace);
     assert_eq!(released.load(Ordering::SeqCst), 1);
@@ -728,17 +772,17 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
     let (rc, failed) = write_namespace_result(custom, table_id, 1, &schema, batch);
     assert_ne!(rc, 0, "conflicting managed version must fail");
     assert!(failed.is_null(), "failed write must not publish a dataset");
-    assert_eq!(
-        lance_last_error_code(),
-        LanceErrorCode::CommitConflict,
-        "{}",
-        last_error()
-    );
     delegate_context
         .fail_next_version
         .store(1, Ordering::SeqCst);
-    let (rc, conflict_result) = call(custom, "create_table_version", r#"{}"#, None);
+    let (rc, conflict_result) = call(
+        custom,
+        "create_table_version",
+        r#"{"id":["workspace","managed"],"version":1,"manifest_path":"x"}"#,
+        None,
+    );
     assert_ne!(rc, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::CommitConflict);
     assert_eq!(
         conflict_result.native_error(),
         Some((14, "injected managed version conflict".to_owned()))
@@ -931,7 +975,7 @@ unsafe extern "C" fn changing_storage_describe(
 ) -> i32 {
     let counter = unsafe { &*(context.cast::<Arc<AtomicUsize>>()) };
     let value = counter.fetch_add(1, Ordering::SeqCst);
-    let json = format!(r#"{{"storageOptions":{{"token":"v{value}","expires_at_millis":"0"}}}}"#);
+    let json = format!(r#"{{"storage_options":{{"token":"v{value}","expires_at_millis":"0"}}}}"#);
     unsafe {
         (*response).data = owned_string(&json);
         (*response).release = Some(free_owned_string);

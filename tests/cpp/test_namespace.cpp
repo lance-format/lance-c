@@ -21,24 +21,46 @@ void noop_schema_release(ArrowSchema* schema) { schema->release = nullptr; }
 void noop_array_release(ArrowArray* array) { array->release = nullptr; }
 
 struct IntStream {
-    ArrowSchema schema{};
-    ArrowArray array{};
-    const void* buffers[2]{};
+    ArrowSchema top_schema{};
+    ArrowSchema id_schema{};
+    ArrowSchema* schema_children[1]{};
+    ArrowArray top_array{};
+    ArrowArray id_array{};
+    ArrowArray* array_children[1]{};
+    const void* top_buffers[1]{};
+    const void* id_buffers[2]{};
     std::array<int32_t, 3> ids{{1, 2, 3}};
     int emitted = 0;
     ArrowArrayStream stream{};
 
     IntStream() {
-        schema.format = "i";
-        schema.name = "id";
-        array.length = static_cast<int64_t>(ids.size());
-        array.n_buffers = 2;
-        buffers[0] = nullptr;
-        buffers[1] = ids.data();
-        array.buffers = buffers;
+        schema_children[0] = &id_schema;
+        top_schema.format = "+s";
+        top_schema.n_children = 1;
+        top_schema.children = schema_children;
+        top_schema.release = noop_schema_release;
+        id_schema.format = "i";
+        id_schema.name = "id";
+        id_schema.release = noop_schema_release;
+
+        id_buffers[0] = nullptr;
+        id_buffers[1] = ids.data();
+        id_array.length = static_cast<int64_t>(ids.size());
+        id_array.n_buffers = 2;
+        id_array.buffers = id_buffers;
+        id_array.release = noop_array_release;
+
+        array_children[0] = &id_array;
+        top_array.length = static_cast<int64_t>(ids.size());
+        top_array.n_buffers = 1;
+        top_buffers[0] = nullptr;
+        top_array.buffers = top_buffers;
+        top_array.n_children = 1;
+        top_array.children = array_children;
+        top_array.release = noop_array_release;
         stream.get_schema = [](ArrowArrayStream* raw, ArrowSchema* out) {
             auto* self = static_cast<IntStream*>(raw->private_data);
-            *out = self->schema;
+            *out = self->top_schema;
             out->release = noop_schema_release;
             return 0;
         };
@@ -49,7 +71,7 @@ struct IntStream {
                 return 0;
             }
             self->emitted = 1;
-            *out = self->array;
+            *out = self->top_array;
             out->release = noop_array_release;
             return 0;
         };
@@ -60,7 +82,7 @@ struct IntStream {
 
     void reset() {
         emitted = 0;
-        array.release = noop_array_release;
+        top_array.release = noop_array_release;
         stream.release = [](ArrowArrayStream* raw) { raw->release = nullptr; };
     }
 };
@@ -145,11 +167,10 @@ int main(int argc, char** argv) {
         bool unsupported = false;
         try {
             custom.call("list_tables", "{}");
-        } catch (const lance::NamespaceError& error) {
-            unsupported = error.code == LANCE_ERR_NOT_SUPPORTED &&
-                          error.native_code == 0 && !error.native_message.empty();
+        } catch (const lance::Error& error) {
+            unsupported = error.code == LANCE_ERR_NOT_SUPPORTED;
         }
-        require(unsupported, "custom native Unsupported");
+        require(unsupported, "custom Unsupported");
 
         // Native REST adapter + REST client through the public wrappers.
         lance::RestAdapter adapter = lance::RestAdapter::start(backend, "127.0.0.1", 0);

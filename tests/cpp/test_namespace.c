@@ -26,10 +26,13 @@ static void fail_check(const char* message, int line) {
 
 typedef struct {
     struct ArrowSchema schema;
+    struct ArrowSchema id_schema;
     struct ArrowArray array;
+    struct ArrowArray id_array;
     struct ArrowSchema* schema_children[1];
     struct ArrowArray* array_children[1];
-    const void* array_buffers[2];
+    const void* array_buffers[1];
+    const void* id_buffers[2];
     int32_t ids[3];
     int emitted;
     struct ArrowArrayStream stream;
@@ -76,13 +79,30 @@ static void init_stream(IntStream* fixture) {
     fixture->ids[0] = 1;
     fixture->ids[1] = 2;
     fixture->ids[2] = 3;
-    fixture->schema.format = "i";
-    fixture->schema.name = "id";
+    fixture->schema_children[0] = &fixture->id_schema;
+    fixture->schema.format = "+s";
+    fixture->schema.n_children = 1;
+    fixture->schema.children = fixture->schema_children;
+    fixture->schema.release = noop_schema_release;
+    fixture->id_schema.format = "i";
+    fixture->id_schema.name = "id";
+    fixture->id_schema.release = noop_schema_release;
+
+    fixture->id_buffers[0] = NULL;
+    fixture->id_buffers[1] = fixture->ids;
+    fixture->id_array.length = 3;
+    fixture->id_array.n_buffers = 2;
+    fixture->id_array.buffers = fixture->id_buffers;
+    fixture->id_array.release = noop_array_release;
+
+    fixture->array_children[0] = &fixture->id_array;
     fixture->array.length = 3;
-    fixture->array.n_buffers = 2;
+    fixture->array.n_buffers = 1;
     fixture->array_buffers[0] = NULL;
-    fixture->array_buffers[1] = fixture->ids;
     fixture->array.buffers = fixture->array_buffers;
+    fixture->array.n_children = 1;
+    fixture->array.children = fixture->array_children;
+    fixture->array.release = noop_array_release;
     fixture->stream.get_schema = stream_get_schema;
     fixture->stream.get_next = stream_get_next;
     fixture->stream.get_last_error = stream_last_error;
