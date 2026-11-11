@@ -73,10 +73,12 @@ can take precedence. Invalid filter columns still produce an error.
 I/O and corruption errors are propagated, not converted to empty results or
 successful fallback.
 
-The first implementation supports live-row ordinary scans and rejects vector/FTS
-queries and `include_deleted_rows=true` at stream creation, even when
-`use_scalar_index=false`. An index built after a delete does not contain the
-tombstoned rows, so even exact segment candidates
+The first implementation supports live-row ordinary scans and rejects
+vector/MinHash/FTS queries and `include_deleted_rows=true` at stream creation,
+even when `use_scalar_index=false`. MinHash search is a global similarity query
+with its own native planning, ranking, and coverage rules; this ordinary-scan
+accelerator does not drive it. An index built after a delete does not contain
+the tombstoned rows, so even exact segment candidates
 cannot satisfy a scan that includes deleted rows. To read those rows, clear the
 segment setting and use an ordinary scan with `with_row_id=true`,
 `include_deleted_rows=true`, and `use_scalar_index=false`.

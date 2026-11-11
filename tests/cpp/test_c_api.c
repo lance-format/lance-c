@@ -3394,6 +3394,155 @@ static void test_native_scalar_indexes(const char *uri) {
     printf("OK\n");
 }
 
+static int collect_minhash_alice(struct ArrowArrayStream *stream) {
+    struct ArrowSchema schema = {0};
+    ASSERT(stream->get_schema(stream, &schema) == 0,
+           "MinHash stream schema failed");
+    int id_column = -1;
+    int distance_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        const struct ArrowSchema *child = schema.children[i];
+        if (child != NULL && child->name != NULL) {
+            if (strcmp(child->name, "id") == 0) id_column = (int)i;
+            if (strcmp(child->name, "_distance") == 0) distance_column = (int)i;
+        }
+    }
+    ASSERT(id_column >= 0, "MinHash schema must contain id");
+    ASSERT(distance_column >= 0, "MinHash schema must contain _distance");
+    schema.release(&schema);
+
+    int found_alice = 0;
+    int64_t total_rows = 0;
+    while (1) {
+        struct ArrowArray array = {0};
+        ASSERT(stream->get_next(stream, &array) == 0,
+               "MinHash stream get_next failed");
+        if (!array.release) break;
+        const struct ArrowArray *ids = array.children[id_column];
+        const struct ArrowArray *distances = array.children[distance_column];
+        ASSERT(ids != NULL && ids->buffers[1] != NULL,
+               "MinHash id values missing");
+        ASSERT(distances != NULL && distances->buffers[1] != NULL,
+               "MinHash distance values missing");
+        const int32_t *id_values = (const int32_t *)ids->buffers[1];
+        const float *distance_values = (const float *)distances->buffers[1];
+        for (int64_t row = 0; row < array.length; ++row) {
+            const int32_t id = id_values[ids->offset + row];
+            const float distance = distance_values[distances->offset + row];
+            ASSERT(distance >= 0.0f, "MinHash distance must be non-negative");
+            total_rows += 1;
+            if (id == 1) {
+                ASSERT(distance == 0.0f,
+                       "identical MinHash text must have distance zero");
+                found_alice += 1;
+            }
+        }
+        array.release(&array);
+    }
+    stream->release(stream);
+    ASSERT(total_rows > 0, "MinHash search must return rows");
+    return found_alice;
+}
+
+static void test_minhash_lsh(const char *uri) {
+    printf("  test_minhash_lsh... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "MinHash dataset open failed");
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "name", "c_minhash", LANCE_SCALAR_MINHASH_LSH,
+               "{\"num_hashes\":64,\"num_bands\":16,\"shingle_size\":1}", 0) == 0,
+           "C MinHash index creation failed");
+
+    char *json = (char *)lance_dataset_index_list_json(ds);
+    ASSERT(json != NULL, "C MinHash index list failed");
+    ASSERT(strstr(json, "\"name\":\"c_minhash\"") != NULL &&
+               strstr(json, "\"type\":\"MinHashLsh\"") != NULL,
+           "C MinHash index listing mismatch");
+    lance_free_string(json);
+    json = (char *)lance_dataset_index_segments_json(ds);
+    ASSERT(json != NULL, "C MinHash segment list failed");
+    ASSERT(strstr(json, "\"name\":\"c_minhash\"") != NULL &&
+               strstr(json, "\"type\":\"MinHashLsh\"") != NULL,
+           "C MinHash segment listing mismatch");
+    lance_free_string(json);
+    ASSERT(lance_dataset_prewarm_index(ds, "c_minhash") == 0,
+           "C MinHash prewarm failed");
+
+    const char *columns[] = {"id", "name", NULL};
+    LanceScanner *scanner = lance_scanner_new(ds, columns, NULL);
+    ASSERT(scanner != NULL, "C MinHash scanner creation failed");
+    ASSERT(lance_scanner_set_minhash_query(scanner, "name", "alice") == 0,
+           "C MinHash query setter failed");
+    ASSERT(lance_scanner_set_limit(scanner, 10) == 0,
+           "C MinHash limit failed");
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "C MinHash stream failed");
+    CHECK_OK();
+    ASSERT(collect_minhash_alice(&stream) == 1,
+           "C MinHash query must return exact alice row");
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(ds, columns, NULL);
+    ASSERT(scanner != NULL, "C MinHash retention scanner creation failed");
+    ASSERT(lance_scanner_set_minhash_query(scanner, "name", "alice") == 0,
+           "C MinHash retention query failed");
+    ASSERT(lance_scanner_set_limit(scanner, 3) == 0,
+           "C MinHash retention limit failed");
+    ASSERT(lance_scanner_set_minhash_query(scanner, "", "alice") == -1,
+           "C MinHash empty column must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "C MinHash empty column error code");
+    const char *message = lance_last_error_message();
+    ASSERT(message != NULL, "C MinHash empty column must set an error");
+    lance_free_string(message);
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "C MinHash failed setter must retain the old query");
+    ASSERT(collect_minhash_alice(&stream) == 1,
+           "C MinHash retained query must find alice");
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(ds, columns, NULL);
+    ASSERT(scanner != NULL, "C MinHash missing-limit scanner creation failed");
+    ASSERT(lance_scanner_set_minhash_query(scanner, "name", "alice") == 0,
+           "C MinHash missing-limit query failed");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == -1,
+           "C MinHash search without a limit must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "C MinHash missing-limit error code");
+    message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "requires a limit") != NULL,
+           "C MinHash missing-limit native error");
+    lance_free_string(message);
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(ds, columns, NULL);
+    ASSERT(scanner != NULL, "C MinHash missing-index scanner creation failed");
+    ASSERT(lance_scanner_set_minhash_query(scanner, "score", "alice") == 0,
+           "C MinHash missing-index query failed");
+    ASSERT(lance_scanner_set_limit(scanner, 5) == 0,
+           "C MinHash missing-index limit failed");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == -1,
+           "C MinHash search without an index must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "C MinHash missing-index error code");
+    message = lance_last_error_message();
+    ASSERT(message != NULL &&
+               strstr(message, "No MinHash LSH index found for column score") != NULL,
+           "C MinHash missing-index native error");
+    lance_free_string(message);
+    lance_scanner_close(scanner);
+
+    ASSERT(lance_dataset_drop_index(ds, "c_minhash") == 0,
+           "C MinHash drop failed");
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static void check_ordering(
     LanceScanner *scanner,
     const int32_t *expected,
@@ -4010,6 +4159,7 @@ int main(int argc, char **argv) {
     test_vector_models_and_reusable_segments(uri);
     test_commit_index_segments(uri);
     test_native_scalar_indexes(uri);
+    test_minhash_lsh(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);

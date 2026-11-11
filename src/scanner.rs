@@ -33,6 +33,7 @@ use lance_datafusion::exec::{
     LanceExecutionOptions, analyze_plan as analyze_execution_plan, execute_plan,
 };
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::ApproxMode;
 use lance_io::stream::RecordBatchStream;
 use lance_table::format::{Fragment, IndexMetadata};
@@ -240,6 +241,7 @@ pub struct LanceScanner {
     prefilter: bool,
     materialization_style: MaterializationStyle,
     fast_search: bool,
+    minhash_query: Option<MinHashQuery>,
     fts_query: Option<FullTextSearchQuery>,
     fts_context: Option<Arc<FtsQueryContextInner>>,
     fts_index_segments: Option<Vec<Uuid>>,
@@ -446,6 +448,7 @@ impl LanceScanner {
             prefilter: false,
             materialization_style: MaterializationStyle::Heuristic,
             fast_search: false,
+            minhash_query: None,
             fts_query: None,
             fts_context: None,
             fts_index_segments: None,
@@ -849,6 +852,9 @@ impl LanceScanner {
             self.apply_fragment_filter(&mut scanner)?;
         }
         scanner.materialization_style(self.materialization_style.clone());
+        if let Some(query) = &self.minhash_query {
+            scanner.minhash_search(query.clone())?;
+        }
         if let Some(fts) = &self.fts_query {
             scanner.full_text_search(fts.clone())?;
         }
@@ -873,6 +879,7 @@ impl LanceScanner {
         self.apply_filter(&mut scanner)?;
         let scalar_segment = if let Some(segment_uuid) = self.scalar_index_segment {
             if self.nearest.is_some()
+                || self.minhash_query.is_some()
                 || self.fts_query.is_some()
                 || self.fts_context.is_some()
                 || self.index_segments.is_some()
@@ -880,7 +887,7 @@ impl LanceScanner {
                 || self.include_deleted_rows
             {
                 return Err(lance_core::Error::invalid_input_source(
-                    "scalar_index_segment requires an ordinary scan of live rows; vector/FTS queries and include_deleted_rows=true are unsupported".into(),
+                    "scalar_index_segment requires an ordinary scan of live rows; vector/MinHash/FTS queries and include_deleted_rows=true are unsupported".into(),
                 ));
             }
             let fragment_ids = self.fragment_ids.as_ref().filter(|ids| !ids.is_empty())
@@ -4519,6 +4526,53 @@ unsafe fn nearest_multivector_inner(
 // ---------------------------------------------------------------------------
 // Full-text search (Phase 2)
 // ---------------------------------------------------------------------------
+
+/// Set a native MinHash LSH text-similarity query on the scanner.
+///
+/// The column and text are copied. A valid earlier query remains attached when
+/// validation fails. The column must be non-empty; an empty text is accepted by
+/// native Lance and produces no matching signatures. The scan must have an
+/// explicit limit before planning; the native scanner limit controls the number
+/// of result rows. Native planning adds `_distance`, equal to one minus the
+/// estimated Jaccard similarity.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_minhash_query(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    text: *const c_char,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_minhash_query_inner(scanner, column, text)
+    })
+}
+
+unsafe fn scanner_set_minhash_query_inner(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    text: *const c_char,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner must not be NULL".into(),
+        ));
+    }
+    let column = unsafe { helpers::parse_c_string(column)? }.ok_or_else(|| {
+        lance_core::Error::invalid_input_source("MinHash column must not be NULL".into())
+    })?;
+    let text = unsafe { helpers::parse_c_string(text)? }.ok_or_else(|| {
+        lance_core::Error::invalid_input_source("MinHash text must not be NULL".into())
+    })?;
+    let query = MinHashQuery::new(text.to_string(), column.to_string());
+    let scanner = unsafe { &mut *scanner };
+    // Reuse the public native builder for its validation phase without
+    // disturbing this scanner's existing query state.
+    scanner.dataset.scan().minhash_search(query.clone())?;
+    scanner.minhash_query = Some(query);
+    Ok(0)
+}
 
 /// Set a BM25 full-text search query on the scanner.
 ///
