@@ -75,7 +75,7 @@ struct OverlayBatch {
             a_values.resize(len);
             a_validity.assign((len + 7) / 8, 0xff);
             a_buffers = {{a_validity.data(), a_values.data()}};
-            init_schema_child(child, "i", "a", ARROW_FLAG_NULLABLE);
+            init_schema_child(child, "i", "a", 2);
             init_array_child(array_storage[child], len, a_buffers[0],
                              a_buffers[1]);
             ++child;
@@ -84,7 +84,7 @@ struct OverlayBatch {
             b_values.resize(len);
             b_validity.assign((len + 7) / 8, 0xff);
             b_buffers = {{b_validity.data(), b_values.data()}};
-            init_schema_child(child, "i", "b", ARROW_FLAG_NULLABLE);
+            init_schema_child(child, "i", "b", 2);
             init_array_child(array_storage[child], len, b_buffers[0],
                              b_buffers[1]);
         }
