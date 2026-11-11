@@ -248,6 +248,26 @@ jobs:
           if (-not ($cache -match '^CMAKE_GENERATOR_TOOLSET(?::[^=]+)?=ClangCL$')) {
             throw 'CMake did not select the ClangCL toolset'
           }
+          $compilerFiles = @(
+            Get-ChildItem -LiteralPath build\CMakeFiles -Recurse `
+              -Filter CMakeCCompiler.cmake | Select-Object -First 1
+            Get-ChildItem -LiteralPath build\CMakeFiles -Recurse `
+              -Filter CMakeCXXCompiler.cmake | Select-Object -First 1
+          )
+          if ($compilerFiles.Count -ne 2 -or $compilerFiles -contains $null) {
+            throw 'CMake did not emit both C and CXX compiler configuration files'
+          }
+          foreach ($compilerFile in $compilerFiles) {
+            $compilerConfig = Get-Content -LiteralPath $compilerFile.FullName -Raw
+            if ($compilerConfig -notmatch
+                'set\(CMAKE_C(?:XX)?_COMPILER_ID "Clang"\)') {
+              throw "CMake compiler ID is not Clang in $($compilerFile.FullName)"
+            }
+            if ($compilerConfig -notmatch
+                '(?i)set\(CMAKE_C(?:XX)?_COMPILER ".*[/\\]Llvm[/\\]Arm64[/\\]bin[/\\]clang-cl\.exe"\)') {
+              throw "CMake compiler is not the Visual Studio ARM64 clang-cl: $($compilerFile.FullName)"
+            }
+          }
       - name: Build
         run: cmake --build build --config Release --parallel 4
       - name: Install to staging prefix
