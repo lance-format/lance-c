@@ -668,6 +668,29 @@ fn run_test_binary_with_dataset(binary: &Path, dataset_uri: &str) {
     );
 }
 
+fn run_test_binary_with_two_args(binary: &Path, first: &str, second: &str) {
+    let output = Command::new(binary)
+        .arg(first)
+        .arg(second)
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("--- stdout ---\n{stdout}");
+    if !stderr.is_empty() {
+        eprintln!("--- stderr ---\n{stderr}");
+    }
+    assert!(
+        output.status.success(),
+        "Test binary {} failed with exit code {:?}\nstdout: {}\nstderr: {}",
+        binary.display(),
+        output.status.code(),
+        stdout,
+        stderr
+    );
+}
+
 #[test]
 #[ignore = "requires C compiler (cc); run with: cargo test -p lance-c -- --ignored test_c_compilation"]
 fn test_c_compilation_and_execution() {
@@ -778,6 +801,36 @@ fn test_typed_fts_native_compilation_and_execution() {
         "C++ FTS test compilation failed"
     );
     run_test_binary_with_dataset(&cpp_binary, &dataset_uri);
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_transaction_compilation_and_execution"]
+fn test_native_transaction_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (tmp, dataset_uri) = create_test_dataset_on_disk();
+    let base = tmp.path().join("native_transactions");
+    std::fs::create_dir_all(&base).unwrap();
+    let base = base.to_str().unwrap();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_transaction.c");
+    let c_binary = build_dir.path().join("test_transaction_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C transaction test compilation failed"
+    );
+    run_test_binary_with_two_args(&c_binary, &dataset_uri, base);
+
+    let cpp_source = tests_dir.join("test_transaction.cpp");
+    let cpp_binary = build_dir.path().join("test_transaction_cpp");
+    assert!(
+        compile_cpp_test(&cpp_source, &cpp_binary, &include_dir, &lib_path),
+        "C++ transaction test compilation failed"
+    );
+    run_test_binary_with_two_args(&cpp_binary, &dataset_uri, base);
 }
 
 /// A fresh C executable must initialize OpenDAL even when archive constructors are omitted.

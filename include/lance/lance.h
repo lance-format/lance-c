@@ -142,6 +142,7 @@ typedef enum {
     LANCE_SCALAR_NGRAM        = 5,
     LANCE_SCALAR_ZONE_MAP     = 6,
     LANCE_SCALAR_BLOOM_FILTER = 7,
+    LANCE_SCALAR_MINHASH_LSH  = 8,
 } LanceScalarIndexType;
 
 typedef enum {
@@ -208,6 +209,8 @@ typedef struct LanceFtsQueryContext LanceFtsQueryContext;
 typedef struct LanceFtsQuery LanceFtsQuery;
 typedef struct LanceBlobFile LanceBlobFile;
 typedef struct LanceFragment LanceFragment;
+typedef struct LanceTransaction LanceTransaction;
+typedef struct LanceOperation LanceOperation;
 
 /* ─── Shared session ─── */
 
@@ -2773,9 +2776,9 @@ int32_t lance_scanner_set_projection(
  * Disable automatic `_score` / `_distance` projection for this scanner.
  *
  * With the published default, an explicit projection still receives `_score`
- * for full-text search or `_distance` for vector search. After this call
- * succeeds, those columns are included only when explicitly requested by the
- * projection, matching Lance `Scanner::disable_scoring_autoprojection()`.
+ * for full-text search or `_distance` for vector and MinHash search. After this
+ * call succeeds, those columns are included only when explicitly requested by
+ * the projection, matching Lance `Scanner::disable_scoring_autoprojection()`.
  *
  * The change is one-way for the lifetime of the scanner. Must be called before
  * the scan starts.
@@ -3192,6 +3195,8 @@ const char* lance_scanner_analyze_plan(const LanceScanner* scanner);
  * This applies the native `COUNT(*)` aggregate to the configured scanner plan
  * and executes that count plan. It does not count batches from a stream.
  * Native aggregate planning rejects any configured limit, offset, or ordering.
+ * MinHash search requires a limit, so it cannot be combined with this count
+ * operation; use a limited MinHash scan and count the returned rows instead.
  * Count execution uses the native count operation's execution options; the
  * registered scan-statistics callback is not invoked for this separate count
  * operation.
@@ -3424,7 +3429,9 @@ int32_t lance_dataset_create_vector_index(
  *                    Lance scalar-index plugin, or NULL for plugin defaults.
  *                    Plugin field names and validation apply; for example
  *                    ZoneMap uses `rows_per_zone`/`use_seeds` and BloomFilter
- *                    uses `number_of_items`/`probability`.
+ *                    uses `number_of_items`/`probability`. MinHash LSH uses
+ *                    `num_hashes`, `num_bands`, `shingle_size`, and
+ *                    `tokenizer`.
  * @return 0 on success, -1 on error.
  */
 int32_t lance_dataset_create_scalar_index(
@@ -4077,8 +4084,9 @@ int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
 /**
  * Configure native indexed-only fast search.
  *
- * This weak-consistency mode applies to vector queries, scalar-indexed filters
- * and full-text search. Index-backed paths can omit unindexed data. Ordinary
+ * This weak-consistency mode applies to vector queries, scalar-indexed filters,
+ * full-text search and MinHash search. Index-backed paths can omit unindexed
+ * data; for MinHash search it omits appended/unindexed fragments. Ordinary
  * scans and expressions without an indexable path follow the native planner's
  * behavior.
  *
@@ -4098,10 +4106,11 @@ int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
 int32_t lance_scanner_set_fast_search(LanceScanner* scanner, bool enable);
 
 /**
- * Choose when scanner filter expressions are applied during nearest-neighbor search.
- * When enabled, filters constrain ANN candidates; when disabled, they refine the
- * candidates after ANN and may produce fewer than k rows. This does not change the
- * fragment search domain set by lance_scanner_set_fragment_ids().
+ * Choose when scanner filter expressions are applied during vector or MinHash
+ * search. When enabled, filters constrain candidates before ranking; when
+ * disabled, they refine the ranked candidates afterward and may produce fewer
+ * than the configured limit. This does not change the fragment search domain set
+ * by lance_scanner_set_fragment_ids().
  */
 int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
 
@@ -4154,8 +4163,9 @@ int32_t lance_scanner_set_index_segments(
  * overlays, fragment reuse, unsupported index types / result domains
  * and missing coverage use the same domain without an index. No filter also
  * falls back. LIMIT/OFFSET apply after the complete scanner filter, never to the
- * unfiltered candidate set. Vector/FTS queries and include_deleted_rows=true
- * are rejected even when use_scalar_index=false; segment mode is live-row-only.
+ * unfiltered candidate set. Vector/MinHash/FTS queries and
+ * include_deleted_rows=true are rejected even when use_scalar_index=false;
+ * segment mode is live-row-only.
  *
  * UUID bytes are copied. Metadata and final option compatibility are validated
  * when creating the stream. Index corruption or I/O failures remain errors.
@@ -4551,6 +4561,33 @@ int32_t lance_scanner_set_fts_query_context(
 );
 
 /**
+ * Set a native MinHash LSH text-similarity query on the scanner.
+ *
+ * The column and text are copied and may be released after this call. A valid
+ * earlier query remains attached when this call fails. An empty column is
+ * rejected by the native query builder; an empty text is accepted by native
+ * Lance and produces no matching signatures.
+ *
+ * The scanner limit is required when planning this query and controls the
+ * number of returned rows. Native planning searches rows with the column's
+ * MinHash LSH index, covers unindexed fragments by default, and adds
+ * `_distance`, equal to one minus the estimated Jaccard similarity. Filters,
+ * prefiltering, fast search, fragment scope, row masks, projection, offset, and
+ * query-combination errors follow native Lance behavior.
+ *
+ * @param scanner Scanner handle. Must not be NULL.
+ * @param column  Text column with a MinHash LSH index. Must not be NULL or
+ *                empty after native validation.
+ * @param text    Query text. Must not be NULL; empty text is allowed.
+ * @return 0 on success, -1 on error (check `lance_last_error_*`).
+ */
+int32_t lance_scanner_set_minhash_query(
+    LanceScanner* scanner,
+    const char* column,
+    const char* text
+);
+
+/**
  * Restrict a context-backed FTS scan to `len` context segment UUIDs supplied
  * by the caller's planner. Pass `len == 0` to clear the restriction and search
  * all context segments. Duplicate or unknown UUIDs are rejected.
@@ -4745,6 +4782,365 @@ int32_t lance_dataset_write_with_options(
     const LanceWriteOptions* options,
     const char* const* storage_opts,
     LanceDataset** out_dataset
+);
+
+/* ─── Native transactions ─── */
+
+/**
+ * Native operation variant. Discriminants are ABI-stable.
+ *
+ * This first transaction delivery constructs Append and Overwrite through the
+ * native writer. The other variants can be read from history and inspected by
+ * kind, but manual construction and variant-specific mutation helpers are
+ * later issue #112 scope.
+ */
+typedef enum {
+    LANCE_OPERATION_UNKNOWN             = 0,
+    LANCE_OPERATION_APPEND              = 1,
+    LANCE_OPERATION_DELETE              = 2,
+    LANCE_OPERATION_OVERWRITE            = 3,
+    LANCE_OPERATION_CREATE_INDEX        = 4,
+    LANCE_OPERATION_REWRITE             = 5,
+    LANCE_OPERATION_DATA_REPLACEMENT    = 6,
+    LANCE_OPERATION_DATA_OVERLAY        = 7,
+    LANCE_OPERATION_MERGE               = 8,
+    LANCE_OPERATION_RESTORE             = 9,
+    LANCE_OPERATION_RESERVE_FRAGMENTS   = 10,
+    LANCE_OPERATION_UPDATE              = 11,
+    LANCE_OPERATION_PROJECT             = 12,
+    LANCE_OPERATION_UPDATE_CONFIG       = 13,
+    LANCE_OPERATION_UPDATE_MEM_WAL_STATE = 14,
+    LANCE_OPERATION_CLONE               = 15,
+    LANCE_OPERATION_UPDATE_BASES        = 16,
+} LanceOperationKind;
+
+/**
+ * Native write options for an uncommitted Arrow stream.
+ *
+ * `write` reuses the `LanceWriteOptions` mapping from the committing writer.
+ * Pass an all-zero struct for native `WriteParams::default()`.
+ *
+ * `write.skip_auto_cleanup` is parsed but cannot affect this call because no
+ * commit occurs. Pass the same setting through LanceCommitOptions when
+ * publishing the returned transaction. `write.auto_cleanup` still participates
+ * in a CREATE transaction's native config upsert.
+ *
+ * `transaction_properties` is a NULL-terminated key-value array. NULL means
+ * native None. A non-NULL pointer, including one whose first entry is NULL,
+ * means native Some and distinguishes an explicitly empty map. The selected
+ * core's CommitBuilder has a separate transaction-properties setter, but its
+ * execute/execute_batch path does not apply that field; properties for this
+ * delivery are therefore carried by the transaction produced here.
+ */
+typedef struct LanceUncommittedWriteOptions {
+    LanceWriteOptions write;
+    const char* const* transaction_properties;
+} LanceUncommittedWriteOptions;
+
+/** Tri-state mapping for the native overall commit timeout. */
+typedef enum {
+    /** Keep the native default (30 minutes). */
+    LANCE_COMMIT_TIMEOUT_DEFAULT  = 0,
+    /** Pass None and disable the overall timeout. */
+    LANCE_COMMIT_TIMEOUT_DISABLED = 1,
+    /** Use the explicit seconds/nanoseconds value, including zero. */
+    LANCE_COMMIT_TIMEOUT_EXPLICIT = 2,
+} LanceCommitTimeoutMode;
+
+/**
+ * Native CommitBuilder settings for transaction publication.
+ *
+ * Zero-initialize this struct to preserve native defaults. Presence flags keep
+ * omitted settings distinct from explicit false, zero retries, zero retry
+ * budget and zero overall timeout.
+ *
+ * The native default retry count is 20. An explicit `max_retries = 0` is
+ * forwarded and selects native strict-overwrite behavior for an Overwrite
+ * transaction. The native retry backoff budget defaults to 30 seconds; an
+ * explicit zero is valid. The overall timeout defaults to 30 minutes; an
+ * explicit zero duration is rejected by the native execute path.
+ *
+ * `data_storage_version` uses the same parser as LanceWriteParams and maps to
+ * CommitBuilder::with_storage_format. NULL keeps the native omitted value.
+ */
+typedef struct LanceCommitOptions {
+    bool has_use_stable_row_ids;
+    bool use_stable_row_ids;
+    bool has_enable_v2_manifest_paths;
+    bool enable_v2_manifest_paths;
+    bool has_max_retries;
+    uint32_t max_retries;
+    bool has_retry_timeout;
+    uint64_t retry_timeout_seconds;
+    uint32_t retry_timeout_nanos;
+    int32_t timeout_mode;
+    uint64_t timeout_seconds;
+    uint32_t timeout_nanos;
+    bool detached;
+    bool skip_auto_cleanup;
+    const char* data_storage_version;
+} LanceCommitOptions;
+
+/**
+ * Write an Arrow stream as uncommitted Lance data files and return the owned
+ * native transaction that would publish it.
+ *
+ * Maps to InsertBuilder::execute_uncommitted_stream. The stream is consumed on
+ * every return path except a NULL stream pointer. `schema` is borrowed; the
+ * caller releases it after this call. The stream schema must match.
+ *
+ * `options` may be NULL for native writer defaults. `storage_opts` uses the
+ * normal NULL-terminated key/value format. `session` may be NULL; a non-NULL
+ * session is retained by native derived values. Write mode, dataset existence,
+ * schema compatibility and create/append/overwrite normalization follow the
+ * selected core.
+ *
+ * On success `*out_transaction` receives an independently owned handle. On
+ * error it remains unchanged. Data files already written by a failed call
+ * remain uncommitted; this API performs no rollback or cleanup policy.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_write_uncommitted_stream(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceUncommittedWriteOptions* options,
+    const char* const* storage_opts,
+    const LanceSession* session,
+    LanceTransaction** out_transaction
+);
+
+/** Close a transaction handle. NULL-safe. Close exactly once. */
+void lance_transaction_close(LanceTransaction* transaction);
+
+/** Close an operation handle. NULL-safe. Close exactly once. */
+void lance_operation_close(LanceOperation* operation);
+
+/**
+ * Read the native transaction read version.
+ * Returns 0 on success, -1 on error. Zero is valid for an uncommitted create.
+ */
+int32_t lance_transaction_read_version(
+    const LanceTransaction* transaction,
+    uint64_t* out_read_version
+);
+
+/**
+ * Return a newly allocated copy of the native transaction UUID.
+ * Caller frees with lance_free_string(). Returns NULL on error.
+ */
+const char* lance_transaction_uuid(const LanceTransaction* transaction);
+
+/**
+ * Copy the optional native transaction tag.
+ *
+ * Returns 1 and a newly allocated string through `out_tag` when present, 0 and
+ * NULL when absent, or -1 on error. The caller frees a present string with
+ * lance_free_string(). Absent and empty are distinct native Option values,
+ * though native protobuf decoding normalizes an encoded empty tag to absent.
+ */
+int32_t lance_transaction_tag(
+    const LanceTransaction* transaction,
+    const char** out_tag
+);
+
+/**
+ * Report whether native transaction properties are Some, including Some(empty).
+ * An absent map is distinct from an empty map.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_transaction_has_properties(
+    const LanceTransaction* transaction,
+    bool* out_has_properties
+);
+
+/**
+ * Read the transaction property count. The count is 0 for both None and
+ * Some(empty); use lance_transaction_has_properties() to distinguish.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_transaction_property_count(
+    const LanceTransaction* transaction,
+    uint64_t* out_count
+);
+
+/**
+ * Return a newly allocated property key at `index`.
+ * Map order is unspecified but stable for the handle. Caller frees with
+ * lance_free_string(). Returns NULL on error, including an out-of-range index.
+ */
+const char* lance_transaction_property_key_at(
+    const LanceTransaction* transaction,
+    size_t index
+);
+
+/**
+ * Return a newly allocated property value at `index`.
+ * Map order is unspecified but stable for the handle. Caller frees with
+ * lance_free_string(). Returns NULL on error, including an out-of-range index.
+ */
+const char* lance_transaction_property_value_at(
+    const LanceTransaction* transaction,
+    size_t index
+);
+
+/**
+ * Clone the transaction operation into an independent owned handle.
+ * Returns 0 on success, -1 on error; the output slot is success-only.
+ */
+int32_t lance_transaction_operation(
+    const LanceTransaction* transaction,
+    LanceOperation** out_operation
+);
+
+/**
+ * Read the operation variant.
+ * Returns 0 on success, -1 on error; the output slot is success-only.
+ */
+int32_t lance_operation_kind(
+    const LanceOperation* operation,
+    LanceOperationKind* out_kind
+);
+
+/**
+ * Read the fragment count for an Append or Overwrite operation.
+ * Returns 0 on success, -1 on error. Other variants return
+ * LANCE_ERR_NOT_SUPPORTED.
+ */
+int32_t lance_operation_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Export an Overwrite operation's schema as Arrow C Data Interface.
+ * The caller owns and releases the output ArrowSchema exactly once.
+ * Append has no schema; other variants return LANCE_ERR_NOT_SUPPORTED.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_schema(
+    const LanceOperation* operation,
+    struct ArrowSchema* out
+);
+
+/**
+ * Serialize a transaction through the selected core's
+ * TryFrom<&Transaction> for pb.Transaction conversion.
+ *
+ * On success, `*out_bytes` receives a malloc-compatible allocation and
+ * `*out_len` its length; free with lance_free_bytes(). Both output slots are
+ * unchanged on error.
+ *
+ * Conversion boundaries are the native contract: Operation::Unknown cannot be
+ * encoded and returns LANCE_ERR_NOT_SUPPORTED. Empty tags/property maps
+ * normalize to absent on decode. The selected core does not carry Overwrite
+ * schema metadata through its separate protobuf field. Consumers must treat
+ * this as native transport, not a lossless object serialization.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_transaction_to_proto(
+    const LanceTransaction* transaction,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Parse one complete protobuf Transaction through the selected core's native
+ * conversion.
+ *
+ * Empty input decodes to the native default transaction with an Unknown
+ * operation. NULL bytes with a non-zero length is invalid. The length must
+ * fit a Rust slice (at most PTRDIFF_MAX). Unknown protobuf oneof variants become
+ * Operation::Unknown: they can be inspected but cannot be serialized again or
+ * committed. The returned handle must be closed exactly once. Returns NULL on
+ * error.
+ */
+LanceTransaction* lance_transaction_from_proto(
+    const uint8_t* bytes,
+    size_t len
+);
+
+/**
+ * Read the current snapshot's transaction.
+ *
+ * Returns 0 on success. On success the output is either an independently owned
+ * transaction handle or NULL when the manifest has no transaction file. The
+ * output slot is unchanged on error. The transaction remains valid after the
+ * source dataset handle is closed.
+ */
+int32_t lance_dataset_read_transaction(
+    const LanceDataset* dataset,
+    LanceTransaction** out_transaction
+);
+
+/**
+ * Read a specific version's transaction.
+ *
+ * `version` is resolved through the native dataset branch and storage rules.
+ * Missing versions and invalid IDs follow native errors. Returns 0 on success;
+ * success writes a transaction handle or NULL when that version has no
+ * transaction file. The output slot is unchanged on error.
+ */
+int32_t lance_dataset_read_transaction_by_version(
+    const LanceDataset* dataset,
+    uint64_t version,
+    LanceTransaction** out_transaction
+);
+
+/**
+ * Publish one native transaction through CommitBuilder::execute.
+ *
+ * `transaction` is borrowed and cloned by the native builder; closing it after
+ * a successful or failed call is the caller's choice and never invalidates a
+ * returned dataset. `options` may be NULL for native commit defaults.
+ * `storage_opts` and `session` configure URI resolution and caches.
+ *
+ * On success `*out_dataset` receives an independently owned dataset at the
+ * committed version and is written only on success. Commit eligibility,
+ * conflict resolution, retries, detached versions, cleanup and normalization
+ * are native.
+ *
+ * A failed publish performs no binding-side rollback. Uncommitted data files
+ * may remain, and an I/O failure can leave the resulting version uncertain.
+ * Reopen the URI to establish the actual committed state before retrying.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_transaction_commit(
+    const char* uri,
+    const LanceTransaction* transaction,
+    const LanceCommitOptions* options,
+    const char* const* storage_opts,
+    const LanceSession* session,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Publish append transactions through CommitBuilder::execute_batch.
+ *
+ * Each input transaction is borrowed and cloned. Native batch rules determine
+ * eligibility, merge order, conflicts, retries and the merged read version.
+ * Non-append batches return LANCE_ERR_NOT_SUPPORTED; an empty batch returns the
+ * native invalid-input error. Both output pointers are required.
+ *
+ * On success the actual merged transaction and an independently owned dataset
+ * are written to the output slots. Both slots are unchanged on error.
+ *
+ * @param transactions Array of `transaction_count` non-NULL handles.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_transaction_commit_batch(
+    const char* uri,
+    const LanceTransaction* const* transactions,
+    size_t transaction_count,
+    const LanceCommitOptions* options,
+    const char* const* storage_opts,
+    const LanceSession* session,
+    LanceDataset** out_dataset,
+    LanceTransaction** out_merged_transaction
 );
 
 #ifdef __cplusplus

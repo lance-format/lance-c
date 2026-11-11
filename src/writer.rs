@@ -18,6 +18,7 @@ use arrow_schema::Schema as ArrowSchema;
 use chrono::TimeDelta;
 use lance::Dataset;
 use lance::dataset::{AutoCleanupParams, WriteMode as LanceWriteModeUpstream, WriteParams};
+use lance::session::Session;
 use lance_core::Result;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
@@ -51,7 +52,7 @@ pub enum LanceWriteMode {
 impl LanceWriteMode {
     /// Validate a raw FFI integer into a `LanceWriteMode`. Out-of-range
     /// values become `InvalidInput`.
-    fn from_raw(raw: i32) -> Result<Self> {
+    pub(crate) fn from_raw(raw: i32) -> Result<Self> {
         match raw {
             0 => Ok(Self::Create),
             1 => Ok(Self::Append),
@@ -294,6 +295,64 @@ struct WriteSettings {
     legacy_auto_cleanup: bool,
 }
 
+/// Build native `WriteParams` from the writer option representations.
+///
+/// This is shared by the committing writer entry points and the uncommitted
+/// transaction entry point so their option/default conversion cannot drift.
+/// The C pointers are borrowed only for this synchronous call.
+pub(crate) unsafe fn write_params_from_ffi(
+    mode: LanceWriteMode,
+    params: *const LanceWriteParams,
+    options: *const LanceWriteOptions,
+    legacy_auto_cleanup: bool,
+    storage_opts: *const *const c_char,
+    session: Option<Arc<Session>>,
+) -> Result<WriteParams> {
+    // SAFETY: `storage_opts` is either NULL or a NULL-terminated array of
+    // C-string pointers per the FFI contract.
+    let opts = unsafe { helpers::parse_storage_options(storage_opts)? };
+    let store_params = (!opts.is_empty()).then(|| ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(opts))),
+        ..ObjectStoreParams::default()
+    });
+    let mut write_params = WriteParams {
+        mode: mode.into(),
+        store_params,
+        session,
+        ..WriteParams::default()
+    };
+
+    if !options.is_null() {
+        // SAFETY: a non-NULL `options` points to a valid `LanceWriteOptions`
+        // for the duration of this call. The borrow ends before any await.
+        let options = unsafe { &*options };
+        unsafe { apply_write_params(&mut write_params, &options.params)? };
+        if !options.auto_cleanup.is_null() {
+            // SAFETY: the caller guarantees a non-NULL `auto_cleanup` points
+            // to a valid `LanceAutoCleanupParams` for this call.
+            write_params.auto_cleanup =
+                Some(unsafe { auto_cleanup_from_ffi(&*options.auto_cleanup)? });
+        }
+        write_params.skip_auto_cleanup = options.skip_auto_cleanup;
+    } else if !params.is_null() {
+        // SAFETY: a non-NULL `params` points to a valid `LanceWriteParams` for
+        // the duration of this call.
+        unsafe { apply_write_params(&mut write_params, &*params)? };
+    }
+
+    if legacy_auto_cleanup {
+        // Lance 9.1 changed the upstream default to `auto_cleanup: None`.
+        // The long-standing C entry points still expose the pre-9.1 policy
+        // (every 20 versions, older than 14 days) so datasets created through
+        // them keep their reclamation path. Pin the values explicitly rather
+        // than via `AutoCleanupParams::default()`, so a future upstream
+        // default change cannot silently shift C-visible behavior.
+        write_params.auto_cleanup = Some(legacy_auto_cleanup_params());
+    }
+
+    Ok(write_params)
+}
+
 unsafe fn write_dataset_inner(
     uri: *const c_char,
     schema: *const FFI_ArrowSchema,
@@ -355,10 +414,16 @@ unsafe fn write_dataset_inner(
         lance_core::Error::invalid_input_source(format!("invalid schema: {e}").into())
     })?;
 
-    // SAFETY: `storage_opts` is either NULL or a NULL-terminated array of
-    // C-string pointers per the FFI contract; `parse_storage_options` returns
-    // an empty map for NULL.
-    let opts = unsafe { helpers::parse_storage_options(storage_opts)? };
+    let write_params = unsafe {
+        write_params_from_ffi(
+            mode,
+            settings.params,
+            settings.options,
+            settings.legacy_auto_cleanup,
+            storage_opts,
+            None,
+        )?
+    };
 
     // Fail fast: compare the stream schema against the caller-provided schema.
     let stream_schema = reader.schema();
@@ -367,48 +432,6 @@ unsafe fn write_dataset_inner(
                 "stream schema does not match the provided schema.\n  expected: {expected_schema}\n  got:      {stream_schema}"
             )
             .into()));
-    }
-
-    let store_params = (!opts.is_empty()).then(|| ObjectStoreParams {
-        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(opts))),
-        ..ObjectStoreParams::default()
-    });
-    let mut write_params = WriteParams {
-        mode: mode.into(),
-        store_params,
-        ..WriteParams::default()
-    };
-    if !settings.options.is_null() {
-        // SAFETY: `settings.options` is non-NULL (checked above) and the caller
-        // guarantees it points to a properly-initialized `LanceWriteOptions`
-        // valid for the duration of this call. The borrow ends before any
-        // await point because `apply_write_params` and the auto-cleanup
-        // conversion are synchronous.
-        let options = unsafe { &*settings.options };
-        unsafe { apply_write_params(&mut write_params, &options.params)? };
-        if !options.auto_cleanup.is_null() {
-            // SAFETY: the caller guarantees a non-NULL `auto_cleanup` points
-            // to a valid `LanceAutoCleanupParams` for this call. We copy the
-            // native values before entering async work.
-            write_params.auto_cleanup =
-                Some(unsafe { auto_cleanup_from_ffi(&*options.auto_cleanup)? });
-        }
-        write_params.skip_auto_cleanup = options.skip_auto_cleanup;
-    } else if !settings.params.is_null() {
-        // SAFETY: `settings.params` is non-NULL (checked above) and the caller
-        // guarantees it points to a properly-initialized `LanceWriteParams`
-        // valid for the duration of this call. We borrow by shared reference
-        // and only read; the borrow is consumed before any await point.
-        unsafe { apply_write_params(&mut write_params, &*settings.params)? };
-    }
-    if settings.legacy_auto_cleanup {
-        // Lance 9.1 changed the upstream default to `auto_cleanup: None`.
-        // The long-standing C entry points still expose the pre-9.1 policy
-        // (every 20 versions, older than 14 days) so datasets created through
-        // them keep their reclamation path. Pin the values explicitly rather
-        // than via `AutoCleanupParams::default()`, so a future upstream
-        // default change cannot silently shift C-visible behavior.
-        write_params.auto_cleanup = Some(legacy_auto_cleanup_params());
     }
 
     let dataset = block_on(Dataset::write(reader, uri_str, Some(write_params)))?;
@@ -453,6 +476,31 @@ fn auto_cleanup_from_ffi(raw: &LanceAutoCleanupParams) -> Result<AutoCleanupPara
     })
 }
 
+/// Parse a nullable native Lance file-version string.
+pub(crate) unsafe fn parse_storage_version(
+    ptr: *const c_char,
+    field: &str,
+) -> Result<Option<LanceFileVersion>> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: the caller guarantees a non-NULL `ptr` is a NUL-terminated
+    // string valid for the duration of the outer FFI call.
+    let value = unsafe { helpers::parse_c_string(ptr)? }
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source(
+                format!("{field} must not be an empty string").into(),
+            )
+        })?;
+    let version = LanceFileVersion::from_str(value).map_err(|error| {
+        lance_core::Error::invalid_input_source(
+            format!("invalid {field} {value:?}: {error}").into(),
+        )
+    })?;
+    Ok(Some(version))
+}
+
 /// Apply caller-provided overrides onto an `lance::WriteParams`. Zero / NULL
 /// fields are no-ops so upstream defaults flow through.
 unsafe fn apply_write_params(target: &mut WriteParams, params: &LanceWriteParams) -> Result<()> {
@@ -466,29 +514,8 @@ unsafe fn apply_write_params(target: &mut WriteParams, params: &LanceWriteParams
         target.max_bytes_per_file = u64_to_usize(params.max_bytes_per_file, "max_bytes_per_file")?;
     }
     if !params.data_storage_version.is_null() {
-        // SAFETY: `data_storage_version` is non-NULL (checked above) and the
-        // `apply_write_params` caller (`unsafe fn` contract) guarantees it
-        // points to a NUL-terminated C string valid for the duration of the
-        // outer FFI call. `parse_c_string` reads by shared reference and the
-        // returned borrow is consumed before this function returns.
-        //
-        // `parse_c_string` returns `None` only for NULL input, which the
-        // outer check already ruled out. `.filter` lets an empty C string
-        // also fail presence, producing the clearer message below instead
-        // of relying on `FromStr`'s generic "unknown version" path.
-        let s = unsafe { helpers::parse_c_string(params.data_storage_version)? }
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                lance_core::Error::invalid_input_source(
-                    "data_storage_version must not be an empty string".into(),
-                )
-            })?;
-        let version = LanceFileVersion::from_str(s).map_err(|e| {
-            lance_core::Error::invalid_input_source(
-                format!("invalid data_storage_version {s:?}: {e}").into(),
-            )
-        })?;
-        target.data_storage_version = Some(version);
+        target.data_storage_version =
+            unsafe { parse_storage_version(params.data_storage_version, "data_storage_version")? };
     }
     target.enable_stable_row_ids = params.enable_stable_row_ids;
     Ok(())

@@ -31,6 +31,7 @@
 namespace lance {
 
 class Scanner;
+struct BatchCommitResult;
 
 // ─── Error ───────────────────────────────────────────────────────────────────
 
@@ -483,6 +484,221 @@ struct WriteOptions {
     WriteParams                      params;
     std::optional<AutoCleanupParams> auto_cleanup;
     bool                             skip_auto_cleanup = false;
+};
+
+/// A native duration expressed as whole seconds plus a subsecond nanosecond
+/// component. Nanoseconds must be less than 1,000,000,000.
+struct CommitDuration {
+    uint64_t seconds = 0;
+    uint32_t nanos = 0;
+};
+
+enum class CommitTimeoutMode : int32_t {
+    Default  = LANCE_COMMIT_TIMEOUT_DEFAULT,
+    Disabled = LANCE_COMMIT_TIMEOUT_DISABLED,
+    Explicit = LANCE_COMMIT_TIMEOUT_EXPLICIT,
+};
+
+/// Settings forwarded directly to the native CommitBuilder.
+///
+/// Omitted optionals keep native defaults. `max_retries = 0` is forwarded as a
+/// real value and selects strict overwrite behavior when applicable.
+struct CommitOptions {
+    std::optional<bool> use_stable_row_ids;
+    std::optional<bool> enable_v2_manifest_paths;
+    std::optional<uint32_t> max_retries;
+    std::optional<CommitDuration> retry_timeout;
+    CommitTimeoutMode timeout_mode = CommitTimeoutMode::Default;
+    CommitDuration timeout;
+    bool detached = false;
+    bool skip_auto_cleanup = false;
+    std::optional<std::string> data_storage_version;
+};
+
+/// Options for Dataset::write_uncommitted.
+///
+/// `write` reuses the committing writer's native option mapping.
+/// `transaction_properties == std::nullopt` selects native None; a supplied
+/// empty vector selects native Some(empty).
+struct UncommittedWriteOptions {
+    WriteOptions write;
+    std::optional<std::vector<std::pair<std::string, std::string>>>
+        transaction_properties;
+};
+
+// ─── Native transactions ─────────────────────────────────────────────────────
+
+enum class OperationKind : int32_t {
+    Unknown             = LANCE_OPERATION_UNKNOWN,
+    Append              = LANCE_OPERATION_APPEND,
+    Delete              = LANCE_OPERATION_DELETE,
+    Overwrite           = LANCE_OPERATION_OVERWRITE,
+    CreateIndex         = LANCE_OPERATION_CREATE_INDEX,
+    Rewrite             = LANCE_OPERATION_REWRITE,
+    DataReplacement     = LANCE_OPERATION_DATA_REPLACEMENT,
+    DataOverlay         = LANCE_OPERATION_DATA_OVERLAY,
+    Merge               = LANCE_OPERATION_MERGE,
+    Restore             = LANCE_OPERATION_RESTORE,
+    ReserveFragments    = LANCE_OPERATION_RESERVE_FRAGMENTS,
+    Update              = LANCE_OPERATION_UPDATE,
+    Project             = LANCE_OPERATION_PROJECT,
+    UpdateConfig        = LANCE_OPERATION_UPDATE_CONFIG,
+    UpdateMemWalState   = LANCE_OPERATION_UPDATE_MEM_WAL_STATE,
+    Clone               = LANCE_OPERATION_CLONE,
+    UpdateBases         = LANCE_OPERATION_UPDATE_BASES,
+};
+
+/// Owned native Operation snapshot. Move-only; closing the source Transaction
+/// does not invalidate this handle.
+class Operation {
+    Handle<LanceOperation, lance_operation_close> handle_;
+
+public:
+    explicit Operation(LanceOperation* operation) : handle_(operation) {}
+
+    Operation(Operation&&) noexcept = default;
+    Operation& operator=(Operation&&) noexcept = default;
+    Operation(const Operation&) = delete;
+    Operation& operator=(const Operation&) = delete;
+
+    OperationKind kind() const {
+        LanceOperationKind raw{};
+        if (lance_operation_kind(handle_.get(), &raw) != 0) check_error();
+        return static_cast<OperationKind>(raw);
+    }
+
+    /// Fragment count for Append/Overwrite. Other native variants throw
+    /// LANCE_ERR_NOT_SUPPORTED until their typed wrappers are added.
+    uint64_t fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_fragment_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    const LanceOperation* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native Transaction snapshot. Move-only and independent of the dataset
+/// or writer that produced it.
+class Transaction {
+    Handle<LanceTransaction, lance_transaction_close> handle_;
+
+public:
+    explicit Transaction(LanceTransaction* transaction) : handle_(transaction) {}
+
+    Transaction(Transaction&&) noexcept = default;
+    Transaction& operator=(Transaction&&) noexcept = default;
+    Transaction(const Transaction&) = delete;
+    Transaction& operator=(const Transaction&) = delete;
+
+    uint64_t read_version() const {
+        uint64_t version = 0;
+        if (lance_transaction_read_version(handle_.get(), &version) != 0) {
+            check_error();
+        }
+        return version;
+    }
+
+    std::string uuid() const {
+        const char* uuid = lance_transaction_uuid(handle_.get());
+        if (!uuid) check_error();
+        std::string out(uuid);
+        lance_free_string(uuid);
+        return out;
+    }
+
+    std::optional<std::string> tag() const {
+        const char* tag = nullptr;
+        int32_t present = lance_transaction_tag(handle_.get(), &tag);
+        if (present < 0) check_error();
+        if (present == 0) {
+            if (tag) {
+                lance_free_string(tag);
+                throw Error(LANCE_ERR_INTERNAL,
+                            "lance_transaction_tag reported absent with a non-null pointer");
+            }
+            return std::nullopt;
+        }
+        if (!tag) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_transaction_tag reported present with a null pointer");
+        }
+        std::string out(tag);
+        lance_free_string(tag);
+        return out;
+    }
+
+    bool has_properties() const {
+        bool present = false;
+        if (lance_transaction_has_properties(handle_.get(), &present) != 0) {
+            check_error();
+        }
+        return present;
+    }
+
+    std::map<std::string, std::string> properties() const {
+        uint64_t count = 0;
+        if (lance_transaction_property_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+
+        std::map<std::string, std::string> out;
+        for (uint64_t i = 0; i < count; ++i) {
+            const char* key = lance_transaction_property_key_at(
+                handle_.get(), static_cast<size_t>(i));
+            if (!key) check_error();
+            const char* value = lance_transaction_property_value_at(
+                handle_.get(), static_cast<size_t>(i));
+            if (!value) {
+                lance_free_string(key);
+                check_error();
+            }
+            out.emplace(key, value);
+            lance_free_string(key);
+            lance_free_string(value);
+        }
+        return out;
+    }
+
+    Operation operation() const {
+        LanceOperation* raw = nullptr;
+        if (lance_transaction_operation(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        if (!raw) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_transaction_operation returned success with null output");
+        }
+        return Operation(raw);
+    }
+
+    /// Serialize with the selected core's native protobuf conversion.
+    std::vector<uint8_t> to_proto() const {
+        uint8_t* bytes = nullptr;
+        size_t len = 0;
+        if (lance_transaction_to_proto(handle_.get(), &bytes, &len) != 0) {
+            check_error();
+        }
+        if (len > 0 && !bytes) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_transaction_to_proto returned a null buffer");
+        }
+        std::vector<uint8_t> out;
+        if (len > 0) out.assign(bytes, bytes + len);
+        lance_free_bytes(bytes);
+        return out;
+    }
+
+    /// Parse one complete native protobuf Transaction.
+    static Transaction from_proto(const std::vector<uint8_t>& bytes) {
+        auto* raw = lance_transaction_from_proto(bytes.data(), bytes.size());
+        if (!raw) check_error();
+        return Transaction(raw);
+    }
+
+    const LanceTransaction* c_handle() const { return handle_.get(); }
 };
 
 /// One native `Dataset::update_config` entry. `value == std::nullopt` removes
@@ -1023,6 +1239,58 @@ public:
 class Dataset {
     Handle<LanceDataset, lance_dataset_close> handle_;
 
+    /// Own the caller's stream until a C entry point consumes it, and own the
+    /// stream-provided schema for the duration of that call. This preserves the
+    /// "consumed on return or throw" contract even when schema extraction or
+    /// option conversion throws before the Rust call.
+    class ArrowStreamInput {
+        ArrowArrayStream* stream_;
+        bool armed_ = true;
+        ArrowSchema schema_ = {};
+
+    public:
+        explicit ArrowStreamInput(ArrowArrayStream* stream) : stream_(stream) {
+            if (!stream_) {
+                throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                            "stream must not be null");
+            }
+        }
+
+        ~ArrowStreamInput() {
+            if (schema_.release) schema_.release(&schema_);
+            if (armed_ && stream_ && stream_->release) {
+                stream_->release(stream_);
+            }
+        }
+
+        ArrowStreamInput(const ArrowStreamInput&) = delete;
+        ArrowStreamInput& operator=(const ArrowStreamInput&) = delete;
+        ArrowStreamInput(ArrowStreamInput&&) = delete;
+        ArrowStreamInput& operator=(ArrowStreamInput&&) = delete;
+
+        const ArrowSchema* read_schema() {
+            if (!stream_->get_schema) {
+                throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                            "stream get_schema callback is null");
+            }
+            if (stream_->get_schema(stream_, &schema_) != 0) {
+                const char* error = stream_->get_last_error
+                    ? stream_->get_last_error(stream_)
+                    : nullptr;
+                throw Error(
+                    LANCE_ERR_INVALID_ARGUMENT,
+                    std::string("failed to read stream schema: ") +
+                        (error ? error : "unknown"));
+            }
+            return &schema_;
+        }
+
+        ArrowArrayStream* consume() noexcept {
+            armed_ = false;
+            return stream_;
+        }
+    };
+
     static std::vector<const char*> to_c_key_values(
         const std::vector<std::pair<std::string, std::string>>& entries) {
         std::vector<const char*> kv;
@@ -1032,6 +1300,62 @@ class Dataset {
         }
         kv.push_back(nullptr);
         return kv;
+    }
+
+    static LanceWriteOptions to_c_write_options(
+        const WriteOptions& options,
+        LanceAutoCleanupParams& cleanup) {
+        LanceWriteOptions c_options = {};
+        c_options.params.max_rows_per_file = options.params.max_rows_per_file;
+        c_options.params.max_rows_per_group = options.params.max_rows_per_group;
+        c_options.params.max_bytes_per_file = options.params.max_bytes_per_file;
+        c_options.params.data_storage_version =
+            options.params.data_storage_version
+                ? options.params.data_storage_version->c_str()
+                : nullptr;
+        c_options.params.enable_stable_row_ids =
+            options.params.enable_stable_row_ids;
+        c_options.skip_auto_cleanup = options.skip_auto_cleanup;
+        if (options.auto_cleanup) {
+            cleanup.interval = options.auto_cleanup->interval;
+            cleanup.older_than_seconds =
+                options.auto_cleanup->older_than_seconds;
+            cleanup.older_than_nanos = options.auto_cleanup->older_than_nanos;
+            c_options.auto_cleanup = &cleanup;
+        }
+        return c_options;
+    }
+
+    static LanceCommitOptions to_c_commit_options(const CommitOptions& options) {
+        LanceCommitOptions c_options = {};
+        if (options.use_stable_row_ids) {
+            c_options.has_use_stable_row_ids = true;
+            c_options.use_stable_row_ids = *options.use_stable_row_ids;
+        }
+        if (options.enable_v2_manifest_paths) {
+            c_options.has_enable_v2_manifest_paths = true;
+            c_options.enable_v2_manifest_paths =
+                *options.enable_v2_manifest_paths;
+        }
+        if (options.max_retries) {
+            c_options.has_max_retries = true;
+            c_options.max_retries = *options.max_retries;
+        }
+        if (options.retry_timeout) {
+            c_options.has_retry_timeout = true;
+            c_options.retry_timeout_seconds = options.retry_timeout->seconds;
+            c_options.retry_timeout_nanos = options.retry_timeout->nanos;
+        }
+        c_options.timeout_mode = static_cast<int32_t>(options.timeout_mode);
+        c_options.timeout_seconds = options.timeout.seconds;
+        c_options.timeout_nanos = options.timeout.nanos;
+        c_options.detached = options.detached;
+        c_options.skip_auto_cleanup = options.skip_auto_cleanup;
+        c_options.data_storage_version =
+            options.data_storage_version
+                ? options.data_storage_version->c_str()
+                : nullptr;
+        return c_options;
     }
 
     static RemovalStats from_c_removal_stats(const LanceRemovalStats& stats) {
@@ -1380,70 +1704,8 @@ class Dataset {
         const LanceWriteOptions* native_options,
         const std::vector<std::pair<std::string, std::string>>& storage_opts) {
 
-        if (stream == nullptr) {
-            throw Error(LANCE_ERR_INVALID_ARGUMENT, "stream must not be null");
-        }
-
-        // RAII guard for the stream. Until the selected write entry point is
-        // called, any exception (failed `get_schema`, `std::bad_alloc` while
-        // building `kv`, etc.) must release the stream. After that call Rust
-        // owns it, so we `disarm()` immediately before invoking the C API.
-        struct StreamGuard {
-            ArrowArrayStream* s;
-            bool armed = true;
-            // Explicit constructor: `= delete`d copy/move ctors disqualify
-            // this from being an aggregate under C++20, so brace-init like
-            // `StreamGuard{stream}` would otherwise fail to compile there.
-            explicit StreamGuard(ArrowArrayStream* p) noexcept : s(p) {}
-            ~StreamGuard() noexcept {
-                if (armed && s && s->release) s->release(s);
-            }
-            void disarm() noexcept { armed = false; }
-            StreamGuard(const StreamGuard&) = delete;
-            StreamGuard& operator=(const StreamGuard&) = delete;
-            StreamGuard(StreamGuard&&) = delete;
-            StreamGuard& operator=(StreamGuard&&) = delete;
-        } stream_guard{stream};
-
-        // Defensive: a non-conforming or already-released producer may have a
-        // null `get_schema`. Without this guard a bad caller would crash with
-        // a null function-pointer dereference on the next line.
-        if (stream->get_schema == nullptr) {
-            throw Error(LANCE_ERR_INVALID_ARGUMENT,
-                        "stream get_schema callback is null");
-        }
-
-        // Arm SchemaGuard before calling `get_schema` so a non-conforming
-        // producer that partially populates the schema before returning an
-        // error still has its `release` fired on unwind. The zero-init keeps
-        // the destructor a no-op on the clean-error path (release == null).
-        struct SchemaGuard {
-            ArrowSchema* s;
-            // Explicit constructor for the same C++20 aggregate-init reason
-            // documented on StreamGuard above.
-            explicit SchemaGuard(ArrowSchema* p) noexcept : s(p) {}
-            ~SchemaGuard() noexcept {
-                if (s && s->release) s->release(s);
-            }
-            SchemaGuard(const SchemaGuard&) = delete;
-            SchemaGuard& operator=(const SchemaGuard&) = delete;
-            SchemaGuard(SchemaGuard&&) = delete;
-            SchemaGuard& operator=(SchemaGuard&&) = delete;
-        };
-        ArrowSchema schema = {};
-        SchemaGuard schema_guard{&schema};
-
-        // On failure, StreamGuard releases the stream and SchemaGuard
-        // releases any partial schema state — preserving the "consumed on
-        // return or throw" contract for both resources.
-        if (stream->get_schema(stream, &schema) != 0) {
-            const char* err = stream->get_last_error
-                ? stream->get_last_error(stream)
-                : nullptr;
-            std::string msg = std::string("failed to read stream schema: ") +
-                              (err ? err : "unknown");
-            throw Error(LANCE_ERR_INVALID_ARGUMENT, msg);
-        }
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
 
         std::vector<const char*> kv;
         for (auto& [k, v] : storage_opts) {
@@ -1454,10 +1716,8 @@ class Dataset {
         const char* const* opts_ptr =
             storage_opts.empty() ? nullptr : kv.data();
 
-        // The C API consumes the stream on every return path, so disarm the
-        // guard before calling. After this point the stream pointer is logically
-        // owned by Rust and any C++-side exception must not re-release it.
-        stream_guard.disarm();
+        // The C API consumes the stream on every return path.
+        ArrowArrayStream* owned_stream = input.consume();
 
         LanceDataset* out = nullptr;
         int32_t rc;
@@ -1466,8 +1726,8 @@ class Dataset {
             entry_point = "lance_dataset_write_with_options";
             rc = lance_dataset_write_with_options(
                 uri.c_str(),
-                &schema,
-                stream,
+                schema,
+                owned_stream,
                 static_cast<int32_t>(mode),
                 native_options,
                 opts_ptr,
@@ -1476,8 +1736,8 @@ class Dataset {
             entry_point = "lance_dataset_write_with_params";
             rc = lance_dataset_write_with_params(
                 uri.c_str(),
-                &schema,
-                stream,
+                schema,
+                owned_stream,
                 static_cast<int32_t>(mode),
                 legacy_params,
                 opts_ptr,
@@ -1587,32 +1847,115 @@ public:
         const WriteOptions& options,
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {}) {
 
-        LanceWriteParams c_params = {};
-        c_params.max_rows_per_file    = options.params.max_rows_per_file;
-        c_params.max_rows_per_group   = options.params.max_rows_per_group;
-        c_params.max_bytes_per_file   = options.params.max_bytes_per_file;
-        c_params.data_storage_version =
-            options.params.data_storage_version
-                ? options.params.data_storage_version->c_str()
-                : nullptr;
-        c_params.enable_stable_row_ids = options.params.enable_stable_row_ids;
-
         LanceAutoCleanupParams c_cleanup = {};
-        LanceWriteOptions c_options = {};
-        c_options.params = c_params;
-        c_options.skip_auto_cleanup = options.skip_auto_cleanup;
-        if (options.auto_cleanup) {
-            c_cleanup.interval = options.auto_cleanup->interval;
-            c_cleanup.older_than_seconds =
-                options.auto_cleanup->older_than_seconds;
-            c_cleanup.older_than_nanos =
-                options.auto_cleanup->older_than_nanos;
-            c_options.auto_cleanup = &c_cleanup;
-        }
+        LanceWriteOptions c_options = to_c_write_options(options, c_cleanup);
 
         return write_impl(
             uri, stream, mode, nullptr, &c_options, storage_opts);
     }
+
+    /// Write an Arrow stream without committing, returning the owned native
+    /// transaction for later publication with `Dataset::commit`.
+    ///
+    /// The stream is consumed on success and on every C-side error path. The
+    /// C++ guard releases it if schema extraction or local conversion throws
+    /// before the call. `session` is borrowed only for this call; native values
+    /// retain shared ownership of its caches.
+    static Transaction write_uncommitted(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const UncommittedWriteOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+
+        LanceAutoCleanupParams cleanup = {};
+        LanceWriteOptions c_write = to_c_write_options(options.write, cleanup);
+
+        std::vector<const char*> properties;
+        if (options.transaction_properties) {
+            properties.reserve(options.transaction_properties->size() * 2 + 1);
+            for (const auto& [key, value] : *options.transaction_properties) {
+                properties.push_back(key.c_str());
+                properties.push_back(value.c_str());
+            }
+            properties.push_back(nullptr);
+        }
+
+        LanceUncommittedWriteOptions c_options = {};
+        c_options.write = c_write;
+        c_options.transaction_properties =
+            options.transaction_properties ? properties.data() : nullptr;
+
+        auto storage_kv = to_c_key_values(storage_opts);
+        const char* const* storage_ptr =
+            storage_opts.empty() ? nullptr : storage_kv.data();
+
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceTransaction* transaction = nullptr;
+        if (lance_dataset_write_uncommitted_stream(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                &c_options,
+                storage_ptr,
+                session ? session->c_handle() : nullptr,
+                &transaction) != 0) {
+            check_error();
+        }
+        if (!transaction) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_uncommitted_stream returned success with "
+                "null out_transaction");
+        }
+        return Transaction(transaction);
+    }
+
+    /// Publish one native transaction through the URI's native CommitBuilder.
+    /// The transaction handle remains valid and is cloned by the C API.
+    static Dataset commit(
+        const std::string& uri,
+        const Transaction& transaction,
+        const CommitOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr) {
+
+        LanceCommitOptions c_options = to_c_commit_options(options);
+        auto storage_kv = to_c_key_values(storage_opts);
+        const char* const* storage_ptr =
+            storage_opts.empty() ? nullptr : storage_kv.data();
+
+        LanceDataset* dataset = nullptr;
+        if (lance_transaction_commit(
+                uri.c_str(),
+                transaction.c_handle(),
+                &c_options,
+                storage_ptr,
+                session ? session->c_handle() : nullptr,
+                &dataset) != 0) {
+            check_error();
+        }
+        if (!dataset) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_transaction_commit returned success with null "
+                        "out_dataset");
+        }
+        return Dataset(dataset);
+    }
+
+    /// Commit native append transactions as one version. Native eligibility and
+    /// merge semantics apply; non-append batches throw LANCE_ERR_NOT_SUPPORTED.
+    static BatchCommitResult commit_batch(
+        const std::string& uri,
+        const std::vector<std::reference_wrapper<const Transaction>>& transactions,
+        const CommitOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
 
     /// Number of rows in the dataset.
     uint64_t count_rows() const {
@@ -1927,6 +2270,32 @@ public:
             check_error();
         }
         return ArrowStream(raw);
+    }
+
+    /// Read this snapshot's native transaction. Returns nullopt when the
+    /// manifest has no transaction file. The result is independent of this
+    /// Dataset handle.
+    std::optional<Transaction> read_transaction() const {
+        LanceTransaction* transaction = nullptr;
+        if (lance_dataset_read_transaction(
+                handle_.get(), &transaction) != 0) {
+            check_error();
+        }
+        if (!transaction) return std::nullopt;
+        return Transaction(transaction);
+    }
+
+    /// Read a specific version's native transaction. Returns nullopt when that
+    /// version has no transaction file. Missing versions follow native errors.
+    std::optional<Transaction> read_transaction_by_version(
+        uint64_t version) const {
+        LanceTransaction* transaction = nullptr;
+        if (lance_dataset_read_transaction_by_version(
+                handle_.get(), version, &transaction) != 0) {
+            check_error();
+        }
+        if (!transaction) return std::nullopt;
+        return Transaction(transaction);
     }
 
     /// Current version details, including native nanosecond timestamp and
@@ -2849,6 +3218,63 @@ private:
     explicit Dataset(LanceDataset* ptr) : handle_(ptr) {}
 };
 
+/// Result of Dataset::commit_batch. The dataset and the actual native merged
+/// transaction are independently owned.
+struct BatchCommitResult {
+    Dataset dataset;
+    Transaction transaction;
+
+    BatchCommitResult(Dataset&& dataset, Transaction&& transaction)
+        : dataset(std::move(dataset)),
+          transaction(std::move(transaction)) {}
+
+    BatchCommitResult(BatchCommitResult&&) noexcept = default;
+    BatchCommitResult& operator=(BatchCommitResult&&) noexcept = default;
+    BatchCommitResult(const BatchCommitResult&) = delete;
+    BatchCommitResult& operator=(const BatchCommitResult&) = delete;
+};
+
+inline BatchCommitResult Dataset::commit_batch(
+    const std::string& uri,
+    const std::vector<std::reference_wrapper<const Transaction>>& transactions,
+    const CommitOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+
+    std::vector<const LanceTransaction*> raw;
+    raw.reserve(transactions.size());
+    for (const auto& transaction : transactions) {
+        raw.push_back(transaction.get().c_handle());
+    }
+
+    LanceCommitOptions c_options = to_c_commit_options(options);
+    auto storage_kv = to_c_key_values(storage_opts);
+    const char* const* storage_ptr =
+        storage_opts.empty() ? nullptr : storage_kv.data();
+
+    LanceDataset* dataset = nullptr;
+    LanceTransaction* merged = nullptr;
+    if (lance_transaction_commit_batch(
+            uri.c_str(),
+            raw.data(),
+            raw.size(),
+            &c_options,
+            storage_ptr,
+            session ? session->c_handle() : nullptr,
+            &dataset,
+            &merged) != 0) {
+        check_error();
+    }
+    if (!dataset || !merged) {
+        if (dataset) lance_dataset_close(dataset);
+        if (merged) lance_transaction_close(merged);
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_transaction_commit_batch returned success with null output");
+    }
+    return BatchCommitResult(Dataset(dataset), Transaction(merged));
+}
+
 // ─── Uncommitted index segments ──────────────────────────────────────────────
 
 /// Move-only owner of an Arrow C Data Interface model array and schema.
@@ -3360,7 +3786,8 @@ public:
 
     /// Generate exact candidates from one BTree/Bitmap/LabelList segment.
     /// fragment_ids is required and defines the complete read/fallback domain. See lance.h.
-    /// Requires live rows only: include_deleted_rows(true) is rejected at stream creation.
+    /// Requires live rows only: vector/MinHash/FTS queries and
+    /// include_deleted_rows(true) are rejected at stream creation.
     /// use_scalar_index(false) selects the scoped fallback without searching the segment.
     Scanner& scalar_index_segment(const std::array<uint8_t, 16>& segment_uuid) {
         if (lance_scanner_set_scalar_index_segment(handle_.get(), segment_uuid.data()) != 0)
@@ -3629,17 +4056,18 @@ public:
         if (lance_scanner_set_use_index(handle_.get(), enable) != 0) check_error();
         return *this;
     }
-    /// Use native indexed-only fast search for vector queries, scalar-indexed
-    /// filters and full-text search. Index-backed paths can omit unindexed data.
-    /// Ordinary scans and non-indexable expressions follow native planning.
-    /// Disabled by default. See lance.h.
+    /// Use native indexed-only fast search for vector, scalar-filtered,
+    /// full-text and MinHash queries. Index-backed paths can omit unindexed
+    /// data. Ordinary scans and non-indexable expressions follow native
+    /// planning. Disabled by default. See lance.h.
     Scanner& fast_search(bool enable = true) {
         if (lance_scanner_set_fast_search(handle_.get(), enable) != 0) check_error();
         return *this;
     }
-    /// Apply scanner filters before ANN when enabled, or refine ANN candidates
-    /// afterward when disabled; postfiltering may return fewer than k rows. This
-    /// does not change the fragment search domain.
+    /// Apply scanner filters before vector/MinHash ranking when enabled, or
+    /// refine ranked candidates afterward when disabled; postfiltering may
+    /// return fewer than the configured limit. This does not change the fragment
+    /// search domain.
     Scanner& prefilter(bool enable) {
         if (lance_scanner_set_prefilter(handle_.get(), enable) != 0) check_error();
         return *this;
@@ -3666,6 +4094,16 @@ public:
     /// the query and its source handles may be destroyed after success.
     Scanner& full_text_search(const FtsQuery& query) {
         if (lance_scanner_set_fts_query(handle_.get(), query.c_handle()) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Native MinHash LSH text-similarity search. `column` must have a MinHash
+    /// LSH scalar index and the scanner must have a limit. Results are ordered
+    /// by native `_distance` (1 - estimated Jaccard similarity).
+    Scanner& minhash_search(const std::string& column, const std::string& text) {
+        if (lance_scanner_set_minhash_query(handle_.get(), column.c_str(),
+                                            text.c_str()) != 0)
             check_error();
         return *this;
     }
