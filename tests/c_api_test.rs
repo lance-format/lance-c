@@ -26327,7 +26327,7 @@ fn test_native_write_options_file_writer_and_validation_errors() {
 #[test]
 fn test_native_write_options_transaction_properties_and_staged_commit() {
     let tmp = tempfile::tempdir().unwrap();
-    let session = lance_session_new(4 * 1024 * 1024, 1 * 1024 * 1024);
+    let session = lance_session_new(4 * 1024 * 1024, 1024 * 1024);
     assert!(!session.is_null(), "{}", take_last_error_message());
 
     let engine_key = c_str("engine");
@@ -26943,7 +26943,7 @@ unsafe extern "C" fn native_write_lock_release_context(callback_ctx: *mut c_void
 #[test]
 fn test_native_write_options_retain_source_owners() {
     let tmp = tempfile::tempdir().unwrap();
-    let session = lance_session_new(4 * 1024 * 1024, 1 * 1024 * 1024);
+    let session = lance_session_new(4 * 1024 * 1024, 1024 * 1024);
     let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), ptr::null()) };
     assert!(!session.is_null() && !accessor.is_null());
 
