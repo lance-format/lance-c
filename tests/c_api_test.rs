@@ -10751,16 +10751,60 @@ fn test_rtree_scalar_index_geometry_queries_and_lifecycle() {
             lance_dataset_create_scalar_index(
                 dataset,
                 geometry.as_ptr(),
-                c_str("bad_rtree_empty_params").as_ptr(),
+                c_str("empty_params_rtree").as_ptr(),
                 LanceScalarIndexType::RTree as i32,
                 c_str("").as_ptr(),
+                false,
+            )
+        },
+        0,
+        "empty params must retain native default handling: {}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_drop_index(dataset, c_str("empty_params_rtree").as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ptr::null_mut(),
+                geometry.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::RTree as i32,
+                ptr::null(),
                 false,
             )
         },
         -1
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    assert!(!take_last_error_message().is_empty());
+    assert!(
+        take_last_error_message().contains("dataset and column must not be NULL"),
+        "NULL dataset must fail at the FFI boundary"
+    );
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                c_str("").as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::RTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("column must not be empty"),
+        "empty column must fail at the FFI boundary"
+    );
 
     assert_eq!(
         unsafe {
