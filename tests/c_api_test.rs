@@ -44109,8 +44109,10 @@ fn test_memwal_vector_search_planner_on_base() {
     );
     let batches = c_stream_batches(unsafe { stream.assume_init() }).1;
     let ids = mw_int32_values(&batches, "id");
-    assert_eq!(ids.len(), 2);
-    assert!(ids.contains(&2), "{ids:?}");
+    // Native vector planning requires a base vector index; without one the
+    // plan is valid but yields no base rows. The indexed test below covers
+    // neighbor behavior against an independent flat-distance control.
+    assert!(ids.is_empty(), "{ids:?}");
     unsafe { lance_mem_wal_plan_free(plan) };
 
     // Wrong query dimension is rejected by native with the dimension details.
