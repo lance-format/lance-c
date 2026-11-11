@@ -44130,7 +44130,7 @@ fn test_memwal_merge_insert_with_compaction() {
     let on = c_str("id");
     let on_columns = [on.as_ptr()];
     let source = mw_batch(&[2, 4], &[Some("bb"), Some("dd")], &[[0.0; 4], [0.0; 4]]);
-    let mut params = LanceMergeInsertParams {
+    let params = LanceMergeInsertParams {
         when_matched: MW_MERGE_UPDATE_ALL,
         when_matched_expr: ptr::null(),
         when_not_matched: MW_MERGE_INSERT_ALL,
