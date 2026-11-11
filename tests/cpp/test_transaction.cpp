@@ -1643,10 +1643,13 @@ static void test_typed_native_operations(const std::string& source_uri,
     CHECK(field_maps.size() == 1);
     CHECK(field_maps.at(seed_id_field).count() == 2);
 
+    // The overwrite publication reuses source fragments for manifest-level
+    // assertions only, so apply the metadata change to the seed dataset whose
+    // data files are reachable for the deletion checks below.
     auto updated = lance::Dataset::commit(
-        overwrite_uri,
-        lance::Transaction::from_operation(published.version(), update_config));
-    CHECK(updated.version() == 2);
+        seed_uri,
+        lance::Transaction::from_operation(seed.version(), update_config));
+    CHECK(updated.version() == seed.version() + 1);
     auto updated_config = updated.config();
     CHECK(updated_config.find("owner") == updated_config.end());
     CHECK(updated_config.find("empty") == updated_config.end());
@@ -1659,12 +1662,15 @@ static void test_typed_native_operations(const std::string& source_uri,
                                std::string("field-value"));
     check_typed_field_metadata(updated, 0, "field-old", std::nullopt);
 
-    CHECK(updated.delete_rows("id = 1") == 1);
-    CHECK(updated.count_rows() == source_rows - 1);
+    // The overwrite publication reuses source fragments, so deletion must run
+    // against the source dataset, whose data files are reachable.
+    auto deletable = lance::Dataset::open(src_uri);
+    CHECK(deletable.delete_rows("id = 1") == 1);
+    CHECK(deletable.count_rows() == source_rows - 1);
     std::optional<lance::Fragment> deleted_fragment;
-    auto updated_ids = updated.fragment_ids();
+    auto updated_ids = deletable.fragment_ids();
     for (uint64_t fragment_id : updated_ids) {
-        auto candidate = updated.open_fragment(fragment_id);
+        auto candidate = deletable.open_fragment(fragment_id);
         if (candidate.metadata_json().find("\"deletion_file\"") !=
             std::string::npos) {
             deleted_fragment.emplace(std::move(candidate));
@@ -1672,7 +1678,7 @@ static void test_typed_native_operations(const std::string& source_uri,
         }
     }
     CHECK(deleted_fragment.has_value());
-    auto updated_schema = updated.native_schema();
+    auto updated_schema = deletable.native_schema();
     auto deletion_overwrite = lance::Operation::make_overwrite(
         updated_schema, {&*deleted_fragment}, std::nullopt, std::nullopt);
     bool deletion_rejected = false;

@@ -3025,12 +3025,15 @@ static void test_native_typed_operations(const char *src_uri,
     lance_update_map_close(typed_field_updates);
     lance_update_map_close(typed_config_updates);
 
+    // UpdateConfig must apply to a dataset whose data files are reachable;
+    // the overwrite publication reuses source fragments for manifest-level
+    // assertions only, so commit the metadata change against the seed.
     LanceTransaction *update_transaction =
         lance_transaction_new(1, update_config, NULL);
     ASSERT(update_transaction != NULL, "typed UpdateConfig transaction");
     CHECK_OK();
     LanceDataset *updated =
-        commit_transaction(overwrite_uri, update_transaction, NULL);
+        commit_transaction(seed_uri, update_transaction, NULL);
     ASSERT(lance_dataset_version(updated) == 2,
            "typed UpdateConfig version");
     CHECK_OK();
@@ -3056,23 +3059,28 @@ static void test_native_typed_operations(const char *src_uri,
     check_field_schema_metadata(updated, 0, "field-key", "field-value");
     check_field_schema_metadata(updated, 0, "field-old", NULL);
 
+    // The overwrite publication reuses source fragments, so deletion must run
+    // against the source dataset, whose data files are reachable.
+    LanceDataset *deletable = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(deletable != NULL, "open typed deletion dataset");
+    CHECK_OK();
     uint64_t deleted = 0;
-    ASSERT(lance_dataset_delete(updated, "id = 1", &deleted) == 0,
+    ASSERT(lance_dataset_delete(deletable, "id = 1", &deleted) == 0,
            "typed deletion seed");
     CHECK_OK();
     ASSERT(deleted == 1, "typed deletion count");
-    uint64_t updated_fragment_count = lance_dataset_fragment_count(updated);
+    uint64_t updated_fragment_count = lance_dataset_fragment_count(deletable);
     CHECK_OK();
     uint64_t *updated_ids =
         (uint64_t *)calloc(updated_fragment_count, sizeof(uint64_t));
     ASSERT(updated_ids != NULL, "allocate typed deletion fragment ids");
-    ASSERT(lance_dataset_fragment_ids(updated, updated_ids) == 0,
+    ASSERT(lance_dataset_fragment_ids(deletable, updated_ids) == 0,
            "typed deletion fragment ids");
     CHECK_OK();
     LanceFragment *deleted_fragment = NULL;
     for (uint64_t i = 0; i < updated_fragment_count; i++) {
         LanceFragment *candidate =
-            lance_dataset_open_fragment(updated, updated_ids[i]);
+            lance_dataset_open_fragment(deletable, updated_ids[i]);
         ASSERT(candidate != NULL, "open typed deletion fragment");
         CHECK_OK();
         const char *candidate_json = lance_fragment_metadata_json(candidate);
@@ -3088,7 +3096,7 @@ static void test_native_typed_operations(const char *src_uri,
     }
     ASSERT(deleted_fragment != NULL, "typed deletion fragment found");
     LanceSchema *updated_schema = NULL;
-    ASSERT(lance_dataset_schema_clone(updated, &updated_schema) == 0,
+    ASSERT(lance_dataset_schema_clone(deletable, &updated_schema) == 0,
            "typed deletion schema clone");
     CHECK_OK();
     const LanceFragment *deletion_fragments[] = {deleted_fragment};
@@ -3168,6 +3176,7 @@ static void test_native_typed_operations(const char *src_uri,
     lance_update_map_close(field_updates);
     lance_dataset_close(published);
     lance_dataset_close(updated);
+    lance_dataset_close(deletable);
     lance_operation_close(overwrite);
     lance_transaction_close(overwrite_transaction);
     lance_operation_close(merge);
