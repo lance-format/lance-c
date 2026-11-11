@@ -45955,6 +45955,172 @@ fn test_memwal_merge_insert_with_compaction() {
 }
 
 #[test]
+fn test_memwal_oversized_array_counts_are_invalid_arguments() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    let version = unsafe { lance_dataset_version(ds) };
+    let key = c_str("id");
+    let columns = [key.as_ptr()];
+    let pointer_count = isize::MAX as usize / std::mem::size_of::<*const std::ffi::c_char>() + 1;
+    let assert_count_error = |label: &str| {
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = take_last_error_message();
+        assert!(message.contains(label), "{message}");
+        assert!(message.contains("count"), "{message}");
+    };
+
+    let compacted = LanceCompactedSsTable {
+        shard_id: [0; 16],
+        generation: 0,
+    };
+    let compacted_count = isize::MAX as usize / std::mem::size_of::<LanceCompactedSsTable>() + 1;
+    for count in [compacted_count, usize::MAX] {
+        let mut source = batch_to_ffi_stream(mw_batch(&[4], &[Some("d")], &[[0.0; 4]]));
+        let mut result = LanceMergeInsertResult {
+            num_inserted_rows: 11,
+            num_updated_rows: 12,
+            num_deleted_rows: 13,
+        };
+        assert_eq!(
+            unsafe {
+                lance_dataset_merge_insert_with_compaction(
+                    ds,
+                    columns.as_ptr(),
+                    columns.len(),
+                    &mut source,
+                    ptr::null(),
+                    &compacted,
+                    count,
+                    &mut result,
+                )
+            },
+            -1
+        );
+        assert_count_error("compacted_sstables");
+        assert_eq!(result.num_inserted_rows, 11);
+        assert_eq!(result.num_updated_rows, 12);
+        assert_eq!(result.num_deleted_rows, 13);
+    }
+
+    let mut source = batch_to_ffi_stream(mw_batch(&[4], &[Some("d")], &[[0.0; 4]]));
+    assert_eq!(
+        unsafe {
+            lance_dataset_merge_insert(
+                ds,
+                columns.as_ptr(),
+                pointer_count,
+                &mut source,
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    assert_count_error("on_columns");
+
+    let snapshots = [ptr::null::<LanceMemWalShardSnapshot>()];
+    let mut scanner = ptr::dangling_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_scanner_from_snapshots(ds, snapshots.as_ptr(), pointer_count, &mut scanner)
+        },
+        -1
+    );
+    assert_count_error("snapshots");
+    assert_eq!(scanner, ptr::dangling_mut());
+    assert_eq!(
+        unsafe { lance_lsm_scanner_from_snapshots(ds, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_lsm_scanner_project(scanner, columns.as_ptr(), pointer_count) },
+        -1
+    );
+    assert_count_error("columns");
+    assert_eq!(
+        unsafe { lance_lsm_scanner_project(scanner, columns.as_ptr(), columns.len()) },
+        0
+    );
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    let fields = [ptr::null::<LanceMemWalShardingField>()];
+    let mut spec = ptr::dangling_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_sharding_spec_new(0, fields.as_ptr(), pointer_count, &mut spec) },
+        -1
+    );
+    assert_count_error("fields");
+    assert_eq!(spec, ptr::dangling_mut());
+
+    let source_id = 0;
+    let source_id_count = isize::MAX as usize / std::mem::size_of::<i32>() + 1;
+    let mut field = ptr::dangling_mut();
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_sharding_field_new(
+                key.as_ptr(),
+                &source_id,
+                source_id_count,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                &mut field,
+            )
+        },
+        -1
+    );
+    assert_count_error("source_ids");
+    assert_eq!(field, ptr::dangling_mut());
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_sharding_field_new(
+                key.as_ptr(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                columns.as_ptr(),
+                columns.as_ptr(),
+                pointer_count,
+                &mut field,
+            )
+        },
+        -1
+    );
+    assert_count_error("parameters");
+    assert_eq!(field, ptr::dangling_mut());
+
+    let hnsw = LanceMemWalHnswParams {
+        index_name: key.as_ptr(),
+        has_num_edges: 0,
+        num_edges: 0,
+        has_ef_construction: 0,
+        ef_construction: 0,
+        has_max_level: 0,
+        max_level: 0,
+    };
+    let config = LanceShardWriterConfig {
+        hnsw_params: &hnsw,
+        num_hnsw_params: isize::MAX as usize / std::mem::size_of::<LanceMemWalHnswParams>() + 1,
+        ..Default::default()
+    };
+    let shard = c_str("00000000-0000-0000-0000-000000000000");
+    let mut writer = ptr::dangling_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_open(ds, shard.as_ptr(), &config, &mut writer) },
+        -1
+    );
+    assert_count_error("hnsw_params");
+    assert_eq!(writer, ptr::dangling_mut());
+    assert_eq!(unsafe { lance_dataset_version(ds) }, version);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_memwal_null_and_error_edges() {
     assert_eq!(
         unsafe { lance_mem_wal_index_details(ptr::null_mut(), ptr::null_mut()) },
