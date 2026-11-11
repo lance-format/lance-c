@@ -231,24 +231,15 @@ int test_transfer_write_failures(const std::string& base_path) {
 
     auto failed_writer =
         files.open_packed_blob_writer("blob-write-failure.lance", 73);
-    bool first_blob_write_threw = false;
-    LanceErrorCode first_blob_write_error = LANCE_OK;
+    bool blob_writes_threw = false;
+    LanceErrorCode blob_write_error = LANCE_OK;
     try {
         failed_writer.write_blob(
             std::vector<uint8_t>(16 * 1024, static_cast<uint8_t>('x')));
-    } catch (const lance::Error& error) {
-        first_blob_write_threw = true;
-        first_blob_write_error = error.code;
-    }
-    bool second_blob_write_threw = false;
-    bool second_blob_write_reports_lost_upload = false;
-    try {
         failed_writer.write_blob(std::vector<uint8_t>{'y'});
     } catch (const lance::Error& error) {
-        second_blob_write_threw = true;
-        second_blob_write_reports_lost_upload =
-            std::string(error.what()).find("no active upload") !=
-            std::string::npos;
+        blob_writes_threw = true;
+        blob_write_error = error.code;
     }
     const auto sentinel = reinterpret_cast<void*>(
         static_cast<uintptr_t>(0x5a5a));
@@ -265,16 +256,11 @@ int test_transfer_write_failures(const std::string& base_path) {
         std::cout << "packed blob finish error=" << error.code << ": "
                   << error.what() << std::endl;
     }
-    std::cout << "packed blob write failure: first_error="
-              << first_blob_write_error
-              << ", first_threw=" << first_blob_write_threw
-              << ", second_threw=" << second_blob_write_threw
+    std::cout << "packed blob write failure: writes_threw="
+              << blob_writes_threw << ", write_error=" << blob_write_error
               << ", finish_threw=" << blob_finish_threw << std::endl;
-    CHECK(first_blob_write_threw,
-          "packed writer reports a native write failure");
-    CHECK(second_blob_write_threw &&
-              second_blob_write_reports_lost_upload,
-          "packed failed write leaves native state without an active upload");
+    CHECK(!blob_writes_threw,
+          "buffered packed writes defer the file-size failure to finish");
     CHECK(blob_finish_threw, "packed finish after write failure reports error");
     CHECK(failed_array.private_data == sentinel &&
               failed_array.release == nullptr,
