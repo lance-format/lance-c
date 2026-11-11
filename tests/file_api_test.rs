@@ -1780,6 +1780,12 @@ fn storage_provider_none_some_empty_error_expiry_and_force() {
         lance_storage_options_accessor_close(accessor);
         lance_storage_options_provider_close(provider);
     }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while counters.provider_releases.load(Ordering::SeqCst) == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(counters.provider_releases.load(Ordering::SeqCst), 1);
     drop(provider_id);
 
