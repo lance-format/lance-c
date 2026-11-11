@@ -7283,8 +7283,7 @@ LanceDataOverlayFile* lance_data_overlay_file_clone(
  * Returns an owned data file, or NULL on error.
  */
 LanceDataFile* lance_data_overlay_file_data_file(
-    const LanceDataOverlayFile* file,
-    LanceDataFile** out_file
+    const LanceDataOverlayFile* file
 );
 
 /**
