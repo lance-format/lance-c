@@ -2541,8 +2541,9 @@ static void test_native_operation_construction(const char *src_uri,
 }
 
 
-static const char *arrow_metadata_value(const char *metadata, const char *key) {
-    if (!metadata) return NULL;
+static bool arrow_metadata_matches(const char *metadata, const char *key,
+                                  const char *expected) {
+    if (!metadata) return expected == NULL;
     size_t key_len = strlen(key);
     const char *cursor = metadata;
     int32_t pair_count = 0;
@@ -2561,10 +2562,13 @@ static const char *arrow_metadata_value(const char *metadata, const char *key) {
         cursor += value_len;
         if (entry_key_len == (int32_t)key_len &&
             memcmp(entry_key, key, key_len) == 0) {
-            return entry_value;
+            if (expected == NULL) return false;
+            size_t expected_len = strlen(expected);
+            return value_len == (int32_t)expected_len &&
+                   memcmp(entry_value, expected, expected_len) == 0;
         }
     }
-    return NULL;
+    return expected == NULL;
 }
 
 static void check_dataset_schema_metadata(LanceDataset *dataset,
@@ -2574,11 +2578,11 @@ static void check_dataset_schema_metadata(LanceDataset *dataset,
     memset(&schema, 0, sizeof(schema));
     ASSERT(lance_dataset_schema(dataset, &schema) == 0, "export dataset schema");
     CHECK_OK();
-    const char *value = arrow_metadata_value(schema.metadata, key);
     if (expected == NULL) {
-        ASSERT(value == NULL, "schema metadata key must be absent");
+        ASSERT(arrow_metadata_matches(schema.metadata, key, NULL),
+               "schema metadata key must be absent");
     } else {
-        ASSERT(value != NULL && strcmp(value, expected) == 0,
+        ASSERT(arrow_metadata_matches(schema.metadata, key, expected),
                "schema metadata value");
     }
     if (schema.release) schema.release(&schema);
@@ -2593,12 +2597,13 @@ static void check_field_schema_metadata(LanceDataset *dataset,
     ASSERT(lance_dataset_schema(dataset, &schema) == 0, "export dataset schema");
     CHECK_OK();
     ASSERT(field_index < (uint64_t)schema.n_children, "schema field index");
-    const char *value =
-        arrow_metadata_value(schema.children[field_index]->metadata, key);
     if (expected == NULL) {
-        ASSERT(value == NULL, "field metadata key must be absent");
+        ASSERT(arrow_metadata_matches(schema.children[field_index]->metadata,
+                                      key, NULL),
+               "field metadata key must be absent");
     } else {
-        ASSERT(value != NULL && strcmp(value, expected) == 0,
+        ASSERT(arrow_metadata_matches(schema.children[field_index]->metadata,
+                                      key, expected),
                "field metadata value");
     }
     if (schema.release) schema.release(&schema);
