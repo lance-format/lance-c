@@ -1850,7 +1850,6 @@ static int write_managed_descriptor_stream(
     struct ArrowArray *wrapped_array = wrap_record_array(array);
     state->array = *wrapped_array;
     free(wrapped_array);
-    free(array);
 
     struct ArrowArrayStream stream = {0};
     stream.get_schema = prepared_stream_get_schema;

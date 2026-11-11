@@ -35192,7 +35192,7 @@ fn test_dataset_read_blob_ranges_identity_nulls_and_options() {
     let all_row_ids = scan_blob_row_ids(dataset);
     let base_requests = [
         (7usize, 100u64, 20u64),
-        (7, 110, 20),
+        (7, 108, 20),
         (2, 128, 0),
         (9, 40, 16),
         (2, 100, 8),
