@@ -849,8 +849,8 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
     });
 
     let mut v1_stream = one_column_stream("value", vec![Some(1), Some(2), Some(3), Some(4)]);
-    let mut sentinel_group = 1usize as *mut LanceDataReplacementGroup;
-    let unchanged_group = sentinel_group;
+    let unchanged_group = ptr::dangling_mut::<LanceDataReplacementGroup>();
+    let mut sentinel_group = unchanged_group;
     assert_eq!(
         unsafe {
             lance_fragment_write_column_with_version(
@@ -902,7 +902,7 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
     });
     assert!(native_full.unwrap().is_none());
     let all_offsets = [0u32, 1, 2, 3];
-    let mut full_output = 1usize as *mut LanceFragment;
+    let mut full_output = ptr::dangling_mut::<LanceFragment>();
     assert_eq!(
         unsafe {
             lance_fragment_delete_rows(
@@ -923,7 +923,8 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
             .await
     });
     let invalid_offsets = [100u32];
-    let mut invalid_output = 1usize as *mut LanceFragment;
+    let invalid_output_sentinel = ptr::dangling_mut::<LanceFragment>();
+    let mut invalid_output = invalid_output_sentinel;
     let rc = unsafe {
         lance_fragment_delete_rows(
             second,
@@ -934,7 +935,7 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
     };
     assert_eq!(rc == 0, native_out_of_range.is_ok());
     if rc != 0 {
-        assert_eq!(invalid_output, 1usize as *mut LanceFragment);
+        assert_eq!(invalid_output, invalid_output_sentinel);
         let (_, message) = take_error();
         assert_eq!(
             message,
@@ -945,7 +946,7 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
 
     assert_eq!(fragment_metadata(fragment), source_metadata);
     unsafe {
-        if !invalid_output.is_null() && invalid_output != 1usize as *mut LanceFragment {
+        if !invalid_output.is_null() && invalid_output != invalid_output_sentinel {
             lance_fragment_close(invalid_output);
         }
         lance_fragment_close(staged_second);
@@ -983,8 +984,8 @@ fn test_fragment_mutation_errors_preserve_outputs_and_consume_streams_once() {
         name: sql_name.as_ptr(),
         expression: sql_expression.as_ptr(),
     }];
-    let mut sql_fragment = 1usize as *mut LanceFragment;
-    let mut sql_schema = 1usize as *mut LanceSchema;
+    let mut sql_fragment = ptr::dangling_mut::<LanceFragment>();
+    let mut sql_schema = ptr::dangling_mut::<LanceSchema>();
     let sql_fragment_sentinel = sql_fragment;
     let sql_schema_sentinel = sql_schema;
     assert_eq!(
@@ -1015,8 +1016,8 @@ fn test_fragment_mutation_errors_preserve_outputs_and_consume_streams_once() {
     let _ = take_error();
 
     let zero = 0u32;
-    let mut zero_fragment = 1usize as *mut LanceFragment;
-    let mut zero_schema = 1usize as *mut LanceSchema;
+    let mut zero_fragment = ptr::dangling_mut::<LanceFragment>();
+    let mut zero_schema = ptr::dangling_mut::<LanceSchema>();
     let zero_fragment_sentinel = zero_fragment;
     let zero_schema_sentinel = zero_schema;
     assert_eq!(
@@ -1040,8 +1041,8 @@ fn test_fragment_mutation_errors_preserve_outputs_and_consume_streams_once() {
 
     let mut zero_reader_stream =
         one_column_stream("zero_reader", vec![Some(1), Some(2), Some(3), Some(4)]);
-    let mut zero_reader_fragment = 1usize as *mut LanceFragment;
-    let mut zero_reader_schema = 1usize as *mut LanceSchema;
+    let mut zero_reader_fragment = ptr::dangling_mut::<LanceFragment>();
+    let mut zero_reader_schema = ptr::dangling_mut::<LanceSchema>();
     let zero_reader_fragment_sentinel = zero_reader_fragment;
     let zero_reader_schema_sentinel = zero_reader_schema;
     assert_eq!(
@@ -1097,7 +1098,7 @@ fn test_fragment_mutation_errors_preserve_outputs_and_consume_streams_once() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     let _ = take_error();
 
-    let result_sentinel = 1usize as *mut LanceFragmentUpdateColumnsResult;
+    let result_sentinel = ptr::dangling_mut::<LanceFragmentUpdateColumnsResult>();
     let mut result = result_sentinel;
     let mut bad_stream = join_stream(vec![1], "value", vec![Some(1)]);
     let left_on = c_string("missing_left");
