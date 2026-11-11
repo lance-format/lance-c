@@ -24001,7 +24001,8 @@ fn test_typed_fts_list_element_execution_matches_native_semantics() {
 
     let mut phrase_options = initialized_phrase_options();
     phrase_options.document_granularity = LanceFtsDocumentGranularity::ListElement as i32;
-    let phrase_cases: [(&str, &[(i32, &[u32])]); 3] = [
+    type ExpectedMembership<'a> = &'a [(i32, &'a [u32])];
+    let phrase_cases: [(&str, ExpectedMembership<'_>); 3] = [
         ("alpha beta", &[(1, &[0]), (9, &[0]), (10, &[1])]),
         ("beta alpha", &[(2, &[1])]),
         ("beta gamma", &[(9, &[0])]),
