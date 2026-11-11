@@ -663,6 +663,18 @@ fn test_fragment_merge_and_update_match_native_oracle() {
     }
     let expected_offsets = native_update.matched_offsets.iter().collect::<Vec<_>>();
     assert_eq!(offsets, expected_offsets);
+    let mut copied_offsets = vec![u32::MAX; offsets.len()];
+    assert_eq!(
+        unsafe {
+            lance_fragment_update_columns_result_matched_offsets(
+                update_result,
+                copied_offsets.as_mut_ptr(),
+                copied_offsets.len(),
+            )
+        },
+        0
+    );
+    assert_eq!(copied_offsets, expected_offsets);
 
     let mut serialized = ptr::null_mut();
     let mut serialized_len = 0_usize;
@@ -691,6 +703,7 @@ fn test_fragment_merge_and_update_match_native_oracle() {
         0
     );
     unsafe { lance_fragment_update_columns_result_close(update_result) };
+    assert_eq!(copied_offsets, expected_offsets);
     assert_eq!(
         fragment_metadata(updated_fragment)["physical_rows"].as_u64(),
         native_update.fragment.physical_rows.map(|rows| rows as u64)
