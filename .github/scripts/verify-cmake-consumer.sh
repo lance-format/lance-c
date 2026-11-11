@@ -53,6 +53,11 @@ verify_consumer_prefix() {
             echo "Expected exit code 2 (usage error) for ${linkage} consumer, got $rc" >&2
             exit 1
         fi
+
+        echo "==> Running installed acceptance consumer (${linkage} linkage)"
+        acceptance_uri="file://${work_dir}/acceptance-${linkage}.lance"
+        rm -rf "${work_dir}/acceptance-${linkage}.lance"
+        "$build_dir/acceptance" "$acceptance_uri"
     done
 }
 

@@ -536,6 +536,8 @@ three of them:
 | `lance-c-v0.1.9-aarch64-apple-darwin.tar.xz` | vcpkg `arm64-osx`, `arm64-osx-dynamic`, Conan `Macos/armv8` |
 
 Intel macOS (`x86_64-apple-darwin`) uses the `from-source` path for v0.1.9.
+Releases cut after the Windows package path was added also publish
+`lance-c-vX.Y.Z-x86_64-pc-windows-msvc.tar.xz`; v0.1.9 predates that artifact.
 The archives contain headers, static and shared libraries,
 CMake package files, pkg-config metadata, and the license. The package recipes
 install only the linkage selected for that package.
@@ -620,6 +622,30 @@ target_link_libraries(myapp PRIVATE LanceC::lance_c)
 
 See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
 working example.
+
+### Windows (x86_64-pc-windows-msvc)
+
+The Windows package path uses the same CMake entry point:
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+cmake --install build --prefix C:\path\to\prefix --config Release
+```
+
+The install prefix contains `lib/lance_c.dll`, its import library
+`lib/lance_c.dll.lib`, the static library `lib/lance_c.lib`, and the public
+headers. `find_package(LanceC)` selects the static library by default; set
+`LanceC_LINK=shared` before `find_package` to link through the import library.
+The installed shared consumer must have `lance_c.dll` beside its executable or
+on its DLL search path.
+
+Windows CI builds this layout with Rust 1.94.0, verifies the PE32+ x64
+architecture, public `lance_*` exports and resolved runtime DLL dependencies,
+then runs static and shared C++17 consumers with `PATH` restricted to the
+Windows system directories. The tested runner is `windows-2022`. This does not
+establish `aarch64-pc-windows-msvc` or an older Windows runtime baseline.
 
 See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
 for a reproducible native-14 C segment to Java-12 commit/query PoC.
@@ -1122,7 +1148,7 @@ back.
 
 ## Releasing
 
-Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds five prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, and macOS arm64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. Intel macOS consumers use the source build described above.
+Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds six prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, macOS arm64, and Windows x86_64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. Intel macOS consumers use the source build described above.
 Before the consumer smoke test and archive upload, the build rows strip the staged shared library, verify its exports, and verify the Linux direct runtime dependencies.
 
 ### Recommended: cut a release via Actions UI
@@ -1139,7 +1165,7 @@ Before the consumer smoke test and archive upload, the build rows strip the stag
    - Commits as `github-actions[bot]` with message `chore: bump version to <version>`.
    - Pushes the commit to `main` and pushes the tag.
    - Dispatches `release.yml` at the new tag's ref. (Direct tag push by `GITHUB_TOKEN` does not trigger workflows — GitHub's recursion guard — so we explicitly `gh workflow run` instead.)
-4. `release.yml` builds artifacts. ~20 minutes later the [GitHub Release](https://github.com/lance-format/lance-c/releases) has all published `.tar.xz` artifacts (Linux x86_64/aarch64, their Debian 12 variants, and macOS arm64) plus a `SHA512SUMS` file.
+4. `release.yml` builds artifacts. The [GitHub Release](https://github.com/lance-format/lance-c/releases) has all published `.tar.xz` artifacts (Linux x86_64/aarch64, their Debian 12 variants, macOS arm64, and Windows x86_64) plus a `SHA512SUMS` file.
 5. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
    - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
    - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
@@ -1167,7 +1193,7 @@ If you need to cut a release without the workflow (e.g. local tag with extra com
    git tag v0.2.0
    git push origin v0.2.0
    ```
-5. `release.yml` fires on the tag push and builds the five prebuilt tarballs as above.
+5. `release.yml` fires on the tag push and builds the six prebuilt tarballs as above.
 
 A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 
