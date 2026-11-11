@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{
+    AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
+};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26229,6 +26231,1130 @@ fn test_dataset_write_empty_stream_creates_empty_dataset() {
     assert!(!ds.is_null());
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 0);
     unsafe { lance_dataset_close(ds) };
+}
+
+// ---------------------------------------------------------------------------
+// Owned native dataset-write options
+// ---------------------------------------------------------------------------
+
+fn native_write_options_new(spec: &LanceNativeWriteOptionsSpec) -> *mut LanceNativeWriteOptions {
+    let options = unsafe { lance_native_write_options_new(spec) };
+    assert!(!options.is_null(), "{}", take_last_error_message());
+    options
+}
+
+fn native_write_default_spec() -> LanceNativeWriteOptionsSpec {
+    unsafe { std::mem::zeroed() }
+}
+
+fn native_write_dataset(
+    uri: &str,
+    batch: RecordBatch,
+    mode: LanceWriteMode,
+    options: *const LanceNativeWriteOptions,
+) -> (i32, *mut LanceDataset) {
+    let c_uri = c_str(uri);
+    let ffi_schema = schema_to_ffi(&batch.schema());
+    let mut stream = batch_to_ffi_stream(batch);
+    let mut out = ptr::null_mut();
+    let rc = unsafe {
+        lance_dataset_write_with_native_options(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            mode as i32,
+            options,
+            &mut out,
+        )
+    };
+    (rc, out)
+}
+
+fn native_write_uncommitted(
+    uri: &str,
+    batch: RecordBatch,
+    mode: LanceWriteMode,
+    options: *const LanceNativeWriteOptions,
+) -> (i32, *mut LanceTransaction) {
+    let c_uri = c_str(uri);
+    let ffi_schema = schema_to_ffi(&batch.schema());
+    let mut stream = batch_to_ffi_stream(batch);
+    let mut out = ptr::null_mut();
+    let rc = unsafe {
+        lance_dataset_write_uncommitted_stream_with_native_options(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            mode as i32,
+            options,
+            &mut out,
+        )
+    };
+    (rc, out)
+}
+
+fn version_manifest_stems(uri: &str) -> Vec<String> {
+    let versions = std::path::Path::new(uri).join("_versions");
+    let mut stems = std::fs::read_dir(&versions)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with("latest_version_hint"))
+        .filter_map(|name| name.strip_suffix(".manifest").map(str::to_owned))
+        .collect::<Vec<_>>();
+    stems.sort();
+    assert!(!stems.is_empty(), "expected at least one manifest");
+    stems
+}
+
+fn dataset_file_base_ids(dataset: *const LanceDataset) -> Vec<Option<u64>> {
+    let count = unsafe { lance_dataset_fragment_count(dataset) };
+    let mut ids = vec![0_u64; count as usize];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, ids.as_mut_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut base_ids = Vec::new();
+    for id in ids {
+        let fragment = unsafe { lance_dataset_open_fragment(dataset, id) };
+        assert!(!fragment.is_null(), "{}", take_last_error_message());
+        let metadata = fragment_metadata_via_c(fragment);
+        for file in metadata["files"].as_array().unwrap() {
+            base_ids.push(file["base_id"].as_u64());
+        }
+        unsafe { lance_fragment_close(fragment) };
+    }
+    base_ids
+}
+
+#[test]
+fn test_native_write_options_create_append_overwrite_and_manifest_scheme() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("native_options_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut spec = native_write_default_spec();
+    let options = native_write_options_new(&spec);
+
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    unsafe { lance_dataset_close(ds) };
+
+    let stems = version_manifest_stems(&uri);
+    assert!(
+        stems.iter().all(|stem| stem.len() == 20),
+        "default create should use v2 manifest names, got {stems:?}"
+    );
+
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![4, 5], vec![4.0, 5.0]),
+        LanceWriteMode::Append,
+        options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 5);
+    unsafe { lance_dataset_close(ds) };
+
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![100, 200], vec![100.0, 200.0]),
+        LanceWriteMode::Overwrite,
+        options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+    unsafe { lance_dataset_close(ds) };
+    unsafe { lance_native_write_options_close(options) };
+
+    let uri_default = tmp
+        .path()
+        .join("native_options_null_handle")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &uri_default,
+        write_batch(vec![7], vec![7.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 1);
+    unsafe { lance_dataset_close(ds) };
+
+    spec.has_enable_v2_manifest_paths = 1;
+    spec.enable_v2_manifest_paths = false;
+    let v1_options = native_write_options_new(&spec);
+    let v1_uri = tmp
+        .path()
+        .join("native_options_v1")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &v1_uri,
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        v1_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    unsafe { lance_dataset_close(ds) };
+    unsafe { lance_native_write_options_close(v1_options) };
+    let stems = version_manifest_stems(&v1_uri);
+    assert!(
+        stems.iter().any(|stem| stem == "1"),
+        "explicit false should create a v1 manifest name, got {stems:?}"
+    );
+}
+
+#[test]
+fn test_native_write_options_file_writer_and_validation_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut write_options: LanceWriteOptions = unsafe { std::mem::zeroed() };
+    let version = c_str("2.2");
+    write_options.params.data_storage_version = version.as_ptr();
+
+    let mut file_options: LanceFileWriterOptions = unsafe { std::mem::zeroed() };
+    file_options.has_data_cache_bytes = 1;
+    file_options.data_cache_bytes = 1024 * 1024;
+    file_options.has_max_page_bytes = 1;
+    file_options.max_page_bytes = 4096;
+    file_options.has_keep_original_array = 1;
+    file_options.keep_original_array = 0;
+
+    let mut spec = native_write_default_spec();
+    spec.write_options = &write_options;
+    spec.file_writer_options = &file_options;
+    let options = native_write_options_new(&spec);
+    let uri = tmp
+        .path()
+        .join("file_writer_ok")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![1, 2], vec![1.0, 2.0]),
+        LanceWriteMode::Create,
+        options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(options);
+    }
+
+    let raw_version = c_str("2.1");
+    file_options.version = raw_version.as_ptr();
+    let mut invalid_spec = native_write_default_spec();
+    invalid_spec.file_writer_options = &file_options;
+    assert!(unsafe { lance_native_write_options_new(&invalid_spec) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("file_writer_options.version"));
+
+    file_options.version = ptr::null();
+    file_options.max_page_bytes = 0;
+    let mut invalid_page_spec = native_write_default_spec();
+    invalid_page_spec.write_options = &write_options;
+    invalid_page_spec.file_writer_options = &file_options;
+    let invalid_options = native_write_options_new(&invalid_page_spec);
+    let invalid_uri = tmp
+        .path()
+        .join("file_writer_invalid_page")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &invalid_uri,
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        invalid_options,
+    );
+    assert_eq!(rc, -1);
+    assert!(ds.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("max_page_bytes"));
+    unsafe { lance_native_write_options_close(invalid_options) };
+    let invalid_uri_c = c_str(&invalid_uri);
+    assert!(
+        unsafe { lance_dataset_open(invalid_uri_c.as_ptr(), ptr::null(), 0) }.is_null(),
+        "failed write must not publish a dataset"
+    );
+}
+
+#[test]
+fn test_native_write_options_transaction_properties_and_staged_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = lance_session_new(4 * 1024 * 1024, 1024 * 1024);
+    assert!(!session.is_null(), "{}", take_last_error_message());
+
+    let engine_key = c_str("engine");
+    let engine_value = c_str("native-write-options");
+    let mode_key = c_str("mode");
+    let mode_value = c_str("staged");
+    let keys = [engine_key.as_ptr(), mode_key.as_ptr()];
+    let values = [engine_value.as_ptr(), mode_value.as_ptr()];
+    let properties = LanceTransactionProperties {
+        keys: keys.as_ptr(),
+        values: values.as_ptr(),
+        count: keys.len(),
+    };
+
+    let mut spec = native_write_default_spec();
+    spec.session = session;
+    spec.transaction_properties = &properties;
+    let options = native_write_options_new(&spec);
+    unsafe { lance_session_close(session) };
+
+    let staged_uri = tmp
+        .path()
+        .join("staged_properties")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, transaction) = native_write_uncommitted(
+        &staged_uri,
+        write_batch(vec![1, 2], vec![1.0, 2.0]),
+        LanceWriteMode::Create,
+        options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert!(!transaction.is_null());
+    let (present, staged_properties) = native_transaction_properties(transaction);
+    assert!(present);
+    assert_eq!(
+        staged_properties.get("engine").map(String::as_str),
+        Some("native-write-options")
+    );
+    assert_eq!(
+        staged_properties.get("mode").map(String::as_str),
+        Some("staged")
+    );
+
+    let c_uri = c_str(&staged_uri);
+    let mut committed = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                c_uri.as_ptr(),
+                transaction,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &mut committed,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!committed.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(committed) }, 2);
+
+    let mut read_transaction = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_read_transaction(committed, &mut read_transaction) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!read_transaction.is_null());
+    let (present, committed_properties) = native_transaction_properties(read_transaction);
+    assert!(present);
+    assert_eq!(committed_properties, staged_properties);
+    unsafe {
+        lance_transaction_close(read_transaction);
+        lance_transaction_close(transaction);
+        lance_dataset_close(committed);
+    }
+
+    let ordinary_uri = tmp
+        .path()
+        .join("ordinary_properties")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &ordinary_uri,
+        write_batch(vec![3], vec![3.0]),
+        LanceWriteMode::Create,
+        options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let mut ordinary_transaction = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_read_transaction(ds, &mut ordinary_transaction) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!ordinary_transaction.is_null());
+    let (present, ordinary_properties) = native_transaction_properties(ordinary_transaction);
+    assert!(present);
+    assert_eq!(
+        ordinary_properties.get("engine").map(String::as_str),
+        Some("native-write-options")
+    );
+    unsafe {
+        lance_transaction_close(ordinary_transaction);
+        lance_dataset_close(ds);
+        lance_native_write_options_close(options);
+    }
+
+    let empty_properties = LanceTransactionProperties {
+        keys: ptr::null(),
+        values: ptr::null(),
+        count: 0,
+    };
+    let mut empty_spec = native_write_default_spec();
+    empty_spec.transaction_properties = &empty_properties;
+    let empty_options = native_write_options_new(&empty_spec);
+    let empty_uri = tmp
+        .path()
+        .join("empty_properties")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, empty_transaction) = native_write_uncommitted(
+        &empty_uri,
+        write_batch(vec![4], vec![4.0]),
+        LanceWriteMode::Create,
+        empty_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (present, values) = native_transaction_properties(empty_transaction);
+    assert!(present);
+    assert!(values.is_empty());
+    unsafe {
+        lance_transaction_close(empty_transaction);
+        lance_native_write_options_close(empty_options);
+    }
+}
+
+#[test]
+fn test_native_write_options_base_registration_and_target_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("primary").to_str().unwrap().to_string();
+    let base1_uri = tmp.path().join("base1").to_str().unwrap().to_string();
+    let base2_uri = tmp.path().join("base2").to_str().unwrap().to_string();
+
+    let base1_path = c_str(&base1_uri);
+    let base2_path = c_str(&base2_uri);
+    let base1_name = c_str("base1");
+    let base2_name = c_str("base2");
+    let initial = [
+        LanceBasePath {
+            id: 1,
+            path: base1_path.as_ptr(),
+            name: base1_name.as_ptr(),
+            is_dataset_root: true,
+        },
+        LanceBasePath {
+            id: 2,
+            path: base2_path.as_ptr(),
+            name: base2_name.as_ptr(),
+            is_dataset_root: false,
+        },
+    ];
+    let initial_list = LanceBasePathList {
+        items: initial.as_ptr(),
+        count: initial.len(),
+    };
+
+    let mut write_options: LanceWriteOptions = unsafe { std::mem::zeroed() };
+    write_options.params.max_rows_per_file = 1;
+
+    let target_one = [1_u32];
+    let target_one_list = LanceUInt32List {
+        items: target_one.as_ptr(),
+        count: target_one.len(),
+    };
+
+    let base_store = [
+        LanceBaseStoreParams {
+            base_path: base1_path.as_ptr(),
+            storage_options_accessor: ptr::null(),
+            has_block_size: 1,
+            block_size: 4096,
+            has_s3_credentials_refresh_offset: 0,
+            s3_credentials_refresh_seconds: 0,
+            s3_credentials_refresh_nanos: 0,
+            has_use_constant_size_upload_parts: 0,
+            use_constant_size_upload_parts: false,
+            has_list_is_lexically_ordered: 0,
+            list_is_lexically_ordered: false,
+        },
+        LanceBaseStoreParams {
+            base_path: base2_path.as_ptr(),
+            storage_options_accessor: ptr::null(),
+            has_block_size: 0,
+            block_size: 0,
+            has_s3_credentials_refresh_offset: 0,
+            s3_credentials_refresh_seconds: 0,
+            s3_credentials_refresh_nanos: 0,
+            has_use_constant_size_upload_parts: 1,
+            use_constant_size_upload_parts: false,
+            has_list_is_lexically_ordered: 1,
+            list_is_lexically_ordered: false,
+        },
+    ];
+    let base_store_list = LanceBaseStoreParamsList {
+        items: base_store.as_ptr(),
+        count: base_store.len(),
+    };
+
+    let mut create_spec = native_write_default_spec();
+    create_spec.write_options = &write_options;
+    create_spec.initial_bases = &initial_list;
+    create_spec.target_bases = &target_one_list;
+    create_spec.base_store_params = &base_store_list;
+    let create_options = native_write_options_new(&create_spec);
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        create_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
+    assert_eq!(dataset_file_base_ids(ds), vec![Some(1), Some(1), Some(1)]);
+    let bases = take_json_value(unsafe { lance_dataset_base_paths_json(ds) });
+    assert!(bases.get("1").is_some());
+    assert!(bases.get("2").is_some());
+    unsafe { lance_dataset_close(ds) };
+    unsafe { lance_native_write_options_close(create_options) };
+
+    let base2_ref = c_str("base2");
+    let refs = [base2_ref.as_ptr()];
+    let ref_list = LanceStringList {
+        items: refs.as_ptr(),
+        count: refs.len(),
+    };
+    let mut name_spec = native_write_default_spec();
+    name_spec.write_options = &write_options;
+    name_spec.target_base_names_or_paths = &ref_list;
+    let name_options = native_write_options_new(&name_spec);
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![4, 5], vec![4.0, 5.0]),
+        LanceWriteMode::Append,
+        name_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let base_ids = dataset_file_base_ids(ds);
+    assert_eq!(&base_ids[3..], &[Some(2), Some(2)]);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(name_options);
+    }
+
+    let primary_and_two = [0_u32, 2];
+    let primary_target = LanceUInt32List {
+        items: primary_and_two.as_ptr(),
+        count: primary_and_two.len(),
+    };
+    let mut primary_spec = native_write_default_spec();
+    primary_spec.write_options = &write_options;
+    primary_spec.target_bases = &primary_target;
+    let primary_options = native_write_options_new(&primary_spec);
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![6, 7], vec![6.0, 7.0]),
+        LanceWriteMode::Append,
+        primary_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let base_ids = dataset_file_base_ids(ds);
+    assert_eq!(&base_ids[5..], &[None, Some(2)]);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(primary_options);
+    }
+
+    let mut all_spec = native_write_default_spec();
+    all_spec.write_options = &write_options;
+    all_spec.has_target_all_bases = 1;
+    all_spec.target_all_bases = true;
+    let all_options = native_write_options_new(&all_spec);
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![8, 9, 10], vec![8.0, 9.0, 10.0]),
+        LanceWriteMode::Append,
+        all_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let base_ids = dataset_file_base_ids(ds);
+    assert_eq!(&base_ids[7..], &[None, Some(1), Some(2)]);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(all_options);
+    }
+
+    let mut without_primary_spec = native_write_default_spec();
+    without_primary_spec.write_options = &write_options;
+    without_primary_spec.has_target_all_bases = 1;
+    without_primary_spec.target_all_bases = false;
+    let without_primary = native_write_options_new(&without_primary_spec);
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![11, 12], vec![11.0, 12.0]),
+        LanceWriteMode::Append,
+        without_primary,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let base_ids = dataset_file_base_ids(ds);
+    assert_eq!(&base_ids[10..], &[Some(1), Some(2)]);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(without_primary);
+    }
+
+    let default_spec = native_write_default_spec();
+    let default_options = native_write_options_new(&default_spec);
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![13], vec![13.0]),
+        LanceWriteMode::Append,
+        default_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let base_ids = dataset_file_base_ids(ds);
+    assert_eq!(&base_ids[12..], &[None]);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(default_options);
+    }
+
+    let mut conflict_spec = native_write_default_spec();
+    conflict_spec.write_options = &write_options;
+    conflict_spec.has_target_all_bases = 1;
+    conflict_spec.target_all_bases = true;
+    conflict_spec.target_bases = &target_one_list;
+    let conflict_options = native_write_options_new(&conflict_spec);
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![14], vec![14.0]),
+        LanceWriteMode::Append,
+        conflict_options,
+    );
+    assert_eq!(rc, -1);
+    assert!(ds.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("Cannot specify target_all_bases"));
+    unsafe { lance_native_write_options_close(conflict_options) };
+
+    let empty_target = LanceUInt32List {
+        items: ptr::null(),
+        count: 0,
+    };
+    let mut empty_target_spec = native_write_default_spec();
+    empty_target_spec.target_bases = &empty_target;
+    let empty_target_options = native_write_options_new(&empty_target_spec);
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![15], vec![15.0]),
+        LanceWriteMode::Append,
+        empty_target_options,
+    );
+    assert_eq!(rc, -1);
+    assert!(ds.is_null());
+    assert!(take_last_error_message().contains("target_bases cannot be empty"));
+    unsafe { lance_native_write_options_close(empty_target_options) };
+
+    let empty_initial = LanceBasePathList {
+        items: ptr::null(),
+        count: 0,
+    };
+    let mut empty_initial_spec = native_write_default_spec();
+    empty_initial_spec.initial_bases = &empty_initial;
+    let empty_initial_options = native_write_options_new(&empty_initial_spec);
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![16], vec![16.0]),
+        LanceWriteMode::Append,
+        empty_initial_options,
+    );
+    assert_eq!(rc, -1);
+    assert!(ds.is_null());
+    assert!(take_last_error_message().contains("Cannot register new bases"));
+    unsafe { lance_native_write_options_close(empty_initial_options) };
+
+    let c_uri = c_str(&uri);
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(reopened) }, 13);
+    unsafe { lance_dataset_close(reopened) };
+}
+
+#[derive(Default)]
+struct NativeWriteProgressState {
+    begins: AtomicUsize,
+    completes: AtomicUsize,
+    stats_calls: AtomicUsize,
+    releases: AtomicUsize,
+    rows: AtomicU64,
+    bytes: AtomicU64,
+    files: AtomicU32,
+    fail_begin: AtomicBool,
+    bad_complete_info: AtomicBool,
+}
+
+struct NativeWriteProgressContext {
+    state: Arc<NativeWriteProgressState>,
+}
+
+unsafe extern "C" fn native_write_release_error(value: *mut LanceOwnedString) {
+    if value.is_null() {
+        return;
+    }
+    let value = unsafe { &mut *value };
+    if !value.data.is_null() {
+        let _ = unsafe { CString::from_raw(value.data) };
+        value.data = ptr::null_mut();
+    }
+    value.release = None;
+}
+
+unsafe extern "C" fn native_write_begin(
+    callback_ctx: *mut c_void,
+    _info: *const LanceWriteFragmentProgressInfo,
+    error: *mut LanceCallbackError,
+) -> i32 {
+    let context = unsafe { &*callback_ctx.cast::<NativeWriteProgressContext>() };
+    context.state.begins.fetch_add(1, AtomicOrdering::SeqCst);
+    if context.state.fail_begin.load(AtomicOrdering::SeqCst) {
+        if !error.is_null() {
+            let message = CString::new("native write progress refused fragment").unwrap();
+            unsafe {
+                (*error).code = LanceErrorCode::InvalidArgument as i32;
+                (*error).message.data = message.into_raw();
+                (*error).message.release = Some(native_write_release_error);
+            }
+        }
+        return -1;
+    }
+    0
+}
+
+unsafe extern "C" fn native_write_complete(
+    callback_ctx: *mut c_void,
+    info: *const LanceWriteFragmentProgressInfo,
+    _error: *mut LanceCallbackError,
+) -> i32 {
+    let context = unsafe { &*callback_ctx.cast::<NativeWriteProgressContext>() };
+    let info = unsafe { &*info };
+    if info.has_physical_rows == 0 || info.file_count == 0 {
+        context
+            .state
+            .bad_complete_info
+            .store(true, AtomicOrdering::SeqCst);
+    }
+    context.state.completes.fetch_add(1, AtomicOrdering::SeqCst);
+    0
+}
+
+unsafe extern "C" fn native_write_stats(callback_ctx: *mut c_void, stats: *const LanceWriteStats) {
+    let context = unsafe { &*callback_ctx.cast::<NativeWriteProgressContext>() };
+    let stats = unsafe { &*stats };
+    context
+        .state
+        .stats_calls
+        .fetch_add(1, AtomicOrdering::SeqCst);
+    context
+        .state
+        .rows
+        .store(stats.rows_written, AtomicOrdering::SeqCst);
+    context
+        .state
+        .bytes
+        .store(stats.bytes_written, AtomicOrdering::SeqCst);
+    context
+        .state
+        .files
+        .store(stats.files_written, AtomicOrdering::SeqCst);
+}
+
+unsafe extern "C" fn native_write_release_progress(callback_ctx: *mut c_void) {
+    let context = unsafe { Box::from_raw(callback_ctx.cast::<NativeWriteProgressContext>()) };
+    context.state.releases.fetch_add(1, AtomicOrdering::SeqCst);
+}
+
+fn native_write_progress_descriptor(
+    context: *mut NativeWriteProgressContext,
+) -> LanceNativeWriteProgress {
+    LanceNativeWriteProgress {
+        begin_fragment: Some(native_write_begin),
+        complete_fragment: Some(native_write_complete),
+        write_stats: Some(native_write_stats),
+        release: Some(native_write_release_progress),
+        callback_ctx: context.cast(),
+    }
+}
+
+#[test]
+fn test_native_write_options_progress_and_failure_without_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(NativeWriteProgressState::default());
+    let context = Box::into_raw(Box::new(NativeWriteProgressContext {
+        state: Arc::clone(&state),
+    }));
+    let progress = native_write_progress_descriptor(context);
+
+    let mut write_options: LanceWriteOptions = unsafe { std::mem::zeroed() };
+    write_options.params.max_rows_per_file = 1;
+    let mut spec = native_write_default_spec();
+    spec.write_options = &write_options;
+    spec.progress = &progress;
+    let options = native_write_options_new(&spec);
+
+    let uri = tmp.path().join("progress_ds").to_str().unwrap().to_string();
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![1, 2, 3, 4, 5], vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        LanceWriteMode::Create,
+        options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 5);
+    assert!(state.begins.load(AtomicOrdering::SeqCst) >= 5);
+    assert!(state.completes.load(AtomicOrdering::SeqCst) >= 5);
+    assert!(state.stats_calls.load(AtomicOrdering::SeqCst) >= 1);
+    assert_eq!(state.rows.load(AtomicOrdering::SeqCst), 5);
+    assert!(state.bytes.load(AtomicOrdering::SeqCst) > 0);
+    assert!(state.files.load(AtomicOrdering::SeqCst) >= 5);
+    assert!(
+        !state.bad_complete_info.load(AtomicOrdering::SeqCst),
+        "complete-fragment progress must carry physical rows and a data file"
+    );
+    assert_eq!(
+        state.releases.load(AtomicOrdering::SeqCst),
+        0,
+        "options handle retains the callback context"
+    );
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(options);
+    }
+    assert_eq!(state.releases.load(AtomicOrdering::SeqCst), 1);
+
+    let failed_state = Arc::new(NativeWriteProgressState::default());
+    failed_state.fail_begin.store(true, AtomicOrdering::SeqCst);
+    let failed_context = Box::into_raw(Box::new(NativeWriteProgressContext {
+        state: Arc::clone(&failed_state),
+    }));
+    let failed_progress = native_write_progress_descriptor(failed_context);
+    let mut failed_spec = native_write_default_spec();
+    failed_spec.progress = &failed_progress;
+    let failed_options = native_write_options_new(&failed_spec);
+    let failed_uri = tmp
+        .path()
+        .join("progress_failure")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &failed_uri,
+        write_batch(vec![1], vec![1.0]),
+        LanceWriteMode::Create,
+        failed_options,
+    );
+    assert_eq!(rc, -1);
+    assert!(ds.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("refused fragment"));
+    let (rc, transaction) = native_write_uncommitted(
+        &failed_uri,
+        write_batch(vec![2], vec![2.0]),
+        LanceWriteMode::Create,
+        failed_options,
+    );
+    assert_eq!(rc, -1);
+    assert!(transaction.is_null());
+    unsafe { lance_native_write_options_close(failed_options) };
+    assert_eq!(failed_state.releases.load(AtomicOrdering::SeqCst), 1);
+    let failed_uri_c = c_str(&failed_uri);
+    assert!(
+        unsafe { lance_dataset_open(failed_uri_c.as_ptr(), ptr::null(), 0) }.is_null(),
+        "failed staged and ordinary writes must not publish a version"
+    );
+}
+
+struct NativeWriteLockContext {
+    releases: Arc<AtomicUsize>,
+    acquires: Arc<AtomicUsize>,
+}
+
+unsafe extern "C" fn native_write_lock_acquire(
+    callback_ctx: *mut c_void,
+    _version: u64,
+    out_lease: *mut *mut c_void,
+    _error: *mut LanceCallbackError,
+) -> i32 {
+    let context = unsafe { &*callback_ctx.cast::<NativeWriteLockContext>() };
+    context.acquires.fetch_add(1, AtomicOrdering::SeqCst);
+    if !out_lease.is_null() {
+        unsafe { *out_lease = ptr::null_mut() };
+    }
+    0
+}
+
+unsafe extern "C" fn native_write_lock_release(
+    _callback_ctx: *mut c_void,
+    _lease: *mut c_void,
+    _success: bool,
+    _error: *mut LanceCallbackError,
+) -> i32 {
+    0
+}
+
+unsafe extern "C" fn native_write_lock_release_context(callback_ctx: *mut c_void) {
+    let context = unsafe { Box::from_raw(callback_ctx.cast::<NativeWriteLockContext>()) };
+    context.releases.fetch_add(1, AtomicOrdering::SeqCst);
+}
+
+#[test]
+fn test_native_write_options_retain_source_owners() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = lance_session_new(4 * 1024 * 1024, 1024 * 1024);
+    let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), ptr::null()) };
+    assert!(!session.is_null() && !accessor.is_null());
+
+    let releases = Arc::new(AtomicUsize::new(0));
+    let acquires = Arc::new(AtomicUsize::new(0));
+    let lock_context = Box::new(NativeWriteLockContext {
+        releases: Arc::clone(&releases),
+        acquires: Arc::clone(&acquires),
+    });
+    let callbacks = LanceCommitLockCallbacks {
+        lock: Some(native_write_lock_acquire),
+        release: Some(native_write_lock_release),
+        destroy_lease: None,
+        callback_ctx: Box::into_raw(lock_context).cast(),
+        release_context: Some(native_write_lock_release_context),
+    };
+    let lock = unsafe { lance_commit_lock_new(&callbacks) };
+    assert!(!lock.is_null(), "{}", take_last_error_message());
+
+    let progress_state = Arc::new(NativeWriteProgressState::default());
+    let progress_context = Box::into_raw(Box::new(NativeWriteProgressContext {
+        state: Arc::clone(&progress_state),
+    }));
+    let progress = native_write_progress_descriptor(progress_context);
+    let mut spec = native_write_default_spec();
+    spec.session = session;
+    spec.storage_options_accessor = accessor;
+    spec.commit_lock = lock;
+    spec.progress = &progress;
+    let options = native_write_options_new(&spec);
+
+    unsafe {
+        lance_session_close(session);
+        lance_storage_options_accessor_close(accessor);
+        lance_commit_lock_close(lock);
+    }
+
+    let uri = tmp
+        .path()
+        .join("retained_owners")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &uri,
+        write_batch(vec![1, 2], vec![1.0, 2.0]),
+        LanceWriteMode::Create,
+        options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+    assert!(progress_state.begins.load(AtomicOrdering::SeqCst) >= 1);
+    assert!(
+        acquires.load(AtomicOrdering::SeqCst) >= 1,
+        "the options handle must forward the commit lock to the native write"
+    );
+    unsafe { lance_dataset_close(ds) };
+    unsafe { lance_native_write_options_close(options) };
+
+    assert_eq!(progress_state.releases.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        releases.load(AtomicOrdering::SeqCst),
+        1,
+        "commit lock context must be released exactly once after final native owner drops"
+    );
+}
+
+#[test]
+fn test_native_write_options_external_blob_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_path = tmp.path().join("external-payload.bin");
+    std::fs::write(&source_path, b"external blob bytes").unwrap();
+    let source_uri = format!("file://{}", source_path.display());
+
+    let mut builder = lance::BlobArrayBuilder::new(1);
+    builder.push_uri(source_uri).expect("external blob URI");
+    let array = builder.finish().unwrap();
+    let schema = Arc::new(Schema::new(vec![lance::blob_field("blob", true)]));
+    let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+    let mut write_options: LanceWriteOptions = unsafe { std::mem::zeroed() };
+    let version = c_str("2.2");
+    write_options.params.data_storage_version = version.as_ptr();
+
+    let mut default_spec = native_write_default_spec();
+    default_spec.write_options = &write_options;
+    let default_options = native_write_options_new(&default_spec);
+    let rejected_uri = tmp
+        .path()
+        .join("external_reference_rejected")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &rejected_uri,
+        batch.clone(),
+        LanceWriteMode::Create,
+        default_options,
+    );
+    assert_eq!(rc, -1);
+    assert!(ds.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("outside registered external bases"));
+    unsafe { lance_native_write_options_close(default_options) };
+
+    let mut allow_spec = native_write_default_spec();
+    allow_spec.write_options = &write_options;
+    allow_spec.allow_external_blob_outside_bases = true;
+    allow_spec.has_blob_pack_file_size_threshold = 1;
+    allow_spec.blob_pack_file_size_threshold = 1;
+    let allow_options = native_write_options_new(&allow_spec);
+    let allowed_uri = tmp
+        .path()
+        .join("external_reference_allowed")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &allowed_uri,
+        batch.clone(),
+        LanceWriteMode::Create,
+        allow_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 1);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(allow_options);
+    }
+
+    let mut ingest_spec = native_write_default_spec();
+    ingest_spec.write_options = &write_options;
+    ingest_spec.allow_external_blob_outside_bases = true;
+    ingest_spec.external_blob_mode = 1;
+    let ingest_options = native_write_options_new(&ingest_spec);
+    let ingest_uri = tmp
+        .path()
+        .join("external_ingest_conflict")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(&ingest_uri, batch, LanceWriteMode::Create, ingest_options);
+    assert_eq!(rc, -1);
+    assert!(ds.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("allow_external_blob_outside_bases"));
+    unsafe { lance_native_write_options_close(ingest_options) };
+}
+
+#[test]
+fn test_native_write_options_blob_pack_file_threshold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let field = lance::blob_field_with_options(
+        "blob",
+        true,
+        lance::BlobFieldOptions {
+            inline_size_threshold: Some(0),
+            dedicated_size_threshold: None,
+        },
+    );
+    let schema = Arc::new(Schema::new(vec![field]));
+    let mut blobs = lance::BlobArrayBuilder::new(2);
+    blobs.push_bytes(vec![7_u8; 16]).unwrap();
+    blobs.push_bytes(vec![9_u8; 16]).unwrap();
+    let batch = RecordBatch::try_new(schema, vec![blobs.finish().unwrap()]).unwrap();
+
+    let mut write_options: LanceWriteOptions = unsafe { std::mem::zeroed() };
+    let version = c_str("2.2");
+    write_options.params.data_storage_version = version.as_ptr();
+
+    let mut default_spec = native_write_default_spec();
+    default_spec.write_options = &write_options;
+    let default_options = native_write_options_new(&default_spec);
+    let default_uri = tmp
+        .path()
+        .join("blob_pack_default")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &default_uri,
+        batch.clone(),
+        LanceWriteMode::Create,
+        default_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(default_options);
+    }
+    let default_packs = count_files_with_extension(std::path::Path::new(&default_uri), "blob");
+    assert_eq!(
+        default_packs, 1,
+        "default threshold packs both blobs together"
+    );
+
+    let mut threshold_spec = native_write_default_spec();
+    threshold_spec.write_options = &write_options;
+    threshold_spec.has_blob_pack_file_size_threshold = 1;
+    threshold_spec.blob_pack_file_size_threshold = 1;
+    let threshold_options = native_write_options_new(&threshold_spec);
+    let threshold_uri = tmp
+        .path()
+        .join("blob_pack_threshold")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &threshold_uri,
+        batch,
+        LanceWriteMode::Create,
+        threshold_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(threshold_options);
+    }
+    let threshold_packs = count_files_with_extension(std::path::Path::new(&threshold_uri), "blob");
+    assert!(
+        threshold_packs >= 2,
+        "threshold 1 must start a new pack per 16-byte blob, got {threshold_packs}"
+    );
 }
 
 // ---------------------------------------------------------------------------

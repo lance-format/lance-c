@@ -199,6 +199,9 @@ class SqlQueryBuilder;
 class SqlQuery;
 class DatasetDeltaBuilder;
 class DatasetDelta;
+class StorageOptionsAccessor;
+class CommitLock;
+class Session;
 
 /// One native `BasePath` for `Dataset::add_bases` and `Operation`
 /// construction.
@@ -543,6 +546,34 @@ struct WriteOptions {
     bool                             skip_auto_cleanup = false;
 };
 
+/// Convert the shared C++ write-option value into the C representation.
+///
+/// `cleanup` must outlive the returned value. Both the legacy write entry
+/// points and the owned native options handle use this mapping so their
+/// defaults cannot drift.
+inline LanceWriteOptions to_c_write_options(
+    const WriteOptions& options,
+    LanceAutoCleanupParams& cleanup) {
+    LanceWriteOptions c_options = {};
+    c_options.params.max_rows_per_file = options.params.max_rows_per_file;
+    c_options.params.max_rows_per_group = options.params.max_rows_per_group;
+    c_options.params.max_bytes_per_file = options.params.max_bytes_per_file;
+    c_options.params.data_storage_version =
+        options.params.data_storage_version
+            ? options.params.data_storage_version->c_str()
+            : nullptr;
+    c_options.params.enable_stable_row_ids =
+        options.params.enable_stable_row_ids;
+    c_options.skip_auto_cleanup = options.skip_auto_cleanup;
+    if (options.auto_cleanup) {
+        cleanup.interval = options.auto_cleanup->interval;
+        cleanup.older_than_seconds = options.auto_cleanup->older_than_seconds;
+        cleanup.older_than_nanos = options.auto_cleanup->older_than_nanos;
+        c_options.auto_cleanup = &cleanup;
+    }
+    return c_options;
+}
+
 /// A native duration expressed as whole seconds plus a subsecond nanosecond
 /// component. Nanoseconds must be less than 1,000,000,000.
 struct CommitDuration {
@@ -581,6 +612,105 @@ struct UncommittedWriteOptions {
     WriteOptions write;
     std::optional<std::vector<std::pair<std::string, std::string>>>
         transaction_properties;
+};
+
+enum class ExternalBlobMode : int32_t {
+    Reference = LANCE_EXTERNAL_BLOB_REFERENCE,
+    Ingest    = LANCE_EXTERNAL_BLOB_INGEST,
+};
+
+/// Native current-format file-writer options for a dataset write.
+///
+/// Dataset file-version selection belongs in `WriteParams::data_storage_version`;
+/// the raw-file `version` field is intentionally absent.
+struct DatasetFileWriterOptions {
+    std::optional<uint64_t> data_cache_bytes;
+    std::optional<uint64_t> max_page_bytes;
+    std::optional<bool>     keep_original_array;
+};
+
+/// One per-base native `ObjectStoreParams` value.
+///
+/// `base_path` is the exact key used by native `WriteParams::base_store_params`.
+/// The accessor is borrowed only during `NativeWriteOptions` construction.
+struct DatasetBaseStoreParams {
+    std::string                    base_path;
+    const StorageOptionsAccessor*  storage_options_accessor = nullptr;
+    std::optional<uint64_t>        block_size;
+    std::optional<CommitDuration>  s3_credentials_refresh_offset;
+    std::optional<bool>            use_constant_size_upload_parts;
+    std::optional<bool>            list_is_lexically_ordered;
+};
+
+/// Cumulative native write statistics.
+struct NativeWriteStats {
+    uint64_t bytes_written = 0;
+    uint64_t rows_written = 0;
+    uint32_t files_written = 0;
+};
+
+/// Native fragment progress payload.
+struct FragmentWriteProgressInfo {
+    uint64_t                    fragment_id = 0;
+    std::optional<uint64_t>     physical_rows;
+    uint64_t                    file_count = 0;
+};
+
+/// C++ progress callbacks for a dataset write.
+///
+/// Fragment callbacks may throw `lance::Error` or another exception; the
+/// wrapper converts it to a native callback error. The stats callback has no
+/// native error channel, so exceptions from it are swallowed to keep the C ABI
+/// boundary sound. Callbacks may run concurrently from native worker threads.
+struct NativeWriteProgress {
+    using FragmentCallback =
+        std::function<void(const FragmentWriteProgressInfo&)>;
+    using StatsCallback = std::function<void(const NativeWriteStats&)>;
+
+    FragmentCallback begin_fragment;
+    FragmentCallback complete_fragment;
+    StatsCallback    write_stats;
+};
+
+/// Configuration for an owned `NativeWriteOptions` handle.
+struct NativeWriteOptionsSpec {
+    WriteOptions write;
+    std::optional<std::vector<std::pair<std::string, std::string>>>
+        transaction_properties;
+    std::optional<bool> enable_v2_manifest_paths;
+    std::optional<std::vector<BasePath>> initial_bases;
+    std::optional<std::vector<uint32_t>> target_bases;
+    std::optional<std::vector<std::string>> target_base_names_or_paths;
+    std::optional<bool> target_all_bases;
+    std::optional<std::vector<DatasetBaseStoreParams>> base_store_params;
+    bool allow_external_blob_outside_bases = false;
+    ExternalBlobMode external_blob_mode = ExternalBlobMode::Reference;
+    std::optional<uint64_t> blob_pack_file_size_threshold;
+    std::optional<DatasetFileWriterOptions> file_writer_options;
+    const Session* session = nullptr;
+    const StorageOptionsAccessor* storage_options_accessor = nullptr;
+    const CommitLock* commit_lock = nullptr;
+    NativeWriteProgress progress;
+};
+
+/// Owned native-backed dataset write options. Move-only.
+///
+/// The handle copies or clones every value from `NativeWriteOptionsSpec`.
+/// Source Session, accessor and commit-lock wrappers may be destroyed after
+/// construction. Destroy this object only after all writes that borrowed it
+/// have returned; callback captures are released from the destructor.
+class NativeWriteOptions {
+    Handle<LanceNativeWriteOptions, lance_native_write_options_close> handle_;
+
+public:
+    explicit NativeWriteOptions(const NativeWriteOptionsSpec& spec);
+
+    NativeWriteOptions(NativeWriteOptions&&) noexcept = default;
+    NativeWriteOptions& operator=(NativeWriteOptions&&) noexcept = default;
+    NativeWriteOptions(const NativeWriteOptions&) = delete;
+    NativeWriteOptions& operator=(const NativeWriteOptions&) = delete;
+
+    const LanceNativeWriteOptions* c_handle() const { return handle_.get(); }
 };
 
 /// Options for native fragment creation.
@@ -3064,6 +3194,331 @@ public:
 
     const LanceSession* c_handle() const { return handle_.get(); }
 };
+
+// ─── Owned native dataset-write options ─────────────────────────────────────
+
+namespace native_write_options_detail {
+
+struct ProgressContext {
+    NativeWriteProgress progress;
+};
+
+inline int32_t invoke_fragment(
+    const NativeWriteProgress::FragmentCallback& callback,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error,
+    const char* context) noexcept {
+    try {
+        FragmentWriteProgressInfo progress{};
+        if (info != nullptr) {
+            progress.fragment_id = info->fragment_id;
+            if (info->has_physical_rows != 0) {
+                progress.physical_rows = info->physical_rows;
+            }
+            progress.file_count = info->file_count;
+        }
+        callback(progress);
+        return 0;
+    } catch (const lance::Error& exception) {
+        callback_detail::set_callback_error(
+            error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, context);
+        return -1;
+    }
+}
+
+extern "C" inline int32_t begin_fragment_trampoline(
+    void* callback_ctx,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error) noexcept {
+    auto* context = static_cast<ProgressContext*>(callback_ctx);
+    return invoke_fragment(
+        context->progress.begin_fragment,
+        info,
+        error,
+        "unknown C++ exception in write fragment begin callback");
+}
+
+extern "C" inline int32_t complete_fragment_trampoline(
+    void* callback_ctx,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error) noexcept {
+    auto* context = static_cast<ProgressContext*>(callback_ctx);
+    return invoke_fragment(
+        context->progress.complete_fragment,
+        info,
+        error,
+        "unknown C++ exception in write fragment complete callback");
+}
+
+extern "C" inline void write_stats_trampoline(
+    void* callback_ctx,
+    const LanceWriteStats* stats) noexcept {
+    auto* context = static_cast<ProgressContext*>(callback_ctx);
+    try {
+        NativeWriteStats value{};
+        if (stats != nullptr) {
+            value.bytes_written = stats->bytes_written;
+            value.rows_written = stats->rows_written;
+            value.files_written = stats->files_written;
+        }
+        context->progress.write_stats(value);
+    } catch (...) {
+        // Native write progress has no error channel. Swallowing keeps the C
+        // ABI boundary sound; use fragment callbacks for fallible progress.
+    }
+}
+
+extern "C" inline void release_progress_context(void* callback_ctx) noexcept {
+    delete static_cast<ProgressContext*>(callback_ctx);
+}
+
+struct BuildState {
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions write{};
+
+    bool has_transaction_properties = false;
+    std::vector<const char*> property_keys;
+    std::vector<const char*> property_values;
+    LanceTransactionProperties properties{};
+
+    std::vector<std::string> base_paths;
+    std::vector<std::optional<std::string>> base_names;
+    std::vector<LanceBasePath> base_views;
+    LanceBasePath empty_base{};
+    LanceBasePathList base_list{};
+
+    std::vector<uint32_t> target_ids;
+    LanceUInt32List target_list{};
+
+    std::vector<std::string> target_names;
+    std::vector<const char*> target_name_ptrs;
+    LanceStringList target_name_list{};
+
+    std::vector<std::string> base_store_paths;
+    std::vector<LanceBaseStoreParams> base_store_views;
+    LanceBaseStoreParamsList base_store_list{};
+
+    LanceFileWriterOptions file_options{};
+
+    std::unique_ptr<ProgressContext> progress_ctx;
+    LanceNativeWriteProgress progress{};
+};
+
+inline void build_initial_bases(
+    const std::optional<std::vector<BasePath>>& initial_bases,
+    BuildState& state) {
+    if (!initial_bases) return;
+    state.base_paths.reserve(initial_bases->size());
+    state.base_names.reserve(initial_bases->size());
+    state.base_views.reserve(initial_bases->size());
+    for (const auto& base : *initial_bases) {
+        state.base_paths.push_back(base.path);
+        state.base_names.push_back(base.name);
+    }
+    for (std::size_t index = 0; index < state.base_paths.size(); ++index) {
+        LanceBasePath view{};
+        view.id = (*initial_bases)[index].id;
+        view.path = state.base_paths[index].c_str();
+        view.name = state.base_names[index]
+                        ? state.base_names[index]->c_str()
+                        : nullptr;
+        view.is_dataset_root = (*initial_bases)[index].is_dataset_root;
+        state.base_views.push_back(view);
+    }
+    state.base_list.items =
+        state.base_views.empty() ? &state.empty_base : state.base_views.data();
+    state.base_list.count = state.base_views.size();
+}
+
+inline void build_base_store_params(
+    const std::optional<std::vector<DatasetBaseStoreParams>>& base_store_params,
+    BuildState& state) {
+    if (!base_store_params) return;
+    state.base_store_paths.reserve(base_store_params->size());
+    state.base_store_views.reserve(base_store_params->size());
+    for (const auto& entry : *base_store_params) {
+        state.base_store_paths.push_back(entry.base_path);
+    }
+    for (std::size_t index = 0; index < base_store_params->size(); ++index) {
+        const auto& entry = (*base_store_params)[index];
+        LanceBaseStoreParams view{};
+        view.base_path = state.base_store_paths[index].c_str();
+        view.storage_options_accessor =
+            entry.storage_options_accessor
+                ? entry.storage_options_accessor->c_handle()
+                : nullptr;
+        if (entry.block_size) {
+            view.has_block_size = 1;
+            view.block_size = *entry.block_size;
+        }
+        if (entry.s3_credentials_refresh_offset) {
+            view.has_s3_credentials_refresh_offset = 1;
+            view.s3_credentials_refresh_seconds =
+                entry.s3_credentials_refresh_offset->seconds;
+            view.s3_credentials_refresh_nanos =
+                entry.s3_credentials_refresh_offset->nanos;
+        }
+        if (entry.use_constant_size_upload_parts) {
+            view.has_use_constant_size_upload_parts = 1;
+            view.use_constant_size_upload_parts =
+                *entry.use_constant_size_upload_parts;
+        }
+        if (entry.list_is_lexically_ordered) {
+            view.has_list_is_lexically_ordered = 1;
+            view.list_is_lexically_ordered =
+                *entry.list_is_lexically_ordered;
+        }
+        state.base_store_views.push_back(view);
+    }
+    state.base_store_list.items = state.base_store_views.empty()
+                                      ? nullptr
+                                      : state.base_store_views.data();
+    state.base_store_list.count = state.base_store_views.size();
+}
+
+}  // namespace native_write_options_detail
+
+inline NativeWriteOptions::NativeWriteOptions(
+    const NativeWriteOptionsSpec& spec)
+    : handle_(nullptr) {
+    using namespace native_write_options_detail;
+
+    BuildState state;
+    state.write = lance::to_c_write_options(spec.write, state.cleanup);
+
+    if (spec.transaction_properties) {
+        state.has_transaction_properties = true;
+        state.property_keys.reserve(spec.transaction_properties->size());
+        state.property_values.reserve(spec.transaction_properties->size());
+        for (const auto& [key, value] : *spec.transaction_properties) {
+            state.property_keys.push_back(key.c_str());
+            state.property_values.push_back(value.c_str());
+        }
+        state.properties.keys = state.property_keys.empty()
+                                    ? nullptr
+                                    : state.property_keys.data();
+        state.properties.values = state.property_values.empty()
+                                      ? nullptr
+                                      : state.property_values.data();
+        state.properties.count = spec.transaction_properties->size();
+    }
+
+    build_initial_bases(spec.initial_bases, state);
+
+    if (spec.target_bases) {
+        state.target_ids = *spec.target_bases;
+        state.target_list.items = state.target_ids.empty()
+                                      ? nullptr
+                                      : state.target_ids.data();
+        state.target_list.count = state.target_ids.size();
+    }
+
+    if (spec.target_base_names_or_paths) {
+        state.target_names = *spec.target_base_names_or_paths;
+        state.target_name_ptrs.reserve(state.target_names.size());
+        for (const auto& value : state.target_names) {
+            state.target_name_ptrs.push_back(value.c_str());
+        }
+        state.target_name_list.items = state.target_name_ptrs.empty()
+                                           ? nullptr
+                                           : state.target_name_ptrs.data();
+        state.target_name_list.count = state.target_name_ptrs.size();
+    }
+
+    build_base_store_params(spec.base_store_params, state);
+
+    if (spec.file_writer_options) {
+        if (spec.file_writer_options->data_cache_bytes) {
+            state.file_options.has_data_cache_bytes = 1;
+            state.file_options.data_cache_bytes =
+                *spec.file_writer_options->data_cache_bytes;
+        }
+        if (spec.file_writer_options->max_page_bytes) {
+            state.file_options.has_max_page_bytes = 1;
+            state.file_options.max_page_bytes =
+                *spec.file_writer_options->max_page_bytes;
+        }
+        if (spec.file_writer_options->keep_original_array) {
+            state.file_options.has_keep_original_array = 1;
+            state.file_options.keep_original_array =
+                *spec.file_writer_options->keep_original_array ? 1 : 0;
+        }
+    }
+
+    const bool has_progress =
+        static_cast<bool>(spec.progress.begin_fragment) ||
+        static_cast<bool>(spec.progress.complete_fragment) ||
+        static_cast<bool>(spec.progress.write_stats);
+    if (has_progress) {
+        state.progress_ctx = std::make_unique<ProgressContext>();
+        state.progress_ctx->progress = spec.progress;
+        if (spec.progress.begin_fragment) {
+            state.progress.begin_fragment = &begin_fragment_trampoline;
+        }
+        if (spec.progress.complete_fragment) {
+            state.progress.complete_fragment = &complete_fragment_trampoline;
+        }
+        if (spec.progress.write_stats) {
+            state.progress.write_stats = &write_stats_trampoline;
+        }
+        state.progress.release = &release_progress_context;
+        state.progress.callback_ctx = state.progress_ctx.get();
+    }
+
+    LanceNativeWriteOptionsSpec c_spec{};
+    c_spec.write_options = &state.write;
+    c_spec.transaction_properties =
+        state.has_transaction_properties ? &state.properties : nullptr;
+    c_spec.has_enable_v2_manifest_paths =
+        spec.enable_v2_manifest_paths ? 1 : 0;
+    c_spec.enable_v2_manifest_paths =
+        spec.enable_v2_manifest_paths.value_or(false);
+    c_spec.initial_bases =
+        spec.initial_bases ? &state.base_list : nullptr;
+    c_spec.target_bases =
+        spec.target_bases ? &state.target_list : nullptr;
+    c_spec.target_base_names_or_paths =
+        spec.target_base_names_or_paths ? &state.target_name_list : nullptr;
+    c_spec.has_target_all_bases = spec.target_all_bases ? 1 : 0;
+    c_spec.target_all_bases = spec.target_all_bases.value_or(false);
+    c_spec.base_store_params =
+        spec.base_store_params ? &state.base_store_list : nullptr;
+    c_spec.allow_external_blob_outside_bases =
+        spec.allow_external_blob_outside_bases;
+    c_spec.external_blob_mode =
+        static_cast<int32_t>(spec.external_blob_mode);
+    c_spec.has_blob_pack_file_size_threshold =
+        spec.blob_pack_file_size_threshold ? 1 : 0;
+    c_spec.blob_pack_file_size_threshold =
+        spec.blob_pack_file_size_threshold.value_or(0);
+    c_spec.file_writer_options =
+        spec.file_writer_options ? &state.file_options : nullptr;
+    c_spec.session = spec.session ? spec.session->c_handle() : nullptr;
+    c_spec.storage_options_accessor =
+        spec.storage_options_accessor
+            ? spec.storage_options_accessor->c_handle()
+            : nullptr;
+    c_spec.commit_lock =
+        spec.commit_lock ? spec.commit_lock->c_handle() : nullptr;
+    c_spec.progress = has_progress ? &state.progress : nullptr;
+
+    auto* raw = lance_native_write_options_new(&c_spec);
+    if (raw == nullptr) {
+        // Ownership of the progress context transfers only on success.
+        check_error();
+    }
+    handle_ = Handle<LanceNativeWriteOptions, lance_native_write_options_close>(
+        raw);
+    (void)state.progress_ctx.release();
+}
 
 // ─── Process-local FTS query context ────────────────────────────────────────
 
@@ -6225,25 +6680,7 @@ class Dataset {
     static LanceWriteOptions to_c_write_options(
         const WriteOptions& options,
         LanceAutoCleanupParams& cleanup) {
-        LanceWriteOptions c_options = {};
-        c_options.params.max_rows_per_file = options.params.max_rows_per_file;
-        c_options.params.max_rows_per_group = options.params.max_rows_per_group;
-        c_options.params.max_bytes_per_file = options.params.max_bytes_per_file;
-        c_options.params.data_storage_version =
-            options.params.data_storage_version
-                ? options.params.data_storage_version->c_str()
-                : nullptr;
-        c_options.params.enable_stable_row_ids =
-            options.params.enable_stable_row_ids;
-        c_options.skip_auto_cleanup = options.skip_auto_cleanup;
-        if (options.auto_cleanup) {
-            cleanup.interval = options.auto_cleanup->interval;
-            cleanup.older_than_seconds =
-                options.auto_cleanup->older_than_seconds;
-            cleanup.older_than_nanos = options.auto_cleanup->older_than_nanos;
-            c_options.auto_cleanup = &cleanup;
-        }
-        return c_options;
+        return lance::to_c_write_options(options, cleanup);
     }
 
     static LanceUncommittedWriteOptions to_c_uncommitted_write_options(
@@ -6989,6 +7426,76 @@ public:
                 "success with null out_dataset");
         }
         return Dataset(out);
+    }
+
+    /// Write with an owned native-backed options handle.
+    ///
+    /// The handle supplies native write defaults plus the session, storage
+    /// accessor, commit lock, base placement, blob policy, file-writer options
+    /// and progress callbacks. The handle is borrowed only for this call. The
+    /// stream is consumed on every return path. Throws `lance::Error` on
+    /// failure.
+    static Dataset write_with_native_options(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const NativeWriteOptions& options) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceDataset* out = nullptr;
+        if (lance_dataset_write_with_native_options(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                options.c_handle(),
+                &out) != 0) {
+            check_error();
+        }
+        if (!out) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_with_native_options returned success "
+                "with null out_dataset");
+        }
+        return Dataset(out);
+    }
+
+    /// Stage an Arrow stream with an owned native-backed options handle.
+    ///
+    /// The returned transaction owns uncommitted data-file metadata and does
+    /// not retain the options handle. Publication naming remains controlled by
+    /// `Dataset::commit` / `Transaction` commit options. The stream is consumed
+    /// on every return path. Throws `lance::Error` on failure; a failed stage
+    /// does not publish a version.
+    static Transaction write_uncommitted_with_native_options(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const NativeWriteOptions& options) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceTransaction* transaction = nullptr;
+        if (lance_dataset_write_uncommitted_stream_with_native_options(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                options.c_handle(),
+                &transaction) != 0) {
+            check_error();
+        }
+        if (!transaction) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_uncommitted_stream_with_native_options "
+                "returned success with null out_transaction");
+        }
+        return Transaction(transaction);
     }
 
     /// Open through a native namespace. Namespace location/storage options and

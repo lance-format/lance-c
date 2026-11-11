@@ -7284,6 +7284,298 @@ int32_t lance_dataset_write_with_options_with_commit_lock(
     LanceDataset** out_dataset
 );
 
+/* ─── Owned native dataset-write options ─── */
+
+/**
+ * Opaque owner of one native `WriteParams` plus retained native owners.
+ *
+ * The handle is immutable after construction. It may be used by concurrent
+ * write calls, but `lance_native_write_options_close` must not run while any
+ * call that borrows the handle is still in flight.
+ */
+typedef struct LanceNativeWriteOptions LanceNativeWriteOptions;
+
+/**
+ * Native external blob handling for a dataset write.
+ *
+ * The FFI field is a fixed-width `int32_t`; out-of-range values are rejected
+ * with `LANCE_ERR_INVALID_ARGUMENT`.
+ */
+typedef enum {
+    LANCE_EXTERNAL_BLOB_REFERENCE = 0,
+    LANCE_EXTERNAL_BLOB_INGEST    = 1,
+} LanceExternalBlobMode;
+
+/**
+ * Borrowed list of native `u32` values.
+ *
+ * A NULL pointer maps to native `None`. A non-NULL pointer with `count == 0`
+ * maps to native `Some(empty)`. Values are copied by
+ * `lance_native_write_options_new`.
+ */
+typedef struct LanceUInt32List {
+    const uint32_t* items;
+    size_t          count;
+} LanceUInt32List;
+
+/**
+ * Borrowed list of NUL-terminated UTF-8 strings.
+ *
+ * A NULL pointer maps to native `None`. A non-NULL pointer with `count == 0`
+ * maps to native `Some(empty)`. Values are copied by
+ * `lance_native_write_options_new`.
+ */
+typedef struct LanceStringList {
+    const char* const* items;
+    size_t             count;
+} LanceStringList;
+
+/**
+ * One native `ObjectStoreParams` value for `WriteParams::base_store_params`.
+ *
+ * `base_path` is the exact map key. `storage_options_accessor` is cloned into
+ * the native params; a NULL handle or an accessor without an inner owner
+ * selects native `None`. Scalar fields use `has_*` flags so omitted values
+ * keep the native `ObjectStoreParams` defaults.
+ *
+ * Native object-store and wrapper trait hooks (`object_store`,
+ * `object_store_wrapper`) and feature-gated AWS credential providers have no
+ * C representation here. Use a `StorageOptionsAccessor` for static or
+ * provider-backed storage options.
+ */
+typedef struct LanceBaseStoreParams {
+    const char* base_path;
+    const LanceStorageOptionsAccessor* storage_options_accessor;
+    int32_t     has_block_size;
+    uint64_t    block_size;
+    int32_t     has_s3_credentials_refresh_offset;
+    uint64_t    s3_credentials_refresh_seconds;
+    uint32_t    s3_credentials_refresh_nanos;
+    int32_t     has_use_constant_size_upload_parts;
+    bool        use_constant_size_upload_parts;
+    int32_t     has_list_is_lexically_ordered;
+    bool        list_is_lexically_ordered;
+} LanceBaseStoreParams;
+
+/**
+ * Borrowed per-base storage parameter list.
+ *
+ * A NULL pointer maps to native `None`. A non-NULL pointer with `count == 0`
+ * maps to native `Some(empty)`. Duplicate `base_path` keys use native
+ * `HashMap` last-write-wins semantics.
+ */
+typedef struct LanceBaseStoreParamsList {
+    const LanceBaseStoreParams* items;
+    size_t                      count;
+} LanceBaseStoreParamsList;
+
+/**
+ * Native cumulative `WriteStats` passed to the write-stats callback.
+ *
+ * `bytes_written` and `rows_written` are cumulative. `files_written` counts
+ * completed native data files/fragments. Values describe actual native
+ * progress, not wrapper estimates.
+ */
+typedef struct LanceWriteStats {
+    uint64_t bytes_written;
+    uint64_t rows_written;
+    uint32_t files_written;
+} LanceWriteStats;
+
+/**
+ * Native fragment progress payload, borrowed for one callback invocation.
+ *
+ * `physical_rows` is present for complete-fragment events and normally absent
+ * for begin-fragment events, matching the native fragment state at each call.
+ */
+typedef struct LanceWriteFragmentProgressInfo {
+    uint64_t fragment_id;
+    int32_t  has_physical_rows;
+    uint64_t physical_rows;
+    uint64_t file_count;
+} LanceWriteFragmentProgressInfo;
+
+/**
+ * Report native begin/complete fragment progress.
+ *
+ * Return 0 on success. A nonzero status reports failure through `error`; the
+ * write then follows native cleanup and no-commit behavior. Callbacks may run
+ * concurrently from native worker threads and must be thread-safe. `info` is
+ * borrowed and must not be retained. `error` is zero-initialized before every
+ * invocation; `LanceCallbackError` uses the same code/message ownership rules
+ * as other callback APIs.
+ */
+typedef int32_t (*LanceWriteFragmentProgressCallback)(
+    void* callback_ctx,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error
+);
+
+/**
+ * Receive cumulative native `WriteStats`.
+ *
+ * Native write progress has no error channel. The callback must be cheap,
+ * non-blocking, thread-safe and must not unwind.
+ */
+typedef void (*LanceWriteStatsCallback)(
+    void* callback_ctx,
+    const LanceWriteStats* stats
+);
+
+/**
+ * Release a progress callback context exactly once.
+ *
+ * The final native progress owner invokes this callback, which may happen
+ * after the write entry point returns or while the options handle is closed.
+ * It may run on a native worker thread and must not unwind.
+ */
+typedef void (*LanceNativeWriteProgressRelease)(void* callback_ctx);
+
+/**
+ * Foreign dataset-write progress callbacks and their owned context.
+ *
+ * Ownership of `callback_ctx` transfers only when
+ * `lance_native_write_options_new` succeeds. `release` is required whenever
+ * this descriptor is supplied. Omitted callbacks leave the corresponding
+ * native progress hook at its default.
+ */
+typedef struct LanceNativeWriteProgress {
+    LanceWriteFragmentProgressCallback begin_fragment;
+    LanceWriteFragmentProgressCallback complete_fragment;
+    LanceWriteStatsCallback            write_stats;
+    LanceNativeWriteProgressRelease    release;
+    void*                              callback_ctx;
+} LanceNativeWriteProgress;
+
+/**
+ * Borrowed configuration for `lance_native_write_options_new`.
+ *
+ * Every pointer is read only during that constructor call. Values, strings,
+ * native owners and callback contexts are copied or cloned into the returned
+ * handle. Presence flags preserve native `None` versus `Some(empty)` and
+ * explicit `false` values.
+ *
+ * Field mapping to native `WriteParams`:
+ * - `write_options` supplies max rows/bytes, data storage version,
+ *   `enable_stable_row_ids`, auto-cleanup and `skip_auto_cleanup`.
+ * - `transaction_properties` maps to native `None`/`Some(map)` directly.
+ * - `enable_v2_manifest_paths` maps to the create-time native field; omitted
+ *   keeps the native default. Native ignores it for existing datasets.
+ * - `initial_bases`, `target_bases`, `target_base_names_or_paths` and
+ *   `target_all_bases` map directly, including primary-base ID 0 and
+ *   dataset-URI references. Empty explicit target lists remain `Some(empty)`
+ *   and are rejected by native resolution, not by this binding.
+ * - `base_store_params` maps exact base-path keys to native
+ *   `ObjectStoreParams` using the representable fields above. The primary
+ *   base is not a registered `BasePath`, so its storage comes from the
+ *   write-level accessor; native target resolution owns that rule.
+ * - `allow_external_blob_outside_bases`, `external_blob_mode` and
+ *   `blob_pack_file_size_threshold` map directly. Native validates
+ *   incompatible combinations such as ingest plus allow-outside-bases.
+ * - `file_writer_options` maps to native `FileWriterOptions`; its raw-file
+ *   `version` field must be NULL because dataset file-version selection
+ *   belongs in `write_options.params.data_storage_version`.
+ * - `session`, `storage_options_accessor` and `commit_lock` are cloned into
+ *   the handle. The caller may close the source handles after construction.
+ * - `progress` maps to native `WriteParams::progress` and `write_progress`.
+ *   No wrapper-generated events are emitted.
+ */
+typedef struct LanceNativeWriteOptionsSpec {
+    const LanceWriteOptions*             write_options;
+    const LanceTransactionProperties*    transaction_properties;
+    int32_t                              has_enable_v2_manifest_paths;
+    bool                                 enable_v2_manifest_paths;
+    const LanceBasePathList*             initial_bases;
+    const LanceUInt32List*               target_bases;
+    const LanceStringList*               target_base_names_or_paths;
+    int32_t                              has_target_all_bases;
+    bool                                 target_all_bases;
+    const LanceBaseStoreParamsList*      base_store_params;
+    bool                                 allow_external_blob_outside_bases;
+    int32_t                              external_blob_mode;
+    int32_t                              has_blob_pack_file_size_threshold;
+    uint64_t                             blob_pack_file_size_threshold;
+    const struct LanceFileWriterOptions* file_writer_options;
+    const LanceSession*                  session;
+    const LanceStorageOptionsAccessor*   storage_options_accessor;
+    const LanceCommitLock*               commit_lock;
+    const LanceNativeWriteProgress*      progress;
+} LanceNativeWriteOptionsSpec;
+
+/**
+ * Create an owned native-backed dataset write-options handle.
+ *
+ * `spec == NULL` selects native `WriteParams::default()`. The write mode is
+ * supplied by the later entry point, not by this handle.
+ *
+ * Ownership of `spec->progress->callback_ctx` transfers only on success. On
+ * failure the caller retains it and `release` is not called. On success the
+ * callback context is released exactly once when the final native owner drops;
+ * this may happen inside `lance_native_write_options_close` or later on a
+ * native worker thread.
+ *
+ * Native validation of option combinations remains authoritative. This
+ * constructor rejects only values that cannot be parsed or represented at the
+ * C boundary. Returns NULL on error.
+ */
+LanceNativeWriteOptions* lance_native_write_options_new(
+    const LanceNativeWriteOptionsSpec* spec
+);
+
+/**
+ * Close an owned native write-options handle.
+ *
+ * Native writes clone the values they need. Close the handle only after all
+ * calls that borrowed it have returned. Closing drops the retained session,
+ * storage accessors, commit lock and progress context; the progress release
+ * callback may run from this call. NULL-safe.
+ */
+void lance_native_write_options_close(LanceNativeWriteOptions* options);
+
+/**
+ * Write with an owned native-backed options handle.
+ *
+ * `options == NULL` selects native `WriteParams::default()`. The handle
+ * supplies every native dataset-write option, including session, storage
+ * accessor, commit lock, base placement, blob policy, file-writer options and
+ * progress callbacks. The stream is consumed on every return path except a
+ * NULL `stream`. `out_dataset` follows the same success-only contract as
+ * `lance_dataset_write`. Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_write_with_native_options(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceNativeWriteOptions* options,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Stage an Arrow stream with an owned native-backed options handle.
+ *
+ * `options == NULL` selects native `WriteParams::default()`. The handle
+ * supplies session, storage accessor, commit lock, base placement, blob
+ * policy, file-writer options and progress callbacks. The stream is consumed
+ * on every return path except a NULL `stream`.
+ *
+ * The returned transaction owns metadata and uncommitted data-file
+ * references. It does not retain the options handle, its session, accessor or
+ * commit lock; pass those to the later commit entry point when commit I/O
+ * needs them.
+ * Publication naming remains controlled by the commit entry point's
+ * `LanceCommitOptions`. Returns 0 on success, -1 on error; a failed stage is
+ * guaranteed not to publish a version.
+ */
+int32_t lance_dataset_write_uncommitted_stream_with_native_options(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceNativeWriteOptions* options,
+    LanceTransaction** out_transaction
+);
+
 /* ─── Native fragment creation ─── */
 
 /**
