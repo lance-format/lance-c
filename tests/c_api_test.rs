@@ -43906,9 +43906,9 @@ fn test_memwal_composite_primary_key_lookup() {
         0
     );
     let data = unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap();
-    let batch = RecordBatch::from(StructArray::from(data));
-    assert_eq!(batch.num_rows(), 1);
-    let names = batch
+    let result = RecordBatch::from(StructArray::from(data));
+    assert_eq!(result.num_rows(), 1);
+    let names = result
         .column_by_name("name")
         .unwrap()
         .as_any()
