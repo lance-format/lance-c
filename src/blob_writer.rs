@@ -8,9 +8,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 
+use arrow::array::ArrayData;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type, to_ffi};
-use arrow_array::{Array, ArrayData, ArrayRef, make_array};
-use arrow_schema::{DataType, Field};
+use arrow_array::{Array, ArrayRef, make_array};
+use arrow_schema::DataType;
 use lance::{BlobDescriptor, BlobDescriptorArrayBuilder, DedicatedBlobWriter, PackedBlobWriter};
 use lance_core::{Error, Result};
 
@@ -115,12 +116,12 @@ unsafe fn borrowed_bytes<'a>(data: *const u8, len: usize, name: &str) -> Result<
         return Ok(&[]);
     }
     if data.is_null() {
-        return Err(Error::invalid_input_source(format!(
+        return Err(Error::invalid_input(format!(
             "{name} must not be NULL when len is {len}"
         )));
     }
     if len > isize::MAX as usize {
-        return Err(Error::invalid_input_source(format!(
+        return Err(Error::invalid_input(format!(
             "{name} len={len} exceeds isize::MAX on this platform"
         )));
     }
