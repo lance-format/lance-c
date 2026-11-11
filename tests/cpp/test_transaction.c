@@ -2680,7 +2680,9 @@ static void test_native_typed_operations(const char *src_uri,
         schema, fragments, 2, &config, &base_list);
     ASSERT(overwrite != NULL, "construct native Overwrite");
     CHECK_OK();
-    ASSERT(lance_operation_kind(overwrite) == LANCE_OPERATION_OVERWRITE,
+    LanceOperationKind overwrite_kind = LANCE_OPERATION_UNKNOWN;
+    ASSERT(lance_operation_kind(overwrite, &overwrite_kind) == 0 &&
+               overwrite_kind == LANCE_OPERATION_OVERWRITE,
            "Overwrite operation kind");
     CHECK_OK();
     uint64_t overwrite_fragments = UINT64_MAX;
@@ -2819,7 +2821,9 @@ static void test_native_typed_operations(const char *src_uri,
         lance_operation_merge_new(schema, fragments, 2, false);
     ASSERT(merge != NULL, "construct native Merge");
     CHECK_OK();
-    ASSERT(lance_operation_kind(merge) == LANCE_OPERATION_MERGE,
+    LanceOperationKind merge_kind = LANCE_OPERATION_UNKNOWN;
+    ASSERT(lance_operation_kind(merge, &merge_kind) == 0 &&
+               merge_kind == LANCE_OPERATION_MERGE,
            "Merge operation kind");
     CHECK_OK();
     uint64_t merge_fragments = UINT64_MAX;
@@ -2851,7 +2855,9 @@ static void test_native_typed_operations(const char *src_uri,
         lance_operation_clone_new(true, NULL, source_version, ref_path, NULL);
     ASSERT(shallow != NULL, "construct native shallow Clone");
     CHECK_OK();
-    ASSERT(lance_operation_kind(shallow) == LANCE_OPERATION_CLONE,
+    LanceOperationKind shallow_kind = LANCE_OPERATION_UNKNOWN;
+    ASSERT(lance_operation_kind(shallow, &shallow_kind) == 0 &&
+               shallow_kind == LANCE_OPERATION_CLONE,
            "Clone operation kind");
     CHECK_OK();
     bool is_shallow = false;
@@ -2948,7 +2954,9 @@ static void test_native_typed_operations(const char *src_uri,
         lance_operation_update_config_new(&update_options);
     ASSERT(update_config != NULL, "construct native UpdateConfig");
     CHECK_OK();
-    ASSERT(lance_operation_kind(update_config) == LANCE_OPERATION_UPDATE_CONFIG,
+    LanceOperationKind update_config_kind = LANCE_OPERATION_UNKNOWN;
+    ASSERT(lance_operation_kind(update_config, &update_config_kind) == 0 &&
+               update_config_kind == LANCE_OPERATION_UPDATE_CONFIG,
            "UpdateConfig operation kind");
     CHECK_OK();
     LanceUpdateMap *typed_config_updates = NULL;
