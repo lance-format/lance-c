@@ -70,6 +70,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 |--------|-----------|-------------|
 | [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
 | [x] | Dataset metadata | Table/schema/field metadata updates plus native storage-version, stable-row-ID and field-ID inspection |
+| [x] | Config, bases and files | Config merge/replace/clear, native base-path inspection/registration, and tracked/all-file Arrow streams |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
 | [x] | Substrait aggregation | `lance_scanner_set_substrait_aggregate()` accepts a serialized Substrait `Plan`; group/measure semantics, aliases, validation, and aggregate output come from the native planner |
 | [x] | Row prefilter | `lance_scanner_set_row_addr_allowlist()` / `lance_scanner_set_row_addr_blocklist()` restrict scans, nearest-neighbor and full-text searches to (or exclude) a set of `_rowid`s before ranking |
@@ -138,6 +139,73 @@ metadata. `lance_dataset_data_storage_version()`,
 `lance_dataset_field_id_at()`, `lance_dataset_resolve_field_id()` and
 `lance_dataset_field_path()` expose the current native snapshot; the C++
 wrappers provide the corresponding `Dataset` methods.
+
+## Dataset configuration, bases and files
+
+`lance_dataset_update_config_json()` and `Dataset::update_config_json()` apply
+native config merge or replace semantics and return the complete resulting map:
+
+```cpp
+auto updated = ds.update_config_json({
+    {"owner", std::string("c++")},
+    {"retired", std::nullopt},
+    {"empty", std::string("")},
+    {"dup", std::string("first")},
+    {"dup", std::string("second")},
+});
+
+auto cleared =
+    ds.update_config_json({}, lance::MetadataUpdateMode::Replace);
+```
+
+A NULL or `std::nullopt` value removes a key, an empty string remains a value,
+and duplicate keys follow the native builder's last-write-wins behavior. An
+empty replace clears the map. The existing merge-only
+`lance_dataset_update_config()` and `Dataset::update_config()` entry points keep
+their original signatures.
+
+Base paths are copied from the current manifest as JSON keyed by decimal ID.
+Registration maps to native `Dataset::add_bases`, including optional transaction
+properties:
+
+```cpp
+auto registry = ds.base_paths_json();
+
+lance::AddBasesOptions options;
+options.transaction_properties =
+    std::vector<std::pair<std::string, std::string>>{{"owner", "c++"}};
+ds.add_bases({
+    lance::BasePath{0, alternate_uri, std::string("alternate"), false},
+}, options);
+```
+
+ID zero requests native allocation. `name == std::nullopt` means native `None`;
+an engaged empty string is preserved. An unset transaction-properties optional
+maps to native `None`, while an engaged empty vector maps to
+`Some(empty map)`. Native duplicate/conflict validation remains authoritative.
+
+`lance_dataset_tracked_files_stream()` and
+`lance_dataset_all_files_stream()` export the corresponding native Arrow
+streams. `Dataset::tracked_files_stream()` and `Dataset::all_files_stream()`
+return the move-only `lance::ArrowStream` owner. Tracked files follow native
+manifest walking across versions and registered bases. `all_files` lists the
+primary root only and includes untracked physical files there.
+
+```cpp
+auto tracked = ds.tracked_files_stream(
+    /*min_version=*/2,
+    [](uint64_t processed, std::optional<uint64_t> total) {
+        /* Runs on a native background task; do not block or throw. */
+    });
+auto files = ds.all_files_stream();
+```
+
+An exported stream retains what it needs after the source dataset closes. The
+stream `release` callback may return before a native progress callback finishes;
+the C++ wrapper keeps the callback capture until the native emitter releases it.
+In C, `LanceTrackedFilesProgress` transfers ownership of `callback_ctx` to the
+library, which calls its `release` exactly once, including on factory errors or
+early stream release.
 
 ## Dataset maintenance
 

@@ -112,10 +112,11 @@ typedef enum {
  * poisoned handle.
  *
  * Callbacks passed INTO the library (LanceCallback, LanceWaker, and
- * LanceScanStatisticsCallback) are the reverse direction and are NOT covered
- * by this contract: their ABI is non-unwinding, so a callback that throws or
- * unwinds can abort the host process before the library can contain it.
- * Callbacks must return normally.
+ * LanceScanStatisticsCallback, LanceTrackedFilesProgressCallback and
+ * LanceTrackedFilesProgressRelease) are the reverse direction and are NOT
+ * covered by this contract: their ABI is non-unwinding, so a callback that
+ * throws or unwinds can abort the host process before the library can contain
+ * it. Callbacks must return normally.
  *
  * This contract requires Rust's `panic = "unwind"` strategy. The crate
  * rejects `panic = "abort"` builds at compile time because catch_unwind
@@ -1480,6 +1481,199 @@ int32_t lance_dataset_update_config(
     const char* const* keys,
     const char* const* values,
     size_t num_entries
+);
+
+/**
+ * Merge or replace dataset config and return the complete updated map as a
+ * JSON object.
+ *
+ * `keys` and `values` are parallel arrays of length `count`.
+ * - `keys[i]` must be a non-NULL, NUL-terminated UTF-8 string.
+ * - `values[i] == NULL` removes `keys[i]`.
+ * - An empty string value is a real value and is stored as `""`.
+ * - `keys` and `values` may be NULL only when `count == 0`.
+ *
+ * `mode` is explicit:
+ * - `LANCE_METADATA_UPDATE_MERGE` applies the entries to the existing map.
+ * - `LANCE_METADATA_UPDATE_REPLACE` replaces the entire map. With
+ *   `count == 0`, this clears the map; value-less entries are omitted.
+ *
+ * Duplicate keys in one call are forwarded in input order and follow the
+ * native builder's last-write-wins behavior. The native builder commits one
+ * transaction and its complete resulting map is serialized as JSON. This
+ * mutates `dataset` in place; other dataset handles and existing streams keep
+ * their prior snapshot view.
+ *
+ * Caller must free the returned JSON string with `lance_free_string()`.
+ * Returns NULL on error.
+ */
+const char* lance_dataset_update_config_json(
+    LanceDataset* dataset,
+    const char* const* keys,
+    const char* const* values,
+    size_t count,
+    LanceMetadataUpdateMode mode
+);
+
+/* ─── Dataset base paths ─── */
+
+/**
+ * Return the current snapshot's native base-path registry as a JSON object
+ * keyed by decimal base ID.
+ *
+ * Each value contains exactly the native fields:
+ * - `id`: unsigned base ID;
+ * - `name`: string or JSON null;
+ * - `path`: full URI string;
+ * - `is_dataset_root`: boolean.
+ *
+ * The snapshot owns copied strings and remains independent of later dataset
+ * versions. Caller must free the returned string with `lance_free_string()`.
+ * Returns NULL on error.
+ */
+const char* lance_dataset_base_paths_json(const LanceDataset* dataset);
+
+/**
+ * One native `BasePath` field set for registration.
+ *
+ * `name == NULL` maps to native `None`; a non-NULL pointer, including an empty
+ * string, maps to `Some(name)`. `id == 0` requests native ID assignment.
+ */
+typedef struct LanceBasePath {
+    uint32_t id;
+    const char* path;
+    const char* name;
+    bool is_dataset_root;
+} LanceBasePath;
+
+/**
+ * Optional transaction properties for one native `add_bases` commit.
+ *
+ * `keys` and `values` are parallel arrays of length `count`; every key and
+ * value must be a non-NULL C string. Empty strings are values. Duplicate keys
+ * follow native `HashMap` last-write-wins behavior.
+ */
+typedef struct LanceTransactionProperties {
+    const char* const* keys;
+    const char* const* values;
+    size_t count;
+} LanceTransactionProperties;
+
+/**
+ * Register new base paths and commit one native `Dataset::add_bases`
+ * transaction.
+ *
+ * `bases` may be NULL when `base_count == 0`. An empty list is passed to
+ * the native transaction builder and follows its commit behavior.
+ *
+ * `transaction_properties == NULL` maps to native `None`. A non-NULL pointer
+ * with `count == 0` maps to native `Some(empty map)`, so the caller's explicit
+ * empty selection is preserved at this boundary. Native handling determines
+ * how that empty map is persisted.
+ *
+ * Inputs are copied before the asynchronous operation starts. ID allocation,
+ * duplicate/conflict checks, persistence and path resolution follow Lance
+ * core. On success the same dataset handle sees the new version; existing
+ * snapshots and streams keep their prior view.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_add_bases(
+    LanceDataset* dataset,
+    const LanceBasePath* bases,
+    size_t base_count,
+    const LanceTransactionProperties* transaction_properties
+);
+
+/* ─── Dataset file enumeration ─── */
+
+/**
+ * Tracked-files progress callback.
+ *
+ * `manifests_total` is NULL when the native total is not yet known. Otherwise
+ * it points to a value borrowed for the duration of this call only. Progress
+ * callbacks run on a native background task and must not block or unwind.
+ */
+typedef void (*LanceTrackedFilesProgressCallback)(
+    void* callback_ctx,
+    uint64_t manifests_processed,
+    const uint64_t* manifests_total
+);
+
+/**
+ * Release a tracked-files progress context.
+ *
+ * The library invokes this exactly once after the native emitter releases the
+ * progress closure. It may run on a native worker after the exported stream
+ * was released or after the stream factory returned an error. Must not unwind.
+ */
+typedef void (*LanceTrackedFilesProgressRelease)(void* callback_ctx);
+
+/**
+ * Foreign progress callback and owned context for tracked-file enumeration.
+ *
+ * When passed to `lance_dataset_tracked_files_stream`, both function pointers
+ * must be non-NULL. Ownership of `callback_ctx` transfers to the library
+ * before any other validation. `release(callback_ctx)` is called exactly once,
+ * including on factory errors and early stream release. Until release runs,
+ * the callback and context must remain valid. The stream's own `release`
+ * callback may return before an in-flight native progress callback finishes.
+ */
+typedef struct LanceTrackedFilesProgress {
+    LanceTrackedFilesProgressCallback callback;
+    LanceTrackedFilesProgressRelease release;
+    void* callback_ctx;
+} LanceTrackedFilesProgress;
+
+/**
+ * Options for `lance_dataset_tracked_files_stream`.
+ *
+ * A NULL options pointer uses native defaults. A non-zero `has_min_version`
+ * forwards `min_version`, including zero. `progress == NULL` disables
+ * progress reporting.
+ */
+typedef struct LanceTrackedFilesOptions {
+    int32_t has_min_version;
+    uint64_t min_version;
+    const LanceTrackedFilesProgress* progress;
+} LanceTrackedFilesOptions;
+
+/**
+ * Export `Dataset::tracked_files_with_options` as an Arrow C stream.
+ *
+ * The native schema, dictionary/timestamp types, values, optional
+ * `min_version` filtering and unspecified row order are preserved. Tracked
+ * files follow native manifest walking; this is not a physical file listing.
+ * The stream owns its resources and remains valid after the source dataset is
+ * closed.
+ *
+ * `out` is caller-owned, must be zero-initialized by convention, and is
+ * written only on success. Invoke its non-NULL `release` callback exactly once.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_tracked_files_stream(
+    const LanceDataset* dataset,
+    const LanceTrackedFilesOptions* options,
+    struct ArrowArrayStream* out
+);
+
+/**
+ * Export `Dataset::all_files` as an Arrow C stream.
+ *
+ * This lists only the primary dataset root. Registered additional base paths
+ * are not scanned, and untracked files physically present under the primary
+ * root are included. The native schema, values and unspecified row order are
+ * preserved. The stream remains valid after the source dataset is closed.
+ *
+ * `out` is caller-owned, must be zero-initialized by convention, and is
+ * written only on success. Invoke its non-NULL `release` callback exactly once.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_all_files_stream(
+    const LanceDataset* dataset,
+    struct ArrowArrayStream* out
 );
 
 /**

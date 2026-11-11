@@ -144,9 +144,10 @@ impl<S> GuardedReader<S> {
     }
 }
 
-impl<S> Iterator for GuardedReader<S>
+impl<S, E> Iterator for GuardedReader<S>
 where
-    S: Stream<Item = lance_core::Result<RecordBatch>> + Unpin,
+    S: Stream<Item = std::result::Result<RecordBatch, E>> + Unpin,
+    E: std::fmt::Display,
 {
     type Item = std::result::Result<RecordBatch, ArrowError>;
 
@@ -173,8 +174,8 @@ where
             match handle.block_on(inner.next()) {
                 Some(Ok(batch)) => Some(Ok(batch)),
                 Some(Err(err)) => {
-                    // Format and detach the arbitrary Lance error while still
-                    // inside the guard. arrow-rs later calls Display and
+                    // Format and detach the arbitrary inner-stream error while
+                    // still inside the guard. arrow-rs later calls Display and
                     // CString::new from a non-unwinding callback, so neither a
                     // panicking source nor an embedded NUL may reach it.
                     Some(Err(ffi_safe_stream_error(err.to_string())))
@@ -196,9 +197,10 @@ where
     }
 }
 
-impl<S> RecordBatchReader for GuardedReader<S>
+impl<S, E> RecordBatchReader for GuardedReader<S>
 where
-    S: Stream<Item = lance_core::Result<RecordBatch>> + Unpin + Send,
+    S: Stream<Item = std::result::Result<RecordBatch, E>> + Unpin + Send,
+    E: std::fmt::Display,
 {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
