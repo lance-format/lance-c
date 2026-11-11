@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow::record_batch::RecordBatchReader;
 use arrow_array::{
     Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray, StructArray,
 };
@@ -877,21 +878,53 @@ fn test_batch_udf_zero_columns_and_null_context() {
 
 #[test]
 fn test_batch_udf_read_columns_and_batch_options() {
-    type ReadColumnsCase = (Option<Vec<&str>>, Vec<String>, Option<u32>, usize);
-    let cases: Vec<ReadColumnsCase> = vec![
-        (None, vec!["id".into(), "label".into()], None, 2),
-        (Some(Vec::new()), vec!["_rowaddr".into()], None, 2),
-        (Some(vec!["id"]), vec!["id".into()], None, 2),
-        (
-            Some(vec!["label", "id"]),
-            vec!["label".into(), "id".into()],
-            None,
-            2,
-        ),
-        (Some(vec!["id"]), vec!["id".into()], Some(1), 8),
+    struct ReadColumnsCase<'a> {
+        read_columns: Option<Vec<&'a str>>,
+        expected_inputs: Vec<String>,
+        batch_size: Option<u32>,
+        expected_calls: usize,
+    }
+
+    let cases = vec![
+        ReadColumnsCase {
+            read_columns: None,
+            expected_inputs: vec!["id".into(), "label".into()],
+            batch_size: None,
+            expected_calls: 2,
+        },
+        ReadColumnsCase {
+            read_columns: Some(Vec::new()),
+            expected_inputs: vec!["_rowaddr".into()],
+            batch_size: None,
+            expected_calls: 2,
+        },
+        ReadColumnsCase {
+            read_columns: Some(vec!["id"]),
+            expected_inputs: vec!["id".into()],
+            batch_size: None,
+            expected_calls: 2,
+        },
+        ReadColumnsCase {
+            read_columns: Some(vec!["label", "id"]),
+            expected_inputs: vec!["label".into(), "id".into()],
+            batch_size: None,
+            expected_calls: 2,
+        },
+        ReadColumnsCase {
+            read_columns: Some(vec!["id"]),
+            expected_inputs: vec!["id".into()],
+            batch_size: Some(1),
+            expected_calls: 8,
+        },
     ];
 
-    for (read_columns, expected_inputs, batch_size, expected_calls) in cases {
+    for case in cases {
+        let ReadColumnsCase {
+            read_columns,
+            expected_inputs,
+            batch_size,
+            expected_calls,
+        } = case;
         let tmp = tempfile::tempdir().unwrap();
         let uri = fixture_uri(&tmp, "read");
         create_batch_udf_dataset(&uri, false);
