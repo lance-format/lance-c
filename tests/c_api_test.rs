@@ -52883,9 +52883,7 @@ fn test_native_updated_fragment_offsets_copy_at_contract() {
     let dense_index = indices[&10];
     let empty_index = indices[&40];
     assert_eq!(
-        unsafe {
-            lance_updated_fragment_offsets_copy_at(offsets, empty_index, ptr::null_mut(), 0)
-        },
+        unsafe { lance_updated_fragment_offsets_copy_at(offsets, empty_index, ptr::null_mut(), 0) },
         0,
         "{}",
         take_last_error_message()
@@ -52913,12 +52911,7 @@ fn test_native_updated_fragment_offsets_copy_at_contract() {
         let before = output.to_vec();
         assert_eq!(
             unsafe {
-                lance_updated_fragment_offsets_copy_at(
-                    offsets,
-                    index,
-                    output.as_mut_ptr(),
-                    count,
-                )
+                lance_updated_fragment_offsets_copy_at(offsets, index, output.as_mut_ptr(), count)
             },
             -1
         );
@@ -52998,11 +52991,7 @@ fn test_native_updated_fragment_offsets_copy_at_contract() {
     assert_eq!(cloned_dense, dense);
 
     let empty_container = unsafe { lance_updated_fragment_offsets_new(ptr::null(), 0) };
-    assert!(
-        !empty_container.is_null(),
-        "{}",
-        take_last_error_message()
-    );
+    assert!(!empty_container.is_null(), "{}", take_last_error_message());
     expect_invalid(empty_container, 0, &mut sentinel, 0);
     unsafe { lance_updated_fragment_offsets_close(empty_container) };
 }
