@@ -6833,6 +6833,122 @@ int32_t lance_dataset_write_with_options(
     LanceDataset** out_dataset
 );
 
+/* ─── Native fragment creation ─── */
+
+/**
+ * Options for the native fragment creation entry points.
+ *
+ * `schema == NULL` leaves native schema inference in place. In APPEND mode
+ * native inference may use the existing dataset's schema, including its field
+ * IDs. A non-NULL schema is borrowed for the call and cloned before the write
+ * starts, so closing the handle during the call is not allowed.
+ *
+ * `mode` is a `LanceWriteMode` value. `write == NULL` selects the native
+ * `WriteParams::default()` writer options. `storage_opts == NULL` and
+ * `session == NULL` keep the native defaults.
+ */
+typedef struct LanceFragmentCreateOptions {
+    /* Native schema to write with. NULL uses native inference. */
+    const LanceSchema*      schema;
+    /* LanceWriteMode: LANCE_WRITE_CREATE, LANCE_WRITE_APPEND or
+     * LANCE_WRITE_OVERWRITE. */
+    int32_t                 mode;
+    /* Native write options. NULL uses native defaults. */
+    const LanceWriteOptions* write;
+    /* NULL-terminated [key, value, ..., NULL] storage options. */
+    const char* const*      storage_opts;
+    /* Shared session for caches and store configuration. NULL means default. */
+    const LanceSession*     session;
+} LanceFragmentCreateOptions;
+
+/**
+ * Create one fragment at `dataset_uri` without publishing a version.
+ *
+ * Maps to native `FragmentCreateBuilder::write(source, Some(fragment_id))`.
+ * Native code owns schema inference and compatibility, file format selection,
+ * the physical row count and all error semantics. A non-empty input is
+ * required; an empty stream fails with the native "Input data was empty."
+ * error. The native API accepts any `fragment_id`, including IDs already used
+ * by existing metadata; duplicate detection happens at commit time.
+ *
+ * The stream is consumed on every return path except a NULL `stream` pointer,
+ * including validation failures and a NULL output slot. Passing a NULL stream
+ * is an invalid argument and leaves it untouched.
+ *
+ * On success `*out_fragment` receives an independently owned detached
+ * metadata handle that remains valid after the dataset, schema and session
+ * handles are closed. Closing the handle never deletes the written data file.
+ * The output is written only on success.
+ *
+ * @return 0 on success, -1 on error. Errors include
+ *         LANCE_ERR_INVALID_ARGUMENT (NULL stream/uri/output, invalid mode,
+ *         empty input), native schema mismatches, storage errors and
+ *         commit-less I/O failures.
+ */
+int32_t lance_fragment_create(
+    const char* dataset_uri,
+    uint64_t fragment_id,
+    const LanceFragmentCreateOptions* options,
+    struct ArrowArrayStream* stream,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Create zero or more fragments without publishing a version.
+ *
+ * Maps to native `FragmentCreateBuilder::write_fragments`. Native
+ * `max_rows_per_file` splitting, fragment ID assignment, file format and
+ * schema handling apply; the binding implements no splitting of its own.
+ *
+ * The stream follows the same consumption contract as `lance_fragment_create`,
+ * and both output slots are written only on success. On success `*out_fragments`
+ * is a library-allocated array of `*out_count` independently owned detached
+ * handles. Release it with `lance_fragment_array_free(*out_fragments,
+ * *out_count)`, which closes every remaining non-NULL element. A successful
+ * empty result writes NULL and 0.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_create_many(
+    const char* dataset_uri,
+    const LanceFragmentCreateOptions* options,
+    struct ArrowArrayStream* stream,
+    LanceFragment*** out_fragments,
+    size_t* out_count
+);
+
+/**
+ * Close every non-NULL fragment in an array from `lance_fragment_create_many`,
+ * then release the array allocation. NULL-safe. `count` must be the count
+ * returned by `create_many`; slots already cleared by a wrapper are skipped.
+ */
+void lance_fragment_array_free(LanceFragment** fragments, size_t count);
+
+/**
+ * Create one fragment from an existing Lance data file.
+ *
+ * Maps to native `FileFragment::create_from_file(filename, dataset_snapshot,
+ * fragment_id as usize, physical_rows)`. `filename` is relative to the
+ * dataset's data directory and keeps native file-version, schema
+ * compatibility and physical-row validation. `physical_rows == NULL` maps to
+ * native `None`; a pointer to zero maps to `Some(0)`, which the current native
+ * format may ignore. Values that do not fit the native `usize` are rejected.
+ *
+ * The dataset handle supplies the target snapshot and is not modified. The
+ * output owns complete detached metadata and remains valid after the dataset
+ * is closed; it is written only on success. Closing the handle never deletes
+ * the file.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_create_from_file(
+    const LanceDataset* dataset,
+    const char* filename,
+    uint64_t fragment_id,
+    const uint64_t* physical_rows,
+    LanceFragment** out_fragment
+);
+
 /* ─── Native data files ─── */
 
 /** Owned native `DataFile` metadata snapshot. */

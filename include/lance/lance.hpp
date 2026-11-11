@@ -554,6 +554,20 @@ struct UncommittedWriteOptions {
         transaction_properties;
 };
 
+/// Options for native fragment creation.
+///
+/// `schema == nullptr` leaves native schema inference in place; in Append mode
+/// native inference may reuse the existing dataset's schema and field IDs. A
+/// non-null schema is borrowed for the call and cloned by the C API before the
+/// asynchronous write starts. `write` maps through the same native option
+/// conversion as `Dataset::write_with_options`, so a default-constructed value
+/// selects native `WriteParams::default()`.
+struct FragmentCreateOptions {
+    const LanceSchema* schema = nullptr;
+    WriteMode          mode = WriteMode::Create;
+    WriteOptions       write;
+};
+
 // ─── Native transactions ─────────────────────────────────────────────────────
 
 /// Owned native `DataFile` metadata snapshot. Move-only.
@@ -2583,6 +2597,53 @@ public:
     /// deletion-file metadata and can be scanned before publication. A full
     /// deletion returns `std::nullopt`.
     std::optional<Fragment> delete_if(const std::string& predicate) const;
+
+    /// Create one fragment without publishing a version.
+    ///
+    /// Maps to native `FragmentCreateBuilder::write(source, Some(fragment_id))`.
+    /// Native owns schema inference and compatibility, file format, physical row
+    /// counts and error semantics; an empty input fails with the native "Input
+    /// data was empty." error. The stream is consumed on every return path,
+    /// including a null stream pointer (which is rejected unconsumed) and local
+    /// conversion failures. A null `options.schema` keeps native inference.
+    ///
+    /// Returns independently owned detached metadata that stays valid after the
+    /// source dataset, schema and session are closed. Closing it never deletes
+    /// the written data file; publish the fragment with an Append transaction.
+    static Fragment create(
+        const std::string& dataset_uri,
+        ArrowArrayStream* stream,
+        uint64_t fragment_id,
+        const FragmentCreateOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
+
+    /// Create zero or more fragments without publishing a version.
+    ///
+    /// Maps to native `FragmentCreateBuilder::write_fragments`, so
+    /// `options.write.params.max_rows_per_file` splitting and fragment ID
+    /// assignment stay native. The stream follows the same consumption contract
+    /// as `create`; an empty input returns an empty vector.
+    static std::vector<Fragment> create_many(
+        const std::string& dataset_uri,
+        ArrowArrayStream* stream,
+        const FragmentCreateOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
+
+    /// Create one fragment from an existing Lance data file in `dataset`'s data
+    /// directory.
+    ///
+    /// Maps to native `FileFragment::create_from_file`. `filename` is relative
+    /// to the dataset's data directory. `physical_rows == std::nullopt` maps to
+    /// native `None`; an engaged value maps to `Some(value)`. Native owns file
+    /// version, schema compatibility and physical-row validation. The dataset
+    /// supplies the target snapshot and is not modified.
+    static Fragment create_from_file(
+        const Dataset& dataset,
+        const std::string& filename,
+        uint64_t fragment_id,
+        std::optional<uint64_t> physical_rows = std::nullopt);
 
     const LanceFragment* c_handle() const { return handle_.get(); }
 };
@@ -6184,6 +6245,8 @@ public:
     /// Access the underlying C handle (does not transfer ownership).
     const LanceDataset* c_handle() const { return handle_.get(); }
 
+    friend class Fragment;
+
 private:
     explicit Dataset(LanceDataset* ptr) : handle_(ptr) {}
 };
@@ -7801,6 +7864,118 @@ inline void Fragment::take(
             handle_.get(), indices, num_indices, nullptr, out) != 0) {
         check_error();
     }
+}
+
+inline Fragment Fragment::create(
+    const std::string& dataset_uri,
+    ArrowArrayStream* stream,
+    uint64_t fragment_id,
+    const FragmentCreateOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+    // Native reads the stream schema itself, so this guard deliberately skips
+    // `read_schema()` and only owns the stream until the C call takes it.
+    Dataset::ArrowStreamInput input(stream);
+
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions c_write =
+        Dataset::to_c_write_options(options.write, cleanup);
+    auto kv = Dataset::to_c_key_values(storage_opts);
+    LanceFragmentCreateOptions c_options{};
+    c_options.schema = options.schema ? options.schema->c_handle() : nullptr;
+    c_options.mode = static_cast<int32_t>(options.mode);
+    c_options.write = &c_write;
+    c_options.storage_opts = storage_opts.empty() ? nullptr : kv.data();
+    c_options.session = session ? session->c_handle() : nullptr;
+
+    LanceFragment* out = nullptr;
+    auto* owned_stream = input.consume();
+    if (lance_fragment_create(
+            dataset_uri.c_str(), fragment_id, &c_options, owned_stream,
+            &out) != 0) {
+        check_error();
+    }
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_fragment_create returned success with null out_fragment");
+    }
+    return Fragment(out);
+}
+
+inline std::vector<Fragment> Fragment::create_many(
+    const std::string& dataset_uri,
+    ArrowArrayStream* stream,
+    const FragmentCreateOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+    Dataset::ArrowStreamInput input(stream);
+
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions c_write =
+        Dataset::to_c_write_options(options.write, cleanup);
+    auto kv = Dataset::to_c_key_values(storage_opts);
+    LanceFragmentCreateOptions c_options{};
+    c_options.schema = options.schema ? options.schema->c_handle() : nullptr;
+    c_options.mode = static_cast<int32_t>(options.mode);
+    c_options.write = &c_write;
+    c_options.storage_opts = storage_opts.empty() ? nullptr : kv.data();
+    c_options.session = session ? session->c_handle() : nullptr;
+
+    LanceFragment** raw = nullptr;
+    size_t count = 0;
+    auto* owned_stream = input.consume();
+    if (lance_fragment_create_many(
+            dataset_uri.c_str(), &c_options, owned_stream, &raw, &count) !=
+        0) {
+        check_error();
+    }
+    if (count > 0 && !raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_fragment_create_many returned success with a null "
+                    "fragment array");
+    }
+
+    std::vector<Fragment> fragments;
+    try {
+        fragments.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            // Adopt before clearing so an exception still leaves the handle in
+            // the array for `lance_fragment_array_free`.
+            fragments.emplace_back(raw[i]);
+            raw[i] = nullptr;
+        }
+    } catch (...) {
+        // Frees every slot that was not adopted; adopted slots are null.
+        lance_fragment_array_free(raw, count);
+        throw;
+    }
+    lance_fragment_array_free(raw, count);
+    return fragments;
+}
+
+inline Fragment Fragment::create_from_file(
+    const Dataset& dataset,
+    const std::string& filename,
+    uint64_t fragment_id,
+    std::optional<uint64_t> physical_rows) {
+    uint64_t rows = physical_rows.value_or(0);
+    LanceFragment* out = nullptr;
+    if (lance_fragment_create_from_file(
+            dataset.c_handle(),
+            filename.c_str(),
+            fragment_id,
+            physical_rows ? &rows : nullptr,
+            &out) != 0) {
+        check_error();
+    }
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_fragment_create_from_file returned success with null "
+            "out_fragment");
+    }
+    return Fragment(out);
 }
 
 inline Scanner Dataset::scan() const {

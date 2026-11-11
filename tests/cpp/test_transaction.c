@@ -2540,6 +2540,242 @@ static void test_native_operation_construction(const char *src_uri,
     printf("native operation construction OK\n");
 }
 
+static void check_fragment_create_metadata(const LanceFragment *fragment,
+                                           uint64_t id,
+                                           uint64_t physical_rows) {
+    bool is_bound = true;
+    ASSERT(lance_fragment_is_bound(fragment, &is_bound) == 0,
+           "read created fragment bound state");
+    CHECK_OK();
+    ASSERT(!is_bound, "created fragment must be detached");
+
+    const char *metadata = lance_fragment_metadata_json(fragment);
+    ASSERT(metadata != NULL, "created fragment metadata JSON");
+    CHECK_OK();
+    char expected[128];
+    snprintf(expected, sizeof(expected), "\"id\":%llu",
+             (unsigned long long)id);
+    ASSERT(strstr(metadata, expected) != NULL,
+           "created fragment must carry the requested id");
+    snprintf(expected, sizeof(expected), "\"physical_rows\":%llu",
+             (unsigned long long)physical_rows);
+    ASSERT(strstr(metadata, expected) != NULL,
+           "created fragment must carry the native physical row count");
+    lance_free_string(metadata);
+}
+
+static uint64_t find_four_row_fragment(LanceDataset *dataset) {
+    uint64_t count = lance_dataset_fragment_count(dataset);
+    CHECK_OK();
+    uint64_t *ids = (uint64_t *)calloc(count, sizeof(uint64_t));
+    ASSERT(ids != NULL, "allocate fragment ids for from-file selection");
+    ASSERT(lance_dataset_fragment_ids(dataset, ids) == 0,
+           "read fragment ids for from-file selection");
+    CHECK_OK();
+    uint64_t found = UINT64_MAX;
+    for (uint64_t i = 0; i < count && found == UINT64_MAX; i++) {
+        LanceFragment *candidate = lance_dataset_open_fragment(dataset, ids[i]);
+        ASSERT(candidate != NULL,
+               "open candidate fragment for from-file creation");
+        CHECK_OK();
+        uint64_t physical_rows = 0;
+        if (lance_fragment_physical_rows(candidate, &physical_rows) == 0 &&
+            physical_rows == 4) {
+            found = ids[i];
+        }
+        lance_fragment_close(candidate);
+    }
+    free(ids);
+    return found;
+}
+
+static LanceDataset *publish_created_fragments(
+    const char *uri,
+    uint64_t read_version,
+    const LanceFragment *const *fragments,
+    size_t count) {
+    LanceOperation *operation = lance_operation_append_new(fragments, count);
+    ASSERT(operation != NULL, "construct append operation from created fragments");
+    CHECK_OK();
+    LanceTransaction *transaction =
+        lance_transaction_new(read_version, operation, NULL);
+    ASSERT(transaction != NULL,
+           "construct append transaction from created fragments");
+    CHECK_OK();
+    ASSERT(transaction_read_version(transaction) == read_version,
+           "created fragment append read version");
+    ASSERT(transaction_operation_kind(transaction) == LANCE_OPERATION_APPEND,
+           "created fragment append operation kind");
+    ASSERT(transaction_fragment_count(transaction) == (uint64_t)count,
+           "created fragment append fragment count");
+    LanceDataset *dataset = commit_transaction(uri, transaction, NULL);
+    lance_transaction_close(transaction);
+    lance_operation_close(operation);
+    return dataset;
+}
+
+static void test_fragment_creation(const char *src_uri, const char *base) {
+    char uri[4096];
+    snprintf(uri, sizeof(uri), "%s/c_fragment_creation", base);
+
+    /* Seed a multi-fragment dataset through the existing uncommitted write
+     * path, so creation operates on a real native dataset. */
+    LanceUncommittedWriteOptions seed_options;
+    memset(&seed_options, 0, sizeof(seed_options));
+    seed_options.write.params.max_rows_per_file = 4;
+    LanceTransaction *seed = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_CREATE, &seed_options);
+    LanceDataset *dataset = commit_transaction(uri, seed, NULL);
+    lance_transaction_close(seed);
+
+    uint64_t version = lance_dataset_version(dataset);
+    CHECK_OK();
+    uint64_t rows = lance_dataset_count_rows(dataset);
+    CHECK_OK();
+    uint64_t fragments_before = lance_dataset_fragment_count(dataset);
+    CHECK_OK();
+    ASSERT(rows >= 4 && fragments_before == (rows + 3) / 4,
+           "seed dataset must span one fragment per four rows");
+
+    LanceSchema *schema = NULL;
+    ASSERT(lance_dataset_schema_clone(dataset, &schema) == 0,
+           "clone seed dataset native schema");
+    CHECK_OK();
+    ASSERT(schema != NULL, "seed dataset native schema output");
+    lance_dataset_close(dataset);
+
+    /* Single create with an explicit fragment id, published by the caller. */
+    StreamInput input = make_source_stream(src_uri);
+    LanceFragmentCreateOptions create_options;
+    memset(&create_options, 0, sizeof(create_options));
+    create_options.schema = schema;
+    create_options.mode = LANCE_WRITE_APPEND;
+    LanceFragment *single = NULL;
+    ASSERT(lance_fragment_create(uri, 1000, &create_options, &input.stream,
+                                 &single) == 0,
+           "create single detached fragment");
+    CHECK_OK();
+    if (input.schema.release) input.schema.release(&input.schema);
+    ASSERT(single != NULL, "single fragment output");
+    check_fragment_create_metadata(single, 1000, rows);
+
+    /* Creation is uncommitted: the dataset is still at its old version. */
+    check_dataset(uri, version, rows, fragments_before);
+
+    const LanceFragment *single_append[] = {single};
+    LanceDataset *published =
+        publish_created_fragments(uri, version, single_append, 1);
+    ASSERT(lance_dataset_version(published) == version + 1,
+           "single fragment append version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(published) == rows * 2,
+           "single fragment append row count");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(published) == fragments_before + 1,
+           "single fragment append fragment count");
+    CHECK_OK();
+    ASSERT(dataset_max_fragment_id(published) == 1000,
+           "explicit fragment id must survive append and commit");
+    uint64_t published_version = lance_dataset_version(published);
+    CHECK_OK();
+    lance_dataset_close(published);
+    lance_fragment_close(single);
+
+    /* The old snapshot still reads the rows it was created with. */
+    check_dataset(uri, version, rows, fragments_before);
+
+    /* Many fragments: native splitting and native id assignment. */
+    input = make_source_stream(src_uri);
+    memset(&create_options, 0, sizeof(create_options));
+    create_options.mode = LANCE_WRITE_APPEND;
+    LanceWriteOptions write_options;
+    memset(&write_options, 0, sizeof(write_options));
+    write_options.params.max_rows_per_file = 4;
+    create_options.write = &write_options;
+    LanceFragment **fragments = NULL;
+    size_t fragment_count = 0;
+    ASSERT(lance_fragment_create_many(uri, &create_options, &input.stream,
+                                      &fragments, &fragment_count) == 0,
+           "create many detached fragments");
+    CHECK_OK();
+    if (input.schema.release) input.schema.release(&input.schema);
+    ASSERT(fragments != NULL, "many fragment array");
+    ASSERT(fragment_count == (size_t)((rows + 3) / 4),
+           "native max_rows_per_file splitting");
+    for (size_t i = 0; i < fragment_count; i++) {
+        ASSERT(fragments[i] != NULL, "many fragment handle");
+        bool is_bound = true;
+        ASSERT(lance_fragment_is_bound(fragments[i], &is_bound) == 0,
+               "many fragment bound state");
+        CHECK_OK();
+        ASSERT(!is_bound, "many fragments must be detached");
+    }
+
+    published = publish_created_fragments(
+        uri, published_version, (const LanceFragment *const *)fragments,
+        fragment_count);
+    ASSERT(lance_dataset_version(published) == published_version + 1,
+           "many fragment append version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(published) == rows * 3,
+           "many fragment append row count");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(published) ==
+               fragments_before + 1 + fragment_count,
+           "many fragment append fragment count");
+    CHECK_OK();
+    uint64_t many_max_id = dataset_max_fragment_id(published);
+    ASSERT(many_max_id >= 1000 + fragment_count,
+           "commit assigns fresh ids above the explicit high-water mark");
+    published_version = lance_dataset_version(published);
+    CHECK_OK();
+    lance_dataset_close(published);
+    lance_fragment_array_free(fragments, fragment_count);
+
+    /* From-file: externally written raw file -> detached fragment -> Append. */
+    LanceDataset *current = lance_dataset_open(uri, NULL, 0);
+    ASSERT(current != NULL, "open dataset for from-file creation");
+    CHECK_OK();
+    uint64_t current_version = lance_dataset_version(current);
+    uint64_t current_rows = lance_dataset_count_rows(current);
+    CHECK_OK();
+    uint64_t current_fragment_id = find_four_row_fragment(current);
+    ASSERT(current_fragment_id != UINT64_MAX,
+           "from-file creation needs a four-row fragment");
+    LanceFragment *bound = lance_dataset_open_fragment(current, current_fragment_id);
+    ASSERT(bound != NULL, "open bound fragment for raw file export");
+    CHECK_OK();
+    const char *file_name = "c11-fragment-create-from-file.lance";
+    write_c_replacement_file(uri, bound, file_name);
+    lance_fragment_close(bound);
+
+    LanceFragment *from_file = NULL;
+    ASSERT(lance_fragment_create_from_file(current, file_name, 2000, NULL,
+                                           &from_file) == 0,
+           "create fragment from external raw file");
+    CHECK_OK();
+    ASSERT(from_file != NULL, "from-file fragment output");
+    check_fragment_create_metadata(from_file, 2000, 4);
+
+    const LanceFragment *file_append[] = {from_file};
+    published = publish_created_fragments(uri, current_version, file_append, 1);
+    ASSERT(lance_dataset_version(published) == current_version + 1,
+           "from-file append version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(published) == current_rows + 4,
+           "from-file append row count");
+    CHECK_OK();
+    lance_dataset_close(published);
+    lance_fragment_close(from_file);
+    lance_dataset_close(current);
+    lance_schema_close(schema);
+
+    /* Reopen by URI and observe the same rows and fragment count. */
+    check_dataset(uri, current_version + 1, current_rows + 4,
+                  fragments_before + 1 + fragment_count + 1);
+    printf("native fragment creation OK\n");
+}
+
 int main(int argc, char **argv) {
     if (argc != 5) {
         fprintf(stderr,
@@ -2552,6 +2788,7 @@ int main(int argc, char **argv) {
     test_validation(argv[2]);
     test_fragment_delete(argv[1], argv[2]);
     test_data_replacement(argv[1], argv[2]);
+    test_fragment_creation(argv[1], argv[2]);
 
     test_native_schema(argv[3]);
     test_blob_writer_publication(argv[4]);

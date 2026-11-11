@@ -1399,6 +1399,137 @@ static void test_native_operations(const std::string& source_uri,
     std::printf("C++ native operation construction OK\n");
 }
 
+static void check_created_fragment(const lance::Fragment& fragment,
+                                   uint64_t id,
+                                   uint64_t physical_rows) {
+    CHECK(!fragment.is_bound());
+    const std::string metadata = fragment.metadata_json();
+    CHECK(metadata.find("\"id\":" + std::to_string(id)) !=
+          std::string::npos);
+    CHECK(metadata.find("\"physical_rows\":" +
+                       std::to_string(physical_rows)) != std::string::npos);
+}
+
+static lance::Dataset publish_created_fragments(
+    const std::string& uri,
+    uint64_t read_version,
+    const std::vector<const lance::Fragment*>& fragments) {
+    auto operation = lance::Operation::make_append(fragments);
+    auto transaction =
+        lance::Transaction::from_operation(read_version, operation);
+    CHECK(transaction.read_version() == read_version);
+    CHECK(transaction.operation().kind() == lance::OperationKind::Append);
+    CHECK(transaction.operation().fragment_count() == fragments.size());
+    return lance::Dataset::commit(uri, transaction);
+}
+
+static void test_fragment_creation(const std::string& src_uri,
+                                   const std::string& base) {
+    const std::string uri = base + "/cpp_fragment_creation";
+
+    lance::UncommittedWriteOptions seed_options;
+    seed_options.write.params.max_rows_per_file = 4;
+    auto seed =
+        write_uncommitted(src_uri, uri, lance::WriteMode::Create, seed_options);
+
+    uint64_t version = 0;
+    uint64_t rows = 0;
+    uint64_t fragments_before = 0;
+    lance::LanceSchema schema = [&]() {
+        auto dataset = lance::Dataset::commit(uri, seed);
+        version = dataset.version();
+        rows = dataset.count_rows();
+        fragments_before = dataset.fragment_count();
+        CHECK(rows >= 4);
+        CHECK(fragments_before == (rows + 3) / 4);
+        return dataset.native_schema();
+    }();
+
+    lance::FragmentCreateOptions create_options;
+    create_options.schema = &schema;
+    create_options.mode = lance::WriteMode::Append;
+
+    ArrowArrayStream stream = source_stream(src_uri);
+    auto single = lance::Fragment::create(uri, &stream, 1000, create_options);
+    CHECK(stream.release == nullptr);
+    check_created_fragment(single, 1000, rows);
+
+    /* Creation writes data files but publishes nothing. */
+    check_dataset(uri, version, rows);
+
+    std::vector<const lance::Fragment*> single_fragments{&single};
+    auto published =
+        publish_created_fragments(uri, version, single_fragments);
+    CHECK(published.version() == version + 1);
+    CHECK(published.count_rows() == rows * 2);
+    CHECK(published.fragment_count() == fragments_before + 1);
+    const auto published_ids = published.fragment_ids();
+    CHECK(std::find(published_ids.begin(), published_ids.end(), 1000) !=
+          published_ids.end());
+    const uint64_t published_version = published.version();
+    check_dataset(uri, version, rows);
+
+    lance::WriteOptions many_write;
+    many_write.params.max_rows_per_file = 4;
+    lance::FragmentCreateOptions many_options;
+    many_options.mode = lance::WriteMode::Append;
+    many_options.write = many_write;
+
+    ArrowArrayStream many_stream = source_stream(src_uri);
+    auto fragments =
+        lance::Fragment::create_many(uri, &many_stream, many_options);
+    CHECK(many_stream.release == nullptr);
+    const uint64_t many_count = (rows + 3) / 4;
+    CHECK(fragments.size() == many_count);
+    for (const auto& fragment : fragments) CHECK(!fragment.is_bound());
+
+    std::vector<const lance::Fragment*> many_handles;
+    many_handles.reserve(fragments.size());
+    for (const auto& fragment : fragments) many_handles.push_back(&fragment);
+    auto many_published =
+        publish_created_fragments(uri, published_version, many_handles);
+    CHECK(many_published.version() == published_version + 1);
+    CHECK(many_published.count_rows() == rows * 3);
+    CHECK(many_published.fragment_count() ==
+          fragments_before + 1 + many_count);
+    auto all_ids = many_published.fragment_ids();
+    std::sort(all_ids.begin(), all_ids.end());
+    CHECK(std::unique(all_ids.begin(), all_ids.end()) == all_ids.end());
+
+    /* From-file: exported raw file -> detached fragment -> Append -> reopen. */
+    const uint64_t current_version = many_published.version();
+    const uint64_t current_rows = many_published.count_rows();
+    uint64_t four_row_id = UINT64_MAX;
+    for (uint64_t id : all_ids) {
+        auto candidate = many_published.open_fragment(id);
+        if (candidate.physical_rows() == 4) {
+            four_row_id = id;
+            break;
+        }
+    }
+    CHECK(four_row_id != UINT64_MAX);
+    auto bound = many_published.open_fragment(four_row_id);
+    const std::string file_name = "cpp17-fragment-create-from-file.lance";
+    CHECK(write_cpp_replacement_file(uri, bound, file_name) == 4);
+
+    auto from_file =
+        lance::Fragment::create_from_file(many_published, file_name, 2000);
+    check_created_fragment(from_file, 2000, 4);
+
+    std::vector<const lance::Fragment*> file_fragments{&from_file};
+    auto file_published =
+        publish_created_fragments(uri, current_version, file_fragments);
+    CHECK(file_published.version() == current_version + 1);
+    CHECK(file_published.count_rows() == current_rows + 4);
+
+    auto reopened = lance::Dataset::open(uri);
+    CHECK(reopened.version() == current_version + 1);
+    CHECK(reopened.count_rows() == current_rows + 4);
+    CHECK(reopened.fragment_count() ==
+          fragments_before + 1 + many_count + 1);
+    std::printf("native fragment creation OK\n");
+}
+
 int main(int argc, char** argv) {
     if (argc != 5) {
         std::fprintf(stderr,
@@ -1413,6 +1544,7 @@ int main(int argc, char** argv) {
         test_fragment_delete(argv[1], argv[2]);
         test_create_index_operation(argv[1], argv[2]);
         test_data_replacement(argv[1], argv[2]);
+        test_fragment_creation(argv[1], argv[2]);
 
         test_native_schema(argv[3]);
         test_blob_writer_data_replacement(argv[4]);
