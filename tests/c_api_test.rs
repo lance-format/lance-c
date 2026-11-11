@@ -28565,14 +28565,17 @@ fn plan_source_fragment_ids(plan: *const LanceCompactionPlan) -> Vec<u64> {
 
 fn dataset_fragment_ids(dataset: *const LanceDataset) -> Vec<u32> {
     let count = unsafe { lance_dataset_fragment_count(dataset) } as usize;
-    let mut ids = vec![0_u32; count];
+    let mut native_ids = vec![0_u64; count];
     assert_eq!(
-        unsafe { lance_dataset_fragment_ids(dataset, ids.as_mut_ptr()) },
+        unsafe { lance_dataset_fragment_ids(dataset, native_ids.as_mut_ptr()) },
         0,
         "{}",
         take_last_error_message()
     );
-    ids
+    native_ids
+        .into_iter()
+        .map(|id| u32::try_from(id).unwrap())
+        .collect()
 }
 
 fn indexed_fragment_ids(dataset: *const LanceDataset) -> std::collections::BTreeSet<u32> {
@@ -28599,7 +28602,7 @@ fn test_compaction_options_v2_config_defaults_and_presence() {
     set_native_dataset_config(
         &uri,
         &[
-            ("lance.compaction.target_rows_per_fragment", "2"),
+            ("lance.compaction.target_rows_per_fragment", "4"),
             ("lance.compaction.max_rows_per_group", "7"),
             ("lance.compaction.max_bytes_per_file", "4096"),
             ("lance.compaction.materialize_deletions", "false"),
@@ -28627,7 +28630,7 @@ fn test_compaction_options_v2_config_defaults_and_presence() {
     let configured_options = &configured_json["options"];
     assert_eq!(
         configured_options["target_rows_per_fragment"].as_u64(),
-        Some(2)
+        Some(4)
     );
     assert_eq!(configured_options["max_rows_per_group"].as_u64(), Some(7));
     assert_eq!(
@@ -28666,8 +28669,8 @@ fn test_compaction_options_v2_config_defaults_and_presence() {
         configured_options["data_storage_version"].as_str(),
         Some("2.1")
     );
-    assert_eq!(configured_json["tasks"].as_array().unwrap().len(), 3);
-    assert_eq!(plan_source_fragment_ids(configured_plan).len(), 3);
+    assert_eq!(configured_json["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(plan_source_fragment_ids(configured_plan).len(), 2);
 
     let defaults = unsafe { lance_compaction_options_v2_new() };
     assert!(!defaults.is_null(), "{}", take_last_error_message());
@@ -28893,7 +28896,7 @@ fn test_compaction_distributed_tasks_results_and_partial_commits() {
         0
     );
 
-    let result0_ptrs = [result0_from_json];
+    let result0_ptrs = [result0_from_json as *const LanceRewriteResult];
     let mut commit_metrics = LanceCompactionMetrics::default();
     assert_eq!(
         unsafe {
@@ -28919,7 +28922,6 @@ fn test_compaction_distributed_tasks_results_and_partial_commits() {
     });
     assert_eq!(
         transaction
-            .inner
             .transaction_properties
             .as_ref()
             .unwrap()
@@ -28930,7 +28932,7 @@ fn test_compaction_distributed_tasks_results_and_partial_commits() {
 
     let result1 = unsafe { lance_compaction_task_execute(dataset, task1_from_json) };
     assert!(!result1.is_null(), "{}", take_last_error_message());
-    let result1_ptrs = [result1];
+    let result1_ptrs = [result1 as *const LanceRewriteResult];
     let mut second_commit_metrics = LanceCompactionMetrics::default();
     assert_eq!(
         unsafe {
@@ -29215,7 +29217,7 @@ fn test_optimize_indices_distributed_plan_tasks_merges_and_partial_commits() {
         0
     );
     assert_eq!(
-        unsafe { lance_optimize_indices_options_set_max_rows_per_segment(options, true, 10) },
+        unsafe { lance_optimize_indices_options_set_max_rows_per_segment(options, true, 5) },
         0
     );
     let property_keys = [c_str("job")];
@@ -29373,7 +29375,7 @@ fn test_optimize_indices_distributed_plan_tasks_merges_and_partial_commits() {
         result
     };
     assert!(!other_result.is_null());
-    let other_results = [other_result];
+    let other_results = [other_result as *const LanceIndexSegmentResult];
     let sentinel = std::ptr::dangling_mut::<LanceIndexSegmentResult>();
     let mut rejected_result = sentinel;
     assert_eq!(
@@ -29396,7 +29398,10 @@ fn test_optimize_indices_distributed_plan_tasks_merges_and_partial_commits() {
         lance_index_segment_result_close(other_result);
     }
 
-    let task_results = [result0, result1];
+    let task_results = [
+        result0 as *const LanceIndexSegmentResult,
+        result1 as *const LanceIndexSegmentResult,
+    ];
     let merged0 = unsafe {
         let mut result = ptr::null_mut();
         assert_eq!(
@@ -29431,7 +29436,7 @@ fn test_optimize_indices_distributed_plan_tasks_merges_and_partial_commits() {
     };
     assert!(!merged0.is_null() && !merged1.is_null());
 
-    let first_commit = [merged0];
+    let first_commit = [merged0 as *const LanceIndexSegmentResult];
     assert_eq!(
         unsafe {
             lance_dataset_commit_optimize_indices(
@@ -29453,7 +29458,6 @@ fn test_optimize_indices_distributed_plan_tasks_merges_and_partial_commits() {
     });
     assert_eq!(
         transaction
-            .inner
             .transaction_properties
             .as_ref()
             .unwrap()
@@ -29462,7 +29466,7 @@ fn test_optimize_indices_distributed_plan_tasks_merges_and_partial_commits() {
         Some("index-distributed")
     );
 
-    let second_commit = [merged1];
+    let second_commit = [merged1 as *const LanceIndexSegmentResult];
     assert_eq!(
         unsafe {
             lance_dataset_commit_optimize_indices(
