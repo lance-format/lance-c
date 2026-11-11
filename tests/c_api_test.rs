@@ -53094,3 +53094,820 @@ fn test_native_dataset_deep_clone_refs_and_sentinels() {
         lance_dataset_close(ds);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Native fragment creation (FragmentCreateBuilder / FileFragment)
+// ---------------------------------------------------------------------------
+
+fn fragment_create_options(
+    schema: *const LanceSchema,
+    mode: LanceWriteMode,
+    write: *const LanceWriteOptions,
+) -> LanceFragmentCreateOptions {
+    LanceFragmentCreateOptions {
+        schema,
+        mode: mode as i32,
+        write,
+        storage_opts: ptr::null(),
+        session: ptr::null(),
+    }
+}
+
+fn write_options_with_max_rows(max_rows_per_file: u64) -> LanceWriteOptions {
+    let mut options: LanceWriteOptions = unsafe { std::mem::zeroed() };
+    options.params.max_rows_per_file = max_rows_per_file;
+    options
+}
+
+/// Decode detached fragment metadata through the native format struct so
+/// assertions compare native values instead of the binding's JSON shape.
+fn native_fragment_metadata(fragment: *const LanceFragment) -> lance_table::format::Fragment {
+    serde_json::from_str(&fragment_json_for_test(fragment)).unwrap()
+}
+
+fn dataset_schema_clone(dataset: *const LanceDataset) -> *mut LanceSchema {
+    let mut schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_schema_clone(dataset, &mut schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!schema.is_null());
+    schema
+}
+
+fn committed_version(dataset: *const LanceDataset) -> u64 {
+    let version = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "{}",
+        take_last_error_message()
+    );
+    version
+}
+
+/// Create a two-fragment, four-row dataset through the existing uncommitted
+/// write path, then return the committed version.
+fn seed_two_fragment_dataset(uri: &str) -> u64 {
+    let mut uncommitted: LanceUncommittedWriteOptions = unsafe { std::mem::zeroed() };
+    uncommitted.write.params.max_rows_per_file = 2;
+    let create = write_uncommitted_for_batch(
+        uri,
+        write_batch((1..=4).collect(), vec![1.0, 2.0, 3.0, 4.0]),
+        LanceWriteMode::Create,
+        &uncommitted,
+    );
+    let dataset = commit_native_transaction(uri, create, ptr::null());
+    let version = committed_version(dataset);
+    unsafe {
+        lance_transaction_close(create);
+        lance_dataset_close(dataset);
+    }
+    version
+}
+
+fn append_fragments_and_commit(
+    uri: &str,
+    read_version: u64,
+    fragments: &[*const LanceFragment],
+) -> *mut LanceDataset {
+    let operation = unsafe { lance_operation_append_new(fragments.as_ptr(), fragments.len()) };
+    assert!(!operation.is_null(), "{}", take_last_error_message());
+    let transaction = unsafe { lance_transaction_new(read_version, operation, ptr::null()) };
+    assert!(!transaction.is_null(), "{}", take_last_error_message());
+    let dataset = commit_native_transaction(uri, transaction, ptr::null());
+    unsafe {
+        lance_transaction_close(transaction);
+        lance_operation_close(operation);
+    }
+    dataset
+}
+
+fn native_fragment_ids(dataset: *const LanceDataset) -> Vec<u64> {
+    let count = unsafe { lance_dataset_fragment_count(dataset) };
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "{}",
+        take_last_error_message()
+    );
+    let mut ids = vec![0u64; count as usize];
+    if !ids.is_empty() {
+        assert_eq!(
+            unsafe { lance_dataset_fragment_ids(dataset, ids.as_mut_ptr()) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+    }
+    ids
+}
+
+#[test]
+fn test_fragment_create_publishes_through_native_append() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("fragment_create_single")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let seed_version = seed_two_fragment_dataset(&uri);
+
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(dataset) }, 4);
+    let schema = dataset_schema_clone(dataset);
+
+    let mut stream = batch_to_ffi_stream(write_batch(vec![10, 11, 12], vec![10.0, 11.0, 12.0]));
+    let options = fragment_create_options(schema, LanceWriteMode::Append, ptr::null());
+    let mut fragment = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_fragment_create(uri_c.as_ptr(), 41, &options, &mut stream, &mut fragment) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!fragment.is_null());
+    assert!(stream.release.is_none(), "stream must be consumed");
+
+    // Creation is uncommitted: the dataset is untouched and the returned
+    // metadata is detached, so data-file accessors reject it.
+    let metadata = native_fragment_metadata(fragment);
+    assert_eq!(metadata.id, 41);
+    assert_eq!(metadata.physical_rows, Some(3));
+    assert_eq!(metadata.deletion_file, None);
+    assert_eq!(metadata.files.len(), 1);
+    assert_eq!(
+        metadata.files[0].fields.as_ref(),
+        &[0, 1],
+        "native inference assigns field ids"
+    );
+    assert!(metadata.files[0].path.ends_with(".lance"));
+    let mut is_bound = true;
+    assert_eq!(
+        unsafe { lance_fragment_is_bound(fragment, &mut is_bound) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!is_bound);
+    let mut rows = 0u64;
+    assert_eq!(
+        unsafe { lance_fragment_physical_rows(fragment, &mut rows) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(unsafe { lance_dataset_count_rows(dataset) }, 4);
+    assert_eq!(native_fragment_ids(dataset), vec![0, 1]);
+
+    // Detached metadata outlives every input handle used to create it.
+    unsafe {
+        lance_dataset_close(dataset);
+        lance_schema_close(schema);
+    }
+    assert_eq!(native_fragment_metadata(fragment).id, 41);
+
+    let published = append_fragments_and_commit(&uri, seed_version, &[fragment]);
+    assert_eq!(committed_version(published), seed_version + 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(published) }, 7);
+    assert_eq!(
+        native_fragment_ids(published),
+        vec![0, 1, 41],
+        "an explicit fragment id must survive commit"
+    );
+    unsafe { lance_dataset_close(published) };
+
+    // The pre-existing snapshot keeps the rows it was created with.
+    let old = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), seed_version) };
+    assert!(!old.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(old) }, 4);
+    unsafe { lance_dataset_close(old) };
+
+    unsafe { lance_fragment_close(fragment) };
+}
+
+#[test]
+fn test_fragment_create_many_splits_and_commit_assigns_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("fragment_create_many")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let seed_version = seed_two_fragment_dataset(&uri);
+    let uri_c = c_str(&uri);
+
+    let write_options = write_options_with_max_rows(2);
+    let mut stream = batch_to_ffi_stream(write_batch(
+        (20..=24).collect(),
+        vec![20.0, 21.0, 22.0, 23.0, 24.0],
+    ));
+    let options = fragment_create_options(ptr::null(), LanceWriteMode::Append, &write_options);
+    let mut fragments: *mut *mut LanceFragment = ptr::null_mut();
+    let mut count = usize::MAX;
+    assert_eq!(
+        unsafe {
+            lance_fragment_create_many(
+                uri_c.as_ptr(),
+                &options,
+                &mut stream,
+                &mut fragments,
+                &mut count,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(stream.release.is_none(), "stream must be consumed");
+    assert_eq!(count, 3, "native owns max_rows_per_file splitting");
+    assert!(!fragments.is_null());
+
+    let handles: Vec<*mut LanceFragment> =
+        unsafe { std::slice::from_raw_parts(fragments, count) }.to_vec();
+    let metadata: Vec<lance_table::format::Fragment> = handles
+        .iter()
+        .map(|handle| native_fragment_metadata(*handle))
+        .collect();
+    assert_eq!(
+        metadata
+            .iter()
+            .map(|fragment| fragment.physical_rows)
+            .collect::<Vec<_>>(),
+        vec![Some(2), Some(2), Some(1)]
+    );
+    assert!(
+        metadata.iter().all(|fragment| fragment.id == 0),
+        "multi-fragment writes keep the native temporary id until commit"
+    );
+
+    let handles_const: Vec<*const LanceFragment> = handles
+        .iter()
+        .map(|handle| *handle as *const LanceFragment)
+        .collect();
+    let published = append_fragments_and_commit(&uri, seed_version, &handles_const);
+    assert_eq!(committed_version(published), seed_version + 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(published) }, 9);
+    let ids = native_fragment_ids(published);
+    assert_eq!(ids.len(), 5);
+    let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+    assert_eq!(unique.len(), 5, "commit must assign distinct ids: {ids:?}");
+    assert!(ids.contains(&0) && ids.contains(&1) && ids.contains(&2));
+    unsafe { lance_dataset_close(published) };
+
+    // The re-open path must observe the same rows and ids.
+    let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(reopened) }, 9);
+    assert_eq!(native_fragment_ids(reopened), ids);
+    unsafe {
+        lance_dataset_close(reopened);
+        lance_fragment_array_free(fragments, count);
+    }
+}
+
+#[test]
+fn test_fragment_create_stream_ownership_and_success_only_outputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("fragment_create_contract")
+        .to_str()
+        .unwrap()
+        .to_string();
+    seed_two_fragment_dataset(&uri);
+    let uri_c = c_str(&uri);
+    let empty_uri = c_str("");
+    let schema = write_schema();
+    let options = fragment_create_options(ptr::null(), LanceWriteMode::Append, ptr::null());
+
+    // A NULL stream is rejected unconsumed and writes no output.
+    let mut untouched = ptr::without_provenance_mut::<LanceFragment>(0x1234);
+    assert_eq!(
+        unsafe {
+            lance_fragment_create(uri_c.as_ptr(), 1, &options, ptr::null_mut(), &mut untouched)
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(untouched as usize, 0x1234);
+
+    // Every later rejection still releases the non-NULL stream it accepted.
+    let mut null_out_stream = make_counted_stream(&schema);
+    assert_eq!(
+        unsafe {
+            lance_fragment_create(
+                uri_c.as_ptr(),
+                1,
+                &options,
+                &mut null_out_stream.0,
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&null_out_stream.0, &null_out_stream.1);
+
+    let mut null_uri_stream = make_counted_stream(&schema);
+    let mut out = ptr::without_provenance_mut::<LanceFragment>(0x2345);
+    assert_eq!(
+        unsafe {
+            lance_fragment_create(ptr::null(), 1, &options, &mut null_uri_stream.0, &mut out)
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&null_uri_stream.0, &null_uri_stream.1);
+    assert_eq!(out as usize, 0x2345, "outputs are success-only");
+
+    // Native checks the empty schema before opening target storage. With
+    // default create options this exercises empty-URI forwarding without
+    // writing into the process's working directory.
+    for many in [false, true] {
+        let empty_schema = Arc::new(Schema::empty());
+        let native_reader =
+            arrow::record_batch::RecordBatchIterator::new(vec![], empty_schema.clone());
+        let native_error = lance_c::runtime::block_on(async {
+            let builder = lance::dataset::fragment::write::FragmentCreateBuilder::new("");
+            if many {
+                builder.write_fragments(native_reader).await.map(|_| ())
+            } else {
+                builder.write(native_reader, Some(1)).await.map(|_| ())
+            }
+        })
+        .unwrap_err();
+        assert!(
+            native_error
+                .to_string()
+                .contains("Cannot write with an empty schema.")
+        );
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut stream = FFI_ArrowArrayStream::new(Box::new(CountingReader {
+            inner: arrow::record_batch::RecordBatchIterator::new(vec![], empty_schema),
+            drop_count: dropped.clone(),
+        }));
+        let mut array = ptr::without_provenance_mut::<*mut LanceFragment>(0x3456);
+        let mut count = usize::MAX;
+        let rc = if many {
+            unsafe {
+                lance_fragment_create_many(
+                    empty_uri.as_ptr(),
+                    ptr::null(),
+                    &mut stream,
+                    &mut array,
+                    &mut count,
+                )
+            }
+        } else {
+            unsafe {
+                lance_fragment_create(empty_uri.as_ptr(), 1, ptr::null(), &mut stream, &mut out)
+            }
+        };
+        assert_eq!(rc, -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert_eq!(take_last_error_message(), native_error.to_string());
+        assert_stream_consumed(&stream, &dropped);
+        assert_eq!(out as usize, 0x2345);
+        assert_eq!(array as usize, 0x3456);
+        assert_eq!(count, usize::MAX);
+    }
+
+    let mut bad_mode = fragment_create_options(ptr::null(), LanceWriteMode::Append, ptr::null());
+    bad_mode.mode = 99;
+    let mut bad_mode_stream = make_counted_stream(&schema);
+    assert_eq!(
+        unsafe {
+            lance_fragment_create(
+                uri_c.as_ptr(),
+                1,
+                &bad_mode,
+                &mut bad_mode_stream.0,
+                &mut out,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&bad_mode_stream.0, &bad_mode_stream.1);
+    assert_eq!(out as usize, 0x2345);
+
+    // Native rejects empty single-fragment input; its message and the
+    // release-on-error contract must both survive the binding.
+    let empty_drop_count = Arc::new(AtomicUsize::new(0));
+    let mut empty_stream = FFI_ArrowArrayStream::new(Box::new(CountingReader {
+        inner: arrow::record_batch::RecordBatchIterator::new(vec![], schema.clone()),
+        drop_count: empty_drop_count.clone(),
+    }));
+    assert_eq!(
+        unsafe { lance_fragment_create(uri_c.as_ptr(), 1, &options, &mut empty_stream, &mut out) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("Input data was empty."),
+        "native error must reach the caller: {message}"
+    );
+    assert_stream_consumed(&empty_stream, &empty_drop_count);
+    assert_eq!(out as usize, 0x2345);
+
+    // An empty multi-fragment write is native success with NULL/0, not an error.
+    let mut many_stream = FFI_ArrowArrayStream::new(Box::new(
+        arrow::record_batch::RecordBatchIterator::new(vec![], schema.clone()),
+    ));
+    let mut many_out: *mut *mut LanceFragment = ptr::without_provenance_mut(0x3456);
+    let mut many_count = usize::MAX;
+    assert_eq!(
+        unsafe {
+            lance_fragment_create_many(
+                uri_c.as_ptr(),
+                &options,
+                &mut many_stream,
+                &mut many_out,
+                &mut many_count,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(many_out.is_null());
+    assert_eq!(many_count, 0);
+    unsafe { lance_fragment_array_free(many_out, many_count) };
+
+    // NULL output slots for the array variant are rejected after the stream is
+    // claimed, and NULL array free is a no-op.
+    let mut null_count_stream = make_counted_stream(&schema);
+    let mut many_out: *mut *mut LanceFragment = ptr::without_provenance_mut(0x4567);
+    assert_eq!(
+        unsafe {
+            lance_fragment_create_many(
+                uri_c.as_ptr(),
+                &options,
+                &mut null_count_stream.0,
+                &mut many_out,
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_stream_consumed(&null_count_stream.0, &null_count_stream.1);
+    assert_eq!(many_out as usize, 0x4567);
+    unsafe { lance_fragment_array_free(ptr::null_mut(), 3) };
+}
+
+#[test]
+fn test_fragment_create_from_file_publishes_external_raw_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("fragment_create_from_file")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let seed_version = seed_two_fragment_dataset(&uri);
+
+    // Write a data file outside the native write path: the v2.1 file writer,
+    // which is the same-family format native accepts for create_from_file.
+    let filename = "external-raw-file.lance";
+    let summary = write_replacement_data_file(
+        &format!("{uri}/data/{filename}"),
+        &write_batch(vec![30, 31], vec![30.0, 31.0]),
+    );
+    assert_eq!(summary.num_rows, 2);
+
+    let uri_c = c_str(&uri);
+    let filename_c = c_str(filename);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+
+    let mut fragment = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_fragment_create_from_file(
+                dataset,
+                filename_c.as_ptr(),
+                12,
+                ptr::null(),
+                &mut fragment,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!fragment.is_null());
+
+    let metadata = native_fragment_metadata(fragment);
+    assert_eq!(metadata.id, 12);
+    assert_eq!(metadata.files.len(), 1);
+    assert_eq!(
+        metadata.files[0].path, filename,
+        "from-file keeps the caller's file name"
+    );
+    assert_eq!(
+        metadata.physical_rows,
+        Some(2),
+        "native reads the row count from the raw file"
+    );
+    let mut is_bound = true;
+    assert_eq!(
+        unsafe { lance_fragment_is_bound(fragment, &mut is_bound) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!is_bound);
+    assert_eq!(
+        native_fragment_ids(dataset),
+        vec![0, 1],
+        "create_from_file must not publish"
+    );
+
+    // Representation guards only; valid-looking values reach native.
+    let mut guard_out = ptr::without_provenance_mut::<LanceFragment>(0x5678);
+    for (dataset_ptr, name_ptr) in [
+        (ptr::null(), filename_c.as_ptr()),
+        (dataset as *const LanceDataset, ptr::null()),
+    ] {
+        assert_eq!(
+            unsafe {
+                lance_fragment_create_from_file(
+                    dataset_ptr,
+                    name_ptr,
+                    1,
+                    ptr::null(),
+                    &mut guard_out,
+                )
+            },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert_eq!(guard_out as usize, 0x5678);
+    }
+    assert_eq!(
+        unsafe {
+            lance_fragment_create_from_file(
+                dataset,
+                filename_c.as_ptr(),
+                1,
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // Empty filenames retain the native file-opening error and output semantics.
+    let native_error = lance_c::runtime::block_on(async {
+        let native = Dataset::open(&uri).await.unwrap();
+        lance::dataset::fragment::FileFragment::create_from_file("", &native, 1, None)
+            .await
+            .unwrap_err()
+    });
+    assert_eq!(
+        unsafe {
+            lance_fragment_create_from_file(dataset, c"".as_ptr(), 1, ptr::null(), &mut guard_out)
+        },
+        -1
+    );
+    assert_eq!(take_last_error_message(), native_error.to_string());
+    assert_eq!(guard_out as usize, 0x5678);
+
+    // A non-NULL `physical_rows` pointer is a hint, not a validation gate: the
+    // current (V2) reader path derives the real count from the file, so an
+    // explicit value must still produce the native row count and not be
+    // rejected or silently passed through.
+    let hinted_rows = 99u64;
+    let mut hinted = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_fragment_create_from_file(
+                dataset,
+                filename_c.as_ptr(),
+                13,
+                &hinted_rows,
+                &mut hinted,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let hinted_metadata = native_fragment_metadata(hinted);
+    assert_eq!(hinted_metadata.id, 13);
+    assert_eq!(
+        hinted_metadata.physical_rows,
+        Some(2),
+        "native must own the physical row count"
+    );
+    unsafe { lance_fragment_close(hinted) };
+
+    let published = append_fragments_and_commit(&uri, seed_version, &[fragment]);
+    assert_eq!(committed_version(published), seed_version + 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(published) }, 6);
+    assert_eq!(native_fragment_ids(published), vec![0, 1, 12]);
+    unsafe { lance_dataset_close(published) };
+
+    // A fresh URI reopen must observe the appended external file rows.
+    let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(reopened) }, 6);
+    assert_eq!(native_fragment_ids(reopened), vec![0, 1, 12]);
+    unsafe {
+        lance_dataset_close(reopened);
+        lance_fragment_close(fragment);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_fragment_create_preserves_native_schema_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("fragment_create_schema")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Root metadata plus a nested struct keeps several distinct field ids, and
+    // dropping the middle column leaves a non-contiguous id set that an Arrow
+    // rebuild would silently renumber.
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("drop_me", DataType::Utf8, true),
+            Field::new(
+                "profile",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("score", DataType::Int32, true),
+                    Field::new("tags", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+        ],
+        [("fixture".to_string(), "fragment-create".to_string())].into(),
+    ));
+    let profile = StructArray::from(vec![
+        (
+            Arc::new(Field::new("score", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![Some(7), Some(8)])) as Arc<dyn Array>,
+        ),
+        (
+            Arc::new(Field::new("tags", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("a"), None])) as Arc<dyn Array>,
+        ),
+    ]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec![Some("drop"), None])),
+            Arc::new(profile),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let drop_me = c_str("drop_me");
+    let drop_columns = [drop_me.as_ptr()];
+    assert_eq!(
+        unsafe { lance_dataset_drop_columns(dataset, drop_columns.as_ptr(), 1) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let supplied = dataset_schema_clone(dataset);
+    let mut field_ids = Vec::new();
+    for column in ["id", "profile", "profile.score", "profile.tags"] {
+        let column = c_str(column);
+        let mut field_id = -1;
+        assert_eq!(
+            unsafe { lance_schema_field_id(supplied, column.as_ptr(), &mut field_id) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        field_ids.push(field_id);
+    }
+    assert_eq!(
+        field_ids,
+        vec![0, 2, 3, 4],
+        "dropping the middle column must leave a gap; a renumbered set means \
+         the schema was rebuilt instead of preserved"
+    );
+
+    // The caller streams the dropped-column projection while the supplied
+    // native schema owns the field ids.
+    let write_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "profile",
+            DataType::Struct(Fields::from(vec![
+                Field::new("score", DataType::Int32, true),
+                Field::new("tags", DataType::Utf8, true),
+            ])),
+            true,
+        ),
+    ]));
+    let profile = StructArray::from(vec![
+        (
+            Arc::new(Field::new("score", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![Some(9), Some(10)])) as Arc<dyn Array>,
+        ),
+        (
+            Arc::new(Field::new("tags", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("c"), Some("d")])) as Arc<dyn Array>,
+        ),
+    ]);
+    let write_batch = RecordBatch::try_new(
+        write_schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![3, 4])), Arc::new(profile)],
+    )
+    .unwrap();
+
+    let mut stream = batch_to_ffi_stream(write_batch);
+    let options = fragment_create_options(supplied, LanceWriteMode::Append, ptr::null());
+    let mut fragment = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_fragment_create(uri_c.as_ptr(), 5, &options, &mut stream, &mut fragment) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let metadata = native_fragment_metadata(fragment);
+    let mut fragment_fields = metadata.files[0].fields.to_vec();
+    fragment_fields.sort_unstable();
+    // A data file records the leaf columns it wrote, so the struct parent id is
+    // absent while the ids of the surviving leaves keep their gaps. Rebuilding
+    // this schema through Arrow would renumber them to 0, 1, 2 instead.
+    assert_eq!(
+        fragment_fields,
+        vec![0, 3, 4],
+        "the fragment must reference the supplied native leaf field ids"
+    );
+
+    let version = committed_version(dataset);
+    let published = append_fragments_and_commit(&uri, version, &[fragment]);
+    assert_eq!(unsafe { lance_dataset_count_rows(published) }, 4);
+    unsafe { lance_dataset_close(published) };
+
+    let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    let reopened_schema = dataset_schema_clone(reopened);
+    let mut reopened_field_ids = Vec::new();
+    for column in ["id", "profile", "profile.score", "profile.tags"] {
+        let column = c_str(column);
+        let mut field_id = -1;
+        assert_eq!(
+            unsafe { lance_schema_field_id(reopened_schema, column.as_ptr(), &mut field_id) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        reopened_field_ids.push(field_id);
+    }
+    assert_eq!(reopened_field_ids, field_ids);
+
+    // Root metadata survives the append and reopen.
+    let mut arrow_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_schema_to_arrow(reopened_schema, &mut arrow_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let arrow_schema = Schema::try_from(&arrow_schema).unwrap();
+    assert_eq!(
+        arrow_schema.metadata().get("fixture").map(String::as_str),
+        Some("fragment-create")
+    );
+
+    unsafe {
+        lance_fragment_close(fragment);
+        lance_schema_close(reopened_schema);
+        lance_schema_close(supplied);
+        lance_dataset_close(reopened);
+        lance_dataset_close(dataset);
+    }
+}
