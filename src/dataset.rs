@@ -333,6 +333,47 @@ unsafe fn dataset_num_small_files_inner(
     Ok(0)
 }
 
+/// Migrate this dataset's manifest paths to the v2 naming scheme.
+///
+/// The rename is performed by native `Dataset::migrate_manifest_paths_v2`;
+/// the dataset handle is replaced with the reopened native snapshot on
+/// success. Storage renames can persist if a later native step fails, so the
+/// binding makes no rollback or added-atomicity claim.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_migrate_manifest_paths_v2(
+    dataset: *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if dataset.is_null() {
+                return Err(lance_core::Error::invalid_input("dataset must not be NULL"));
+            }
+            unsafe { &*dataset }
+                .with_mut(|dataset| block_on(dataset.migrate_manifest_paths_v2()))?;
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Delete every row through native `Dataset::truncate_table`.
+///
+/// A new dataset version is committed on success; schema and configuration
+/// stay unchanged. Native commit and storage failure behavior is preserved.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_truncate_table(dataset: *mut LanceDataset) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if dataset.is_null() {
+                return Err(lance_core::Error::invalid_input("dataset must not be NULL"));
+            }
+            unsafe { &*dataset }.with_mut(|dataset| block_on(dataset.truncate_table()))?;
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
 /// Count rows matching an optional SQL filter.
 ///
 /// `filter == NULL` maps to native `Dataset::count_rows(None)` and uses the

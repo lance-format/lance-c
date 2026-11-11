@@ -8,7 +8,7 @@
 //! optional transaction properties; ID allocation, conflict validation,
 //! persistence and path resolution remain in Lance core.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::c_char;
 use std::sync::Arc;
 
@@ -21,6 +21,7 @@ use crate::error::ffi_try;
 use crate::helpers;
 use crate::metadata::owned_c_string;
 use crate::runtime::block_on;
+use crate::transaction_properties::{LanceTransactionProperties, parse_transaction_properties};
 
 /// One native `BasePath` field set for registration.
 ///
@@ -34,20 +35,6 @@ pub struct LanceBasePath {
     pub path: *const c_char,
     pub name: *const c_char,
     pub is_dataset_root: bool,
-}
-
-/// Optional transaction properties for one native `add_bases` commit.
-///
-/// A NULL pointer passed to `lance_dataset_add_bases` maps to native `None`.
-/// A non-NULL pointer with `count == 0` maps to `Some(empty map)`. `keys` and
-/// `values` are parallel arrays of length `count`; every key and value must be
-/// non-NULL. Duplicate keys follow native `HashMap` last-write-wins behavior.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct LanceTransactionProperties {
-    pub keys: *const *const c_char,
-    pub values: *const *const c_char,
-    pub count: usize,
 }
 
 /// Return the current snapshot's native base-path registry as a JSON object
@@ -170,51 +157,4 @@ unsafe fn add_bases_inner(
         Ok(())
     })?;
     Ok(0)
-}
-
-unsafe fn parse_transaction_properties(
-    properties: &LanceTransactionProperties,
-) -> Result<HashMap<String, String>> {
-    if properties.count > 0 && properties.keys.is_null() {
-        return Err(lance_core::Error::invalid_input(format!(
-            "transaction_properties.keys must not be NULL when count = {}",
-            properties.count
-        )));
-    }
-    if properties.count > 0 && properties.values.is_null() {
-        return Err(lance_core::Error::invalid_input(format!(
-            "transaction_properties.values must not be NULL when count = {}",
-            properties.count
-        )));
-    }
-
-    let mut parsed = HashMap::with_capacity(properties.count);
-    for index in 0..properties.count {
-        let key = unsafe { *properties.keys.add(index) };
-        let key = unsafe { helpers::parse_c_string(key) }
-            .map_err(|error| {
-                lance_core::Error::invalid_input(format!(
-                    "transaction_properties.keys[{index}]: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                lance_core::Error::invalid_input(format!(
-                    "transaction_properties.keys[{index}] must not be NULL"
-                ))
-            })?;
-        let value = unsafe { *properties.values.add(index) };
-        let value = unsafe { helpers::parse_c_string(value) }
-            .map_err(|error| {
-                lance_core::Error::invalid_input(format!(
-                    "transaction_properties.values[{index}]: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                lance_core::Error::invalid_input(format!(
-                    "transaction_properties.values[{index}] must not be NULL"
-                ))
-            })?;
-        parsed.insert(key.to_owned(), value.to_owned());
-    }
-    Ok(parsed)
 }

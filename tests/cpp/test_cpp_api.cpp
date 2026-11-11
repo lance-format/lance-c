@@ -39,6 +39,19 @@
 #define TEST(name) printf("  %s... ", #name)
 #define PASS()     printf("OK\n")
 
+static_assert(sizeof(LanceCompactionOptions) == 40);
+static_assert(std::is_move_constructible_v<lance::CompactionOptions>);
+static_assert(std::is_move_constructible_v<lance::CompactionPlan>);
+static_assert(std::is_move_constructible_v<lance::CompactionTask>);
+static_assert(std::is_move_constructible_v<lance::RewriteResult>);
+static_assert(std::is_move_constructible_v<lance::OptimizeIndicesOptions>);
+static_assert(std::is_move_constructible_v<lance::OptimizeIndicesPlan>);
+static_assert(std::is_move_constructible_v<lance::OptimizeIndexTask>);
+static_assert(std::is_move_constructible_v<lance::OptimizeIndexMerge>);
+static_assert(std::is_move_constructible_v<lance::IndexSegmentResult>);
+static_assert(!std::is_copy_constructible_v<lance::CompactionPlan>);
+static_assert(!std::is_copy_constructible_v<lance::IndexSegmentResult>);
+
 static const char* arrow_field_metadata_value(
     const ArrowSchema* field,
     const char* key,
@@ -3398,6 +3411,59 @@ static void test_compact_files(const std::string& dst_uri) {
     assert(metrics.fragments_removed == 0);
     assert(metrics.fragments_added == 0);
     assert(ds.version() == v_before);
+
+    lance::CompactionOptions options;
+    options.set_target_rows_per_fragment(100)
+        .set_max_rows_per_group(1024)
+        .set_max_bytes_per_file(std::nullopt)
+        .set_materialize_deletions(true)
+        .set_materialize_deletions_threshold(0.5f)
+        .set_num_threads(std::optional<uint64_t>{0})
+        .set_batch_size(std::nullopt)
+        .set_io_buffer_size(std::optional<uint64_t>{0})
+        .set_defer_index_remap(false)
+        .set_index_remap_mode(LANCE_INDEX_REMAP_DIRECT)
+        .set_compaction_mode(std::nullopt)
+        .set_binary_copy_read_batch_bytes(std::nullopt)
+        .set_max_source_fragments(std::nullopt)
+        .set_max_source_rows(std::nullopt)
+        .set_max_source_bytes(std::nullopt)
+        .set_excluded_fragment_ids({})
+        .set_max_overlays_per_fragment(std::nullopt)
+        .set_data_storage_version(std::string{"2.1"})
+        .set_transaction_properties(std::nullopt);
+
+    auto from_dataset = lance::CompactionOptions::from_dataset(ds);
+    auto plan = ds.plan_compaction(&options);
+    assert(plan.read_version() == v_before);
+    assert(plan.num_tasks() == 0);
+    auto plan_options = plan.options();
+    (void)plan_options;
+    auto plan_json = plan.json();
+    auto decoded_plan = lance::CompactionPlan::from_json(plan_json);
+    assert(decoded_plan.read_version() == v_before);
+    auto moved_plan = std::move(decoded_plan);
+    assert(moved_plan.num_tasks() == 0);
+
+    auto v2_metrics = ds.compact_files_with_options(&from_dataset);
+    assert(v2_metrics.fragments_removed == 0);
+    assert(v2_metrics.fragments_added == 0);
+    assert(ds.version() == v_before);
+
+    lance::OptimizeIndicesOptions index_options;
+    index_options.set_num_indices_to_merge(std::optional<uint64_t>{0})
+        .set_enable_partition_rebalancing(false)
+        .set_index_names(std::vector<std::string>{})
+        .set_retrain(false)
+        .set_transaction_properties(std::nullopt)
+        .set_max_rows_per_task(std::nullopt)
+        .set_max_rows_per_segment(std::nullopt);
+    auto index_plan = ds.plan_optimize_indices(&index_options);
+    assert(index_plan.num_tasks() == 0);
+    auto index_plan_json = index_plan.json();
+    auto decoded_index_plan =
+        lance::OptimizeIndicesPlan::from_json(index_plan_json);
+    assert(decoded_index_plan.num_merges() == 0);
 
     PASS();
 }
