@@ -5,7 +5,7 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, RecordBatch, StructArray, UInt64Array};
+use arrow::array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt64Array};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
@@ -967,4 +967,282 @@ fn data_overlay_validation_errors() {
         lance_schema_close(schema);
         lance_fragment_close(fragment);
     }
+}
+
+#[test]
+fn data_overlay_native_batch_validation_and_detached_fragment() {
+    let fixture = Fixture::new();
+    let fragment = open_fragment(fixture.dataset, 0);
+    let schema = projected_schema(fragment, &["a"]);
+    let native = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
+    let native_fragment = native.get_fragments().remove(0);
+    let native_schema = native_fragment.schema().project(&["a"]).unwrap();
+    let nullable_address_schema = Arc::new(Schema::new(vec![
+        Field::new("_rowaddr", DataType::UInt64, true),
+        Field::new("a", DataType::Int32, true),
+    ]));
+    let null_address = RecordBatch::try_new(
+        nullable_address_schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![None])),
+            Arc::new(Int32Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let wrong_address_type = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("_rowaddr", DataType::Int32, false),
+            Field::new("a", DataType::Int32, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![0])),
+            Arc::new(Int32Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let wrong_value_type = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("_rowaddr", DataType::UInt64, false),
+            Field::new("a", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(UInt64Array::from(vec![0])),
+            Arc::new(StringArray::from(vec!["wrong type"])),
+        ],
+    )
+    .unwrap();
+    let cases = [
+        (
+            "MissingRowAddr",
+            overlay_batch(vec![0], Some(vec![Some(1)]), None)
+                .project(&[1])
+                .unwrap(),
+        ),
+        ("RowAddrType", wrong_address_type),
+        ("NullRowAddr", null_address),
+        (
+            "ForeignRowAddr",
+            overlay_batch(vec![row_address(1, 0)], Some(vec![Some(1)]), None),
+        ),
+        (
+            "OffsetOutOfRange",
+            overlay_batch(vec![row_address(0, 10)], Some(vec![Some(1)]), None),
+        ),
+        (
+            "OffsetNotAscending",
+            overlay_batch(vec![0, 0], Some(vec![Some(1), Some(2)]), None),
+        ),
+        (
+            "OffsetNotAscending",
+            overlay_batch(vec![1, 0], Some(vec![Some(1), Some(2)]), None),
+        ),
+        (
+            "UndeclaredColumn",
+            overlay_batch(vec![0], None, Some(vec![Some(1)])),
+        ),
+        ("BatchSchemaMismatch", wrong_value_type),
+    ];
+    for (expected_variant, batch) in cases {
+        let mut native_writer =
+            lance_c::runtime::block_on(native_fragment.write_overlay(&native_schema)).unwrap();
+        let native_error =
+            lance_c::runtime::block_on(native_writer.write_batch(&batch)).unwrap_err();
+        assert!(
+            format!("{native_error:?}").starts_with(expected_variant),
+            "expected {expected_variant}, got {native_error:?}"
+        );
+        let native_error = lance_core::Error::from(native_error);
+        let writer = new_writer(fragment, schema);
+        let imported = import_batch(&batch);
+        assert_eq!(
+            unsafe { lance_fragment_overlay_writer_write_batch(writer, imported) },
+            -1
+        );
+        let (code, message) = take_error();
+        assert_eq!(code, LanceErrorCode::InvalidArgument);
+        assert_eq!(message, native_error.to_string());
+        unsafe {
+            lance_batch_free(imported);
+            lance_fragment_overlay_writer_abort(writer);
+        }
+        lance_c::runtime::block_on(native_writer.abort());
+    }
+
+    // Nullable schema metadata is allowed when the addresses themselves are valid.
+    let valid = RecordBatch::try_new(
+        nullable_address_schema,
+        vec![
+            Arc::new(UInt64Array::from(vec![Some(2)])),
+            Arc::new(Int32Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let mut native_writer =
+        lance_c::runtime::block_on(native_fragment.write_overlay(&native_schema)).unwrap();
+    let writer = new_writer(fragment, schema);
+    lance_c::runtime::block_on(native_writer.write_batch(&valid)).unwrap();
+    write_overlay(writer, &valid);
+    let backwards = overlay_batch(vec![1], Some(vec![Some(2)]), None);
+    let native_error =
+        lance_c::runtime::block_on(native_writer.write_batch(&backwards)).unwrap_err();
+    assert!(matches!(
+        native_error,
+        lance::dataset::WriteOverlayError::OffsetNotAscending { .. }
+    ));
+    let imported = import_batch(&backwards);
+    assert_eq!(
+        unsafe { lance_fragment_overlay_writer_write_batch(writer, imported) },
+        -1
+    );
+    let (code, message) = take_error();
+    assert_eq!(code, LanceErrorCode::InvalidArgument);
+    assert_eq!(message, lance_core::Error::from(native_error).to_string());
+    unsafe { lance_batch_free(imported) };
+    let next = overlay_batch(vec![3], Some(vec![Some(3)]), None);
+    lance_c::runtime::block_on(native_writer.write_batch(&next)).unwrap();
+    write_overlay(writer, &next);
+    lance_c::runtime::block_on(native_writer.abort());
+    unsafe { lance_fragment_overlay_writer_abort(writer) };
+
+    let fragments = [fragment as *const LanceFragment];
+    let operation = unsafe { lance_operation_append_new(fragments.as_ptr(), 1) };
+    assert!(!operation.is_null());
+    let mut detached = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_at(operation, 0, &mut detached) },
+        0
+    );
+    unsafe { lance_operation_close(operation) };
+    let sentinel = ptr::dangling_mut::<LanceFragmentOverlayWriter>();
+    let mut output = sentinel;
+    assert_eq!(
+        unsafe { lance_fragment_overlay_writer_new(detached, schema, &mut output) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(output, sentinel);
+    let reopened = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
+    assert_eq!(reopened.version().version, 2);
+    unsafe {
+        lance_fragment_close(detached);
+        lance_schema_close(schema);
+        lance_fragment_close(fragment);
+    }
+}
+
+#[test]
+fn data_overlay_native_constructor_restrictions() {
+    use lance_file::version::LanceFileVersion;
+
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new();
+    let fragment = open_fragment(fixture.dataset, 0);
+    let native = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
+    let native_fragment = native.get_fragments().remove(0);
+    let legacy = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)])),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )
+    .unwrap();
+    let mut blobs = lance::BlobArrayBuilder::new(1);
+    blobs.push_bytes(vec![1, 2]).unwrap();
+    let blob = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![lance::blob_field_with_options(
+            "a",
+            true,
+            lance::BlobFieldOptions {
+                inline_size_threshold: Some(8),
+                dedicated_size_threshold: std::num::NonZeroUsize::new(128),
+            },
+        )])),
+        vec![blobs.finish().unwrap()],
+    )
+    .unwrap();
+    let structure = StructArray::from(vec![(
+        Arc::new(Field::new("value", DataType::Int32, true)),
+        Arc::new(Int32Array::from(vec![1])) as Arc<dyn Array>,
+    )]);
+    let nullable_struct = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "a",
+            structure.data_type().clone(),
+            true,
+        )])),
+        vec![Arc::new(structure)],
+    )
+    .unwrap();
+
+    for (expected_variant, batch, version) in [
+        ("LegacyFileFormat", legacy, LanceFileVersion::Legacy),
+        ("BlobField", blob, LanceFileVersion::V2_2),
+        (
+            "NullableStructAncestor",
+            nullable_struct,
+            LanceFileVersion::V2_1,
+        ),
+    ] {
+        let uri = directory.path().join(expected_variant);
+        let uri = uri.to_str().unwrap();
+        let native_source = lance_c::runtime::block_on(Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            uri,
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        ))
+        .unwrap();
+        let source_fragment = native_source.get_fragments().remove(0);
+        let source_schema = source_fragment.schema().project(&["a"]).unwrap();
+        let native_error =
+            lance_c::runtime::block_on(source_fragment.write_overlay(&source_schema))
+                .err()
+                .expect("native overlay constructor must reject this schema or format");
+        assert!(
+            format!("{native_error:?}").starts_with(expected_variant),
+            "expected {expected_variant}, got {native_error:?}"
+        );
+        let uri = c_string(uri);
+        let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+        assert!(!dataset.is_null());
+        let source = open_fragment(dataset, 0);
+        let schema = projected_schema(source, &["a"]);
+        let sentinel = ptr::dangling_mut::<LanceFragmentOverlayWriter>();
+        let mut output = sentinel;
+        assert_eq!(
+            unsafe { lance_fragment_overlay_writer_new(source, schema, &mut output) },
+            -1
+        );
+        let (code, message) = take_error();
+        assert_eq!(code, LanceErrorCode::NotSupported);
+        assert_eq!(message, lance_core::Error::from(native_error).to_string());
+        assert_eq!(output, sentinel);
+
+        if expected_variant == "BlobField" {
+            let native_error =
+                lance_c::runtime::block_on(native_fragment.write_overlay(&source_schema))
+                    .err()
+                    .expect("foreign schema identity must be checked by native");
+            assert!(matches!(
+                native_error,
+                lance::dataset::WriteOverlayError::SchemaMismatch { .. }
+            ));
+            assert_eq!(
+                unsafe { lance_fragment_overlay_writer_new(fragment, schema, &mut output) },
+                -1
+            );
+            let (code, message) = take_error();
+            assert_eq!(code, LanceErrorCode::InvalidArgument);
+            assert_eq!(message, lance_core::Error::from(native_error).to_string());
+            assert_eq!(output, sentinel);
+        }
+        unsafe {
+            lance_schema_close(schema);
+            lance_fragment_close(source);
+            lance_dataset_close(dataset);
+        }
+    }
+    let reopened = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
+    assert_eq!(reopened.version().version, 2);
+    unsafe { lance_fragment_close(fragment) };
 }
