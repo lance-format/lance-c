@@ -463,7 +463,7 @@ mod tests {
         let expected_ptr = bytes.as_ptr();
         let array = large_binary_row(Some(bytes)).unwrap();
         assert_eq!(array.value(0), b"native payload");
-        assert_eq!(array.value_data().as_ptr(), expected_ptr);
+        assert!(std::ptr::eq(array.value_data().as_ptr(), expected_ptr));
     }
 
     #[test]

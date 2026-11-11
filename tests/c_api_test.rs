@@ -35509,8 +35509,7 @@ fn test_managed_blob_descriptor_append_reuse_reopen_and_base_validation() {
             || error.contains("managed.bin"),
         "{error}"
     );
-    if stream.release.is_some() {
-        let release = stream.release.unwrap();
+    if let Some(release) = stream.release {
         unsafe { release(&mut stream) };
     }
     unsafe { lance_dataset_close(dataset) };
