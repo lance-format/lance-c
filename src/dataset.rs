@@ -812,10 +812,10 @@ mod tests {
 
         let clone_ptr = unsafe { lance_dataset_clone_handle(&handle) };
         assert!(!clone_ptr.is_null());
-        assert_ne!(
+        assert!(!std::ptr::eq(
             clone_ptr as *const LanceDataset,
             &handle as *const LanceDataset
-        );
+        ));
         let cloned = unsafe { &*clone_ptr };
 
         // The clone must reuse the exact native snapshot instead of reopening
