@@ -3243,6 +3243,7 @@ static std::vector<int32_t> scan_rtree_ids(
 
 static void test_rtree_scalar_index(const std::string& uri) {
     TEST(test_rtree_scalar_index);
+    assert(LANCE_SCALAR_RTREE == 9);
 
     auto ds = lance::Dataset::open(uri);
     assert(ds.fragment_count() == 3);

@@ -3997,6 +3997,7 @@ static void check_rtree_query(
 
 static void test_rtree_scalar_index(const char *uri) {
     printf("  test_rtree_scalar_index... ");
+    ASSERT(LANCE_SCALAR_RTREE == 9, "C RTree ABI value mismatch");
 
     LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
     ASSERT(ds != NULL, "RTree geometry dataset open failed");
