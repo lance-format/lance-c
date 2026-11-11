@@ -176,6 +176,7 @@ class OptimizeIndicesPlan;
 class OptimizeIndexTask;
 class OptimizeIndexMerge;
 class IndexSegmentResult;
+class IvfModel;
 class FtsQueryContext;
 class FtsQuery;
 
@@ -2937,6 +2938,24 @@ public:
     const LanceOptimizeIndicesPlan* c_handle() const { return handle_.get(); }
 };
 
+/// Additive standalone IVF/PQ trainer controls.
+struct IndexTrainerOptions {
+    std::optional<uint64_t> sample_rate;
+    std::optional<uint64_t> max_iters;
+};
+
+/// Additive scalar-index build controls.
+struct ScalarIndexOptions {
+    std::optional<bool> train;
+};
+
+/// Prewarm controls. An engaged empty segment list maps to Some(empty) and
+/// performs no segment work.
+struct IndexPrewarmOptions {
+    bool with_position = false;
+    std::optional<std::vector<std::array<uint8_t, 16>>> index_segments;
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -5062,6 +5081,27 @@ public:
             check_error();
     }
 
+    /// Create a scalar index with the additive native train control.
+    void create_scalar_index_with_options(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        const ScalarIndexOptions& options,
+        const std::string& index_name = "",
+        const std::string& params_json = "",
+        bool replace = false) {
+        const char* name_c = index_name.empty() ? nullptr : index_name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        LanceScalarIndexOptions scalar_options{};
+        if (options.train) {
+            scalar_options.has_train = true;
+            scalar_options.train = *options.train;
+        }
+        if (lance_dataset_create_scalar_index_with_options(
+                handle_.get(), column.c_str(), name_c, index_type, json_c,
+                &scalar_options, replace) != 0)
+            check_error();
+    }
+
     /// Create a single-use builder for an uncommitted scalar index segment.
     /// The builder owns a snapshot, so it remains valid independently of this
     /// Dataset object's lifetime.
@@ -5071,6 +5111,15 @@ public:
         const std::string& index_name = "",
         const std::string& params_json = "",
         const LanceIndexSegmentBuildOptions* options = nullptr) const;
+
+    /// Create a scalar segment builder with the additive native train control.
+    IndexSegmentBuilder new_scalar_index_segment_builder_with_options(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        const ScalarIndexOptions& options,
+        const std::string& index_name = "",
+        const std::string& params_json = "",
+        const LanceIndexSegmentBuildOptions* build_options = nullptr) const;
 
     /// Create a single-use builder for an uncommitted vector index segment.
     IndexSegmentBuilder new_vector_index_segment_builder(
@@ -5107,6 +5156,43 @@ public:
         IndexModel& ivf_centroids,
         const std::vector<uint32_t>& fragment_ids = {}) const;
 
+    /// Train IVF centroids with native sample-rate and iteration controls.
+    IndexModel train_ivf_model_with_options(
+        const std::string& column,
+        uint32_t num_partitions,
+        LanceMetricType metric,
+        const IndexTrainerOptions& options = {},
+        const std::vector<uint32_t>& fragment_ids = {}) const;
+
+    /// Train a PQ codebook with native trainer controls.
+    IndexModel train_pq_model_with_options(
+        const std::string& column,
+        uint32_t num_sub_vectors,
+        uint32_t num_bits,
+        LanceMetricType metric,
+        IndexModel& ivf_centroids,
+        const IndexTrainerOptions& options = {},
+        const std::vector<uint32_t>& fragment_ids = {}) const;
+
+    /// JSON array of every native index description, including system indexes.
+    std::string describe_indices_json() const;
+
+    /// Native index-family-specific statistics JSON. May publish a native
+    /// migration version for old corrupt fragment coverage.
+    std::string index_statistics_json(const std::string& index_name);
+
+    /// Owned IVF model snapshot for the first physical vector segment.
+    IvfModel get_ivf_model(const std::string& index_name) const;
+
+    /// Centroids from get_ivf_model(index_name), or nullopt when absent.
+    std::optional<IndexModel> centroids(const std::string& index_name) const;
+
+    /// Read one logical IVF partition; the stream owns its native snapshot.
+    ArrowStream read_index_partition(
+        const std::string& index_name,
+        uint64_t partition_id,
+        bool with_vector = false) const;
+
     /// Drop an index by name.
     void drop_index(const std::string& name) {
         if (lance_dataset_drop_index(handle_.get(), name.c_str()) != 0)
@@ -5118,6 +5204,25 @@ public:
     /// Throws lance::Error on failure, including an absent or empty index name.
     void prewarm_index(const std::string& index_name) const {
         if (lance_dataset_prewarm_index(handle_.get(), index_name.c_str()) != 0)
+            check_error();
+    }
+
+    /// Prewarm selected segments with native FTS position controls.
+    void prewarm_index_with_options(
+        const std::string& index_name,
+        const IndexPrewarmOptions& options = {}) const {
+        LanceIndexPrewarmOptions prewarm{};
+        prewarm.with_position = options.with_position;
+        if (options.index_segments) {
+            prewarm.has_segment_selection = true;
+            prewarm.segment_count = options.index_segments->size();
+            if (!options.index_segments->empty()) {
+                prewarm.segment_uuids = reinterpret_cast<const uint8_t*>(
+                    options.index_segments->data());
+            }
+        }
+        if (lance_dataset_prewarm_index_with_options(
+                handle_.get(), index_name.c_str(), &prewarm) != 0)
             check_error();
     }
 
@@ -5148,6 +5253,50 @@ public:
         std::string out(json);
         lance_free_string(json);
         return out;
+    }
+
+    /// Merge distributed Inverted index files. Files only; does not commit.
+    void merge_index_metadata(
+        const std::array<uint8_t, 16>& index_uuid,
+        const std::string& index_type,
+        std::optional<size_t> batch_readhead = std::nullopt,
+        LanceIndexBuildProgressCallback callback = nullptr,
+        void* callback_ctx = nullptr) const {
+        if (lance_dataset_merge_index_metadata(
+                handle_.get(), index_uuid.data(), index_type.c_str(),
+                batch_readhead.has_value(), batch_readhead.value_or(0), callback,
+                callback_ctx) != 0)
+            check_error();
+    }
+
+    /// Merge existing uncommitted segments into one uncommitted segment.
+    std::vector<uint8_t> merge_index_segments(
+        const std::vector<std::vector<uint8_t>>& segment_metadata) const {
+        std::vector<const uint8_t*> bytes;
+        std::vector<size_t> lens;
+        bytes.reserve(segment_metadata.size());
+        lens.reserve(segment_metadata.size());
+        for (const auto& metadata : segment_metadata) {
+            bytes.push_back(metadata.data());
+            lens.push_back(metadata.size());
+        }
+        uint8_t* output = nullptr;
+        size_t output_len = 0;
+        struct BytesGuard {
+            uint8_t* bytes = nullptr;
+            ~BytesGuard() { lance_free_bytes(bytes); }
+        } guard;
+        if (lance_dataset_merge_index_segments(
+                handle_.get(), bytes.empty() ? nullptr : bytes.data(),
+                lens.empty() ? nullptr : lens.data(), bytes.size(), &output,
+                &output_len) != 0)
+            check_error();
+        guard.bytes = output;
+        if (!output || output_len == 0) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_dataset_merge_index_segments returned empty metadata");
+        }
+        return std::vector<uint8_t>(output, output + output_len);
     }
 
     /// Number of segments that make up a logical vector index.
@@ -5330,6 +5479,7 @@ class IndexModel {
     }
 
     friend class Dataset;
+    friend class IvfModel;
 
     IndexModel() noexcept = default;
 
@@ -5381,6 +5531,58 @@ public:
 
     ArrowArray* array() noexcept { return &array_; }
     const ArrowSchema* schema() const noexcept { return &schema_; }
+};
+
+/// Move-only owner of a cloned native IVF model.
+class IvfModel {
+    Handle<LanceIvfModel, lance_ivf_model_free> handle_;
+
+    explicit IvfModel(LanceIvfModel* model) : handle_(model) {}
+    friend class Dataset;
+
+public:
+    IvfModel(IvfModel&&) noexcept = default;
+    IvfModel& operator=(IvfModel&&) noexcept = default;
+    IvfModel(const IvfModel&) = delete;
+    IvfModel& operator=(const IvfModel&) = delete;
+
+    bool has_centroids() const {
+        bool value = lance_ivf_model_has_centroids(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Owned Arrow centroids, or nullopt when the model has none.
+    std::optional<IndexModel> centroids() const {
+        if (!has_centroids()) return std::nullopt;
+        ArrowArray array = {};
+        ArrowSchema schema = {};
+        if (lance_ivf_model_export_centroids(handle_.get(), &array, &schema) != 0)
+            check_error();
+        return IndexModel(array, schema);
+    }
+
+    uint64_t num_partitions() const {
+        uint64_t value = lance_ivf_model_num_partitions(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    uint64_t dimension() const {
+        uint64_t value = lance_ivf_model_dimension(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Native partition size. An absent partition returns 0.
+    uint64_t partition_size(uint64_t partition_id) const {
+        uint64_t value =
+            lance_ivf_model_partition_size(handle_.get(), partition_id);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    const LanceIvfModel* c_handle() const { return handle_.get(); }
 };
 
 namespace detail {
@@ -5866,6 +6068,28 @@ inline IndexSegmentBuilder Dataset::new_scalar_index_segment_builder(
     return IndexSegmentBuilder(builder);
 }
 
+inline IndexSegmentBuilder Dataset::new_scalar_index_segment_builder_with_options(
+    const std::string& column,
+    LanceScalarIndexType index_type,
+    const ScalarIndexOptions& options,
+    const std::string& index_name,
+    const std::string& params_json,
+    const LanceIndexSegmentBuildOptions* build_options) const {
+    const char* index_name_c = index_name.empty() ? nullptr : index_name.c_str();
+    const char* params_json_c = params_json.empty() ? nullptr : params_json.c_str();
+    LanceScalarIndexOptions scalar_options{};
+    if (options.train) {
+        scalar_options.has_train = true;
+        scalar_options.train = *options.train;
+    }
+    auto* builder = lance_index_segment_builder_new_scalar_with_options(
+        handle_.get(), column.c_str(), index_name_c,
+        static_cast<int32_t>(index_type), params_json_c, &scalar_options,
+        build_options);
+    if (!builder) check_error();
+    return IndexSegmentBuilder(builder);
+}
+
 inline IndexSegmentBuilder Dataset::new_vector_index_segment_builder(
     const std::string& column,
     const LanceVectorIndexParams& params,
@@ -5961,6 +6185,107 @@ inline IndexModel Dataset::train_pq_model(
             ivf_centroids.array(), ivf_centroids.schema(), &array, &schema) != 0)
         check_error();
     return IndexModel(array, schema);
+}
+
+inline IndexModel Dataset::train_ivf_model_with_options(
+    const std::string& column,
+    uint32_t num_partitions,
+    LanceMetricType metric,
+    const IndexTrainerOptions& options,
+    const std::vector<uint32_t>& fragment_ids) const {
+    ArrowArray array = {};
+    ArrowSchema schema = {};
+    LanceIndexTrainerOptions trainer{};
+    if (options.sample_rate) {
+        trainer.sample_rate.value = *options.sample_rate;
+        trainer.sample_rate.is_set = true;
+    }
+    if (options.max_iters) {
+        trainer.max_iters.value = *options.max_iters;
+        trainer.max_iters.is_set = true;
+    }
+    const uint32_t* ids = fragment_ids.empty() ? nullptr : fragment_ids.data();
+    if (lance_index_train_ivf_model_with_options(
+            handle_.get(), column.c_str(), num_partitions,
+            static_cast<int32_t>(metric), ids, fragment_ids.size(), &trainer,
+            &array, &schema) != 0)
+        check_error();
+    return IndexModel(array, schema);
+}
+
+inline IndexModel Dataset::train_pq_model_with_options(
+    const std::string& column,
+    uint32_t num_sub_vectors,
+    uint32_t num_bits,
+    LanceMetricType metric,
+    IndexModel& ivf_centroids,
+    const IndexTrainerOptions& options,
+    const std::vector<uint32_t>& fragment_ids) const {
+    ArrowArray array = {};
+    ArrowSchema schema = {};
+    LanceIndexTrainerOptions trainer{};
+    if (options.sample_rate) {
+        trainer.sample_rate.value = *options.sample_rate;
+        trainer.sample_rate.is_set = true;
+    }
+    if (options.max_iters) {
+        trainer.max_iters.value = *options.max_iters;
+        trainer.max_iters.is_set = true;
+    }
+    const uint32_t* ids = fragment_ids.empty() ? nullptr : fragment_ids.data();
+    if (lance_index_train_pq_model_with_options(
+            handle_.get(), column.c_str(), num_sub_vectors, num_bits,
+            static_cast<int32_t>(metric), ids, fragment_ids.size(),
+            ivf_centroids.array(), ivf_centroids.schema(), &trainer, &array,
+            &schema) != 0)
+        check_error();
+    return IndexModel(array, schema);
+}
+
+inline std::string Dataset::describe_indices_json() const {
+    const char* json = lance_dataset_describe_indices_json(handle_.get());
+    if (!json) check_error();
+    std::unique_ptr<const char, void (*)(const char*)> guard(json,
+                                                             lance_free_string);
+    return std::string(json);
+}
+
+inline std::string Dataset::index_statistics_json(
+    const std::string& index_name) {
+    const char* json = lance_dataset_index_statistics_json(
+        handle_.get(), index_name.c_str());
+    if (!json) check_error();
+    std::unique_ptr<const char, void (*)(const char*)> guard(json,
+                                                             lance_free_string);
+    return std::string(json);
+}
+
+inline IvfModel Dataset::get_ivf_model(const std::string& index_name) const {
+    auto* model =
+        lance_dataset_get_ivf_model(handle_.get(), index_name.c_str());
+    if (!model) check_error();
+    return IvfModel(model);
+}
+
+inline std::optional<IndexModel> Dataset::centroids(
+    const std::string& index_name) const {
+    return get_ivf_model(index_name).centroids();
+}
+
+inline ArrowStream Dataset::read_index_partition(
+    const std::string& index_name,
+    uint64_t partition_id,
+    bool with_vector) const {
+    ArrowArrayStream stream = {};
+    if (lance_dataset_read_index_partition(
+            handle_.get(), index_name.c_str(), partition_id, with_vector,
+            &stream) != 0)
+        check_error();
+    if (!stream.release) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_dataset_read_index_partition returned an empty stream");
+    }
+    return ArrowStream(stream);
 }
 
 // ─── Scanner ─────────────────────────────────────────────────────────────────
@@ -6455,6 +6780,12 @@ public:
     /// Replace only the maximum partition-search bound.
     Scanner& maximum_nprobes(uint32_t maximum_nprobes) {
         if (lance_scanner_set_maximum_nprobes(handle_.get(), maximum_nprobes) != 0) check_error();
+        return *this;
+    }
+    /// Set native continuous IVF search effort. Any explicit value, including
+    /// 0.5, ignores fixed nprobes while explicit minimum/maximum remain.
+    Scanner& search_effort(double effort) {
+        if (lance_scanner_set_search_effort(handle_.get(), effort) != 0) check_error();
         return *this;
     }
     Scanner& approx_mode(LanceApproxMode approx_mode) {

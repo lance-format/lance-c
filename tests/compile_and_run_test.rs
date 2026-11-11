@@ -150,6 +150,82 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Three-fragment dataset with deterministic vectors and positional text for
+/// the focused native-index consumers.
+fn create_index_capability_dataset_on_disk(name: &str) -> (tempfile::TempDir, String) {
+    const DIM: i32 = 8;
+    const ROWS_PER_FRAGMENT: i32 = 64;
+    const FRAGMENTS: i32 = 3;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join(name).to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), DIM),
+            false,
+        ),
+    ]));
+
+    lance_c::runtime::block_on(async {
+        for fragment in 0..FRAGMENTS {
+            let ids = (0..ROWS_PER_FRAGMENT)
+                .map(|row| fragment * ROWS_PER_FRAGMENT + row)
+                .collect::<Vec<_>>();
+            let texts = ids
+                .iter()
+                .map(|id| {
+                    if id % 4 == 0 {
+                        format!("alpha beta doc{id}")
+                    } else {
+                        format!("beta alpha doc{id}")
+                    }
+                })
+                .collect::<Vec<_>>();
+            let text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+            let values = ids
+                .iter()
+                .flat_map(|id| (0..DIM).map(move |component| *id as f32 + component as f32 / 10.0))
+                .collect::<Vec<_>>();
+            let embeddings = FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                DIM,
+                Arc::new(Float32Array::from(values)),
+                None,
+            )
+            .unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(text_refs)),
+                    Arc::new(embeddings),
+                ],
+            )
+            .unwrap();
+            let params = WriteParams {
+                mode: if fragment == 0 {
+                    WriteMode::Create
+                } else {
+                    WriteMode::Append
+                },
+                ..Default::default()
+            };
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                &uri,
+                Some(params),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    (tmp, uri)
+}
+
 /// Create a five-version, four-fragment dataset with one deleted row for
 /// maintenance API tests.
 fn create_cleanup_dataset_on_disk() -> (tempfile::TempDir, String) {
@@ -829,6 +905,34 @@ fn test_typed_fts_native_compilation_and_execution() {
         "C++ FTS test compilation failed"
     );
     run_test_binary_with_dataset(&cpp_binary, &dataset_uri);
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_index_capabilities_consumers"]
+fn test_native_index_capabilities_consumers() {
+    let (lib_path, include_dir) = build_lance_c();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let (_c_tmp, c_uri) = create_index_capability_dataset_on_disk("index_caps_c");
+    let c_source = tests_dir.join("test_index_capabilities.c");
+    let c_binary = build_dir.path().join("test_index_capabilities_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "focused C index capability consumer failed to compile"
+    );
+    run_test_binary_with_dataset(&c_binary, &c_uri);
+
+    let (_cpp_tmp, cpp_uri) = create_index_capability_dataset_on_disk("index_caps_cpp");
+    let cpp_source = tests_dir.join("test_index_capabilities.cpp");
+    let cpp_binary = build_dir.path().join("test_index_capabilities_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "focused C++ index capability consumer failed to compile"
+    );
+    run_test_binary_with_dataset(&cpp_binary, &cpp_uri);
 }
 
 #[test]
