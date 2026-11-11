@@ -61,6 +61,13 @@ object_store = "=0.14.2"
 opendal = { version = "=0.59.2", default-features = false, features = ["http-transport-reqwest"] }
 pin-project = "1.0"
 prost = "0.14"
+# Direct for `prost_types::Any` in the native `Operation::Rewrite` index details
+# and for the typed key-existence filter transport; already in the graph
+# transitively via lance.
+prost-types = "0.14"
+# Direct for the `RoaringBitmap` values in native `UpdatedFragmentOffsets`,
+# whose field is public and therefore names this crate.
+roaring = "0.11"
 # Direct JSON transport for native maintenance plan/task/result values.
 serde = "1"
 serde_json = "1"
@@ -75,7 +82,6 @@ datafusion-substrait = { version = "=54.1.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
-prost-types = "0.14"
 tempfile = "3"
 # Direct for `libc::SIGABRT` in the panic-guard test's child-process assertions;
 # already in the graph transitively via tokio/lance.

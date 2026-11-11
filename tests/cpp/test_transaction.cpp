@@ -1476,6 +1476,278 @@ static void test_dynamic_storage_accessor(
     std::printf("C++ dynamic storage accessor OK\n");
 }
 
+
+static void test_update_rewrite_operations(const std::string& source_uri,
+                                           const std::string& base) {
+    using lance::IndexFile;
+
+    /* ── UpdatedFragmentOffsets keeps None/empty/populated distinct. ── */
+    lance::UpdatedFragmentOffsets empty_offsets(
+        std::vector<std::pair<uint64_t, std::vector<uint32_t>>>{});
+    CHECK(empty_offsets.size() == 0);
+    lance::UpdatedFragmentOffsets populated_offsets(
+        {{2, {5, 1, 5}}, {1, {}}, {2, {7}}});
+    CHECK(populated_offsets.size() == 2);
+    std::map<uint64_t, std::vector<uint32_t>> offsets_by_fragment;
+    for (size_t i = 0; i < populated_offsets.size(); ++i) {
+        offsets_by_fragment[populated_offsets.fragment_id_at(i)] =
+            populated_offsets.offsets_at(i);
+    }
+    CHECK(offsets_by_fragment.size() == 2);
+    CHECK((offsets_by_fragment[2] == std::vector<uint32_t>{7}));
+    CHECK(offsets_by_fragment[1].empty());
+    auto offsets_clone = populated_offsets.clone();
+    CHECK(offsets_clone.size() == populated_offsets.size());
+
+    /* ── KeyExistenceFilter explicit protobuf conversion. ── */
+    const std::vector<uint8_t> exact_bytes = {0x08, 0x01, 0x12, 0x04,
+                                              0x08, 0x04, 0x08, 0x09};
+    auto exact = lance::KeyExistenceFilter::from_proto(exact_bytes);
+    CHECK(exact.kind() == LANCE_KEY_EXISTENCE_FILTER_EXACT);
+    CHECK((exact.field_ids() == std::vector<int32_t>{1}));
+    CHECK((exact.exact_keys() == std::vector<uint64_t>{4, 9}));
+    auto exact_round_trip = lance::KeyExistenceFilter::from_proto(
+        exact.to_proto());
+    CHECK((exact_round_trip.exact_keys() == std::vector<uint64_t>{4, 9}));
+    bool bloom_rejected = false;
+    try {
+        (void)exact.bloom();
+    } catch (const lance::Error& error) {
+        bloom_rejected = error.code == LANCE_ERR_NOT_SUPPORTED;
+    }
+    CHECK(bloom_rejected);
+
+    const std::vector<uint8_t> bloom_bytes = {
+        0x08, 0x01, 0x1A, 0x12, 0x0A, 0x03, 0x01, 0x02, 0x03, 0x10,
+        0x40, 0x18, 0x00, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00};
+    auto bloom = lance::KeyExistenceFilter::from_proto(bloom_bytes);
+    CHECK(bloom.kind() == LANCE_KEY_EXISTENCE_FILTER_BLOOM);
+    auto bloom_values = bloom.bloom();
+    CHECK((bloom_values.bitmap == std::vector<uint8_t>{1, 2, 3}));
+    CHECK(bloom_values.num_bits == 64);
+    CHECK(bloom_values.number_of_items == 8192);
+    CHECK(bloom_values.probability == 0.00057);
+    auto bloom_round_trip = lance::KeyExistenceFilter::from_proto(
+        bloom.to_proto());
+    CHECK(bloom_round_trip.bloom().number_of_items == 8192);
+
+    /* ── RewrittenIndex: None vs Some(empty) vs populated files. ── */
+    const std::array<uint8_t, 16> old_id = {0x11, 0x11, 0x11, 0x11,
+                                            0x11, 0x11, 0x11, 0x11,
+                                            0x11, 0x11, 0x11, 0x11,
+                                            0x11, 0x11, 0x11, 0x11};
+    const std::array<uint8_t, 16> new_id = {0x22, 0x22, 0x22, 0x22,
+                                            0x22, 0x22, 0x22, 0x22,
+                                            0x22, 0x22, 0x22, 0x22,
+                                            0x22, 0x22, 0x22, 0x22};
+    const std::string type_url = "type.googleapis.com/lance.index.TestDetails";
+    const std::vector<uint8_t> details_value = {0x0A, 0x02, 0x68, 0x69};
+    lance::RewrittenIndex populated_index(
+        old_id, new_id, type_url, details_value, 3,
+        std::vector<IndexFile>{{{"index.idx", 128}, {"aux.idx", 16}}});
+    CHECK(populated_index.old_id() == old_id);
+    CHECK(populated_index.new_id() == new_id);
+    CHECK(populated_index.details_type_url() == type_url);
+    CHECK(populated_index.details_value() == details_value);
+    CHECK(populated_index.version() == 3);
+    CHECK(populated_index.has_files());
+    CHECK(populated_index.files().size() == 2);
+    CHECK(populated_index.files()[0].path == "index.idx");
+    CHECK(populated_index.files()[0].size_bytes == 128);
+    lance::RewrittenIndex no_files_index(old_id, new_id, type_url,
+                                         details_value, 1, std::nullopt);
+    CHECK(!no_files_index.has_files());
+    CHECK(no_files_index.files().empty());
+    lance::RewrittenIndex empty_files_index(
+        old_id, new_id, type_url, details_value, 2,
+        std::vector<IndexFile>{});
+    CHECK(empty_files_index.has_files());
+    CHECK(empty_files_index.files().empty());
+
+    /* ── Update: real multi-fragment publication through the owners. ── */
+    const std::string uri = base + "/cpp_update_operations";
+    const auto source_rows = lance::Dataset::open(source_uri).count_rows();
+
+    lance::UncommittedWriteOptions write_options;
+    write_options.write.params.max_rows_per_file = 2;
+    auto dataset = lance::Dataset::commit(
+        uri, write_uncommitted(source_uri, uri, lance::WriteMode::Create,
+                               write_options));
+    CHECK(dataset.version() == 1);
+    const uint64_t total_rows = dataset.count_rows();
+    CHECK(total_rows == source_rows);
+    const auto seed_fragments = dataset.fragment_count();
+    CHECK(seed_fragments >= 4);
+    const auto seed_ids = dataset.fragment_ids();
+
+    auto old_first = dataset.open_fragment(seed_ids[0]);
+    auto old_second = dataset.open_fragment(seed_ids[1]);
+    CHECK(old_first.is_bound());
+    CHECK(old_second.is_bound());
+    const uint64_t replaced_rows =
+        old_first.physical_rows() + old_second.physical_rows();
+
+    uint64_t staged_read_version = 0;
+    std::vector<lance::Fragment> staged_fragments;
+    {
+        auto staged = write_uncommitted(source_uri, uri,
+                                        lance::WriteMode::Append,
+                                        write_options);
+        staged_read_version = staged.read_version();
+        CHECK(staged_read_version == dataset.version());
+        auto operation = staged.operation();
+        CHECK(operation.kind() == lance::OperationKind::Append);
+        CHECK(operation.append_fragment_count() > 1);
+        for (size_t i = 0; i < operation.append_fragment_count(); ++i) {
+            staged_fragments.push_back(operation.append_fragment_at(i));
+        }
+    }
+    std::vector<const lance::Fragment*> staged_pointers;
+    staged_pointers.reserve(staged_fragments.size());
+    for (const auto& fragment : staged_fragments) {
+        staged_pointers.push_back(&fragment);
+    }
+
+    lance::UpdateOperationSpec update_spec;
+    update_spec.removed_fragment_ids = {seed_ids[0], seed_ids[1]};
+    update_spec.updated_fragments = {&old_first, &old_second};
+    update_spec.new_fragments = staged_pointers;
+    update_spec.fields_modified = {0};
+    update_spec.update_mode = lance::UpdateMode::RewriteRows;
+    auto update = lance::Operation::make_update(update_spec);
+    CHECK(update.kind() == lance::OperationKind::Update);
+    CHECK(update.removed_fragment_count() == 2);
+    CHECK(update.removed_fragment_id(1) == seed_ids[1]);
+    CHECK(update.updated_fragment_count() == 2);
+    CHECK(update.new_fragment_count() == staged_fragments.size());
+    CHECK(update.fields_modified(0) == 0);
+    CHECK(update.compacted_sstable_count() == 0);
+    CHECK(update.fields_for_preserving_frag_bitmap_count() == 0);
+    CHECK(update.update_mode() == lance::UpdateMode::RewriteRows);
+    CHECK(!update.inserted_rows_filter().has_value());
+    CHECK(!update.updated_fragment_offsets().has_value());
+    {
+        auto cloned = update.updated_fragment_at(0);
+        CHECK(!cloned.is_bound());
+        CHECK(cloned.data_file_count() > 0);
+    }
+    auto published = lance::Dataset::commit(
+        uri, lance::Transaction::from_operation(dataset.version(), update));
+    CHECK(published.version() == dataset.version() + 1);
+    CHECK(published.count_rows() == total_rows - replaced_rows + total_rows);
+    CHECK(published.fragment_count() ==
+          seed_fragments - 2 + staged_fragments.size());
+    published.validate();
+    auto reopened = lance::Dataset::open(uri);
+    CHECK(reopened.count_rows() == published.count_rows());
+    CHECK(reopened.fragment_count() == published.fragment_count());
+
+    /* Value-level RewriteColumns op keeps the mode and matched offsets. */
+    lance::UpdateOperationSpec columns_spec;
+    columns_spec.updated_fragments = {&old_first};
+    columns_spec.new_fragments = staged_pointers;
+    columns_spec.fields_modified = {1};
+    columns_spec.update_mode = lance::UpdateMode::RewriteColumns;
+    columns_spec.inserted_rows_filter = exact.clone();
+    columns_spec.updated_fragment_offsets = populated_offsets.clone();
+    auto columns_update = lance::Operation::make_update(columns_spec);
+    CHECK(columns_update.update_mode() == lance::UpdateMode::RewriteColumns);
+    CHECK(columns_update.inserted_rows_filter().has_value());
+    CHECK((columns_update.inserted_rows_filter()->exact_keys() ==
+           std::vector<uint64_t>{4, 9}));
+    CHECK(columns_update.updated_fragment_offsets().has_value());
+    CHECK(columns_update.updated_fragment_offsets()->size() == 2);
+
+    /* ── Rewrite: real compaction-task publication. ── */
+    const std::string rewrite_uri = base + "/cpp_rewrite_operations";
+    write_options.write.params.max_rows_per_file = 1;
+    auto rewrite_seed = lance::Dataset::commit(
+        rewrite_uri,
+        write_uncommitted(source_uri, rewrite_uri, lance::WriteMode::Create,
+                          write_options));
+    const uint64_t rewrite_rows = rewrite_seed.count_rows();
+    CHECK(rewrite_rows == source_rows);
+    const auto rewrite_fragments = rewrite_seed.fragment_count();
+    CHECK(rewrite_fragments >= 4);
+
+    lance::CompactionOptions compaction_options;
+    compaction_options.set_target_rows_per_fragment(4);
+    auto plan = rewrite_seed.plan_compaction(&compaction_options);
+    CHECK(plan.num_tasks() > 0);
+    auto task = plan.task(0);
+    auto rewrite_result = task.execute(rewrite_seed);
+    const size_t original_count =
+        rewrite_result.original_fragment_count();
+    CHECK(original_count >= 2);
+    const size_t replacement_count = rewrite_result.new_fragment_count();
+    CHECK(replacement_count == 1);
+
+    std::vector<lance::Fragment> originals;
+    std::vector<const lance::Fragment*> original_pointers;
+    for (size_t i = 0; i < original_count; ++i) {
+        originals.push_back(rewrite_result.original_fragment_at(i));
+        CHECK(originals.back().data_file_count() > 0);
+    }
+    for (const auto& fragment : originals) original_pointers.push_back(&fragment);
+    auto replacement = rewrite_result.new_fragment_at(0);
+    std::vector<const lance::Fragment*> replacement_pointers = {&replacement};
+
+    lance::RewriteGroup group(original_pointers, replacement_pointers);
+    CHECK(group.old_fragment_count() == original_count);
+    CHECK(group.new_fragment_count() == 1);
+    CHECK(group.old_fragments().size() == original_count);
+    const std::vector<const lance::RewriteGroup*> groups = {&group};
+    auto rewrite_value = lance::Operation::make_rewrite(
+        groups, {&populated_index, &no_files_index, &empty_files_index});
+    CHECK(rewrite_value.kind() == lance::OperationKind::Rewrite);
+    CHECK(rewrite_value.rewrite_group_count() == 1);
+    CHECK(rewrite_value.rewritten_index_count() == 3);
+    CHECK(!rewrite_value.frag_reuse_index().has_value());
+    {
+        auto cloned_group = rewrite_value.rewrite_group_at(0);
+        CHECK(cloned_group.new_fragment_count() == 1);
+        auto without_files = rewrite_value.rewritten_index_at(1);
+        CHECK(!without_files.has_files());
+        CHECK(without_files.version() == 1);
+        auto with_empty_files = rewrite_value.rewritten_index_at(2);
+        CHECK(with_empty_files.has_files());
+        CHECK(with_empty_files.files().empty());
+        auto populated = rewrite_value.rewritten_index_at(0);
+        CHECK(populated.has_files());
+        CHECK(populated.files().size() == 2);
+        CHECK(populated.details_type_url() == type_url);
+    }
+    /* Only the fragment rewrite participates in the published transaction;
+       native index maintenance rejects rewritten-index records for indices the
+       dataset does not carry. */
+    const std::vector<const lance::RewrittenIndex*> no_rewritten_indices;
+    auto rewrite =
+        lance::Operation::make_rewrite(groups, no_rewritten_indices);
+    CHECK(rewrite.rewritten_index_count() == 0);
+    auto rewritten = lance::Dataset::commit(
+        rewrite_uri,
+        lance::Transaction::from_operation(task.read_version(), rewrite));
+    CHECK(rewritten.count_rows() == rewrite_rows);
+    CHECK(rewritten.fragment_count() ==
+          rewrite_fragments - original_count + replacement_count);
+    rewritten.validate();
+    auto rewritten_reopened = lance::Dataset::open(rewrite_uri);
+    CHECK(rewritten_reopened.count_rows() == rewrite_rows);
+    CHECK(rewritten_reopened.fragment_count() == rewritten.fragment_count());
+
+    /* ── UpdateMemWalState: complete value. ── */
+    const auto compacted = lance::CompactedSsTable::from_uuid(
+        "00000000-0000-0000-0000-000000000000", 5);
+    auto mem_wal = lance::Operation::make_update_mem_wal_state({compacted});
+    CHECK(mem_wal.kind() == lance::OperationKind::UpdateMemWalState);
+    CHECK(mem_wal.update_mem_wal_state_compacted_sstable_count() == 1);
+    CHECK(mem_wal.update_mem_wal_state_compacted_sstable_at(0).generation == 5);
+    CHECK(mem_wal.update_mem_wal_state_compacted_sstable_at(0).shard_id ==
+          compacted.shard_id);
+    auto empty_mem_wal = lance::Operation::make_update_mem_wal_state({});
+    CHECK(empty_mem_wal.update_mem_wal_state_compacted_sstable_count() == 0);
+}
 int main(int argc, char** argv) {
     if (argc != 5) {
         std::fprintf(stderr,
@@ -1495,6 +1767,7 @@ int main(int argc, char** argv) {
         test_native_schema(argv[3]);
         test_blob_writer_data_replacement(argv[4]);
         test_native_operations(argv[1], argv[2]);
+        test_update_rewrite_operations(argv[1], argv[2]);
     } catch (const lance::Error& error) {
         std::fprintf(stderr, "lance::Error(%d): %s\n",
                      static_cast<int>(error.code), error.what());
