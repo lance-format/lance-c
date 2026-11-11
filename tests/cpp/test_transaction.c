@@ -2545,12 +2545,22 @@ static const char *arrow_metadata_value(const char *metadata, const char *key) {
     if (!metadata) return NULL;
     size_t key_len = strlen(key);
     const char *cursor = metadata;
-    while (*cursor != '\0') {
+    int32_t pair_count = 0;
+    memcpy(&pair_count, cursor, sizeof(pair_count));
+    cursor += sizeof(pair_count);
+    for (int32_t i = 0; i < pair_count; ++i) {
+        int32_t entry_key_len = 0;
+        memcpy(&entry_key_len, cursor, sizeof(entry_key_len));
+        cursor += sizeof(entry_key_len);
         const char *entry_key = cursor;
-        cursor += strlen(cursor) + 1;
+        cursor += entry_key_len;
+        int32_t value_len = 0;
+        memcpy(&value_len, cursor, sizeof(value_len));
+        cursor += sizeof(value_len);
         const char *entry_value = cursor;
-        cursor += strlen(cursor) + 1;
-        if (strncmp(entry_key, key, key_len) == 0 && entry_key[key_len] == '\0') {
+        cursor += value_len;
+        if (entry_key_len == (int32_t)key_len &&
+            memcmp(entry_key, key, key_len) == 0) {
             return entry_value;
         }
     }

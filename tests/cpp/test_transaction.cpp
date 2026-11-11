@@ -1405,11 +1405,20 @@ static std::map<std::string, std::string> typed_arrow_metadata(
     std::map<std::string, std::string> out;
     if (metadata == nullptr) return out;
     const char* cursor = metadata;
-    while (*cursor != '\0') {
-        std::string key(cursor);
-        cursor += key.size() + 1;
-        std::string value(cursor);
-        cursor += value.size() + 1;
+    int32_t pair_count = 0;
+    std::memcpy(&pair_count, cursor, sizeof(pair_count));
+    cursor += sizeof(pair_count);
+    for (int32_t i = 0; i < pair_count; ++i) {
+        int32_t key_len = 0;
+        std::memcpy(&key_len, cursor, sizeof(key_len));
+        cursor += sizeof(key_len);
+        std::string key(cursor, static_cast<size_t>(key_len));
+        cursor += key_len;
+        int32_t value_len = 0;
+        std::memcpy(&value_len, cursor, sizeof(value_len));
+        cursor += sizeof(value_len);
+        std::string value(cursor, static_cast<size_t>(value_len));
+        cursor += value_len;
         out.emplace(std::move(key), std::move(value));
     }
     return out;
