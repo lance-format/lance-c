@@ -29123,7 +29123,7 @@ fn data_file_page_payloads(uri: &str) -> Vec<Vec<u8>> {
                 let file_bytes =
                     std::fs::read(std::path::Path::new(&uri).join(&data_file.path)).unwrap();
                 for column in &metadata.column_infos {
-                    for page in &column.page_infos {
+                    for page in column.page_infos.iter() {
                         let mut payload = Vec::new();
                         for &(offset, size) in page.buffer_offsets_and_sizes.iter() {
                             let start = usize::try_from(offset).unwrap();
