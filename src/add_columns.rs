@@ -98,20 +98,7 @@ unsafe fn add_columns_sql_inner(
 
     let batch_size = resolve_batch_size(batch_size)?;
 
-    // Materialize the (name, expression) pairs up front so a precise per-index
-    // error fires before the dataset's write lock is taken — matches the
-    // pre-lock validation pattern used by the sibling schema-evolution APIs.
-    let mut pairs: Vec<(String, String)> = Vec::with_capacity(num_columns);
-    for i in 0..num_columns {
-        // SAFETY: `columns` is non-NULL (checked above) and the caller
-        // guarantees the array has at least `num_columns` initialised entries
-        // valid for this call. Each entry's `name` / `expression` pointers are
-        // dereferenced by `parse_required_field` under the same guarantee.
-        let entry = unsafe { &*columns.add(i) };
-        let name = unsafe { parse_required_field(entry.name, i, "name")? };
-        let expression = unsafe { parse_required_field(entry.expression, i, "expression")? };
-        pairs.push((name, expression));
-    }
+    let pairs = unsafe { parse_sql_columns(columns, num_columns) }?;
 
     let transform = NewColumnTransform::SqlExpressions(pairs);
 
@@ -287,6 +274,25 @@ unsafe fn parse_required_field(ptr: *const c_char, index: usize, field: &str) ->
             )
         })?;
     Ok(value.to_string())
+}
+
+/// Convert borrowed SQL-column declarations into the native expression list.
+///
+/// This is shared by dataset and fragment add-columns entry points so both
+/// retain the same null, UTF-8 and per-entry validation behavior.
+pub(crate) unsafe fn parse_sql_columns(
+    columns: *const LanceSqlColumn,
+    num_columns: usize,
+) -> Result<Vec<(String, String)>> {
+    let columns =
+        unsafe { helpers::required_slice(columns, num_columns, "columns", "num_columns")? };
+    let mut pairs = Vec::with_capacity(columns.len());
+    for (index, entry) in columns.iter().enumerate() {
+        let name = unsafe { parse_required_field(entry.name, index, "name")? };
+        let expression = unsafe { parse_required_field(entry.expression, index, "expression")? };
+        pairs.push((name, expression));
+    }
+    Ok(pairs)
 }
 
 /// Translate the `0 = upstream default` batch-size sentinel into `Option<u32>`,

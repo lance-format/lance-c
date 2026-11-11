@@ -105,36 +105,12 @@ pub struct LanceBatchUDF {
     pub checkpoint_store: *const LanceUDFCheckpointStore,
 }
 
-/// Add columns produced by the native BatchUDF transform.
+/// Build the native BatchUDF transform from the borrowed C declaration.
 ///
-/// `read_columns == NULL` maps to native `None`; a non-NULL NULL-terminated
-/// array maps to `Some`, including an immediately terminated empty array.
-/// `batch_size == NULL` maps to `None`; otherwise the pointed-to value,
-/// including zero, maps to `Some(value)`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lance_dataset_add_columns_batch_udf(
-    dataset: *mut LanceDataset,
-    udf: *const LanceBatchUDF,
-    read_columns: *const *const c_char,
-    batch_size: *const u32,
-) -> i32 {
-    ffi_try!(
-        unsafe { add_columns_batch_udf_inner(dataset, udf, read_columns, batch_size) },
-        neg
-    )
-}
-
-unsafe fn add_columns_batch_udf_inner(
-    dataset: *mut LanceDataset,
-    udf: *const LanceBatchUDF,
-    read_columns: *const *const c_char,
-    batch_size: *const u32,
-) -> Result<i32> {
-    if dataset.is_null() {
-        return Err(Error::invalid_input_source(
-            "dataset must not be NULL".into(),
-        ));
-    }
+/// This owns the callback adapters and declared output schema for the complete
+/// synchronous native call. Dataset and fragment add-columns paths share this
+/// conversion so mapper/checkpoint behavior cannot diverge.
+pub(crate) unsafe fn batch_udf_transform(udf: *const LanceBatchUDF) -> Result<NewColumnTransform> {
     if udf.is_null() {
         return Err(Error::invalid_input_source("udf must not be NULL".into()));
     }
@@ -148,13 +124,6 @@ unsafe fn add_columns_batch_udf_inner(
         .ok_or_else(|| Error::invalid_input_source("udf.mapper must not be NULL".into()))?;
     let output_schema =
         unsafe { helpers::import_arrow_schema(udf.output_schema, "udf.output_schema")? };
-    let read_columns = unsafe { helpers::parse_c_string_array(read_columns)? };
-    let batch_size = if batch_size.is_null() {
-        None
-    } else {
-        // SAFETY: non-NULL means the caller supplied one readable u32.
-        Some(unsafe { *batch_size })
-    };
 
     let result_checkpoint = if udf.checkpoint_store.is_null() {
         None
@@ -186,11 +155,51 @@ unsafe fn add_columns_batch_udf_inner(
         mapper.map(batch)
     });
 
-    let transform = NewColumnTransform::BatchUDF(BatchUDF {
+    Ok(NewColumnTransform::BatchUDF(BatchUDF {
         mapper,
         output_schema,
         result_checkpoint,
-    });
+    }))
+}
+
+/// Add columns produced by the native BatchUDF transform.
+///
+/// `read_columns == NULL` maps to native `None`; a non-NULL NULL-terminated
+/// array maps to `Some`, including an immediately terminated empty array.
+/// `batch_size == NULL` maps to `None`; otherwise the pointed-to value,
+/// including zero, maps to `Some(value)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_add_columns_batch_udf(
+    dataset: *mut LanceDataset,
+    udf: *const LanceBatchUDF,
+    read_columns: *const *const c_char,
+    batch_size: *const u32,
+) -> i32 {
+    ffi_try!(
+        unsafe { add_columns_batch_udf_inner(dataset, udf, read_columns, batch_size) },
+        neg
+    )
+}
+
+unsafe fn add_columns_batch_udf_inner(
+    dataset: *mut LanceDataset,
+    udf: *const LanceBatchUDF,
+    read_columns: *const *const c_char,
+    batch_size: *const u32,
+) -> Result<i32> {
+    if dataset.is_null() {
+        return Err(Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
+    }
+    let transform = unsafe { batch_udf_transform(udf)? };
+    let read_columns = unsafe { helpers::parse_c_string_array(read_columns)? };
+    let batch_size = if batch_size.is_null() {
+        None
+    } else {
+        // SAFETY: non-NULL means the caller supplied one readable u32.
+        Some(unsafe { *batch_size })
+    };
 
     // SAFETY: `dataset` is non-NULL and points to a live LanceDataset. The
     // write lock is held for the complete native call, including synchronous

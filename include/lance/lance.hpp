@@ -165,6 +165,7 @@ class Scanner;
 class Dataset;
 class Fragment;
 class FragmentOverlayWriter;
+class FragmentUpdateColumnsResult;
 class LanceSchema;
 class Batch;
 struct Table;
@@ -2553,6 +2554,79 @@ inline int32_t insert_fragment_trampoline(
     }
 }
 
+/// Complete call-scoped state for one native BatchUDF invocation.
+///
+/// The raw callback table points only into this object. Keep it on the stack
+/// for the duration of the synchronous add-columns call; it is neither movable
+/// nor copyable.
+struct BatchUDFCall {
+    std::optional<std::vector<std::string>> read_columns;
+    std::vector<const char*> read_column_ptrs;
+    uint32_t batch_size_value = 0;
+    const char* const* read_columns_ptr = nullptr;
+    const uint32_t* batch_size_ptr = nullptr;
+    MapperContext mapper_context{};
+    CheckpointContext checkpoint_context{};
+    LanceUDFCheckpointStore raw_store{};
+    LanceBatchUDF raw{};
+
+    BatchUDFCall(const BatchUDF& udf,
+                 std::optional<std::vector<std::string>> columns,
+                 std::optional<uint32_t> batch_size)
+        : read_columns(std::move(columns)) {
+        if (!udf.mapper) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT, "BatchUDF mapper must not be empty");
+        }
+        if (udf.output_schema == nullptr) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "BatchUDF output_schema must not be null");
+        }
+
+        const UDFCheckpointStore* store = nullptr;
+        if (udf.checkpoint_store) {
+            store = &*udf.checkpoint_store;
+            if (!store->get_batch || !store->insert_batch ||
+                !store->get_fragment || !store->insert_fragment) {
+                throw Error(
+                    LANCE_ERR_INVALID_ARGUMENT,
+                    "UDFCheckpointStore must provide all four callbacks");
+            }
+            checkpoint_context.store = store;
+            raw_store.get_batch = &get_batch_trampoline;
+            raw_store.insert_batch = &insert_batch_trampoline;
+            raw_store.get_fragment = &get_fragment_trampoline;
+            raw_store.insert_fragment = &insert_fragment_trampoline;
+            raw_store.callback_ctx = &checkpoint_context;
+        }
+
+        mapper_context.udf = &udf;
+        raw.mapper = &mapper_trampoline;
+        raw.mapper_ctx = &mapper_context;
+        raw.output_schema = udf.output_schema;
+        raw.checkpoint_store = store == nullptr ? nullptr : &raw_store;
+
+        if (read_columns) {
+            read_column_ptrs.reserve(read_columns->size() + 1);
+            for (const auto& column : *read_columns) {
+                read_column_ptrs.push_back(column.c_str());
+            }
+            read_column_ptrs.push_back(nullptr);
+            read_columns_ptr = read_column_ptrs.data();
+        }
+        if (batch_size) {
+            batch_size_value = *batch_size;
+            batch_size_ptr = &batch_size_value;
+        }
+    }
+
+    BatchUDFCall(const BatchUDFCall&) = delete;
+    BatchUDFCall& operator=(const BatchUDFCall&) = delete;
+    BatchUDFCall(BatchUDFCall&&) = delete;
+    BatchUDFCall& operator=(BatchUDFCall&&) = delete;
+};
+
 }  // namespace callback_detail
 
 // ─── Commit lock ─────────────────────────────────────────────────────────────
@@ -3874,6 +3948,14 @@ public:
         return value;
     }
 
+    /// Dataset read version captured by this bound fragment.
+    uint64_t read_version() const {
+        uint64_t value = 0;
+        if (lance_fragment_read_version(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
     /// Start a scanner over this fragment's owned snapshot.
     Scanner scan() const;
 
@@ -3906,6 +3988,59 @@ public:
     /// deletion returns `std::nullopt`.
     std::optional<Fragment> delete_if(const std::string& predicate) const;
 
+    /// Add SQL-derived columns to this bound fragment.
+    ///
+    /// `batch_size == std::nullopt` maps to native `None`; an engaged zero is
+    /// forwarded as `Some(0)`. Returns detached fragment metadata and the
+    /// complete native final schema for a later Merge operation.
+    std::pair<Fragment, LanceSchema> add_columns_sql(
+        const std::vector<SqlColumn>& columns,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
+    /// Add all-null columns described by a borrowed Arrow schema.
+    std::pair<Fragment, LanceSchema> add_columns_nulls(
+        const ArrowSchema* columns) const;
+
+    /// Add columns from a consumed Arrow stream using Native Reader semantics.
+    std::pair<Fragment, LanceSchema> add_columns_reader(
+        ArrowArrayStream* stream,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
+    /// Add columns through the shared BatchUDF callback adapter.
+    std::pair<Fragment, LanceSchema> add_columns_batch_udf(
+        const BatchUDF& udf,
+        std::optional<std::vector<std::string>> read_columns = std::nullopt,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
+    /// Merge a consumed right-hand Arrow stream into this bound fragment.
+    std::pair<Fragment, LanceSchema> merge_columns(
+        ArrowArrayStream* stream,
+        const std::string& left_on,
+        const std::string& right_on) const;
+
+    /// Rewrite existing columns through a native join and return matched
+    /// physical offsets with the updated metadata.
+    FragmentUpdateColumnsResult update_columns(
+        ArrowArrayStream* stream,
+        const std::string& left_on,
+        const std::string& right_on) const;
+
+    /// Stage a replacement data file using the manifest's default version.
+    DataReplacementGroup write_columns(
+        const LanceSchema& schema,
+        ArrowArrayStream* stream) const;
+
+    /// Stage a replacement data file using an explicit native file version.
+    DataReplacementGroup write_column_with_version(
+        const LanceSchema& schema,
+        ArrowArrayStream* stream,
+        LanceFileFormatVersion file_version) const;
+
+    /// Add physical row offsets to a clone and return updated bound metadata.
+    /// A full deletion returns `std::nullopt`.
+    std::optional<Fragment> delete_rows(
+        const std::vector<uint32_t>& offsets) const;
+
     /// Open an overlay writer for this bound fragment. The schema may be a
     /// compatible subset of the fragment schema. Commit the resulting overlay
     /// with the dataset read version used to open the writer.
@@ -3927,6 +4062,100 @@ inline std::optional<Fragment> Fragment::delete_if(
     if (!raw) return std::nullopt;
     return Fragment(raw);
 }
+
+/// Move-only owner of a native `FragmentUpdateColumnsResult`.
+class FragmentUpdateColumnsResult {
+    Handle<LanceFragmentUpdateColumnsResult,
+           lance_fragment_update_columns_result_close>
+        handle_;
+
+public:
+    explicit FragmentUpdateColumnsResult(LanceFragmentUpdateColumnsResult* result)
+        : handle_(result) {
+        if (!handle_) check_error();
+    }
+
+    FragmentUpdateColumnsResult(FragmentUpdateColumnsResult&&) noexcept = default;
+    FragmentUpdateColumnsResult& operator=(
+        FragmentUpdateColumnsResult&&) noexcept = default;
+    FragmentUpdateColumnsResult(const FragmentUpdateColumnsResult&) = delete;
+    FragmentUpdateColumnsResult& operator=(
+        const FragmentUpdateColumnsResult&) = delete;
+
+    /// Independent detached fragment metadata.
+    Fragment fragment() const {
+        LanceFragment* raw = nullptr;
+        if (lance_fragment_update_columns_result_fragment(
+                handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        if (!raw) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "update-columns result fragment getter returned null");
+        }
+        return Fragment(raw);
+    }
+
+    /// Native modified field IDs in result order.
+    std::vector<uint32_t> fields_modified() const {
+        uint64_t count = 0;
+        if (lance_fragment_update_columns_result_fields_modified_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::vector<uint32_t> out;
+        out.reserve(static_cast<std::size_t>(count));
+        for (uint64_t i = 0; i < count; ++i) {
+            uint32_t field_id = 0;
+            if (lance_fragment_update_columns_result_fields_modified_at(
+                    handle_.get(), static_cast<std::size_t>(i),
+                    &field_id) != 0) {
+                check_error();
+            }
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Matched physical row offsets in their native u32 domain.
+    std::vector<uint32_t> matched_offsets() const {
+        uint64_t count = 0;
+        if (lance_fragment_update_columns_result_matched_offset_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::vector<uint32_t> out;
+        out.reserve(static_cast<std::size_t>(count));
+        for (uint64_t i = 0; i < count; ++i) {
+            uint32_t offset = 0;
+            if (lance_fragment_update_columns_result_matched_offset_at(
+                    handle_.get(), static_cast<std::size_t>(i), &offset) != 0) {
+                check_error();
+            }
+            out.push_back(offset);
+        }
+        return out;
+    }
+
+    /// Portable Roaring interoperability export. Normal Update construction
+    /// should use matched_offsets() directly.
+    std::vector<uint8_t> matched_offsets_serialized() const {
+        uint8_t* bytes = nullptr;
+        std::size_t len = 0;
+        if (lance_fragment_update_columns_result_matched_offsets_serialize(
+                handle_.get(), &bytes, &len) != 0) {
+            check_error();
+        }
+        std::unique_ptr<uint8_t, void (*)(uint8_t*)> guard(
+            bytes, lance_free_bytes);
+        if (bytes == nullptr) return {};
+        return std::vector<uint8_t>(bytes, bytes + len);
+    }
+
+    const LanceFragmentUpdateColumnsResult* c_handle() const {
+        return handle_.get();
+    }
+};
 
 /// Move-only owner of a native Lance schema.
 ///
@@ -4008,6 +4237,166 @@ public:
 
 inline LanceSchema Fragment::native_schema() const {
     return LanceSchema::from_fragment(*this);
+}
+
+namespace fragment_mutation_detail {
+
+inline std::pair<Fragment, LanceSchema> take_fragment_schema_pair(
+    ::LanceFragment* fragment, ::LanceSchema* schema) {
+    if (!fragment || !schema) {
+        if (fragment) lance_fragment_close(fragment);
+        if (schema) lance_schema_close(schema);
+        throw Error(LANCE_ERR_INTERNAL,
+                    "fragment mutation returned a null success output");
+    }
+    return std::pair<Fragment, LanceSchema>(
+        Fragment(fragment), LanceSchema(schema));
+}
+
+inline DataReplacementGroup take_replacement_group(
+    LanceDataReplacementGroup* group) {
+    if (!group) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "fragment write_columns returned a null group");
+    }
+    return DataReplacementGroup(group);
+}
+
+}  // namespace fragment_mutation_detail
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_sql(
+    const std::vector<SqlColumn>& columns,
+    std::optional<uint32_t> batch_size) const {
+    std::vector<LanceSqlColumn> raw;
+    raw.reserve(columns.size());
+    for (const auto& column : columns) {
+        LanceSqlColumn entry{};
+        entry.name = column.name.c_str();
+        entry.expression = column.expression.c_str();
+        raw.push_back(entry);
+    }
+    const uint32_t batch_size_value = batch_size.value_or(0);
+    const uint32_t* batch_size_ptr = batch_size ? &batch_size_value : nullptr;
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_sql(
+            handle_.get(), raw.empty() ? nullptr : raw.data(), raw.size(),
+            batch_size_ptr, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_nulls(
+    const ArrowSchema* columns) const {
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_nulls(
+            handle_.get(), columns, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_reader(
+    ArrowArrayStream* stream, std::optional<uint32_t> batch_size) const {
+    const uint32_t batch_size_value = batch_size.value_or(0);
+    const uint32_t* batch_size_ptr = batch_size ? &batch_size_value : nullptr;
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_stream(
+            handle_.get(), stream, batch_size_ptr, &out_fragment,
+            &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_batch_udf(
+    const BatchUDF& udf,
+    std::optional<std::vector<std::string>> read_columns,
+    std::optional<uint32_t> batch_size) const {
+    callback_detail::BatchUDFCall call(
+        udf, std::move(read_columns), batch_size);
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_batch_udf(
+            handle_.get(), &call.raw, call.read_columns_ptr,
+            call.batch_size_ptr, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::merge_columns(
+    ArrowArrayStream* stream,
+    const std::string& left_on,
+    const std::string& right_on) const {
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_merge_columns(
+            handle_.get(), stream, left_on.c_str(), right_on.c_str(),
+            &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline FragmentUpdateColumnsResult Fragment::update_columns(
+    ArrowArrayStream* stream,
+    const std::string& left_on,
+    const std::string& right_on) const {
+    LanceFragmentUpdateColumnsResult* result = nullptr;
+    if (lance_fragment_update_columns(
+            handle_.get(), stream, left_on.c_str(), right_on.c_str(),
+            &result) != 0) {
+        check_error();
+    }
+    if (!result) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "fragment update_columns returned a null result");
+    }
+    return FragmentUpdateColumnsResult(result);
+}
+
+inline DataReplacementGroup Fragment::write_columns(
+    const LanceSchema& schema, ArrowArrayStream* stream) const {
+    LanceDataReplacementGroup* group = nullptr;
+    if (lance_fragment_write_columns(
+            handle_.get(), schema.c_handle(), stream, &group) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_replacement_group(group);
+}
+
+inline DataReplacementGroup Fragment::write_column_with_version(
+    const LanceSchema& schema,
+    ArrowArrayStream* stream,
+    LanceFileFormatVersion file_version) const {
+    LanceDataReplacementGroup* group = nullptr;
+    if (lance_fragment_write_column_with_version(
+            handle_.get(), schema.c_handle(), stream,
+            static_cast<int32_t>(file_version), &group) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_replacement_group(group);
+}
+
+inline std::optional<Fragment> Fragment::delete_rows(
+    const std::vector<uint32_t>& offsets) const {
+    LanceFragment* raw = nullptr;
+    if (lance_fragment_delete_rows(
+            handle_.get(), offsets.empty() ? nullptr : offsets.data(),
+            offsets.size(), &raw) != 0) {
+        check_error();
+    }
+    if (!raw) return std::nullopt;
+    return Fragment(raw);
 }
 
 inline LanceSchema LanceSchema::from_fragment(const Fragment& fragment) {
@@ -8297,57 +8686,12 @@ public:
         const BatchUDF& udf,
         std::optional<std::vector<std::string>> read_columns = std::nullopt,
         std::optional<uint32_t> batch_size = std::nullopt) {
-        if (!udf.mapper) {
-            throw Error(
-                LANCE_ERR_INVALID_ARGUMENT, "BatchUDF mapper must not be empty");
-        }
-        if (udf.output_schema == nullptr) {
-            throw Error(
-                LANCE_ERR_INVALID_ARGUMENT,
-                "BatchUDF output_schema must not be null");
-        }
-
-        callback_detail::MapperContext mapper_context{&udf};
-        callback_detail::CheckpointContext checkpoint_context{nullptr};
-        LanceUDFCheckpointStore raw_store{};
-        const UDFCheckpointStore* store = nullptr;
-        if (udf.checkpoint_store) {
-            store = &*udf.checkpoint_store;
-            if (!store->get_batch || !store->insert_batch ||
-                !store->get_fragment || !store->insert_fragment) {
-                throw Error(
-                    LANCE_ERR_INVALID_ARGUMENT,
-                    "UDFCheckpointStore must provide all four callbacks");
-            }
-            checkpoint_context.store = store;
-            raw_store.get_batch = &callback_detail::get_batch_trampoline;
-            raw_store.insert_batch = &callback_detail::insert_batch_trampoline;
-            raw_store.get_fragment = &callback_detail::get_fragment_trampoline;
-            raw_store.insert_fragment = &callback_detail::insert_fragment_trampoline;
-            raw_store.callback_ctx = &checkpoint_context;
-        }
-
-        LanceBatchUDF raw{};
-        raw.mapper = &callback_detail::mapper_trampoline;
-        raw.mapper_ctx = &mapper_context;
-        raw.output_schema = udf.output_schema;
-        raw.checkpoint_store = store == nullptr ? nullptr : &raw_store;
-
-        std::vector<const char*> read_column_ptrs;
-        if (read_columns) {
-            read_column_ptrs.reserve(read_columns->size() + 1);
-            for (const auto& column : *read_columns) {
-                read_column_ptrs.push_back(column.c_str());
-            }
-            read_column_ptrs.push_back(nullptr);
-        }
-        const uint32_t batch_size_value = batch_size.value_or(0);
-        const char* const* read_columns_ptr =
-            read_columns ? read_column_ptrs.data() : nullptr;
-        const uint32_t* batch_size_ptr = batch_size ? &batch_size_value : nullptr;
+        callback_detail::BatchUDFCall call(
+            udf, std::move(read_columns), batch_size);
 
         if (lance_dataset_add_columns_batch_udf(
-                handle_.get(), &raw, read_columns_ptr, batch_size_ptr) != 0) {
+                handle_.get(), &call.raw, call.read_columns_ptr,
+                call.batch_size_ptr) != 0) {
             check_error();
         }
     }

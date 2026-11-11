@@ -375,6 +375,7 @@ typedef struct LanceUpdateMap LanceUpdateMap;
 typedef struct LanceDataOverlayFile LanceDataOverlayFile;
 typedef struct LanceDataOverlayGroup LanceDataOverlayGroup;
 typedef struct LanceFragmentOverlayWriter LanceFragmentOverlayWriter;
+typedef struct LanceFragmentUpdateColumnsResult LanceFragmentUpdateColumnsResult;
 typedef struct LanceUpdatedFragmentOffsets LanceUpdatedFragmentOffsets;
 typedef struct LanceKeyExistenceFilter LanceKeyExistenceFilter;
 typedef struct LanceRewriteGroup LanceRewriteGroup;
@@ -3355,6 +3356,22 @@ int32_t lance_fragment_is_bound(
 );
 
 /**
+ * Return the dataset read version captured by a bound fragment.
+ *
+ * This is the native snapshot version carried by the fragment's
+ * `FileFragment`. Pass it as the read version when committing fragment
+ * mutations through the generic transaction API. A detached metadata-only
+ * handle has no dataset snapshot and returns LANCE_ERR_NOT_SUPPORTED. The
+ * output slot is written only on success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_read_version(
+    const LanceFragment* fragment,
+    uint64_t* out_version
+);
+
+/**
  * Clone one native base data file from the fragment metadata.
  *
  * `index` addresses the native `Fragment::files` array. The returned handle
@@ -3654,6 +3671,276 @@ int32_t lance_fragment_delete(
     const LanceFragment* fragment,
     const char* predicate,
     LanceFragment** out_fragment
+);
+
+/* ─── Fragment mutation and staging ─── */
+
+/**
+ * Add columns computed from SQL expressions to one bound fragment.
+ *
+ * This calls Native `FileFragment::add_columns` with
+ * `NewColumnTransform::SqlExpressions`. `columns` is borrowed and copied;
+ * a NULL array is accepted only when `column_count == 0`. Native validates the
+ * expressions, names, schema and row alignment.
+ *
+ * `batch_size == NULL` maps to native `None`; a non-NULL pointer is forwarded
+ * as `Some(value)`, including zero.
+ *
+ * On success both outputs are written and own detached fragment metadata plus
+ * the complete native final schema. A detached input fragment returns
+ * LANCE_ERR_NOT_SUPPORTED. Both output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_sql(
+    const LanceFragment* fragment,
+    const LanceSqlColumn* columns,
+    size_t column_count,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add all-null columns described by a borrowed Arrow schema.
+ *
+ * This maps to `NewColumnTransform::AllNulls`. The Arrow schema supplies the
+ * logical new-column definitions; Native allocates new field identities and
+ * returns the complete final native schema. The schema is borrowed and its
+ * release callback is never called.
+ *
+ * On success both outputs are written and own detached fragment metadata plus
+ * the complete native final schema. Both output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_nulls(
+    const LanceFragment* fragment,
+    const struct ArrowSchema* columns,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add columns read from an Arrow stream with Native `Reader` semantics.
+ *
+ * This follows Python's fragment `add_columns_from_reader` mapping: the native
+ * `read_columns` argument is `None`. A non-NULL stream is consumed exactly once
+ * on every return path after ownership transfer. `batch_size == NULL` maps to
+ * native `None`; a non-NULL pointer is forwarded as `Some(value)`, including
+ * zero. Both outputs are success-only and contain detached fragment metadata
+ * plus the complete native final schema.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_stream(
+    const LanceFragment* fragment,
+    struct ArrowArrayStream* stream,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add columns through a borrowed BatchUDF declaration.
+ *
+ * The mapper, all four checkpoint callbacks, output-schema ownership and
+ * `block_in_place` behavior are shared with the dataset add-columns path.
+ * `read_columns == NULL` maps to native `None`; a non-NULL NULL-terminated
+ * array maps to `Some`, including an immediately terminated empty array.
+ * `batch_size == NULL` maps to `None`; zero remains `Some(0)`.
+ *
+ * Callback contexts remain borrowed until this synchronous call returns.
+ * Callbacks may read through independent dataset handles or existing snapshots;
+ * they must not use a closed handle. Both outputs are success-only.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_batch_udf(
+    const LanceFragment* fragment,
+    const LanceBatchUDF* udf,
+    const char* const* read_columns,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Merge a right-hand Arrow stream into one bound fragment with a native join.
+ *
+ * The bound fragment is cloned before Native `FileFragment::merge_columns`.
+ * Native owns left/right column validation, the left join, schema merge,
+ * nullability behavior and final field identities. A non-NULL stream is
+ * consumed exactly once.
+ *
+ * On success both outputs are written and own detached fragment metadata plus
+ * the complete native final schema. Both output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_merge_columns(
+    const LanceFragment* fragment,
+    struct ArrowArrayStream* stream,
+    const char* left_on,
+    const char* right_on,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Rewrite existing columns in one bound fragment through a native join.
+ *
+ * This calls Native `FileFragment::update_columns_with_offsets` on a cloned
+ * bound fragment. The result owns complete updated fragment metadata, the
+ * native modified field IDs and the native RoaringBitmap of matched physical
+ * row offsets. A non-NULL stream is consumed exactly once.
+ *
+ * On success `*out_result` receives an independently owned result. Close it
+ * with `lance_fragment_update_columns_result_close`. The output slot is
+ * unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns(
+    const LanceFragment* fragment,
+    struct ArrowArrayStream* stream,
+    const char* left_on,
+    const char* right_on,
+    LanceFragmentUpdateColumnsResult** out_result
+);
+
+/**
+ * Stage a replacement data file for existing fragment columns.
+ *
+ * The native schema is borrowed and forwarded unchanged. The consumed Arrow
+ * stream must produce the fragment's physical rows, including deleted slots.
+ * Native owns file-version, schema/layout, Blob preparation, row-alignment and
+ * failure-cleanup behavior. On success `*out_group` receives an independently
+ * owned `DataReplacementGroup`; the output slot is unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_write_columns(
+    const LanceFragment* fragment,
+    const LanceSchema* schema,
+    struct ArrowArrayStream* stream,
+    LanceDataReplacementGroup** out_group
+);
+
+/**
+ * Stage a replacement data file using an explicit file-format version.
+ *
+ * `file_version` uses the `LanceFileFormatVersion` discriminants:
+ * V1=0, V2_0=1, V2_1=2, V2_2=3, V2_3=4. Native `write_column_with_version`
+ * owns V1 rejection, V2 compatibility and all layout checks. Stream ownership
+ * and output behavior match `lance_fragment_write_columns`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_write_column_with_version(
+    const LanceFragment* fragment,
+    const LanceSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t file_version,
+    LanceDataReplacementGroup** out_group
+);
+
+/**
+ * Add physical row offsets to a clone of one bound fragment.
+ *
+ * Offsets are forwarded unchanged to Native `FileFragment::extend_deletions`.
+ * No binding-side range, sort, duplicate or full-deletion policy is added.
+ * The source handle remains usable. On success a partial deletion returns an
+ * independently owned bound fragment and a full deletion returns NULL. The
+ * output slot is unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_delete_rows(
+    const LanceFragment* fragment,
+    const uint32_t* offsets,
+    size_t offset_count,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Close an update-columns result. NULL-safe.
+ */
+void lance_fragment_update_columns_result_close(
+    LanceFragmentUpdateColumnsResult* result
+);
+
+/**
+ * Clone the updated fragment metadata into an independent handle.
+ *
+ * The returned handle is detached and owns complete metadata. The output slot
+ * is written only on success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_fragment(
+    const LanceFragmentUpdateColumnsResult* result,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the number of modified field IDs.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_fields_modified_count(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint64_t* out_count
+);
+
+/**
+ * Read one modified field ID in native result order.
+ *
+ * @return 0 on success, -1 on error. The output is unchanged on error.
+ */
+int32_t lance_fragment_update_columns_result_fields_modified_at(
+    const LanceFragmentUpdateColumnsResult* result,
+    size_t index,
+    uint32_t* out_field_id
+);
+
+/**
+ * Read the number of matched physical row offsets.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offset_count(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint64_t* out_count
+);
+
+/**
+ * Read one matched physical row offset in stable bitmap order.
+ *
+ * Values remain in their native u32 domain.
+ *
+ * @return 0 on success, -1 on error. The output is unchanged on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offset_at(
+    const LanceFragmentUpdateColumnsResult* result,
+    size_t index,
+    uint32_t* out_offset
+);
+
+/**
+ * Serialize the matched offsets with the portable Roaring format.
+ *
+ * This optional interoperability export is separate from typed Update
+ * construction. The malloc-compatible buffer is allocated on success and must
+ * be released with `lance_free_bytes`; a zero-length encoding yields NULL.
+ * Both outputs are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offsets_serialize(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint8_t** out_bytes,
+    size_t* out_len
 );
 
 /* ─── Random access ─── */

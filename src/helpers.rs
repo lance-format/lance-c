@@ -34,6 +34,27 @@ pub(crate) fn validate_slice_length<T>(count: usize, label: &str) -> Result<()> 
     Ok(())
 }
 
+/// Borrow a caller-supplied array after validating its byte span.
+///
+/// A NULL pointer is accepted only for an empty array.
+pub(crate) unsafe fn required_slice<'a, T>(
+    values: *const T,
+    count: usize,
+    label: &str,
+    count_label: &str,
+) -> Result<&'a [T]> {
+    if count == 0 {
+        return Ok(&[]);
+    }
+    if values.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{label} must not be NULL when {count_label} = {count}").into(),
+        ));
+    }
+    validate_slice_length::<T>(count, label)?;
+    Ok(unsafe { std::slice::from_raw_parts(values, count) })
+}
+
 /// Parse a nullable C string pointer into an `Option<&str>`.
 pub unsafe fn parse_c_string<'a>(ptr: *const c_char) -> Result<Option<&'a str>> {
     if ptr.is_null() {
