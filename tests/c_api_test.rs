@@ -24,8 +24,9 @@ use arrow::record_batch::RecordBatchReader;
 use arrow_array::make_array;
 use arrow_array::types::{Int8Type, Int32Type};
 use arrow_array::{
-    Array, BinaryArray, DictionaryArray, Float32Array, Int32Array, Int64Array, LargeBinaryArray,
-    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt32Array, UInt64Array,
+    Array, BinaryArray, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
+    LargeBinaryArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use bytes::Bytes;
@@ -37692,7 +37693,7 @@ fn native_vector_ids(dataset: &Dataset, query: &[f32], k: u32, args: ProbeArgs) 
 #[test]
 fn test_describe_and_statistics_match_native_metadata() {
     use chrono::SecondsFormat;
-    use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
+    use lance::index::DatasetIndexExt;
 
     let (_tmp, uri) = create_index_capability_dataset();
     let uri_c = c_str(&uri);
@@ -37876,7 +37877,7 @@ fn test_describe_and_statistics_match_native_metadata() {
 
 #[test]
 fn test_ivf_model_centroids_and_partition_streams() {
-    use lance::index::DatasetIndexInternalExt;
+    use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
     use lance_index::metrics::NoOpMetricsCollector;
 
     let (_tmp, uri) = create_index_capability_dataset();
