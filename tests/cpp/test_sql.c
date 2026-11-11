@@ -84,7 +84,7 @@ static size_t collect_first_i32(struct ArrowArrayStream *stream, int32_t *out,
         }
         batch.release(&batch);
     }
-    qsort(out, count, sizeof(int32_t), compare_i32);
+    if (count > 1) qsort(out, count, sizeof(int32_t), compare_i32);
     return count;
 }
 
@@ -428,7 +428,7 @@ static void test_planning_and_runtime_errors(const char *uri) {
 
     /* Execution errors surface while reading the stream, not at export. */
     LanceSqlQueryBuilder *builder = lance_dataset_sql_builder_new(
-        dataset, "SELECT id / (id - id) AS boom FROM dataset");
+        dataset, "SELECT id / (id - 1) AS boom FROM dataset");
     ASSERT(builder != NULL, "create runtime-error builder");
     CHECK_OK();
     LanceSqlQuery *query = NULL;

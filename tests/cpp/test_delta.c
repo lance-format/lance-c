@@ -81,7 +81,7 @@ static size_t collect_first_i32(struct ArrowArrayStream *stream, int32_t *out,
         }
         batch.release(&batch);
     }
-    qsort(out, count, sizeof(int32_t), compare_i32);
+    if (count > 1) qsort(out, count, sizeof(int32_t), compare_i32);
     return count;
 }
 
@@ -101,7 +101,7 @@ static size_t collect_first_u64(struct ArrowArrayStream *stream, uint64_t *out,
         }
         batch.release(&batch);
     }
-    qsort(out, count, sizeof(uint64_t), compare_u64);
+    if (count > 1) qsort(out, count, sizeof(uint64_t), compare_u64);
     return count;
 }
 

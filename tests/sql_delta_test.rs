@@ -742,7 +742,7 @@ fn test_sql_planning_and_runtime_errors() {
     }
 
     // Runtime errors surface while the stream is read, not from into_stream.
-    let sql = "SELECT id / (id - id) AS boom FROM dataset";
+    let sql = "SELECT id / (id - 1) AS boom FROM dataset";
     let c_sql_text = c_str(sql);
     let builder = unsafe { lance_dataset_sql_builder_new(ds, c_sql_text.as_ptr()) };
     assert!(!builder.is_null());

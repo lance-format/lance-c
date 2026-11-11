@@ -272,7 +272,7 @@ void test_sql_errors(const std::string& uri) {
 
     // A runtime failure only surfaces while reading the stream.
     auto query =
-        dataset.sql("SELECT id / (id - id) AS boom FROM dataset").build();
+        dataset.sql("SELECT id / (id - 1) AS boom FROM dataset").build();
     auto stream = query.into_stream();
     ArrowArray batch{};
     CHECK(stream->get_next(stream.get(), &batch) != 0);
