@@ -179,6 +179,12 @@ class CompactionOptions;
 class CompactionPlan;
 class CompactionTask;
 class RewriteResult;
+class UpdatedFragmentOffsets;
+class KeyExistenceFilter;
+class RewriteGroup;
+class RewrittenIndex;
+struct UpdateOperationSpec;
+struct CompactedSsTable;
 struct BasePath;
 class OptimizeIndicesOptions;
 class OptimizeIndicesPlan;
@@ -1032,6 +1038,394 @@ enum class OperationKind : int32_t {
     UpdateBases         = LANCE_OPERATION_UPDATE_BASES,
 };
 
+// ─── Native update and rewrite values ───────────────────────────────────────
+
+/// Native update mode of an Update operation.
+enum class UpdateMode : int32_t {
+    RewriteRows    = LANCE_UPDATE_MODE_REWRITE_ROWS,
+    RewriteColumns = LANCE_UPDATE_MODE_REWRITE_COLUMNS,
+};
+
+/// One index file recorded by a rewritten index.
+struct IndexFile {
+    std::string path;
+    uint64_t size_bytes = 0;
+};
+
+/// Bloom-filter parameters of a key-existence filter.
+struct BloomFilterValues {
+    std::vector<uint8_t> bitmap;
+    uint32_t num_bits = 0;
+    uint64_t number_of_items = 0;
+    double probability = 0.0;
+};
+
+/// Owned native `UpdatedFragmentOffsets` value. Move-only.
+///
+/// Native absent, present-but-empty, and populated values are distinct and are
+/// preserved here. Offsets are treated as sets, and a repeated fragment ID in
+/// the constructor input keeps the last entry, matching native `HashMap`
+/// representation.
+class UpdatedFragmentOffsets {
+    Handle<LanceUpdatedFragmentOffsets,
+           lance_updated_fragment_offsets_close>
+        handle_;
+
+public:
+    explicit UpdatedFragmentOffsets(LanceUpdatedFragmentOffsets* offsets)
+        : handle_(offsets) {}
+
+    /// Build from (fragment ID, offsets) entries in input order.
+    explicit UpdatedFragmentOffsets(
+        const std::vector<std::pair<uint64_t, std::vector<uint32_t>>>& entries)
+        : handle_(nullptr) {
+        std::vector<::LanceFragmentOffsetsView> views;
+        views.reserve(entries.size());
+        for (const auto& entry : entries) {
+            ::LanceFragmentOffsetsView view{};
+            view.fragment_id = entry.first;
+            view.offsets = entry.second.empty() ? nullptr
+                                                : entry.second.data();
+            view.offset_count = entry.second.size();
+            views.push_back(view);
+        }
+        auto* raw = lance_updated_fragment_offsets_new(
+            views.empty() ? nullptr : views.data(), views.size());
+        if (!raw) check_error();
+        handle_ =
+            Handle<LanceUpdatedFragmentOffsets,
+                   lance_updated_fragment_offsets_close>(raw);
+    }
+
+    UpdatedFragmentOffsets(UpdatedFragmentOffsets&&) noexcept = default;
+    UpdatedFragmentOffsets& operator=(UpdatedFragmentOffsets&&) noexcept =
+        default;
+    UpdatedFragmentOffsets(const UpdatedFragmentOffsets&) = delete;
+    UpdatedFragmentOffsets& operator=(const UpdatedFragmentOffsets&) = delete;
+
+    /// Number of fragment entries. Entry order is unspecified.
+    size_t size() const {
+        uint64_t count = 0;
+        if (lance_updated_fragment_offsets_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return static_cast<size_t>(count);
+    }
+
+    uint64_t fragment_id_at(size_t index) const {
+        uint64_t id = 0;
+        if (lance_updated_fragment_offsets_fragment_id_at(
+                handle_.get(), index, &id) != 0) {
+            check_error();
+        }
+        return id;
+    }
+
+    size_t offset_count_at(size_t index) const {
+        uint64_t count = 0;
+        if (lance_updated_fragment_offsets_offset_count_at(
+                handle_.get(), index, &count) != 0) {
+            check_error();
+        }
+        return static_cast<size_t>(count);
+    }
+
+    /// Offsets of one entry in ascending native bitmap order.
+    std::vector<uint32_t> offsets_at(size_t index) const {
+        std::vector<uint32_t> out;
+        size_t count = offset_count_at(index);
+        out.reserve(count);
+        for (size_t position = 0; position < count; ++position) {
+            uint32_t offset = 0;
+            if (lance_updated_fragment_offsets_offset_at(
+                    handle_.get(), index, position, &offset) != 0) {
+                check_error();
+            }
+            out.push_back(offset);
+        }
+        return out;
+    }
+
+    /// Clone into independently owned native storage.
+    UpdatedFragmentOffsets clone() const {
+        auto* raw = lance_updated_fragment_offsets_clone(handle_.get());
+        if (!raw) check_error();
+        return UpdatedFragmentOffsets(raw);
+    }
+
+    const LanceUpdatedFragmentOffsets* c_handle() const {
+        return handle_.get();
+    }
+};
+
+/// Owned native key-existence filter. Move-only.
+///
+/// Values built from explicit protobuf bytes follow the native `TryFrom`
+/// defaults: an absent bloom `number_of_items` becomes 8192, an absent bloom
+/// `probability` becomes 0.00057, and an absent filter body becomes an empty
+/// exact set.
+class KeyExistenceFilter {
+    Handle<LanceKeyExistenceFilter, lance_key_existence_filter_close> handle_;
+
+public:
+    explicit KeyExistenceFilter(LanceKeyExistenceFilter* filter)
+        : handle_(filter) {}
+
+    KeyExistenceFilter(KeyExistenceFilter&&) noexcept = default;
+    KeyExistenceFilter& operator=(KeyExistenceFilter&&) noexcept = default;
+    KeyExistenceFilter(const KeyExistenceFilter&) = delete;
+    KeyExistenceFilter& operator=(const KeyExistenceFilter&) = delete;
+
+    /// Decode one encoded native key-existence-filter message.
+    static KeyExistenceFilter from_proto(const std::vector<uint8_t>& bytes) {
+        LanceKeyExistenceFilter* filter = nullptr;
+        if (lance_key_existence_filter_from_proto(
+                bytes.empty() ? nullptr : bytes.data(), bytes.size(),
+                &filter) != 0) {
+            check_error();
+        }
+        return KeyExistenceFilter(filter);
+    }
+
+    LanceKeyExistenceFilterKind kind() const {
+        LanceKeyExistenceFilterKind kind = LANCE_KEY_EXISTENCE_FILTER_EXACT;
+        if (lance_key_existence_filter_kind(handle_.get(), &kind) != 0) {
+            check_error();
+        }
+        return kind;
+    }
+
+    std::vector<int32_t> field_ids() const {
+        uint64_t count = 0;
+        if (lance_key_existence_filter_field_id_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::vector<int32_t> out;
+        out.reserve(static_cast<size_t>(count));
+        for (size_t index = 0; index < count; ++index) {
+            int32_t field_id = 0;
+            if (lance_key_existence_filter_field_id_at(
+                    handle_.get(), index, &field_id) != 0) {
+                check_error();
+            }
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Keys of an exact-set filter in ascending order. Throws
+    /// LANCE_ERR_NOT_SUPPORTED for a bloom filter.
+    std::vector<uint64_t> exact_keys() const {
+        uint64_t count = 0;
+        if (lance_key_existence_filter_exact_count(handle_.get(), &count) !=
+            0) {
+            check_error();
+        }
+        std::vector<uint64_t> out;
+        out.reserve(static_cast<size_t>(count));
+        for (size_t index = 0; index < count; ++index) {
+            uint64_t key = 0;
+            if (lance_key_existence_filter_exact_key_at(
+                    handle_.get(), index, &key) != 0) {
+                check_error();
+            }
+            out.push_back(key);
+        }
+        return out;
+    }
+
+    /// Bloom parameters. Throws LANCE_ERR_NOT_SUPPORTED for an exact set.
+    BloomFilterValues bloom() const {
+        uint8_t* bitmap = nullptr;
+        size_t bitmap_len = 0;
+        BloomFilterValues out;
+        if (lance_key_existence_filter_bloom(
+                handle_.get(), &bitmap, &bitmap_len, &out.num_bits,
+                &out.number_of_items, &out.probability) != 0) {
+            check_error();
+        }
+        if (bitmap) {
+            out.bitmap.assign(bitmap, bitmap + bitmap_len);
+            lance_free_bytes(bitmap);
+        }
+        return out;
+    }
+
+    /// Encode with the native protobuf conversion used by persisted Update
+    /// operations.
+    std::vector<uint8_t> to_proto() const {
+        uint8_t* bytes = nullptr;
+        size_t len = 0;
+        if (lance_key_existence_filter_to_proto(
+                handle_.get(), &bytes, &len) != 0) {
+            check_error();
+        }
+        std::vector<uint8_t> out;
+        if (bytes) {
+            out.assign(bytes, bytes + len);
+            lance_free_bytes(bytes);
+        }
+        return out;
+    }
+
+    /// Clone into independently owned native storage.
+    KeyExistenceFilter clone() const {
+        auto* raw = lance_key_existence_filter_clone(handle_.get());
+        if (!raw) check_error();
+        return KeyExistenceFilter(raw);
+    }
+
+    const LanceKeyExistenceFilter* c_handle() const {
+        return handle_.get();
+    }
+};
+
+/// Owned native `RewriteGroup`. Move-only.
+///
+/// Native equality treats both fragment lists as unordered; this wrapper keeps
+/// the stored order unchanged.
+class RewriteGroup {
+    Handle<LanceRewriteGroup, lance_rewrite_group_close> handle_;
+
+public:
+    explicit RewriteGroup(LanceRewriteGroup* group) : handle_(group) {}
+
+    /// Build from borrowed fragment handles. Complete native fragment metadata
+    /// is copied.
+    RewriteGroup(const std::vector<const Fragment*>& old_fragments,
+                 const std::vector<const Fragment*>& new_fragments);
+
+    RewriteGroup(RewriteGroup&&) noexcept = default;
+    RewriteGroup& operator=(RewriteGroup&&) noexcept = default;
+    RewriteGroup(const RewriteGroup&) = delete;
+    RewriteGroup& operator=(const RewriteGroup&) = delete;
+
+    size_t old_fragment_count() const;
+    Fragment old_fragment_at(size_t index) const;
+    std::vector<Fragment> old_fragments() const;
+    size_t new_fragment_count() const;
+    Fragment new_fragment_at(size_t index) const;
+    std::vector<Fragment> new_fragments() const;
+
+    /// Clone into independently owned native storage.
+    RewriteGroup clone() const {
+        auto* raw = lance_rewrite_group_clone(handle_.get());
+        if (!raw) check_error();
+        return RewriteGroup(raw);
+    }
+
+    const LanceRewriteGroup* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native `RewrittenIndex`. Move-only.
+class RewrittenIndex {
+    Handle<LanceRewrittenIndex, lance_rewritten_index_close> handle_;
+
+public:
+    explicit RewrittenIndex(LanceRewrittenIndex* index) : handle_(index) {}
+
+    /// Build one rewritten-index record. `index_files == std::nullopt` maps to
+    /// native None, while an engaged empty vector is the distinct
+    /// `Some(empty)` state older writers persisted.
+    RewrittenIndex(const std::array<uint8_t, 16>& old_id,
+                   const std::array<uint8_t, 16>& new_id,
+                   std::string_view details_type_url,
+                   const std::vector<uint8_t>& details_value,
+                   uint32_t index_version,
+                   std::optional<std::vector<IndexFile>> index_files);
+
+    RewrittenIndex(RewrittenIndex&&) noexcept = default;
+    RewrittenIndex& operator=(RewrittenIndex&&) noexcept = default;
+    RewrittenIndex(const RewrittenIndex&) = delete;
+    RewrittenIndex& operator=(const RewrittenIndex&) = delete;
+
+    std::array<uint8_t, 16> old_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_rewritten_index_old_id(handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    std::array<uint8_t, 16> new_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_rewritten_index_new_id(handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    std::string details_type_url() const {
+        const char* raw = lance_rewritten_index_details_type_url(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    std::vector<uint8_t> details_value() const {
+        uint8_t* bytes = nullptr;
+        size_t len = 0;
+        if (lance_rewritten_index_details_value(
+                handle_.get(), &bytes, &len) != 0) {
+            check_error();
+        }
+        std::vector<uint8_t> out;
+        if (bytes) {
+            out.assign(bytes, bytes + len);
+            lance_free_bytes(bytes);
+        }
+        return out;
+    }
+
+    uint32_t version() const {
+        uint32_t version = 0;
+        if (lance_rewritten_index_version(handle_.get(), &version) != 0)
+            check_error();
+        return version;
+    }
+
+    bool has_files() const {
+        bool present = false;
+        if (lance_rewritten_index_has_files(handle_.get(), &present) != 0)
+            check_error();
+        return present;
+    }
+
+    /// Index files. Returns an empty vector both for native None and
+    /// Some(empty); use has_files() to tell them apart.
+    std::vector<IndexFile> files() const {
+        uint64_t count = 0;
+        if (lance_rewritten_index_file_count(handle_.get(), &count) != 0)
+            check_error();
+        std::vector<IndexFile> out;
+        out.reserve(static_cast<size_t>(count));
+        for (size_t index = 0; index < count; ++index) {
+            const char* path =
+                lance_rewritten_index_file_path_at(handle_.get(), index);
+            if (!path) check_error();
+            IndexFile file;
+            file.path.assign(path);
+            lance_free_string(path);
+            if (lance_rewritten_index_file_size_at(
+                    handle_.get(), index, &file.size_bytes) != 0) {
+                check_error();
+            }
+            out.push_back(std::move(file));
+        }
+        return out;
+    }
+
+    /// Clone into independently owned native storage.
+    RewrittenIndex clone() const {
+        auto* raw = lance_rewritten_index_clone(handle_.get());
+        if (!raw) check_error();
+        return RewrittenIndex(raw);
+    }
+
+    const LanceRewrittenIndex* c_handle() const { return handle_.get(); }
+};
+
 /// Owned native Operation snapshot. Move-only; closing the source Transaction
 /// does not invalidate this handle.
 class Operation {
@@ -1550,6 +1944,195 @@ public:
         lance_free_string(raw);
         return out;
     }
+
+    /// Construct an owned native Update operation. Fragment handles are
+    /// borrowed and their complete native metadata is copied. Native commit
+    /// validation owns schema coverage, conflict detection and row-version
+    /// behavior; no policy is applied here.
+    static Operation make_update(const UpdateOperationSpec& spec);
+
+    /// Construct an owned native Rewrite operation. Groups and rewritten
+    /// indices are cloned from their handles. `frag_reuse_index` may be null
+    /// for native None. It is in-memory only, so an explicit protobuf round
+    /// trip drops it.
+    static Operation make_rewrite(
+        const std::vector<const RewriteGroup*>& groups,
+        const std::vector<const RewrittenIndex*>& rewritten_indices,
+        const IndexSegmentMetadata* frag_reuse_index = nullptr);
+
+    /// Construct an owned native UpdateMemWalState operation from flushed
+    /// generation markers. Native merge-insert validation owns shard
+    /// existence, generation ordering and atomicity.
+    static Operation make_update_mem_wal_state(
+        const std::vector<CompactedSsTable>& compacted_sstables);
+
+    // Update inspection. Inspecting a different operation kind throws
+    // LANCE_ERR_NOT_SUPPORTED; every getter below reports native fields
+    // unchanged.
+
+    /// Number of removed fragment IDs in an Update operation.
+    uint64_t removed_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_removed_fragment_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// One removed fragment ID by position.
+    uint64_t removed_fragment_id(size_t index) const {
+        uint64_t id = 0;
+        if (lance_operation_update_removed_fragment_id_at(
+                handle_.get(), index, &id) != 0) {
+            check_error();
+        }
+        return id;
+    }
+
+    /// Number of updated fragments in an Update operation.
+    uint64_t updated_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_updated_fragment_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one updated fragment as an independent snapshot.
+    Fragment updated_fragment_at(size_t index) const;
+
+    /// Number of new fragments in an Update operation.
+    uint64_t new_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_new_fragment_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one new fragment as an independent snapshot.
+    Fragment new_fragment_at(size_t index) const;
+
+    /// Number of modified field IDs in an Update operation.
+    uint64_t fields_modified_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_fields_modified_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// One modified field ID by position.
+    uint32_t fields_modified(size_t index) const {
+        uint32_t field_id = 0;
+        if (lance_operation_update_fields_modified_at(
+                handle_.get(), index, &field_id) != 0) {
+            check_error();
+        }
+        return field_id;
+    }
+
+    /// Number of compacted SSTable entries in an Update operation.
+    uint64_t compacted_sstable_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_compacted_sstable_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// One compacted SSTable entry by position.
+    CompactedSsTable compacted_sstable_at(size_t index) const;
+
+    /// Number of preserved-fragment-bitmap field IDs in an Update operation.
+    uint64_t fields_for_preserving_frag_bitmap_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_fields_for_preserving_frag_bitmap_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// One preserved-fragment-bitmap field ID by position.
+    uint32_t fields_for_preserving_frag_bitmap(size_t index) const {
+        uint32_t field_id = 0;
+        if (lance_operation_update_fields_for_preserving_frag_bitmap_at(
+                handle_.get(), index, &field_id) != 0) {
+            check_error();
+        }
+        return field_id;
+    }
+
+    /// Native update mode, distinguishing absent from both variants.
+    std::optional<UpdateMode> update_mode() const {
+        bool present = false;
+        int32_t mode = 0;
+        if (lance_operation_update_mode(
+                handle_.get(), &present, &mode) != 0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return static_cast<UpdateMode>(mode);
+    }
+
+    /// Cloned inserted-rows filter, or nullopt for native None.
+    std::optional<KeyExistenceFilter> inserted_rows_filter() const;
+
+    /// Cloned updated-fragment offsets, or nullopt for native None. A present
+    /// but empty value is preserved.
+    std::optional<UpdatedFragmentOffsets> updated_fragment_offsets() const;
+
+    /// Number of groups in a Rewrite operation.
+    uint64_t rewrite_group_count() const {
+        uint64_t count = 0;
+        if (lance_operation_rewrite_group_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one Rewrite group by position.
+    RewriteGroup rewrite_group_at(size_t index) const;
+
+    /// Number of rewritten indices in a Rewrite operation.
+    uint64_t rewritten_index_count() const {
+        uint64_t count = 0;
+        if (lance_operation_rewrite_rewritten_index_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one rewritten index by position.
+    RewrittenIndex rewritten_index_at(size_t index) const;
+
+    /// Cloned in-memory fragment-reuse index, or nullopt for native None.
+    std::optional<IndexSegmentMetadata> frag_reuse_index() const;
+
+    // UpdateMemWalState inspection. Inspecting a different operation kind
+    // throws LANCE_ERR_NOT_SUPPORTED.
+
+    /// Number of flushed generation markers in an UpdateMemWalState operation.
+    uint64_t update_mem_wal_state_compacted_sstable_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_mem_wal_state_compacted_sstable_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Copy one flushed generation marker by position.
+    CompactedSsTable update_mem_wal_state_compacted_sstable_at(
+        size_t index) const;
 
     const LanceOperation* c_handle() const { return handle_.get(); }
 };
@@ -4120,6 +4703,14 @@ public:
         return out;
     }
 
+    /// Clone one original fragment as an owned native snapshot. The handle
+    /// stays valid after this rewrite result is closed.
+    Fragment original_fragment_at(size_t index) const;
+
+    /// Clone one new (staged) fragment native compaction produced. Such a
+    /// fragment can seed a `RewriteGroup`.
+    Fragment new_fragment_at(size_t index) const;
+
     std::string json() const {
         const char* raw = lance_rewrite_result_json(handle_.get());
         if (!raw) check_error();
@@ -4744,6 +5335,26 @@ struct CompactedSsTable {
         raw.generation = generation;
         return raw;
     }
+};
+
+/// Complete input for Operation::make_update().
+///
+/// Every member maps to one native field unchanged. Native commit validation
+/// owns schema coverage, conflicts and row-version behavior, so no default is
+/// applied: an engaged empty vector means the caller supplied no entries.
+/// `update_mode == std::nullopt`, a null `inserted_rows_filter` and a null
+/// `updated_fragment_offsets` map to native `None`, which is distinct from
+/// empty populated values.
+struct UpdateOperationSpec {
+    std::vector<uint64_t> removed_fragment_ids;
+    std::vector<const Fragment*> updated_fragments;
+    std::vector<const Fragment*> new_fragments;
+    std::vector<uint32_t> fields_modified;
+    std::vector<CompactedSsTable> compacted_sstables;
+    std::vector<uint32_t> fields_for_preserving_frag_bitmap;
+    std::optional<UpdateMode> update_mode;
+    std::optional<KeyExistenceFilter> inserted_rows_filter;
+    std::optional<UpdatedFragmentOffsets> updated_fragment_offsets;
 };
 
 /// One SSTable referenced by a shard snapshot.
@@ -7371,10 +7982,10 @@ public:
         return count;
     }
 
-    /// Commit a new manifest that aliases `version` as the latest. The
-    /// returned Dataset points at the target version; this handle is
-    /// unchanged. If `version` is already the latest, no new manifest is
-    /// written. Throws lance::Error on failure.
+    /// Commit a new manifest carrying the fragments of `version`, even when
+    /// `version` is already the latest. The returned Dataset points at the
+    /// newly committed version; this handle is unchanged.
+    /// Throws lance::Error on failure.
     Dataset restore(uint64_t version) const {
         auto* out = lance_dataset_restore(handle_.get(), version);
         if (!out) check_error();
@@ -12377,6 +12988,352 @@ inline ExecutionPlan LsmVectorSearchPlanner::plan_search(
     return ExecutionPlan(plan);
 }
 
+
+// ─── Native update and rewrite value definitions ────────────────────────────
+
+inline RewriteGroup::RewriteGroup(
+    const std::vector<const Fragment*>& old_fragments,
+    const std::vector<const Fragment*>& new_fragments) {
+    std::vector<const ::LanceFragment*> old_raw;
+    old_raw.reserve(old_fragments.size());
+    for (const auto* fragment : old_fragments) {
+        old_raw.push_back(fragment->c_handle());
+    }
+    std::vector<const ::LanceFragment*> new_raw;
+    new_raw.reserve(new_fragments.size());
+    for (const auto* fragment : new_fragments) {
+        new_raw.push_back(fragment->c_handle());
+    }
+    auto* raw = lance_rewrite_group_new(
+        old_raw.empty() ? nullptr : old_raw.data(), old_raw.size(),
+        new_raw.empty() ? nullptr : new_raw.data(), new_raw.size());
+    if (!raw) check_error();
+    handle_ = Handle<LanceRewriteGroup, lance_rewrite_group_close>(raw);
+}
+
+inline size_t RewriteGroup::old_fragment_count() const {
+    uint64_t count = 0;
+    if (lance_rewrite_group_old_fragment_count(handle_.get(), &count) != 0)
+        check_error();
+    return static_cast<size_t>(count);
+}
+
+inline Fragment RewriteGroup::old_fragment_at(size_t index) const {
+    LanceFragment* fragment = nullptr;
+    if (lance_rewrite_group_old_fragment_at(
+            handle_.get(), index, &fragment) != 0) {
+        check_error();
+    }
+    return Fragment(fragment);
+}
+
+inline std::vector<Fragment> RewriteGroup::old_fragments() const {
+    std::vector<Fragment> out;
+    size_t count = old_fragment_count();
+    out.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        out.push_back(old_fragment_at(index));
+    }
+    return out;
+}
+
+inline size_t RewriteGroup::new_fragment_count() const {
+    uint64_t count = 0;
+    if (lance_rewrite_group_new_fragment_count(handle_.get(), &count) != 0)
+        check_error();
+    return static_cast<size_t>(count);
+}
+
+inline Fragment RewriteGroup::new_fragment_at(size_t index) const {
+    LanceFragment* fragment = nullptr;
+    if (lance_rewrite_group_new_fragment_at(
+            handle_.get(), index, &fragment) != 0) {
+        check_error();
+    }
+    return Fragment(fragment);
+}
+
+inline std::vector<Fragment> RewriteGroup::new_fragments() const {
+    std::vector<Fragment> out;
+    size_t count = new_fragment_count();
+    out.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        out.push_back(new_fragment_at(index));
+    }
+    return out;
+}
+
+inline RewrittenIndex::RewrittenIndex(
+    const std::array<uint8_t, 16>& old_id,
+    const std::array<uint8_t, 16>& new_id,
+    std::string_view details_type_url,
+    const std::vector<uint8_t>& details_value,
+    uint32_t index_version,
+    std::optional<std::vector<IndexFile>> index_files)
+    : handle_(nullptr) {
+    std::string owned_type_url(details_type_url);
+    std::vector<::LanceIndexFile> raw_files;
+    if (index_files) {
+        raw_files.reserve(index_files->size());
+        for (const auto& file : *index_files) {
+            ::LanceIndexFile raw{};
+            raw.path = file.path.c_str();
+            raw.size_bytes = file.size_bytes;
+            raw_files.push_back(raw);
+        }
+    }
+    auto* raw = lance_rewritten_index_new(
+        old_id.data(), new_id.data(), owned_type_url.c_str(),
+        details_value.empty() ? nullptr : details_value.data(),
+        details_value.size(), index_version, index_files.has_value(),
+        raw_files.empty() ? nullptr : raw_files.data(), raw_files.size());
+    if (!raw) check_error();
+    handle_ = Handle<LanceRewrittenIndex, lance_rewritten_index_close>(raw);
+}
+
+inline Fragment Operation::updated_fragment_at(size_t index) const {
+    LanceFragment* fragment = nullptr;
+    if (lance_operation_update_updated_fragment_at(
+            handle_.get(), index, &fragment) != 0) {
+        check_error();
+    }
+    return Fragment(fragment);
+}
+
+inline Fragment Operation::new_fragment_at(size_t index) const {
+    LanceFragment* fragment = nullptr;
+    if (lance_operation_update_new_fragment_at(
+            handle_.get(), index, &fragment) != 0) {
+        check_error();
+    }
+    return Fragment(fragment);
+}
+
+inline CompactedSsTable Operation::compacted_sstable_at(size_t index) const {
+    ::LanceCompactedSsTable raw{};
+    if (lance_operation_update_compacted_sstable_at(
+            handle_.get(), index, &raw) != 0) {
+        check_error();
+    }
+    CompactedSsTable value;
+    std::memcpy(value.shard_id.data(), raw.shard_id, value.shard_id.size());
+    value.generation = raw.generation;
+    return value;
+}
+
+inline CompactedSsTable Operation::update_mem_wal_state_compacted_sstable_at(
+    size_t index) const {
+    ::LanceCompactedSsTable raw{};
+    if (lance_operation_update_mem_wal_state_compacted_sstable_at(
+            handle_.get(), index, &raw) != 0) {
+        check_error();
+    }
+    CompactedSsTable value;
+    std::memcpy(value.shard_id.data(), raw.shard_id, value.shard_id.size());
+    value.generation = raw.generation;
+    return value;
+}
+
+inline std::optional<KeyExistenceFilter> Operation::inserted_rows_filter()
+    const {
+    bool present = false;
+    LanceKeyExistenceFilter* filter = nullptr;
+    if (lance_operation_update_inserted_rows_filter(
+            handle_.get(), &present, &filter) != 0) {
+        check_error();
+    }
+    if (!present) {
+        if (filter) {
+            lance_key_existence_filter_close(filter);
+            throw Error(LANCE_ERR_INTERNAL,
+                        "Update inserted-rows filter reported absent with a "
+                        "non-null handle");
+        }
+        return std::nullopt;
+    }
+    if (!filter) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "Update inserted-rows filter reported present with a "
+                    "null handle");
+    }
+    return KeyExistenceFilter(filter);
+}
+
+inline std::optional<UpdatedFragmentOffsets>
+Operation::updated_fragment_offsets() const {
+    bool present = false;
+    LanceUpdatedFragmentOffsets* offsets = nullptr;
+    if (lance_operation_update_updated_fragment_offsets(
+            handle_.get(), &present, &offsets) != 0) {
+        check_error();
+    }
+    if (!present) {
+        if (offsets) {
+            lance_updated_fragment_offsets_close(offsets);
+            throw Error(LANCE_ERR_INTERNAL,
+                        "Update fragment offsets reported absent with a "
+                        "non-null handle");
+        }
+        return std::nullopt;
+    }
+    if (!offsets) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "Update fragment offsets reported present with a null "
+                    "handle");
+    }
+    return UpdatedFragmentOffsets(offsets);
+}
+
+inline RewriteGroup Operation::rewrite_group_at(size_t index) const {
+    LanceRewriteGroup* group = nullptr;
+    if (lance_operation_rewrite_group_at(handle_.get(), index, &group) != 0) {
+        check_error();
+    }
+    return RewriteGroup(group);
+}
+
+inline RewrittenIndex Operation::rewritten_index_at(size_t index) const {
+    LanceRewrittenIndex* rewritten = nullptr;
+    if (lance_operation_rewrite_rewritten_index_at(
+            handle_.get(), index, &rewritten) != 0) {
+        check_error();
+    }
+    return RewrittenIndex(rewritten);
+}
+
+inline std::optional<IndexSegmentMetadata> Operation::frag_reuse_index()
+    const {
+    bool present = false;
+    LanceIndexSegmentMetadata* metadata = nullptr;
+    if (lance_operation_rewrite_frag_reuse_index(
+            handle_.get(), &present, &metadata) != 0) {
+        check_error();
+    }
+    if (!present) {
+        if (metadata) {
+            lance_index_segment_metadata_free(metadata);
+            throw Error(LANCE_ERR_INTERNAL,
+                        "Rewrite fragment-reuse index reported absent with a "
+                        "non-null handle");
+        }
+        return std::nullopt;
+    }
+    if (!metadata) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "Rewrite fragment-reuse index reported present with a "
+                    "null handle");
+    }
+    return IndexSegmentMetadata(metadata);
+}
+
+inline Operation Operation::make_update(const UpdateOperationSpec& spec) {
+    std::vector<const ::LanceFragment*> updated;
+    updated.reserve(spec.updated_fragments.size());
+    for (const auto* fragment : spec.updated_fragments) {
+        updated.push_back(fragment->c_handle());
+    }
+    std::vector<const ::LanceFragment*> inserted;
+    inserted.reserve(spec.new_fragments.size());
+    for (const auto* fragment : spec.new_fragments) {
+        inserted.push_back(fragment->c_handle());
+    }
+    std::vector<::LanceCompactedSsTable> compacted;
+    compacted.reserve(spec.compacted_sstables.size());
+    for (const auto& sstable : spec.compacted_sstables) {
+        compacted.push_back(sstable.to_c());
+    }
+    int32_t update_mode = 0;
+    if (spec.update_mode) {
+        if (*spec.update_mode == UpdateMode::RewriteRows) {
+            update_mode = LANCE_UPDATE_MODE_REWRITE_ROWS;
+        } else if (*spec.update_mode == UpdateMode::RewriteColumns) {
+            update_mode = LANCE_UPDATE_MODE_REWRITE_COLUMNS;
+        } else {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "update_mode is not a LanceUpdateMode value");
+        }
+    }
+
+    ::LanceUpdateOperationOptions options{};
+    options.removed_fragment_ids = spec.removed_fragment_ids.empty()
+                                       ? nullptr
+                                       : spec.removed_fragment_ids.data();
+    options.removed_fragment_count = spec.removed_fragment_ids.size();
+    options.updated_fragments = updated.empty() ? nullptr : updated.data();
+    options.updated_fragment_count = updated.size();
+    options.new_fragments = inserted.empty() ? nullptr : inserted.data();
+    options.new_fragment_count = inserted.size();
+    options.fields_modified =
+        spec.fields_modified.empty() ? nullptr : spec.fields_modified.data();
+    options.fields_modified_count = spec.fields_modified.size();
+    options.compacted_sstables = compacted.empty() ? nullptr : compacted.data();
+    options.compacted_sstable_count = compacted.size();
+    options.fields_for_preserving_frag_bitmap =
+        spec.fields_for_preserving_frag_bitmap.empty()
+            ? nullptr
+            : spec.fields_for_preserving_frag_bitmap.data();
+    options.fields_for_preserving_frag_bitmap_count =
+        spec.fields_for_preserving_frag_bitmap.size();
+    options.has_update_mode = spec.update_mode.has_value();
+    options.update_mode = update_mode;
+    options.inserted_rows_filter = spec.inserted_rows_filter
+                                       ? spec.inserted_rows_filter->c_handle()
+                                       : nullptr;
+    options.updated_fragment_offsets =
+        spec.updated_fragment_offsets
+            ? spec.updated_fragment_offsets->c_handle()
+            : nullptr;
+
+    auto* raw = lance_operation_update_new(&options);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_rewrite(
+    const std::vector<const RewriteGroup*>& groups,
+    const std::vector<const RewrittenIndex*>& rewritten_indices,
+    const IndexSegmentMetadata* frag_reuse_index) {
+    std::vector<const ::LanceRewriteGroup*> raw_groups;
+    raw_groups.reserve(groups.size());
+    for (const auto* group : groups) raw_groups.push_back(group->c_handle());
+    std::vector<const ::LanceRewrittenIndex*> raw_indices;
+    raw_indices.reserve(rewritten_indices.size());
+    for (const auto* index : rewritten_indices) {
+        raw_indices.push_back(index->c_handle());
+    }
+    auto* raw = lance_operation_rewrite_new(
+        raw_groups.empty() ? nullptr : raw_groups.data(), raw_groups.size(),
+        raw_indices.empty() ? nullptr : raw_indices.data(), raw_indices.size(),
+        frag_reuse_index ? frag_reuse_index->c_handle() : nullptr);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_update_mem_wal_state(
+    const std::vector<CompactedSsTable>& compacted_sstables) {
+    std::vector<::LanceCompactedSsTable> raw;
+    raw.reserve(compacted_sstables.size());
+    for (const auto& sstable : compacted_sstables) {
+        raw.push_back(sstable.to_c());
+    }
+    auto* operation = lance_operation_update_mem_wal_state_new(
+        raw.empty() ? nullptr : raw.data(), raw.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline Fragment RewriteResult::original_fragment_at(size_t index) const {
+    auto* raw =
+        lance_rewrite_result_original_fragment_at(handle_.get(), index);
+    if (!raw) check_error();
+    return Fragment(raw);
+}
+
+inline Fragment RewriteResult::new_fragment_at(size_t index) const {
+    auto* raw = lance_rewrite_result_new_fragment_at(handle_.get(), index);
+    if (!raw) check_error();
+    return Fragment(raw);
+}
 
 } // namespace lance
 

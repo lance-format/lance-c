@@ -375,6 +375,11 @@ typedef struct LanceUpdateMap LanceUpdateMap;
 typedef struct LanceDataOverlayFile LanceDataOverlayFile;
 typedef struct LanceDataOverlayGroup LanceDataOverlayGroup;
 typedef struct LanceFragmentOverlayWriter LanceFragmentOverlayWriter;
+typedef struct LanceUpdatedFragmentOffsets LanceUpdatedFragmentOffsets;
+typedef struct LanceKeyExistenceFilter LanceKeyExistenceFilter;
+typedef struct LanceRewriteGroup LanceRewriteGroup;
+typedef struct LanceRewrittenIndex LanceRewrittenIndex;
+typedef struct LanceCompactedSsTable LanceCompactedSsTable;
 typedef struct LanceIvfModel LanceIvfModel;
 typedef struct LanceSchema LanceSchema;
 typedef struct LanceNamespace LanceNamespace;
@@ -1953,15 +1958,15 @@ int32_t lance_dataset_all_files_stream(
 );
 
 /**
- * Restore the dataset to an older version by committing a new manifest that
- * carries the fragments of `version`. If `version` is already the latest,
- * succeeds as a no-op without writing a new manifest.
+ * Restore the dataset by committing a new manifest that carries the fragments
+ * of `version`. A new version is committed even when `version` is already the
+ * latest. The input dataset handle remains unchanged.
  *
  * @param dataset  Open dataset (not consumed). Must not be NULL.
  * @param version  Target version id (>= 1). `0` is rejected since it is the
  *                 "latest" sentinel used by lance_dataset_open.
- * @return Fresh LanceDataset* positioned at the target version (caller closes
- *         with lance_dataset_close), or NULL on error. Possible error codes
+ * @return Fresh LanceDataset* positioned at the newly committed version
+ *         (caller closes with lance_dataset_close), or NULL on error. Error codes
  *         include LANCE_ERR_INVALID_ARGUMENT (NULL handle or version == 0),
  *         LANCE_ERR_NOT_FOUND (unknown version),
  *         LANCE_ERR_COMMIT_CONFLICT (concurrent writer).
@@ -8760,6 +8765,818 @@ int32_t lance_dataset_read_transaction_by_version(
     LanceTransaction** out_transaction
 );
 
+/* -------------------------------------------------------------------------
+ * Update, Rewrite and UpdateMemWalState operation values
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Native update mode for an Update operation. Values are pinned for the ABI.
+ */
+typedef enum LanceUpdateMode {
+    LANCE_UPDATE_MODE_REWRITE_ROWS    = 0,
+    LANCE_UPDATE_MODE_REWRITE_COLUMNS = 1
+} LanceUpdateMode;
+
+/**
+ * Borrowed row offsets for one fragment in an `UpdatedFragmentOffsets` value.
+ *
+ * `offsets` is read as a set: repeated values collapse. `offsets` may be NULL
+ * only when `offset_count` is 0, which is a real empty bitmap entry rather than
+ * an absent one.
+ */
+typedef struct LanceFragmentOffsetsView {
+    uint64_t       fragment_id;
+    const uint32_t* offsets;
+    size_t         offset_count;
+} LanceFragmentOffsetsView;
+
+/**
+ * Borrowed index-file entry for a `LanceRewrittenIndex`.
+ */
+typedef struct LanceIndexFile {
+    const char* path;
+    uint64_t    size_bytes;
+} LanceIndexFile;
+
+/**
+ * Kind of a native key-existence filter. Values are pinned for the ABI.
+ */
+typedef enum LanceKeyExistenceFilterKind {
+    LANCE_KEY_EXISTENCE_FILTER_EXACT = 0,
+    LANCE_KEY_EXISTENCE_FILTER_BLOOM = 1
+} LanceKeyExistenceFilterKind;
+
+/**
+ * Construct owned native `UpdatedFragmentOffsets` from ordered entries.
+ *
+ * Entries and their offset arrays are copied before this function returns, and
+ * the result does not borrow from them. A repeated `fragment_id` keeps the last
+ * entry, matching the native `HashMap` representation. `Some(empty)` and an
+ * empty bitmap entry are both representable; only an explicit protobuf round
+ * trip normalizes an all-empty value to native `None`.
+ *
+ * @return the new value, or NULL on error.
+ */
+LanceUpdatedFragmentOffsets* lance_updated_fragment_offsets_new(
+    const LanceFragmentOffsetsView* entries,
+    size_t entry_count
+);
+
+/**
+ * Clone an owned `UpdatedFragmentOffsets` into independent native storage.
+ *
+ * @return the new value, or NULL on error.
+ */
+LanceUpdatedFragmentOffsets* lance_updated_fragment_offsets_clone(
+    const LanceUpdatedFragmentOffsets* offsets
+);
+
+/**
+ * Free an `UpdatedFragmentOffsets` value. Safe to call with NULL.
+ */
+void lance_updated_fragment_offsets_close(LanceUpdatedFragmentOffsets* offsets);
+
+/**
+ * Read the number of fragment entries.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_updated_fragment_offsets_count(
+    const LanceUpdatedFragmentOffsets* offsets,
+    uint64_t* out_count
+);
+
+/**
+ * Read one fragment ID by entry index. Entry order is unspecified.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_updated_fragment_offsets_fragment_id_at(
+    const LanceUpdatedFragmentOffsets* offsets,
+    size_t index,
+    uint64_t* out_fragment_id
+);
+
+/**
+ * Read the number of offsets recorded at one entry index.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_updated_fragment_offsets_offset_count_at(
+    const LanceUpdatedFragmentOffsets* offsets,
+    size_t index,
+    uint64_t* out_count
+);
+
+/**
+ * Read one offset by entry index and ascending offset position.
+ *
+ * Native bitmaps are ordered, so position 0 is the smallest offset of that
+ * fragment entry.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_updated_fragment_offsets_offset_at(
+    const LanceUpdatedFragmentOffsets* offsets,
+    size_t index,
+    size_t position,
+    uint32_t* out_offset
+);
+
+/**
+ * Build an owned native key-existence filter from explicit protobuf bytes.
+ *
+ * `bytes` is one encoded `lance.table.transaction.KeyExistenceFilter` message
+ * and is converted through the native `TryFrom` implementation, so absent bloom
+ * fields take the native defaults (`number_of_items = 8192`,
+ * `probability = 0.00057`) and an absent filter body becomes an empty exact
+ * set. NULL bytes are accepted only with a zero length.
+ *
+ * @return 0 on success and writes `*out_filter`, -1 on error.
+ */
+int32_t lance_key_existence_filter_from_proto(
+    const uint8_t* bytes,
+    size_t len,
+    LanceKeyExistenceFilter** out_filter
+);
+
+/**
+ * Clone a key-existence filter into independent native storage.
+ *
+ * @return the new value, or NULL on error.
+ */
+LanceKeyExistenceFilter* lance_key_existence_filter_clone(
+    const LanceKeyExistenceFilter* filter
+);
+
+/**
+ * Free a key-existence filter. Safe to call with NULL.
+ */
+void lance_key_existence_filter_close(LanceKeyExistenceFilter* filter);
+
+/**
+ * Read the filter kind.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_kind(
+    const LanceKeyExistenceFilter* filter,
+    LanceKeyExistenceFilterKind* out_kind
+);
+
+/**
+ * Read the number of filtered field IDs.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_field_id_count(
+    const LanceKeyExistenceFilter* filter,
+    uint64_t* out_count
+);
+
+/**
+ * Read one filtered field ID by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_field_id_at(
+    const LanceKeyExistenceFilter* filter,
+    size_t index,
+    int32_t* out_field_id
+);
+
+/**
+ * Read the number of keys in an exact-set filter.
+ *
+ * Returns `LANCE_ERR_NOT_SUPPORTED` for a bloom filter.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_exact_count(
+    const LanceKeyExistenceFilter* filter,
+    uint64_t* out_count
+);
+
+/**
+ * Read one exact key by ascending position.
+ *
+ * Native exact sets are unordered, so keys are reported in ascending order to
+ * keep repeated inspections stable. Returns `LANCE_ERR_NOT_SUPPORTED` for a
+ * bloom filter.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_exact_key_at(
+    const LanceKeyExistenceFilter* filter,
+    size_t index,
+    uint64_t* out_key
+);
+
+/**
+ * Copy a bloom filter's bitmap and parameters.
+ *
+ * The bitmap is allocated with `malloc` and must be released with
+ * `lance_free_bytes`; a zero-length bitmap yields a NULL pointer. All output
+ * pointers are required and are written only on success. Returns
+ * `LANCE_ERR_NOT_SUPPORTED` for an exact-set filter.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_bloom(
+    const LanceKeyExistenceFilter* filter,
+    uint8_t** out_bitmap,
+    size_t* out_bitmap_len,
+    uint32_t* out_num_bits,
+    uint64_t* out_number_of_items,
+    double* out_probability
+);
+
+/**
+ * Encode a key-existence filter with the native protobuf conversion.
+ *
+ * This is the same encoding an Update operation persists, so a filter built
+ * with `lance_key_existence_filter_from_proto()` round-trips exactly. The
+ * buffer is allocated with `malloc` and must be released with
+ * `lance_free_bytes`; an empty encoding yields a NULL pointer.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_to_proto(
+    const LanceKeyExistenceFilter* filter,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Complete input for `lance_operation_update_new()`.
+ *
+ * Every array is borrowed for the duration of the call and copied into native
+ * owned values. A NULL array is accepted only with a zero count. Native fields
+ * are not defaulted: an empty `fields_modified`, `compacted_sstables`,
+ * `removed_fragment_ids` or `fields_for_preserving_frag_bitmap` means the caller
+ * supplied none.
+ *
+ * A NULL `inserted_rows_filter` or `updated_fragment_offsets` maps to native
+ * `None`, as does `has_update_mode == false`; these are distinct from the
+ * populated and empty-value states. `update_mode` is ignored unless
+ * `has_update_mode` is true and must then be a `LanceUpdateMode` value.
+ *
+ * This struct grows only by appending fields.
+ */
+typedef struct LanceUpdateOperationOptions {
+    const uint64_t* removed_fragment_ids;
+    size_t          removed_fragment_count;
+    const LanceFragment* const* updated_fragments;
+    size_t          updated_fragment_count;
+    const LanceFragment* const* new_fragments;
+    size_t          new_fragment_count;
+    const uint32_t* fields_modified;
+    size_t          fields_modified_count;
+    const LanceCompactedSsTable* compacted_sstables;
+    size_t          compacted_sstable_count;
+    const uint32_t* fields_for_preserving_frag_bitmap;
+    size_t          fields_for_preserving_frag_bitmap_count;
+    bool            has_update_mode;
+    int32_t         update_mode;
+    const LanceKeyExistenceFilter* inserted_rows_filter;
+    const LanceUpdatedFragmentOffsets* updated_fragment_offsets;
+} LanceUpdateOperationOptions;
+
+/**
+ * Construct an owned native Update operation.
+ *
+ * `options` is required. Every fragment handle is borrowed and its complete
+ * native metadata is copied, including pre-assigned IDs, data files and
+ * deletion files. Native commit validation owns schema coverage, conflict
+ * detection and row-version behavior; this function only maps values.
+ *
+ * @return the new operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_new(
+    const LanceUpdateOperationOptions* options
+);
+
+/**
+ * Read the number of removed fragment IDs in an Update operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_removed_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one removed fragment ID by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_removed_fragment_id_at(
+    const LanceOperation* operation,
+    size_t index,
+    uint64_t* out_fragment_id
+);
+
+/**
+ * Read the number of updated fragments in an Update operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_updated_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one updated fragment by position.
+ *
+ * The returned handle owns a complete native fragment snapshot and remains
+ * valid after the operation handle is closed.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_updated_fragment_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the number of new fragments in an Update operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_new_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one new fragment by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_new_fragment_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the number of modified field IDs in an Update operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_fields_modified_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one modified field ID by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_fields_modified_at(
+    const LanceOperation* operation,
+    size_t index,
+    uint32_t* out_field_id
+);
+
+/**
+ * Read the number of compacted SSTable entries in an Update operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_compacted_sstable_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Copy one compacted SSTable entry by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_compacted_sstable_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceCompactedSsTable* out_sstable
+);
+
+/**
+ * Read the number of preserved-fragment-bitmap field IDs in an Update.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_fields_for_preserving_frag_bitmap_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one preserved-fragment-bitmap field ID by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_fields_for_preserving_frag_bitmap_at(
+    const LanceOperation* operation,
+    size_t index,
+    uint32_t* out_field_id
+);
+
+/**
+ * Read the native update mode, distinguishing absent from both variants.
+ *
+ * Writes `*out_present` and, when present, the `LanceUpdateMode` code.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_mode(
+    const LanceOperation* operation,
+    bool* out_present,
+    int32_t* out_mode
+);
+
+/**
+ * Clone the inserted-rows key-existence filter of an Update operation.
+ *
+ * When the native field is `None`, writes `*out_present = false` and a NULL handle.
+ * Otherwise writes 1 and an independently owned filter that the caller closes
+ * with `lance_key_existence_filter_close()`. Both outputs are written only on
+ * success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_inserted_rows_filter(
+    const LanceOperation* operation,
+    bool* out_present,
+    LanceKeyExistenceFilter** out_filter
+);
+
+/**
+ * Clone the updated-fragment offsets of an Update operation.
+ *
+ * When the native field is `None`, writes `*out_present = 0` and a NULL handle;
+ * otherwise writes 1 and an independently owned value, preserving the
+ * `None`/`Some(empty)`/populated distinction. Both outputs are written only on
+ * success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_updated_fragment_offsets(
+    const LanceOperation* operation,
+    bool* out_present,
+    LanceUpdatedFragmentOffsets** out_offsets
+);
+
+/**
+ * Construct an owned native `RewriteGroup` from two fragment arrays.
+ *
+ * Both arrays are borrowed and every fragment's complete native metadata is
+ * copied. NULL arrays are accepted only with a zero count.
+ *
+ * @return the new group, or NULL on error.
+ */
+LanceRewriteGroup* lance_rewrite_group_new(
+    const LanceFragment* const* old_fragments,
+    size_t old_fragment_count,
+    const LanceFragment* const* new_fragments,
+    size_t new_fragment_count
+);
+
+/**
+ * Clone an owned `RewriteGroup` into independent native storage.
+ *
+ * @return the new group, or NULL on error.
+ */
+LanceRewriteGroup* lance_rewrite_group_clone(const LanceRewriteGroup* group);
+
+/**
+ * Free a `RewriteGroup`. Safe to call with NULL.
+ */
+void lance_rewrite_group_close(LanceRewriteGroup* group);
+
+/**
+ * Read the number of replaced fragments in a `RewriteGroup`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewrite_group_old_fragment_count(
+    const LanceRewriteGroup* group,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one replaced fragment of a `RewriteGroup` by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewrite_group_old_fragment_at(
+    const LanceRewriteGroup* group,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the number of replacement fragments in a `RewriteGroup`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewrite_group_new_fragment_count(
+    const LanceRewriteGroup* group,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one replacement fragment of a `RewriteGroup` by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewrite_group_new_fragment_at(
+    const LanceRewriteGroup* group,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Construct an owned native `RewrittenIndex`.
+ *
+ * `old_id` and `new_id` must each point to 16 canonical UUID bytes.
+ * `details_type_url` is required but may be empty, matching the native
+ * `prost_types::Any` field; `details_value` may be NULL only with a zero
+ * length.
+ *
+ * `has_index_files == false` maps to native `None` and requires a zero count.
+ * `has_index_files == true` with a zero count is the distinct `Some(empty)` state
+ * that older writers persisted, so both must be preserved. Index-file paths are
+ * copied and must be non-NULL and valid UTF-8.
+ *
+ * @return the new value, or NULL on error.
+ */
+LanceRewrittenIndex* lance_rewritten_index_new(
+    const uint8_t* old_id,
+    const uint8_t* new_id,
+    const char* details_type_url,
+    const uint8_t* details_value,
+    size_t details_value_len,
+    uint32_t index_version,
+    bool has_index_files,
+    const LanceIndexFile* index_files,
+    size_t index_file_count
+);
+
+/**
+ * Clone an owned `RewrittenIndex` into independent native storage.
+ *
+ * @return the new value, or NULL on error.
+ */
+LanceRewrittenIndex* lance_rewritten_index_clone(const LanceRewrittenIndex* index);
+
+/**
+ * Free a `RewrittenIndex`. Safe to call with NULL.
+ */
+void lance_rewritten_index_close(LanceRewrittenIndex* index);
+
+/**
+ * Copy the old index UUID as 16 bytes into `out_uuid`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_old_id(
+    const LanceRewrittenIndex* index,
+    uint8_t* out_uuid
+);
+
+/**
+ * Copy the new index UUID as 16 bytes into `out_uuid`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_new_id(
+    const LanceRewrittenIndex* index,
+    uint8_t* out_uuid
+);
+
+/**
+ * Copy the index-details type URL.
+ *
+ * The string is allocated with `malloc` and must be released with
+ * `lance_free_string`. Returns NULL on error or when the URL contains a NUL
+ * byte, which the native string can hold but a C string cannot.
+ */
+const char* lance_rewritten_index_details_type_url(
+    const LanceRewrittenIndex* index
+);
+
+/**
+ * Copy the index-details value bytes.
+ *
+ * The buffer is allocated with `malloc` and must be released with
+ * `lance_free_bytes`; a zero-length value yields a NULL pointer.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_details_value(
+    const LanceRewrittenIndex* index,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Read the new index version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_version(
+    const LanceRewrittenIndex* index,
+    uint32_t* out_version
+);
+
+/**
+ * Report whether the rewritten index carries an index-file list.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_has_files(
+    const LanceRewrittenIndex* index,
+    bool* out_present
+);
+
+/**
+ * Read the number of index files; 0 also when the native list is `None`.
+ *
+ * Use `lance_rewritten_index_has_files()` to distinguish `None` from
+ * `Some(empty)`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_file_count(
+    const LanceRewrittenIndex* index,
+    uint64_t* out_count
+);
+
+/**
+ * Copy one index-file path.
+ *
+ * The string is allocated with `malloc` and must be released with
+ * `lance_free_string`. Returns NULL on error or when the native list is `None`.
+ */
+const char* lance_rewritten_index_file_path_at(
+    const LanceRewrittenIndex* index,
+    size_t position
+);
+
+/**
+ * Read one index-file size by position.
+ *
+ * @return 0 on success, -1 on error or when the native list is `None`.
+ */
+int32_t lance_rewritten_index_file_size_at(
+    const LanceRewrittenIndex* index,
+    size_t position,
+    uint64_t* out_size
+);
+
+/**
+ * Construct an owned native Rewrite operation.
+ *
+ * Groups and rewritten indices are cloned from their handles. `frag_reuse_index`
+ * may be NULL for native `None`; otherwise its complete native index metadata is
+ * copied.
+ *
+ * The fragment-reuse index is in-memory only. Native serialization never writes
+ * it, so an explicit protobuf round trip yields `None` even when the in-memory
+ * operation carries one.
+ *
+ * @return the new operation, or NULL on error.
+ */
+LanceOperation* lance_operation_rewrite_new(
+    const LanceRewriteGroup* const* groups,
+    size_t group_count,
+    const LanceRewrittenIndex* const* rewritten_indices,
+    size_t rewritten_index_count,
+    const LanceIndexSegmentMetadata* frag_reuse_index
+);
+
+/**
+ * Read the number of groups in a Rewrite operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_rewrite_group_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one Rewrite group by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_rewrite_group_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceRewriteGroup** out_group
+);
+
+/**
+ * Read the number of rewritten indices in a Rewrite operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_rewrite_rewritten_index_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one rewritten index by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_rewrite_rewritten_index_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceRewrittenIndex** out_index
+);
+
+/**
+ * Clone the in-memory fragment-reuse index of a Rewrite operation.
+ *
+ * When the native field is `None`, writes `*out_present = false` and a NULL handle.
+ * Otherwise writes 1 and an independently owned metadata snapshot, including
+ * fragment bitmap, index details and files. Both outputs are written only on
+ * success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_rewrite_frag_reuse_index(
+    const LanceOperation* operation,
+    bool* out_present,
+    LanceIndexSegmentMetadata** out_metadata
+);
+
+/**
+ * Construct an owned native UpdateMemWalState operation.
+ *
+ * `compacted_sstables` uses the shared `LanceCompactedSsTable` value and the
+ * same native conversion as merge-insert compaction, so a caller can record
+ * flushed generations as an explicit operation. Native merge-insert validation
+ * owns shard existence, generation ordering and atomicity. A NULL array is
+ * accepted only with a zero count.
+ *
+ * @return the new operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_mem_wal_state_new(
+    const LanceCompactedSsTable* compacted_sstables,
+    size_t compacted_sstable_count
+);
+
+/**
+ * Read the number of compacted SSTables in an UpdateMemWalState operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_mem_wal_state_compacted_sstable_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Copy one compacted SSTable entry of an UpdateMemWalState operation.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_mem_wal_state_compacted_sstable_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceCompactedSsTable* out_sstable
+);
+
+/**
+ * Clone one original fragment of a rewrite result as an owned native snapshot.
+ *
+ * The handle owns complete native fragment metadata and remains valid after the
+ * rewrite result is closed. Returns NULL on error.
+ */
+LanceFragment* lance_rewrite_result_original_fragment_at(
+    const LanceRewriteResult* result,
+    size_t index
+);
+
+/**
+ * Clone one new fragment of a rewrite result as an owned native snapshot.
+ *
+ * These are the staged fragments native compaction produced, so a caller can
+ * build a Rewrite group from them. The handle owns complete native metadata and
+ * remains valid after the rewrite result is closed. Returns NULL on error.
+ */
+LanceFragment* lance_rewrite_result_new_fragment_at(
+    const LanceRewriteResult* result,
+    size_t index
+);
+
 /**
  * Publish one native transaction through CommitBuilder::execute.
  *
@@ -10321,7 +11138,7 @@ typedef enum {
  * 8-4-4-4-12 order. The value is passed by pointer to
  * lance_dataset_merge_insert_with_compaction() and copied by native code.
  */
-typedef struct {
+typedef struct LanceCompactedSsTable {
     uint8_t  shard_id[16];
     uint64_t generation;
 } LanceCompactedSsTable;

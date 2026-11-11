@@ -3317,6 +3317,459 @@ static void test_native_typed_operations(const char *src_uri,
     lance_transaction_close(seed_transaction);
 }
 
+static uint64_t fragment_row_count(LanceFragment *fragment) {
+    uint64_t rows = UINT64_MAX;
+    ASSERT(lance_fragment_count_rows(fragment, NULL, &rows) == 0,
+           "count fragment rows");
+    CHECK_OK();
+    return rows;
+}
+
+static void check_wrong_kind(int32_t rc, const char *message) {
+    ASSERT(rc == -1, message);
+    ASSERT(lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED, message);
+}
+
+static void test_update_rewrite_operations(const char *src_uri,
+                                           const char *base) {
+    /* ── Update: complete value plus a real multi-fragment publication. ── */
+    char uri[4096];
+    snprintf(uri, sizeof(uri), "%s/c_update_operations", base);
+
+    LanceUncommittedWriteOptions write_options;
+    memset(&write_options, 0, sizeof(write_options));
+    write_options.write.params.max_rows_per_file = 2;
+
+    LanceTransaction *create = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_CREATE, &write_options);
+    LanceDataset *dataset = commit_transaction(uri, create, NULL);
+    uint64_t version = lance_dataset_version(dataset);
+    CHECK_OK();
+    uint64_t total_rows = lance_dataset_count_rows(dataset);
+    CHECK_OK();
+    uint64_t seed_fragments = lance_dataset_fragment_count(dataset);
+    CHECK_OK();
+    ASSERT(seed_fragments >= 4, "update fixture must span fragments");
+    lance_transaction_close(create);
+
+    uint64_t *ids = (uint64_t *)calloc(seed_fragments, sizeof(uint64_t));
+    ASSERT(ids != NULL, "allocate update fragment ids");
+    ASSERT(lance_dataset_fragment_ids(dataset, ids) == 0,
+           "read update fragment ids");
+    CHECK_OK();
+
+    LanceFragment *old_fragments[2];
+    old_fragments[0] = lance_dataset_open_fragment(dataset, ids[0]);
+    old_fragments[1] = lance_dataset_open_fragment(dataset, ids[1]);
+    ASSERT(old_fragments[0] != NULL && old_fragments[1] != NULL,
+           "open update predecessor fragments");
+    CHECK_OK();
+    uint64_t replaced_rows = fragment_row_count(old_fragments[0]) +
+                             fragment_row_count(old_fragments[1]);
+
+    LanceTransaction *staged = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_APPEND, &write_options);
+    ASSERT(transaction_read_version(staged) == version,
+           "staged append read version");
+    LanceOperation *staged_operation = NULL;
+    ASSERT(lance_transaction_operation(staged, &staged_operation) == 0,
+           "clone staged append operation");
+    CHECK_OK();
+    uint64_t staged_count = UINT64_MAX;
+    ASSERT(lance_operation_append_fragment_count(staged_operation,
+                                                 &staged_count) == 0,
+           "staged append fragment count");
+    CHECK_OK();
+    ASSERT(staged_count > 1, "staged append must span fragments");
+
+    LanceFragment **staged_fragments =
+        (LanceFragment **)calloc(staged_count, sizeof(LanceFragment *));
+    ASSERT(staged_fragments != NULL, "allocate staged fragments");
+    for (uint64_t i = 0; i < staged_count; i++) {
+        ASSERT(lance_operation_append_fragment_at(staged_operation, i,
+                                                  &staged_fragments[i]) == 0,
+               "staged append fragment");
+        CHECK_OK();
+    }
+    lance_operation_close(staged_operation);
+
+    const uint64_t removed[2] = {ids[0], ids[1]};
+    const uint32_t fields_modified[1] = {0};
+    LanceUpdateOperationOptions update;
+    memset(&update, 0, sizeof(update));
+    update.removed_fragment_ids = removed;
+    update.removed_fragment_count = 2;
+    update.updated_fragments = (const LanceFragment *const *)old_fragments;
+    update.updated_fragment_count = 2;
+    update.new_fragments = (const LanceFragment *const *)staged_fragments;
+    update.new_fragment_count = staged_count;
+    update.fields_modified = fields_modified;
+    update.fields_modified_count = 1;
+    update.has_update_mode = true;
+    update.update_mode = LANCE_UPDATE_MODE_REWRITE_ROWS;
+
+    LanceOperation *update_operation = lance_operation_update_new(&update);
+    ASSERT(update_operation != NULL, "build update operation");
+    CHECK_OK();
+    LanceOperationKind kind = LANCE_OPERATION_UNKNOWN;
+    ASSERT(lance_operation_kind(update_operation, &kind) == 0 &&
+               kind == LANCE_OPERATION_UPDATE,
+           "update operation kind");
+    CHECK_OK();
+    uint64_t count = UINT64_MAX;
+    ASSERT(lance_operation_update_removed_fragment_count(update_operation,
+                                                          &count) == 0 &&
+               count == 2,
+           "update removed fragment count");
+    CHECK_OK();
+    uint64_t removed_id = UINT64_MAX;
+    ASSERT(lance_operation_update_removed_fragment_id_at(
+               update_operation, 1, &removed_id) == 0 &&
+               removed_id == ids[1],
+           "update removed fragment ID");
+    CHECK_OK();
+    ASSERT(lance_operation_update_updated_fragment_count(update_operation,
+                                                          &count) == 0 &&
+               count == 2,
+           "update updated fragment count");
+    CHECK_OK();
+    LanceFragment *updated_fragment = NULL;
+    ASSERT(lance_operation_update_updated_fragment_at(
+               update_operation, 0, &updated_fragment) == 0,
+           "update updated fragment");
+    CHECK_OK();
+    bool is_bound = true;
+    ASSERT(lance_fragment_is_bound(updated_fragment, &is_bound) == 0 && !is_bound,
+           "cloned updated fragments are detached metadata snapshots");
+    CHECK_OK();
+    ASSERT(lance_fragment_data_file_count(updated_fragment) > 0,
+           "cloned updated fragments keep their data files");
+    CHECK_OK();
+    lance_fragment_close(updated_fragment);
+    ASSERT(lance_operation_update_new_fragment_count(update_operation,
+                                                      &count) == 0 &&
+               count == staged_count,
+           "update new fragment count");
+    CHECK_OK();
+    ASSERT(lance_operation_update_fields_modified_count(update_operation,
+                                                         &count) == 0 &&
+               count == 1,
+           "update fields modified count");
+    CHECK_OK();
+    uint32_t field_id = UINT32_MAX;
+    ASSERT(lance_operation_update_fields_modified_at(update_operation, 0,
+                                                      &field_id) == 0 &&
+               field_id == 0,
+           "update modified field ID");
+    CHECK_OK();
+    ASSERT(lance_operation_update_compacted_sstable_count(update_operation,
+                                                           &count) == 0 &&
+               count == 0,
+           "update compacted sstable count");
+    CHECK_OK();
+    ASSERT(lance_operation_update_fields_for_preserving_frag_bitmap_count(
+               update_operation, &count) == 0 &&
+               count == 0,
+           "update preserving bitmap count");
+    CHECK_OK();
+    bool present = true;
+    int32_t mode = INT32_MIN;
+    ASSERT(lance_operation_update_mode(update_operation, &present, &mode) == 0 &&
+               present && mode == LANCE_UPDATE_MODE_REWRITE_ROWS,
+           "update mode");
+    CHECK_OK();
+    present = true;
+    LanceKeyExistenceFilter *filter = NULL;
+    ASSERT(lance_operation_update_inserted_rows_filter(update_operation,
+                                                        &present,
+                                                        &filter) == 0 &&
+               !present && filter == NULL,
+           "update inserted rows filter is native None");
+    CHECK_OK();
+    present = true;
+    LanceUpdatedFragmentOffsets *offsets = NULL;
+    ASSERT(lance_operation_update_updated_fragment_offsets(
+               update_operation, &present, &offsets) == 0 &&
+               !present && offsets == NULL,
+           "update offsets are native None");
+    CHECK_OK();
+
+    /* Value-level rejections. */
+    check_wrong_kind(lance_operation_rewrite_group_count(update_operation,
+                                                          &count),
+                     "rewrite inspection rejects an Update");
+    ASSERT(lance_operation_update_new(NULL) == NULL,
+           "update options must not be NULL");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL update options error code");
+    update.update_mode = 9;
+    ASSERT(lance_operation_update_new(&update) == NULL,
+           "invalid update mode is rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid update mode error code");
+    update.update_mode = LANCE_UPDATE_MODE_REWRITE_ROWS;
+    update.removed_fragment_ids = NULL;
+    ASSERT(lance_operation_update_new(&update) == NULL,
+           "NULL removed fragment array is rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL removed fragment array error code");
+    update.removed_fragment_ids = removed;
+
+    LanceTransaction *update_transaction =
+        lance_transaction_new(version, update_operation, NULL);
+    ASSERT(update_transaction != NULL, "build update transaction");
+    CHECK_OK();
+    LanceDataset *published = commit_transaction(uri, update_transaction, NULL);
+    ASSERT(lance_dataset_count_rows(published) ==
+               total_rows - replaced_rows + total_rows,
+           "Update must replace the removed fragments with the staged ones");
+    CHECK_OK();
+    ASSERT(lance_dataset_validate(published) == 0,
+           "published update dataset must validate");
+    CHECK_OK();
+    uint64_t published_fragments = lance_dataset_fragment_count(published);
+    CHECK_OK();
+    ASSERT(published_fragments == seed_fragments - 2 + staged_count,
+           "Update fragment count after publication");
+    lance_dataset_close(published);
+    lance_transaction_close(update_transaction);
+
+    LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen published update dataset");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(reopened) == version + 1,
+           "update publication version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(reopened) ==
+               total_rows - replaced_rows + total_rows,
+           "reopened update rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(reopened) == published_fragments,
+           "reopened update fragments");
+    CHECK_OK();
+    lance_dataset_close(reopened);
+
+    lance_operation_close(update_operation);
+    lance_transaction_close(staged);
+    for (uint64_t i = 0; i < staged_count; i++) {
+        lance_fragment_close(staged_fragments[i]);
+    }
+    free(staged_fragments);
+    lance_fragment_close(old_fragments[0]);
+    lance_fragment_close(old_fragments[1]);
+    free(ids);
+    lance_dataset_close(dataset);
+
+    /* ── Rewrite: real compaction-task publication. ── */
+    char rewrite_uri[4096];
+    snprintf(rewrite_uri, sizeof(rewrite_uri), "%s/c_rewrite_operations", base);
+
+    memset(&write_options, 0, sizeof(write_options));
+    write_options.write.params.max_rows_per_file = 1;
+    create = write_uncommitted_from_source(src_uri, rewrite_uri,
+                                           LANCE_WRITE_CREATE, &write_options);
+    LanceDataset *rewrite_dataset = commit_transaction(rewrite_uri, create, NULL);
+    uint64_t rewrite_version = lance_dataset_version(rewrite_dataset);
+    CHECK_OK();
+    uint64_t rewrite_rows = lance_dataset_count_rows(rewrite_dataset);
+    CHECK_OK();
+    uint64_t rewrite_fragments = lance_dataset_fragment_count(rewrite_dataset);
+    CHECK_OK();
+    ASSERT(rewrite_fragments >= 4, "rewrite fixture must span fragments");
+    lance_transaction_close(create);
+
+    LanceCompactionOptionsV2 *compaction_options =
+        lance_compaction_options_v2_new();
+    ASSERT(compaction_options != NULL, "create compaction options");
+    CHECK_OK();
+    ASSERT(lance_compaction_options_v2_set_target_rows_per_fragment(
+               compaction_options, 4) == 0,
+           "set target rows per fragment");
+    CHECK_OK();
+    LanceCompactionPlan *plan = lance_dataset_plan_compaction(
+        rewrite_dataset, compaction_options);
+    ASSERT(plan != NULL, "plan rewrite compaction");
+    CHECK_OK();
+    ASSERT(lance_compaction_plan_task_count(plan) > 0,
+           "rewrite compaction plan tasks");
+    CHECK_OK();
+    LanceCompactionTask *task = lance_compaction_plan_task_at(plan, 0);
+    ASSERT(task != NULL, "create rewrite compaction task");
+    CHECK_OK();
+    LanceRewriteResult *rewrite_result =
+        lance_compaction_task_execute(rewrite_dataset, task);
+    ASSERT(rewrite_result != NULL, "execute rewrite compaction task");
+    CHECK_OK();
+    size_t original_count =
+        lance_rewrite_result_original_fragment_count(rewrite_result);
+    ASSERT(lance_last_error_code() == LANCE_OK && original_count >= 2,
+           "rewrite result original fragment count");
+    size_t replacement_count =
+        lance_rewrite_result_new_fragment_count(rewrite_result);
+    ASSERT(lance_last_error_code() == LANCE_OK && replacement_count == 1,
+           "rewrite result new fragment count");
+
+    LanceFragment **original_fragments =
+        (LanceFragment **)calloc(original_count, sizeof(LanceFragment *));
+    ASSERT(original_fragments != NULL, "allocate rewrite original fragments");
+    for (size_t i = 0; i < original_count; i++) {
+        original_fragments[i] =
+            lance_rewrite_result_original_fragment_at(rewrite_result, i);
+        ASSERT(original_fragments[i] != NULL,
+               "rewrite result original fragment");
+        CHECK_OK();
+    }
+    LanceFragment *replacement_fragment =
+        lance_rewrite_result_new_fragment_at(rewrite_result, 0);
+    ASSERT(replacement_fragment != NULL, "rewrite result new fragment");
+    CHECK_OK();
+    ASSERT(lance_rewrite_result_original_fragment_at(rewrite_result,
+                                                      original_count) == NULL,
+           "out-of-range rewrite result fragment is rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "out-of-range rewrite result fragment error code");
+
+    LanceRewriteGroup *group = lance_rewrite_group_new(
+        (const LanceFragment *const *)original_fragments, original_count,
+        (const LanceFragment *const *)&replacement_fragment, 1);
+    ASSERT(group != NULL, "build rewrite group");
+    CHECK_OK();
+    ASSERT(lance_rewrite_group_old_fragment_count(group, &count) == 0 &&
+               count == original_count,
+           "rewrite group old fragment count");
+    CHECK_OK();
+    ASSERT(lance_rewrite_group_new_fragment_count(group, &count) == 0 &&
+               count == 1,
+           "rewrite group new fragment count");
+    CHECK_OK();
+
+    const LanceRewriteGroup *groups[1] = {group};
+    LanceOperation *rewrite_operation =
+        lance_operation_rewrite_new(groups, 1, NULL, 0, NULL);
+    ASSERT(rewrite_operation != NULL, "build rewrite operation");
+    CHECK_OK();
+    ASSERT(lance_operation_rewrite_group_count(rewrite_operation, &count) == 0 &&
+               count == 1,
+           "rewrite operation group count");
+    CHECK_OK();
+    LanceRewriteGroup *cloned_group = NULL;
+    ASSERT(lance_operation_rewrite_group_at(rewrite_operation, 0,
+                                             &cloned_group) == 0,
+           "clone rewrite group");
+    CHECK_OK();
+    ASSERT(lance_rewrite_group_new_fragment_count(cloned_group, &count) == 0 &&
+               count == 1,
+           "cloned rewrite group new fragment count");
+    CHECK_OK();
+    lance_rewrite_group_close(cloned_group);
+    ASSERT(lance_operation_rewrite_rewritten_index_count(rewrite_operation,
+                                                          &count) == 0 &&
+               count == 0,
+           "rewrite operation rewritten index count");
+    CHECK_OK();
+    present = true;
+    LanceIndexSegmentMetadata *frag_reuse = NULL;
+    ASSERT(lance_operation_rewrite_frag_reuse_index(rewrite_operation,
+                                                     &present,
+                                                     &frag_reuse) == 0 &&
+               !present && frag_reuse == NULL,
+           "rewrite operation frag reuse index is native None");
+    CHECK_OK();
+
+    LanceTransaction *rewrite_transaction = lance_transaction_new(
+        lance_compaction_task_read_version(task), rewrite_operation, NULL);
+    ASSERT(rewrite_transaction != NULL, "build rewrite transaction");
+    CHECK_OK();
+    LanceDataset *rewritten = commit_transaction(rewrite_uri,
+                                                 rewrite_transaction, NULL);
+    ASSERT(lance_dataset_count_rows(rewritten) == rewrite_rows,
+           "Rewrite must preserve rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(rewritten) ==
+               rewrite_fragments - original_count + replacement_count,
+           "Rewrite fragment count after publication");
+    CHECK_OK();
+    ASSERT(lance_dataset_validate(rewritten) == 0,
+           "published rewrite dataset must validate");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(rewritten) == rewrite_version + 1,
+           "rewrite publication version");
+    lance_dataset_close(rewritten);
+    lance_transaction_close(rewrite_transaction);
+
+    reopened = lance_dataset_open(rewrite_uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen published rewrite dataset");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(reopened) == rewrite_rows,
+           "reopened rewrite rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(reopened) ==
+               rewrite_fragments - original_count + replacement_count,
+           "reopened rewrite fragments");
+    CHECK_OK();
+    lance_dataset_close(reopened);
+
+    lance_operation_close(rewrite_operation);
+    lance_rewrite_group_close(group);
+    lance_fragment_close(replacement_fragment);
+    for (size_t i = 0; i < original_count; i++) {
+        lance_fragment_close(original_fragments[i]);
+    }
+    free(original_fragments);
+    lance_rewrite_result_close(rewrite_result);
+    lance_compaction_task_close(task);
+    lance_compaction_plan_close(plan);
+    lance_compaction_options_v2_free(compaction_options);
+    lance_dataset_close(rewrite_dataset);
+
+    /* ── UpdateMemWalState: complete value with the shared value type. ── */
+    LanceCompactedSsTable compacted_value;
+    memset(&compacted_value, 0, sizeof(compacted_value));
+    for (size_t i = 0; i < 16; i++) {
+        compacted_value.shard_id[i] = (uint8_t)(0x10 + i);
+    }
+    compacted_value.generation = 5;
+    LanceOperation *mem_wal_operation =
+        lance_operation_update_mem_wal_state_new(&compacted_value, 1);
+    ASSERT(mem_wal_operation != NULL, "build UpdateMemWalState operation");
+    CHECK_OK();
+    ASSERT(lance_operation_kind(mem_wal_operation, &kind) == 0 &&
+               kind == LANCE_OPERATION_UPDATE_MEM_WAL_STATE,
+           "UpdateMemWalState operation kind");
+    CHECK_OK();
+    ASSERT(lance_operation_update_mem_wal_state_compacted_sstable_count(
+               mem_wal_operation, &count) == 0 &&
+               count == 1,
+           "UpdateMemWalState sstable count");
+    CHECK_OK();
+    LanceCompactedSsTable readback;
+    memset(&readback, 0, sizeof(readback));
+    ASSERT(lance_operation_update_mem_wal_state_compacted_sstable_at(
+               mem_wal_operation, 0, &readback) == 0,
+           "UpdateMemWalState sstable");
+    CHECK_OK();
+    ASSERT(readback.generation == 5, "UpdateMemWalState generation");
+    ASSERT(memcmp(readback.shard_id, compacted_value.shard_id, 16) == 0,
+           "UpdateMemWalState shard id");
+    check_wrong_kind(lance_operation_update_removed_fragment_count(
+                         mem_wal_operation, &count),
+                     "update inspection rejects UpdateMemWalState");
+    ASSERT(lance_operation_update_mem_wal_state_new(NULL, 1) == NULL,
+           "NULL UpdateMemWalState array is rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL UpdateMemWalState array error code");
+    lance_operation_close(mem_wal_operation);
+    mem_wal_operation = lance_operation_update_mem_wal_state_new(NULL, 0);
+    ASSERT(mem_wal_operation != NULL, "empty UpdateMemWalState operation");
+    CHECK_OK();
+    ASSERT(lance_operation_update_mem_wal_state_compacted_sstable_count(
+               mem_wal_operation, &count) == 0 &&
+               count == 0,
+           "empty UpdateMemWalState sstable count");
+    CHECK_OK();
+    lance_operation_close(mem_wal_operation);
+}
+
 static void check_fragment_create_metadata(const LanceFragment *fragment,
                                            uint64_t id,
                                            uint64_t physical_rows) {
@@ -3576,6 +4029,7 @@ int main(int argc, char **argv) {
     test_blob_writer_publication(argv[4]);
     test_native_operation_construction(argv[1], argv[2]);
     test_native_typed_operations(argv[1], argv[2]);
+    test_update_rewrite_operations(argv[1], argv[2]);
     printf("All C transaction tests passed!\n");
     return 0;
 }

@@ -25,6 +25,7 @@ use lance_file::version::LanceFileVersion;
 
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
+use crate::fragment::LanceFragment;
 use crate::helpers;
 use crate::metadata::owned_c_string;
 use crate::runtime::block_on;
@@ -1093,6 +1094,67 @@ pub unsafe extern "C" fn lance_rewrite_result_new_fragment_count(
             Ok(unsafe { &*result }.result.new_fragments.len())
         })(),
         0
+    )
+}
+
+/// Clone one original fragment as an owned native fragment snapshot.
+///
+/// The returned handle owns complete native fragment metadata, including
+/// pre-assigned IDs, data files and deletion files, and remains valid after the
+/// rewrite result is closed. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewrite_result_original_fragment_at(
+    result: *const LanceRewriteResult,
+    index: usize,
+) -> *mut LanceFragment {
+    ffi_try!(
+        (|| -> Result<*mut LanceFragment> {
+            if result.is_null() {
+                return Err(invalid_input("result must not be NULL"));
+            }
+            let result = unsafe { &*result };
+            let fragment = result.result.original_fragments.get(index).ok_or_else(|| {
+                invalid_input(format!(
+                    "original fragment index {index} is out of range; count = {}",
+                    result.result.original_fragments.len()
+                ))
+            })?;
+            Ok(Box::into_raw(Box::new(LanceFragment::from_metadata(
+                fragment.clone(),
+            ))))
+        })(),
+        null
+    )
+}
+
+/// Clone one new fragment as an owned native fragment snapshot.
+///
+/// This is the staged output of native compaction, so a caller can build a
+/// Rewrite group from the fragments the native task actually produced. The
+/// handle owns complete native metadata and remains valid after the rewrite
+/// result is closed. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_rewrite_result_new_fragment_at(
+    result: *const LanceRewriteResult,
+    index: usize,
+) -> *mut LanceFragment {
+    ffi_try!(
+        (|| -> Result<*mut LanceFragment> {
+            if result.is_null() {
+                return Err(invalid_input("result must not be NULL"));
+            }
+            let result = unsafe { &*result };
+            let fragment = result.result.new_fragments.get(index).ok_or_else(|| {
+                invalid_input(format!(
+                    "new fragment index {index} is out of range; count = {}",
+                    result.result.new_fragments.len()
+                ))
+            })?;
+            Ok(Box::into_raw(Box::new(LanceFragment::from_metadata(
+                fragment.clone(),
+            ))))
+        })(),
+        null
     )
 }
 
