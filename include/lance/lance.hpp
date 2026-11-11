@@ -7043,14 +7043,18 @@ public:
     /// version id pinned); it does not select the latest head. Pass
     /// `Ref::version(std::nullopt, std::nullopt)` to clone the current head of
     /// the default branch. `storage_options == nullptr` passes native None;
-    /// otherwise the accessor's native Arc is forwarded as Some, even when it
-    /// holds neither static options nor a provider, without resolving or
-    /// copying credentials. The returned dataset keeps the cloned snapshot's
-    /// version id (native clone commit semantics), so `version()` is not
-    /// necessarily 1. On failure the target is not published, but partial
-    /// objects may remain under `target_path`.
+    /// otherwise the accessor's native Arc is forwarded as-is when it holds
+    /// static options or a provider (an accessor with neither passes None),
+    /// without resolving or copying credentials. The returned dataset keeps
+    /// the cloned snapshot's version id (native clone commit semantics), so
+    /// `version()` is not necessarily 1. On failure the target is not
+    /// published, but partial objects may remain under `target_path` and are
+    /// not rolled back.
     /// The target URI must use a scheme known to the default object-store
     /// registry, because native clone commits resolve it there.
+    /// For datasets with additional base paths, native deep clone reads them
+    /// through the source dataset's object store; per-base distinct source
+    /// credentials are not supported.
     Dataset deep_clone(
         const std::string& target_path,
         const Ref* reference = nullptr,

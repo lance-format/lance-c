@@ -38,14 +38,15 @@ fn invalid(message: impl Into<String>) -> lance_core::Error {
 ///   `Ref::Version(snapshot.manifest.branch, Some(snapshot.version_id()))`.
 ///   This pins the snapshot; it does not select the latest head of the branch.
 /// - `target_storage_options == NULL` passes native `None`. A non-NULL
-///   accessor forwards its native `Arc` into `ObjectStoreParams` as `Some`,
-///   even when it holds neither static options nor a provider. Credentials
-///   are not resolved or copied here.
+///   accessor that holds static options and/or a provider contributes its
+///   native `Arc` to `ObjectStoreParams`; an accessor created with neither
+///   contributes native `None`. Credentials are not resolved or copied here.
 ///
 /// The out handle is written only on success. On failure, native copies may
 /// leave partial objects under `target_path`, while the target dataset itself
-/// is published only by the final manifest commit. A retry then fails the
-/// native target-exists preflight until those objects are removed.
+/// is published only by the final manifest commit. Partial objects are not
+/// rolled back; a target that already contains a published dataset is
+/// rejected by the native preflight before any copy.
 ///
 /// The returned dataset is a fresh `LanceDataset` whose manifest keeps the
 /// cloned snapshot's version id (native clone commit semantics), so its version
@@ -55,10 +56,11 @@ fn invalid(message: impl Into<String>) -> lance_core::Error {
 /// registry, so the target must use a scheme that registry knows. Schemes
 /// registered only on a custom session registry are not visible here.
 ///
-/// For datasets with additional base paths, source credentials come from the
-/// source dataset's native session and per-base store binding. This function
-/// does not construct extra providers, caches, registries, or per-base
-/// credential sets.
+/// For datasets with additional base paths, native `Dataset::deep_clone`
+/// reads every collected file through the source dataset's object store;
+/// per-base distinct source credentials are not supported. This function does
+/// not construct extra providers, caches, registries, or per-base credential
+/// sets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_deep_clone(
     dataset: *const LanceDataset,

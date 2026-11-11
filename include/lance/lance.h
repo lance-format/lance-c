@@ -1379,14 +1379,16 @@ LanceDataset* lance_dataset_checkout_ref(
  * `target_storage_options` is an existing storage-options accessor, or NULL.
  * Its native accessor Arc is forwarded into `ObjectStoreParams` without
  * resolving, snapshotting, or copying credentials, so a dynamic provider keeps
- * its refresh behavior. NULL passes native `None`; a non-NULL accessor is
- * forwarded as `Some` even when it has no static options or provider.
+ * its refresh behavior. NULL passes native `None`; a non-NULL accessor that
+ * holds static options and/or a provider contributes its native `Arc`, while
+ * an accessor created with neither contributes native `None`.
  *
  * Files are copied and the target dataset is published by native Lance. The
  * out handle is written only on success. On failure the out parameter is
  * untouched and no target dataset is published, but object-store copies are
- * not transactional: partial objects may remain under `target_path`, and a
- * retry fails the native target-exists preflight until they are removed.
+ * not transactional: partial objects may remain under `target_path` and are
+ * not rolled back. A target that already contains a published dataset is
+ * rejected by the native preflight before any copy.
  *
  * The returned dataset is a normal LanceDataset whose manifest keeps the
  * cloned snapshot's version id (native clone commit semantics), so its
@@ -1399,9 +1401,10 @@ LanceDataset* lance_dataset_checkout_ref(
  * commit. Use `lance_dataset_write`/`lance_dataset_branch_create` with an
  * explicit session for those schemes.
  *
- * For datasets with additional base paths, source credentials come from the
- * source dataset's native session and per-base store binding. This call does
- * not create extra providers, caches, registries, or per-base credential sets.
+ * For datasets with additional base paths, native deep clone reads every
+ * collected file through the source dataset's object store; per-base distinct
+ * source credentials are not supported. This call does not create extra
+ * providers, caches, registries, or per-base credential sets.
  *
  * Caller closes the returned handle with lance_dataset_close().
  * @param dataset source dataset handle (must not be NULL)

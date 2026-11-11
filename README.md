@@ -1013,11 +1013,15 @@ lance::Dataset at_seven = ds.deep_clone("copy-v7.lance", &ref);
 The target must not exist yet. The returned handle is a normal dataset whose
 version id is the cloned snapshot's version; the source handle keeps its
 snapshot and no source write lock is held during copying. The optional storage
-options accessor is forwarded as native `Arc` without resolving or copying
-credentials. Native clone commits resolve the target URI through the default
-object-store registry, so target schemes registered only on a custom session
-are rejected. On failure the target dataset is not published, but copied
-objects may remain under the target path and must be removed before retrying.
+options accessor contributes its native `Arc` without resolving or copying
+credentials; NULL, or an accessor created with neither static options nor a
+provider, passes native `None`. For datasets with additional base paths, native
+deep clone reads them through the source dataset's object store; per-base
+distinct source credentials are not supported. Native clone commits resolve the
+target URI through the default object-store registry, so target schemes
+registered only on a custom session are rejected. On failure the target dataset
+is not published, but copied objects may remain under the target path and are
+not rolled back.
 
 ## Releasing
 
