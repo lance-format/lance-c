@@ -215,11 +215,12 @@ static LanceDataset *commit_transaction(
     return dataset;
 }
 
-static void check_dataset(const char *uri,
-                          uint64_t version,
-                          uint64_t rows,
-                          uint64_t fragments) {
-    LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
+static void check_dataset_at(const char *uri,
+                             uint64_t open_version,
+                             uint64_t version,
+                             uint64_t rows,
+                             uint64_t fragments) {
+    LanceDataset *dataset = lance_dataset_open(uri, NULL, open_version);
     ASSERT(dataset != NULL, "reopen committed dataset");
     CHECK_OK();
     uint64_t observed_version = lance_dataset_version(dataset);
@@ -232,20 +233,42 @@ static void check_dataset(const char *uri,
 
     char message[256];
     snprintf(message, sizeof(message),
-             "dataset version: expected %llu, observed %llu",
-             (unsigned long long)version, (unsigned long long)observed_version);
+             "dataset version (opened version %llu): expected %llu, observed "
+             "%llu",
+             (unsigned long long)open_version, (unsigned long long)version,
+             (unsigned long long)observed_version);
     ASSERT(observed_version == version, message);
     snprintf(message, sizeof(message),
-             "dataset row count: expected %llu, observed %llu",
-             (unsigned long long)rows, (unsigned long long)observed_rows);
+             "dataset row count (opened version %llu): expected %llu, "
+             "observed %llu",
+             (unsigned long long)open_version, (unsigned long long)rows,
+             (unsigned long long)observed_rows);
     ASSERT(observed_rows == rows, message);
     if (fragments != UINT64_MAX) {
         snprintf(message, sizeof(message),
-                 "dataset fragment count: expected %llu, observed %llu",
+                 "dataset fragment count (opened version %llu): expected "
+                 "%llu, observed %llu",
+                 (unsigned long long)open_version,
                  (unsigned long long)fragments,
                  (unsigned long long)observed_fragments);
         ASSERT(observed_fragments == fragments, message);
     }
+}
+
+static void check_dataset(const char *uri,
+                          uint64_t version,
+                          uint64_t rows,
+                          uint64_t fragments) {
+    check_dataset_at(uri, 0, version, rows, fragments);
+}
+
+/* Opens a historical version explicitly, so a later publication is not what is
+ * being measured. */
+static void check_snapshot(const char *uri,
+                           uint64_t version,
+                           uint64_t rows,
+                           uint64_t fragments) {
+    check_dataset_at(uri, version, version, rows, fragments);
 }
 
 static void write_c_replacement_file(const char *uri,
@@ -2700,7 +2723,7 @@ static void test_fragment_creation(const char *src_uri, const char *base) {
     lance_fragment_close(single);
 
     /* The old snapshot still reads the rows it was created with. */
-    check_dataset(uri, version, rows, fragments_before);
+    check_snapshot(uri, version, rows, fragments_before);
 
     /* Many fragments: native splitting and native id assignment. */
     input = make_source_stream(src_uri);

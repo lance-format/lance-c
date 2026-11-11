@@ -45,12 +45,40 @@ static lance::Transaction write_uncommitted(
         destination_uri, &stream, mode, options, {}, session);
 }
 
+static void check_dataset_at(const std::string& uri,
+                             uint64_t open_version,
+                             uint64_t version,
+                             uint64_t rows) {
+    auto dataset = lance::Dataset::open(uri, {}, open_version);
+    const uint64_t observed_version = dataset.version();
+    const uint64_t observed_rows = dataset.count_rows();
+    if (observed_version != version || observed_rows != rows) {
+        std::fprintf(stderr,
+                     "check_dataset mismatch for %s: opened version=%llu, "
+                     "expected version=%llu rows=%llu, observed version=%llu "
+                     "rows=%llu\n",
+                     uri.c_str(), static_cast<unsigned long long>(open_version),
+                     static_cast<unsigned long long>(version),
+                     static_cast<unsigned long long>(rows),
+                     static_cast<unsigned long long>(observed_version),
+                     static_cast<unsigned long long>(observed_rows));
+    }
+    CHECK(observed_version == version);
+    CHECK(observed_rows == rows);
+}
+
 static void check_dataset(const std::string& uri,
                           uint64_t version,
                           uint64_t rows) {
-    auto dataset = lance::Dataset::open(uri);
-    CHECK(dataset.version() == version);
-    CHECK(dataset.count_rows() == rows);
+    check_dataset_at(uri, 0, version, rows);
+}
+
+/* Opens a historical version explicitly, so a later publication is not what is
+ * being measured. */
+static void check_snapshot(const std::string& uri,
+                           uint64_t version,
+                           uint64_t rows) {
+    check_dataset_at(uri, version, version, rows);
 }
 
 static uint64_t write_cpp_replacement_file(
@@ -1467,7 +1495,7 @@ static void test_fragment_creation(const std::string& src_uri,
     CHECK(std::find(published_ids.begin(), published_ids.end(), 1000) !=
           published_ids.end());
     const uint64_t published_version = published.version();
-    check_dataset(uri, version, rows);
+    check_snapshot(uri, version, rows);
 
     lance::WriteOptions many_write;
     many_write.params.max_rows_per_file = 4;
