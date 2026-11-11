@@ -22,6 +22,7 @@ use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{
     CachedFileMetadata, FileReader as NativeFileReader, FileReaderOptions as NativeReaderOptions,
+    ReaderProjection,
 };
 use lance_file::version::LanceFileVersion;
 use lance_file::versions;
@@ -190,12 +191,16 @@ fn write_with_native(uri: &str, batch: &RecordBatch) {
     });
 }
 
-fn open_c_reader_result(uri: &str) -> Result<*mut LanceFileReader, (LanceErrorCode, String)> {
+fn open_c_reader_result(
+    uri: &str,
+    options: Option<&LanceFileReaderOptions>,
+) -> Result<*mut LanceFileReader, (LanceErrorCode, String)> {
     let uri = c_string(uri);
+    let options_ptr = options.map_or(ptr::null(), |options| options as *const _);
     let reader = unsafe {
         lance_file_reader_open(
             uri.as_ptr(),
-            ptr::null(),
+            options_ptr,
             ptr::null(),
             ptr::null(),
             ptr::null(),
@@ -224,7 +229,28 @@ fn metadata_info(reader: *const LanceFileReader) -> LanceFileMetadataInfo {
 }
 
 fn c_read_all(uri: &str) -> Result<usize, String> {
-    let reader = open_c_reader_result(uri)
+    c_read_all_with_options(uri, None)
+}
+
+fn c_read_all_columns(uri: &str, columns: &[&str]) -> Result<usize, String> {
+    let columns: Vec<CString> = columns.iter().map(|column| c_string(column)).collect();
+    let column_ptrs: Vec<*const std::ffi::c_char> =
+        columns.iter().map(|column| column.as_ptr()).collect();
+    let options = LanceFileReaderOptions {
+        has_columns: 1,
+        columns: column_ptrs.as_ptr(),
+        column_count: column_ptrs.len(),
+        ..Default::default()
+    };
+    println!("C read_all columns={columns:?}");
+    c_read_all_with_options(uri, Some(&options))
+}
+
+fn c_read_all_with_options(
+    uri: &str,
+    options: Option<&LanceFileReaderOptions>,
+) -> Result<usize, String> {
+    let reader = open_c_reader_result(uri, options)
         .map_err(|(code, text)| format!("C open failed: {code:?}: {text}"))?;
     let info = metadata_info(reader);
     println!(
@@ -319,8 +345,33 @@ fn describe_schema(metadata: &CachedFileMetadata) {
 }
 
 fn native_read_all(uri: &str) -> Result<usize, String> {
+    native_read_all_with_projection(uri, None)
+}
+
+fn native_read_all_columns(uri: &str, columns: &[&str]) -> Result<usize, String> {
     let metadata = native_metadata(uri)?;
     describe_schema(&metadata);
+    let projection = versions::reader_projection_from_column_names(
+        metadata.version,
+        &metadata.file_schema,
+        columns,
+    )
+    .map_err(|error| format!("native projection from columns: {error}"))?;
+    println!(
+        "explicit native projection columns={columns:?}: indices={:?}",
+        projection.column_indices
+    );
+    native_read_all_with_projection(uri, Some(projection))
+}
+
+fn native_read_all_with_projection(
+    uri: &str,
+    projection: Option<ReaderProjection>,
+) -> Result<usize, String> {
+    let metadata = native_metadata(uri)?;
+    if projection.is_none() {
+        describe_schema(&metadata);
+    }
     lance_c::runtime::block_on(async {
         let (store, path) = ObjectStore::from_uri(uri)
             .await
@@ -337,7 +388,7 @@ fn native_read_all(uri: &str) -> Result<usize, String> {
         let reader = NativeFileReader::try_open_with_file_metadata(
             io,
             path,
-            None,
+            projection,
             Arc::<DecoderPlugins>::default(),
             metadata,
             &LanceCache::no_cache(),
@@ -392,6 +443,20 @@ fn probe_case(root: &std::path::Path, name: &str, include_id: bool, use_c_writer
     }
 }
 
+fn probe_projection(root: &std::path::Path, name: &str) {
+    let uri = root.join(format!("{name}.lance"));
+    let uri = uri.to_str().unwrap();
+    println!("\n=== {name}: explicit blob-column projection ===");
+    match c_read_all_columns(uri, &["blob"]) {
+        Ok(rows) => println!("C read_all blob column OK rows={rows}"),
+        Err(error) => println!("C read_all blob column ERROR: {error}"),
+    }
+    match native_read_all_columns(uri, &["blob"]) {
+        Ok(rows) => println!("native read_all blob column OK rows={rows}"),
+        Err(error) => println!("native read_all blob column ERROR: {error}"),
+    }
+}
+
 #[test]
 #[ignore = "diagnostic probe; run explicitly with --ignored"]
 fn raw_blob_readback_probe() {
@@ -400,4 +465,6 @@ fn raw_blob_readback_probe() {
     probe_case(root.path(), "c_id_blob", true, true);
     probe_case(root.path(), "n_blob_only", false, false);
     probe_case(root.path(), "n_id_blob", true, false);
+    probe_projection(root.path(), "c_blob_only");
+    probe_projection(root.path(), "n_blob_only");
 }
