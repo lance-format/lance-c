@@ -446,7 +446,10 @@ pub(crate) unsafe fn open_reader_at(
         None
     };
 
-    let io = Arc::new(lance_file::LanceEncodingsIo::new(file_scheduler));
+    let io = Arc::new(
+        lance_file::LanceEncodingsIo::new(file_scheduler)
+            .with_read_chunk_size(options.native.read_chunk_size),
+    );
     let native = block_on(FileReader::try_open_with_file_metadata(
         io,
         path,
