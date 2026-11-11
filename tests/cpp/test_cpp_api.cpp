@@ -21,7 +21,9 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -31,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 // Arrow C Data Interface flag bits — see arrow_schema/arrow_c_data_interface.h.
