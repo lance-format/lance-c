@@ -730,6 +730,11 @@ impl LanceScanner {
             .is_some_and(|query| query.mode == NearestMode::MultiVector);
         let has_aggregate =
             operation == ScannerOperation::Scan && self.substrait_aggregate.is_some();
+        if self.nearest.is_none() && self.probe.search_effort.is_some() {
+            return Err(lance_core::Error::invalid_input_source(
+                "search_effort requires nearest() to be configured".into(),
+            ));
+        }
         // The multi-vector window must rank on the native distance after the
         // final projection. Projections can rename or transform `_distance`,
         // so carry a binding-private copy whenever a projection is configured.
