@@ -9610,7 +9610,11 @@ int32_t lance_shard_writer_lsm_scanner(
  */
 int32_t lance_shard_writer_close(LanceShardWriter* writer);
 
-/** Free a shard writer. Does not flush; close it first for durability. */
+/**
+ * Stop a live writer's native background tasks and free its allocation.
+ * Waits for in-progress native work to settle. Close first for durability;
+ * free requests native abort without a final flush. NULL-safe.
+ */
 void lance_shard_writer_free(LanceShardWriter* writer);
 
 /**

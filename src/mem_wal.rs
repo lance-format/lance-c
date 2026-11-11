@@ -55,7 +55,7 @@ use crate::error::{ffi_try, set_last_error, swallow_unwind};
 use crate::helpers::{parse_c_string, take_arrow_array_stream};
 use crate::runtime::{RT, block_on};
 use crate::schema::LanceSchema;
-use crate::stream_guard::GuardedReader;
+use crate::stream_guard::{GuardedReader, guarded_ffi_stream_from_reader};
 
 // ─── Value types ─────────────────────────────────────────────────────────────
 
@@ -305,7 +305,7 @@ where
     if out.is_null() {
         return Err(invalid("out must not be NULL"));
     }
-    let ffi_stream = FFI_ArrowArrayStream::new(Box::new(stream));
+    let ffi_stream = guarded_ffi_stream_from_reader(stream)?;
     unsafe {
         std::ptr::write_unaligned(out, ffi_stream);
     }
@@ -1733,7 +1733,12 @@ unsafe fn writer_close_inner(writer: *mut LanceShardWriter) -> lance_core::Resul
 pub unsafe extern "C" fn lance_shard_writer_free(writer: *mut LanceShardWriter) {
     if !writer.is_null() {
         swallow_unwind("lance_shard_writer_free", || unsafe {
-            drop(Box::from_raw(writer));
+            let mut writer = Box::from_raw(writer);
+            if let Some(live) = writer.writer.take()
+                && let Err(error) = block_on(live.abort())
+            {
+                log::error!("lance_shard_writer_free: native abort failed: {error}");
+            }
         });
     }
 }
