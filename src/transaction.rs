@@ -2418,10 +2418,7 @@ unsafe fn operation_overwrite_config_upsert_count_inner(
     Ok(0)
 }
 
-fn overwrite_config_entry<'a>(
-    operation: &'a LanceOperation,
-    index: usize,
-) -> Result<&'a (CString, CString)> {
+fn overwrite_config_entry(operation: &LanceOperation, index: usize) -> Result<&(CString, CString)> {
     let parts = overwrite_operation_parts(operation)?;
     let count = parts.config_upsert_values.as_ref().map_or(0, HashMap::len);
     if operation.config_upserts.len() != count {
