@@ -27012,13 +27012,11 @@ fn test_native_write_options_external_blob_policy() {
     std::fs::write(&source_path, b"external blob bytes").unwrap();
     let source_uri = format!("file://{}", source_path.display());
 
-    let mut builder = lance::BlobDescriptorArrayBuilder::new("blob");
-    builder
-        .push_external(source_uri, None)
-        .expect("external descriptor");
-    let (field, array) = builder.finish().unwrap().into_parts();
-    let schema = Arc::new(Schema::new(vec![field]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+    let mut builder = lance::BlobArrayBuilder::new(1);
+    builder.push_uri(source_uri).expect("external blob URI");
+    let array = builder.finish().unwrap();
+    let schema = Arc::new(Schema::new(vec![lance::blob_field("blob", true)]));
+    let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
 
     let mut write_options: LanceWriteOptions = unsafe { std::mem::zeroed() };
     let version = c_str("2.2");
