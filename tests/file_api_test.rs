@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow::buffer::NullBuffer;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::record_batch::RecordBatchReader;
@@ -17,7 +18,6 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, Int8Array, Int32Array,
     RecordBatch, RecordBatchOptions, StringArray, StructArray,
 };
-use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field, Fields, Schema};
 use futures::StreamExt;
 use lance_c::*;
@@ -412,7 +412,7 @@ fn metadata_info(reader: *const LanceFileReader) -> LanceFileMetadataInfo {
 
 fn native_success<T, E>(operation: impl FnOnce() -> Result<T, E>) -> bool {
     catch_unwind(AssertUnwindSafe(operation))
-        .map(Result::is_ok)
+        .map(|result| result.is_ok())
         .unwrap_or(false)
 }
 
