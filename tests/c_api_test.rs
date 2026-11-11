@@ -10899,7 +10899,7 @@ unsafe fn build_scalar_segment_via_c(
 }
 
 fn build_native_zone_map_segment(
-    dataset: &Dataset,
+    dataset: &mut Dataset,
     fragment_ids: &[u32],
     uuid: [u8; 16],
     index_name: &str,
@@ -10999,9 +10999,14 @@ fn test_index_metadata_complete_inspection_clone_and_native_oracle() {
     let after_ms = Utc::now().timestamp_millis();
     let actual = inspect_index_metadata_via_c(metadata);
 
-    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
-    let oracle =
-        build_native_zone_map_segment(&native, &[0, 1], uuid, "score_zonemap_create", params_json);
+    let mut native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let oracle = build_native_zone_map_segment(
+        &mut native,
+        &[0, 1],
+        uuid,
+        "score_zonemap_create",
+        params_json,
+    );
     assert_complete_metadata_matches_native_oracle(
         &actual,
         &oracle,
@@ -11021,7 +11026,9 @@ fn test_index_metadata_complete_inspection_clone_and_native_oracle() {
         (before_ms..=after_ms).contains(&created_ms),
         "created_at {created_ms} must be recorded during this build ({before_ms}..={after_ms})"
     );
-    let details = pb::ZoneMapIndexDetails::decode(actual.index_details_value.as_slice()).unwrap();
+    let details =
+        lance_index::pbold::ZoneMapIndexDetails::decode(actual.index_details_value.as_slice())
+            .unwrap();
     assert_eq!(details.rows_per_zone, Some(2));
     assert_eq!(details.use_seeds, Some(false));
 

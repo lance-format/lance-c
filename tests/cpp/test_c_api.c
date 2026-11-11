@@ -4754,7 +4754,7 @@ static void test_create_index_operation(const char *uri) {
                committed, "c_create_index_zonemap") == 2,
            "CreateIndex must publish both segments");
     CHECK_OK();
-    ASSERT(lance_dataset_count_rows_filtered(committed, "score = 70") == 1,
+    ASSERT(lance_dataset_count_rows_filtered(committed, "score = 80") == 1,
            "CreateIndex fixture query must return the expected row");
     CHECK_OK();
     lance_transaction_close(transaction);

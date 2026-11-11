@@ -2159,8 +2159,8 @@ mod tests {
         assert!(!cloned.is_null());
         assert_eq!(unsafe { (*cloned).native_metadata() }, &metadata);
         assert_eq!(
-            unsafe { (*cloned).native_metadata().files },
-            Some(Vec::new()),
+            unsafe { (*cloned).native_metadata().files.as_ref() }.map(Vec::len),
+            Some(0),
             "an in-memory Some(empty) files value must not normalize to None"
         );
 

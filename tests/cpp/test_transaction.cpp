@@ -461,7 +461,7 @@ static void test_create_index_operation(const std::string& source_uri,
         lance::Dataset::commit(uri, transaction, commit_options);
     CHECK(committed.version() == version + 1);
     CHECK(committed.index_segment_count("cpp_create_index_zonemap") == 2);
-    CHECK(committed.count_rows("score = 70") == 1);
+    CHECK(committed.count_rows("score = 80") == 1);
 
     auto history = committed.read_transaction();
     CHECK(history.has_value());
