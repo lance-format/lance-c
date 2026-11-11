@@ -1412,7 +1412,11 @@ fn test_delta_deleted_ids_require_stable_row_ids() {
     // stable row ids does not record, so this dataset reports no changes —
     // the native reader agrees.
     let inserted = c_delta_stream(delta, DeltaStream::Inserted);
-    let native_inserted = native_delta(&uri, unchanged, DeltaStream::Inserted);
+    let native_inserted = native_delta(
+        &uri,
+        |builder| builder.with_begin_version(1).with_end_version(2),
+        DeltaStream::Inserted,
+    );
     assert_eq!(ids_of(&native_inserted), ids_of(&inserted));
     assert!(
         ids_of(&inserted).is_empty(),
