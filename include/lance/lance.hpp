@@ -165,6 +165,12 @@ class Scanner;
 class Dataset;
 class Fragment;
 class LanceSchema;
+class Batch;
+struct Table;
+class ArrowSchemaOwner;
+class ShardWriter;
+class LsmScanner;
+class ExecutionPlan;
 class IndexModel;
 class IndexSegmentBuilder;
 class IndexSegmentMetadata;
@@ -2676,6 +2682,12 @@ public:
         return id;
     }
 
+    /// Build a native schema from a borrowed Arrow schema. Fields without a
+    /// `lance:field_id` metadata entry receive fresh native IDs; existing
+    /// IDs, dictionaries, and metadata are preserved. Throws on native
+    /// validation failure.
+    static LanceSchema from_arrow(const ArrowSchema* schema);
+
     /// Export an Arrow interoperability view. `out` is caller-owned and must
     /// be released exactly once. Arrow cannot represent every native detail.
     void to_arrow(ArrowSchema* out) const {
@@ -3696,6 +3708,808 @@ struct ScalarIndexOptions {
 struct IndexPrewarmOptions {
     bool with_position = false;
     std::optional<std::vector<std::array<uint8_t, 16>>> index_segments;
+};
+
+// ─── MemWAL / LSM ───────────────────────────────────────────────────────────
+
+/// Native distance metric for MemWAL vector search.
+enum class MemWalDistanceType : int32_t {
+    L2 = LANCE_MEM_WAL_DISTANCE_L2,
+    Cosine = LANCE_MEM_WAL_DISTANCE_COSINE,
+    Dot = LANCE_MEM_WAL_DISTANCE_DOT,
+    Hamming = LANCE_MEM_WAL_DISTANCE_HAMMING,
+};
+
+/// A compacted SSTable marker advanced atomically with a merge-insert commit.
+struct CompactedSsTable {
+    std::array<uint8_t, 16> shard_id{};
+    uint64_t generation = 0;
+
+    static CompactedSsTable from_uuid(const std::string& shard_id,
+                                      uint64_t generation) {
+        ::LanceCompactedSsTable raw{};
+        if (lance_mem_wal_compacted_sstable_new(shard_id.c_str(), generation,
+                                                &raw) != 0) {
+            check_error();
+        }
+        CompactedSsTable value;
+        std::memcpy(value.shard_id.data(), raw.shard_id,
+                    value.shard_id.size());
+        value.generation = raw.generation;
+        return value;
+    }
+
+    ::LanceCompactedSsTable to_c() const {
+        ::LanceCompactedSsTable raw{};
+        std::memcpy(raw.shard_id, shard_id.data(), shard_id.size());
+        raw.generation = generation;
+        return raw;
+    }
+};
+
+/// One SSTable referenced by a shard snapshot.
+struct SsTable {
+    uint64_t generation = 0;
+    std::string path;
+};
+
+/// Per-index HNSW build controls.
+struct HnswParams {
+    std::string index_name;
+    std::optional<uint32_t> num_edges;
+    std::optional<uint32_t> ef_construction;
+    std::optional<uint32_t> max_level;
+};
+
+/// Snapshot of native shard-writer counters.
+struct ShardWriterStats {
+    uint64_t put_count = 0;
+    uint64_t put_time_nanos = 0;
+    uint64_t wal_flush_count = 0;
+    uint64_t wal_flush_time_nanos = 0;
+    uint64_t wal_flush_bytes = 0;
+    uint64_t wal_io_time_nanos = 0;
+    uint64_t wal_io_count = 0;
+    uint64_t index_update_time_nanos = 0;
+    uint64_t index_update_count = 0;
+    uint64_t index_update_rows = 0;
+    uint64_t memtable_flush_count = 0;
+    uint64_t memtable_flush_time_nanos = 0;
+    uint64_t memtable_flush_rows = 0;
+    uint64_t memtable_flush_failures = 0;
+};
+
+/// Snapshot of live MemTable and memory statistics.
+struct ShardMemTableStats {
+    bool is_live = false;
+    uint64_t row_count = 0;
+    uint64_t batch_count = 0;
+    uint64_t estimated_size_bytes = 0;
+    uint64_t index_bytes = 0;
+    uint64_t frozen_bytes = 0;
+    uint64_t grace_bytes = 0;
+    uint64_t retained_bytes = 0;
+    uint64_t generation = 0;
+    std::optional<uint64_t> max_buffered_batch_position;
+    uint64_t durable_batch_count = 0;
+    uint64_t global_offset = 0;
+    std::optional<uint64_t> pending_wal_start_batch_position;
+    std::optional<uint64_t> pending_wal_end_batch_position;
+    uint64_t pending_wal_batch_count = 0;
+    uint64_t pending_wal_row_count = 0;
+    uint64_t pending_wal_estimated_bytes = 0;
+    uint64_t frozen_count = 0;
+};
+
+/// Native put/delete batch-position range.
+struct ShardWriteResult {
+    uint64_t batch_position_begin = 0;
+    uint64_t batch_position_end = 0;
+};
+
+/// Optional overrides for a native `ShardWriterConfig`. Unset fields keep the
+/// native defaults. `hnsw_params` entries replace same-named native defaults.
+class ShardWriterConfig {
+public:
+    std::optional<bool> durable_write;
+    std::optional<uint64_t> max_wal_buffer_size;
+    std::optional<uint64_t> max_wal_flush_interval_ms;
+    std::optional<uint64_t> max_memtable_size;
+    std::optional<uint64_t> max_memtable_rows;
+    std::optional<uint64_t> max_memtable_batches;
+    std::optional<uint64_t> max_unflushed_memtable_bytes;
+    std::optional<uint64_t> manifest_scan_batch_size;
+    std::optional<uint64_t> backpressure_log_interval_ms;
+    std::optional<uint64_t> stats_log_interval_ms;
+    std::vector<HnswParams> hnsw_params;
+
+    ShardWriterConfig& set_durable_write(bool value) { durable_write = value; return *this; }
+    ShardWriterConfig& set_max_wal_buffer_size(uint64_t value) { max_wal_buffer_size = value; return *this; }
+    ShardWriterConfig& set_max_wal_flush_interval_ms(uint64_t value) { max_wal_flush_interval_ms = value; return *this; }
+    ShardWriterConfig& set_max_memtable_size(uint64_t value) { max_memtable_size = value; return *this; }
+    ShardWriterConfig& set_max_memtable_rows(uint64_t value) { max_memtable_rows = value; return *this; }
+    ShardWriterConfig& set_max_memtable_batches(uint64_t value) { max_memtable_batches = value; return *this; }
+    ShardWriterConfig& set_max_unflushed_memtable_bytes(uint64_t value) { max_unflushed_memtable_bytes = value; return *this; }
+    ShardWriterConfig& set_manifest_scan_batch_size(uint64_t value) { manifest_scan_batch_size = value; return *this; }
+    ShardWriterConfig& set_backpressure_log_interval_ms(uint64_t value) { backpressure_log_interval_ms = value; return *this; }
+    ShardWriterConfig& set_stats_log_interval_ms(uint64_t value) { stats_log_interval_ms = value; return *this; }
+    ShardWriterConfig& add_hnsw_params(HnswParams value) { hnsw_params.push_back(std::move(value)); return *this; }
+
+    LanceShardWriterConfig to_c(std::vector<std::string>& names,
+                                std::vector<::LanceMemWalHnswParams>& params) const {
+        LanceShardWriterConfig raw{};
+        if (durable_write) {
+            raw.has_durable_write = 1;
+            raw.durable_write = *durable_write ? 1 : 0;
+        }
+        auto set_u64 = [](std::optional<uint64_t> value, int32_t& has, uint64_t& out) {
+            if (value) { has = 1; out = *value; }
+        };
+        set_u64(max_wal_buffer_size, raw.has_max_wal_buffer_size, raw.max_wal_buffer_size);
+        set_u64(max_wal_flush_interval_ms, raw.has_max_wal_flush_interval_ms,
+                raw.max_wal_flush_interval_ms);
+        set_u64(max_memtable_size, raw.has_max_memtable_size, raw.max_memtable_size);
+        set_u64(max_memtable_rows, raw.has_max_memtable_rows, raw.max_memtable_rows);
+        set_u64(max_memtable_batches, raw.has_max_memtable_batches, raw.max_memtable_batches);
+        set_u64(max_unflushed_memtable_bytes, raw.has_max_unflushed_memtable_bytes,
+                raw.max_unflushed_memtable_bytes);
+        set_u64(manifest_scan_batch_size, raw.has_manifest_scan_batch_size,
+                raw.manifest_scan_batch_size);
+        set_u64(backpressure_log_interval_ms, raw.has_backpressure_log_interval_ms,
+                raw.backpressure_log_interval_ms);
+        set_u64(stats_log_interval_ms, raw.has_stats_log_interval_ms,
+                raw.stats_log_interval_ms);
+        names.clear();
+        names.reserve(hnsw_params.size());
+        for (const auto& entry : hnsw_params) names.push_back(entry.index_name);
+        params.clear();
+        params.reserve(hnsw_params.size());
+        for (size_t i = 0; i < hnsw_params.size(); ++i) {
+            const auto& entry = hnsw_params[i];
+            ::LanceMemWalHnswParams raw_entry{};
+            raw_entry.index_name = names[i].c_str();
+            if (entry.num_edges) {
+                raw_entry.has_num_edges = 1;
+                raw_entry.num_edges = *entry.num_edges;
+            }
+            if (entry.ef_construction) {
+                raw_entry.has_ef_construction = 1;
+                raw_entry.ef_construction = *entry.ef_construction;
+            }
+            if (entry.max_level) {
+                raw_entry.has_max_level = 1;
+                raw_entry.max_level = *entry.max_level;
+            }
+            params.push_back(raw_entry);
+        }
+        raw.hnsw_params = params.empty() ? nullptr : params.data();
+        raw.num_hnsw_params = params.size();
+        return raw;
+    }
+};
+
+/// Options for `Dataset::initialize_mem_wal`.
+struct MemWalInitOptions {
+    ::LanceMemWalShardingMode mode = LANCE_MEM_WAL_SHARDING_MANUAL;
+    std::optional<std::string> column;
+    uint32_t num_buckets = 0;
+    /// Unset keeps native maintain-all behavior; an empty engaged vector
+    /// maintains no indexes.
+    std::optional<std::vector<std::string>> maintained_indexes;
+    std::optional<ShardWriterConfig> writer_config;
+};
+
+/// Owned native sharding field.
+class ShardingField {
+    Handle<::LanceMemWalShardingField, lance_mem_wal_sharding_field_free> handle_;
+
+public:
+    explicit ShardingField(::LanceMemWalShardingField* field) : handle_(field) {
+        if (!handle_) check_error();
+    }
+
+    ShardingField(ShardingField&&) noexcept = default;
+    ShardingField& operator=(ShardingField&&) noexcept = default;
+    ShardingField(const ShardingField&) = delete;
+    ShardingField& operator=(const ShardingField&) = delete;
+
+    static ShardingField create(
+        std::string field_id,
+        std::vector<int32_t> source_ids,
+        std::optional<std::string> transform,
+        std::optional<std::string> expression,
+        std::string result_type,
+        std::map<std::string, std::string> parameters = {}) {
+        std::vector<const char*> keys;
+        std::vector<const char*> values;
+        keys.reserve(parameters.size());
+        values.reserve(parameters.size());
+        for (const auto& [key, value] : parameters) {
+            keys.push_back(key.c_str());
+            values.push_back(value.c_str());
+        }
+        ::LanceMemWalShardingField* raw = nullptr;
+        if (lance_mem_wal_sharding_field_new(
+                field_id.c_str(),
+                source_ids.empty() ? nullptr : source_ids.data(),
+                source_ids.size(),
+                transform ? transform->c_str() : nullptr,
+                expression ? expression->c_str() : nullptr,
+                result_type.c_str(),
+                keys.empty() ? nullptr : keys.data(),
+                values.empty() ? nullptr : values.data(),
+                keys.size(),
+                &raw) != 0) {
+            check_error();
+        }
+        return ShardingField(raw);
+    }
+
+    ShardingField clone() const {
+        ::LanceMemWalShardingField* raw = nullptr;
+        if (lance_mem_wal_sharding_field_clone(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ShardingField(raw);
+    }
+
+    std::string id() const {
+        const char* value = lance_mem_wal_sharding_field_id(handle_.get());
+        if (!value) check_error();
+        return value;
+    }
+
+    std::vector<int32_t> source_ids() const {
+        size_t count = 0;
+        const int32_t* values = lance_mem_wal_sharding_field_source_ids(handle_.get(), &count);
+        if (!values && count != 0) check_error();
+        return values ? std::vector<int32_t>(values, values + count)
+                      : std::vector<int32_t>{};
+    }
+
+    std::optional<std::string> transform() const {
+        const char* value = lance_mem_wal_sharding_field_transform(handle_.get());
+        if (value) return std::string(value);
+        return std::nullopt;
+    }
+
+    std::optional<std::string> expression() const {
+        const char* value = lance_mem_wal_sharding_field_expression(handle_.get());
+        if (value) return std::string(value);
+        return std::nullopt;
+    }
+
+    std::string result_type() const {
+        const char* value = lance_mem_wal_sharding_field_result_type(handle_.get());
+        if (!value) check_error();
+        return value;
+    }
+
+    std::map<std::string, std::string> parameters() const {
+        std::map<std::string, std::string> result;
+        const size_t count = lance_mem_wal_sharding_field_parameter_count(handle_.get());
+        for (size_t i = 0; i < count; ++i) {
+            const char* key = nullptr;
+            const char* value = nullptr;
+            if (lance_mem_wal_sharding_field_parameter_at(
+                    handle_.get(), i, &key, &value) != 0) {
+                check_error();
+            }
+            if (!key || !value) check_error();
+            result.emplace(key, value);
+        }
+        return result;
+    }
+
+    std::optional<std::string> parameter(const std::string& key) const {
+        auto all = parameters();
+        auto it = all.find(key);
+        if (it == all.end()) return std::nullopt;
+        return it->second;
+    }
+
+    const ::LanceMemWalShardingField* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native sharding spec.
+class ShardingSpec {
+    Handle<::LanceMemWalShardingSpec, lance_mem_wal_sharding_spec_free> handle_;
+
+public:
+    explicit ShardingSpec(::LanceMemWalShardingSpec* spec) : handle_(spec) {
+        if (!handle_) check_error();
+    }
+
+    ShardingSpec(ShardingSpec&&) noexcept = default;
+    ShardingSpec& operator=(ShardingSpec&&) noexcept = default;
+    ShardingSpec(const ShardingSpec&) = delete;
+    ShardingSpec& operator=(const ShardingSpec&) = delete;
+
+    static ShardingSpec create(uint32_t spec_id,
+                               std::vector<ShardingField> fields) {
+        std::vector<const ::LanceMemWalShardingField*> raw;
+        raw.reserve(fields.size());
+        for (const auto& field : fields) raw.push_back(field.c_handle());
+        ::LanceMemWalShardingSpec* spec = nullptr;
+        if (lance_mem_wal_sharding_spec_new(
+                spec_id, raw.empty() ? nullptr : raw.data(), raw.size(), &spec) != 0) {
+            check_error();
+        }
+        return ShardingSpec(spec);
+    }
+
+    ShardingSpec clone() const {
+        ::LanceMemWalShardingSpec* raw = nullptr;
+        if (lance_mem_wal_sharding_spec_clone(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ShardingSpec(raw);
+    }
+
+    uint32_t id() const {
+        return lance_mem_wal_sharding_spec_id(handle_.get());
+    }
+
+    size_t field_count() const {
+        return lance_mem_wal_sharding_spec_field_count(handle_.get());
+    }
+
+    ShardingField field_at(size_t index) const {
+        ::LanceMemWalShardingField* raw = nullptr;
+        if (lance_mem_wal_sharding_spec_field_at(handle_.get(), index, &raw) != 0) {
+            check_error();
+        }
+        return ShardingField(raw);
+    }
+
+    std::vector<ShardingField> fields() const {
+        std::vector<ShardingField> result;
+        const size_t count = field_count();
+        result.reserve(count);
+        for (size_t i = 0; i < count; ++i) result.push_back(field_at(i));
+        return result;
+    }
+
+    void add_field(ShardingField field) {
+        auto current = fields();
+        current.push_back(std::move(field));
+        auto next = ShardingSpec::create(id(), std::move(current));
+        handle_ = std::move(next.handle_);
+    }
+
+    const ::LanceMemWalShardingSpec* c_handle() const { return handle_.get(); }
+
+private:
+    friend class Dataset;
+};
+
+/// Owned native shard snapshot.
+class ShardSnapshot {
+    Handle<::LanceMemWalShardSnapshot, lance_mem_wal_shard_snapshot_free> handle_;
+
+public:
+    explicit ShardSnapshot(::LanceMemWalShardSnapshot* snapshot) : handle_(snapshot) {
+        if (!handle_) check_error();
+    }
+
+    ShardSnapshot(ShardSnapshot&&) noexcept = default;
+    ShardSnapshot& operator=(ShardSnapshot&&) noexcept = default;
+    ShardSnapshot(const ShardSnapshot&) = delete;
+    ShardSnapshot& operator=(const ShardSnapshot&) = delete;
+
+    static ShardSnapshot create(const std::string& shard_id) {
+        ::LanceMemWalShardSnapshot* raw = nullptr;
+        if (lance_mem_wal_shard_snapshot_new(shard_id.c_str(), &raw) != 0) {
+            check_error();
+        }
+        return ShardSnapshot(raw);
+    }
+
+    ShardSnapshot clone() const {
+        ::LanceMemWalShardSnapshot* raw = nullptr;
+        if (lance_mem_wal_shard_snapshot_clone(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ShardSnapshot(raw);
+    }
+
+    std::string shard_id() const {
+        const char* value = lance_mem_wal_shard_snapshot_shard_id(handle_.get());
+        if (!value) check_error();
+        return value;
+    }
+
+    uint32_t spec_id() const {
+        return lance_mem_wal_shard_snapshot_spec_id(handle_.get());
+    }
+
+    ShardSnapshot& set_spec_id(uint32_t value) {
+        if (lance_mem_wal_shard_snapshot_with_spec_id(handle_.get(), value) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    uint64_t current_generation() const {
+        return lance_mem_wal_shard_snapshot_current_generation(handle_.get());
+    }
+
+    ShardSnapshot& set_current_generation(uint64_t value) {
+        if (lance_mem_wal_shard_snapshot_with_current_generation(
+                handle_.get(), value) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    ShardSnapshot& add_sstable(uint64_t generation, const std::string& path) {
+        if (lance_mem_wal_shard_snapshot_with_sstable(
+                handle_.get(), generation, path.c_str()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    std::vector<SsTable> sstables() const {
+        std::vector<SsTable> result;
+        const size_t count = lance_mem_wal_shard_snapshot_sstable_count(handle_.get());
+        result.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            uint64_t generation = 0;
+            const char* path = nullptr;
+            if (lance_mem_wal_shard_snapshot_sstable_at(
+                    handle_.get(), i, &generation, &path) != 0) {
+                check_error();
+            }
+            if (!path) check_error();
+            result.push_back(SsTable{generation, path});
+        }
+        return result;
+    }
+
+    const ::LanceMemWalShardSnapshot* c_handle() const { return handle_.get(); }
+};
+
+/// Owned copy of native MemWAL index details.
+class MemWalIndexDetails {
+    uint32_t num_shards_ = 0;
+    bool maintain_all_ = false;
+    std::vector<std::string> maintained_;
+    std::vector<ShardingSpec> specs_;
+    std::map<std::string, std::string> defaults_;
+
+public:
+    MemWalIndexDetails(uint32_t num_shards,
+                       bool maintain_all,
+                       std::vector<std::string> maintained,
+                       std::vector<ShardingSpec> specs,
+                       std::map<std::string, std::string> defaults)
+        : num_shards_(num_shards),
+          maintain_all_(maintain_all),
+          maintained_(std::move(maintained)),
+          specs_(std::move(specs)),
+          defaults_(std::move(defaults)) {}
+
+    MemWalIndexDetails(MemWalIndexDetails&&) noexcept = default;
+    MemWalIndexDetails& operator=(MemWalIndexDetails&&) noexcept = default;
+    MemWalIndexDetails(const MemWalIndexDetails&) = delete;
+    MemWalIndexDetails& operator=(const MemWalIndexDetails&) = delete;
+
+    uint32_t num_shards() const { return num_shards_; }
+    bool maintain_all_indexes() const { return maintain_all_; }
+    const std::vector<std::string>& maintained_indexes() const { return maintained_; }
+    const std::map<std::string, std::string>& writer_config_defaults() const {
+        return defaults_;
+    }
+    size_t sharding_spec_count() const { return specs_.size(); }
+    ShardingSpec sharding_spec_at(size_t index) const {
+        if (index >= specs_.size()) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "sharding spec index out of range");
+        }
+        return specs_[index].clone();
+    }
+    std::vector<ShardingSpec> sharding_specs() const {
+        std::vector<ShardingSpec> result;
+        result.reserve(specs_.size());
+        for (const auto& spec : specs_) result.push_back(spec.clone());
+        return result;
+    }
+};
+
+/// Owned native shard writer.
+class ShardWriter {
+    Handle<::LanceShardWriter, lance_shard_writer_free> handle_;
+
+public:
+    explicit ShardWriter(::LanceShardWriter* writer) : handle_(writer) {
+        if (!handle_) check_error();
+    }
+
+    ~ShardWriter() = default;
+    ShardWriter(ShardWriter&&) noexcept = default;
+    ShardWriter& operator=(ShardWriter&&) noexcept = default;
+    ShardWriter(const ShardWriter&) = delete;
+    ShardWriter& operator=(const ShardWriter&) = delete;
+
+    /// Open a native writer for one shard. The dataset handle is borrowed.
+    static ShardWriter open(const Dataset& dataset,
+                            const std::string& shard_id,
+                            const ShardWriterConfig& config = {});
+
+    std::string shard_id() const {
+        const char* value = lance_shard_writer_shard_id(handle_.get());
+        if (!value) check_error();
+        return value;
+    }
+
+    ShardWriteResult put(ArrowArrayStream* stream) {
+        ::LanceShardWriteResult raw{};
+        if (lance_shard_writer_put(handle_.get(), stream, &raw) != 0) {
+            check_error();
+        }
+        return ShardWriteResult{raw.batch_position_begin,
+                                raw.batch_position_end};
+    }
+
+    ShardWriteResult delete_rows(ArrowArrayStream* stream) {
+        ::LanceShardWriteResult raw{};
+        if (lance_shard_writer_delete(handle_.get(), stream, &raw) != 0) {
+            check_error();
+        }
+        return ShardWriteResult{raw.batch_position_begin,
+                                raw.batch_position_end};
+    }
+
+    ShardWriterStats stats() const {
+        ::LanceShardWriterStats raw{};
+        if (lance_shard_writer_stats(handle_.get(), &raw) != 0) check_error();
+        return ShardWriterStats{
+            raw.put_count, raw.put_time_nanos,
+            raw.wal_flush_count, raw.wal_flush_time_nanos, raw.wal_flush_bytes,
+            raw.wal_io_time_nanos, raw.wal_io_count,
+            raw.index_update_time_nanos, raw.index_update_count,
+            raw.index_update_rows,
+            raw.memtable_flush_count, raw.memtable_flush_time_nanos,
+            raw.memtable_flush_rows, raw.memtable_flush_failures};
+    }
+
+    ShardMemTableStats memtable_stats() const {
+        ::LanceShardMemTableStats raw{};
+        if (lance_shard_writer_memtable_stats(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        ShardMemTableStats stats;
+        stats.is_live = raw.is_live != 0;
+        stats.row_count = raw.row_count;
+        stats.batch_count = raw.batch_count;
+        stats.estimated_size_bytes = raw.estimated_size_bytes;
+        stats.index_bytes = raw.index_bytes;
+        stats.frozen_bytes = raw.frozen_bytes;
+        stats.grace_bytes = raw.grace_bytes;
+        stats.retained_bytes = raw.retained_bytes;
+        stats.generation = raw.generation;
+        if (raw.has_max_buffered_batch_position) {
+            stats.max_buffered_batch_position = raw.max_buffered_batch_position;
+        }
+        stats.durable_batch_count = raw.durable_batch_count;
+        stats.global_offset = raw.global_offset;
+        if (raw.has_pending_wal_start_batch_position) {
+            stats.pending_wal_start_batch_position =
+                raw.pending_wal_start_batch_position;
+        }
+        if (raw.has_pending_wal_end_batch_position) {
+            stats.pending_wal_end_batch_position =
+                raw.pending_wal_end_batch_position;
+        }
+        stats.pending_wal_batch_count = raw.pending_wal_batch_count;
+        stats.pending_wal_row_count = raw.pending_wal_row_count;
+        stats.pending_wal_estimated_bytes = raw.pending_wal_estimated_bytes;
+        stats.frozen_count = raw.frozen_count;
+        return stats;
+    }
+
+    /// Snapshot the writer's latest manifest. Returns nullopt when the writer
+    /// has not committed yet; an uncommitted shard is composed by the caller's
+    /// scanner using a default snapshot.
+    std::optional<ShardSnapshot> snapshot() const {
+        ::LanceMemWalShardSnapshot* raw = nullptr;
+        if (lance_shard_writer_snapshot(handle_.get(), &raw) != 0) check_error();
+        if (!raw) return std::nullopt;
+        return ShardSnapshot(raw);
+    }
+
+    LsmScanner lsm_scanner(std::vector<ShardSnapshot> snapshots);
+
+    void close() {
+        if (lance_shard_writer_close(handle_.get()) != 0) check_error();
+    }
+
+    const ::LanceShardWriter* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native LSM scanner.
+class LsmScanner {
+    Handle<::LanceLsmScanner, lance_lsm_scanner_free> handle_;
+
+public:
+    explicit LsmScanner(::LanceLsmScanner* scanner) : handle_(scanner) {
+        if (!handle_) check_error();
+    }
+    ~LsmScanner() = default;
+    LsmScanner(LsmScanner&&) noexcept = default;
+    LsmScanner& operator=(LsmScanner&&) noexcept = default;
+    LsmScanner(const LsmScanner&) = delete;
+    LsmScanner& operator=(const LsmScanner&) = delete;
+
+    static LsmScanner from_snapshots(const Dataset& dataset,
+                                     std::vector<ShardSnapshot> snapshots);
+
+    LsmScanner& project(const std::vector<std::string>& columns) {
+        std::vector<const char*> raw;
+        raw.reserve(columns.size());
+        for (const auto& column : columns) raw.push_back(column.c_str());
+        if (lance_lsm_scanner_project(
+                handle_.get(), raw.empty() ? nullptr : raw.data(),
+                raw.size()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    LsmScanner& filter(const std::string& expression) {
+        if (lance_lsm_scanner_filter(handle_.get(), expression.c_str()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    LsmScanner& limit(std::optional<int64_t> limit,
+                      std::optional<int64_t> offset = std::nullopt) {
+        if (lance_lsm_scanner_limit(
+                handle_.get(), limit.value_or(0), limit.has_value(),
+                offset.value_or(0), offset.has_value()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    LsmScanner& with_row_address() {
+        if (lance_lsm_scanner_with_row_address(handle_.get()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    LsmScanner& with_memtable_gen() {
+        if (lance_lsm_scanner_with_memtable_gen(handle_.get()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    Batch to_batch() const;
+    std::vector<Batch> to_batches() const;
+    Table to_table() const;
+    uint64_t count_rows() const {
+        uint64_t count = 0;
+        if (lance_lsm_scanner_count_rows(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    ArrowStream to_reader() const {
+        ArrowArrayStream raw{};
+        if (lance_lsm_scanner_to_arrow_stream(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ArrowStream(raw);
+    }
+
+    const ::LanceLsmScanner* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native execution plan.
+class ExecutionPlan {
+    Handle<::LanceMemWalPlan, lance_mem_wal_plan_free> handle_;
+
+public:
+    explicit ExecutionPlan(::LanceMemWalPlan* plan) : handle_(plan) {
+        if (!handle_) check_error();
+    }
+    ~ExecutionPlan() = default;
+    ExecutionPlan(ExecutionPlan&&) noexcept = default;
+    ExecutionPlan& operator=(ExecutionPlan&&) noexcept = default;
+    ExecutionPlan(const ExecutionPlan&) = delete;
+    ExecutionPlan& operator=(const ExecutionPlan&) = delete;
+
+    ArrowSchemaOwner schema() const;
+    ArrowSchemaOwner dataset_schema() const;
+
+    std::string explain() const {
+        char* text = nullptr;
+        if (lance_mem_wal_plan_explain(handle_.get(), &text) != 0) {
+            check_error();
+        }
+        std::unique_ptr<char, decltype(&lance_free_string)> guard(text, lance_free_string);
+        return std::string(text);
+    }
+
+    Batch to_batch() const;
+    std::vector<Batch> to_batches() const;
+    Table to_table() const;
+
+    ArrowStream to_reader() const {
+        ArrowArrayStream raw{};
+        if (lance_mem_wal_plan_to_arrow_stream(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ArrowStream(raw);
+    }
+
+    const ::LanceMemWalPlan* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native point-lookup planner.
+class LsmPointLookupPlanner {
+    Handle<::LanceLsmPointLookupPlanner, lance_lsm_point_lookup_planner_free> handle_;
+
+public:
+    LsmPointLookupPlanner(const Dataset& dataset,
+                          std::vector<ShardSnapshot> snapshots,
+                          std::optional<std::vector<std::string>> pk_columns = std::nullopt);
+
+    ~LsmPointLookupPlanner() = default;
+    LsmPointLookupPlanner(LsmPointLookupPlanner&&) noexcept = default;
+    LsmPointLookupPlanner& operator=(LsmPointLookupPlanner&&) noexcept = default;
+    LsmPointLookupPlanner(const LsmPointLookupPlanner&) = delete;
+    LsmPointLookupPlanner& operator=(const LsmPointLookupPlanner&) = delete;
+
+    ExecutionPlan plan_lookup(
+        const Batch& pk_value,
+        std::optional<std::vector<std::string>> columns = std::nullopt) const;
+
+private:
+    explicit LsmPointLookupPlanner(::LanceLsmPointLookupPlanner* planner)
+        : handle_(planner) {
+        if (!handle_) check_error();
+    }
+    friend class Dataset;
+};
+
+/// Owned native vector-search planner.
+class LsmVectorSearchPlanner {
+    Handle<::LanceLsmVectorSearchPlanner, lance_lsm_vector_search_planner_free> handle_;
+
+public:
+    LsmVectorSearchPlanner(const Dataset& dataset,
+                           std::vector<ShardSnapshot> snapshots,
+                           std::string vector_column,
+                           std::optional<std::vector<std::string>> pk_columns = std::nullopt,
+                           MemWalDistanceType distance_type = MemWalDistanceType::L2,
+                           std::optional<std::string> filter = std::nullopt);
+
+    ~LsmVectorSearchPlanner() = default;
+    LsmVectorSearchPlanner(LsmVectorSearchPlanner&&) noexcept = default;
+    LsmVectorSearchPlanner& operator=(LsmVectorSearchPlanner&&) noexcept = default;
+    LsmVectorSearchPlanner(const LsmVectorSearchPlanner&) = delete;
+    LsmVectorSearchPlanner& operator=(const LsmVectorSearchPlanner&) = delete;
+
+    ExecutionPlan plan_search(
+        const std::vector<float>& query,
+        uint64_t k = 10,
+        uint64_t nprobes = 20,
+        std::optional<std::vector<std::string>> columns = std::nullopt,
+        bool refine_base_table = false,
+        double overfetch_factor = 1.0) const;
+
+private:
+    explicit LsmVectorSearchPlanner(::LanceLsmVectorSearchPlanner* planner)
+        : handle_(planner) {
+        if (!handle_) check_error();
+    }
+    friend class Dataset;
 };
 
 // ─── Dataset ─────────────────────────────────────────────────────────────────
@@ -5507,6 +6321,53 @@ public:
         params.when_not_matched = LANCE_MERGE_WHEN_NOT_MATCHED_INSERT_ALL;
         params.when_not_matched_by_source = LANCE_MERGE_WHEN_NOT_MATCHED_BY_SOURCE_KEEP;
         return merge_insert(on_columns, source, &params);
+    }
+
+    // ─── MemWAL / LSM ────────────────────────────────────────────────────────
+
+    /// Initialize native MemWAL on this dataset. The handle is updated in
+    /// place; existing scanners keep their previous snapshot. Sharding mode,
+    /// column, bucket bounds, maintained index names, and writer defaults are
+    /// validated by native code.
+    void initialize_mem_wal(const MemWalInitOptions& options);
+
+    /// Read native MemWAL index details. Returns nullopt when MemWAL is not
+    /// initialized on the current snapshot.
+    std::optional<MemWalIndexDetails> mem_wal_index_details() const;
+
+    /// Open a native shard writer. The supplied shard ID must be a UUID;
+    /// `config` overrides native defaults for this writer only.
+    ShardWriter mem_wal_writer(const std::string& shard_id,
+                               const ShardWriterConfig& config = {}) const;
+
+    /// Merge `source` and atomically advance MemWAL compaction progress.
+    /// `source` is consumed on return or throw. An empty list is a plain merge.
+    LanceMergeInsertResult merge_insert_with_compaction(
+        const std::vector<std::string>& on_columns,
+        ArrowArrayStream* source,
+        const LanceMergeInsertParams* params,
+        const std::vector<CompactedSsTable>& compacted_sstables) {
+        std::vector<const char*> col_ptrs;
+        col_ptrs.reserve(on_columns.size());
+        for (const auto& column : on_columns) col_ptrs.push_back(column.c_str());
+        std::vector<::LanceCompactedSsTable> raw_compacted;
+        raw_compacted.reserve(compacted_sstables.size());
+        for (const auto& entry : compacted_sstables) {
+            raw_compacted.push_back(entry.to_c());
+        }
+        LanceMergeInsertResult result{};
+        if (lance_dataset_merge_insert_with_compaction(
+                handle_.get(),
+                col_ptrs.empty() ? nullptr : col_ptrs.data(),
+                col_ptrs.size(),
+                source,
+                params,
+                raw_compacted.empty() ? nullptr : raw_compacted.data(),
+                raw_compacted.size(),
+                &result) != 0) {
+            check_error();
+        }
+        return result;
     }
 
     /// Compact small or deleted-heavy fragments into larger ones, committing
@@ -9826,6 +10687,304 @@ inline Dataset Dataset::commit_namespace_uri(
     }
     return Dataset(out);
 }
+
+
+// ─── MemWAL out-of-line definitions ──────────────────────────────────────────
+
+/// One Arrow schema plus a materialized batch list.
+struct Table {
+    ArrowSchemaOwner schema;
+    std::vector<Batch> batches;
+};
+
+inline LanceSchema LanceSchema::from_arrow(const ArrowSchema* schema) {
+    ::LanceSchema* raw = nullptr;
+    if (lance_schema_from_arrow(schema, &raw) != 0) check_error();
+    return LanceSchema(raw);
+}
+
+inline void Dataset::initialize_mem_wal(const MemWalInitOptions& options) {
+    std::vector<const char*> maintained;
+    maintained.reserve(options.maintained_indexes.value_or(
+        std::vector<std::string>{}).size());
+    if (options.maintained_indexes) {
+        for (const auto& name : *options.maintained_indexes) {
+            maintained.push_back(name.c_str());
+        }
+    }
+    std::vector<std::string> names;
+    std::vector<::LanceMemWalHnswParams> hnsw;
+    ::LanceShardWriterConfig config{};
+    const ::LanceShardWriterConfig* config_ptr = nullptr;
+    if (options.writer_config) {
+        config = options.writer_config->to_c(names, hnsw);
+        config_ptr = &config;
+    }
+    if (lance_mem_wal_initialize(
+            const_cast<::LanceDataset*>(handle_.get()), options.mode,
+            options.column ? options.column->c_str() : nullptr,
+            options.num_buckets,
+            options.maintained_indexes.has_value() ? 1 : 0,
+            maintained.empty() ? nullptr : maintained.data(), maintained.size(),
+            config_ptr) != 0) {
+        check_error();
+    }
+}
+
+inline std::optional<MemWalIndexDetails> Dataset::mem_wal_index_details() const {
+    ::LanceMemWalIndexDetails* raw = nullptr;
+    if (lance_mem_wal_index_details(
+            const_cast<::LanceDataset*>(handle_.get()), &raw) != 0) {
+        check_error();
+    }
+    if (!raw) return std::nullopt;
+    Handle<::LanceMemWalIndexDetails, lance_mem_wal_index_details_free> details(raw);
+
+    std::vector<std::string> maintained;
+    const size_t maintained_count =
+        lance_mem_wal_index_details_maintained_index_count(details.get());
+    maintained.reserve(maintained_count);
+    for (size_t i = 0; i < maintained_count; ++i) {
+        const char* name = nullptr;
+        if (lance_mem_wal_index_details_maintained_index_at(
+                details.get(), i, &name) != 0) {
+            check_error();
+        }
+        maintained.emplace_back(name);
+    }
+
+    std::vector<ShardingSpec> specs;
+    const size_t spec_count =
+        lance_mem_wal_index_details_sharding_spec_count(details.get());
+    specs.reserve(spec_count);
+    for (size_t i = 0; i < spec_count; ++i) {
+        ::LanceMemWalShardingSpec* spec = nullptr;
+        if (lance_mem_wal_index_details_sharding_spec_at(
+                details.get(), i, &spec) != 0) {
+            check_error();
+        }
+        specs.emplace_back(spec);
+    }
+
+    std::map<std::string, std::string> defaults;
+    const size_t default_count =
+        lance_mem_wal_index_details_writer_config_default_count(details.get());
+    for (size_t i = 0; i < default_count; ++i) {
+        const char* key = nullptr;
+        const char* value = nullptr;
+        if (lance_mem_wal_index_details_writer_config_default_at(
+                details.get(), i, &key, &value) != 0) {
+            check_error();
+        }
+        defaults.emplace(key, value);
+    }
+
+    const uint32_t num_shards =
+        lance_mem_wal_index_details_num_shards(details.get());
+    const int32_t maintain_all =
+        lance_mem_wal_index_details_maintain_all_indexes(details.get());
+    return MemWalIndexDetails(num_shards, maintain_all != 0,
+                              std::move(maintained), std::move(specs),
+                              std::move(defaults));
+}
+
+inline ShardWriter Dataset::mem_wal_writer(
+    const std::string& shard_id, const ShardWriterConfig& config) const {
+    std::vector<std::string> names;
+    std::vector<::LanceMemWalHnswParams> hnsw;
+    auto raw_config = config.to_c(names, hnsw);
+    ::LanceShardWriter* raw = nullptr;
+    if (lance_shard_writer_open(
+            const_cast<::LanceDataset*>(handle_.get()), shard_id.c_str(),
+            &raw_config, &raw) != 0) {
+        check_error();
+    }
+    return ShardWriter(raw);
+}
+
+inline ShardWriter ShardWriter::open(const Dataset& dataset,
+                                     const std::string& shard_id,
+                                     const ShardWriterConfig& config) {
+    return dataset.mem_wal_writer(shard_id, config);
+}
+
+inline LsmScanner ShardWriter::lsm_scanner(
+    std::vector<ShardSnapshot> snapshots) {
+    std::vector<const ::LanceMemWalShardSnapshot*> raw;
+    raw.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) raw.push_back(snapshot.c_handle());
+    ::LanceLsmScanner* scanner = nullptr;
+    if (lance_shard_writer_lsm_scanner(
+            handle_.get(), raw.empty() ? nullptr : raw.data(), raw.size(),
+            &scanner) != 0) {
+        check_error();
+    }
+    return LsmScanner(scanner);
+}
+
+inline LsmScanner LsmScanner::from_snapshots(
+    const Dataset& dataset, std::vector<ShardSnapshot> snapshots) {
+    std::vector<const ::LanceMemWalShardSnapshot*> raw;
+    raw.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) raw.push_back(snapshot.c_handle());
+    ::LanceLsmScanner* scanner = nullptr;
+    if (lance_lsm_scanner_from_snapshots(
+            const_cast<::LanceDataset*>(dataset.c_handle()),
+            raw.empty() ? nullptr : raw.data(), raw.size(), &scanner) != 0) {
+        check_error();
+    }
+    return LsmScanner(scanner);
+}
+
+inline Batch LsmScanner::to_batch() const {
+    ::LanceBatch* raw = nullptr;
+    if (lance_lsm_scanner_to_batch(handle_.get(), &raw) != 0) check_error();
+    return Batch(raw);
+}
+
+inline std::vector<Batch> LsmScanner::to_batches() const {
+    std::vector<Batch> batches;
+    batches.push_back(to_batch());
+    return batches;
+}
+
+inline Table LsmScanner::to_table() const {
+    Table table;
+    ArrowSchema raw{};
+    if (lance_lsm_scanner_schema(handle_.get(), &raw) != 0) {
+        check_error();
+    }
+    table.schema = ArrowSchemaOwner(raw);
+    table.batches = to_batches();
+    return table;
+}
+
+inline ArrowSchemaOwner ExecutionPlan::schema() const {
+    ArrowSchema raw{};
+    if (lance_mem_wal_plan_schema(handle_.get(), &raw) != 0) {
+        check_error();
+    }
+    return ArrowSchemaOwner(raw);
+}
+
+inline ArrowSchemaOwner ExecutionPlan::dataset_schema() const {
+    ArrowSchema raw{};
+    if (lance_mem_wal_plan_dataset_schema(handle_.get(), &raw) != 0) {
+        check_error();
+    }
+    return ArrowSchemaOwner(raw);
+}
+
+inline Batch ExecutionPlan::to_batch() const {
+    ::LanceBatch* raw = nullptr;
+    if (lance_mem_wal_plan_to_batch(handle_.get(), &raw) != 0) check_error();
+    return Batch(raw);
+}
+
+inline std::vector<Batch> ExecutionPlan::to_batches() const {
+    std::vector<Batch> batches;
+    batches.push_back(to_batch());
+    return batches;
+}
+
+inline Table ExecutionPlan::to_table() const {
+    Table table;
+    table.schema = schema();
+    table.batches = to_batches();
+    return table;
+}
+
+inline LsmPointLookupPlanner::LsmPointLookupPlanner(
+    const Dataset& dataset, std::vector<ShardSnapshot> snapshots,
+    std::optional<std::vector<std::string>> pk_columns) {
+    std::vector<const ::LanceMemWalShardSnapshot*> raw;
+    raw.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) raw.push_back(snapshot.c_handle());
+    std::vector<const char*> columns;
+    if (pk_columns) {
+        columns.reserve(pk_columns->size());
+        for (const auto& column : *pk_columns) columns.push_back(column.c_str());
+    }
+    ::LanceLsmPointLookupPlanner* planner = nullptr;
+    if (lance_lsm_point_lookup_planner_new(
+            const_cast<::LanceDataset*>(dataset.c_handle()),
+            raw.empty() ? nullptr : raw.data(), raw.size(),
+            pk_columns.has_value() ? 1 : 0,
+            columns.empty() ? nullptr : columns.data(), columns.size(),
+            &planner) != 0) {
+        check_error();
+    }
+    handle_ = Handle<::LanceLsmPointLookupPlanner,
+                     lance_lsm_point_lookup_planner_free>(planner);
+}
+
+inline ExecutionPlan LsmPointLookupPlanner::plan_lookup(
+    const Batch& pk_value,
+    std::optional<std::vector<std::string>> columns) const {
+    std::vector<const char*> raw_columns;
+    if (columns) {
+        raw_columns.reserve(columns->size());
+        for (const auto& column : *columns) raw_columns.push_back(column.c_str());
+    }
+    ::LanceMemWalPlan* plan = nullptr;
+    if (lance_lsm_point_lookup_planner_plan(
+            handle_.get(), pk_value.c_handle(),
+            columns.has_value() ? 1 : 0,
+            raw_columns.empty() ? nullptr : raw_columns.data(),
+            raw_columns.size(), &plan) != 0) {
+        check_error();
+    }
+    return ExecutionPlan(plan);
+}
+
+inline LsmVectorSearchPlanner::LsmVectorSearchPlanner(
+    const Dataset& dataset, std::vector<ShardSnapshot> snapshots,
+    std::string vector_column,
+    std::optional<std::vector<std::string>> pk_columns,
+    MemWalDistanceType distance_type, std::optional<std::string> filter) {
+    std::vector<const ::LanceMemWalShardSnapshot*> raw;
+    raw.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) raw.push_back(snapshot.c_handle());
+    std::vector<const char*> columns;
+    if (pk_columns) {
+        columns.reserve(pk_columns->size());
+        for (const auto& column : *pk_columns) columns.push_back(column.c_str());
+    }
+    ::LanceLsmVectorSearchPlanner* planner = nullptr;
+    if (lance_lsm_vector_search_planner_new(
+            const_cast<::LanceDataset*>(dataset.c_handle()),
+            raw.empty() ? nullptr : raw.data(), raw.size(),
+            vector_column.c_str(), pk_columns.has_value() ? 1 : 0,
+            columns.empty() ? nullptr : columns.data(), columns.size(),
+            static_cast<::LanceMemWalDistanceType>(distance_type),
+            filter ? filter->c_str() : nullptr, &planner) != 0) {
+        check_error();
+    }
+    handle_ = Handle<::LanceLsmVectorSearchPlanner,
+                     lance_lsm_vector_search_planner_free>(planner);
+}
+
+inline ExecutionPlan LsmVectorSearchPlanner::plan_search(
+    const std::vector<float>& query, uint64_t k, uint64_t nprobes,
+    std::optional<std::vector<std::string>> columns, bool refine_base_table,
+    double overfetch_factor) const {
+    std::vector<const char*> raw_columns;
+    if (columns) {
+        raw_columns.reserve(columns->size());
+        for (const auto& column : *columns) raw_columns.push_back(column.c_str());
+    }
+    ::LanceMemWalPlan* plan = nullptr;
+    if (lance_lsm_vector_search_planner_plan(
+            handle_.get(), query.empty() ? nullptr : query.data(), query.size(),
+            k, nprobes, columns.has_value() ? 1 : 0,
+            raw_columns.empty() ? nullptr : raw_columns.data(),
+            raw_columns.size(), refine_base_table ? 1 : 0, overfetch_factor,
+            &plan) != 0) {
+        check_error();
+    }
+    return ExecutionPlan(plan);
+}
+
 
 } // namespace lance
 

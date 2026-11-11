@@ -67,7 +67,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: |
+          # Use an independent mirror while Ubuntu archive DNS is unavailable.
+          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
@@ -87,7 +91,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler lld
+        run: |
+          # Use an independent mirror while Ubuntu archive DNS is unavailable.
+          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler lld
       - name: Build library artifacts
         run: cargo build --lib
       - name: Run tests
@@ -133,7 +141,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: |
+          # Use an independent mirror while Ubuntu archive DNS is unavailable.
+          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
@@ -148,6 +160,10 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: |
+          # Use an independent mirror while Ubuntu archive DNS is unavailable.
+          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Check MSRV
         run: cargo check --all-targets

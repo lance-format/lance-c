@@ -44858,6 +44858,2202 @@ fn test_update_bases_proto_preserves_native_names_with_embedded_nul() {
 }
 
 // ---------------------------------------------------------------------------
+// MemWAL / LSM public workflow (issue 117)
+// ---------------------------------------------------------------------------
+
+fn mw_vector_dim() -> i32 {
+    4
+}
+
+const MW_SHARDING_MANUAL: i32 = 0;
+const MW_SHARDING_UNSHARDED: i32 = 1;
+const MW_SHARDING_BUCKET: i32 = 2;
+const MW_SHARDING_IDENTITY: i32 = 3;
+const MW_DISTANCE_L2: i32 = 0;
+const MW_MERGE_UPDATE_ALL: i32 = 1;
+const MW_MERGE_INSERT_ALL: i32 = 0;
+const MW_MERGE_KEEP: i32 = 0;
+
+fn mw_schema() -> Arc<Schema> {
+    let mut pk = HashMap::new();
+    pk.insert(
+        "lance-schema:unenforced-primary-key".to_string(),
+        "true".to_string(),
+    );
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(pk),
+        Field::new("name", DataType::Utf8, true),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                mw_vector_dim(),
+            ),
+            true,
+        ),
+    ]))
+}
+
+fn mw_batch(ids: &[i32], names: &[Option<&str>], vectors: &[[f32; 4]]) -> RecordBatch {
+    let schema = mw_schema();
+    let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+    let vector = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        mw_vector_dim(),
+        Arc::new(Float32Array::from(flat)),
+        None,
+    )
+    .unwrap();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(names.to_vec())),
+            Arc::new(vector),
+        ],
+    )
+    .unwrap()
+}
+
+fn mw_create_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("memwal_ds").to_str().unwrap().to_string();
+    let batch = mw_batch(
+        &[1, 2, 3],
+        &[Some("a"), Some("b"), Some("c")],
+        &[
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ],
+    );
+    let schema = batch.schema();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+    (tmp, uri)
+}
+
+fn mw_open(uri: &str) -> *mut lance_c::LanceDataset {
+    let uri = c_str(uri);
+    let ds = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    ds
+}
+
+fn mw_initialize(
+    ds: *mut lance_c::LanceDataset,
+    mode: i32,
+    column: Option<&str>,
+    buckets: u32,
+) -> i32 {
+    mw_initialize_with_config(ds, mode, column, buckets, ptr::null())
+}
+
+fn mw_initialize_with_config(
+    ds: *mut lance_c::LanceDataset,
+    mode: i32,
+    column: Option<&str>,
+    buckets: u32,
+    config: *const LanceShardWriterConfig,
+) -> i32 {
+    let column = column.map(c_str);
+    unsafe {
+        lance_mem_wal_initialize(
+            ds,
+            mode,
+            column.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
+            buckets,
+            0,
+            ptr::null(),
+            0,
+            config,
+        )
+    }
+}
+
+fn mw_writer_open(ds: *mut lance_c::LanceDataset, shard: &str) -> *mut LanceShardWriter {
+    let shard = c_str(shard);
+    let mut writer = ptr::null_mut();
+    let rc = unsafe { lance_shard_writer_open(ds, shard.as_ptr(), ptr::null(), &mut writer) };
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert!(!writer.is_null());
+    writer
+}
+
+fn mw_put(writer: *mut LanceShardWriter, batch: RecordBatch) -> LanceShardWriteResult {
+    let mut result = LanceShardWriteResult::default();
+    let rc =
+        unsafe { lance_shard_writer_put(writer, &mut batch_to_ffi_stream(batch), &mut result) };
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    result
+}
+
+fn mw_scan_to_batches(scanner: *mut LanceLsmScanner) -> Vec<RecordBatch> {
+    let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+    let rc = unsafe { lance_lsm_scanner_to_arrow_stream(scanner, stream.as_mut_ptr()) };
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let stream = unsafe { stream.assume_init() };
+    c_stream_batches(stream).1
+}
+
+fn mw_int32_values(batches: &[RecordBatch], column: &str) -> Vec<i32> {
+    let mut values = Vec::new();
+    for batch in batches {
+        let array = batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("missing column {column} in {:?}", batch.schema()))
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        values.extend(array.iter().flatten());
+    }
+    values
+}
+
+#[test]
+fn test_memwal_free_releases_active_batch_without_close() {
+    use arrow::buffer::{Buffer, ScalarBuffer};
+    use std::ptr::NonNull;
+
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let writer = mw_writer_open(ds, "00000000-0000-0000-0000-000000000000");
+
+    let owner = Arc::new(vec![42_i32]);
+    let weak = Arc::downgrade(&owner);
+    let data = unsafe {
+        Buffer::from_custom_allocation(
+            NonNull::new(owner.as_ptr() as *mut u8).unwrap(),
+            std::mem::size_of::<i32>(),
+            owner,
+        )
+    };
+    let tracked = Int32Array::new(ScalarBuffer::new(data, 0, 1), None);
+    let template = mw_batch(&[42], &[Some("tracked")], &[[0.0; 4]]);
+    let mut columns = template.columns().to_vec();
+    columns[0] = Arc::new(tracked);
+    mw_put(
+        writer,
+        RecordBatch::try_new(template.schema(), columns).unwrap(),
+    );
+    assert!(weak.upgrade().is_some());
+
+    unsafe { lance_shard_writer_free(writer) };
+    let released = weak.upgrade().is_none();
+    unsafe { lance_dataset_close(ds) };
+    assert!(released, "freed writer still retains active batch");
+}
+
+#[test]
+fn test_memwal_plan_stream_rejects_unexportable_schema() {
+    const CHILD_ENV: &str = "LANCE_C_TEST_MEMWAL_PLAN_SCHEMA_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "test_memwal_plan_stream_rejects_unexportable_schema",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "schema subprocess failed ({:?})\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("nul_schema").to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        mw_schema().field(0).clone(),
+        Field::new("bad\0name", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![2])),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(Dataset::write(
+        arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &uri,
+        None,
+    ))
+    .unwrap();
+
+    let ds = mw_open(&uri);
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_new(ds, ptr::null(), 0, 0, ptr::null(), 0, &mut planner)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let key = mw_batch(&[1], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let (mut array, schema) = ffi_record_batch(&key);
+    let mut key_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut key_batch) },
+        0
+    );
+    let mut plan = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key_batch, 0, ptr::null(), 0, &mut plan)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { lance_mem_wal_plan_to_arrow_stream(plan, &mut stream) };
+    if rc == 0 {
+        let mut schema = FFI_ArrowSchema::empty();
+        unsafe { stream.get_schema.unwrap()(&mut stream, &mut schema) };
+        panic!("unexportable schema reached the C callback");
+    }
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    assert!(take_last_error_message().contains("panic exporting Arrow schema"));
+    assert!(stream.release.is_none());
+    assert!(stream.get_schema.is_none());
+    assert!(stream.get_next.is_none());
+    unsafe {
+        lance_mem_wal_plan_free(plan);
+        lance_batch_free(key_batch);
+        lance_lsm_point_lookup_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_initialize_and_details() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+
+    // Uninitialized dataset: success with a NULL optional handle.
+    let mut missing: *mut LanceMemWalIndexDetails = ptr::dangling_mut();
+    assert_eq!(unsafe { lance_mem_wal_index_details(ds, &mut missing) }, 0);
+    assert!(missing.is_null());
+
+    assert_eq!(
+        mw_initialize_with_config(
+            ds,
+            MW_SHARDING_UNSHARDED,
+            None,
+            0,
+            &LanceShardWriterConfig::default()
+        ),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut details = ptr::null_mut();
+    assert_eq!(unsafe { lance_mem_wal_index_details(ds, &mut details) }, 0);
+    assert!(!details.is_null());
+    assert_eq!(
+        unsafe { lance_mem_wal_index_details_num_shards(details) },
+        1
+    );
+    assert_eq!(
+        unsafe { lance_mem_wal_index_details_maintain_all_indexes(details) },
+        1
+    );
+    assert_eq!(
+        unsafe { lance_mem_wal_index_details_maintained_index_count(details) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_mem_wal_index_details_sharding_spec_count(details) },
+        1
+    );
+
+    let mut spec = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_index_details_sharding_spec_at(details, 0, &mut spec) },
+        0
+    );
+    assert_eq!(unsafe { lance_mem_wal_sharding_spec_field_count(spec) }, 1);
+    let mut field = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_sharding_spec_field_at(spec, 0, &mut field) },
+        0
+    );
+    let id = unsafe { CStr::from_ptr(lance_mem_wal_sharding_field_id(field)) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(id, "bucket");
+    let transform = unsafe { CStr::from_ptr(lance_mem_wal_sharding_field_transform(field)) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(transform, "unsharded");
+    unsafe {
+        lance_mem_wal_sharding_field_free(field);
+        lance_mem_wal_sharding_spec_free(spec);
+    }
+
+    // Writer defaults are the native defaults and sorting is lexicographic.
+    let count = unsafe { lance_mem_wal_index_details_writer_config_default_count(details) };
+    assert!(count > 0);
+    let mut previous = String::new();
+    let mut seen = HashMap::new();
+    for index in 0..count {
+        let mut key = ptr::null();
+        let mut value = ptr::null();
+        assert_eq!(
+            unsafe {
+                lance_mem_wal_index_details_writer_config_default_at(
+                    details, index, &mut key, &mut value,
+                )
+            },
+            0
+        );
+        let key = unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_string();
+        let value = unsafe { CStr::from_ptr(value) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(previous.is_empty() || previous < key, "{previous} !< {key}");
+        previous = key.clone();
+        seen.insert(key, value);
+    }
+    assert_eq!(seen.get("durable_write").map(String::as_str), Some("true"));
+    assert_eq!(
+        seen.get("max_memtable_rows").map(String::as_str),
+        Some("100000")
+    );
+    assert!(!seen.contains_key("stats_log_interval_ms") || seen["stats_log_interval_ms"] != "0");
+    unsafe { lance_mem_wal_index_details_free(details) };
+
+    // A second initialization is rejected and does not clobber the output.
+    let mut untouched: *mut LanceMemWalIndexDetails = ptr::dangling_mut();
+    assert_eq!(mw_initialize(ds, MW_SHARDING_MANUAL, None, 0), -1);
+    assert!(take_last_error_message().contains("already initialized"));
+    unsafe {
+        lance_mem_wal_index_details(ds, &mut untouched);
+        lance_mem_wal_index_details_free(untouched);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_sharding_values_match_native() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(
+        mw_initialize(ds, MW_SHARDING_BUCKET, Some("id"), 8),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut details = ptr::null_mut();
+    assert_eq!(unsafe { lance_mem_wal_index_details(ds, &mut details) }, 0);
+    let mut spec = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_index_details_sharding_spec_at(details, 0, &mut spec) },
+        0
+    );
+    let mut field = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_sharding_spec_field_at(spec, 0, &mut field) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_mem_wal_sharding_field_parameter_count(field) },
+        1
+    );
+    let mut key = ptr::null();
+    let mut value = ptr::null();
+    assert_eq!(
+        unsafe { lance_mem_wal_sharding_field_parameter_at(field, 0, &mut key, &mut value) },
+        0
+    );
+    assert_eq!(
+        unsafe { CStr::from_ptr(key) }.to_str().unwrap(),
+        "num_buckets"
+    );
+    assert_eq!(unsafe { CStr::from_ptr(value) }.to_str().unwrap(), "8");
+
+    let input = mw_batch(
+        &[1, 2, 3],
+        &[Some("a"), Some("b"), Some("c")],
+        &[[0.0; 4], [1.0; 4], [2.0; 4]],
+    );
+    let (mut array, arrow_schema) = ffi_record_batch(&input);
+    let mut batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &arrow_schema, &mut batch) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut output = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_evaluate_sharding_spec(ds, batch, spec, &mut output) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut ffi_array = arrow::ffi::FFI_ArrowArray::empty();
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_batch_to_arrow(output, &mut ffi_array, &mut ffi_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let data = unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap();
+    let c_out = RecordBatch::from(StructArray::from(data));
+    let c_values = c_out
+        .column_by_name("bucket")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+
+    // Independent native oracle built from the same dataset schema ids.
+    use lance::dataset::mem_wal::evaluate_sharding_spec;
+    use lance_table::system_index::mem_wal::{ShardingField, ShardingSpec};
+    let native_out = lance_c::runtime::block_on(async {
+        let native = Dataset::open(&uri).await.unwrap();
+        let source_id = native.schema().field("id").unwrap().id;
+        let native_spec = ShardingSpec {
+            spec_id: 1,
+            fields: vec![ShardingField {
+                field_id: "bucket".to_string(),
+                source_ids: vec![source_id],
+                transform: Some("bucket".to_string()),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters: HashMap::from([("num_buckets".to_string(), "8".to_string())]),
+            }],
+        };
+        evaluate_sharding_spec(&input, &native_spec, native.schema()).unwrap()
+    });
+    let native_values = native_out
+        .column_by_name("bucket")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(c_values, native_values);
+    assert!(c_values.iter().all(|v| (0..8).contains(v)));
+
+    unsafe {
+        lance_batch_free(output);
+        lance_batch_free(batch);
+        lance_mem_wal_sharding_field_free(field);
+        lance_mem_wal_sharding_spec_free(spec);
+        lance_mem_wal_index_details_free(details);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_composite_primary_key_lookup() {
+    let mut pk = HashMap::new();
+    pk.insert(
+        "lance-schema:unenforced-primary-key".to_string(),
+        "true".to_string(),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(pk.clone()),
+        Field::new("tenant", DataType::Utf8, false).with_metadata(pk),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+            Arc::new(StringArray::from(vec![Some("alice"), Some("bob")])),
+        ],
+    )
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("composite_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let ds = mw_open(&uri);
+    assert_eq!(
+        mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let id = c"id";
+    let tenant = c"tenant";
+    let pk_columns = [id.as_ptr(), tenant.as_ptr()];
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_new(
+                ds,
+                ptr::null(),
+                0,
+                1,
+                pk_columns.as_ptr(),
+                2,
+                &mut planner,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let key_fields = Fields::from(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("tenant", DataType::Utf8, false),
+    ]);
+    let keys = StructArray::try_new(
+        key_fields.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![2])),
+            Arc::new(StringArray::from(vec![Some("b")])),
+        ],
+        None,
+    )
+    .unwrap();
+    let key_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "pk",
+            DataType::Struct(key_fields),
+            false,
+        )])),
+        vec![Arc::new(keys)],
+    )
+    .unwrap();
+    let (mut array, key_schema) = ffi_record_batch(&key_batch);
+    let mut key = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &key_schema, &mut key) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let name = c"name";
+    let columns = [name.as_ptr()];
+    let mut plan = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key, 1, columns.as_ptr(), 1, &mut plan)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_to_batch(plan, &mut batch) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut ffi_array = arrow::ffi::FFI_ArrowArray::empty();
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_batch_to_arrow(batch, &mut ffi_array, &mut ffi_schema) },
+        0
+    );
+    let data = unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap();
+    let result = RecordBatch::from(StructArray::from(data));
+    assert_eq!(result.num_rows(), 1);
+    let names = result
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "bob");
+
+    unsafe {
+        lance_batch_free(batch);
+        lance_mem_wal_plan_free(plan);
+        lance_batch_free(key);
+        lance_lsm_point_lookup_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_writer_scan_mutation_and_durable_reopen() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(
+        mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let shard = "00000000-0000-0000-0000-000000000000";
+    let writer = mw_writer_open(ds, shard);
+
+    let first = mw_put(
+        writer,
+        mw_batch(
+            &[10, 11],
+            &[Some("x"), Some("y")],
+            &[[0.5, 0.0, 0.0, 0.0], [0.25, 0.0, 0.0, 0.0]],
+        ),
+    );
+    assert!(first.batch_position_end > first.batch_position_begin);
+
+    let mut stats = LanceShardWriterStats::default();
+    assert_eq!(
+        unsafe { lance_shard_writer_stats(writer, &mut stats) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(stats.put_count, 1);
+
+    let mut memory = LanceShardMemTableStats::default();
+    assert_eq!(
+        unsafe { lance_shard_writer_memtable_stats(writer, &mut memory) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(memory.is_live, 1);
+    assert!(memory.row_count >= 2);
+
+    // Writer scanner must include base rows and live (pre-flush) rows.
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(writer, ptr::null(), 0, &mut scanner) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut ids = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3, 10, 11]);
+    let mut count = 0_u64;
+    assert_eq!(
+        unsafe { lance_lsm_scanner_count_rows(scanner, &mut count) },
+        0
+    );
+    assert_eq!(count, 5);
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(writer, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    let filter = c_str("id >= 10");
+    assert_eq!(
+        unsafe { lance_lsm_scanner_filter(scanner, filter.as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let filter_ids = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    assert_eq!(filter_ids.len(), 2);
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    // A scanner over explicit snapshots still sees the base table.
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_lsm_scanner_from_snapshots(ds, ptr::null(), 0, &mut scanner) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let name = c_str("name");
+    assert_eq!(
+        unsafe { lance_lsm_scanner_project(scanner, &name.as_ptr(), 1) },
+        0
+    );
+    assert_eq!(unsafe { lance_lsm_scanner_limit(scanner, 2, 1, 1, 1) }, 0);
+    assert_eq!(unsafe { lance_lsm_scanner_with_row_address(scanner) }, 0);
+    assert_eq!(unsafe { lance_lsm_scanner_with_memtable_gen(scanner) }, 0);
+    let batches = mw_scan_to_batches(scanner);
+    assert!(!batches.is_empty());
+    assert!(batches[0].column_by_name("_rowaddr").is_some());
+    assert!(batches[0].column_by_name("_memtable_gen").is_some());
+    // Native projection keeps primary-key columns for deduplication.
+    assert!(batches[0].column_by_name("id").is_some());
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    let mut count = 0_u64;
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(writer, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_lsm_scanner_count_rows(scanner, &mut count) },
+        0
+    );
+    assert_eq!(count, 5);
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    // Snapshot before close is optional; representing it via the native owner.
+    let mut snapshot: *mut LanceMemWalShardSnapshot = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_snapshot(writer, &mut snapshot) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_mem_wal_shard_snapshot_free(snapshot) };
+
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    // Repeated close preserves Python's already-closed success.
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    let mut closed_stats = LanceShardWriterStats::default();
+    assert_eq!(
+        unsafe { lance_shard_writer_stats(writer, &mut closed_stats) },
+        0
+    );
+    assert_eq!(closed_stats.put_count, 1);
+    unsafe { lance_shard_writer_free(writer) };
+
+    // Durable reopen replays the WAL into a new native writer.
+    let writer = mw_writer_open(ds, shard);
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(writer, ptr::null(), 0, &mut scanner) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut ids = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3, 10, 11]);
+    unsafe {
+        lance_lsm_scanner_free(scanner);
+        assert_eq!(lance_shard_writer_close(writer), 0);
+        lance_shard_writer_free(writer);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_point_lookup_planner_on_base() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_new(ds, ptr::null(), 0, 0, ptr::null(), 0, &mut planner)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!planner.is_null());
+
+    let key = mw_batch(&[2], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let (mut array, schema) = ffi_record_batch(&key);
+    let mut key_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut key_batch) },
+        0
+    );
+    let mut plan = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key_batch, 0, ptr::null(), 0, &mut plan)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!plan.is_null());
+
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_schema(plan, &mut ffi_schema) },
+        0
+    );
+    let plan_field = Field::try_from(&ffi_schema).unwrap();
+    use lance_arrow::DataTypeExt;
+    assert!(plan_field.data_type().is_struct());
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_dataset_schema(plan, &mut ffi_schema) },
+        0
+    );
+    let mut explain = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_explain(plan, &mut explain) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let text = unsafe { CStr::from_ptr(explain) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { lance_free_string(explain) };
+    assert!(text.contains("Filter") || text.contains("filter"), "{text}");
+
+    let mut batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_to_batch(plan, &mut batch) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut ffi_array = arrow::ffi::FFI_ArrowArray::empty();
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_batch_to_arrow(batch, &mut ffi_array, &mut ffi_schema) },
+        0
+    );
+    let data = unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap();
+    let batch = RecordBatch::from(StructArray::from(data));
+    assert_eq!(mw_int32_values(&[batch], "id"), vec![2]);
+
+    // Point lookup rejects a two-row key batch before native execution.
+    let key = mw_batch(&[2, 3], &[None, None], &[[0.0; 4], [0.0; 4]]);
+    let (mut array, schema) = ffi_record_batch(&key);
+    let mut key_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut key_batch) },
+        0
+    );
+    let mut rejected = ptr::dangling_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(
+                planner,
+                key_batch,
+                0,
+                ptr::null(),
+                0,
+                &mut rejected,
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("exactly one row") || message.contains("row"),
+        "{message}"
+    );
+    unsafe {
+        lance_batch_free(key_batch);
+        lance_mem_wal_plan_free(plan);
+        lance_lsm_point_lookup_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_vector_search_planner_on_base() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let column = c_str("vector");
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_vector_search_planner_new(
+                ds,
+                ptr::null(),
+                0,
+                column.as_ptr(),
+                0,
+                ptr::null(),
+                0,
+                MW_DISTANCE_L2,
+                ptr::null(),
+                &mut planner,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let query = [0.9_f32, 0.1, 0.0, 0.0];
+    let mut plan = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_vector_search_planner_plan(
+                planner,
+                query.as_ptr(),
+                query.len(),
+                2,
+                20,
+                0,
+                ptr::null(),
+                0,
+                0,
+                1.0,
+                &mut plan,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_to_arrow_stream(plan, stream.as_mut_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let batches = c_stream_batches(unsafe { stream.assume_init() }).1;
+    let ids = mw_int32_values(&batches, "id");
+    // Native vector planning requires a base vector index; without one the
+    // plan is valid but yields no base rows. The indexed test below covers
+    // neighbor behavior against an independent flat-distance control.
+    assert!(ids.is_empty(), "{ids:?}");
+    unsafe { lance_mem_wal_plan_free(plan) };
+
+    // Wrong query dimension is rejected by native with the dimension details.
+    let short = [0.0_f32; 3];
+    let mut rejected = ptr::dangling_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_vector_search_planner_plan(
+                planner,
+                short.as_ptr(),
+                short.len(),
+                1,
+                20,
+                0,
+                ptr::null(),
+                0,
+                0,
+                1.0,
+                &mut rejected,
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dimension"), "{message}");
+
+    unsafe {
+        lance_lsm_vector_search_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_merge_insert_with_compaction() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+
+    let shard = "00000000-0000-0000-0000-000000000000";
+    for batch in [
+        mw_batch(&[2, 4], &[Some("bb"), Some("dd")], &[[0.0; 4], [0.0; 4]]),
+        mw_batch(&[4], &[Some("dd-final")], &[[0.0; 4]]),
+    ] {
+        let writer = mw_writer_open(ds, shard);
+        mw_put(writer, batch);
+        assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+        unsafe { lance_shard_writer_free(writer) };
+    }
+
+    // Closing each writer flushes a real generation before the next opens.
+    let writer = mw_writer_open(ds, shard);
+    let mut snapshot = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_snapshot(writer, &mut snapshot) },
+        0
+    );
+    assert!(!snapshot.is_null());
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    unsafe { lance_shard_writer_free(writer) };
+
+    let count = unsafe { lance_mem_wal_shard_snapshot_sstable_count(snapshot) };
+    assert!(count > 0, "close must persist the written rows in SSTables");
+    let mut max_generation = 0;
+    for index in 0..count {
+        let mut generation = 0;
+        let mut path = ptr::null();
+        assert_eq!(
+            unsafe {
+                lance_mem_wal_shard_snapshot_sstable_at(snapshot, index, &mut generation, &mut path)
+            },
+            0
+        );
+        assert!(!unsafe { CStr::from_ptr(path) }.to_bytes().is_empty());
+        max_generation = max_generation.max(generation);
+    }
+    assert!(max_generation > 0);
+    let mut compacted = LanceCompactedSsTable {
+        shard_id: [0; 16],
+        generation: 0,
+    };
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_compacted_sstable_new(
+                lance_mem_wal_shard_snapshot_shard_id(snapshot),
+                max_generation,
+                &mut compacted,
+            )
+        },
+        0
+    );
+
+    let mut scanner = ptr::null_mut();
+    let snapshots = [snapshot as *const LanceMemWalShardSnapshot];
+    assert_eq!(
+        unsafe {
+            lance_lsm_scanner_from_snapshots(ds, snapshots.as_ptr(), snapshots.len(), &mut scanner)
+        },
+        0
+    );
+    let filter = c_str("id = 2 OR id = 4");
+    assert_eq!(
+        unsafe { lance_lsm_scanner_filter(scanner, filter.as_ptr()) },
+        0
+    );
+    let mut source = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+    assert_eq!(
+        unsafe { lance_lsm_scanner_to_arrow_stream(scanner, source.as_mut_ptr()) },
+        0
+    );
+    let mut source = unsafe { source.assume_init() };
+    unsafe {
+        lance_lsm_scanner_free(scanner);
+        lance_mem_wal_shard_snapshot_free(snapshot);
+    }
+
+    let old = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let version = unsafe { lance_dataset_version(ds) };
+    let on = c_str("id");
+    let on_columns = [on.as_ptr()];
+    let params = LanceMergeInsertParams {
+        when_matched: MW_MERGE_UPDATE_ALL,
+        when_matched_expr: ptr::null(),
+        when_not_matched: MW_MERGE_INSERT_ALL,
+        when_not_matched_by_source: MW_MERGE_KEEP,
+        when_not_matched_by_source_expr: ptr::null(),
+    };
+    let mut result = LanceMergeInsertResult::default();
+    assert_eq!(
+        unsafe {
+            lance_dataset_merge_insert_with_compaction(
+                ds,
+                on_columns.as_ptr(),
+                on_columns.len(),
+                &mut source,
+                &params,
+                &compacted,
+                1,
+                &mut result,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(result.num_inserted_rows, 1);
+    assert_eq!(result.num_updated_rows, 1);
+    assert_eq!(unsafe { lance_dataset_version(ds) }, version + 1);
+
+    // Inspect the persisted data and native progress from the same version.
+    lance_c::runtime::block_on(async {
+        use futures::TryStreamExt;
+        use lance::dataset::mem_wal::DatasetMemWalExt;
+
+        let reopened = Dataset::open(&uri).await.unwrap();
+        assert_eq!(reopened.version().version, version + 1);
+        let details = reopened.mem_wal_index_details().await.unwrap().unwrap();
+        assert_eq!(details.compacted_sstables.len(), 1);
+        assert_eq!(
+            details.compacted_sstables[0].shard_id.as_bytes(),
+            &compacted.shard_id
+        );
+        assert_eq!(details.compacted_sstables[0].generation, max_generation);
+
+        let batches = reopened
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), names.value(i).to_string())));
+        }
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a".into()),
+                (2, "bb".into()),
+                (3, "c".into()),
+                (4, "dd-final".into())
+            ]
+        );
+        assert_eq!(old.count_rows(None).await.unwrap(), 3);
+        assert!(
+            old.mem_wal_index_details()
+                .await
+                .unwrap()
+                .unwrap()
+                .compacted_sstables
+                .is_empty()
+        );
+    });
+
+    // Empty compaction list behaves like the plain merge-insert entry point.
+    let source = mw_batch(&[5], &[Some("ee")], &[[0.0; 4]]);
+    let mut result = LanceMergeInsertResult::default();
+    assert_eq!(
+        unsafe {
+            lance_dataset_merge_insert_with_compaction(
+                ds,
+                on_columns.as_ptr(),
+                on_columns.len(),
+                &mut batch_to_ffi_stream(source),
+                &params,
+                ptr::null(),
+                0,
+                &mut result,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(result.num_inserted_rows, 1);
+
+    let native = lance_c::runtime::block_on(async {
+        let ds = Dataset::open(&uri).await.unwrap();
+        ds.count_rows(None).await.unwrap()
+    });
+    assert_eq!(native, 5);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_memwal_oversized_array_counts_are_invalid_arguments() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    let version = unsafe { lance_dataset_version(ds) };
+    let key = c_str("id");
+    let columns = [key.as_ptr()];
+    let pointer_count = isize::MAX as usize / std::mem::size_of::<*const std::ffi::c_char>() + 1;
+    let assert_count_error = |label: &str| {
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = take_last_error_message();
+        assert!(message.contains(label), "{message}");
+        assert!(message.contains("count"), "{message}");
+    };
+
+    let compacted = LanceCompactedSsTable {
+        shard_id: [0; 16],
+        generation: 0,
+    };
+    let compacted_count = isize::MAX as usize / std::mem::size_of::<LanceCompactedSsTable>() + 1;
+    for count in [compacted_count, usize::MAX] {
+        let mut source = batch_to_ffi_stream(mw_batch(&[4], &[Some("d")], &[[0.0; 4]]));
+        let mut result = LanceMergeInsertResult {
+            num_inserted_rows: 11,
+            num_updated_rows: 12,
+            num_deleted_rows: 13,
+        };
+        assert_eq!(
+            unsafe {
+                lance_dataset_merge_insert_with_compaction(
+                    ds,
+                    columns.as_ptr(),
+                    columns.len(),
+                    &mut source,
+                    ptr::null(),
+                    &compacted,
+                    count,
+                    &mut result,
+                )
+            },
+            -1
+        );
+        assert_count_error("compacted_sstables");
+        assert_eq!(result.num_inserted_rows, 11);
+        assert_eq!(result.num_updated_rows, 12);
+        assert_eq!(result.num_deleted_rows, 13);
+    }
+
+    let mut source = batch_to_ffi_stream(mw_batch(&[4], &[Some("d")], &[[0.0; 4]]));
+    assert_eq!(
+        unsafe {
+            lance_dataset_merge_insert(
+                ds,
+                columns.as_ptr(),
+                pointer_count,
+                &mut source,
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    assert_count_error("on_columns");
+
+    let snapshots = [ptr::null::<LanceMemWalShardSnapshot>()];
+    let mut scanner = ptr::dangling_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_scanner_from_snapshots(ds, snapshots.as_ptr(), pointer_count, &mut scanner)
+        },
+        -1
+    );
+    assert_count_error("snapshots");
+    assert_eq!(scanner, ptr::dangling_mut());
+    assert_eq!(
+        unsafe { lance_lsm_scanner_from_snapshots(ds, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_lsm_scanner_project(scanner, columns.as_ptr(), pointer_count) },
+        -1
+    );
+    assert_count_error("columns");
+    assert_eq!(
+        unsafe { lance_lsm_scanner_project(scanner, columns.as_ptr(), columns.len()) },
+        0
+    );
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    let fields = [ptr::null::<LanceMemWalShardingField>()];
+    let mut spec = ptr::dangling_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_sharding_spec_new(0, fields.as_ptr(), pointer_count, &mut spec) },
+        -1
+    );
+    assert_count_error("fields");
+    assert_eq!(spec, ptr::dangling_mut());
+
+    let source_id = 0;
+    let source_id_count = isize::MAX as usize / std::mem::size_of::<i32>() + 1;
+    let mut field = ptr::dangling_mut();
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_sharding_field_new(
+                key.as_ptr(),
+                &source_id,
+                source_id_count,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                &mut field,
+            )
+        },
+        -1
+    );
+    assert_count_error("source_ids");
+    assert_eq!(field, ptr::dangling_mut());
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_sharding_field_new(
+                key.as_ptr(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                columns.as_ptr(),
+                columns.as_ptr(),
+                pointer_count,
+                &mut field,
+            )
+        },
+        -1
+    );
+    assert_count_error("parameters");
+    assert_eq!(field, ptr::dangling_mut());
+
+    let hnsw = LanceMemWalHnswParams {
+        index_name: key.as_ptr(),
+        has_num_edges: 0,
+        num_edges: 0,
+        has_ef_construction: 0,
+        ef_construction: 0,
+        has_max_level: 0,
+        max_level: 0,
+    };
+    let config = LanceShardWriterConfig {
+        hnsw_params: &hnsw,
+        num_hnsw_params: isize::MAX as usize / std::mem::size_of::<LanceMemWalHnswParams>() + 1,
+        ..Default::default()
+    };
+    let shard = c_str("00000000-0000-0000-0000-000000000000");
+    let mut writer = ptr::dangling_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_open(ds, shard.as_ptr(), &config, &mut writer) },
+        -1
+    );
+    assert_count_error("hnsw_params");
+    assert_eq!(writer, ptr::dangling_mut());
+    assert_eq!(unsafe { lance_dataset_version(ds) }, version);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_memwal_null_and_error_edges() {
+    assert_eq!(
+        unsafe { lance_mem_wal_index_details(ptr::null_mut(), ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(
+        unsafe {
+            lance_shard_writer_open(ptr::null_mut(), ptr::null(), ptr::null(), ptr::null_mut())
+        },
+        -1
+    );
+    assert_eq!(
+        unsafe {
+            lance_lsm_scanner_from_snapshots(ptr::null_mut(), ptr::null(), 0, ptr::null_mut())
+        },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_explain(ptr::null(), ptr::null_mut()) },
+        -1
+    );
+
+    // Invalid UUID is rejected with the offending text.
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let bad = c_str("not-a-uuid");
+    let mut writer = ptr::dangling_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_open(ds, bad.as_ptr(), ptr::null(), &mut writer) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("not-a-uuid"), "{message}");
+    assert_eq!(writer, ptr::dangling_mut());
+
+    // Bucket range is native policy.
+    let (_tmp2, uri2) = mw_create_dataset();
+    let ds2 = mw_open(&uri2);
+    assert_eq!(mw_initialize(ds2, MW_SHARDING_BUCKET, Some("id"), 0), -1);
+    let message = take_last_error_message();
+    assert!(!message.is_empty(), "native bucket error must be reported");
+    unsafe {
+        lance_dataset_close(ds2);
+        lance_dataset_close(ds);
+    }
+}
+
+fn mw_append_batch(uri: &str, batch: RecordBatch) {
+    let schema = batch.schema();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(lance::dataset::WriteParams {
+                mode: lance::dataset::WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+}
+
+fn mw_create_indexed_vector_dataset() -> (tempfile::TempDir, String) {
+    use lance::index::DatasetIndexExt;
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("mem_wal_vector_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let ids: Vec<i32> = (0..400).collect();
+    let names: Vec<String> = ids.iter().map(|id| format!("row-{id}")).collect();
+    let vectors: Vec<[f32; 4]> = ids
+        .iter()
+        .map(|id| {
+            let value = *id as f32;
+            [
+                (value * 0.37).sin(),
+                (value * 0.11).cos(),
+                (value * 0.07).sin(),
+                (value * 0.23).cos(),
+            ]
+        })
+        .collect();
+    let batch = mw_batch(
+        &ids,
+        &names.iter().map(|v| Some(v.as_str())).collect::<Vec<_>>(),
+        &vectors,
+    );
+    let write_schema = batch.schema();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], write_schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                lance_index::IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+                false,
+            )
+            .await
+            .unwrap();
+    });
+    (tmp, uri)
+}
+
+#[test]
+fn test_memwal_writer_delete_fencing_and_replay() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let shard = "00000000-0000-0000-0000-000000000000";
+
+    // A second writer for the same shard fences the first.
+    let first = mw_writer_open(ds, shard);
+    let second = mw_writer_open(ds, shard);
+    let batched = mw_batch(&[10], &[Some("j")], &[[0.0; 4]]);
+    let mut result = LanceShardWriteResult::default();
+    assert_eq!(
+        unsafe { lance_shard_writer_put(first, &mut batch_to_ffi_stream(batched), &mut result,) },
+        -1,
+        "a fenced writer must reject writes"
+    );
+    assert!(!take_last_error_message().is_empty());
+
+    // The current writer deletes by primary key, and the delete is durable.
+    let key = mw_batch(&[2], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    assert_eq!(
+        unsafe { lance_shard_writer_delete(second, &mut batch_to_ffi_stream(key), &mut result,) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_shard_writer_close(second) }, 0);
+    unsafe { lance_shard_writer_free(second) };
+
+    // Closing and reopening replays the durable WAL without duplicate rows.
+    let reopened = mw_writer_open(ds, shard);
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(reopened, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    let ids = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    assert_eq!(ids, vec![1, 3]);
+    unsafe {
+        lance_lsm_scanner_free(scanner);
+        lance_shard_writer_free(first);
+        lance_shard_writer_close(reopened);
+        lance_shard_writer_free(reopened);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_scanner_multi_fragment_and_multi_shard() {
+    let (_tmp, uri) = mw_create_dataset();
+    let extra = mw_batch(&[4, 5], &[Some("d"), Some("e")], &[[0.0; 4], [0.0; 4]]);
+    mw_append_batch(&uri, extra);
+
+    let ds = mw_open(&uri);
+    let mut details = ptr::null_mut();
+    assert_eq!(unsafe { lance_mem_wal_index_details(ds, &mut details) }, 0);
+    assert!(details.is_null());
+    assert_eq!(mw_initialize(ds, MW_SHARDING_BUCKET, Some("id"), 8), 0);
+
+    let shard_a = "00000000-0000-0000-0000-000000000000";
+    let shard_b = "00000000-0000-0000-0000-000000000001";
+    let writer_a = mw_writer_open(ds, shard_a);
+    let writer_b = mw_writer_open(ds, shard_b);
+    mw_put(writer_a, mw_batch(&[10], &[Some("x")], &[[0.0; 4]]));
+    mw_put(writer_b, mw_batch(&[11], &[Some("y")], &[[0.0; 4]]));
+
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(writer_a, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    let ids = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    // Two base fragments are visible; only shard A's live row is attached.
+    assert!(ids.contains(&1) && ids.contains(&5) && ids.contains(&10));
+    assert!(!ids.contains(&11));
+    unsafe {
+        lance_lsm_scanner_free(scanner);
+        lance_shard_writer_close(writer_a);
+        lance_shard_writer_free(writer_a);
+        lance_shard_writer_close(writer_b);
+        lance_shard_writer_free(writer_b);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_vector_search_indexed() {
+    use std::collections::HashSet;
+
+    let (_tmp, uri) = mw_create_indexed_vector_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_vector_search_planner_new(
+                ds,
+                ptr::null(),
+                0,
+                c_str("vector").as_ptr(),
+                0,
+                ptr::null(),
+                0,
+                MW_DISTANCE_L2,
+                ptr::null(),
+                &mut planner,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let query = [0.0_f32, 1.0, 0.0, 1.0];
+    let mut plan = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_vector_search_planner_plan(
+                planner,
+                query.as_ptr(),
+                query.len(),
+                5,
+                2,
+                0,
+                ptr::null(),
+                0,
+                0,
+                1.0,
+                &mut plan,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_to_arrow_stream(plan, stream.as_mut_ptr()) },
+        0
+    );
+    let (_, batches) = c_stream_batches(unsafe { stream.assume_init() });
+    let ids = mw_int32_values(&batches, "id");
+    assert_eq!(ids.len(), 5);
+    assert!(ids.iter().all(|id| (0..400).contains(id)));
+
+    // Independent flat L2 oracle: returned neighbors stay within the exact
+    // top-20 set; randomized PQ ordering is not compared to exact top-k.
+    let mut exact: Vec<(i32, f32)> = (0..400)
+        .map(|id| {
+            let value = id as f32;
+            let candidate = [
+                (value * 0.37).sin(),
+                (value * 0.11).cos(),
+                (value * 0.07).sin(),
+                (value * 0.23).cos(),
+            ];
+            let distance: f32 = candidate
+                .iter()
+                .zip(query.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            (id, distance)
+        })
+        .collect();
+    exact.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let top20: HashSet<i32> = exact.iter().take(20).map(|(id, _)| *id).collect();
+    assert!(
+        ids.iter().all(|id| top20.contains(id)),
+        "{ids:?} not in top20"
+    );
+
+    unsafe {
+        lance_mem_wal_plan_free(plan);
+        lance_lsm_vector_search_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+}
+
+fn mw_writer_config(rows: Option<u64>) -> LanceShardWriterConfig {
+    let mut config = LanceShardWriterConfig::default();
+    if let Some(rows) = rows {
+        config.has_max_memtable_rows = 1;
+        config.max_memtable_rows = rows;
+    }
+    config
+}
+
+#[test]
+fn test_memwal_snapshot_isolation_update_delete() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let shard = "00000000-0000-0000-0000-000000000000";
+
+    // Commit an initial generation so the writer has a native manifest.
+    let writer = mw_writer_open(ds, shard);
+    mw_put(writer, mw_batch(&[4], &[Some("d")], &[[0.0; 4]]));
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    unsafe { lance_shard_writer_free(writer) };
+
+    let writer = mw_writer_open(ds, shard);
+    let mut snapshot = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_snapshot(writer, &mut snapshot) },
+        0
+    );
+    assert!(!snapshot.is_null(), "a committed writer has a manifest");
+    let mut snapshots = [snapshot as *const LanceMemWalShardSnapshot];
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_scanner_from_snapshots(
+                ds,
+                snapshots.as_mut_ptr(),
+                snapshots.len(),
+                &mut scanner,
+            )
+        },
+        0
+    );
+    let mut before = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    before.sort_unstable();
+    assert_eq!(before, vec![1, 2, 3, 4]);
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    // Uncommitted mutations are visible to the live writer scanner but not to
+    // the snapshot scanner above.
+    mw_put(writer, mw_batch(&[1], &[Some("updated")], &[[0.0; 4]]));
+    let key = mw_batch(&[2], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let mut result = LanceShardWriteResult::default();
+    assert_eq!(
+        unsafe { lance_shard_writer_delete(writer, &mut batch_to_ffi_stream(key), &mut result) },
+        0
+    );
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(writer, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    let batches = mw_scan_to_batches(scanner);
+    let ids = mw_int32_values(&batches, "id");
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![1, 3, 4]);
+    let names = batches[0]
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    let position = ids.iter().position(|id| *id == 1).unwrap();
+    assert_eq!(names.value(position), "updated");
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    // Point lookups on the live writer apply the same newest-wins rules.
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_new(ds, ptr::null(), 0, 0, ptr::null(), 0, &mut planner)
+        },
+        0
+    );
+    let mut plan = ptr::null_mut();
+    let key = mw_batch(&[2], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let (mut array, schema) = ffi_record_batch(&key);
+    let mut key_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut key_batch) },
+        0
+    );
+    // The planner above has no snapshot: it must still execute against the
+    // base table after the writer's updates are committed below.
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key_batch, 0, ptr::null(), 0, &mut plan)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_mem_wal_plan_free(plan) };
+    let mut plan = ptr::null_mut();
+    let key = mw_batch(&[1], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let (mut array, schema) = ffi_record_batch(&key);
+    let mut key_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut key_batch) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key_batch, 0, ptr::null(), 0, &mut plan)
+        },
+        0
+    );
+    let batches = c_stream_batches({
+        let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+        assert_eq!(
+            unsafe { lance_mem_wal_plan_to_arrow_stream(plan, stream.as_mut_ptr()) },
+            0
+        );
+        unsafe { stream.assume_init() }
+    })
+    .1;
+    let ids = mw_int32_values(&batches, "id");
+    assert_eq!(
+        ids,
+        vec![1],
+        "base lookup does not see uncommitted writer state"
+    );
+
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    unsafe {
+        lance_shard_writer_free(writer);
+        lance_mem_wal_shard_snapshot_free(snapshot);
+        lance_mem_wal_plan_free(plan);
+        lance_lsm_point_lookup_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_manual_identity_and_config_validation() {
+    for (mode, num_shards, field_transform) in [
+        (MW_SHARDING_MANUAL, 0_u32, None),
+        (MW_SHARDING_IDENTITY, 0_u32, Some("identity")),
+    ] {
+        let (_tmp, uri) = mw_create_dataset();
+        let ds = mw_open(&uri);
+        let column = (mode == MW_SHARDING_IDENTITY).then_some("id");
+        let mut config = mw_writer_config(Some(1));
+        config.has_durable_write = 1;
+        config.durable_write = 0;
+        assert_eq!(
+            mw_initialize_with_config(ds, mode, column, 0, &config),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let mut details = ptr::null_mut();
+        assert_eq!(unsafe { lance_mem_wal_index_details(ds, &mut details) }, 0);
+        assert!(!details.is_null());
+        assert_eq!(
+            unsafe { lance_mem_wal_index_details_num_shards(details) },
+            num_shards
+        );
+        let specs = unsafe { lance_mem_wal_index_details_sharding_spec_count(details) };
+        assert_eq!(specs, usize::from(field_transform.is_some()));
+        if let Some(transform) = field_transform {
+            let mut spec = ptr::null_mut();
+            assert_eq!(
+                unsafe { lance_mem_wal_index_details_sharding_spec_at(details, 0, &mut spec) },
+                0
+            );
+            let mut field = ptr::null_mut();
+            assert_eq!(
+                unsafe { lance_mem_wal_sharding_spec_field_at(spec, 0, &mut field) },
+                0
+            );
+            let actual = unsafe { CStr::from_ptr(lance_mem_wal_sharding_field_transform(field)) }
+                .to_str()
+                .unwrap();
+            assert_eq!(actual, transform);
+            unsafe {
+                lance_mem_wal_sharding_field_free(field);
+                lance_mem_wal_sharding_spec_free(spec);
+            }
+        }
+        // Writer config defaults reflect the explicit override.
+        let mut key = ptr::null();
+        let mut value = ptr::null();
+        let count = unsafe { lance_mem_wal_index_details_writer_config_default_count(details) };
+        let mut durable = None;
+        for index in 0..count {
+            assert_eq!(
+                unsafe {
+                    lance_mem_wal_index_details_writer_config_default_at(
+                        details, index, &mut key, &mut value,
+                    )
+                },
+                0
+            );
+            if unsafe { CStr::from_ptr(key) }.to_str().unwrap() == "durable_write" {
+                durable = Some(
+                    unsafe { CStr::from_ptr(value) }
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(durable.as_deref(), Some("false"));
+        unsafe { lance_mem_wal_index_details_free(details) };
+
+        // Invalid flags and NULL columns are rejected before native work.
+        assert_eq!(mw_initialize(ds, 9, None, 0), -1);
+        assert_eq!(mw_initialize(ds, mode, None, 0), -1);
+        unsafe { lance_dataset_close(ds) };
+    }
+}
+
+#[test]
+fn test_memwal_frozen_visibility_and_handle_lifetimes() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    let config = mw_writer_config(Some(1));
+    assert_eq!(
+        mw_initialize_with_config(ds, MW_SHARDING_UNSHARDED, None, 0, &config),
+        0
+    );
+    let writer = mw_writer_open(ds, "00000000-0000-0000-0000-000000000000");
+    for id in 10..15 {
+        mw_put(writer, mw_batch(&[id], &[Some("f")], &[[0.0; 4]]));
+    }
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(writer, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    // Active plus frozen-awaiting-flush generations must all be visible.
+    assert_eq!(mw_int32_values(&mw_scan_to_batches(scanner), "id").len(), 8);
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    // Scanner and planner owners keep the dataset alive after the C handle is
+    // closed. Plan execution happens after both planner and dataset are freed.
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_lsm_scanner_from_snapshots(ds, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_new(ds, ptr::null(), 0, 0, ptr::null(), 0, &mut planner)
+        },
+        0
+    );
+    let key = mw_batch(&[1], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let (mut array, schema) = ffi_record_batch(&key);
+    let mut key_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut key_batch) },
+        0
+    );
+    let mut plan = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key_batch, 0, ptr::null(), 0, &mut plan)
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    unsafe {
+        lance_shard_writer_free(writer);
+        lance_lsm_point_lookup_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+    let batches = mw_scan_to_batches(scanner);
+    assert!(batches.iter().any(|batch| {
+        batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .contains(&1)
+    }));
+    let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_to_arrow_stream(plan, stream.as_mut_ptr()) },
+        0
+    );
+    let (_, batches) = c_stream_batches(unsafe { stream.assume_init() });
+    assert_eq!(mw_int32_values(&batches, "id"), vec![1]);
+    unsafe {
+        lance_mem_wal_plan_free(plan);
+        lance_lsm_scanner_free(scanner);
+    }
+}
+
+#[test]
+fn test_memwal_closed_writer_consumes_streams() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let writer = mw_writer_open(ds, "00000000-0000-0000-0000-000000000000");
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+
+    let mut stream = batch_to_ffi_stream(mw_batch(&[9], &[Some("x")], &[[0.0; 4]]));
+    let mut result = LanceShardWriteResult::default();
+    assert_eq!(
+        unsafe { lance_shard_writer_put(writer, &mut stream, &mut result) },
+        -1
+    );
+    assert!(take_last_error_message().contains("already closed"));
+    assert!(
+        stream.release.is_none(),
+        "a rejected put still consumes its stream"
+    );
+
+    // Repeated close succeeds without replaying the first close result.
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    // Stats stay available from the retained native owner.
+    let mut stats = std::mem::MaybeUninit::<LanceShardWriterStats>::uninit();
+    assert_eq!(
+        unsafe { lance_shard_writer_stats(writer, stats.as_mut_ptr()) },
+        0
+    );
+    // Memtable statistics require the live native writer.
+    let mut mem = std::mem::MaybeUninit::<LanceShardMemTableStats>::uninit();
+    assert_eq!(
+        unsafe { lance_shard_writer_memtable_stats(writer, mem.as_mut_ptr()) },
+        -1
+    );
+    unsafe {
+        lance_shard_writer_free(writer);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_string_sharding_and_schema_factory() {
+    use lance::dataset::mem_wal::evaluate_sharding_spec;
+    use lance_table::system_index::mem_wal::{ShardingField, ShardingSpec};
+
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+
+    // Shared Arrow -> native schema factory. `name` gets a fresh native id.
+    let arrow_schema = FFI_ArrowSchema::try_from(mw_schema().as_ref()).unwrap();
+    let mut native_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_schema_from_arrow(&arrow_schema, &mut native_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut name_id = 0;
+    assert_eq!(
+        unsafe { lance_schema_field_id(native_schema, c"name".as_ptr(), &mut name_id) },
+        0
+    );
+    assert!(name_id > 0);
+
+    let mut field = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_sharding_field_new(
+                c"bucket".as_ptr(),
+                &name_id,
+                1,
+                c"bucket".as_ptr(),
+                ptr::null(),
+                c"int32".as_ptr(),
+                [c"num_buckets".as_ptr()].as_ptr(),
+                [c"8".as_ptr()].as_ptr(),
+                1,
+                &mut field,
+            )
+        },
+        0
+    );
+    let fields = [field as *const LanceMemWalShardingField];
+    let mut spec = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_sharding_spec_new(1, fields.as_ptr(), 1, &mut spec) },
+        0
+    );
+
+    let input = mw_batch(
+        &[1, 2, 3],
+        &[Some("a"), Some("b"), None],
+        &[[0.0; 4], [1.0; 4], [2.0; 4]],
+    );
+    let (mut array, arrow_schema_in) = ffi_record_batch(&input);
+    let mut batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &arrow_schema_in, &mut batch) },
+        0
+    );
+    let mut output = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_evaluate_sharding_spec_with_schema(
+                batch,
+                spec,
+                native_schema,
+                &mut output,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut ffi_array = arrow::ffi::FFI_ArrowArray::empty();
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_batch_to_arrow(output, &mut ffi_array, &mut ffi_schema) },
+        0
+    );
+    let c_out = RecordBatch::from(StructArray::from(
+        unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap(),
+    ));
+    let c_values = c_out
+        .column_by_name("bucket")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(c_values, vec![1, 5, 0]);
+
+    let native_values = lance_c::runtime::block_on(async {
+        let native = Dataset::open(&uri).await.unwrap();
+        let name_id = native.schema().field("name").unwrap().id;
+        let native_spec = ShardingSpec {
+            spec_id: 1,
+            fields: vec![ShardingField {
+                field_id: "bucket".to_string(),
+                source_ids: vec![name_id],
+                transform: Some("bucket".to_string()),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters: HashMap::from([("num_buckets".to_string(), "8".to_string())]),
+            }],
+        };
+        evaluate_sharding_spec(&input, &native_spec, native.schema()).unwrap()
+    });
+    let native_ids = native_values
+        .column_by_name("bucket")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(c_values, native_ids);
+
+    // Empty input still succeeds and produces an empty column.
+    let empty = mw_batch(&[], &[], &[]);
+    let (mut array, arrow_schema_in) = ffi_record_batch(&empty);
+    let mut empty_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &arrow_schema_in, &mut empty_batch) },
+        0
+    );
+    let mut empty_output = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_evaluate_sharding_spec_with_schema(
+                empty_batch,
+                spec,
+                native_schema,
+                &mut empty_output,
+            )
+        },
+        0
+    );
+    let mut ffi_array = arrow::ffi::FFI_ArrowArray::empty();
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_batch_to_arrow(empty_output, &mut ffi_array, &mut ffi_schema) },
+        0
+    );
+    let empty_out = RecordBatch::from(StructArray::from(
+        unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap(),
+    ));
+    assert_eq!(empty_out.num_rows(), 0);
+
+    unsafe {
+        lance_batch_free(empty_output);
+        lance_batch_free(empty_batch);
+        lance_batch_free(output);
+        lance_batch_free(batch);
+        lance_mem_wal_sharding_spec_free(spec);
+        lance_mem_wal_sharding_field_free(field);
+        lance_schema_close(native_schema);
+        lance_dataset_close(ds);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dataset dynamic storage-options accessor/provider
 // ---------------------------------------------------------------------------
 
