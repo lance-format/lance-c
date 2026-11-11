@@ -262,18 +262,20 @@ static void test_fragment_delete(const std::string& source_uri,
     const auto ids = dataset.fragment_ids();
     CHECK(ids.size() == 5);
 
-    auto first = dataset.open_fragment(ids[0]);
-    auto second = dataset.open_fragment(ids[1]);
-    auto no_delete = first.delete_if("false");
+    std::optional<lance::Fragment> first =
+        dataset.open_fragment(ids[0]);
+    std::optional<lance::Fragment> second =
+        dataset.open_fragment(ids[1]);
+    auto no_delete = first->delete_if("false");
     CHECK(no_delete.has_value());
     CHECK(no_delete->id() == ids[0]);
     no_delete.reset();
 
-    auto all_deleted = second.delete_if("true");
+    auto all_deleted = second->delete_if("true");
     CHECK(!all_deleted.has_value());
-    CHECK(second.logical_rows() == 3);
+    CHECK(second->logical_rows() == 3);
 
-    auto staged = first.delete_if("id = 3");
+    auto staged = first->delete_if("id = 3");
     CHECK(staged.has_value());
     CHECK(staged->deleted_rows() == 2);
     CHECK(staged->logical_rows() == 2);
