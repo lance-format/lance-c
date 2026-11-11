@@ -45737,7 +45737,9 @@ fn test_native_operation_typed_publication_paths() {
     assert!(!shallow.is_null(), "{}", take_last_error_message());
     let shallow_transaction = unsafe { lance_transaction_new(stale_version, shallow, ptr::null()) };
     let cloned = commit_native_transaction(&clone_uri, shallow_transaction, ptr::null());
-    assert_eq!(unsafe { lance_dataset_version(cloned) }, 1);
+    // A brand-new dataset's first manifest version is the transaction read
+    // version plus one (native `target_version = read_version + 1`).
+    assert_eq!(unsafe { lance_dataset_version(cloned) }, stale_version + 1);
     let current_rows = {
         let current = open_dataset_for_test(&source_uri);
         let rows = unsafe { lance_dataset_count_rows(current) };

@@ -2880,7 +2880,8 @@ static void test_native_typed_operations(const char *src_uri,
     CHECK_OK();
     LanceDataset *cloned =
         commit_transaction(clone_uri, clone_transaction, NULL);
-    ASSERT(lance_dataset_version(cloned) == 1, "typed Clone version");
+    ASSERT(lance_dataset_version(cloned) == source_version + 1,
+           "typed Clone version");
     CHECK_OK();
     ASSERT(lance_dataset_count_rows(cloned) == source_rows,
            "typed Clone rows");

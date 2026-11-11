@@ -1570,7 +1570,9 @@ static void test_typed_native_operations(const std::string& source_uri,
     auto cloned = lance::Dataset::commit(
         clone_uri,
         lance::Transaction::from_operation(source_version, shallow));
-    CHECK(cloned.version() == 1);
+    // A brand-new dataset's first manifest version is the transaction read
+    // version plus one (native `target_version = read_version + 1`).
+    CHECK(cloned.version() == source_version + 1);
     CHECK(cloned.count_rows() == source_rows);
 
     auto deep = lance::Operation::make_clone(
