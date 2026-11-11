@@ -755,7 +755,8 @@ static void build_vector_segments(const char *uri, const char *metadata_dir) {
     options.pq_codebook_schema = &codebook_schema;
     options.index_file_version = LANCE_INDEX_FILE_VERSION_V3;
     options.has_train = true;
-    options.train = false;
+    /* Native treats train=false as a definition-only build with empty coverage. */
+    options.train = true;
 
     char uuids[VECTOR_FRAGMENTS][37] = {{0}};
     for (size_t segment = 0; segment < VECTOR_FRAGMENTS; ++segment) {
