@@ -151,6 +151,20 @@ mod tests {
 
     const SRC_SCHEME: &str = "clone-src";
     const DST_SCHEME: &str = "clone-dst";
+    const BLOB_SRC_SCHEME: &str = "clone-blob-src";
+    const BLOB_DST_SCHEME: &str = "clone-blob-dst";
+
+    fn last_error() -> String {
+        let ptr = crate::error::lance_last_error_message();
+        if ptr.is_null() {
+            return String::new();
+        }
+        let message = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::error::lance_free_string(ptr) };
+        message
+    }
 
     fn c_string(value: &str) -> CString {
         CString::new(value).unwrap()
@@ -591,5 +605,174 @@ mod tests {
             lance_dataset_close(out_head);
             lance_dataset_close(dataset);
         }
+    }
+
+    /// Blob v2 fixture sizes per fragment: inline, packed, dedicated, empty, null.
+    fn blob_row_sizes() -> [Option<usize>; 5] {
+        [Some(8), Some(128), Some(1024), Some(0), None]
+    }
+
+    fn blob_payload(len: usize, seed: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 + 3 + seed) as u8).collect()
+    }
+
+    fn blob_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            lance::blob_field_with_options(
+                "blob",
+                true,
+                lance::BlobFieldOptions {
+                    inline_size_threshold: Some(16),
+                    dedicated_size_threshold: std::num::NonZeroUsize::new(256),
+                },
+            ),
+            Field::new("raw", DataType::Binary, true),
+        ]))
+    }
+
+    fn blob_batch(schema: &Arc<Schema>, base_id: u32) -> RecordBatch {
+        let mut blobs = lance::BlobArrayBuilder::new(blob_row_sizes().len());
+        for size in blob_row_sizes() {
+            match size {
+                Some(0) => blobs.push_empty().unwrap(),
+                Some(len) => blobs
+                    .push_bytes(blob_payload(len, base_id as usize))
+                    .unwrap(),
+                None => blobs.push_null().unwrap(),
+            }
+        }
+        let ids: Vec<u32> = (0..blob_row_sizes().len() as u32)
+            .map(|row| base_id + row)
+            .collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::UInt32Array::from(ids)),
+                blobs.finish().unwrap(),
+                arrow_array::new_null_array(&DataType::Binary, blob_row_sizes().len()),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn write_blob_source(session: Arc<Session>, uri: &str) {
+        let schema = blob_schema();
+        for (fragment, base_id) in [0u32, 100].into_iter().enumerate() {
+            let params = WriteParams {
+                mode: if fragment == 0 {
+                    lance::dataset::WriteMode::Create
+                } else {
+                    lance::dataset::WriteMode::Append
+                },
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                session: Some(session.clone()),
+                ..Default::default()
+            };
+            block_on(Dataset::write(
+                RecordBatchIterator::new(vec![Ok(blob_batch(&schema, base_id))], schema.clone()),
+                uri,
+                Some(params),
+            ))
+            .unwrap();
+        }
+    }
+
+    fn read_blob_by_index(dataset: *const LanceDataset, index: u64) -> Option<Vec<u8>> {
+        let column = c_string("blob");
+        let mut handle: *mut crate::blob::LanceBlobFile = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                crate::blob::lance_dataset_take_blobs_by_indices(
+                    dataset,
+                    &index,
+                    1,
+                    column.as_ptr(),
+                    &mut handle,
+                )
+            },
+            0,
+            "take_blobs_by_indices failed: {}",
+            last_error()
+        );
+        if handle.is_null() {
+            return None;
+        }
+        let size = unsafe { crate::blob::lance_blob_file_size(handle) };
+        let mut bytes = vec![0u8; size as usize];
+        assert_eq!(
+            unsafe { crate::blob::lance_blob_file_read(handle, bytes.as_mut_ptr(), bytes.len()) },
+            0,
+            "blob read failed: {}",
+            last_error()
+        );
+        unsafe { crate::blob::lance_blob_file_close(handle) };
+        Some(bytes)
+    }
+
+    #[test]
+    fn deep_clone_collects_blob_sidecars() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let src_uri = uri(BLOB_SRC_SCHEME, &format!("src-{suffix}"), "blob.lance");
+        let dst_uri = uri(BLOB_DST_SCHEME, &format!("dst-{suffix}"), "blob.lance");
+
+        let src_session = Arc::new(Session::new(
+            0,
+            0,
+            Arc::new(registry_with(&[BLOB_SRC_SCHEME, BLOB_DST_SCHEME])),
+        ));
+        write_blob_source(src_session.clone(), &src_uri);
+
+        let dataset = open_c(&src_uri, &src_session);
+        assert!(!dataset.is_null(), "open failed");
+
+        let target = c_string(&dst_uri);
+        let mut cloned: *mut LanceDataset = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lance_dataset_deep_clone(
+                    dataset,
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut cloned,
+                )
+            },
+            0,
+            "blob clone failed: {}",
+            last_error()
+        );
+        assert_eq!(unsafe { lance_dataset_version(cloned) }, 2);
+        assert_eq!(unsafe { lance_dataset_count_rows(cloned) }, 10);
+
+        for index in 0..10u64 {
+            let row = index as usize;
+            let expected =
+                blob_row_sizes()[row % 5].map(|len| blob_payload(len, (row / 5) as usize * 100));
+            assert_eq!(read_blob_by_index(cloned, index), expected, "row {index}");
+        }
+
+        unsafe {
+            lance_dataset_close(cloned);
+            lance_dataset_close(dataset);
+        }
+        drop(src_session);
+
+        // Reopen with a session that can only resolve the target scheme.
+        let dst_session = Session::new(0, 0, Arc::new(registry_with(&[BLOB_DST_SCHEME])));
+        let reopened = open_c(&dst_uri, &dst_session);
+        assert!(!reopened.is_null());
+        assert_eq!(unsafe { lance_dataset_count_rows(reopened) }, 10);
+        assert_eq!(
+            read_blob_by_index(reopened, 2),
+            Some(blob_payload(1024, 0)),
+            "dedicated blob sidecar missing from the clone"
+        );
+        assert_eq!(
+            read_blob_by_index(reopened, 7),
+            Some(blob_payload(128, 100)),
+            "packed blob sidecar missing from the clone"
+        );
+        unsafe { lance_dataset_close(reopened) };
     }
 }
