@@ -46,13 +46,8 @@ fn last_error() -> String {
     take_and_free(ptr)
 }
 
+#[derive(Default)]
 struct NamespaceResult(LanceNamespaceResult);
-
-impl Default for NamespaceResult {
-    fn default() -> Self {
-        Self(LanceNamespaceResult::default())
-    }
-}
 
 impl Drop for NamespaceResult {
     fn drop(&mut self) {
@@ -1032,4 +1027,70 @@ fn constructor_failures_release_foreign_contexts_exactly_once() {
     assert!(namespace.is_null(), "invalid REST properties must fail");
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!(released.load(Ordering::SeqCst), 2);
+}
+
+static PARTIAL_RESPONSE_RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn free_counted_owned_string(value: *mut LanceOwnedString) {
+    unsafe {
+        if value.is_null() || (*value).data.is_null() {
+            return;
+        }
+        PARTIAL_RESPONSE_RELEASES.fetch_add(1, Ordering::SeqCst);
+        free_owned_string(value);
+    }
+}
+
+unsafe extern "C" fn partial_response_then_error(
+    _context: *mut c_void,
+    _request: *const c_char,
+    response: *mut LanceOwnedString,
+    error: *mut LanceCallbackError,
+) -> i32 {
+    unsafe {
+        (*response).data = owned_string(r#"{"location":"partial"}"#);
+        (*response).release = Some(free_counted_owned_string);
+        (*error).code = LanceErrorCode::Internal as i32;
+        (*error).message.data = owned_string("callback failed after writing a response");
+        (*error).message.release = Some(free_owned_string);
+    }
+    1
+}
+
+#[test]
+fn failed_custom_callback_releases_partial_response_exactly_once() {
+    PARTIAL_RESPONSE_RELEASES.store(0, Ordering::SeqCst);
+    let released = Arc::new(AtomicUsize::new(0));
+    let context = Box::into_raw(Box::new(released.clone())) as *mut c_void;
+    let namespace_id = c_string("partial");
+    let spec = LanceNamespaceCustomClientSpec {
+        describe_table: Some(partial_response_then_error),
+        describe_table_version: Some(unsupported_callback),
+        create_table_version: Some(unsupported_callback),
+        list_table_versions: Some(unsupported_callback),
+        release: Some(count_release),
+        client_ctx: context,
+        namespace_id: namespace_id.as_ptr(),
+    };
+    let namespace = unsafe { lance_namespace_custom_new(&spec) };
+    assert!(
+        !namespace.is_null(),
+        "custom namespace failed: {}",
+        last_error()
+    );
+
+    let (rc, result) = call(
+        namespace,
+        "describe_table",
+        r#"{"id":["workspace","table"]}"#,
+        None,
+    );
+    assert_ne!(rc, 0);
+    assert_eq!(
+        result.native_error(),
+        Some((18, "callback failed after writing a response".to_owned()))
+    );
+    assert_eq!(PARTIAL_RESPONSE_RELEASES.load(Ordering::SeqCst), 1);
+    close_namespace(namespace);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
 }
