@@ -14650,6 +14650,12 @@ fn assert_ffi_outputs_untouched(
     assert!(schema.release.is_none());
 }
 
+unsafe extern "C" fn release_invalid_test_array(array: *mut FFI_ArrowArray) {
+    if !array.is_null() {
+        unsafe { (*array).release = None };
+    }
+}
+
 #[test]
 fn test_blob_writer_arrow_ownership_validation_and_finish_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
@@ -14720,8 +14726,18 @@ fn test_blob_writer_arrow_ownership_validation_and_finish_lifecycle() {
     assert!(take_last_error_message().contains("schema must not be NULL"));
 
     let binary_schema = FFI_ArrowSchema::try_from(&binary_field).unwrap();
-    let mut malformed = FFI_ArrowArray::new(&binary.to_data());
-    malformed.offset = 100;
+    let invalid_offsets = [0_i32, 2, 1, 3];
+    let values = b"abc";
+    let mut malformed_buffers = [
+        ptr::null::<c_void>(),
+        invalid_offsets.as_ptr().cast::<c_void>(),
+        values.as_ptr().cast::<c_void>(),
+    ];
+    let mut malformed = FFI_ArrowArray::empty();
+    malformed.length = 3;
+    malformed.n_buffers = 3;
+    malformed.buffers = malformed_buffers.as_mut_ptr();
+    malformed.release = Some(release_invalid_test_array);
     assert_eq!(
         unsafe { lance_packed_blob_writer_write_blobs(writer, &mut malformed, &binary_schema) },
         -1
