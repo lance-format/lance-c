@@ -6821,7 +6821,8 @@ fn test_fragment_delete_stages_metadata_and_publishes_one_version() {
     assert!(!first.is_null() && !second.is_null());
     unsafe { lance_dataset_close(ds) };
 
-    let mut unchanged = 1usize as *mut LanceFragment;
+    let dangling_fragment = std::ptr::dangling_mut::<LanceFragment>();
+    let mut unchanged = dangling_fragment;
     let invalid_utf8 = b"id = \xff\0";
     assert_eq!(
         unsafe {
@@ -6834,12 +6835,12 @@ fn test_fragment_delete_stages_metadata_and_publishes_one_version() {
         -1
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    assert_eq!(unchanged, 1usize as *mut LanceFragment);
+    assert_eq!(unchanged, dangling_fragment);
     assert_eq!(
         unsafe { lance_fragment_delete(first, ptr::null(), &mut unchanged) },
         -1
     );
-    assert_eq!(unchanged, 1usize as *mut LanceFragment);
+    assert_eq!(unchanged, dangling_fragment);
     let predicate = c_str("id = 2");
     assert_eq!(
         unsafe { lance_fragment_delete(first, predicate.as_ptr(), ptr::null_mut()) },
@@ -6850,7 +6851,7 @@ fn test_fragment_delete_stages_metadata_and_publishes_one_version() {
         unsafe { lance_fragment_delete(ptr::null(), predicate.as_ptr(), &mut unchanged) },
         -1
     );
-    assert_eq!(unchanged, 1usize as *mut LanceFragment);
+    assert_eq!(unchanged, dangling_fragment);
 
     let no_deletion = delete_fragment_via_c(first, "false");
     assert!(!no_deletion.is_null());
@@ -7254,7 +7255,7 @@ fn test_fragment_delete_conflict_and_append_rebase() {
     assert_eq!(unsafe { lance_dataset_version(winner) }, read_version + 1);
     unsafe { lance_dataset_close(winner) };
 
-    let sentinel = 1usize as *mut LanceDataset;
+    let sentinel = std::ptr::dangling_mut::<LanceDataset>();
     let mut failed_output = sentinel;
     let uri_c = c_str(&uri);
     assert_eq!(
@@ -7306,7 +7307,7 @@ fn test_fragment_delete_conflict_and_append_rebase() {
 
     lance_c::runtime::block_on(async {
         let mut native = Dataset::open(&rebase_uri).await.unwrap();
-        let mut scanner = native.scan();
+        let scanner = native.scan();
         let stream = scanner.try_into_stream().await.unwrap();
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
         let schema: Schema = native.schema().into();
