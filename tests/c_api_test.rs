@@ -35038,6 +35038,16 @@ fn test_dataset_read_blobs_all_selectors_and_native_identity() {
         .collect::<Vec<_>>();
     expected_unique.sort_by_key(|(address, _)| *address);
     assert_eq!(unordered, expected_unique);
+    let mut native_unordered = native_whole_blob_values(
+        &uri,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &unique_rows,
+        Some(64),
+        false,
+    );
+    native_unordered.sort_by_key(|(address, _)| *address);
+    assert_eq!(unordered, native_unordered);
 
     unsafe { lance_dataset_close(dataset) };
 }
@@ -35182,6 +35192,7 @@ fn test_dataset_read_blob_ranges_identity_nulls_and_options() {
     let all_row_ids = scan_blob_row_ids(dataset);
     let base_requests = [
         (7usize, 100u64, 20u64),
+        (7, 110, 20),
         (2, 128, 0),
         (9, 40, 16),
         (2, 100, 8),
@@ -35650,6 +35661,49 @@ fn test_managed_blob_descriptor_append_reuse_reopen_and_base_validation() {
     assert_eq!(
         whole_blob_values(&batches),
         vec![(((2u64) << 32), Some(b"2345".to_vec()))]
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    // A prepared External descriptor can share the same registered base and
+    // immutable object without introducing a second payload owner.
+    let builder = unsafe { lance_blob_descriptor_array_builder_new(c"blob".as_ptr()) };
+    assert_eq!(
+        unsafe {
+            lance_blob_descriptor_array_builder_append_external(
+                builder,
+                7,
+                c"_blobs/base.bin".as_ptr(),
+                1,
+                3,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let (field, array) = finish_descriptor_builder(builder);
+    unsafe { lance_blob_descriptor_array_builder_close(builder) };
+    let (schema, stream) = ffi_descriptor_stream(field, array, Some(managed_metadata()));
+    assert_eq!(
+        write_descriptor_dataset(&uri, LanceWriteMode::Append as i32, &schema, stream,),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let (rc, stream) = c_read_blobs(
+        dataset,
+        "blob",
+        BLOB_SELECTOR_INDICES,
+        &[3],
+        &c_blob_read_options(None, true),
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = collect_whole_blob_stream(stream);
+    assert_eq!(
+        whole_blob_values(&batches),
+        vec![(((3u64) << 32), Some(b"123".to_vec()))]
     );
     unsafe { lance_dataset_close(dataset) };
     assert_eq!(std::fs::read(&object_path).unwrap(), b"0123456789");

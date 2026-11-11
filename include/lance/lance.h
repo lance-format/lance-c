@@ -3041,12 +3041,15 @@ typedef struct LanceBlobRangeRequest {
  * values have a null `data` entry; valid empty blobs have a non-null empty
  * buffer. Native ordering, duplicate selection and payload bytes are
  * preserved. Selected input rows are copied before native state retains them.
+ * Native payload `Bytes` are retained directly by the Arrow buffers; payload
+ * bytes are not copied when an Arrow record is assembled.
  *
  * Column lookup and read planning run in this factory and their errors are
  * returned before any output stream exists. Payload I/O errors happen while
  * consuming the stream and use the ArrowArrayStream error contract
  * (`get_next` nonzero plus `get_last_error`). Closing the dataset handle does
- * not invalidate a successfully created stream.
+ * not invalidate a successfully created stream. Exported batches own their
+ * buffers and remain valid after the stream is released.
  *
  * `out` is written only after successful native planning and Arrow stream
  * export, and must then be released exactly once. On error it is untouched.
@@ -3077,12 +3080,15 @@ int32_t lance_dataset_read_blobs(
  * is the zero-based input position and remains present for duplicate and
  * unordered requests. NULL blobs have null `data`; a non-null blob with an
  * empty range has a non-null empty buffer.
+ * Native payload `Bytes` are retained directly by the Arrow buffers; payload
+ * bytes are not copied when an Arrow record is assembled.
  *
  * Native validation stages are retained. Request offset-plus-length overflow,
  * scheduler buffer validation and physical range planning happen in the
  * factory. Native null-blob requests skip logical bounds checks. Payload I/O
  * errors happen while consuming the stream and use the ArrowArrayStream error
- * contract.
+ * contract. Exported batches own their buffers and remain valid after the
+ * stream is released.
  *
  * Planning retains O(request_count) metadata. `io_buffer_size` bounds each
  * scheduler-visible physical batch after range coalescing, except that one

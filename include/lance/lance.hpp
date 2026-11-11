@@ -3384,7 +3384,9 @@ public:
     /// ArrowStream. Each stream record contains `row_address` and nullable
     /// LargeBinary `data`; native order, duplicates and NULL-versus-empty
     /// values are preserved. The stream remains valid after this Dataset is
-    /// destroyed.
+    /// destroyed. Native payload bytes are retained directly in Arrow buffers
+    /// without a payload copy; exported batches remain valid after the stream
+    /// is released.
     ArrowStream read_blobs(
         const std::string& column,
         BlobRowSelector selector,
@@ -3413,7 +3415,9 @@ public:
     /// existing move-only ArrowStream. Each record contains `request_index`,
     /// `row_address`, `offset`, `length` and nullable LargeBinary `data`.
     /// `request_index` identifies duplicate/unordered requests. The stream
-    /// remains valid after this Dataset is destroyed.
+    /// remains valid after this Dataset is destroyed. Native payload bytes are
+    /// retained directly in Arrow buffers without a payload copy; exported
+    /// batches remain valid after the stream is released.
     ArrowStream read_blob_ranges(
         const std::string& column,
         BlobRowSelector selector,
