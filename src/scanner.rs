@@ -379,14 +379,7 @@ impl ProbeConfig {
                 "minimum_nprobes must be greater than 0, got 0".into(),
             ));
         }
-        let effective_maximum = self.maximum.or_else(|| {
-            if self.search_effort.is_none() {
-                self.nprobes
-            } else {
-                None
-            }
-        });
-        if let Some(maximum_nprobes) = effective_maximum
+        if let Some(maximum_nprobes) = self.maximum
             && minimum_nprobes > maximum_nprobes
         {
             return Err(lance_core::Error::invalid_input_source(
@@ -408,14 +401,7 @@ impl ProbeConfig {
                 "maximum_nprobes must be greater than 0, got 0".into(),
             ));
         }
-        let effective_minimum = self.minimum.or_else(|| {
-            if self.search_effort.is_none() {
-                self.nprobes
-            } else {
-                None
-            }
-        });
-        if let Some(minimum_nprobes) = effective_minimum
+        if let Some(minimum_nprobes) = self.minimum
             && maximum_nprobes < minimum_nprobes
         {
             return Err(lance_core::Error::invalid_input_source(
@@ -441,6 +427,21 @@ impl ProbeConfig {
             search_effort: Some(effort),
             ..self
         })
+    }
+
+    fn validate_for_scan(self) -> Result<()> {
+        let fixed = self.nprobes.filter(|_| self.search_effort.is_none());
+        let minimum = self.minimum.or(fixed).unwrap_or(1);
+        let maximum = self.maximum.or(fixed);
+        if let Some(maximum) = maximum
+            && minimum > maximum
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("minimum_nprobes ({minimum}) must not exceed maximum_nprobes ({maximum})")
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -863,6 +864,7 @@ impl LanceScanner {
             scanner.fast_search();
         }
         if let Some(n) = &self.nearest {
+            self.probe.validate_for_scan()?;
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
             scanner.distance_range(n.lower_bound, n.upper_bound);
             if let Some(nprobes) = self.probe.nprobes {
@@ -3924,8 +3926,9 @@ unsafe fn scanner_set_nprobes_inner(scanner: *mut LanceScanner, nprobes: u32) ->
 
 /// Set the minimum number of vector-index partitions to search.
 ///
-/// The value must be greater than zero, no greater than a configured
-/// `maximum_nprobes`, and must be set before the scan starts.
+/// The value must be greater than zero and no greater than an explicit
+/// `maximum_nprobes`. A conflict with only a fixed `nprobes` count is reported
+/// when the nearest scan is prepared.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_minimum_nprobes(
     scanner: *mut LanceScanner,
@@ -3955,8 +3958,9 @@ unsafe fn scanner_set_minimum_nprobes_inner(
 
 /// Set the maximum number of vector-index partitions to search.
 ///
-/// The value must be greater than zero, no less than a configured
-/// `minimum_nprobes`, and must be set before the scan starts.
+/// The value must be greater than zero and no less than an explicit
+/// `minimum_nprobes`. A conflict with only a fixed `nprobes` count is reported
+/// when the nearest scan is prepared.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_maximum_nprobes(
     scanner: *mut LanceScanner,
@@ -5113,16 +5117,24 @@ mod tests {
             ProbeConfig::default().with_nprobes(4).unwrap()
         );
 
-        // A failed partial update leaves both bounds unchanged.
-        assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 5) }, -1);
+        // A fixed count and an explicit minimum can be staged before the
+        // explicit maximum. Their no-effort conflict is checked when the
+        // nearest scan is prepared, not while the range is still incomplete.
+        assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 5) }, 0);
         assert_eq!(
             unsafe { &*scanner }.probe,
-            ProbeConfig::default().with_nprobes(4).unwrap()
+            ProbeConfig {
+                nprobes: Some(4),
+                minimum: Some(5),
+                maximum: None,
+                search_effort: None,
+            }
         );
+        assert!(unsafe { &*scanner }.probe.validate_for_scan().is_err());
 
-        // Widening the maximum first makes the new minimum valid.
+        // An explicit maximum completes the range without changing the
+        // staged minimum.
         assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 6) }, 0);
-        assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 5) }, 0);
         assert_eq!(
             unsafe { &*scanner }.probe,
             ProbeConfig {
@@ -5132,6 +5144,7 @@ mod tests {
                 search_effort: None,
             }
         );
+        unsafe { &*scanner }.probe.validate_for_scan().unwrap();
 
         // A later combined call deterministically replaces the widened range.
         assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 3) }, 0);
@@ -5139,12 +5152,9 @@ mod tests {
             unsafe { &*scanner }.probe,
             ProbeConfig::default().with_nprobes(3).unwrap()
         );
-        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 2) }, -1);
+        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 2) }, 0);
+        assert!(unsafe { &*scanner }.probe.validate_for_scan().is_err());
         assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 0) }, -1);
-        assert_eq!(
-            unsafe { &*scanner }.probe,
-            ProbeConfig::default().with_nprobes(3).unwrap()
-        );
 
         // The combined setter clears explicit bounds but never discards an
         // effort supplied before it.
@@ -5158,6 +5168,7 @@ mod tests {
                 ..ProbeConfig::default()
             }
         );
+        unsafe { &*scanner }.probe.validate_for_scan().unwrap();
 
         unsafe {
             lance_scanner_close(scanner);

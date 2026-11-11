@@ -5249,8 +5249,10 @@ int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t nprobes);
 /**
  * Set the minimum number of vector-index partitions to search.
  * This replaces only the minimum bound; the current maximum is preserved.
- * Must be greater than zero and no greater than `maximum_nprobes` when set.
- * An invalid resulting range is rejected without changing either bound.
+ * Must be greater than zero and no greater than an explicitly configured
+ * `maximum_nprobes`. A conflict with only a fixed `nprobes` value is reported
+ * when the nearest scan is prepared. An invalid explicit range is rejected
+ * without changing either bound.
  * Must be set before scanning starts.
  */
 int32_t lance_scanner_set_minimum_nprobes(
@@ -5261,9 +5263,11 @@ int32_t lance_scanner_set_minimum_nprobes(
 /**
  * Set the maximum number of vector-index partitions to search.
  * This replaces only the maximum bound; the current minimum is preserved.
- * Must be greater than zero and no less than `minimum_nprobes` when set.
+ * Must be greater than zero and no less than an explicitly configured
+ * `minimum_nprobes`. A conflict with only a fixed `nprobes` value is reported
+ * when the nearest scan is prepared.
  * This only affects prefiltered searches that need more candidates.
- * An invalid resulting range is rejected without changing either bound.
+ * An invalid explicit range is rejected without changing either bound.
  * Must be set before scanning starts.
  */
 int32_t lance_scanner_set_maximum_nprobes(
