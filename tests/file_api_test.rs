@@ -16,20 +16,23 @@ use arrow::record_batch::RecordBatchReader;
 use arrow_array::builder::{Int32Builder, ListBuilder};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, Int8Array, Int32Array,
-    RecordBatch, RecordBatchOptions, StringArray, StructArray,
+    RecordBatch, RecordBatchOptions, StringArray, StructArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use futures::StreamExt;
 use lance_c::*;
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::format::pbfile;
 use lance_file::reader::{
     CachedFileMetadata, FileReader as NativeFileReader, FileReaderOptions as NativeReaderOptions,
     describe_encoding,
 };
 use lance_file::version::LanceFileVersion;
 use lance_file::versions;
-use lance_file::writer::FileWriterOptions as NativeWriterOptions;
+use lance_file::writer::{
+    FileWriter as NativeFileWriter, FileWriterOptions as NativeWriterOptions,
+};
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -340,6 +343,10 @@ fn read_all_c(
 }
 
 fn native_reader(uri: &str) -> NativeFileReader {
+    native_reader_with_options(uri, NativeReaderOptions::default())
+}
+
+fn native_reader_with_options(uri: &str, options: NativeReaderOptions) -> NativeFileReader {
     lance_c::runtime::block_on(async {
         let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
         let scheduler = ScanScheduler::new(store, SchedulerConfig::default_for_testing());
@@ -356,7 +363,7 @@ fn native_reader(uri: &str) -> NativeFileReader {
             Arc::<DecoderPlugins>::default(),
             Arc::new(metadata),
             &LanceCache::no_cache(),
-            NativeReaderOptions::default(),
+            options,
         )
         .await
         .unwrap()
@@ -397,7 +404,7 @@ fn assert_fixture_batches(batches: &[RecordBatch]) {
 
 fn assert_fixture_batches_expected(batches: &[RecordBatch], expected: &RecordBatch) {
     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(rows, 7);
+    assert_eq!(rows, expected.num_rows());
     let actual = arrow::compute::concat_batches(&expected.schema(), batches).unwrap();
     assert_eq!(actual.schema(), expected.schema());
     assert_eq!(actual.num_rows(), expected.num_rows());
@@ -440,6 +447,118 @@ fn native_success<T, E>(operation: impl FnOnce() -> Result<T, E>) -> bool {
     catch_unwind(AssertUnwindSafe(operation))
         .map(|result| result.is_ok())
         .unwrap_or(false)
+}
+
+fn native_writer(
+    uri: &str,
+    schema: &Schema,
+    options: NativeWriterOptions,
+) -> lance_core::Result<NativeFileWriter> {
+    lance_c::runtime::block_on(async {
+        let (store, path) = ObjectStore::from_uri(uri).await?;
+        let object_writer = store.create(&path).await?;
+        let schema = lance_core::datatypes::Schema::try_from(schema)?;
+        versions::create_writer(
+            LanceFileVersion::V2_2.resolve(),
+            object_writer,
+            schema,
+            options,
+        )
+    })
+}
+
+fn native_lazy_writer(
+    uri: &str,
+    options: NativeWriterOptions,
+) -> lance_core::Result<NativeFileWriter> {
+    lance_c::runtime::block_on(async {
+        let (store, path) = ObjectStore::from_uri(uri).await?;
+        let object_writer = store.create(&path).await?;
+        versions::create_lazy_writer(LanceFileVersion::V2_2.resolve(), object_writer, options)
+    })
+}
+
+fn native_write_batch(
+    writer: &mut NativeFileWriter,
+    batch: &RecordBatch,
+) -> lance_core::Result<()> {
+    lance_c::runtime::block_on(writer.write_batch(batch))
+}
+
+fn assert_buffer_descriptors(
+    actual: *const LanceBufferDescriptor,
+    count: usize,
+    offsets: &[u64],
+    sizes: &[u64],
+    context: &str,
+) {
+    assert_eq!(count, offsets.len(), "{context} buffer count");
+    assert_eq!(count, sizes.len(), "{context} buffer size count");
+    for index in 0..count {
+        let actual = unsafe { &*actual.add(index) };
+        assert_eq!(actual.position, offsets[index], "{context} buffer {index}");
+        assert_eq!(actual.size, sizes[index], "{context} buffer {index}");
+    }
+}
+
+fn assert_encoding_descriptor(
+    actual: &LanceEncodingDescriptor,
+    expected: Option<&pbfile::Encoding>,
+    context: &str,
+) {
+    match expected.and_then(|encoding| encoding.location.as_ref()) {
+        None => {
+            assert_eq!(
+                actual.kind,
+                LanceFileEncodingKind::Absent as i32,
+                "{context}"
+            );
+            assert_eq!(actual.buffer_location, 0, "{context}");
+            assert_eq!(actual.buffer_length, 0, "{context}");
+            assert!(actual.direct_bytes.is_null(), "{context}");
+            assert_eq!(actual.direct_bytes_len, 0, "{context}");
+        }
+        Some(pbfile::encoding::Location::None(_)) => {
+            assert_eq!(actual.kind, LanceFileEncodingKind::None as i32, "{context}");
+            assert_eq!(actual.buffer_location, 0, "{context}");
+            assert_eq!(actual.buffer_length, 0, "{context}");
+            assert!(actual.direct_bytes.is_null(), "{context}");
+            assert_eq!(actual.direct_bytes_len, 0, "{context}");
+        }
+        Some(pbfile::encoding::Location::Direct(direct)) => {
+            assert_eq!(
+                actual.kind,
+                LanceFileEncodingKind::Direct as i32,
+                "{context}"
+            );
+            assert_eq!(actual.buffer_location, 0, "{context}");
+            assert_eq!(actual.buffer_length, 0, "{context}");
+            assert_eq!(actual.direct_bytes_len, direct.encoding.len(), "{context}");
+            if direct.encoding.is_empty() {
+                assert!(actual.direct_bytes.is_null(), "{context}");
+            } else {
+                assert!(!actual.direct_bytes.is_null(), "{context}");
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(actual.direct_bytes, actual.direct_bytes_len)
+                };
+                assert_eq!(bytes, direct.encoding.as_slice(), "{context}");
+            }
+        }
+        Some(pbfile::encoding::Location::Indirect(indirect)) => {
+            assert_eq!(
+                actual.kind,
+                LanceFileEncodingKind::Indirect as i32,
+                "{context}"
+            );
+            assert_eq!(
+                actual.buffer_location, indirect.buffer_location,
+                "{context}"
+            );
+            assert_eq!(actual.buffer_length, indirect.buffer_length, "{context}");
+            assert!(actual.direct_bytes.is_null(), "{context}");
+            assert_eq!(actual.direct_bytes_len, 0, "{context}");
+        }
+    }
 }
 
 #[test]
@@ -620,16 +739,36 @@ fn metadata_statistics_pages_and_global_buffers_match_native() {
     assert_eq!(column_count, native.column_metadatas.len());
     for (column_index, native_column) in native.column_metadatas.iter().enumerate() {
         let column = unsafe { &*columns.add(column_index) };
-        assert_eq!(
+        assert_buffer_descriptors(
+            column.column_buffers,
             column.column_buffer_count,
-            native_column.buffer_offsets.len()
+            &native_column.buffer_offsets,
+            &native_column.buffer_sizes,
+            &format!("column {column_index}"),
+        );
+        assert_encoding_descriptor(
+            &column.encoding,
+            native_column.encoding.as_ref(),
+            &format!("column {column_index} encoding"),
         );
         assert_eq!(column.page_count, native_column.pages.len());
         for page_index in 0..column.page_count {
             let page = unsafe { &*column.pages.add(page_index) };
             let native_page = &native_column.pages[page_index];
+            assert_buffer_descriptors(
+                page.buffers,
+                page.buffer_count,
+                &native_page.buffer_offsets,
+                &native_page.buffer_sizes,
+                &format!("column {column_index} page {page_index}"),
+            );
             assert_eq!(page.num_rows, native_page.length);
             assert_eq!(page.priority, native_page.priority);
+            assert_encoding_descriptor(
+                &page.encoding,
+                native_page.encoding.as_ref(),
+                &format!("column {column_index} page {page_index} encoding"),
+            );
             assert_eq!(
                 unsafe { CStr::from_ptr(page.encoding_description) }
                     .to_str()
@@ -699,6 +838,29 @@ fn reader_projection_range_indices_errors_and_io_stats() {
     assert_eq!(schema.fields().len(), 2);
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 7);
 
+    let default_batches = read_all_c(uri, None).1;
+    assert_eq!(default_batches.len(), 3);
+    let explicit_zero_false = LanceFileReaderOptions {
+        has_batch_size_bytes: 1,
+        batch_size_bytes: 0,
+        has_cache_repetition_index: 1,
+        cache_repetition_index: 0,
+        has_validate_on_decode: 1,
+        validate_on_decode: 0,
+        has_inline_scheduling: 1,
+        inline_scheduling: 0,
+        ..Default::default()
+    };
+    let (_, sized_batches) = read_all_c(uri, Some(&explicit_zero_false));
+    assert_eq!(sized_batches.len(), 7);
+    let mut native_options = NativeReaderOptions::default();
+    native_options.batch_size_bytes = Some(0);
+    native_options.decoder_config.cache_repetition_index = false;
+    native_options.decoder_config.validate_on_decode = false;
+    native_options.decoder_config.inline_scheduling = Some(false);
+    let native_sized = native_reader_with_options(uri, native_options);
+    assert_batches_match_ignoring_root_metadata(&sized_batches, &native_batches(&native_sized));
+
     let reader = open_c_reader(uri, None);
     let mut range = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
     assert_eq!(
@@ -742,6 +904,81 @@ fn reader_projection_range_indices_errors_and_io_stats() {
             .values(),
         &[1, 3, 7]
     );
+
+    let duplicate_indices = [2u32, 2, 0];
+    let mut duplicate_stream = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe {
+            lance_file_reader_read_indices(
+                reader,
+                duplicate_indices.as_ptr(),
+                duplicate_indices.len(),
+                8,
+                1,
+                &mut duplicate_stream,
+            )
+        },
+        0
+    );
+    let (_, duplicate_batches) = collect_c_stream(duplicate_stream);
+    let duplicate = arrow::compute::concat_batches(&fixture_schema(), &duplicate_batches).unwrap();
+    assert_eq!(
+        duplicate
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[3, 3, 1]
+    );
+    let oracle = native_reader(uri);
+    let native_duplicates = lance_c::runtime::block_on(async {
+        oracle
+            .read_stream(
+                ReadBatchParams::Indices(UInt32Array::from_iter_values(duplicate_indices)),
+                8,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .map(|batch| batch.unwrap())
+            .collect::<Vec<_>>()
+            .await
+    });
+    assert_batches_match_ignoring_root_metadata(&duplicate_batches, &native_duplicates);
+
+    let out_of_range = [7u32];
+    let mut out_of_range_stream = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe {
+            lance_file_reader_read_indices(
+                reader,
+                out_of_range.as_ptr(),
+                out_of_range.len(),
+                8,
+                1,
+                &mut out_of_range_stream,
+            )
+        },
+        -1
+    );
+    let (_, c_out_of_range_error) = take_error();
+    let native_out_of_range_error = lance_c::runtime::block_on(async {
+        oracle
+            .read_stream(
+                ReadBatchParams::Indices(UInt32Array::from_iter_values(out_of_range)),
+                8,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .err()
+            .expect("native out-of-range index must fail")
+    });
+    assert_eq!(c_out_of_range_error, native_out_of_range_error.to_string());
+    assert!(c_out_of_range_error.contains("out of bounds"));
 
     let mut stats = LanceScanStats::default();
     assert_eq!(
@@ -1202,6 +1439,250 @@ fn writer_repeated_abort_and_failure_follow_native_state() {
 }
 
 #[test]
+fn writer_zero_max_page_bytes_matches_native_for_declared_and_lazy() {
+    let root = tempfile::tempdir().unwrap();
+    let batch = fixture_batch();
+    let schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
+    let options = LanceFileWriterOptions {
+        has_max_page_bytes: 1,
+        max_page_bytes: 0,
+        ..Default::default()
+    };
+    let native_options = NativeWriterOptions {
+        max_page_bytes: Some(0),
+        ..Default::default()
+    };
+
+    let declared_uri = root.path().join("declared-zero-page.lance");
+    let declared_uri = declared_uri.to_str().unwrap();
+    let uri = c_string(declared_uri);
+    let writer = unsafe {
+        lance_file_writer_open(uri.as_ptr(), &schema, &options, ptr::null(), ptr::null())
+    };
+    assert!(writer.is_null(), "declared zero-page limit must fail open");
+    let (code, message) = take_error();
+    assert_eq!(code, LanceErrorCode::InvalidArgument);
+    let native_error = native_writer(declared_uri, &fixture_schema(), native_options.clone())
+        .err()
+        .expect("native declared zero-page limit must fail");
+    assert_eq!(message, native_error.to_string());
+    assert!(message.contains("max_page_bytes must be greater than 0, got 0"));
+
+    let native_lazy_uri = root.path().join("native-lazy-zero-page.lance");
+    let mut native_lazy =
+        native_lazy_writer(native_lazy_uri.to_str().unwrap(), native_options).unwrap();
+    let native_error = native_write_batch(&mut native_lazy, &batch)
+        .expect_err("native lazy zero-page write must fail");
+
+    let lazy_uri = root.path().join("lazy-zero-page.lance");
+    let lazy_uri = lazy_uri.to_str().unwrap();
+    let uri = c_string(lazy_uri);
+    let writer = unsafe {
+        lance_file_writer_open(
+            uri.as_ptr(),
+            ptr::null(),
+            &options,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(
+        !writer.is_null(),
+        "lazy zero-page writer opens before write"
+    );
+    let raw_batch = import_batch(&batch);
+    assert_eq!(
+        unsafe { lance_file_writer_write_batch(writer, raw_batch) },
+        -1
+    );
+    let (code, message) = take_error();
+    assert_eq!(code, LanceErrorCode::InvalidArgument);
+    assert_eq!(message, native_error.to_string());
+    unsafe {
+        lance_batch_free(raw_batch);
+        lance_file_writer_close(writer);
+    }
+}
+
+#[test]
+fn writer_batch_mismatches_match_native_for_declared_and_lazy() {
+    let root = tempfile::tempdir().unwrap();
+    let required = Field::new("required", DataType::Int32, false);
+    let optional = Field::new("optional", DataType::Utf8, true);
+    let writer_schema = Arc::new(Schema::new(vec![required, optional]));
+    let ffi_schema = FFI_ArrowSchema::try_from(writer_schema.as_ref()).unwrap();
+    let valid = RecordBatch::try_new(
+        writer_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+
+    let missing = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "required",
+            DataType::Int32,
+            false,
+        )])),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    let type_mismatch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("required", DataType::Int64, true),
+            Field::new("optional", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+    let null_required = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("required", DataType::Int32, true),
+            Field::new("optional", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+
+    let cases = [
+        ("missing", missing, "missing the column `optional`"),
+        ("type-mismatch", type_mismatch, "Int64"),
+        ("null-required", null_required, "contained null values"),
+    ];
+
+    for lazy in [false, true] {
+        for (name, invalid, expected_fragment) in &cases {
+            let mode = if lazy { "lazy" } else { "declared" };
+            let native_uri = root.path().join(format!("native-{mode}-{name}.lance"));
+            let c_uri = root.path().join(format!("c-{mode}-{name}.lance"));
+            let native_uri = native_uri.to_str().unwrap();
+            let c_uri = c_uri.to_str().unwrap();
+            let c_uri_c = c_string(c_uri);
+            let mut native_writer = if lazy {
+                native_lazy_writer(native_uri, NativeWriterOptions::default()).unwrap()
+            } else {
+                native_writer(
+                    native_uri,
+                    writer_schema.as_ref(),
+                    NativeWriterOptions::default(),
+                )
+                .unwrap()
+            };
+            let c_writer = unsafe {
+                lance_file_writer_open(
+                    c_uri_c.as_ptr(),
+                    if lazy { ptr::null() } else { &ffi_schema },
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                )
+            };
+            assert!(!c_writer.is_null());
+
+            if lazy {
+                native_write_batch(&mut native_writer, &valid).unwrap();
+                let valid_raw = import_batch(&valid);
+                assert_eq!(
+                    unsafe { lance_file_writer_write_batch(c_writer, valid_raw) },
+                    0
+                );
+                unsafe { lance_batch_free(valid_raw) };
+            }
+
+            let native_error = native_write_batch(&mut native_writer, invalid).unwrap_err();
+            assert!(
+                matches!(native_error, lance_core::Error::InvalidInput { .. }),
+                "{mode} {name}: unexpected native error {native_error:?}"
+            );
+            let native_message = native_error.to_string();
+            assert!(
+                native_message.contains(*expected_fragment),
+                "{mode} {name}: native error lacks {expected_fragment:?}: {native_message}"
+            );
+
+            let raw_invalid = import_batch(invalid);
+            assert_eq!(
+                unsafe { lance_file_writer_write_batch(c_writer, raw_invalid) },
+                -1
+            );
+            let (code, message) = take_error();
+            assert_eq!(code, LanceErrorCode::InvalidArgument);
+            assert_eq!(message, native_message, "{mode} {name}");
+            unsafe {
+                lance_batch_free(raw_invalid);
+                lance_file_writer_close(c_writer);
+            }
+        }
+    }
+}
+
+#[test]
+fn writer_keep_original_array_retains_imported_stream_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let source_uri = root.path().join("source.lance");
+    let source_uri = source_uri.to_str().unwrap();
+    write_fixture(
+        source_uri,
+        Some("2.2"),
+        false,
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+
+    let reader = open_c_reader(source_uri, None);
+    let mut stream = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_file_reader_read_all(reader, 2, 1, &mut stream) },
+        0
+    );
+    let mut stream_reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let source_batch = stream_reader.next().unwrap().unwrap();
+    assert_eq!(source_batch.num_rows(), 2);
+    drop(stream_reader);
+    unsafe { lance_file_reader_close(reader) };
+
+    let writer_uri = root.path().join("kept.lance");
+    let writer_uri = writer_uri.to_str().unwrap();
+    let schema = FFI_ArrowSchema::try_from(source_batch.schema().as_ref()).unwrap();
+    let options = LanceFileWriterOptions {
+        has_keep_original_array: 1,
+        keep_original_array: 1,
+        ..Default::default()
+    };
+    let uri = c_string(writer_uri);
+    let writer = unsafe {
+        lance_file_writer_open(uri.as_ptr(), &schema, &options, ptr::null(), ptr::null())
+    };
+    assert!(!writer.is_null());
+    let raw_batch = import_batch(&source_batch);
+    drop(source_batch);
+    assert_eq!(
+        unsafe { lance_file_writer_write_batch(writer, raw_batch) },
+        0
+    );
+    unsafe { lance_batch_free(raw_batch) };
+    let mut summary = LanceFileWriteSummary::default();
+    assert_eq!(unsafe { lance_file_writer_finish(writer, &mut summary) }, 0);
+    assert_eq!(summary.num_rows, 2);
+    unsafe { lance_file_writer_close(writer) };
+
+    let (_, output) = read_all_c(writer_uri, None);
+    let expected = fixture_batch().slice(0, 2);
+    assert_fixture_batches_expected(&output, &expected);
+}
+
+#[test]
 fn malformed_files_and_v1_are_rejected_without_panic() {
     let root = tempfile::tempdir().unwrap();
     let valid = root.path().join("valid.lance");
@@ -1253,6 +1734,30 @@ fn malformed_files_and_v1_are_rejected_without_panic() {
         assert_ne!(code, LanceErrorCode::Ok);
         assert!(!message.is_empty(), "{name} returned no error message");
     }
+}
+
+#[test]
+fn real_v1_fixture_is_rejected_by_the_current_format_reader() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test_data/v0.27.1/pq_in_schema/data/9a05591c-9c05-4599-8d0f-40b36f27a313.lance");
+    let uri = c_string(path.to_str().unwrap());
+    let reader = unsafe {
+        lance_file_reader_open(
+            uri.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(reader.is_null(), "v1 fixture unexpectedly opened");
+    let (code, message) = take_error();
+    assert_ne!(code, LanceErrorCode::Ok);
+    assert_ne!(code, LanceErrorCode::Panic);
+    assert!(
+        message.to_lowercase().contains("v1"),
+        "v1 rejection must come from the native current-format reader: {message}"
+    );
 }
 
 #[derive(Clone, Default)]
