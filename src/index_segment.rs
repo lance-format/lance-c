@@ -1618,7 +1618,7 @@ unsafe fn commit_index_segments_inner(
     }
     let bytes_array = unsafe { slice::from_raw_parts(segment_metadata_bytes, segment_count) };
     let lens_array = unsafe { slice::from_raw_parts(segment_metadata_lens, segment_count) };
-    let mut segments = Vec::new();
+    let mut segments = Vec::with_capacity(segment_count);
     for (position, (&bytes, &len)) in bytes_array.iter().zip(lens_array.iter()).enumerate() {
         if bytes.is_null() || len == 0 {
             return Err(invalid_input(format!(
@@ -1753,7 +1753,7 @@ unsafe fn merge_index_segments_inner(
             "dataset, out_bytes, and out_len must not be NULL",
         ));
     }
-    let mut segments = Vec::with_capacity(segment_count);
+    let mut segments = Vec::new();
     if segment_count > 0 {
         if segment_metadata_bytes.is_null() || segment_metadata_lens.is_null() {
             return Err(invalid_input(format!(
