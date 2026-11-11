@@ -23,12 +23,10 @@ use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::Result;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-use lance_index::vector::VectorIndex;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use lance_index::vector::ivf::storage::IvfModel as NativeIvfModel;
-use lance_index::{FtsPrewarmOptions, IndexDescription, IndexType, PrewarmOptions};
-use lance_io::stream::RecordBatchStream;
+use lance_index::{FtsPrewarmOptions, IndexType, PrewarmOptions};
 use lance_table::format::IndexMetadata;
 use object_store::path::Path;
 use prost::Message;
@@ -693,7 +691,7 @@ pub unsafe extern "C" fn lance_dataset_get_ivf_model(
 ) -> *mut LanceIvfModel {
     ffi_try!(
         unsafe { dataset_get_ivf_model_inner(dataset, index_name) },
-        null_mut()
+        std::ptr::null_mut()
     )
 }
 
