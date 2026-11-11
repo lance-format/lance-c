@@ -1884,7 +1884,7 @@ fn storage_provider_none_some_empty_error_expiry_and_force() {
     assert!(!provider.is_null());
     let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), provider) };
     let (code, _) = snapshot_options(accessor).unwrap_err();
-    assert_eq!(code, LanceErrorCode::InvalidArgument);
+    assert_eq!(code, LanceErrorCode::IoError);
     assert_eq!(releases.load(Ordering::SeqCst), 1);
     unsafe {
         lance_storage_options_accessor_close(accessor);
