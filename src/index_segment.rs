@@ -16,6 +16,7 @@ use arrow_schema::{DataType, Field};
 use chrono::{DateTime, Utc};
 use lance::Dataset;
 use lance::index::DatasetIndexExt;
+use lance::index::vector::{StageParams, VectorIndexParams as LanceCoreVectorIndexParams};
 use lance_core::{Error, Result};
 use lance_index::progress::IndexBuildProgress;
 use lance_index::scalar::ScalarIndexParams;
@@ -27,8 +28,8 @@ use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::helpers;
 use crate::index::{
-    LanceMetricType, LanceScalarIndexType, LanceVectorIndexParams, LanceVectorIndexType,
-    build_vector_params_with_models,
+    LanceMetricType, LanceScalarIndexType, LanceVectorIndexOptions, LanceVectorIndexParams,
+    LanceVectorIndexType, build_vector_params_with_models, prepare_vector_build,
 };
 use crate::runtime::block_on;
 
@@ -129,10 +130,20 @@ enum SegmentKind {
         params_json: Option<String>,
     },
     Vector {
-        params: LanceVectorIndexParams,
-        centroids: Option<Arc<FixedSizeListArray>>,
-        codebook: Option<ArrayRef>,
+        params: LanceCoreVectorIndexParams,
+        train: bool,
     },
+}
+
+/// Fragment selection and optional UUID for the additive vector segment
+/// builder. A NULL optional pointer preserves native `None`; a non-NULL scope
+/// with `fragment_count == 0` represents an explicit empty selection.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceVectorIndexSegmentScope {
+    pub fragment_ids: *const u32,
+    pub fragment_count: usize,
+    pub index_uuid: *const u8,
 }
 
 /// Event code delivered to `LanceIndexBuildProgressCallback`; mirrors
@@ -360,7 +371,7 @@ pub(crate) struct ModelProvenance {
 
 unsafe fn parse_options(
     options: *const LanceIndexSegmentBuildOptions,
-    dataset: &Dataset,
+    _dataset: &Dataset,
     scalar: bool,
 ) -> Result<ParsedBuildOptions> {
     if options.is_null() {
@@ -379,40 +390,14 @@ unsafe fn parse_options(
                 "fragment_ids is NULL but fragment_count is {count}"
             )));
         }
-        (false, 0) => {
-            return Err(invalid_input(
-                "fragment_ids is non-NULL but fragment_count is 0",
-            ));
-        }
+        (false, 0) => Some(Vec::new()),
         (false, count) => {
             if count > isize::MAX as usize / std::mem::size_of::<u32>() {
                 return Err(invalid_input(format!(
                     "fragment_count {count} exceeds the maximum addressable u32 slice length"
                 )));
             }
-            let ids = unsafe { slice::from_raw_parts(options.fragment_ids, count) }.to_vec();
-            let mut unique = HashSet::with_capacity(ids.len());
-            for (position, fragment_id) in ids.iter().copied().enumerate() {
-                if !unique.insert(fragment_id) {
-                    return Err(invalid_input(format!(
-                        "fragment_ids[{position}] is duplicate fragment id {fragment_id}"
-                    )));
-                }
-            }
-            let existing: HashSet<u32> = dataset
-                .get_fragments()
-                .iter()
-                .filter_map(|fragment| u32::try_from(fragment.id()).ok())
-                .collect();
-            for (position, fragment_id) in ids.iter().copied().enumerate() {
-                if !existing.contains(&fragment_id) {
-                    return Err(invalid_input(format!(
-                        "fragment_ids[{position}]={fragment_id} does not exist in dataset version {}",
-                        dataset.version().version
-                    )));
-                }
-            }
-            Some(ids)
+            Some(unsafe { slice::from_raw_parts(options.fragment_ids, count) }.to_vec())
         }
     };
 
@@ -700,15 +685,15 @@ pub(crate) unsafe fn borrow_model_array(
         return Err(invalid_input(format!("{name} must not be NULL")));
     }
     let field = unsafe { validate_model_schema(schema, name)? };
-    let DataType::FixedSizeList(child_field, list_size) = field.data_type() else {
+    let DataType::FixedSizeList(_, list_size) = field.data_type() else {
         return Err(invalid_input(format!(
             "{name}_schema must describe FixedSizeList, got {:?}",
             field.data_type()
         )));
     };
-    if *list_size <= 0 || child_field.data_type() != &DataType::Float32 {
+    if *list_size <= 0 {
         return Err(invalid_input(format!(
-            "{name}_schema must describe FixedSizeList<Float32> with positive list_size, got {:?}",
+            "{name}_schema must describe FixedSizeList with positive list_size, got {:?}",
             field.data_type()
         )));
     }
@@ -776,7 +761,7 @@ pub(crate) unsafe fn borrow_model_array(
     validate_common(child, &format!("{name}.children[0]"))?;
     if child.n_buffers != 2 || child.buffers.is_null() {
         return Err(invalid_input(format!(
-            "{name}.children[0] Float32 must have two buffers and a non-NULL buffers pointer; n_buffers={}",
+            "{name}.children[0] primitive values must have two buffers and a non-NULL buffers pointer; n_buffers={}",
             child.n_buffers
         )));
     }
@@ -837,7 +822,7 @@ pub(crate) fn fixed_size_list_model(array: ArrayRef, name: &str) -> Result<Fixed
         .cloned()
         .ok_or_else(|| {
             invalid_input(format!(
-                "{name} must be FixedSizeList<Float32>, got {:?}",
+                "{name} must be FixedSizeList, got {:?}",
                 array.data_type()
             ))
         })?;
@@ -1081,25 +1066,44 @@ unsafe fn new_vector_builder_inner(
     };
 
     let centroids = centroids.map(Arc::new);
-    // Construct now so all parameter/model mismatches fail at the FFI boundary.
-    let _ = build_vector_params_with_models(&params, centroids.clone(), codebook.clone())?;
+    // Construct now so all supported parameter/model mismatches fail while
+    // creating the builder. Fragment validation itself stays in Lance core.
+    let core_params = build_vector_params_with_models(&params, centroids, codebook)?;
 
-    // TODO(upstream-lance): Remove this fail-fast once Lance's distributed
-    // vector-index path reconstructs a supplied PQ codebook with an L2
-    // ProductQuantizer, matching the ordinary full-dataset path. Pinned Lance
-    // revision ab6b5bbe rewraps supplied codebooks with DistanceType::Dot in
-    // `make_global_pq`, which silently switches PQ code assignment away from
-    // the L2 contract shared by full-dataset builds and index readers.
-    if matches!(
-        params.index_type,
-        LanceVectorIndexType::IvfPq | LanceVectorIndexType::IvfHnswPq
-    ) && params.metric == LanceMetricType::Dot
-        && codebook.is_some()
-        && let Some(fragment_ids) = parsed.fragment_ids.as_ref()
+    validate_precomputed_pq_fragment_scope(&dataset, &core_params, parsed.fragment_ids.as_deref())?;
+
+    Ok(Box::into_raw(Box::new(LanceIndexSegmentBuilder {
+        dataset,
+        column,
+        index_name,
+        kind: SegmentKind::Vector {
+            params: core_params,
+            train: true,
+        },
+        fragment_ids: parsed.fragment_ids,
+        index_uuid: parsed.index_uuid,
+        progress: None,
+        executed: false,
+    })))
+}
+
+// The selected core's distributed path reconstructs supplied PQ codebooks with
+// the query metric. Index readers and ordinary builds use L2 PQ assignment,
+// so preserve the existing restriction for DOT models on fragment subsets
+// until the core's make_global_pq uses the same assignment metric.
+fn validate_precomputed_pq_fragment_scope(
+    dataset: &Dataset,
+    params: &LanceCoreVectorIndexParams,
+    fragment_ids: Option<&[u32]>,
+) -> Result<()> {
+    let has_codebook = params
+        .stages
+        .iter()
+        .any(|stage| matches!(stage, StageParams::PQ(pq) if pq.codebook.is_some()));
+    if params.metric_type == LanceMetricType::Dot.to_distance()
+        && has_codebook
+        && let Some(fragment_ids) = fragment_ids
     {
-        // `fragment_ids` are unique and known to exist (checked in
-        // `parse_options`), so set inequality here is exactly an effective
-        // strict subset, mirroring core `effective_vector_fragments`.
         let all_fragment_ids: HashSet<u32> = dataset
             .get_fragments()
             .iter()
@@ -1108,13 +1112,98 @@ unsafe fn new_vector_builder_inner(
         let selected_fragment_ids: HashSet<u32> = fragment_ids.iter().copied().collect();
         if selected_fragment_ids != all_fragment_ids {
             return Err(invalid_input(format!(
-                "pq_codebook is supplied for metric=DOT, index_type={:?}, mode={:?}, and an effective strict fragment subset ({} of {} fragments): pinned Lance revision ab6b5bbe reconstructs the supplied codebook with a DOT ProductQuantizer in the distributed build path (make_global_pq), silently breaking the L2 PQ-assignment contract; cover the full dataset in one segment (pass NULL fragment_ids or list every fragment) or wait for upstream Lance DOT support",
-                params.index_type,
-                parsed.mode,
+                "pq_codebook with metric=DOT and an effective strict fragment subset ({} of {} fragments) is unsupported on Lance revision 40f15ed1. Its distributed make_global_pq path reconstructs the supplied codebook with a DOT ProductQuantizer, breaking the L2 PQ-assignment contract. Cover the full dataset in one segment by passing NULL fragment_ids or every fragment.",
                 selected_fragment_ids.len(),
                 all_fragment_ids.len()
             )));
         }
+    }
+    Ok(())
+}
+
+unsafe fn parse_vector_segment_scope(
+    scope: *const LanceVectorIndexSegmentScope,
+) -> Result<(Option<Vec<u32>>, Option<Uuid>)> {
+    if scope.is_null() {
+        return Ok((None, None));
+    }
+    let scope = unsafe { &*scope };
+    let fragment_ids = match (scope.fragment_ids.is_null(), scope.fragment_count) {
+        (true, 0) => None,
+        (true, count) => {
+            return Err(invalid_input(format!(
+                "scope.fragment_ids is NULL but scope.fragment_count is {count}"
+            )));
+        }
+        (false, 0) => Some(Vec::new()),
+        (false, count) => {
+            if count > isize::MAX as usize / std::mem::size_of::<u32>() {
+                return Err(invalid_input(format!(
+                    "scope.fragment_count {count} exceeds the maximum addressable u32 slice length"
+                )));
+            }
+            Some(unsafe { slice::from_raw_parts(scope.fragment_ids, count) }.to_vec())
+        }
+    };
+    let index_uuid = if scope.index_uuid.is_null() {
+        None
+    } else {
+        let bytes: [u8; 16] = unsafe { slice::from_raw_parts(scope.index_uuid, 16) }
+            .try_into()
+            .expect("slice has a fixed length of 16");
+        Some(Uuid::from_bytes(bytes))
+    };
+    Ok((fragment_ids, index_uuid))
+}
+
+/// Create a vector segment builder from additive native options.
+///
+/// The builder copies strings, maps, paths, fragment IDs and UUIDs at creation.
+/// Arrow models are borrowed synchronously and leave a live caller-owned
+/// equivalent in place. The dataset is snapshotted and need not outlive the
+/// builder.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_builder_new_vector_with_options(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    options: *const LanceVectorIndexOptions,
+    scope: *const LanceVectorIndexSegmentScope,
+) -> *mut LanceIndexSegmentBuilder {
+    ffi_try!(
+        unsafe {
+            new_vector_builder_with_options_inner(dataset, column, index_name, options, scope)
+        },
+        null
+    )
+}
+
+unsafe fn new_vector_builder_with_options_inner(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    options: *const LanceVectorIndexOptions,
+    scope: *const LanceVectorIndexSegmentScope,
+) -> Result<*mut LanceIndexSegmentBuilder> {
+    if dataset.is_null() || column.is_null() || options.is_null() {
+        return Err(invalid_input(
+            "dataset, column, and options must not be NULL",
+        ));
+    }
+    let column = unsafe { helpers::parse_c_string(column)? }
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_input("column must not be NULL or empty"))?
+        .to_string();
+    let index_name = unsafe { helpers::parse_c_string(index_name)? }.map(str::to_string);
+    let prepared = unsafe { prepare_vector_build(options)? };
+    let (fragment_ids, index_uuid) = unsafe { parse_vector_segment_scope(scope)? };
+    let dataset = unsafe { &*dataset }.snapshot().as_ref().clone();
+    if prepared.train {
+        validate_precomputed_pq_fragment_scope(
+            &dataset,
+            &prepared.params,
+            fragment_ids.as_deref(),
+        )?;
     }
 
     Ok(Box::into_raw(Box::new(LanceIndexSegmentBuilder {
@@ -1122,12 +1211,11 @@ unsafe fn new_vector_builder_inner(
         column,
         index_name,
         kind: SegmentKind::Vector {
-            params,
-            centroids,
-            codebook,
+            params: prepared.params,
+            train: prepared.train,
         },
-        fragment_ids: parsed.fragment_ids,
-        index_uuid: parsed.index_uuid,
+        fragment_ids,
+        index_uuid,
         progress: None,
         executed: false,
     })))
@@ -1199,17 +1287,11 @@ unsafe fn execute_uncommitted_inner(
             }
             block_on(core_builder.execute_uncommitted())
         }
-        SegmentKind::Vector {
-            params,
-            centroids,
-            codebook,
-        } => {
-            let core_params =
-                build_vector_params_with_models(params, centroids.clone(), codebook.clone())?;
+        SegmentKind::Vector { params, train } => {
             let mut core_builder = builder.dataset.create_index_builder(
                 &columns,
                 lance_index::IndexType::Vector,
-                &core_params,
+                params,
             );
             if let Some(name) = builder.index_name.clone() {
                 core_builder = core_builder.name(name);
@@ -1223,9 +1305,7 @@ unsafe fn execute_uncommitted_inner(
             if let Some(progress) = builder.progress.clone() {
                 core_builder = core_builder.progress(Arc::new(progress));
             }
-            // Core's train=false means "create an empty index".  Model presence
-            // itself controls whether IVF/PQ training is skipped.
-            block_on(core_builder.train(true).execute_uncommitted())
+            block_on(core_builder.train(*train).execute_uncommitted())
         }
     };
     let metadata = result?;
@@ -1599,11 +1679,12 @@ unsafe fn metadata_index_type_inner(metadata: *const LanceIndexSegmentMetadata) 
             (false, None | Some(Compression::Flat(_))) => Ok(101),
             (false, Some(Compression::Sq(_))) => Ok(102),
             (false, Some(Compression::Pq(_))) => Ok(103),
+            (false, Some(Compression::Rq(_))) => Ok(107),
             (true, Some(Compression::Sq(_))) => Ok(104),
             (true, Some(Compression::Pq(_))) => Ok(105),
             (true, None | Some(Compression::Flat(_))) => Ok(106),
-            (_, Some(Compression::Rq(_))) => Err(Error::not_supported(
-                "Rabit-quantized vector metadata has no LanceVectorIndexType value",
+            (true, Some(Compression::Rq(_))) => Err(Error::not_supported(
+                "IVF_HNSW_RQ vector metadata is not supported by the C index type enum",
             )),
         };
     }

@@ -3720,6 +3720,7 @@ dependencies = [
  "lance-table",
  "libc",
  "log",
+ "object_store 0.14.2",
  "opendal",
  "pin-project",
  "prost",

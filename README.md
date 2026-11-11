@@ -34,11 +34,11 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Vector search | Nearest-neighbor via scanner with metric/k/nprobes |
 | [x] | Full-text search | FTS queries through scanner interface |
 | [x] | MinHash text search | Native MinHash LSH index and scanner similarity search with `_distance` |
-| [x] | Vector index creation | IVF_PQ, IVF_FLAT, IVF_SQ, HNSW variants |
+| [x] | Vector index creation | IVF_FLAT, IVF_SQ, IVF_PQ, IVF_RQ and HNSW variants, with native build options |
 | [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List, NGram, ZoneMap, BloomFilter, MinHash LSH indexes |
 | [x] | Index management | List and drop index operations |
-| [x] | Distributed index build | Train shared IVF/PQ models, build uncommitted fragment-scoped segments, and exchange protobuf metadata |
-| [x] | C++ wrappers | `create_vector_index()` and `create_scalar_index()` methods |
+| [x] | Distributed index build | Share IVF/PQ/RQ models, build uncommitted fragment-scoped segments, and exchange protobuf metadata |
+| [x] | C++ wrappers | `create_vector_index[_with_options]()` and `create_scalar_index()` methods |
 
 ### Phase 3: Write Path & Mutations
 
@@ -822,6 +822,57 @@ auto approx_items = session.approx_num_items();
 `size_bytes()` is the native deep size of live session state, not an RSS
 measurement or a configured limit. `approx_num_items()` is explicitly
 approximate and may change as cache maintenance runs.
+
+### Vector index build options
+
+`lance_dataset_create_vector_index` and
+`lance_index_segment_builder_new_vector` retain the original
+`LanceVectorIndexParams` ABI and its zero-as-default rules. IVF_RQ is value 107;
+its legacy `num_bits == 0` selects the native RQ default of 5.
+
+Use `lance_dataset_create_vector_index_with_options` and
+`lance_index_segment_builder_new_vector_with_options` when a build needs native
+presence semantics. `LanceVectorIndexOptions` distinguishes an absent value from
+an explicit zero, supports automatic or explicit IVF sizing, training/sampling
+and streaming controls, precomputed partitions/shuffle inputs, storage and
+runtime hints, PQ parameters/models, native IVF/PQ Arrow model pairs, RQ JSON,
+HNSW tuning, index file version, transpose control, and the native train flag.
+`options->has_train == false` retains the native train=true default.
+
+```c
+LanceVectorIndexOptions options = {0};
+options.index_type = LANCE_INDEX_IVF_RQ;
+options.metric = LANCE_METRIC_L2;
+options.num_partitions = (LanceOptionalU64){256, true}; /* absent: native auto */
+options.num_bits = (LanceOptionalU64){5, true};
+const char* rq_model = lance_index_build_rq_model(128, 0); /* 0 -> native 5 */
+options.rabitq_model_json = rq_model;
+int32_t status = lance_dataset_create_vector_index_with_options(
+    dataset, "embedding", "embedding_idx", &options, false);
+lance_free_string(rq_model);
+```
+
+```cpp
+lance::VectorIndexOptions options;
+options.index_type = LANCE_INDEX_IVF_RQ;
+options.num_partitions = 256;
+options.rabitq_model_json = lance::build_rq_model(128);
+dataset.create_vector_index_with_options("embedding", options);
+```
+
+String maps must contain valid UTF-8. Duplicate keys use Rust HashMap
+last-write-wins semantics. Fragment selection preserves native None versus
+Some(empty); Lance decides duplicate and missing-ID validation at build time.
+Native Arrow model pointers are borrowed synchronously and may be replaced while
+a live caller-owned equivalent remains in place. `IndexModel::adopt` transfers
+caller-produced native Arrow structs and clears the input structs, allowing
+model dtypes beyond the legacy trainer's Float32 representation.
+
+Uncommitted builders copy their dataset snapshot, strings, maps, paths, fragment
+IDs and UUIDs. The committed options entry point follows native publication:
+Lance commits first and then reloads index metadata, so an error can be returned
+after a new dataset version was published. Reopen the dataset to determine its
+current version; the binding does not claim storage rollback on such errors.
 
 ### Prewarm an index synchronously
 

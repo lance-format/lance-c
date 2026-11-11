@@ -4662,6 +4662,103 @@ static void test_vector_models_and_reusable_segments(const char *uri) {
     printf("OK\n");
 }
 
+static int32_t first_nearest_id(LanceDataset *ds, const float *query) {
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "create nearest scanner failed");
+    ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                 LANCE_DTYPE_FLOAT32, 3) == 0,
+           "nearest failed");
+    ASSERT(lance_scanner_set_nprobes(scanner, 2) == 0, "set_nprobes failed");
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "nearest stream failed");
+
+    struct ArrowSchema schema = {0};
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "nearest schema failed");
+    int id_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (strcmp(schema.children[i]->name, "id") == 0) {
+            id_column = (int)i;
+            break;
+        }
+    }
+    ASSERT(id_column >= 0, "nearest result is missing id");
+    ASSERT(strcmp(schema.children[id_column]->format, "i") == 0,
+           "nearest id column type mismatch");
+    schema.release(&schema);
+
+    int32_t id = -1;
+    while (1) {
+        struct ArrowArray array = {0};
+        ASSERT(stream.get_next(&stream, &array) == 0, "nearest get_next failed");
+        if (array.release == NULL) break;
+        if (id < 0 && array.length > 0) {
+            const struct ArrowArray *ids = array.children[id_column];
+            const int32_t *values = (const int32_t *)ids->buffers[1];
+            id = values[ids->offset];
+        }
+        array.release(&array);
+    }
+    stream.release(&stream);
+    lance_scanner_close(scanner);
+    return id;
+}
+
+static void test_vector_index_options_and_rq_model(const char *uri) {
+    printf("  test_vector_index_options_and_rq_model... ");
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    struct ArrowArray centroids = {0};
+    struct ArrowSchema centroids_schema = {0};
+    ASSERT(lance_index_train_ivf_model(
+               ds, "embedding", 2, LANCE_METRIC_L2, NULL, 0,
+               &centroids, &centroids_schema) == 0,
+           "IVF training failed");
+    const char *rq_json = lance_index_build_rq_model(8, 0);
+    ASSERT(rq_json != NULL, "RQ model generation failed");
+    ASSERT(strstr(rq_json, "\"num_bits\":5") != NULL,
+           "RQ zero bits must select the native default");
+
+    LanceVectorIndexOptions options = {0};
+    options.index_type = LANCE_INDEX_IVF_RQ;
+    options.metric = LANCE_METRIC_L2;
+    options.num_partitions = (LanceOptionalU64){2, true};
+    options.ivf_centroids = &centroids;
+    options.ivf_centroids_schema = &centroids_schema;
+    options.rabitq_model_json = rq_json;
+    options.index_file_version = LANCE_INDEX_FILE_VERSION_V3;
+    ASSERT(lance_dataset_create_vector_index_with_options(
+               ds, "embedding", "c_options_rq_idx", &options, false) == 0,
+           "options vector create failed");
+
+    float query[8];
+    for (int i = 0; i < 8; ++i) query[i] = 0.3f + (float)i;
+    ASSERT(first_nearest_id(ds, query) == 3,
+           "IVF_RQ nearest result mismatch");
+    const char *segments = lance_dataset_index_segments_json(ds);
+    ASSERT(segments != NULL, "index segments JSON failed");
+    ASSERT(strstr(segments, "\"type\":\"IVF_RQ\"") != NULL,
+           "missing IVF_RQ metadata type");
+    ASSERT(strstr(segments, "\"index_version\":2") != NULL,
+           "missing IVF_RQ index version");
+    lance_free_string(segments);
+    lance_dataset_close(ds);
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "reopen failed");
+    ASSERT(first_nearest_id(ds, query) == 3,
+           "IVF_RQ nearest result changed after reopen");
+    ASSERT(lance_dataset_drop_index(ds, "c_options_rq_idx") == 0,
+           "drop IVF_RQ index failed");
+
+    lance_dataset_close(ds);
+    lance_free_string(rq_json);
+    if (centroids.release) centroids.release(&centroids);
+    if (centroids_schema.release) centroids_schema.release(&centroids_schema);
+    printf("OK\n");
+}
+
 /* Builds one uncommitted vector segment per fragment and commits them as a
  * single logical multi-segment index from a real C caller. */
 static void test_commit_index_segments(const char *uri) {
@@ -6073,6 +6170,7 @@ int main(int argc, char **argv) {
     test_index_segment_builder(uri);
     test_index_segment_builder_progress(uri);
     test_vector_models_and_reusable_segments(uri);
+    test_vector_index_options_and_rq_model(uri);
     test_commit_index_segments(uri);
     test_native_scalar_indexes(uri);
     test_minhash_lsh(uri);

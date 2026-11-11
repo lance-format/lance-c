@@ -6,17 +6,23 @@
 //! Index creation mutates the dataset under an exclusive write lock; existing
 //! scanners that already cloned the inner Arc keep their snapshot view.
 
-use std::ffi::{CString, c_char};
+use std::collections::HashMap;
+use std::ffi::{CStr, CString, c_char};
 use std::future::Future;
 use std::sync::Arc;
 
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray};
+use lance::index::vector::IndexFileVersion;
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::Result;
 use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+use lance_index::vector::bq::RQBuildParams;
+use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use lance_table::format::IndexMetadata;
+use object_store::path::Path;
 use prost::Message;
 use serde_json::json;
 use uuid::Uuid;
@@ -24,6 +30,7 @@ use uuid::Uuid;
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
+use crate::index_segment::{borrow_model_array, fixed_size_list_model};
 use crate::runtime::block_on;
 
 /// Scalar index type, matching the C enum `LanceScalarIndexType`.
@@ -625,6 +632,7 @@ pub enum LanceVectorIndexType {
     IvfHnswSq = 104,
     IvfHnswPq = 105,
     IvfHnswFlat = 106,
+    IvfRq = 107,
 }
 
 impl LanceVectorIndexType {
@@ -636,6 +644,7 @@ impl LanceVectorIndexType {
             104 => Ok(Self::IvfHnswSq),
             105 => Ok(Self::IvfHnswPq),
             106 => Ok(Self::IvfHnswFlat),
+            107 => Ok(Self::IvfRq),
             _ => Err(lance_core::Error::invalid_input_source(
                 format!("invalid vector index type: {value}").into(),
             )),
@@ -676,6 +685,110 @@ pub struct LanceVectorIndexParams {
     pub hnsw_m: u32,
     pub hnsw_ef_construction: u32,
     pub sample_rate: u32,
+}
+
+/// Presence-aware unsigned option for native `Option<usize>` and similar
+/// fields. `is_set == false` means the value was not specified and `value` is
+/// ignored, including values that would not fit the native type.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LanceOptionalU64 {
+    pub value: u64,
+    pub is_set: bool,
+}
+
+/// Borrowed UTF-8 string map. Duplicate keys follow Rust `HashMap` insertion
+/// semantics, so the last value wins.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceStringMap {
+    pub keys: *const *const c_char,
+    pub values: *const *const c_char,
+    pub count: usize,
+}
+
+/// Borrowed precomputed shuffle-buffer input. `path` must be non-NULL.
+/// `buffer_count == 0` represents an explicitly empty buffer list.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LancePrecomputedShuffleBuffers {
+    pub path: *const c_char,
+    pub buffers: *const *const c_char,
+    pub buffer_count: usize,
+}
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceIndexFileVersion {
+    V3 = 0,
+    Legacy = 1,
+}
+
+impl LanceIndexFileVersion {
+    fn from_c(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::V3),
+            1 => Ok(Self::Legacy),
+            _ => Err(lance_core::Error::invalid_input(format!(
+                "index_file_version must be 0 (V3) or 1 (Legacy), got {value}"
+            ))),
+        }
+    }
+
+    fn to_native(self) -> IndexFileVersion {
+        match self {
+            Self::V3 => IndexFileVersion::V3,
+            Self::Legacy => IndexFileVersion::Legacy,
+        }
+    }
+}
+
+/// Additive vector-build options. The whole object is zero-initializable:
+/// every `LanceOptionalU64` defaults to "not specified", `index_file_version`
+/// zero selects V3, and absent model/map pointers select native defaults.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceVectorIndexOptions {
+    pub index_type: i32,
+    pub metric: i32,
+
+    pub num_partitions: LanceOptionalU64,
+    pub target_partition_size: LanceOptionalU64,
+    pub max_iters: LanceOptionalU64,
+    pub sample_rate: LanceOptionalU64,
+    pub streaming_sample_rate: LanceOptionalU64,
+    pub streaming_coreset_rate: LanceOptionalU64,
+    pub streaming_refine_passes: u64,
+
+    pub precomputed_partitions_file: *const c_char,
+    pub precomputed_shuffle_buffers: *const LancePrecomputedShuffleBuffers,
+    pub shuffle_partition_batches: LanceOptionalU64,
+    pub shuffle_partition_concurrency: LanceOptionalU64,
+    pub storage_options: *const LanceStringMap,
+
+    pub num_sub_vectors: LanceOptionalU64,
+    pub num_bits: LanceOptionalU64,
+
+    pub ivf_centroids: *mut FFI_ArrowArray,
+    pub ivf_centroids_schema: *const FFI_ArrowSchema,
+    pub pq_codebook: *mut FFI_ArrowArray,
+    pub pq_codebook_schema: *const FFI_ArrowSchema,
+    pub rabitq_model_json: *const c_char,
+
+    pub hnsw_max_level: LanceOptionalU64,
+    pub hnsw_m: LanceOptionalU64,
+    pub hnsw_ef_construction: LanceOptionalU64,
+
+    pub index_file_version: i32,
+    pub skip_transpose: bool,
+    pub runtime_hints: *const LanceStringMap,
+    pub has_train: bool,
+    pub train: bool,
+}
+
+pub(crate) struct PreparedVectorBuild {
+    pub params: LanceCoreVectorIndexParams,
+    pub train: bool,
 }
 
 impl LanceMetricType {
@@ -739,6 +852,19 @@ fn build_ivf(
         ivf.sample_rate = p.sample_rate as usize;
     }
     Ok(ivf)
+}
+
+fn build_rq(p: &LanceVectorIndexParams) -> Result<RQBuildParams> {
+    let mut rq = RQBuildParams::default();
+    if p.num_bits != 0 {
+        rq.num_bits = u8::try_from(p.num_bits).map_err(|_| {
+            lance_core::Error::invalid_input(format!(
+                "num_bits {} cannot be represented as the native IVF_RQ u8 bit width",
+                p.num_bits
+            ))
+        })?;
+    }
+    Ok(rq)
 }
 
 fn build_pq(p: &LanceVectorIndexParams, codebook: Option<ArrayRef>) -> Result<PQBuildParams> {
@@ -825,6 +951,11 @@ pub(crate) fn build_vector_params_with_models(
             let sq = build_sq(p)?;
             LanceCoreVectorIndexParams::with_ivf_sq_params(metric, ivf, sq)
         }
+        IvfRq => {
+            let ivf = build_ivf(p, centroids)?;
+            let rq = build_rq(p)?;
+            LanceCoreVectorIndexParams::with_ivf_rq_params(metric, ivf, rq)
+        }
         IvfHnswFlat => {
             let ivf = build_ivf(p, centroids)?;
             let hnsw = build_hnsw(p)?;
@@ -846,6 +977,315 @@ pub(crate) fn build_vector_params_with_models(
     Ok(core)
 }
 
+fn parse_optional_u64(field: LanceOptionalU64) -> Result<Option<u64>> {
+    Ok(if field.is_set {
+        Some(field.value)
+    } else {
+        None
+    })
+}
+
+fn parse_optional_usize(field: LanceOptionalU64, name: &str) -> Result<Option<usize>> {
+    parse_optional_u64(field)?
+        .map(|value| {
+            usize::try_from(value).map_err(|_| {
+                lance_core::Error::invalid_input(format!(
+                    "{name}={value} cannot be represented as usize on this platform"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn parse_optional_u16(field: LanceOptionalU64, name: &str) -> Result<Option<u16>> {
+    parse_optional_u64(field)?
+        .map(|value| {
+            u16::try_from(value).map_err(|_| {
+                lance_core::Error::invalid_input(format!(
+                    "{name}={value} cannot be represented as u16"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn parse_optional_u8(field: LanceOptionalU64, name: &str) -> Result<Option<u8>> {
+    parse_optional_u64(field)?
+        .map(|value| {
+            u8::try_from(value).map_err(|_| {
+                lance_core::Error::invalid_input(format!(
+                    "{name}={value} cannot be represented as u8"
+                ))
+            })
+        })
+        .transpose()
+}
+
+unsafe fn parse_string_map(
+    map: *const LanceStringMap,
+    label: &str,
+) -> Result<Option<HashMap<String, String>>> {
+    if map.is_null() {
+        return Ok(None);
+    }
+    let map = unsafe { &*map };
+    if map.count > isize::MAX as usize / std::mem::size_of::<*const c_char>() {
+        return Err(lance_core::Error::invalid_input(format!(
+            "{label}.count {} exceeds the maximum addressable pointer slice length",
+            map.count
+        )));
+    }
+    if map.count > 0 && (map.keys.is_null() || map.values.is_null()) {
+        return Err(lance_core::Error::invalid_input(format!(
+            "{label}.keys and {label}.values must be non-NULL when count is {}",
+            map.count
+        )));
+    }
+    let mut parsed = HashMap::with_capacity(map.count);
+    for index in 0..map.count {
+        let key = unsafe { *map.keys.add(index) };
+        let value = unsafe { *map.values.add(index) };
+        if key.is_null() || value.is_null() {
+            return Err(lance_core::Error::invalid_input(format!(
+                "{label}.keys[{index}] and {label}.values[{index}] must not be NULL"
+            )));
+        }
+        let key = unsafe { CStr::from_ptr(key) }.to_str().map_err(|error| {
+            lance_core::Error::invalid_input(format!(
+                "{label}.keys[{index}] is not valid UTF-8: {error}"
+            ))
+        })?;
+        let value = unsafe { CStr::from_ptr(value) }.to_str().map_err(|error| {
+            lance_core::Error::invalid_input(format!(
+                "{label}.values[{index}] is not valid UTF-8: {error}"
+            ))
+        })?;
+        parsed.insert(key.to_string(), value.to_string());
+    }
+    Ok(Some(parsed))
+}
+
+unsafe fn parse_precomputed_shuffle_buffers(
+    buffers: *const LancePrecomputedShuffleBuffers,
+) -> Result<Option<(Path, Vec<String>)>> {
+    if buffers.is_null() {
+        return Ok(None);
+    }
+    let buffers = unsafe { &*buffers };
+    let raw_path = unsafe { helpers::parse_c_string(buffers.path)? }.ok_or_else(|| {
+        lance_core::Error::invalid_input("precomputed_shuffle_buffers.path must not be NULL")
+    })?;
+    let path = Path::parse(raw_path).map_err(|error| {
+        lance_core::Error::invalid_input(format!(
+            "precomputed_shuffle_buffers.path '{raw_path}' is invalid: {error}"
+        ))
+    })?;
+    if buffers.buffer_count > isize::MAX as usize / std::mem::size_of::<*const c_char>() {
+        return Err(lance_core::Error::invalid_input(format!(
+            "precomputed_shuffle_buffers.buffer_count {} exceeds the maximum addressable pointer slice length",
+            buffers.buffer_count
+        )));
+    }
+    if buffers.buffer_count > 0 && buffers.buffers.is_null() {
+        return Err(lance_core::Error::invalid_input(format!(
+            "precomputed_shuffle_buffers.buffers must be non-NULL when buffer_count is {}",
+            buffers.buffer_count
+        )));
+    }
+    let mut names = Vec::with_capacity(buffers.buffer_count);
+    for index in 0..buffers.buffer_count {
+        let buffer = unsafe { *buffers.buffers.add(index) };
+        let name = unsafe { helpers::parse_c_string(buffer)? }.ok_or_else(|| {
+            lance_core::Error::invalid_input(format!(
+                "precomputed_shuffle_buffers.buffers[{index}] must not be NULL"
+            ))
+        })?;
+        names.push(name.to_string());
+    }
+    Ok(Some((path, names)))
+}
+
+unsafe fn parse_native_fixed_size_list_model(
+    array: *mut FFI_ArrowArray,
+    schema: *const FFI_ArrowSchema,
+    name: &str,
+) -> Result<Option<FixedSizeListArray>> {
+    if array.is_null() != schema.is_null() {
+        return Err(lance_core::Error::invalid_input(format!(
+            "{name} and {name}_schema must both be NULL or both be non-NULL"
+        )));
+    }
+    if array.is_null() {
+        return Ok(None);
+    }
+    let model = unsafe { borrow_model_array(array, schema, name)? };
+    fixed_size_list_model(model, name).map(Some)
+}
+
+/// Convert the additive C options into native builder parameters. All native
+/// semantic validation stays in Lance. This layer only validates representation
+/// (UTF-8, pointer pairing, addressability and Rust type ranges).
+pub(crate) unsafe fn prepare_vector_build(
+    options: *const LanceVectorIndexOptions,
+) -> Result<PreparedVectorBuild> {
+    if options.is_null() {
+        return Err(lance_core::Error::invalid_input(
+            "options must not be NULL for the vector index options entry point",
+        ));
+    }
+    let options = unsafe { &*options };
+    let index_type = LanceVectorIndexType::from_c(options.index_type)?;
+    let metric = LanceMetricType::from_c(options.metric)?;
+    let train = if options.has_train {
+        options.train
+    } else {
+        true
+    };
+
+    let mut ivf = IvfBuildParams {
+        num_partitions: parse_optional_usize(options.num_partitions, "num_partitions")?,
+        target_partition_size: parse_optional_usize(
+            options.target_partition_size,
+            "target_partition_size",
+        )?,
+        ..Default::default()
+    };
+    if let Some(value) = parse_optional_usize(options.max_iters, "max_iters")? {
+        ivf.max_iters = value;
+    }
+    if let Some(value) = parse_optional_usize(options.sample_rate, "sample_rate")? {
+        ivf.sample_rate = value;
+    }
+    ivf.streaming_sample_rate =
+        parse_optional_usize(options.streaming_sample_rate, "streaming_sample_rate")?;
+    ivf.streaming_coreset_rate =
+        parse_optional_usize(options.streaming_coreset_rate, "streaming_coreset_rate")?;
+    ivf.streaming_refine_passes =
+        usize::try_from(options.streaming_refine_passes).map_err(|_| {
+            lance_core::Error::invalid_input(format!(
+                "streaming_refine_passes={} cannot be represented as usize",
+                options.streaming_refine_passes
+            ))
+        })?;
+    ivf.precomputed_partitions_file =
+        unsafe { helpers::parse_c_string(options.precomputed_partitions_file)? }
+            .map(str::to_string);
+    ivf.precomputed_shuffle_buffers =
+        unsafe { parse_precomputed_shuffle_buffers(options.precomputed_shuffle_buffers)? };
+    if let Some(value) = parse_optional_usize(
+        options.shuffle_partition_batches,
+        "shuffle_partition_batches",
+    )? {
+        ivf.shuffle_partition_batches = value;
+    }
+    if let Some(value) = parse_optional_usize(
+        options.shuffle_partition_concurrency,
+        "shuffle_partition_concurrency",
+    )? {
+        ivf.shuffle_partition_concurrency = value;
+    }
+    ivf.storage_options = unsafe { parse_string_map(options.storage_options, "storage_options")? };
+
+    if let Some(centroids) = unsafe {
+        parse_native_fixed_size_list_model(
+            options.ivf_centroids,
+            options.ivf_centroids_schema,
+            "ivf_centroids",
+        )?
+    } {
+        ivf.centroids = Some(Arc::new(centroids));
+    }
+
+    let codebook = unsafe {
+        parse_native_fixed_size_list_model(
+            options.pq_codebook,
+            options.pq_codebook_schema,
+            "pq_codebook",
+        )?
+    }
+    .map(|codebook| codebook.values().clone());
+
+    let mut pq = PQBuildParams::default();
+    if let Some(value) = parse_optional_usize(options.num_sub_vectors, "num_sub_vectors")? {
+        pq.num_sub_vectors = value;
+    }
+    if let Some(value) = parse_optional_usize(options.num_bits, "num_bits")? {
+        pq.num_bits = value;
+    }
+    if let Some(value) = parse_optional_usize(options.max_iters, "max_iters")? {
+        pq.max_iters = value;
+    }
+    if let Some(value) = parse_optional_usize(options.sample_rate, "sample_rate")? {
+        pq.sample_rate = value;
+    }
+    pq.codebook = codebook;
+
+    let mut sq = SQBuildParams::default();
+    if let Some(value) = parse_optional_usize(options.sample_rate, "sample_rate")? {
+        sq.sample_rate = value;
+    }
+
+    let mut hnsw = HnswBuildParams::default();
+    if let Some(value) = parse_optional_u16(options.hnsw_max_level, "hnsw_max_level")? {
+        hnsw.max_level = value;
+    }
+    if let Some(value) = parse_optional_usize(options.hnsw_m, "hnsw_m")? {
+        hnsw.m = value;
+    }
+    if let Some(value) = parse_optional_usize(options.hnsw_ef_construction, "hnsw_ef_construction")?
+    {
+        hnsw.ef_construction = value;
+    }
+
+    let mut rq = RQBuildParams::default();
+    if matches!(index_type, LanceVectorIndexType::IvfRq) {
+        if let Some(value) = parse_optional_u8(options.num_bits, "num_bits")? {
+            rq.num_bits = value;
+        }
+        if let Some(json) = unsafe { helpers::parse_c_string(options.rabitq_model_json)? } {
+            rq.rotation = Some(
+                serde_json::from_str::<RabitQuantizationMetadata>(json).map_err(|error| {
+                    lance_core::Error::invalid_input(format!(
+                        "rabitq_model_json is not a valid RabitQuantizationMetadata value: {error}"
+                    ))
+                })?,
+            );
+        }
+    } else if !options.rabitq_model_json.is_null() {
+        return Err(lance_core::Error::invalid_input(format!(
+            "rabitq_model_json is only valid for IVF_RQ, got index_type={index_type:?}"
+        )));
+    }
+
+    use LanceVectorIndexType::*;
+    let is_pq = matches!(index_type, IvfPq | IvfHnswPq);
+    if !is_pq && pq.codebook.is_some() {
+        return Err(lance_core::Error::invalid_input(format!(
+            "pq_codebook is only valid for IVF_PQ and IVF_HNSW_PQ, got index_type={index_type:?}"
+        )));
+    }
+
+    let native_metric = metric.to_distance();
+    let mut params = match index_type {
+        IvfFlat => LanceCoreVectorIndexParams::with_ivf_flat_params(native_metric, ivf),
+        IvfSq => LanceCoreVectorIndexParams::with_ivf_sq_params(native_metric, ivf, sq),
+        IvfPq => LanceCoreVectorIndexParams::with_ivf_pq_params(native_metric, ivf, pq),
+        IvfRq => LanceCoreVectorIndexParams::with_ivf_rq_params(native_metric, ivf, rq),
+        IvfHnswFlat => LanceCoreVectorIndexParams::ivf_hnsw(native_metric, ivf, hnsw),
+        IvfHnswPq => {
+            LanceCoreVectorIndexParams::with_ivf_hnsw_pq_params(native_metric, ivf, hnsw, pq)
+        }
+        IvfHnswSq => {
+            LanceCoreVectorIndexParams::with_ivf_hnsw_sq_params(native_metric, ivf, hnsw, sq)
+        }
+    };
+    params.version = LanceIndexFileVersion::from_c(options.index_file_version)?.to_native();
+    params.skip_transpose = options.skip_transpose;
+    params.runtime_hints =
+        unsafe { parse_string_map(options.runtime_hints, "runtime_hints")? }.unwrap_or_default();
+    Ok(PreparedVectorBuild { params, train })
+}
+
 /// Create a vector index on a column.
 ///
 /// `params.index_type` selects the variant; the rest of the fields are
@@ -861,6 +1301,28 @@ pub unsafe extern "C" fn lance_dataset_create_vector_index(
 ) -> i32 {
     ffi_try!(
         unsafe { create_vector_index_inner(dataset, column, index_name, params, replace) },
+        neg
+    )
+}
+
+/// Create a vector index from additive, presence-aware native options.
+///
+/// The native builder commits the index and then reloads committed index
+/// metadata. An error can therefore be returned after the dataset version has
+/// already been published. Reopen the dataset to determine its current
+/// version; this entry point does not claim storage rollback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_create_vector_index_with_options(
+    dataset: *mut LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    options: *const LanceVectorIndexOptions,
+    replace: bool,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            create_vector_index_with_options_inner(dataset, column, index_name, options, replace)
+        },
         neg
     )
 }
@@ -893,6 +1355,41 @@ unsafe fn create_vector_index_inner(
             &core_params,
             replace,
         ))
+    })?;
+    Ok(0)
+}
+
+unsafe fn create_vector_index_with_options_inner(
+    dataset: *mut LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    options: *const LanceVectorIndexOptions,
+    replace: bool,
+) -> Result<i32> {
+    if dataset.is_null() || column.is_null() || options.is_null() {
+        return Err(lance_core::Error::invalid_input(
+            "dataset, column, and options must not be NULL",
+        ));
+    }
+    let ds = unsafe { &*dataset };
+    let column = unsafe { helpers::parse_c_string(column)? }
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| lance_core::Error::invalid_input("column must not be NULL or empty"))?
+        .to_string();
+    let index_name = unsafe { helpers::parse_c_string(index_name)? }.map(str::to_string);
+    let prepared = unsafe { prepare_vector_build(options)? };
+
+    ds.with_mut(|dataset| {
+        let columns = [column.as_str()];
+        let mut builder =
+            dataset.create_index_builder(&columns, IndexType::Vector, &prepared.params);
+        if let Some(index_name) = index_name.clone() {
+            builder = builder.name(index_name);
+        }
+        builder = builder.replace(replace).train(prepared.train);
+        // `execute` is private in the pinned core, while `IntoFuture` is the
+        // public commit path and performs the same commit-plus-metadata reload.
+        block_on(std::future::IntoFuture::into_future(builder))
     })?;
     Ok(0)
 }

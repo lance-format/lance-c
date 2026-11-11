@@ -4,13 +4,13 @@
 //! Standalone vector model training C API.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_char;
+use std::ffi::{CString, c_char};
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, to_ffi};
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::{Array, FixedSizeListArray, types::Float32Type};
 use arrow_schema::{DataType, Field};
 use lance::Dataset;
 use lance::index::vector::ivf::build_ivf_model;
@@ -18,9 +18,12 @@ use lance::index::vector::pq::build_pq_model_in_fragments;
 use lance::index::vector::utils::{get_vector_dim, get_vector_type, validate_distance_type_for};
 use lance_core::{Error, Result};
 use lance_index::progress::noop_progress;
+use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::{RQBuildParams, RQRotationType, validate_rq_num_bits};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::quantizer::Quantization;
 
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
@@ -34,6 +37,53 @@ use crate::runtime::block_on;
 
 fn invalid_input(message: impl Into<String>) -> Error {
     Error::invalid_input(message)
+}
+
+/// Build a deterministic-shape fast RaBitQ rotation and return its native
+/// `RabitQuantizationMetadata` JSON. `num_bits == 0` selects the native RQ
+/// default of 5. JSON is the portable model form: dense matrix rotations carry
+/// a `#[serde(skip)]` matrix and are not representable by this helper.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_build_rq_model(
+    dimension: u32,
+    num_bits: u32,
+) -> *const c_char {
+    ffi_try!(
+        (|| -> Result<*const c_char> {
+            let dimension = i32::try_from(dimension).map_err(|_| {
+                invalid_input(format!(
+                    "dimension={dimension} cannot be represented as the native i32 dimension"
+                ))
+            })?;
+            if dimension <= 0 || dimension % (u8::BITS as i32) != 0 {
+                return Err(invalid_input(format!(
+                    "dimension must be positive and divisible by 8 for IVF_RQ, got {dimension}"
+                )));
+            }
+            let num_bits = if num_bits == 0 {
+                RQBuildParams::default().num_bits
+            } else {
+                u8::try_from(num_bits).map_err(|_| {
+                    invalid_input(format!(
+                        "num_bits={num_bits} cannot be represented as the native u8 bit width"
+                    ))
+                })?
+            };
+            validate_rq_num_bits(num_bits)?;
+            let quantizer = RabitQuantizer::new_with_rotation::<Float32Type>(
+                num_bits,
+                dimension,
+                RQRotationType::Fast,
+            );
+            let json = serde_json::to_string(&quantizer.metadata(None)).map_err(|error| {
+                Error::internal(format!("failed to serialize RQ model JSON: {error}"))
+            })?;
+            let json = CString::new(json)
+                .map_err(|_| Error::internal("RQ model JSON contains an embedded NUL byte"))?;
+            Ok(json.into_raw().cast_const())
+        })(),
+        ptr::null()
+    )
 }
 
 type CommonTrainerInput = (Dataset, String, usize, LanceMetricType, Option<Vec<u32>>);

@@ -2046,6 +2046,67 @@ static void test_vector_models_and_reusable_segments(const std::string& uri) {
     PASS();
 }
 
+static void test_vector_index_options_and_model_adoption(
+    const std::string& uri) {
+    TEST(test_vector_index_options_and_model_adoption);
+
+    auto ds = lance::Dataset::open(uri);
+    auto all_ids = ds.fragment_ids();
+    assert(!all_ids.empty());
+    auto centroids = ds.train_ivf_model("embedding", 2, LANCE_METRIC_L2);
+    auto adopted = lance::IndexModel::adopt(
+        centroids.array(), const_cast<ArrowSchema*>(centroids.schema()));
+    assert(centroids.array()->release == nullptr);
+    assert(centroids.schema()->release == nullptr);
+
+    lance::VectorIndexOptions options;
+    options.index_type = LANCE_INDEX_IVF_RQ;
+    options.metric = LANCE_METRIC_L2;
+    options.num_partitions = 2;
+    options.ivf_centroids = &adopted;
+    options.rabitq_model_json = lance::build_rq_model(8, 0);
+    options.storage_options = std::map<std::string, std::string>{};
+    options.runtime_hints["cpp.option"] = "value";
+    options.skip_transpose = true;
+
+    std::optional<std::vector<uint32_t>> fragment_ids =
+        std::vector<uint32_t>{static_cast<uint32_t>(all_ids.front())};
+    std::array<uint8_t, 16> uuid = {
+        0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93,
+        0x23, 0x84, 0x62, 0x64, 0x33, 0x83, 0x27, 0x95,
+    };
+    auto builder = ds.new_vector_index_segment_builder_with_options(
+        "embedding", options, "cpp_options_rq_segment", fragment_ids, &uuid);
+    auto bytes = builder.execute_uncommitted();
+    auto metadata = lance::IndexSegmentMetadata::parse(bytes);
+    assert(metadata.index_type() == LANCE_INDEX_IVF_RQ);
+    assert(metadata.index_version() == 2);
+    assert(metadata.uuid() == uuid);
+    assert(metadata.fragment_ids() == *fragment_ids);
+    assert(adopted.array()->release != nullptr);
+
+    // An engaged empty selection is Some(empty), not absent.
+    lance::VectorIndexOptions empty = options;
+    empty.train = false;
+    auto empty_builder = ds.new_vector_index_segment_builder_with_options(
+        "embedding", empty, "cpp_empty_scope", std::vector<uint32_t>{});
+    auto empty_bytes = empty_builder.execute_uncommitted();
+    auto empty_metadata = lance::IndexSegmentMetadata::parse(empty_bytes);
+    assert(empty_metadata.fragment_ids().empty());
+
+    // Exercise the committed options entry point without training a second
+    // index on the same column.
+    empty.index_type = LANCE_INDEX_IVF_FLAT;
+    empty.ivf_centroids = nullptr;
+    empty.rabitq_model_json.reset();
+    empty.train = false;
+    ds.create_vector_index_with_options("embedding", empty,
+                                        "cpp_options_definition_only");
+    ds.drop_index("cpp_options_definition_only");
+
+    PASS();
+}
+
 static void test_commit_index_segments(const std::string& uri) {
     TEST(test_commit_index_segments);
 
@@ -4439,6 +4500,7 @@ int main(int argc, char** argv) {
     test_index_segment_builder(uri);
     test_index_segment_builder_progress(uri);
     test_vector_models_and_reusable_segments(uri);
+    test_vector_index_options_and_model_adoption(uri);
     test_commit_index_segments(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
