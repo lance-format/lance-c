@@ -39,9 +39,11 @@
 
 typedef struct OverlayBatch {
     struct ArrowSchema schema;
-    struct ArrowSchema *schema_children;
+    struct ArrowSchema **schema_children;
+    struct ArrowSchema *schema_storage;
     struct ArrowArray array;
-    struct ArrowArray *array_children;
+    struct ArrowArray **array_children;
+    struct ArrowArray *array_storage;
     uint64_t *rowaddrs;
     int32_t *a_values;
     uint8_t *a_validity;
@@ -68,7 +70,9 @@ static void release_child_schema(struct ArrowSchema *schema) {
 
 static void release_root_schema(struct ArrowSchema *schema) {
     free(schema->children);
+    free(schema->private_data);
     schema->children = NULL;
+    schema->private_data = NULL;
     schema->release = NULL;
 }
 
@@ -90,6 +94,7 @@ static void release_root_array(struct ArrowArray *array) {
             }
         }
         free(array->children);
+        free(array->private_data);
     }
     free((void *)array->buffers);
     array->children = NULL;
@@ -127,27 +132,36 @@ static void init_overlay_batch(OverlayBatch *batch, size_t len, int with_a,
     batch->with_b = with_b;
     size_t children = 1 + (size_t)with_a + (size_t)with_b;
     batch->schema_children = calloc(children, sizeof(*batch->schema_children));
+    batch->schema_storage = calloc(children, sizeof(*batch->schema_storage));
     batch->array_children = calloc(children, sizeof(*batch->array_children));
+    batch->array_storage = calloc(children, sizeof(*batch->array_storage));
     batch->rowaddrs = calloc(len, sizeof(*batch->rowaddrs));
-    ASSERT(batch->schema_children != NULL && batch->array_children != NULL &&
+    ASSERT(batch->schema_children != NULL && batch->schema_storage != NULL &&
+               batch->array_children != NULL && batch->array_storage != NULL &&
                batch->rowaddrs != NULL,
            "allocate overlay batch");
+    for (size_t i = 0; i < children; ++i) {
+        batch->schema_children[i] = &batch->schema_storage[i];
+        batch->array_children[i] = &batch->array_storage[i];
+    }
 
     batch->schema.format = "+s";
     batch->schema.name = "";
     batch->schema.n_children = (int64_t)children;
-    batch->schema.children = &batch->schema_children[0];
+    batch->schema.children = batch->schema_children;
+    batch->schema.private_data = batch->schema_storage;
     batch->schema.release = release_root_schema;
-    init_child_schema(&batch->schema_children[0], "L", "_rowaddr", 0);
+    init_child_schema(batch->schema_children[0], "L", "_rowaddr", 0);
 
     batch->array.length = (int64_t)len;
     batch->array.n_buffers = 1;
     batch->array.buffers = calloc(1, sizeof(*batch->array.buffers));
     ASSERT(batch->array.buffers != NULL, "allocate struct buffers");
     batch->array.n_children = (int64_t)children;
-    batch->array.children = &batch->array_children[0];
+    batch->array.children = batch->array_children;
+    batch->array.private_data = batch->array_storage;
     batch->array.release = release_root_array;
-    init_child_array(&batch->array_children[0], len, NULL, batch->rowaddrs);
+    init_child_array(batch->array_children[0], len, NULL, batch->rowaddrs);
 
     size_t child = 1;
     if (with_a) {
@@ -156,8 +170,8 @@ static void init_overlay_batch(OverlayBatch *batch, size_t len, int with_a,
         ASSERT(batch->a_values != NULL && batch->a_validity != NULL,
                "allocate a buffers");
         memset(batch->a_validity, 0xff, (len + 7) / 8);
-        init_child_schema(&batch->schema_children[child], "i", "a", 2);
-        init_child_array(&batch->array_children[child], len,
+        init_child_schema(batch->schema_children[child], "i", "a", 2);
+        init_child_array(batch->array_children[child], len,
                          batch->a_validity, batch->a_values);
         ++child;
     }
@@ -167,8 +181,8 @@ static void init_overlay_batch(OverlayBatch *batch, size_t len, int with_a,
         ASSERT(batch->b_values != NULL && batch->b_validity != NULL,
                "allocate b buffers");
         memset(batch->b_validity, 0xff, (len + 7) / 8);
-        init_child_schema(&batch->schema_children[child], "i", "b", 2);
-        init_child_array(&batch->array_children[child], len,
+        init_child_schema(batch->schema_children[child], "i", "b", 2);
+        init_child_array(batch->array_children[child], len,
                          batch->b_validity, batch->b_values);
     }
 }
@@ -186,7 +200,7 @@ static void set_a_null(OverlayBatch *batch, size_t index) {
     ASSERT(batch->with_a, "batch has an a column");
     size_t child = 1;
     batch->a_validity[index / 8] &= (uint8_t)~(1u << (index % 8));
-    batch->array_children[child].null_count += 1;
+    batch->array_children[child]->null_count += 1;
 }
 
 static void set_b(OverlayBatch *batch, size_t index, int32_t value) {

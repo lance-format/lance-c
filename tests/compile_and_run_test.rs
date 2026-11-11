@@ -217,6 +217,7 @@ fn create_overlay_dataset_on_disk(name: &str) -> (tempfile::TempDir, String) {
             &uri,
             Some(WriteParams {
                 max_rows_per_file: 10,
+                enable_stable_row_ids: true,
                 ..Default::default()
             }),
         )
