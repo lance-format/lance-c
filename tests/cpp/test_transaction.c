@@ -1180,7 +1180,7 @@ static void test_native_schema(const char *uri) {
     const char *missing_column = "profile.tags";
     ASSERT(lance_schema_field_id(projected, missing_column, &missing_id) == -1,
            "projected schema has no dropped field");
-    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+    ASSERT(lance_last_error_code() == LANCE_ERR_INTERNAL,
            "dropped field error code");
     ASSERT(missing_id == -7, "failed field ID lookup leaves output");
 
@@ -1450,7 +1450,7 @@ static void test_native_schema(const char *uri) {
     ASSERT(lance_schema_project(schema, unknown_columns, 1,
                                 &projected_out) == -1,
            "unknown project column");
-    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+    ASSERT(lance_last_error_code() == LANCE_ERR_INTERNAL,
            "unknown project column code");
     ASSERT(projected_out == projected_sentinel,
            "unknown project column leaves output");
@@ -1496,7 +1496,7 @@ static void test_native_schema(const char *uri) {
     int32_t field_sentinel = -11;
     ASSERT(lance_schema_field_id(schema, "nope", &field_sentinel) == -1,
            "unknown field ID");
-    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+    ASSERT(lance_last_error_code() == LANCE_ERR_INTERNAL,
            "unknown field ID code");
     ASSERT(field_sentinel == -11, "unknown field ID leaves output");
 

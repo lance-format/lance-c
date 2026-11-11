@@ -187,7 +187,7 @@ static void test_native_schema(const std::string& uri) {
         (void)clone.field_id("missing.column");
     } catch (const lance::Error& error) {
         threw = true;
-        CHECK(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        CHECK(error.code == LANCE_ERR_INTERNAL);
     }
     CHECK(threw);
 
@@ -203,7 +203,7 @@ static void test_native_schema(const std::string& uri) {
         (void)projected.field_id("profile.tags");
     } catch (const lance::Error& error) {
         threw = true;
-        CHECK(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        CHECK(error.code == LANCE_ERR_INTERNAL);
     }
     CHECK(threw);
 

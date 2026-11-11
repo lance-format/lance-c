@@ -278,10 +278,7 @@ unsafe fn schema_project_inner(
         }
     }
 
-    let projected = schema
-        .inner
-        .project(&projected_columns)
-        .map_err(schema_lookup_error)?;
+    let projected = schema.inner.project(&projected_columns)?;
     unsafe {
         *out_schema = Box::into_raw(Box::new(LanceSchema { inner: projected }));
     }
@@ -305,19 +302,6 @@ pub unsafe extern "C" fn lance_schema_field_id(
     )
 }
 
-/// Translate the native missing-column error into the C API's argument error.
-///
-/// Existing APIs keep their historical LANCE_ERR_INTERNAL mapping; the native
-/// schema entry points promise LANCE_ERR_INVALID_ARGUMENT for unknown columns.
-fn schema_lookup_error(err: lance_core::Error) -> lance_core::Error {
-    match err {
-        lance_core::Error::FieldNotFound { .. } => {
-            lance_core::Error::invalid_input_source(format!("{err}").into())
-        }
-        other => other,
-    }
-}
-
 unsafe fn schema_field_id_inner(
     schema: *const LanceSchema,
     column: *const c_char,
@@ -336,11 +320,7 @@ unsafe fn schema_field_id_inner(
     }
     let column = unsafe { parse_c_string(column) }?
         .ok_or_else(|| lance_core::Error::invalid_input_source("column must not be NULL".into()))?;
-    let field_id = schema.inner.field_id(column).map_err(|err| {
-        lance_core::Error::invalid_input_source(
-            format!("column '{column}' is not in the native schema: {err}").into(),
-        )
-    })?;
+    let field_id = schema.inner.field_id(column)?;
     unsafe {
         *out_field_id = field_id;
     }
@@ -462,7 +442,7 @@ mod tests {
 
     use super::*;
     use crate::dataset::LanceDataset;
-    use crate::error::{LanceErrorCode, lance_last_error_code};
+    use crate::error::{LanceErrorCode, error_code_from_lance, lance_last_error_code};
     use crate::runtime::block_on;
 
     const FIXTURE_FIELD_IDS: &[(&str, i32)] = &[
@@ -700,7 +680,11 @@ mod tests {
             -1
         );
         assert_eq!(sentinel, -123);
-        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let native_error = expected.field_id("does_not_exist").unwrap_err();
+        assert_eq!(
+            lance_last_error_code(),
+            error_code_from_lance(&native_error)
+        );
         unsafe { lance_schema_close(schema) };
     }
 
@@ -756,7 +740,11 @@ mod tests {
         );
         assert_eq!(sentinel, sentinel_value);
         assert!(unsafe { (*sentinel).inner == expected });
-        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let native_error = expected.project(&["missing.column"]).unwrap_err();
+        assert_eq!(
+            lance_last_error_code(),
+            error_code_from_lance(&native_error)
+        );
         unsafe {
             lance_schema_close(sentinel_value);
             lance_schema_close(schema);
