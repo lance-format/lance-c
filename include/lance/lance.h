@@ -1698,6 +1698,21 @@ typedef struct LanceBasePath {
 } LanceBasePath;
 
 /**
+ * Borrowed native `BasePath` fields owned by an operation handle.
+ *
+ * `path` and `name` point into the operation's storage and remain valid until
+ * `lance_operation_close()` is called on that handle. `name == NULL` represents
+ * native `None`; a non-NULL pointer, including an empty string, represents
+ * `Some(name)`.
+ */
+typedef struct LanceBasePathView {
+    uint32_t id;
+    const char* path;
+    const char* name;
+    bool is_dataset_root;
+} LanceBasePathView;
+
+/**
  * Optional transaction properties for one native `add_bases` commit.
  *
  * `keys` and `values` are parallel arrays of length `count`; every key and
@@ -3002,6 +3017,52 @@ uint64_t lance_fragment_id(const LanceFragment* fragment);
  * NULL handle.
  */
 uint64_t lance_fragment_data_file_count(const LanceFragment* fragment);
+
+/**
+ * Return whether this handle retains a dataset-bound native fragment.
+ *
+ * Detached handles own only cloned native metadata, load no data files, and
+ * reject dataset-dependent reads with LANCE_ERR_NOT_SUPPORTED. The output slot
+ * is written only on success.
+ *
+ * @return 0 on success, -1 on error (including NULL fragment/out_is_bound).
+ */
+int32_t lance_fragment_is_bound(
+    const LanceFragment* fragment,
+    bool* out_is_bound
+);
+
+/**
+ * Clone one native base data file from the fragment metadata.
+ *
+ * `index` addresses the native `Fragment::files` array. The returned handle
+ * owns an independent copy and must be closed with `lance_data_file_close()`.
+ *
+ * @return 0 on success, -1 on error. A missing index sets
+ *         LANCE_ERR_INVALID_ARGUMENT; `*out_file` is unchanged on error.
+ */
+int32_t lance_fragment_data_file_at(
+    const LanceFragment* fragment,
+    size_t index,
+    LanceDataFile** out_file
+);
+
+/**
+ * Find the native base data file that stores a field ID.
+ *
+ * Bound handles use Native `FileFragment::data_file_for_field`; detached
+ * handles use the same `fields` membership rule on owned metadata. A missing
+ * field succeeds with `*out_file == NULL`; a negative field ID or NULL output
+ * slot is an invalid argument. The returned handle is independent and must be
+ * closed with `lance_data_file_close()`.
+ *
+ * @return 0 on success, -1 on error; the output slot is unchanged on error.
+ */
+int32_t lance_fragment_data_file_for_field(
+    const LanceFragment* fragment,
+    int32_t field_id,
+    LanceDataFile** out_file
+);
 
 /**
  * Serialize the Native fragment metadata as JSON.
@@ -6993,6 +7054,58 @@ LanceOperation* lance_operation_delete_new(
 );
 
 /**
+ * Construct an owned native Append operation.
+ *
+ * `fragments` is an array of borrowed fragment handles; each handle is required
+ * when the count is non-zero and its complete native metadata, including
+ * pre-assigned IDs, row ID metadata and data files, is copied. A NULL array is
+ * valid only with a zero count.
+ *
+ * Native commit validation owns schema coverage, fragment ID assignment and
+ * row-ID assignment. Explicit fields and non-zero reserved IDs pass through
+ * unchanged; this constructor adds no binding-side policy. Returns an owned
+ * operation, or NULL on error.
+ */
+LanceOperation* lance_operation_append_new(
+    const LanceFragment* const* fragments,
+    size_t fragment_count
+);
+
+/**
+ * Construct an owned native Restore operation.
+ *
+ * `version` passes through unchanged. Native commit validation owns whether the
+ * version exists and is restorable. Returns an owned operation, or NULL on
+ * error.
+ */
+LanceOperation* lance_operation_restore_new(uint64_t version);
+
+/**
+ * Construct an owned native ReserveFragments operation.
+ *
+ * `num_fragments == 0` is a native no-op version; larger values advance the
+ * manifest maximum fragment ID for later native allocation. Returns an owned
+ * operation, or NULL on error.
+ */
+LanceOperation* lance_operation_reserve_fragments_new(uint64_t num_fragments);
+
+/**
+ * Construct an owned native UpdateBases operation.
+ *
+ * Each entry is parsed into native `BasePath` storage owned by the returned
+ * operation. A NULL array is valid only with a zero count; every non-NULL entry
+ * requires a non-NULL UTF-8 path, while `name == NULL` means native `None`.
+ *
+ * Native commit validation owns path/name conflict detection and zero-ID
+ * allocation. This constructor adds no binding-side policy. Returns an owned
+ * operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_bases_new(
+    const LanceBasePath* new_bases,
+    size_t new_base_count
+);
+
+/**
  * Construct an owned native CreateIndex operation.
  *
  * `new_indices` and `removed_indices` are arrays of borrowed metadata handles
@@ -7112,6 +7225,74 @@ int32_t lance_operation_kind(
 int32_t lance_operation_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
+);
+
+/**
+ * Read the number of fragments in an Append operation.
+ * Returns 0 on success, -1 on error; other variants return
+ * LANCE_ERR_NOT_SUPPORTED.
+ */
+int32_t lance_operation_append_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one Append fragment as an independently owned detached handle.
+ *
+ * The clone owns the complete native `Fragment` metadata and remains valid
+ * after the operation and every source dataset are closed. It supports metadata
+ * inspection and operation construction but rejects dataset-dependent reads.
+ * Returns 0 on success, -1 on error; the output slot is unchanged on error.
+ */
+int32_t lance_operation_append_fragment_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the target version of a Restore operation.
+ * Returns 0 on success, -1 on error; other variants return
+ * LANCE_ERR_NOT_SUPPORTED.
+ */
+int32_t lance_operation_restore_version(
+    const LanceOperation* operation,
+    uint64_t* out_version
+);
+
+/**
+ * Read the reserved fragment count of a ReserveFragments operation.
+ * Returns 0 on success, -1 on error; other variants return
+ * LANCE_ERR_NOT_SUPPORTED.
+ */
+int32_t lance_operation_reserve_fragments_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read the number of new base paths in an UpdateBases operation.
+ * Returns 0 on success, -1 on error; other variants return
+ * LANCE_ERR_NOT_SUPPORTED.
+ */
+int32_t lance_operation_update_bases_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one borrowed new base path from an UpdateBases operation.
+ *
+ * `path` and `name` point into the operation handle and remain valid until it
+ * is closed. `name == NULL` means native `None`; an empty string is an
+ * explicit empty name. Returns 0 on success, -1 on error; the output slot is
+ * unchanged on error.
+ */
+int32_t lance_operation_update_bases_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceBasePathView* out_base
 );
 
 /**
