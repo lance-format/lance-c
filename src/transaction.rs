@@ -245,7 +245,7 @@ unsafe fn operation_delete_new_inner(
                         .into(),
                     ));
                 }
-                Ok(unsafe { &**fragment }.inner.metadata().clone())
+                Ok(unsafe { &**fragment }.metadata().clone())
             })
             .collect::<Result<Vec<_>>>()?
     };

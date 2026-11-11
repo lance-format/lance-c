@@ -31,6 +31,12 @@ pub struct LanceFragment {
     inner: FileFragment,
 }
 
+impl LanceFragment {
+    pub(crate) fn metadata(&self) -> &Fragment {
+        self.inner.metadata()
+    }
+}
+
 unsafe fn fragment_ref<'a>(fragment: *const LanceFragment) -> Result<&'a LanceFragment> {
     if fragment.is_null() {
         return Err(Error::invalid_input_source(
