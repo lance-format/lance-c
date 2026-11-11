@@ -2141,6 +2141,87 @@ pub unsafe extern "C" fn lance_index_segment_metadata_clone(
     )
 }
 
+/// Clone parsed index metadata with caller-supplied fragment coverage.
+///
+/// When `has_fragment_ids` is false, the source `fragment_bitmap` option is
+/// copied unchanged and `fragment_ids`/`fragment_count` are ignored. When true,
+/// the clone's coverage becomes `Some` of the caller's IDs; a zero count maps
+/// to `Some(empty)`, and a positive count requires a non-NULL pointer. The
+/// native bitmap sorts the IDs and treats them as a set. Every other field is
+/// copied exactly, including in-memory optionals; no coverage, overlap, or
+/// index-family validation is performed here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_clone_with_fragment_ids(
+    metadata: *const LanceIndexSegmentMetadata,
+    has_fragment_ids: bool,
+    fragment_ids: *const u32,
+    fragment_count: usize,
+) -> *mut LanceIndexSegmentMetadata {
+    ffi_try!(
+        (|| -> Result<*mut LanceIndexSegmentMetadata> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata must not be NULL"));
+            }
+            let mut cloned = unsafe { (*metadata).metadata.clone() };
+            if has_fragment_ids {
+                if fragment_count > isize::MAX as usize / std::mem::size_of::<u32>() {
+                    return Err(invalid_input(format!(
+                        "fragment_count {fragment_count} exceeds the maximum addressable uint32_t slice length"
+                    )));
+                }
+                if fragment_count > 0 && fragment_ids.is_null() {
+                    return Err(invalid_input(format!(
+                        "fragment_ids must not be NULL when fragment_count is {fragment_count}"
+                    )));
+                }
+                let ids = if fragment_count == 0 {
+                    Vec::new()
+                } else {
+                    unsafe { slice::from_raw_parts(fragment_ids, fragment_count) }.to_vec()
+                };
+                cloned.fragment_bitmap = Some(ids.into_iter().collect());
+            }
+            metadata_handle(cloned)
+        })(),
+        ptr::null_mut()
+    )
+}
+
+/// Encode parsed index metadata as protobuf-encoded `IndexMetadata` bytes.
+///
+/// Encoding is an explicit request to serialize through the native protobuf
+/// representation. Successful output is library-owned and must be released
+/// with `lance_free_bytes`; `out_bytes` and `out_len` are success-only and
+/// remain unchanged on error. The protobuf format cannot distinguish some
+/// in-memory optionals, so encoding may normalize them (for example
+/// `Some(empty)` files decode as absent). Cloning does not normalize them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_encode(
+    metadata: *const LanceIndexSegmentMetadata,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    ffi_try!(
+        unsafe { metadata_encode_inner(metadata, out_bytes, out_len) },
+        neg
+    )
+}
+
+unsafe fn metadata_encode_inner(
+    metadata: *const LanceIndexSegmentMetadata,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> Result<i32> {
+    if metadata.is_null() {
+        return Err(invalid_input("metadata must not be NULL"));
+    }
+    if out_bytes.is_null() || out_len.is_null() {
+        return Err(invalid_input("out_bytes and out_len must not be NULL"));
+    }
+    unsafe { export_index_metadata((*metadata).native_metadata(), out_bytes, out_len)? };
+    Ok(0)
+}
+
 /// Return the number of covering field IDs. Returns 0 on error; zero is also a
 /// valid count, so check lance_last_error_code().
 #[unsafe(no_mangle)]
@@ -2417,6 +2498,244 @@ mod tests {
         unsafe {
             lance_index_segment_metadata_free(cloned);
             lance_index_segment_metadata_free(original);
+        }
+    }
+
+    fn complete_metadata() -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::from_u128(0x00112233445566778899aabbccddeeff),
+            name: "complete_metadata".to_string(),
+            fields: vec![3, 7],
+            covering_fields: vec![7],
+            dataset_version: 42,
+            fragment_bitmap: Some([1, 4, 9].into_iter().collect()),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "/lance.table.InvertedIndexDetails".to_string(),
+                value: b"native details".to_vec(),
+            })),
+            index_version: 5,
+            created_at: DateTime::<Utc>::from_timestamp_millis(1_700_000_123_456),
+            base_id: Some(13),
+            files: Some(vec![
+                lance_table::format::IndexFile {
+                    path: "index.idx".to_string(),
+                    size_bytes: 11,
+                },
+                lance_table::format::IndexFile {
+                    path: "metadata.idx".to_string(),
+                    size_bytes: 22,
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn metadata_clone_with_fragment_ids_preserves_complete_value() {
+        let source_value = complete_metadata();
+        let source = metadata_handle(source_value.clone()).unwrap();
+        let replacement = [8_u32, 2, 8, 4];
+        let cloned = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(
+                source,
+                true,
+                replacement.as_ptr(),
+                replacement.len(),
+            )
+        };
+        assert!(!cloned.is_null());
+        let expected = IndexMetadata {
+            fragment_bitmap: Some([2_u32, 4, 8].into_iter().collect()),
+            ..source_value.clone()
+        };
+        assert_eq!(unsafe { (*cloned).native_metadata() }, &expected);
+        assert_eq!(unsafe { (*source).native_metadata() }, &source_value);
+
+        let unchanged = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(
+                source,
+                false,
+                1 as *const u32,
+                usize::MAX,
+            )
+        };
+        assert!(!unchanged.is_null());
+        assert_eq!(unsafe { (*unchanged).native_metadata() }, &source_value);
+
+        let empty = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(source, true, ptr::null(), 0)
+        };
+        assert!(!empty.is_null());
+        assert_eq!(
+            unsafe { (*empty).native_metadata().fragment_bitmap.as_ref() }
+                .map(|bitmap| bitmap.iter().collect::<Vec<_>>()),
+            Some(Vec::<u32>::new())
+        );
+
+        let mut encoded = ptr::null_mut();
+        let mut encoded_len = 0_usize;
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_encode(source, &mut encoded, &mut encoded_len) },
+            0
+        );
+        assert!(!encoded.is_null() && encoded_len > 0);
+        unsafe {
+            lance_free_bytes(encoded);
+            lance_index_segment_metadata_free(empty);
+            lance_index_segment_metadata_free(unchanged);
+            lance_index_segment_metadata_free(cloned);
+            lance_index_segment_metadata_free(source);
+        }
+    }
+
+    #[test]
+    fn metadata_encode_round_trips_complete_value_and_normalizes_empty_options() {
+        let source_value = complete_metadata();
+        let source = metadata_handle(source_value.clone()).unwrap();
+        let replacement = [1_u32, 3];
+        let cloned = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(
+                source,
+                true,
+                replacement.as_ptr(),
+                replacement.len(),
+            )
+        };
+        assert!(!cloned.is_null());
+        let expected = IndexMetadata {
+            fragment_bitmap: Some([1_u32, 3].into_iter().collect()),
+            ..source_value.clone()
+        };
+        assert_eq!(unsafe { (*cloned).native_metadata() }, &expected);
+
+        let mut encoded = ptr::null_mut();
+        let mut encoded_len = 0_usize;
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_encode(cloned, &mut encoded, &mut encoded_len) },
+            0
+        );
+        let decoded =
+            decode_segment_metadata(unsafe { slice::from_raw_parts(encoded, encoded_len) })
+                .unwrap();
+        assert_eq!(decoded, expected);
+
+        let empty_value = IndexMetadata {
+            uuid: Uuid::from_u128(7),
+            name: "empty_optionals".to_string(),
+            fields: vec![2],
+            covering_fields: Vec::new(),
+            dataset_version: 1,
+            fragment_bitmap: Some(Default::default()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: Some(Vec::new()),
+        };
+        let empty_source = metadata_handle(empty_value.clone()).unwrap();
+        let empty_copy = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(
+                empty_source,
+                false,
+                ptr::null(),
+                0,
+            )
+        };
+        assert!(!empty_copy.is_null());
+        assert_eq!(unsafe { (*empty_copy).native_metadata() }, &empty_value);
+
+        let mut empty_encoded = ptr::null_mut();
+        let mut empty_encoded_len = 0_usize;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_metadata_encode(
+                    empty_copy,
+                    &mut empty_encoded,
+                    &mut empty_encoded_len,
+                )
+            },
+            0
+        );
+        let empty_decoded = decode_segment_metadata(unsafe {
+            slice::from_raw_parts(empty_encoded, empty_encoded_len)
+        })
+        .unwrap();
+        assert_eq!(empty_decoded.fragment_bitmap, None);
+        assert_eq!(empty_decoded.files, None);
+
+        unsafe {
+            lance_free_bytes(empty_encoded);
+            lance_free_bytes(encoded);
+            lance_index_segment_metadata_free(empty_copy);
+            lance_index_segment_metadata_free(empty_source);
+            lance_index_segment_metadata_free(cloned);
+            lance_index_segment_metadata_free(source);
+        }
+    }
+
+    #[test]
+    fn metadata_clone_with_fragment_ids_and_encode_validate_foreign_inputs() {
+        assert!(
+            unsafe {
+                lance_index_segment_metadata_clone_with_fragment_ids(
+                    ptr::null(),
+                    false,
+                    ptr::null(),
+                    0,
+                )
+            }
+            .is_null()
+        );
+
+        let source = metadata_handle(complete_metadata()).unwrap();
+        let oversized = isize::MAX as usize / std::mem::size_of::<u32>() + 1;
+        assert!(
+            unsafe {
+                lance_index_segment_metadata_clone_with_fragment_ids(
+                    source,
+                    true,
+                    1 as *const u32,
+                    oversized,
+                )
+            }
+            .is_null()
+        );
+        let unchanged = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(
+                source,
+                false,
+                1 as *const u32,
+                usize::MAX,
+            )
+        };
+        assert!(!unchanged.is_null());
+
+        let sentinel = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        let mut out_bytes = sentinel;
+        let mut out_len = usize::MAX;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_metadata_encode(ptr::null(), &mut out_bytes, &mut out_len)
+            },
+            -1
+        );
+        assert_eq!(out_bytes, sentinel);
+        assert_eq!(out_len, usize::MAX);
+
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_encode(source, ptr::null_mut(), &mut out_len) },
+            -1
+        );
+        assert_eq!(out_len, usize::MAX);
+
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_encode(source, &mut out_bytes, ptr::null_mut()) },
+            -1
+        );
+        assert_eq!(out_bytes, sentinel);
+
+        unsafe {
+            lance_index_segment_metadata_free(unchanged);
+            lance_index_segment_metadata_free(source);
         }
     }
 

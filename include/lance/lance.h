@@ -5422,6 +5422,50 @@ LanceIndexSegmentMetadata* lance_index_segment_metadata_clone(
 );
 
 /**
+ * Clone parsed index metadata with caller-supplied fragment coverage.
+ *
+ * When `has_fragment_ids` is false, the native `fragment_bitmap` option is
+ * copied unchanged and `fragment_ids` / `fragment_count` are ignored. When
+ * true, the clone's coverage becomes some of the caller's IDs: `fragment_count
+ * == 0` maps to present-empty coverage, and a positive count requires
+ * `fragment_ids` to point at that many `uint32_t` values. IDs are copied into
+ * the native bitmap, which sorts them and treats them as a set.
+ *
+ * Every other native field is copied exactly, including name, field and
+ * covering declarations, dataset/index versions, index details, created_at,
+ * base_id, and files, together with their in-memory option presence. This call
+ * performs no coverage, overlap, staleness, index-family, or file validation;
+ * those rules remain with the native commit path. The source handle is
+ * unchanged and remains usable.
+ *
+ * Returns an independently owned handle, or NULL on error.
+ */
+LanceIndexSegmentMetadata* lance_index_segment_metadata_clone_with_fragment_ids(
+    const LanceIndexSegmentMetadata* metadata,
+    bool has_fragment_ids,
+    const uint32_t* fragment_ids,
+    size_t fragment_count
+);
+
+/**
+ * Encode parsed index metadata as protobuf-encoded Lance `IndexMetadata`.
+ *
+ * This explicitly serializes the complete in-memory native value. On success,
+ * `*out_bytes` receives a library-owned buffer of `*out_len` bytes that the
+ * caller frees with lance_free_bytes(). Both output slots are success-only and
+ * remain unchanged on error. Protobuf cannot distinguish some in-memory
+ * optionals, so encoding may normalize them (for example present-empty files
+ * decode as absent); cloning does not perform that normalization.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_index_segment_metadata_encode(
+    const LanceIndexSegmentMetadata* metadata,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
  * Return the number of covering field IDs. Returns 0 on error; zero is also a
  * valid count, so check lance_last_error_code().
  */
