@@ -36,6 +36,45 @@ trap 'rm -rf "$work_dir"' EXIT
 verify_consumer_prefix() {
     local install_prefix=$1
 
+    echo "==> Verifying installed artifacts in $install_prefix"
+    case "$(uname -s)" in
+        Darwin)
+            bash "$repo_root/.github/scripts/verify-macos-staging.sh" \
+                "$install_prefix" "$(uname -m)"
+            bash "$repo_root/.github/scripts/verify-shared-exports.sh" \
+                "$install_prefix/lib/liblance_c.dylib" \
+                "$install_prefix/include/lance/lance.h" macos
+            ;;
+        Linux)
+            bash "$repo_root/.github/scripts/verify-shared-exports.sh" \
+                "$install_prefix/lib/liblance_c.so" \
+                "$install_prefix/include/lance/lance.h" linux
+            ;;
+        *)
+            echo "unsupported platform: $(uname -s)" >&2
+            exit 1
+            ;;
+    esac
+
+    echo "==> Installed library identity"
+    for library in \
+        "$install_prefix/lib/liblance_c.a" \
+        "$install_prefix/lib/liblance_c.so" \
+        "$install_prefix/lib/liblance_c.dylib"; do
+        if [ -f "$library" ]; then
+            file "$library"
+            if command -v sha256sum >/dev/null 2>&1; then
+                sha256sum "$library"
+            else
+                shasum -a 256 "$library"
+            fi
+            wc -c "$library"
+        fi
+    done
+
+    local dataset_uri="$repo_root/test_data/v0.27.1/pq_in_schema"
+    local expected_dataset_output="rows: 512, version: 2"
+
     for linkage in static shared; do
         local build_dir="$work_dir/consumer-${linkage}"
         echo "==> Testing find_package(LanceC) consumer (${linkage} linkage)"
@@ -53,6 +92,24 @@ verify_consumer_prefix() {
             echo "Expected exit code 2 (usage error) for ${linkage} consumer, got $rc" >&2
             exit 1
         fi
+
+        set +e
+        local dataset_output
+        dataset_output=$("$build_dir/consumer" "$dataset_uri" 2>&1)
+        rc=$?
+        set -e
+        if [ "$rc" -ne 0 ]; then
+            echo "${linkage} consumer failed to read $dataset_uri (exit $rc):" >&2
+            printf '%s\n' "$dataset_output" >&2
+            exit 1
+        fi
+        if [ "$dataset_output" != "$expected_dataset_output" ]; then
+            echo "${linkage} consumer returned unexpected dataset output:" >&2
+            printf '  expected: %s\n  actual:   %s\n' \
+                "$expected_dataset_output" "$dataset_output" >&2
+            exit 1
+        fi
+        printf 'Verified %s consumer dataset read: %s\n' "$linkage" "$dataset_output"
     done
 }
 
@@ -83,11 +140,6 @@ case "$mode" in
             -DLANCE_C_USE_PREBUILT=ON \
             -DLANCE_C_PREBUILT_DIR="$prebuilt_dir"
         cmake --install "$work_dir/build-prebuilt" --prefix "$install_dir"
-
-        if [ "$(uname -s)" = "Darwin" ]; then
-            bash "$repo_root/.github/scripts/verify-macos-staging.sh" \
-                "$install_dir" "$(uname -m)"
-        fi
 
         verify_consumer_prefix "$install_dir"
         ;;

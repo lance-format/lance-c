@@ -536,6 +536,10 @@ three of them:
 | `lance-c-v0.1.9-aarch64-apple-darwin.tar.xz` | vcpkg `arm64-osx`, `arm64-osx-dynamic`, Conan `Macos/armv8` |
 
 Intel macOS (`x86_64-apple-darwin`) uses the `from-source` path for v0.1.9.
+The release workflow now includes an Intel macOS build row for future tags.
+That row has no effect on the published v0.1.9 package set: Intel remains a
+source build until a release containing the new archive is published and the
+recipes are updated with its hash.
 The archives contain headers, static and shared libraries,
 CMake package files, pkg-config metadata, and the license. The package recipes
 install only the linkage selected for that package.
@@ -592,6 +596,10 @@ audit](https://github.com/lance-format/lance-c/blob/2c00796/validation/issue-103
 Runtime consumer evidence covers Linux x86_64 and is recorded in the
 [issue 100 validation
 record](https://github.com/lance-format/lance-c/blob/5a29b67/validation/issue-100/RESULTS.md).
+The candidate Intel macOS row is built and executed on the hosted macOS 15
+Intel runner. Its dylib `minos` value is build metadata, not proof that macOS 11
+can run the complete static distribution; the exercised runner OS and build SDK
+are recorded in the workflow log.
 
 ### From source via cargo (Rust developers)
 
@@ -1054,7 +1062,7 @@ back.
 
 ## Releasing
 
-Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds five prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, and macOS arm64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. Intel macOS consumers use the source build described above.
+Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds six prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, and macOS arm64 and Intel x86_64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the restored Intel row; its published matrix remains the five archives listed above.
 Before the consumer smoke test and archive upload, the build rows strip the staged shared library, verify its exports, and verify the Linux direct runtime dependencies.
 
 ### Recommended: cut a release via Actions UI
@@ -1071,7 +1079,7 @@ Before the consumer smoke test and archive upload, the build rows strip the stag
    - Commits as `github-actions[bot]` with message `chore: bump version to <version>`.
    - Pushes the commit to `main` and pushes the tag.
    - Dispatches `release.yml` at the new tag's ref. (Direct tag push by `GITHUB_TOKEN` does not trigger workflows — GitHub's recursion guard — so we explicitly `gh workflow run` instead.)
-4. `release.yml` builds artifacts. ~20 minutes later the [GitHub Release](https://github.com/lance-format/lance-c/releases) has all published `.tar.xz` artifacts (Linux x86_64/aarch64, their Debian 12 variants, and macOS arm64) plus a `SHA512SUMS` file.
+4. `release.yml` builds artifacts. Once the tag includes all rows, the [GitHub Release](https://github.com/lance-format/lance-c/releases) has `.tar.xz` artifacts for Linux x86_64/aarch64, their Debian 12 variants, and macOS arm64/Intel x86_64, plus a `SHA512SUMS` file. The v0.1.9 release remains the historical five-asset set above.
 5. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
    - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
    - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
@@ -1099,7 +1107,7 @@ If you need to cut a release without the workflow (e.g. local tag with extra com
    git tag v0.2.0
    git push origin v0.2.0
    ```
-5. `release.yml` fires on the tag push and builds the five prebuilt tarballs as above.
+5. `release.yml` fires on the tag push and builds the six prebuilt tarballs as above.
 
 A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 
