@@ -222,16 +222,30 @@ static void check_dataset(const char *uri,
     LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
     ASSERT(dataset != NULL, "reopen committed dataset");
     CHECK_OK();
-    ASSERT(lance_dataset_version(dataset) == version, "dataset version");
+    uint64_t observed_version = lance_dataset_version(dataset);
     CHECK_OK();
-    ASSERT(lance_dataset_count_rows(dataset) == rows, "dataset row count");
+    uint64_t observed_rows = lance_dataset_count_rows(dataset);
     CHECK_OK();
-    if (fragments != UINT64_MAX) {
-        ASSERT(lance_dataset_fragment_count(dataset) == fragments,
-               "dataset fragment count");
-        CHECK_OK();
-    }
+    uint64_t observed_fragments = lance_dataset_fragment_count(dataset);
+    CHECK_OK();
     lance_dataset_close(dataset);
+
+    char message[256];
+    snprintf(message, sizeof(message),
+             "dataset version: expected %llu, observed %llu",
+             (unsigned long long)version, (unsigned long long)observed_version);
+    ASSERT(observed_version == version, message);
+    snprintf(message, sizeof(message),
+             "dataset row count: expected %llu, observed %llu",
+             (unsigned long long)rows, (unsigned long long)observed_rows);
+    ASSERT(observed_rows == rows, message);
+    if (fragments != UINT64_MAX) {
+        snprintf(message, sizeof(message),
+                 "dataset fragment count: expected %llu, observed %llu",
+                 (unsigned long long)fragments,
+                 (unsigned long long)observed_fragments);
+        ASSERT(observed_fragments == fragments, message);
+    }
 }
 
 static void write_c_replacement_file(const char *uri,
@@ -2643,6 +2657,10 @@ static void test_fragment_creation(const char *src_uri, const char *base) {
     CHECK_OK();
     ASSERT(schema != NULL, "seed dataset native schema output");
     lance_dataset_close(dataset);
+
+    /* The seed commit is readable at the version and shape reported above, so a
+     * later mismatch isolates the creation step. */
+    check_dataset(uri, version, rows, fragments_before);
 
     /* Single create with an explicit fragment id, published by the caller. */
     StreamInput input = make_source_stream(src_uri);

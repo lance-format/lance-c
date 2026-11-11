@@ -45011,9 +45011,13 @@ fn test_fragment_create_preserves_native_schema_identity() {
     let metadata = native_fragment_metadata(fragment);
     let mut fragment_fields = metadata.files[0].fields.to_vec();
     fragment_fields.sort_unstable();
+    // A data file records the leaf columns it wrote, so the struct parent id is
+    // absent while the ids of the surviving leaves keep their gaps. Rebuilding
+    // this schema through Arrow would renumber them to 0, 1, 2 instead.
     assert_eq!(
-        fragment_fields, field_ids,
-        "the fragment must reference the supplied native field ids"
+        fragment_fields,
+        vec![0, 3, 4],
+        "the fragment must reference the supplied native leaf field ids"
     );
 
     let version = committed_version(dataset);
