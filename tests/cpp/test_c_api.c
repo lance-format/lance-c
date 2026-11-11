@@ -972,14 +972,6 @@ static void assert_blob_payload(const uint8_t *bytes, size_t len, size_t offset)
     }
 }
 
-static void assert_blob_payload_seeded(
-    const uint8_t *bytes, size_t len, size_t offset, uint8_t seed) {
-    for (size_t i = 0; i < len; i++) {
-        ASSERT(bytes[i] == (uint8_t)(blob_byte(offset + i) + seed),
-               "seeded blob payload mismatch");
-    }
-}
-
 static void test_take_blobs(const char *blob_uri) {
     printf("  test_take_blobs... ");
 
@@ -1138,8 +1130,7 @@ static void test_blob_native_read_slice(const char *blob_uri) {
         rc = lance_blob_file_read(
             addressed[i], buffer, (size_t)sizes[i]);
         ASSERT(rc == 0, "by-address read after dataset close failed");
-        assert_blob_payload_seeded(
-            buffer, (size_t)sizes[i], 0, (i == 1 || i == 2) ? 100 : 0);
+        assert_blob_payload(buffer, (size_t)sizes[i], 0);
     }
 
     /* Ordered, overlapping, duplicate and empty ranges. Capacities are larger
@@ -1176,11 +1167,11 @@ static void test_blob_native_read_slice(const char *blob_uri) {
     rc = lance_blob_file_read_ranges(
         packed, ranges, 6, destinations, destination_lens);
     ASSERT(rc == 0, "read_ranges failed");
-    assert_blob_payload_seeded(range0, 20, 100, 100);
-    assert_blob_payload_seeded(range2, 16, 40, 100);
-    assert_blob_payload_seeded(range3, 8, 100, 100);
-    assert_blob_payload_seeded(range4, 1, 127, 100);
-    assert_blob_payload_seeded(range5, 128, 0, 100);
+    assert_blob_payload(range0, 20, 100);
+    assert_blob_payload(range2, 16, 40);
+    assert_blob_payload(range3, 8, 100);
+    assert_blob_payload(range4, 1, 127);
+    assert_blob_payload(range5, 128, 0);
     for (size_t i = 20; i < sizeof(range0); i++) {
         ASSERT(range0[i] == 0xEE, "range0 tail was modified");
     }

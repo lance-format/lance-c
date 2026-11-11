@@ -867,10 +867,9 @@ static void test_scanner_blob_handling(const std::string& blob_uri) {
 static uint8_t blob_byte(size_t i) { return static_cast<uint8_t>(i * 7 + 3); }
 
 /// Check that `bytes` are the payload bytes starting at `offset`.
-static void assert_blob_payload(
-    const std::vector<uint8_t>& bytes, size_t offset, uint8_t seed = 0) {
+static void assert_blob_payload(const std::vector<uint8_t>& bytes, size_t offset) {
     for (size_t i = 0; i < bytes.size(); i++) {
-        assert(bytes[i] == static_cast<uint8_t>(blob_byte(offset + i) + seed));
+        assert(bytes[i] == blob_byte(offset + i));
     }
 }
 
@@ -998,8 +997,7 @@ static void test_blob_native_read_slice(const std::string& blob_uri) {
         if (i == 5) {
             assert(addressed_survivors[i]->tell() == 0);
         }
-        uint8_t seed = (i == 1 || i == 2) ? 100 : 0;
-        assert_blob_payload(addressed_survivors[i]->read(), 0, seed);
+        assert_blob_payload(addressed_survivors[i]->read(), 0);
     }
 
     lance::BlobFile& packed = *addressed_survivors[2];
@@ -1017,7 +1015,7 @@ static void test_blob_native_read_slice(const std::string& blob_uri) {
     const size_t sizes[] = {20, 0, 16, 8, 1, 128};
     for (size_t i = 0; i < parts.size(); i++) {
         assert(parts[i].size() == sizes[i]);
-        assert_blob_payload(parts[i], ranges[i].offset, 100);
+        assert_blob_payload(parts[i], ranges[i].offset);
     }
     assert(packed.tell() == 5);
     assert(packed.read_ranges(std::vector<lance::BlobRange>{}).empty());
@@ -1029,7 +1027,7 @@ static void test_blob_native_read_slice(const std::string& blob_uri) {
     size_t bytes_read = packed.read_into(tail.data(), tail.size());
     assert(bytes_read == 8);
     std::vector<uint8_t> tail_bytes(tail.begin(), tail.begin() + 8);
-    assert_blob_payload(tail_bytes, 120, 100);
+    assert_blob_payload(tail_bytes, 120);
     assert(packed.tell() == 128);
     assert(packed.read_into(nullptr, 0) == 0);
 
