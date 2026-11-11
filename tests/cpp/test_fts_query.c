@@ -90,7 +90,7 @@ static int collect_hits(LanceScanner* scanner, struct hit* hits, int capacity) {
 
         int id_index = -1;
         int score_index = -1;
-        for (int64_t index = 0; index < schema.nchildren; ++index) {
+        for (int64_t index = 0; index < schema.n_children; ++index) {
             const char* name = schema.children[index]->name;
             if (name && strcmp(name, "id") == 0) id_index = (int)index;
             if (name && strcmp(name, "_score") == 0) score_index = (int)index;
