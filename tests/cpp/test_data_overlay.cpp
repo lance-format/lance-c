@@ -33,8 +33,10 @@ void release_schema_noop(ArrowSchema* schema) { schema->release = nullptr; }
 void release_array_noop(ArrowArray* array) { array->release = nullptr; }
 
 struct OverlayBatch {
-    std::array<ArrowSchema, 3> schema_children{};
-    std::array<ArrowArray, 3> array_children{};
+    std::array<ArrowSchema, 3> schema_storage{};
+    std::array<ArrowSchema*, 3> schema_children{};
+    std::array<ArrowArray, 3> array_storage{};
+    std::array<ArrowArray*, 3> array_children{};
     std::array<const void*, 1> struct_buffers{{nullptr}};
     std::array<const void*, 2> a_buffers{};
     std::array<const void*, 2> b_buffers{};
@@ -58,11 +60,15 @@ struct OverlayBatch {
         schema.format = "+s";
         schema.name = "";
         schema.n_children = static_cast<int64_t>(children);
+        for (size_t i = 0; i < children; ++i) {
+            schema_children[i] = &schema_storage[i];
+            array_children[i] = &array_storage[i];
+        }
         schema.children = schema_children.data();
         schema.release = release_schema_noop;
 
         init_schema_child(0, "L", "_rowaddr", 0);
-        init_array_child(0, len, nullptr, rowaddrs.data());
+        init_array_child(array_storage[0], len, nullptr, rowaddrs.data());
 
         size_t child = 1;
         if (with_a) {
@@ -70,7 +76,8 @@ struct OverlayBatch {
             a_validity.assign((len + 7) / 8, 0xff);
             a_buffers = {{a_validity.data(), a_values.data()}};
             init_schema_child(child, "i", "a", ARROW_FLAG_NULLABLE);
-            init_array_child(child, len, a_buffers[0], a_buffers[1]);
+            init_array_child(array_storage[child], len, a_buffers[0],
+                             a_buffers[1]);
             ++child;
         }
         if (with_b) {
@@ -78,7 +85,8 @@ struct OverlayBatch {
             b_validity.assign((len + 7) / 8, 0xff);
             b_buffers = {{b_validity.data(), b_values.data()}};
             init_schema_child(child, "i", "b", ARROW_FLAG_NULLABLE);
-            init_array_child(child, len, b_buffers[0], b_buffers[1]);
+            init_array_child(array_storage[child], len, b_buffers[0],
+                             b_buffers[1]);
         }
 
         array.length = static_cast<int64_t>(len);
@@ -105,7 +113,7 @@ struct OverlayBatch {
         CHECK(with_a);
         a_validity.at(index / 8) &=
             static_cast<uint8_t>(~(1u << (index % 8)));
-        array_children[1].null_count += 1;
+        array_storage[1].null_count += 1;
     }
 
     void set_b(size_t index, int32_t value) {
@@ -116,7 +124,7 @@ struct OverlayBatch {
 private:
     void init_schema_child(size_t index, const char* format, const char* name,
                            int64_t flags) {
-        ArrowSchema& child = schema_children.at(index);
+        ArrowSchema& child = schema_storage.at(index);
         child = {};
         child.format = format;
         child.name = name;
