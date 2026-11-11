@@ -1376,8 +1376,9 @@ unsafe fn create_vector_index_with_options_inner(
     let prepared = unsafe { prepare_vector_build(options)? };
 
     ds.with_mut(|dataset| {
+        let columns = [column.as_str()];
         let mut builder =
-            dataset.create_index_builder(&[column.as_str()], IndexType::Vector, &prepared.params);
+            dataset.create_index_builder(&columns, IndexType::Vector, &prepared.params);
         if let Some(index_name) = index_name.clone() {
             builder = builder.name(index_name);
         }
