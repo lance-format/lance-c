@@ -1203,11 +1203,11 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_with_spec_id(
     spec_id: u32,
 ) -> i32 {
     ffi_try!(
-
+        {
             let snapshot = required_mut(snapshot, "snapshot")?;
             snapshot.snapshot.spec_id = spec_id;
             Ok(0)
-        ,
+        },
         neg
     )
 }
@@ -1218,11 +1218,11 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_with_current_generation(
     generation: u64,
 ) -> i32 {
     ffi_try!(
-
+        {
             let snapshot = required_mut(snapshot, "snapshot")?;
             snapshot.snapshot.current_generation = generation;
             Ok(0)
-        ,
+        },
         neg
     )
 }
@@ -1234,7 +1234,7 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_with_sstable(
     path: *const c_char,
 ) -> i32 {
     ffi_try!(
-
+        {
             let snapshot = required_mut(snapshot, "snapshot")?;
             let path = unsafe { parse_c_string(path)? }
                 .ok_or_else(|| invalid("path must not be NULL"))?
@@ -1245,7 +1245,7 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_with_sstable(
                 .push(SsTable { generation, path });
             snapshot.sync_paths()?;
             Ok(0)
-        ,
+        },
         neg
     )
 }
@@ -1816,7 +1816,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_project(
     num_columns: usize,
 ) -> i32 {
     ffi_try!(
-
+        {
             let scanner = scanner_mut(scanner)?;
             let columns = unsafe { c_string_array(columns, num_columns, "columns")? };
             let current = scanner.take()?;
@@ -1827,7 +1827,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_project(
                 }
                 Err(error) => Err(error),
             }
-        ,
+        },
         neg
     )
 }
@@ -1839,7 +1839,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_filter(
     filter: *const c_char,
 ) -> i32 {
     ffi_try!(
-
+        {
             let scanner = scanner_mut(scanner)?;
             let filter = unsafe { parse_c_string(filter)? }
                 .ok_or_else(|| invalid("filter must not be NULL"))?;
@@ -1854,7 +1854,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_filter(
                 }
                 Err(error) => Err(error),
             }
-        ,
+        },
         neg
     )
 }
@@ -1869,7 +1869,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_limit(
     has_offset: i32,
 ) -> i32 {
     ffi_try!(
-
+        {
             let scanner = scanner_mut(scanner)?;
             let limit = bool_flag(has_limit, "has_limit")?.then_some(limit);
             let offset = bool_flag(has_offset, "has_offset")?.then_some(offset);
@@ -1891,7 +1891,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_limit(
                 }
                 Err(error) => Err(error),
             }
-        ,
+        },
         neg
     )
 }
@@ -1899,12 +1899,12 @@ pub unsafe extern "C" fn lance_lsm_scanner_limit(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_lsm_scanner_with_row_address(scanner: *mut LanceLsmScanner) -> i32 {
     ffi_try!(
-
+        {
             let scanner = scanner_mut(scanner)?;
             let current = scanner.take()?;
             scanner.scanner = Some(current.with_row_address());
             Ok(0)
-        ,
+        },
         neg
     )
 }
@@ -1912,12 +1912,12 @@ pub unsafe extern "C" fn lance_lsm_scanner_with_row_address(scanner: *mut LanceL
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_lsm_scanner_with_memtable_gen(scanner: *mut LanceLsmScanner) -> i32 {
     ffi_try!(
-
+        {
             let scanner = scanner_mut(scanner)?;
             let current = scanner.take()?;
             scanner.scanner = Some(current.with_memtable_gen());
             Ok(0)
-        ,
+        },
         neg
     )
 }
@@ -1929,12 +1929,12 @@ pub unsafe extern "C" fn lance_lsm_scanner_schema(
     out: *mut FFI_ArrowSchema,
 ) -> i32 {
     ffi_try!(
-
+        {
             let scanner = scanner_ref(scanner)?;
             let schema = scanner.current()?.schema();
             write_ffi_schema(out, schema.as_ref())?;
             Ok(0)
-        ,
+        },
         neg
     )
 }
@@ -1964,7 +1964,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_to_arrow_stream(
     out: *mut FFI_ArrowArrayStream,
 ) -> i32 {
     ffi_try!(
-
+        {
             let scanner = scanner_ref(scanner)?;
             let stream = block_on(scanner.current()?.try_into_stream())?;
             let schema = stream.schema();
@@ -1976,7 +1976,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_to_arrow_stream(
             );
             write_ffi_stream(out, reader)?;
             Ok(0)
-        ,
+        },
         neg
     )
 }
@@ -2431,11 +2431,11 @@ pub unsafe extern "C" fn lance_mem_wal_plan_schema(
     out: *mut FFI_ArrowSchema,
 ) -> i32 {
     ffi_try!(
-
+        {
             let plan = plan_ref(plan)?;
             write_ffi_schema(out, plan.plan.schema().as_ref())?;
             Ok(0)
-        ,
+        },
         neg
     )
 }
@@ -2447,11 +2447,11 @@ pub unsafe extern "C" fn lance_mem_wal_plan_dataset_schema(
     out: *mut FFI_ArrowSchema,
 ) -> i32 {
     ffi_try!(
-
+        {
             let plan = plan_ref(plan)?;
             write_ffi_schema(out, plan.dataset_schema.as_ref())?;
             Ok(0)
-        ,
+        },
         neg
     )
 }
@@ -2515,14 +2515,14 @@ pub unsafe extern "C" fn lance_mem_wal_plan_to_arrow_stream(
     out: *mut FFI_ArrowArrayStream,
 ) -> i32 {
     ffi_try!(
-
+        {
             let plan = plan_ref(plan)?;
             let batches = execute_plan_batches(&plan.plan)?;
             let schema = plan.plan.schema();
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
             write_ffi_stream(out, reader)?;
             Ok(0)
-        ,
+        },
         neg
     )
 }
