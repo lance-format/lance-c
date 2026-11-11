@@ -1233,7 +1233,17 @@ fn data_overlay_native_constructor_restrictions() {
             );
             let (code, message) = take_error();
             assert_eq!(code, LanceErrorCode::InvalidArgument);
-            assert_eq!(message, lance_core::Error::from(native_error).to_string());
+            let native_message = lance_core::Error::from(native_error).to_string();
+            // Schema differences include sets of nested fields with no display order.
+            for diagnostic in [
+                "column data for fragment 0 does not match dataset field id 0",
+                "expected name 'id' but name was 'a'",
+                "a.data",
+                "a.uri",
+            ] {
+                assert!(native_message.contains(diagnostic), "{native_message}");
+                assert!(message.contains(diagnostic), "{message}");
+            }
             assert_eq!(output, sentinel);
         }
         unsafe {
