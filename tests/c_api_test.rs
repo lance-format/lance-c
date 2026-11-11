@@ -11537,7 +11537,7 @@ fn test_rtree_reloaded_nonfinite_bounds_keep_finite_matches() {
 
     let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!dataset.is_null(), "{}", take_last_error_message());
-    let filter = "ST_Intersects(geometry, ST_GeomFromWKT('POINT (10 10)'))";
+    let filter = "ST_Intersects(geometry, ST_GeomFromText('POINT (10 10)'))";
     let (ffi_indexed, _, plan) = scan_geometry_ids(dataset, filter, true);
     let (ffi_flat, _, _) = scan_geometry_ids(dataset, filter, false);
     let native_indexed = native_rtree_ids(uri, filter, true);
