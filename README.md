@@ -1019,9 +1019,10 @@ provider, passes native `None`. For datasets with additional base paths, native
 deep clone reads them through the source dataset's object store; per-base
 distinct source credentials are not supported. Native clone commits resolve the
 target URI through the default object-store registry, so target schemes
-registered only on a custom session are rejected. On failure the target dataset
-is not published, but copied objects may remain under the target path and are
-not rolled back.
+registered only on a custom session are rejected. A copy or commit error does
+not guarantee that the target remains unpublished; reopen the target to check
+its state. Copied objects may remain under the target path and are not rolled
+back.
 
 ## Releasing
 

@@ -1390,10 +1390,11 @@ LanceDataset* lance_dataset_checkout_ref(
  *
  * Files are copied and the target dataset is published by native Lance. The
  * out handle is written only on success. On failure the out parameter is
- * untouched and no target dataset is published, but object-store copies are
- * not transactional: partial objects may remain under `target_path` and are
- * not rolled back. A target that already contains a published dataset is
- * rejected by the native preflight before any copy.
+ * untouched. A copy or commit error does not guarantee that the target remains
+ * unpublished. Object-store copies are not transactional: partial objects may
+ * remain under `target_path` and are not rolled back. Reopen the target to
+ * check its state after an error. A target that already contains a published
+ * dataset is rejected by the native preflight before any copy.
  *
  * The returned dataset is a normal LanceDataset whose manifest keeps the
  * cloned snapshot's version id (native clone commit semantics), so its

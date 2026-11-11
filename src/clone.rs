@@ -90,10 +90,6 @@ unsafe fn deep_clone_inner(
     }
     let target_path = unsafe { helpers::parse_c_string(target_path)? }
         .ok_or_else(|| invalid("target_path must not be NULL"))?;
-    if target_path.trim().is_empty() {
-        return Err(invalid("target_path must not be empty"));
-    }
-
     let snapshot = unsafe { &*dataset }.snapshot();
     let reference = if reference.is_null() {
         Ref::Version(
@@ -534,6 +530,28 @@ mod tests {
         assert_eq!(rc, -1);
         assert!(sentinel.is_null(), "out written on failure");
         assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+
+        // Native resolves the source reference before interpreting the target
+        // path. Empty or whitespace paths must not introduce an earlier FFI
+        // error, and the missing reference prevents any target storage work.
+        for target in ["", " \t"] {
+            let target = c_string(target);
+            let mut unchanged = std::ptr::dangling_mut::<LanceDataset>();
+            assert_eq!(
+                unsafe {
+                    lance_dataset_deep_clone(
+                        dataset,
+                        target.as_ptr(),
+                        bad_tag,
+                        std::ptr::null(),
+                        &mut unchanged,
+                    )
+                },
+                -1
+            );
+            assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+            assert_eq!(unchanged, std::ptr::dangling_mut::<LanceDataset>());
+        }
 
         // Existing target is rejected by the native preflight.
         let mut existing: *mut LanceDataset = std::ptr::null_mut();
