@@ -976,7 +976,7 @@ fn reader_projection_range_indices_errors_and_io_stats() {
     let native_out_of_range_error =
         native_indices_batches(&oracle, out_of_range.to_vec()).unwrap_err();
     assert_eq!(c_out_of_range_error, native_out_of_range_error);
-    assert!(c_out_of_range_error.contains("out of bounds"));
+    assert!(c_out_of_range_error.contains("cannot read"));
 
     let mut stats = LanceScanStats::default();
     assert_eq!(
