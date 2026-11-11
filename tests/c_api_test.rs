@@ -38239,6 +38239,78 @@ fn test_trainer_options_follow_native_types_and_shape() {
     };
     assert_eq!(*len, 4);
     assert_eq!(item.data_type(), &DataType::Float16);
+
+    for zero in [
+        LanceIndexTrainerOptions {
+            sample_rate: set_option(0),
+            max_iters: set_option(1),
+        },
+        LanceIndexTrainerOptions {
+            sample_rate: set_option(1),
+            max_iters: set_option(0),
+        },
+    ] {
+        let mut failed_centroids = FFI_ArrowArray::empty();
+        let mut failed_schema = FFI_ArrowSchema::empty();
+        assert_eq!(
+            unsafe {
+                lance_index_train_ivf_model_with_options(
+                    dataset,
+                    c_str("embedding").as_ptr(),
+                    2,
+                    LanceMetricType::L2 as i32,
+                    ptr::null(),
+                    0,
+                    &zero,
+                    &mut failed_centroids,
+                    &mut failed_schema,
+                )
+            },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = take_last_error_message();
+        assert!(
+            message.contains("sample_rate must be positive"),
+            "{message}"
+        );
+        assert!(failed_centroids.release.is_none());
+        assert!(failed_schema.release.is_none());
+
+        let mut failed_codebook = FFI_ArrowArray::empty();
+        let mut failed_codebook_schema = FFI_ArrowSchema::empty();
+        assert_eq!(
+            unsafe {
+                lance_index_train_pq_model_with_options(
+                    dataset,
+                    c_str("embedding").as_ptr(),
+                    2,
+                    4,
+                    LanceMetricType::L2 as i32,
+                    ptr::null(),
+                    0,
+                    &mut centroids,
+                    &centroids_schema,
+                    &zero,
+                    &mut failed_codebook,
+                    &mut failed_codebook_schema,
+                )
+            },
+            -1
+        );
+        let code = lance_last_error_code();
+        let message = take_last_error_message();
+        if zero.sample_rate.value == 0 {
+            assert_eq!(code, LanceErrorCode::Internal);
+            assert!(message.contains("Not enough rows to train PQ"), "{message}");
+        } else {
+            assert_eq!(code, LanceErrorCode::Panic);
+            assert!(message.contains("range end index"), "{message}");
+        }
+        assert!(failed_codebook.release.is_none());
+        assert!(failed_codebook_schema.release.is_none());
+    }
+
     unsafe {
         if let Some(release) = codebook.release {
             release(&mut codebook);

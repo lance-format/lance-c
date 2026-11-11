@@ -29,8 +29,8 @@
     } while (0)
 
 typedef struct {
-    uint64_t events;
-    int invalid;
+    _Atomic uint64_t events;
+    _Atomic int invalid;
 } ProgressCapture;
 
 static void capture_progress(
@@ -46,10 +46,10 @@ static void capture_progress(
     if (capture == NULL || stage == NULL || unit == NULL ||
         event < LANCE_INDEX_BUILD_PROGRESS_STAGE_START ||
         event > LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE) {
-        if (capture != NULL) capture->invalid = 1;
+        if (capture != NULL) atomic_store(&capture->invalid, 1);
         return;
     }
-    capture->events += 1;
+    atomic_fetch_add(&capture->events, 1);
 }
 
 static void release_arrow(struct ArrowArray *array, struct ArrowSchema *schema) {
@@ -256,7 +256,8 @@ static void test_physical_merge(LanceDataset *dataset) {
                &capture) == 0,
            "metadata merge failed");
     CHECK_OK();
-    ASSERT(capture.invalid == 0, "metadata merge callback contract violated");
+    ASSERT(atomic_load(&capture.invalid) == 0,
+           "metadata merge callback contract violated");
     ASSERT(lance_dataset_version(dataset) == version_before,
            "metadata merge must not commit");
 
