@@ -2540,6 +2540,87 @@ static void test_native_operation_construction(const char *src_uri,
     printf("native operation construction OK\n");
 }
 
+static void test_dynamic_storage_accessor(const char *src_uri,
+                                             const char *base) {
+    char uri[4096];
+    snprintf(uri, sizeof(uri), "%s/c_accessor_commit", base);
+
+    const char *keys[] = {"block_size"};
+    const char *values[] = {"4096"};
+    LanceStorageOptionsInput input = {keys, values, 1};
+    LanceStorageOptionsAccessor *accessor =
+        lance_storage_options_accessor_new(&input, NULL);
+    ASSERT(accessor != NULL, "create static storage accessor");
+    CHECK_OK();
+
+    LanceDatasetOpenOptions open_options;
+    memset(&open_options, 0, sizeof(open_options));
+    open_options.storage_options_accessor = accessor;
+    LanceDataset *opened =
+        lance_dataset_open_with_options(src_uri, &open_options, NULL);
+    ASSERT(opened != NULL, "open with explicit accessor");
+    CHECK_OK();
+    uint64_t source_rows = lance_dataset_count_rows(opened);
+    CHECK_OK();
+    ASSERT(source_rows > 0, "source dataset rows");
+    lance_dataset_close(opened);
+
+    LanceDataset *defaulted =
+        lance_dataset_open_with_options(src_uri, NULL, NULL);
+    ASSERT(defaulted != NULL, "open with NULL options");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(defaulted) == source_rows,
+           "NULL options preserve native open");
+    CHECK_OK();
+    lance_dataset_close(defaulted);
+
+    LanceTransaction *seed = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_CREATE, NULL);
+    LanceDataset *dataset = NULL;
+    ASSERT(lance_transaction_commit_with_accessor(
+               uri, seed, NULL, accessor, NULL, &dataset) == 0,
+           "commit create with accessor");
+    CHECK_OK();
+    lance_transaction_close(seed);
+    ASSERT(dataset != NULL, "create commit output");
+    ASSERT(lance_dataset_version(dataset) == 1, "accessor create version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == source_rows,
+           "accessor create rows");
+    CHECK_OK();
+    lance_dataset_close(dataset);
+
+    LanceTransaction *left = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_APPEND, NULL);
+    LanceTransaction *right = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_APPEND, NULL);
+    const LanceTransaction *transactions[] = {left, right};
+    LanceDataset *batched = NULL;
+    LanceTransaction *merged = NULL;
+    ASSERT(lance_transaction_commit_batch_with_accessor(
+               uri, transactions, 2, NULL, accessor, NULL, &batched,
+               &merged) == 0,
+           "batch commit with accessor");
+    CHECK_OK();
+    lance_transaction_close(left);
+    lance_transaction_close(right);
+    ASSERT(batched != NULL && merged != NULL, "batch accessor outputs");
+    ASSERT(lance_dataset_version(batched) == 2, "batch accessor version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(batched) == source_rows * 3,
+           "batch accessor rows");
+    CHECK_OK();
+
+    // The native dataset retained the accessor after the C handle closed.
+    lance_storage_options_accessor_close(accessor);
+    ASSERT(lance_dataset_count_rows(batched) == source_rows * 3,
+           "dataset remains valid after accessor handle closes");
+    CHECK_OK();
+    lance_transaction_close(merged);
+    lance_dataset_close(batched);
+    printf("C dynamic storage accessor OK\n");
+}
+
 int main(int argc, char **argv) {
     if (argc != 5) {
         fprintf(stderr,
@@ -2549,6 +2630,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     test_create_append_overwrite(argv[1], argv[2]);
+    test_dynamic_storage_accessor(argv[1], argv[2]);
     test_validation(argv[2]);
     test_fragment_delete(argv[1], argv[2]);
     test_data_replacement(argv[1], argv[2]);

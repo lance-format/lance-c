@@ -87,6 +87,22 @@ pub struct LanceStorageOptionsAccessor {
     pub(crate) inner: Option<Arc<StorageOptionsAccessor>>,
 }
 
+/// Clone the native accessor retained by a C handle.
+///
+/// A NULL handle and an explicitly constructed empty accessor both map to
+/// native `None`. The clone keeps the same native provider and cache, so
+/// later I/O observes the native refresh policy.
+pub(crate) unsafe fn storage_options_accessor_from_ffi(
+    accessor: *const LanceStorageOptionsAccessor,
+) -> Result<Option<Arc<StorageOptionsAccessor>>> {
+    if accessor.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: a non-NULL accessor points to a valid handle for this call; the
+    // native Arc is cloned before the C handle can be closed.
+    Ok(unsafe { &*accessor }.inner.clone())
+}
+
 pub struct LanceStorageOptionsSnapshot {
     has_options: bool,
     entries: Vec<(CString, CString)>,

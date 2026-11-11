@@ -27,6 +27,7 @@ use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
 use crate::runtime::block_on;
+use crate::storage_options::{LanceStorageOptionsAccessor, storage_options_accessor_from_ffi};
 
 /// Write mode for `lance_dataset_write`.
 ///
@@ -198,6 +199,7 @@ pub unsafe extern "C" fn lance_dataset_write(
                     params: std::ptr::null(),
                     options: std::ptr::null(),
                     legacy_auto_cleanup: true,
+                    storage_options_accessor: std::ptr::null(),
                 },
                 storage_opts,
                 out_dataset,
@@ -234,6 +236,7 @@ pub unsafe extern "C" fn lance_dataset_write_with_params(
                     params,
                     options: std::ptr::null(),
                     legacy_auto_cleanup: true,
+                    storage_options_accessor: std::ptr::null(),
                 },
                 storage_opts,
                 out_dataset,
@@ -277,8 +280,119 @@ pub unsafe extern "C" fn lance_dataset_write_with_options(
                     params: std::ptr::null(),
                     options,
                     legacy_auto_cleanup: false,
+                    storage_options_accessor: std::ptr::null(),
                 },
                 storage_opts,
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Write with a native storage-options accessor and the legacy 20/14
+/// auto-cleanup policy.
+///
+/// `storage_options_accessor` may be NULL for native defaults. Static storage
+/// options belong in the accessor's initial options, so no `storage_opts`
+/// parameter is accepted here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_write_with_accessor(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options: std::ptr::null(),
+                    legacy_auto_cleanup: true,
+                    storage_options_accessor,
+                },
+                std::ptr::null(),
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Write with native `LanceWriteParams` and a storage-options accessor.
+///
+/// `params` may be NULL for native defaults. `storage_options_accessor` may be
+/// NULL for native defaults. This entry point keeps the legacy 20/14
+/// auto-cleanup policy, matching `lance_dataset_write_with_params`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_dataset_write_with_params_and_accessor(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    params: *const LanceWriteParams,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params,
+                    options: std::ptr::null(),
+                    legacy_auto_cleanup: true,
+                    storage_options_accessor,
+                },
+                std::ptr::null(),
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Write with native `LanceWriteOptions` and a storage-options accessor.
+///
+/// `options` may be NULL for a zero-initialized `LanceWriteOptions`, which
+/// selects native `WriteParams::default()`. `storage_options_accessor` may be
+/// NULL for native defaults.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_dataset_write_with_options_and_accessor(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    options: *const LanceWriteOptions,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options,
+                    legacy_auto_cleanup: false,
+                    storage_options_accessor,
+                },
+                std::ptr::null(),
                 out_dataset,
             )
         },
@@ -293,6 +407,7 @@ struct WriteSettings {
     params: *const LanceWriteParams,
     options: *const LanceWriteOptions,
     legacy_auto_cleanup: bool,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
 }
 
 /// Build native `WriteParams` from the writer option representations.
@@ -306,15 +421,31 @@ pub(crate) unsafe fn write_params_from_ffi(
     options: *const LanceWriteOptions,
     legacy_auto_cleanup: bool,
     storage_opts: *const *const c_char,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
     session: Option<Arc<Session>>,
 ) -> Result<WriteParams> {
     // SAFETY: `storage_opts` is either NULL or a NULL-terminated array of
     // C-string pointers per the FFI contract.
     let opts = unsafe { helpers::parse_storage_options(storage_opts)? };
-    let store_params = (!opts.is_empty()).then(|| ObjectStoreParams {
-        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(opts))),
-        ..ObjectStoreParams::default()
-    });
+    let accessor = unsafe { storage_options_accessor_from_ffi(storage_options_accessor)? };
+    if accessor.is_some() && !opts.is_empty() {
+        return Err(lance_core::Error::invalid_input_source(
+            "storage_opts must be NULL when a storage options accessor is provided".into(),
+        ));
+    }
+    let store_params = if let Some(accessor) = accessor {
+        Some(ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..ObjectStoreParams::default()
+        })
+    } else {
+        (!opts.is_empty()).then(|| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                opts,
+            ))),
+            ..ObjectStoreParams::default()
+        })
+    };
     let mut write_params = WriteParams {
         mode: mode.into(),
         store_params,
@@ -421,6 +552,7 @@ unsafe fn write_dataset_inner(
             settings.options,
             settings.legacy_auto_cleanup,
             storage_opts,
+            settings.storage_options_accessor,
             None,
         )?
     };

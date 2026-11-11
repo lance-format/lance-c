@@ -46759,3 +46759,777 @@ fn test_memwal_string_sharding_and_schema_factory() {
         lance_dataset_close(ds);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Dataset dynamic storage-options accessor/provider
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct DatasetProviderCounters {
+    fetches: Arc<AtomicUsize>,
+    snapshot_releases: Arc<AtomicUsize>,
+    provider_releases: Arc<AtomicUsize>,
+}
+
+struct DatasetProviderContext {
+    counters: DatasetProviderCounters,
+    fail_next: Arc<AtomicBool>,
+    expires_at_millis: u64,
+}
+
+struct DatasetProviderSnapshot {
+    keys: Vec<CString>,
+    values: Vec<CString>,
+    key_ptrs: Vec<*const c_char>,
+    value_ptrs: Vec<*const c_char>,
+    releases: Arc<AtomicUsize>,
+}
+
+static DATASET_PROVIDER_ERROR_RELEASES: AtomicUsize = AtomicUsize::new(0);
+static DATASET_PROVIDER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+unsafe extern "C" fn release_dataset_provider_snapshot(raw: *mut c_void) {
+    let snapshot = unsafe { Box::from_raw(raw as *mut DatasetProviderSnapshot) };
+    snapshot.releases.fetch_add(1, AtomicOrdering::SeqCst);
+}
+
+unsafe extern "C" fn release_dataset_provider_error(value: *mut LanceOwnedString) {
+    if value.is_null() {
+        return;
+    }
+    let value = unsafe { &mut *value };
+    if !value.data.is_null() {
+        let _ = unsafe { CString::from_raw(value.data) };
+        value.data = ptr::null_mut();
+    }
+    value.release = None;
+    DATASET_PROVIDER_ERROR_RELEASES.fetch_add(1, AtomicOrdering::SeqCst);
+}
+
+unsafe extern "C" fn dataset_provider_fetch(
+    callback_ctx: *mut c_void,
+    out: *mut LanceStorageOptionsFetchResult,
+    error: *mut LanceCallbackError,
+) -> i32 {
+    let context = unsafe { &*(callback_ctx as *const DatasetProviderContext) };
+    context
+        .counters
+        .fetches
+        .fetch_add(1, AtomicOrdering::SeqCst);
+    if context.fail_next.swap(false, AtomicOrdering::SeqCst) {
+        if !error.is_null() {
+            let message = CString::new("dynamic provider refused refresh").unwrap();
+            unsafe {
+                (*error).code = LanceErrorCode::IoError as i32;
+                (*error).message.data = message.into_raw();
+                (*error).message.release = Some(release_dataset_provider_error);
+            }
+        }
+        return -1;
+    }
+
+    let entries = [
+        (
+            "expires_at_millis".to_string(),
+            context.expires_at_millis.to_string(),
+        ),
+        ("refresh_offset_millis".to_string(), "0".to_string()),
+        (
+            "aws_access_key_id".to_string(),
+            "test-access-key".to_string(),
+        ),
+        (
+            "aws_secret_access_key".to_string(),
+            "test-secret-key".to_string(),
+        ),
+    ];
+    let mut snapshot = Box::new(DatasetProviderSnapshot {
+        keys: entries
+            .iter()
+            .map(|(key, _)| CString::new(key.as_str()).unwrap())
+            .collect(),
+        values: entries
+            .iter()
+            .map(|(_, value)| CString::new(value.as_str()).unwrap())
+            .collect(),
+        key_ptrs: Vec::new(),
+        value_ptrs: Vec::new(),
+        releases: context.counters.snapshot_releases.clone(),
+    });
+    snapshot.key_ptrs = snapshot.keys.iter().map(|key| key.as_ptr()).collect();
+    snapshot.value_ptrs = snapshot.values.iter().map(|value| value.as_ptr()).collect();
+    unsafe {
+        (*out).has_options = 1;
+        (*out).keys = snapshot.key_ptrs.as_ptr();
+        (*out).values = snapshot.value_ptrs.as_ptr();
+        (*out).count = snapshot.key_ptrs.len();
+        (*out).snapshot_ctx = Box::into_raw(snapshot) as *mut c_void;
+        (*out).release_snapshot = Some(release_dataset_provider_snapshot);
+    }
+    0
+}
+
+unsafe extern "C" fn release_dataset_provider(callback_ctx: *mut c_void) {
+    let context = unsafe { Box::from_raw(callback_ctx as *mut DatasetProviderContext) };
+    context
+        .counters
+        .provider_releases
+        .fetch_add(1, AtomicOrdering::SeqCst);
+}
+
+fn create_dataset_provider(
+    expires_at_millis: u64,
+) -> (
+    *mut LanceStorageOptionsProvider,
+    DatasetProviderCounters,
+    Arc<AtomicBool>,
+    CString,
+) {
+    let counters = DatasetProviderCounters::default();
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let context = Box::new(DatasetProviderContext {
+        counters: counters.clone(),
+        fail_next: fail_next.clone(),
+        expires_at_millis,
+    });
+    let provider_id = c_str("dataset-dynamic-provider");
+    let spec = LanceStorageOptionsProviderSpec {
+        fetch: Some(dataset_provider_fetch),
+        force_fetch: None,
+        release: Some(release_dataset_provider),
+        provider_ctx: Box::into_raw(context) as *mut c_void,
+        provider_id: provider_id.as_ptr(),
+    };
+    let provider = unsafe { lance_storage_options_provider_new(&spec) };
+    assert!(!provider.is_null(), "{}", take_last_error_message());
+    (provider, counters, fail_next, provider_id)
+}
+
+fn create_dataset_accessor_with_initial(
+    provider: *const LanceStorageOptionsProvider,
+    initial: &[(String, String)],
+) -> *mut LanceStorageOptionsAccessor {
+    let keys = initial
+        .iter()
+        .map(|(key, _)| CString::new(key.as_str()).unwrap())
+        .collect::<Vec<_>>();
+    let values = initial
+        .iter()
+        .map(|(_, value)| CString::new(value.as_str()).unwrap())
+        .collect::<Vec<_>>();
+    let key_ptrs = keys.iter().map(|key| key.as_ptr()).collect::<Vec<_>>();
+    let value_ptrs = values
+        .iter()
+        .map(|value| value.as_ptr())
+        .collect::<Vec<_>>();
+    let input = LanceStorageOptionsInput {
+        keys: key_ptrs.as_ptr(),
+        values: value_ptrs.as_ptr(),
+        count: key_ptrs.len(),
+    };
+    unsafe { lance_storage_options_accessor_new(&input, provider) }
+}
+
+fn wait_for_dataset_counter(counter: &AtomicUsize, expected: usize) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if counter.load(AtomicOrdering::SeqCst) == expected {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    counter.load(AtomicOrdering::SeqCst) == expected
+}
+
+fn current_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn first_registered_base_id(dataset: *const LanceDataset) -> u32 {
+    let value = take_json_value(unsafe { lance_dataset_base_paths_json(dataset) });
+    let base_paths: BTreeMap<String, serde_json::Value> = serde_json::from_value(value).unwrap();
+    let (base_id, _) = base_paths.iter().next().expect("registered base path");
+    base_id.parse().unwrap()
+}
+
+#[test]
+fn test_dataset_open_with_options_defaults_preserve_native_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("default-open")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let c_uri = c_str(&uri);
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+    let mut written = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write(
+                c_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                ptr::null(),
+                &mut written,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!written.is_null());
+    unsafe { lance_dataset_close(written) };
+
+    let null_options =
+        unsafe { lance_dataset_open_with_options(c_uri.as_ptr(), ptr::null(), ptr::null()) };
+    assert!(!null_options.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(null_options) }, 3);
+    unsafe { lance_dataset_close(null_options) };
+
+    let options = LanceDatasetOpenOptions {
+        version: 0,
+        storage_options_accessor: ptr::null(),
+    };
+    let zeroed = unsafe { lance_dataset_open_with_options(c_uri.as_ptr(), &options, ptr::null()) };
+    assert!(!zeroed.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(zeroed) }, 3);
+    unsafe { lance_dataset_close(zeroed) };
+}
+
+#[test]
+fn test_dataset_open_with_dynamic_accessor_refreshes_later_io_and_reports_failure() {
+    let _guard = DATASET_PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let main_uri = tmp.path().join("main").to_str().unwrap().to_string();
+    let base_uri = "s3://lance-c-test/base".to_string();
+
+    let main_c_uri = c_str(&main_uri);
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+    let mut written = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write(
+                main_c_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                ptr::null(),
+                &mut written,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(written) };
+
+    DATASET_PROVIDER_ERROR_RELEASES.store(0, AtomicOrdering::SeqCst);
+    let (provider, counters, fail_next, _provider_id) =
+        create_dataset_provider(current_epoch_millis() + 60_000);
+    let initial = vec![
+        ("aws_endpoint".to_string(), "http://127.0.0.1:1".to_string()),
+        ("allow_http".to_string(), "true".to_string()),
+        ("region".to_string(), "us-east-1".to_string()),
+        (
+            "virtual_hosted_style_request".to_string(),
+            "false".to_string(),
+        ),
+        (
+            "expires_at_millis".to_string(),
+            (current_epoch_millis() + 150).to_string(),
+        ),
+        ("refresh_offset_millis".to_string(), "0".to_string()),
+        // Keep the native global AIMD state cache out of this ownership test.
+        ("lance_aimd_max_retries".to_string(), "0".to_string()),
+    ];
+    let accessor = create_dataset_accessor_with_initial(provider, &initial);
+    assert!(!accessor.is_null(), "{}", take_last_error_message());
+    let session = lance_session_new(0, 0);
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    let options = LanceDatasetOpenOptions {
+        version: 0,
+        storage_options_accessor: accessor,
+    };
+    let dataset =
+        unsafe { lance_dataset_open_with_options(main_c_uri.as_ptr(), &options, session) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let snapshot = unsafe { lance_storage_options_accessor_snapshot(accessor) };
+    assert!(!snapshot.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_storage_options_snapshot_has_options(snapshot) },
+        1
+    );
+    unsafe { lance_storage_options_snapshot_close(snapshot) };
+    let fetches_after_open = counters.fetches.load(AtomicOrdering::SeqCst);
+    assert_eq!(
+        fetches_after_open, 0,
+        "reading the initial accessor must not fetch the provider"
+    );
+
+    unsafe {
+        lance_storage_options_accessor_close(accessor);
+        lance_storage_options_provider_close(provider);
+    }
+    assert_eq!(
+        counters.provider_releases.load(AtomicOrdering::SeqCst),
+        0,
+        "the open dataset must retain the provider after C handles close"
+    );
+
+    let base_uri_c = c_str(&base_uri);
+    let base = LanceBasePath {
+        id: 0,
+        path: base_uri_c.as_ptr(),
+        name: ptr::null(),
+        is_dataset_root: false,
+    };
+    assert_eq!(
+        unsafe { lance_dataset_add_bases(dataset, &base, 1, ptr::null()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let base_id = first_registered_base_id(dataset);
+    std::thread::sleep(Duration::from_millis(250));
+    fail_next.store(true, AtomicOrdering::SeqCst);
+    let file_name = c_str("dynamic-base-file.lance");
+    let mut file = ptr::null_mut();
+    let rc =
+        unsafe { lance_dataset_create_data_file(dataset, file_name.as_ptr(), &base_id, &mut file) };
+    assert_eq!(rc, -1, "a failing provider must fail later dataset I/O");
+    assert!(file.is_null());
+    let message = take_last_error_message();
+    assert!(
+        message.contains("dynamic provider refused refresh"),
+        "provider failure must reach the caller: {message}"
+    );
+    assert_eq!(
+        DATASET_PROVIDER_ERROR_RELEASES.load(AtomicOrdering::SeqCst),
+        1,
+        "callback error message must be released exactly once"
+    );
+    let fetches_after_failure = counters.fetches.load(AtomicOrdering::SeqCst);
+    assert!(
+        fetches_after_failure > fetches_after_open,
+        "later I/O must refresh an expired provider instead of using the open snapshot"
+    );
+
+    fail_next.store(false, AtomicOrdering::SeqCst);
+    let rc =
+        unsafe { lance_dataset_create_data_file(dataset, file_name.as_ptr(), &base_id, &mut file) };
+    assert_eq!(
+        rc, -1,
+        "the loopback S3 endpoint must refuse the connection after credentials refresh"
+    );
+    assert!(file.is_null());
+    let transport_error = take_last_error_message();
+    assert!(
+        !transport_error.contains("dynamic provider refused refresh"),
+        "the retry must use successful provider credentials: {transport_error}"
+    );
+    assert!(
+        counters.fetches.load(AtomicOrdering::SeqCst) > fetches_after_failure,
+        "a successful later refresh must fetch again"
+    );
+    assert_eq!(
+        counters.snapshot_releases.load(AtomicOrdering::SeqCst),
+        1,
+        "the successful provider snapshot must be released exactly once"
+    );
+
+    unsafe {
+        lance_dataset_close(dataset);
+        lance_session_close(session);
+    }
+    assert!(
+        wait_for_dataset_counter(&counters.provider_releases, 1),
+        "provider context must be released exactly once after the final native owner drops"
+    );
+    assert_eq!(
+        counters.snapshot_releases.load(AtomicOrdering::SeqCst),
+        counters.fetches.load(AtomicOrdering::SeqCst) - 1,
+        "each successful fetch releases its snapshot exactly once; the failed fetch has no snapshot"
+    );
+    assert_eq!(
+        counters.fetches.load(AtomicOrdering::SeqCst),
+        2,
+        "one failed refresh and one successful refresh must serve later I/O"
+    );
+}
+
+#[test]
+fn test_dataset_write_and_commit_propagate_dynamic_provider_failure() {
+    let _guard = DATASET_PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let local_uri = tmp
+        .path()
+        .join("commit-source")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    DATASET_PROVIDER_ERROR_RELEASES.store(0, AtomicOrdering::SeqCst);
+    let (provider, counters, fail_next, _provider_id) =
+        create_dataset_provider(current_epoch_millis() + 60_000);
+    let initial = vec![
+        ("aws_endpoint".to_string(), "http://127.0.0.1:1".to_string()),
+        ("allow_http".to_string(), "true".to_string()),
+        ("region".to_string(), "us-east-1".to_string()),
+        (
+            "virtual_hosted_style_request".to_string(),
+            "false".to_string(),
+        ),
+        (
+            "expires_at_millis".to_string(),
+            (current_epoch_millis() + 60_000).to_string(),
+        ),
+        ("refresh_offset_millis".to_string(), "0".to_string()),
+        ("lance_aimd_max_retries".to_string(), "0".to_string()),
+    ];
+    let accessor = create_dataset_accessor_with_initial(provider, &initial);
+    assert!(!accessor.is_null(), "{}", take_last_error_message());
+    let ffi_schema = schema_to_ffi(&write_schema());
+
+    fail_next.store(true, AtomicOrdering::SeqCst);
+    let write_uri = c_str("s3://lance-c-test/provider-write");
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1], vec![1.0]));
+    let mut written = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_with_accessor(
+                write_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                accessor,
+                &mut written,
+            )
+        },
+        -1,
+        "write must surface a dynamic provider failure"
+    );
+    assert!(written.is_null());
+    let write_error = take_last_error_message();
+    assert!(
+        write_error.contains("dynamic provider refused refresh"),
+        "write provider failure must reach the caller: {write_error}"
+    );
+    assert_eq!(
+        DATASET_PROVIDER_ERROR_RELEASES.load(AtomicOrdering::SeqCst),
+        1,
+        "write callback error message must be released exactly once"
+    );
+
+    let local_c_uri = c_str(&local_uri);
+    let mut stream = batch_to_ffi_stream(write_batch(vec![2], vec![2.0]));
+    let mut transaction = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_uncommitted_stream_with_accessor(
+                local_c_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                ptr::null(),
+                accessor,
+                ptr::null(),
+                &mut transaction,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!transaction.is_null());
+
+    fail_next.store(true, AtomicOrdering::SeqCst);
+    let commit_uri = c_str("s3://lance-c-test/provider-commit");
+    let mut committed = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit_with_accessor(
+                commit_uri.as_ptr(),
+                transaction,
+                ptr::null(),
+                accessor,
+                ptr::null(),
+                &mut committed,
+            )
+        },
+        -1,
+        "commit must surface a dynamic provider failure"
+    );
+    assert!(committed.is_null());
+    let commit_error = take_last_error_message();
+    assert!(
+        commit_error.contains("dynamic provider refused refresh"),
+        "commit provider failure must reach the caller: {commit_error}"
+    );
+    assert_eq!(
+        DATASET_PROVIDER_ERROR_RELEASES.load(AtomicOrdering::SeqCst),
+        2,
+        "commit callback error message must be released exactly once"
+    );
+    assert_eq!(
+        counters.fetches.load(AtomicOrdering::SeqCst),
+        2,
+        "write and commit must each consult the failing provider"
+    );
+
+    unsafe {
+        lance_transaction_close(transaction);
+        lance_storage_options_accessor_close(accessor);
+        lance_storage_options_provider_close(provider);
+    }
+    assert!(
+        wait_for_dataset_counter(&counters.provider_releases, 1),
+        "provider context must be released exactly once after failed write/commit owners drop"
+    );
+    assert_eq!(
+        counters.snapshot_releases.load(AtomicOrdering::SeqCst),
+        0,
+        "failed fetches do not produce snapshots"
+    );
+}
+
+#[test]
+fn test_dataset_write_and_commit_with_dynamic_accessor_retain_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("dynamic-write")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let batch_uri = tmp
+        .path()
+        .join("dynamic-batch")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let c_uri = c_str(&uri);
+    let c_batch_uri = c_str(&batch_uri);
+    let ffi_schema = schema_to_ffi(&write_schema());
+
+    let (provider, counters, _fail_next, _provider_id) =
+        create_dataset_provider(current_epoch_millis() + 60_000);
+    let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), provider) };
+    assert!(!accessor.is_null(), "{}", take_last_error_message());
+
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+    let mut written = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_with_accessor(
+                c_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                accessor,
+                &mut written,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!written.is_null());
+    assert_eq!(unsafe { lance_dataset_count_rows(written) }, 3);
+    unsafe { lance_dataset_close(written) };
+
+    let null_uri = c_str(tmp.path().join("null-accessor-write").to_str().unwrap());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![11], vec![11.0]));
+    let mut null_written = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_with_accessor(
+                null_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                ptr::null(),
+                &mut null_written,
+            )
+        },
+        0,
+        "NULL accessor must select native defaults: {}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(null_written) }, 1);
+    unsafe { lance_dataset_close(null_written) };
+
+    let mut stream = batch_to_ffi_stream(write_batch(vec![4, 5], vec![4.0, 5.0]));
+    let mut appended = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_with_params_and_accessor(
+                c_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Append as i32,
+                ptr::null(),
+                accessor,
+                &mut appended,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(appended) }, 5);
+    unsafe { lance_dataset_close(appended) };
+
+    let mut stream = batch_to_ffi_stream(write_batch(vec![6], vec![6.0]));
+    let mut options_written = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_with_options_and_accessor(
+                c_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Append as i32,
+                ptr::null(),
+                accessor,
+                &mut options_written,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(options_written) }, 6);
+    unsafe { lance_dataset_close(options_written) };
+
+    let mut stream = batch_to_ffi_stream(write_batch(vec![7], vec![7.0]));
+    let mut transaction = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write_uncommitted_stream_with_accessor(
+                c_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Append as i32,
+                ptr::null(),
+                accessor,
+                ptr::null(),
+                &mut transaction,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut committed = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit_with_accessor(
+                c_uri.as_ptr(),
+                transaction,
+                ptr::null(),
+                accessor,
+                ptr::null(),
+                &mut committed,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(committed) }, 7);
+    unsafe {
+        lance_transaction_close(transaction);
+        lance_dataset_close(committed);
+    }
+
+    let mut stream = batch_to_ffi_stream(write_batch(vec![100], vec![1.0]));
+    let mut batch_written = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write(
+                c_batch_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                ptr::null(),
+                &mut batch_written,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(batch_written) };
+
+    let mut transactions = Vec::new();
+    for (ids, value) in [(vec![101], 2.0f32), (vec![102], 3.0f32)] {
+        let mut stream = batch_to_ffi_stream(write_batch(ids, vec![value]));
+        let mut transaction = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lance_dataset_write_uncommitted_stream_with_accessor(
+                    c_batch_uri.as_ptr(),
+                    &ffi_schema,
+                    &mut stream,
+                    LanceWriteMode::Append as i32,
+                    ptr::null(),
+                    accessor,
+                    ptr::null(),
+                    &mut transaction,
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        transactions.push(transaction);
+    }
+    let mut merged = ptr::null_mut();
+    let mut batch_dataset = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit_batch_with_accessor(
+                c_batch_uri.as_ptr(),
+                transactions.as_ptr() as *const *const LanceTransaction,
+                transactions.len(),
+                ptr::null(),
+                accessor,
+                ptr::null(),
+                &mut batch_dataset,
+                &mut merged,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(batch_dataset) }, 3);
+    unsafe {
+        for transaction in transactions {
+            lance_transaction_close(transaction);
+        }
+        lance_transaction_close(merged);
+        lance_dataset_close(batch_dataset);
+        lance_storage_options_accessor_close(accessor);
+        lance_storage_options_provider_close(provider);
+    }
+    assert!(
+        wait_for_dataset_counter(&counters.provider_releases, 1),
+        "all native dataset/transaction owners must release the provider exactly once"
+    );
+    assert_eq!(
+        counters.snapshot_releases.load(AtomicOrdering::SeqCst),
+        counters.fetches.load(AtomicOrdering::SeqCst),
+        "every successful provider fetch snapshot must be released exactly once"
+    );
+}
