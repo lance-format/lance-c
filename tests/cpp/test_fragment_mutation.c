@@ -347,6 +347,33 @@ static OneColumnStream *one_column_stream(const char *name, const char *format,
     return data;
 }
 
+static void test_stream_output_lifetimes(void) {
+    const int64_t ids[] = {7, 9};
+    const int32_t values[] = {70, 90};
+    TwoColumnStream *two =
+        two_column_stream("id", "l", "value", "i", ids, values, 2);
+    ArrowSchema schema = {0};
+    ArrowArray batch = {0};
+    ASSERT(two->stream.get_schema(&two->stream, &schema) == 0, "export schema");
+    ASSERT(two->stream.get_next(&two->stream, &batch) == 0, "export batch");
+    two->stream.release(&two->stream);
+    ASSERT(integer_value(batch.children[0], 1, "l") == 9,
+           "batch remains readable after stream release");
+    batch.release(&batch);
+    ASSERT(strcmp(schema.children[1]->name, "value") == 0,
+           "schema remains readable after stream and batch release");
+    schema.release(&schema);
+
+    OneColumnStream *one = one_column_stream("value", "i", values, 2);
+    ASSERT(one->stream.get_schema(&one->stream, &schema) == 0, "export schema");
+    ASSERT(one->stream.get_next(&one->stream, &batch) == 0, "export batch");
+    schema.release(&schema);
+    one->stream.release(&one->stream);
+    ASSERT(integer_value(batch.children[0], 1, "i") == 90,
+           "batch remains readable after schema and stream release");
+    batch.release(&batch);
+}
+
 static void commit_operation(const char *uri, uint64_t read_version,
                              LanceOperation *operation) {
     LanceTransaction *transaction =
@@ -712,6 +739,7 @@ static void test_delete_rows(const char *uri) {
 }
 
 int main(int argc, char **argv) {
+    test_stream_output_lifetimes();
     if (argc != 6) {
         fprintf(stderr,
                 "usage: %s ADD_URI MERGE_URI UPDATE_URI REPLACE_URI DELETE_URI\n",
