@@ -43095,7 +43095,7 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
     let uri_c = c_str(&uri);
 
     let mut write_options: LanceUncommittedWriteOptions = unsafe { std::mem::zeroed() };
-    write_options.write.params.max_rows_per_file = 1;
+    write_options.write.params.max_rows_per_file = 2;
     let create = write_uncommitted_for_batch(
         &uri,
         write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
@@ -43416,8 +43416,12 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
         committed_fragments.len(),
         fragments_after_delete as usize + append_count as usize
     );
+    let retained_deletion = committed_fragments
+        .iter()
+        .find(|fragment| fragment.id == 0)
+        .expect("fragment 0 must survive deletion and append");
     assert!(
-        committed_fragments[1].deletion_file.is_some(),
+        retained_deletion.deletion_file.is_some(),
         "deletion metadata must survive append"
     );
     let appended_ids = committed_fragments

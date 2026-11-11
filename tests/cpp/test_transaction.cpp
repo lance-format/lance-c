@@ -659,9 +659,6 @@ static void test_native_operations(const std::string& source_uri,
     CHECK(seed.version() == 1);
     CHECK(seed.fragment_count() > 1);
     const auto seed_fragments = seed.fragment_count();
-    const auto seed_ids = seed.fragment_ids();
-    const auto seed_max_id =
-        *std::max_element(seed_ids.begin(), seed_ids.end());
 
     uint64_t read_version = 0;
     std::vector<lance::Fragment> detached;
@@ -711,6 +708,9 @@ static void test_native_operations(const std::string& source_uri,
     CHECK(appended.version() == 2);
     CHECK(appended.count_rows() == source_rows * 2);
     CHECK(appended.fragment_count() == seed_fragments * 2);
+    const auto appended_ids = appended.fragment_ids();
+    const auto max_after_append =
+        *std::max_element(appended_ids.begin(), appended_ids.end());
 
     auto restore = lance::Operation::make_restore(1);
     CHECK(restore.restore_version() == 1);
@@ -761,7 +761,7 @@ static void test_native_operations(const std::string& source_uri,
           seed_fragments + reserved_fragments.size());
     const auto reserved_ids = reserved_commit.fragment_ids();
     CHECK(*std::max_element(reserved_ids.begin(), reserved_ids.end()) ==
-          seed_max_id + 2 + reserved_fragments.size());
+          max_after_append + 2 + reserved_fragments.size());
 
     const std::string base_a = uri + "_cpp_base_a";
     const std::string base_b = uri + "_cpp_base_b";
