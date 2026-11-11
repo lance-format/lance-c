@@ -97,12 +97,13 @@ fn report_native(uri: &str, file: &str) {
         let dataset = Dataset::open(uri).await.unwrap();
         match FileFragment::create_from_file(file, &dataset, 9_001, None).await {
             Ok(fragment) => {
-                let metadata = fragment.metadata();
+                // `create_from_file` returns detached metadata, not a
+                // `FileFragment`, so read the fields directly.
                 println!(
                     "native create_from_file OK file={file} id={} physical_rows={:?} files={:?}",
-                    metadata.id,
-                    metadata.physical_rows,
-                    metadata
+                    fragment.id,
+                    fragment.physical_rows,
+                    fragment
                         .files
                         .iter()
                         .map(|f| f.path.clone())
@@ -115,12 +116,14 @@ fn report_native(uri: &str, file: &str) {
 }
 
 unsafe fn last_error() -> String {
-    let message = lance_c::lance_last_error_message();
+    let message = unsafe { lance_c::lance_last_error_message() };
     if message.is_null() {
         return String::new();
     }
-    let text = CStr::from_ptr(message).to_string_lossy().into_owned();
-    lance_c::lance_free_string(message);
+    let text = unsafe { CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { lance_c::lance_free_string(message) };
     text
 }
 
