@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 /* Arrow C Data Interface flag bits — mirror arrow_schema/arrow_c_data_interface.h
@@ -1302,6 +1303,654 @@ static void test_blob_native_read_slice(const char *blob_uri) {
     for (size_t i = 0; i < 6; i++) {
         lance_blob_file_close(addressed[i]);
     }
+    printf("OK\n");
+}
+
+static int array_value_is_null(const struct ArrowArray *array, int64_t index) {
+    if (array->null_count == 0) return 0;
+    ASSERT(array->buffers[0] != NULL, "nullable array must carry a validity buffer");
+    int64_t bit = array->offset + index;
+    const uint8_t *validity = (const uint8_t *)array->buffers[0];
+    return (validity[bit / 8] & (uint8_t)(1u << (bit % 8))) == 0;
+}
+
+static uint64_t u64_array_value(const struct ArrowArray *array, int64_t index) {
+    ASSERT(array->buffers[1] != NULL, "UInt64 array must carry values");
+    const uint64_t *values = (const uint64_t *)array->buffers[1];
+    return values[array->offset + index];
+}
+
+static uint32_t u32_array_value(const struct ArrowArray *array, int64_t index) {
+    ASSERT(array->buffers[1] != NULL, "UInt32 array must carry values");
+    const uint32_t *values = (const uint32_t *)array->buffers[1];
+    return values[array->offset + index];
+}
+
+static void test_blob_fields_and_descriptors(void) {
+    printf("  test_blob_fields_and_descriptors... ");
+
+    LanceBlobFieldOptions options = {
+        true, 0,
+        true, 256,
+    };
+    struct ArrowSchema field_schema = {0};
+    ASSERT(lance_blob_field_with_options(
+               "blob", true, &options, &field_schema) == 0,
+           "blob_field_with_options failed");
+    ASSERT(strcmp(field_schema.name, "blob") == 0, "field name");
+    ASSERT(strcmp(field_schema.format, "+s") == 0, "blob field must be a struct");
+    ASSERT((field_schema.flags & ARROW_FLAG_NULLABLE) != 0, "nullable flag");
+    assert_field_metadata(
+        &field_schema, "ARROW:extension:name", "lance.blob.v2");
+    assert_field_metadata(
+        &field_schema,
+        "lance-encoding:blob-inline-size-threshold",
+        "0");
+    assert_field_metadata(
+        &field_schema,
+        "lance-encoding:blob-dedicated-size-threshold",
+        "256");
+    ASSERT(field_schema.n_children == 2, "minimal blob field child count");
+    ASSERT(strcmp(field_schema.children[0]->name, "data") == 0,
+           "blob field child 0");
+    ASSERT(strcmp(field_schema.children[1]->name, "uri") == 0,
+           "blob field child 1");
+    field_schema.release(&field_schema);
+
+    LanceBlobFieldOptions invalid = {0};
+    invalid.has_dedicated_size_threshold = true;
+    invalid.dedicated_size_threshold = 0;
+    struct ArrowSchema untouched = {0};
+    ASSERT(lance_blob_field_with_options(
+               "invalid", true, &invalid, &untouched) == -1,
+           "zero dedicated threshold must fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "greater than 0",
+        "zero dedicated threshold");
+    ASSERT(untouched.release == NULL && untouched.format == NULL,
+           "failed field export must leave out untouched");
+
+    LanceBlobDescriptorArrayBuilder *builder =
+        lance_blob_descriptor_array_builder_new("blob");
+    ASSERT(builder != NULL, "descriptor builder creation failed");
+    ASSERT(lance_blob_descriptor_array_builder_append_inline(
+               builder, (const uint8_t *)"inline payload", 14) == 0,
+           "inline append");
+    ASSERT(lance_blob_descriptor_array_builder_append_null(builder) == 0,
+           "null append");
+    ASSERT(lance_blob_descriptor_array_builder_append_packed(
+               builder, 7, 100, 8) == 0,
+           "packed append");
+    ASSERT(lance_blob_descriptor_array_builder_append_dedicated(
+               builder, 9, 1024) == 0,
+           "dedicated append");
+    ASSERT(lance_blob_descriptor_array_builder_append_managed(
+               builder, "data/a.blob", 2, 3, false, 0) == 0,
+           "managed base None append");
+    ASSERT(lance_blob_descriptor_array_builder_append_managed(
+               builder, "data/b.blob", 4, 5, true, 0) == 0,
+           "managed base Some(0) append");
+    const LanceBlobRange packed_ranges[] = {{1, 2}, {3, 4}};
+    ASSERT(lance_blob_descriptor_array_builder_extend_packed(
+               builder, 11, packed_ranges, 2) == 0,
+           "extend_packed");
+    ASSERT(lance_blob_descriptor_array_builder_push_external(
+               builder, "file:///tmp/external.bin", true, 7, 9) == 0,
+           "push_external");
+    ASSERT(lance_blob_descriptor_array_builder_append_external(
+               builder, 3, "s3://bucket/object", 11, 13) == 0,
+           "append_external");
+    ASSERT(lance_blob_descriptor_array_builder_append_inline(
+               builder, NULL, 0) == 0,
+           "valid empty inline append");
+
+    struct ArrowSchema builder_field = {0};
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, &builder_field) == 0,
+           "builder field export");
+    assert_field_metadata(
+        &builder_field, "ARROW:extension:name", "lance.blob.v2");
+    builder_field.release(&builder_field);
+
+    struct ArrowArray array = {0};
+    struct ArrowSchema schema = {0};
+    ASSERT(lance_blob_descriptor_array_builder_finish(
+               builder, &array, &schema) == 0,
+           "descriptor finish");
+    ASSERT(array.release != NULL && schema.release != NULL,
+           "finish must export both Arrow parts");
+    ASSERT(array.length == 11, "descriptor array length");
+    ASSERT(array.n_children == 6, "prepared descriptor child count");
+    ASSERT(schema.n_children == 6, "prepared schema child count");
+    const char *prepared_names[] = {
+        "kind", "data", "uri", "blob_id", "blob_size", "position",
+    };
+    for (size_t i = 0; i < 6; ++i) {
+        ASSERT(strcmp(schema.children[i]->name, prepared_names[i]) == 0,
+               "prepared schema child name/order");
+    }
+
+    const struct ArrowArray *kinds = array.children[0];
+    const struct ArrowArray *data = array.children[1];
+    const struct ArrowArray *blob_ids = array.children[3];
+    const uint8_t *kind_values = (const uint8_t *)kinds->buffers[1];
+    ASSERT(!array_value_is_null(kinds, 0) && kind_values[0] == 0,
+           "inline kind");
+    ASSERT(array_value_is_null(kinds, 1), "null row kind");
+    ASSERT(kind_values[2] == 1, "packed kind");
+    ASSERT(kind_values[3] == 2, "dedicated kind");
+    ASSERT(kind_values[4] == 4, "Managed without base kind");
+    ASSERT(kind_values[5] == 5, "ManagedWithBase kind");
+    ASSERT(kind_values[8] == 3 && kind_values[9] == 3,
+           "external descriptor kinds");
+    ASSERT(array_value_is_null(blob_ids, 4),
+           "Managed None must have a null blob_id");
+    ASSERT(!array_value_is_null(blob_ids, 5) &&
+               u32_array_value(blob_ids, 5) == 0,
+           "Managed Some(0) must retain an explicit zero blob_id");
+    ASSERT(!array_value_is_null(data, 0), "inline data must be non-null");
+    const int64_t *data_offsets = (const int64_t *)data->buffers[1];
+    ASSERT(data_offsets[1] - data_offsets[0] == 14,
+           "inline payload length");
+    ASSERT(memcmp((const uint8_t *)data->buffers[2] + data_offsets[0],
+                  "inline payload", 14) == 0,
+           "inline payload bytes");
+
+    struct ArrowSchema post_finish_field = {0};
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, &post_finish_field) == 0,
+           "field must remain available after finish");
+    post_finish_field.release(&post_finish_field);
+    ASSERT(lance_blob_descriptor_array_builder_append_null(builder) == -1,
+           "append after finish must fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "already finished", "append after finish");
+
+    array.release(&array);
+    schema.release(&schema);
+    lance_blob_descriptor_array_builder_close(builder);
+    printf("OK\n");
+}
+
+static void assert_blob_payload_with_seed(
+    const uint8_t *bytes,
+    size_t len,
+    size_t offset,
+    size_t seed) {
+    for (size_t i = 0; i < len; ++i) {
+        ASSERT(bytes[i] == (uint8_t)((offset + i) * 7 + 3 + seed),
+               "planned blob payload mismatch");
+    }
+}
+
+static void test_blob_planned_reads(const char *blob_uri) {
+    printf("  test_blob_planned_reads... ");
+
+    LanceDataset *ds = lance_dataset_open(blob_uri, NULL, 0);
+    ASSERT(ds != NULL, "blob dataset open failed");
+    const uint64_t indices[] = {7, 2, 3, 4, 9, 0};
+    const uint64_t expected_addresses[] = {
+        (((uint64_t)1) << 32) | 2,
+        2,
+        3,
+        4,
+        (((uint64_t)1) << 32) | 4,
+        0,
+    };
+    const size_t expected_sizes[] = {128, 128, 0, 0, 128, 8};
+    const size_t expected_seeds[] = {100, 0, 0, 0, 100, 0};
+    const int expected_null[] = {0, 0, 0, 1, 0, 0};
+
+    LanceBlobReadOptions options = {0};
+    options.order = LANCE_BLOB_READ_PRESERVE_ORDER;
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_dataset_read_blobs(
+               ds, "blob", LANCE_BLOB_ROWS_INDICES, indices, 6,
+               &options, &stream) == 0,
+           "planned whole-blob read failed");
+    struct ArrowSchema schema = {0};
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "whole schema");
+    ASSERT(schema.n_children == 2, "whole schema child count");
+    ASSERT(strcmp(schema.children[0]->name, "row_address") == 0 &&
+               strcmp(schema.children[0]->format, "L") == 0,
+           "whole row_address schema");
+    ASSERT(strcmp(schema.children[1]->name, "data") == 0 &&
+               strcmp(schema.children[1]->format, "Z") == 0,
+           "whole data schema");
+    schema.release(&schema);
+
+    for (size_t row = 0; row < 6; ++row) {
+        struct ArrowArray array = {0};
+        ASSERT(stream.get_next(&stream, &array) == 0,
+               "whole get_next failed");
+        ASSERT(array.release != NULL, "expected one whole record");
+        ASSERT(array.length == 1 && array.n_children == 2,
+               "one whole result per Arrow record");
+        ASSERT(u64_array_value(array.children[0], 0) == expected_addresses[row],
+               "whole row address");
+        const struct ArrowArray *data = array.children[1];
+        if (expected_null[row]) {
+            ASSERT(array_value_is_null(data, 0), "NULL blob must stay NULL");
+        } else {
+            ASSERT(!array_value_is_null(data, 0),
+                   "non-NULL blob must not be NULL");
+            const int64_t *offsets = (const int64_t *)data->buffers[1];
+            size_t len = (size_t)(offsets[1] - offsets[0]);
+            ASSERT(len == expected_sizes[row], "whole payload length");
+            assert_blob_payload_with_seed(
+                (const uint8_t *)data->buffers[2] + offsets[0],
+                len, 0, expected_seeds[row]);
+        }
+        array.release(&array);
+    }
+    struct ArrowArray eos = {0};
+    ASSERT(stream.get_next(&stream, &eos) == 0 && eos.release == NULL,
+           "whole stream must end after native results");
+    stream.release(&stream);
+
+    const LanceBlobRangeRequest requests[] = {
+        {7, 100, 20},
+        {2, 128, 0},
+        {9, 40, 16},
+        {2, 100, 8},
+        {3, 0, 0},
+        {4, 1000, 100},
+    };
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_read_blob_ranges(
+               ds, "blob", LANCE_BLOB_ROWS_INDICES, requests, 6,
+               &options, &stream) == 0,
+           "planned range read failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "range schema");
+    const char *range_names[] = {
+        "request_index", "row_address", "offset", "length", "data",
+    };
+    ASSERT(schema.n_children == 5, "range schema child count");
+    for (size_t i = 0; i < 5; ++i) {
+        ASSERT(strcmp(schema.children[i]->name, range_names[i]) == 0,
+               "range schema child name/order");
+    }
+    schema.release(&schema);
+
+    const uint8_t expected_null_range[] = {0, 0, 0, 0, 0, 1};
+    const size_t expected_range_sizes[] = {20, 0, 16, 8, 0, 0};
+    for (size_t request = 0; request < 6; ++request) {
+        struct ArrowArray array = {0};
+        ASSERT(stream.get_next(&stream, &array) == 0,
+               "range get_next failed");
+        ASSERT(array.release != NULL, "expected one range record");
+        ASSERT(array.length == 1 && array.n_children == 5,
+               "one range result per Arrow record");
+        ASSERT(u64_array_value(array.children[0], 0) == request,
+               "request_index identity");
+        ASSERT(u64_array_value(array.children[1], 0) ==
+                   (request == 0 ? ((((uint64_t)1) << 32) | 2) :
+                    request == 2 ? ((((uint64_t)1) << 32) | 4) :
+                    request == 3 ? 2 : request == 4 ? 3 :
+                    request == 5 ? 4 : 2),
+               "range row address");
+        const struct ArrowArray *data = array.children[4];
+        if (expected_null_range[request]) {
+            ASSERT(array_value_is_null(data, 0),
+                   "NULL range must stay NULL");
+        } else {
+            ASSERT(!array_value_is_null(data, 0),
+                   "non-NULL range must not be NULL");
+            const int64_t *offsets = (const int64_t *)data->buffers[1];
+            ASSERT((size_t)(offsets[1] - offsets[0]) ==
+                       expected_range_sizes[request],
+                   "range payload length");
+        }
+        array.release(&array);
+    }
+    memset(&eos, 0, sizeof(eos));
+    ASSERT(stream.get_next(&stream, &eos) == 0 && eos.release == NULL,
+           "range stream must end");
+    stream.release(&stream);
+
+    memset(&stream, 0, sizeof(stream));
+    const uint64_t empty_rows = 0;
+    (void)empty_rows;
+    ASSERT(lance_dataset_read_blobs(
+               ds, "blob", LANCE_BLOB_ROWS_INDICES, NULL, 0,
+               &options, &stream) == 0,
+           "explicit empty planned read failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "empty read schema");
+    ASSERT(schema.n_children == 2, "empty read schema shape");
+    schema.release(&schema);
+    memset(&eos, 0, sizeof(eos));
+    ASSERT(stream.get_next(&stream, &eos) == 0 && eos.release == NULL,
+           "explicit empty selection must yield no records");
+    stream.release(&stream);
+
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_read_blobs(
+               ds, "blob", LANCE_BLOB_ROWS_NONE, NULL, 0,
+               &options, &stream) == -1,
+           "native no-selection must fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "requires a row selection",
+        "planned read no-selection");
+    ASSERT(stream.release == NULL, "failed factory must not write stream");
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+typedef struct {
+    struct ArrowSchema *child;
+} WrappedSchemaState;
+
+static void release_wrapped_schema(struct ArrowSchema *schema) {
+    WrappedSchemaState *state = (WrappedSchemaState *)schema->private_data;
+    if (state != NULL) {
+        if (state->child != NULL) {
+            if (state->child->release != NULL) {
+                state->child->release(state->child);
+            }
+            free(state->child);
+        }
+        free(state);
+    }
+    free((void *)schema->format);
+    free((void *)schema->name);
+    free((void *)schema->metadata);
+    free(schema->children);
+    schema->release = NULL;
+}
+
+static char *managed_schema_metadata(void) {
+    const char *key = "lance.blob.managed";
+    const char *value = "true";
+    int32_t key_len = (int32_t)strlen(key);
+    int32_t value_len = (int32_t)strlen(value);
+    int32_t pair_count = 1;
+    size_t size = sizeof(pair_count) + sizeof(key_len) + (size_t)key_len +
+                  sizeof(value_len) + (size_t)value_len;
+    char *metadata = (char *)malloc(size);
+    ASSERT(metadata != NULL, "allocate schema metadata");
+    char *cursor = metadata;
+    memcpy(cursor, &pair_count, sizeof(pair_count));
+    cursor += sizeof(pair_count);
+    memcpy(cursor, &key_len, sizeof(key_len));
+    cursor += sizeof(key_len);
+    memcpy(cursor, key, (size_t)key_len);
+    cursor += key_len;
+    memcpy(cursor, &value_len, sizeof(value_len));
+    cursor += sizeof(value_len);
+    memcpy(cursor, value, (size_t)value_len);
+    return metadata;
+}
+
+static struct ArrowSchema *wrap_record_schema(
+    struct ArrowSchema *child,
+    int managed_opt_in) {
+    struct ArrowSchema *schema =
+        (struct ArrowSchema *)calloc(1, sizeof(*schema));
+    WrappedSchemaState *state =
+        (WrappedSchemaState *)calloc(1, sizeof(*state));
+    ASSERT(schema != NULL && state != NULL, "allocate wrapped schema");
+    schema->format = strdup("+s");
+    schema->metadata = managed_opt_in ? managed_schema_metadata() : NULL;
+    schema->flags = 0;
+    schema->n_children = 1;
+    schema->children =
+        (struct ArrowSchema **)calloc(1, sizeof(struct ArrowSchema *));
+    ASSERT(schema->format != NULL && schema->children != NULL,
+           "allocate wrapped schema children");
+    state->child = child;
+    schema->children[0] = child;
+    schema->dictionary = NULL;
+    schema->release = release_wrapped_schema;
+    schema->private_data = state;
+    return schema;
+}
+
+static void release_wrapped_array(struct ArrowArray *array) {
+    for (int64_t i = 0; i < array->n_children; ++i) {
+        if (array->children != NULL && array->children[i] != NULL) {
+            if (array->children[i]->release != NULL) {
+                array->children[i]->release(array->children[i]);
+            }
+            free(array->children[i]);
+        }
+    }
+    free(array->children);
+    free((void *)array->buffers);
+    array->release = NULL;
+}
+
+static struct ArrowArray *wrap_record_array(struct ArrowArray *child) {
+    struct ArrowArray *array =
+        (struct ArrowArray *)calloc(1, sizeof(*array));
+    const void **buffers =
+        (const void **)calloc(1, sizeof(const void *));
+    struct ArrowArray **children =
+        (struct ArrowArray **)calloc(1, sizeof(struct ArrowArray *));
+    ASSERT(array != NULL && buffers != NULL && children != NULL,
+           "allocate wrapped array");
+    array->length = child->length;
+    array->null_count = 0;
+    array->offset = 0;
+    array->n_buffers = 1;
+    array->n_children = 1;
+    array->buffers = buffers;
+    array->children = children;
+    array->dictionary = NULL;
+    array->release = release_wrapped_array;
+    array->private_data = NULL;
+    array->children[0] = child;
+    return array;
+}
+
+typedef struct {
+    struct ArrowSchema schema;
+    int schema_taken;
+    struct ArrowArray array;
+    int array_taken;
+} PreparedStreamState;
+
+static int prepared_stream_get_schema(
+    struct ArrowArrayStream *stream,
+    struct ArrowSchema *out) {
+    PreparedStreamState *state =
+        (PreparedStreamState *)stream->private_data;
+    if (state->schema_taken) {
+        return -1;
+    }
+    *out = state->schema;
+    memset(&state->schema, 0, sizeof(state->schema));
+    state->schema_taken = 1;
+    return 0;
+}
+
+static int prepared_stream_get_next(
+    struct ArrowArrayStream *stream,
+    struct ArrowArray *out) {
+    PreparedStreamState *state =
+        (PreparedStreamState *)stream->private_data;
+    if (state->array_taken) {
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
+    *out = state->array;
+    memset(&state->array, 0, sizeof(state->array));
+    state->array_taken = 1;
+    return 0;
+}
+
+static const char *prepared_stream_last_error(
+    struct ArrowArrayStream *stream) {
+    (void)stream;
+    return NULL;
+}
+
+static void prepared_stream_release(struct ArrowArrayStream *stream) {
+    PreparedStreamState *state =
+        (PreparedStreamState *)stream->private_data;
+    if (state == NULL) return;
+    if (state->schema.release != NULL) state->schema.release(&state->schema);
+    if (state->array.release != NULL) state->array.release(&state->array);
+    free(state);
+    memset(stream, 0, sizeof(*stream));
+}
+
+static int write_managed_descriptor_stream(
+    const char *uri,
+    int32_t mode,
+    uint64_t offset,
+    uint64_t length,
+    int managed_opt_in) {
+    LanceBlobDescriptorArrayBuilder *builder =
+        lance_blob_descriptor_array_builder_new("blob");
+    ASSERT(builder != NULL, "managed descriptor builder creation failed");
+    ASSERT(lance_blob_descriptor_array_builder_append_managed(
+               builder, "_blobs/managed.bin", offset, length, false, 0) == 0,
+           "managed descriptor append failed");
+
+    struct ArrowSchema *argument_child =
+        (struct ArrowSchema *)calloc(1, sizeof(*argument_child));
+    struct ArrowSchema *stream_child =
+        (struct ArrowSchema *)calloc(1, sizeof(*stream_child));
+    ASSERT(argument_child != NULL && stream_child != NULL,
+           "allocate prepared helper schemas");
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, argument_child) == 0,
+           "argument field export failed");
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, stream_child) == 0,
+           "stream field export failed");
+
+    struct ArrowArray prepared_array = {0};
+    struct ArrowSchema finished_field = {0};
+    ASSERT(lance_blob_descriptor_array_builder_finish(
+               builder, &prepared_array, &finished_field) == 0,
+           "managed descriptor finish failed");
+    finished_field.release(&finished_field);
+    lance_blob_descriptor_array_builder_close(builder);
+
+    struct ArrowArray *array =
+        (struct ArrowArray *)calloc(1, sizeof(*array));
+    ASSERT(array != NULL, "allocate prepared array");
+    *array = prepared_array;
+    memset(&prepared_array, 0, sizeof(prepared_array));
+
+    struct ArrowSchema *argument_schema =
+        wrap_record_schema(argument_child, managed_opt_in);
+    PreparedStreamState *state =
+        (PreparedStreamState *)calloc(1, sizeof(*state));
+    ASSERT(state != NULL, "allocate prepared stream state");
+    struct ArrowSchema *wrapped_schema =
+        wrap_record_schema(stream_child, managed_opt_in);
+    state->schema = *wrapped_schema;
+    free(wrapped_schema);
+    struct ArrowArray *wrapped_array = wrap_record_array(array);
+    state->array = *wrapped_array;
+    free(wrapped_array);
+    free(array);
+
+    struct ArrowArrayStream stream = {0};
+    stream.get_schema = prepared_stream_get_schema;
+    stream.get_next = prepared_stream_get_next;
+    stream.get_last_error = prepared_stream_last_error;
+    stream.release = prepared_stream_release;
+    stream.private_data = state;
+
+    LanceWriteParams params = {0};
+    params.data_storage_version = "2.2";
+    LanceDataset *dataset = NULL;
+    int32_t rc = lance_dataset_write_with_params(
+        uri, argument_schema, &stream, mode, &params, NULL, &dataset);
+    argument_schema->release(argument_schema);
+    free(argument_schema);
+    if (rc == 0) {
+        ASSERT(dataset != NULL, "managed write returned null dataset");
+        lance_dataset_close(dataset);
+    }
+    return rc;
+}
+
+static void test_managed_blob_descriptor_roundtrip(const char *write_uri) {
+    printf("  test_managed_blob_descriptor_roundtrip... ");
+
+    char managed_uri[4096];
+    char no_opt_in_uri[4096];
+    int written = snprintf(
+        managed_uri, sizeof(managed_uri), "%s.managed-blob", write_uri);
+    ASSERT(written > 0 && (size_t)written < sizeof(managed_uri),
+           "managed dataset URI too long");
+    written = snprintf(
+        no_opt_in_uri, sizeof(no_opt_in_uri), "%s.no-managed-opt-in",
+        write_uri);
+    ASSERT(written > 0 && (size_t)written < sizeof(no_opt_in_uri),
+           "no-opt-in dataset URI too long");
+
+    ASSERT(write_managed_descriptor_stream(
+               managed_uri, LANCE_WRITE_CREATE, 1, 5, 1) == 0,
+           "managed create failed");
+
+    char object_dir[4096];
+    char object_path[4096];
+    written = snprintf(object_dir, sizeof(object_dir), "%s/_blobs", managed_uri);
+    ASSERT(written > 0 && (size_t)written < sizeof(object_dir),
+           "managed object directory URI too long");
+    written = snprintf(
+        object_path, sizeof(object_path), "%s/managed.bin", object_dir);
+    ASSERT(written > 0 && (size_t)written < sizeof(object_path),
+           "managed object path too long");
+    (void)mkdir(object_dir, 0755);
+    FILE *object = fopen(object_path, "wb");
+    ASSERT(object != NULL, "create managed object");
+    ASSERT(fwrite("0123456789", 1, 10, object) == 10,
+           "write managed object");
+    ASSERT(fclose(object) == 0, "close managed object");
+
+    LanceDataset *ds = lance_dataset_open(managed_uri, NULL, 0);
+    ASSERT(ds != NULL, "managed dataset open failed");
+    const uint64_t first_index = 0;
+    LanceBlobFile *blob = NULL;
+    ASSERT(lance_dataset_take_blobs_by_indices(
+               ds, &first_index, 1, "blob", &blob) == 0 && blob != NULL,
+           "managed first read failed");
+    uint8_t bytes[16] = {0};
+    ASSERT(lance_blob_file_read(blob, bytes, 5) == 0, "managed blob read");
+    ASSERT(memcmp(bytes, "12345", 5) == 0, "managed first range bytes");
+    lance_blob_file_close(blob);
+    lance_dataset_close(ds);
+
+    ASSERT(write_managed_descriptor_stream(
+               managed_uri, LANCE_WRITE_APPEND, 5, 3, 1) == 0,
+           "managed append failed");
+    ds = lance_dataset_open(managed_uri, NULL, 0);
+    ASSERT(ds != NULL, "managed reopen failed");
+    const uint64_t both_indices[] = {0, 1};
+    LanceBlobFile *blobs[2] = {0};
+    ASSERT(lance_dataset_take_blobs_by_indices(
+               ds, both_indices, 2, "blob", blobs) == 0,
+           "managed reuse read failed");
+    ASSERT(blobs[0] != NULL && blobs[1] != NULL,
+           "managed reuse handles");
+    ASSERT(lance_blob_file_read(blobs[0], bytes, 5) == 0 &&
+               memcmp(bytes, "12345", 5) == 0,
+           "managed reuse first bytes");
+    ASSERT(lance_blob_file_read(blobs[1], bytes, 3) == 0 &&
+               memcmp(bytes, "567", 3) == 0,
+           "managed reuse second bytes");
+    lance_blob_file_close(blobs[0]);
+    lance_blob_file_close(blobs[1]);
+    lance_dataset_close(ds);
+
+    ASSERT(write_managed_descriptor_stream(
+               no_opt_in_uri, LANCE_WRITE_CREATE, 0, 1, 0) == -1,
+           "managed write must require schema opt-in");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "lance.blob.managed=true",
+        "managed schema opt-in");
+
     printf("OK\n");
 }
 
@@ -5075,6 +5724,9 @@ int main(int argc, char **argv) {
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_blob_native_read_slice(blob_uri);
+    test_blob_fields_and_descriptors();
+    test_blob_planned_reads(blob_uri);
+    test_managed_blob_descriptor_roundtrip(write_uri);
     test_versions(uri);
     test_native_refs_and_tags(uri);
     test_branch_lifecycle(uri);

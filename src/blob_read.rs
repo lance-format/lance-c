@@ -21,8 +21,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use lance::dataset::{
-    BlobRangeRequest, BlobReadRange, Dataset, ReadBlob, ReadBlobRange, ReadBlobRangesStream,
-    ReadBlobsStream,
+    BlobRangeRequest, ReadBlob, ReadBlobRange, ReadBlobRangesStream, ReadBlobsStream,
 };
 use lance_core::Result;
 

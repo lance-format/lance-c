@@ -1068,6 +1068,268 @@ static void test_blob_native_read_slice(const std::string& blob_uri) {
     PASS();
 }
 
+static int64_t cpp_schema_field_index(const ArrowSchema* schema,
+                                      const char* name) {
+    for (int64_t i = 0; i < schema->n_children; ++i) {
+        if (schema->children[i] && schema->children[i]->name &&
+            strcmp(schema->children[i]->name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool cpp_array_value_is_null(const ArrowArray* array, int64_t index) {
+    if (array->null_count == 0) return false;
+    assert(array->buffers[0] != nullptr);
+    int64_t bit = array->offset + index;
+    const auto* validity = static_cast<const uint8_t*>(array->buffers[0]);
+    return (validity[bit / 8] & static_cast<uint8_t>(1u << (bit % 8))) == 0;
+}
+
+static uint64_t cpp_u64_array_value(const ArrowArray* array, int64_t index) {
+    assert(array->buffers[1] != nullptr);
+    const auto* values = static_cast<const uint64_t*>(array->buffers[1]);
+    return values[array->offset + index];
+}
+
+static uint32_t cpp_u32_array_value(const ArrowArray* array, int64_t index) {
+    assert(array->buffers[1] != nullptr);
+    const auto* values = static_cast<const uint32_t*>(array->buffers[1]);
+    return values[array->offset + index];
+}
+
+static void test_blob_fields_and_descriptors() {
+    TEST(test_blob_fields_and_descriptors);
+
+    lance::BlobFieldOptions options;
+    options.inline_size_threshold = size_t{0};
+    options.dedicated_size_threshold = size_t{256};
+    ArrowSchema field{};
+    lance::blob_field_with_options("blob", true, options, &field);
+    assert(strcmp(field.name, "blob") == 0);
+    assert(strcmp(field.format, "+s") == 0);
+    assert((field.flags & ARROW_FLAG_NULLABLE) != 0);
+    assert_field_metadata(&field, "ARROW:extension:name", "lance.blob.v2");
+    assert_field_metadata(
+        &field, "lance-encoding:blob-inline-size-threshold", "0");
+    assert_field_metadata(
+        &field, "lance-encoding:blob-dedicated-size-threshold", "256");
+    field.release(&field);
+
+    ArrowSchema default_field{};
+    lance::blob_field("default", false, &default_field);
+    assert(strcmp(default_field.name, "default") == 0);
+    assert((default_field.flags & ARROW_FLAG_NULLABLE) == 0);
+    assert_field_metadata_absent(
+        &default_field, "lance-encoding:blob-inline-size-threshold");
+    default_field.release(&default_field);
+
+    lance::BlobDescriptorArrayBuilder builder("blob");
+    builder.append_inline(
+        reinterpret_cast<const uint8_t*>("inline payload"), 14);
+    builder.append_null();
+    builder.append_packed(7, 100, 8);
+    builder.append_dedicated(9, 1024);
+    builder.append_managed("data/a.blob", 2, 3);
+    builder.append_managed("data/b.blob", 4, 5, uint32_t{0});
+    builder.extend_packed(11, {{1, 2}, {3, 4}});
+    builder.push_external(
+        "file:///tmp/external.bin", lance::BlobRange{7, 9});
+    builder.append_external(3, "s3://bucket/object", 11, 13);
+    builder.append_inline(nullptr, 0);
+
+    ArrowSchema builder_field{};
+    builder.field(&builder_field);
+    assert_field_metadata(
+        &builder_field, "ARROW:extension:name", "lance.blob.v2");
+    builder_field.release(&builder_field);
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    builder.finish(&array, &schema);
+    assert(array.length == 11);
+    assert(array.n_children == 6 && schema.n_children == 6);
+    const char* prepared_names[] = {
+        "kind", "data", "uri", "blob_id", "blob_size", "position",
+    };
+    for (size_t i = 0; i < 6; ++i) {
+        assert(std::string(schema.children[i]->name) == prepared_names[i]);
+    }
+
+    const ArrowArray* kinds = array.children[0];
+    const ArrowArray* data = array.children[1];
+    const ArrowArray* blob_ids = array.children[3];
+    const auto* kind_values = static_cast<const uint8_t*>(kinds->buffers[1]);
+    assert(!cpp_array_value_is_null(kinds, 0) && kind_values[0] == 0);
+    assert(cpp_array_value_is_null(kinds, 1));
+    assert(kind_values[2] == 1);
+    assert(kind_values[3] == 2);
+    assert(kind_values[4] == 4);
+    assert(kind_values[5] == 5);
+    assert(kind_values[8] == 3 && kind_values[9] == 3);
+    assert(cpp_array_value_is_null(blob_ids, 4));
+    assert(!cpp_array_value_is_null(blob_ids, 5) &&
+           cpp_u32_array_value(blob_ids, 5) == 0);
+    const auto* data_offsets =
+        static_cast<const int64_t*>(data->buffers[1]);
+    assert(data_offsets[1] - data_offsets[0] == 14);
+    assert(memcmp(static_cast<const uint8_t*>(data->buffers[2]) +
+                      data_offsets[0],
+                  "inline payload", 14) == 0);
+
+    ArrowSchema post_finish_field{};
+    builder.field(&post_finish_field);
+    assert(strcmp(post_finish_field.name, "blob") == 0);
+    post_finish_field.release(&post_finish_field);
+    bool finished = false;
+    try {
+        builder.append_null();
+    } catch (const lance::Error& error) {
+        finished = error.code == LANCE_ERR_INVALID_ARGUMENT &&
+                   std::string(error.what()).find("already finished") !=
+                       std::string::npos;
+    }
+    assert(finished);
+
+    array.release(&array);
+    schema.release(&schema);
+    PASS();
+}
+
+static void test_blob_planned_reads(const std::string& blob_uri) {
+    TEST(test_blob_planned_reads);
+
+    lance::ArrowStream stream;
+    {
+        auto ds = lance::Dataset::open(blob_uri);
+        stream = ds.read_blobs(
+            "blob", lance::BlobRowSelector::Indices,
+            std::vector<uint64_t>{7, 2, 3, 4, 9, 0});
+        // Dataset destruction must not invalidate the exported stream.
+    }
+    ArrowSchema schema{};
+    assert(stream->get_schema(stream.get(), &schema) == 0);
+    assert(schema.n_children == 2);
+    assert(cpp_schema_field_index(&schema, "row_address") == 0);
+    assert(cpp_schema_field_index(&schema, "data") == 1);
+    assert(strcmp(schema.children[0]->format, "L") == 0);
+    assert(strcmp(schema.children[1]->format, "Z") == 0);
+    schema.release(&schema);
+
+    const uint64_t expected_addresses[] = {
+        (uint64_t{1} << 32) | 2,
+        2,
+        3,
+        4,
+        (uint64_t{1} << 32) | 4,
+        0,
+    };
+    const size_t expected_sizes[] = {128, 128, 0, 0, 128, 8};
+    const bool expected_null[] = {false, false, false, true, false, false};
+    for (size_t row = 0; row < 6; ++row) {
+        ArrowArray array{};
+        assert(stream->get_next(stream.get(), &array) == 0);
+        assert(array.release != nullptr);
+        assert(array.length == 1 && array.n_children == 2);
+        assert(cpp_u64_array_value(array.children[0], 0) ==
+               expected_addresses[row]);
+        const ArrowArray* data = array.children[1];
+        if (expected_null[row]) {
+            assert(cpp_array_value_is_null(data, 0));
+        } else {
+            assert(!cpp_array_value_is_null(data, 0));
+            const auto* offsets =
+                static_cast<const int64_t*>(data->buffers[1]);
+            assert(static_cast<size_t>(offsets[1] - offsets[0]) ==
+                   expected_sizes[row]);
+        }
+        array.release(&array);
+    }
+    ArrowArray eos{};
+    assert(stream->get_next(stream.get(), &eos) == 0 &&
+           eos.release == nullptr);
+
+    auto ds = lance::Dataset::open(blob_uri);
+    lance::BlobReadOptions read_options;
+    read_options.io_buffer_size = uint64_t{64};
+    read_options.preserve_order = false;
+    auto range_stream = ds.read_blob_ranges(
+        "blob", lance::BlobRowSelector::Indices,
+        std::vector<lance::BlobRangeRequest>{
+            {7, 100, 20},
+            {2, 128, 0},
+            {9, 40, 16},
+            {2, 100, 8},
+            {3, 0, 0},
+            {4, 1000, 100},
+        },
+        read_options);
+    ArrowSchema range_schema{};
+    assert(range_stream->get_schema(range_stream.get(), &range_schema) == 0);
+    assert(range_schema.n_children == 5);
+    assert(cpp_schema_field_index(&range_schema, "request_index") == 0);
+    assert(cpp_schema_field_index(&range_schema, "row_address") == 1);
+    assert(cpp_schema_field_index(&range_schema, "offset") == 2);
+    assert(cpp_schema_field_index(&range_schema, "length") == 3);
+    assert(cpp_schema_field_index(&range_schema, "data") == 4);
+    range_schema.release(&range_schema);
+    std::set<size_t> request_indices;
+    while (true) {
+        ArrowArray array{};
+        assert(range_stream->get_next(range_stream.get(), &array) == 0);
+        if (!array.release) break;
+        assert(array.length == 1 && array.n_children == 5);
+        size_t request =
+            static_cast<size_t>(cpp_u64_array_value(array.children[0], 0));
+        assert(request_indices.insert(request).second);
+        const ArrowArray* data = array.children[4];
+        if (request == 5) {
+            assert(cpp_array_value_is_null(data, 0));
+        } else {
+            assert(!cpp_array_value_is_null(data, 0));
+        }
+        array.release(&array);
+    }
+    assert(request_indices.size() == 6);
+
+    auto empty = ds.read_blobs(
+        "blob", lance::BlobRowSelector::Ids, std::vector<uint64_t>{});
+    ArrowSchema empty_schema{};
+    assert(empty->get_schema(empty.get(), &empty_schema) == 0);
+    ArrowArray empty_array{};
+    assert(empty->get_next(empty.get(), &empty_array) == 0 &&
+           empty_array.release == nullptr);
+    empty_schema.release(&empty_schema);
+
+    bool no_selection = false;
+    try {
+        (void)ds.read_blobs("blob", lance::BlobRowSelector::None, {});
+    } catch (const lance::Error& error) {
+        no_selection =
+            error.code == LANCE_ERR_INVALID_ARGUMENT &&
+            std::string(error.what()).find("requires a row selection") !=
+                std::string::npos;
+    }
+    assert(no_selection);
+
+    bool zero_buffer = false;
+    try {
+        lance::BlobReadOptions invalid;
+        invalid.io_buffer_size = uint64_t{0};
+        (void)ds.read_blobs(
+            "blob", lance::BlobRowSelector::Indices,
+            std::vector<uint64_t>{0}, invalid);
+    } catch (const lance::Error& error) {
+        zero_buffer = error.code == LANCE_ERR_INVALID_ARGUMENT &&
+                      std::string(error.what()).find("greater than 0") !=
+                          std::string::npos;
+    }
+    assert(zero_buffer);
+
+    PASS();
+}
+
 static void test_dataset_take(const std::string& uri) {
     TEST(test_dataset_take);
 
@@ -3914,6 +4176,8 @@ int main(int argc, char** argv) {
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_blob_native_read_slice(blob_uri);
+    test_blob_fields_and_descriptors();
+    test_blob_planned_reads(blob_uri);
     test_dataset_take(uri);
     test_dataset_take_rows(uri);
     test_raii_cleanup(uri);
