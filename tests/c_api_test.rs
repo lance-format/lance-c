@@ -11365,6 +11365,19 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
         "{}",
         take_last_error_message()
     );
+    let replacement_segment = unsafe {
+        build_scalar_segment_via_c(
+            dataset,
+            "score",
+            "score_zonemap_create",
+            LanceScalarIndexType::ZoneMap,
+            params,
+            &[0, 1, 2, 3],
+            Some(uuid_replacement),
+        )
+    };
+    let replacement_value = inspect_index_metadata_via_c(replacement_segment);
+    assert_eq!(replacement_value.fragment_ids, vec![0, 1, 2, 3]);
 
     unsafe {
         lance_index_segment_metadata_free(segment_a);
@@ -11499,22 +11512,7 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
         lance_index_segment_metadata_free(parsed_b);
     }
 
-    let replacement_dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
-    assert!(!replacement_dataset.is_null());
-    let replacement_version = unsafe { lance_dataset_version(replacement_dataset) };
-    let replacement_segment = unsafe {
-        build_scalar_segment_via_c(
-            replacement_dataset,
-            "score",
-            "score_zonemap_create",
-            LanceScalarIndexType::ZoneMap,
-            params,
-            &[0, 1, 2, 3],
-            Some(uuid_replacement),
-        )
-    };
-    let replacement_value = inspect_index_metadata_via_c(replacement_segment);
-    assert_eq!(replacement_value.fragment_ids, vec![0, 1, 2, 3]);
+    let replacement_version = read_version + 1;
 
     let replacement_new = [replacement_segment as *const LanceIndexSegmentMetadata];
     let removed = [
@@ -11546,7 +11544,6 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
         lance_index_segment_metadata_free(replacement_segment);
         lance_index_segment_metadata_free(history_a);
         lance_index_segment_metadata_free(history_b);
-        lance_dataset_close(replacement_dataset);
     }
     let replaced = commit_native_transaction(&uri, replacement_transaction, &commit_options);
     assert_eq!(
@@ -11637,6 +11634,87 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
         inspect_index_metadata_via_c(parsed_removed_b),
         segment_b_value
     );
+
+    let removal_indices = [parsed_new as *const LanceIndexSegmentMetadata];
+    let removal_operation = unsafe {
+        lance_operation_create_index_new(
+            ptr::null(),
+            0,
+            removal_indices.as_ptr(),
+            removal_indices.len(),
+        )
+    };
+    assert!(
+        !removal_operation.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let removal_transaction =
+        unsafe { lance_transaction_new(replacement_version + 1, removal_operation, ptr::null()) };
+    assert!(
+        !removal_transaction.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_operation_close(removal_operation) };
+    let removed_dataset = commit_native_transaction(&uri, removal_transaction, &commit_options);
+    assert_eq!(
+        unsafe { lance_dataset_version(removed_dataset) },
+        replacement_version + 2
+    );
+    let removal_name = c_str("score_zonemap_create");
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(removed_dataset, removal_name.as_ptr()) },
+        0
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+    let (ids, statistics) = scan_index_ids(removed_dataset, "score = 70", false);
+    assert_eq!(ids, vec![7]);
+    assert_eq!(statistics.indices_loaded, 0);
+    let mut removal_history = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_read_transaction(removed_dataset, &mut removal_history) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!removal_history.is_null());
+    let removal_history_operation = native_transaction_operation(removal_history);
+    let mut removal_new_count = u64::MAX;
+    let mut removal_removed_count = u64::MAX;
+    assert_eq!(
+        unsafe {
+            lance_operation_create_index_new_count(
+                removal_history_operation,
+                &mut removal_new_count,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_operation_create_index_removed_count(
+                removal_history_operation,
+                &mut removal_removed_count,
+            )
+        },
+        0
+    );
+    assert_eq!(removal_new_count, 0);
+    assert_eq!(removal_removed_count, 1);
+    let removal_metadata = metadata_from_operation(removal_history_operation, true, 0);
+    assert_eq!(
+        inspect_index_metadata_via_c(removal_metadata),
+        replacement_value
+    );
+    unsafe {
+        lance_operation_close(removal_history_operation);
+        lance_transaction_close(removal_history);
+        lance_transaction_close(removal_transaction);
+        lance_index_segment_metadata_free(removal_metadata);
+        lance_dataset_close(removed_dataset);
+    }
+
     unsafe {
         lance_operation_close(parsed_replacement_operation);
         lance_transaction_close(parsed_replacement);
