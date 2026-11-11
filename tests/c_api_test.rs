@@ -43724,7 +43724,8 @@ fn test_memwal_sharding_values_match_native() {
         .to_vec();
 
     // Independent native oracle built from the same dataset schema ids.
-    use lance::dataset::mem_wal::{ShardingField, ShardingSpec, evaluate_sharding_spec};
+    use lance::dataset::mem_wal::evaluate_sharding_spec;
+    use lance_table::system_index::mem_wal::{ShardingField, ShardingSpec};
     let native_out = lance_c::runtime::block_on(async {
         let native = Dataset::open(&uri).await.unwrap();
         let source_id = native.schema().field("id").unwrap().id;
@@ -43753,8 +43754,8 @@ fn test_memwal_sharding_values_match_native() {
     assert!(c_values.iter().all(|v| (0..8).contains(v)));
 
     unsafe {
-        lance_batch_close(output);
-        lance_batch_close(batch);
+        lance_batch_free(output);
+        lance_batch_free(batch);
         lance_mem_wal_sharding_field_free(field);
         lance_mem_wal_sharding_spec_free(spec);
         lance_mem_wal_index_details_free(details);
@@ -43956,6 +43957,7 @@ fn test_memwal_point_lookup_planner_on_base() {
         0
     );
     let plan_field = Field::try_from(&ffi_schema).unwrap();
+    use lance_arrow::DataTypeExt;
     assert!(plan_field.data_type().is_struct());
     let mut ffi_schema = FFI_ArrowSchema::empty();
     assert_eq!(
@@ -44021,7 +44023,7 @@ fn test_memwal_point_lookup_planner_on_base() {
         "{message}"
     );
     unsafe {
-        lance_batch_close(key_batch);
+        lance_batch_free(key_batch);
         lance_mem_wal_plan_free(plan);
         lance_lsm_point_lookup_planner_free(planner);
         lance_dataset_close(ds);
