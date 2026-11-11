@@ -112,6 +112,11 @@ verify_consumer_prefix() {
             exit 1
         fi
         printf 'Verified %s consumer dataset read: %s\n' "$linkage" "$dataset_output"
+
+        echo "==> Running installed acceptance consumer (${linkage} linkage)"
+        acceptance_uri="file://${work_dir}/acceptance-${linkage}.lance"
+        rm -rf "${work_dir}/acceptance-${linkage}.lance"
+        "$build_dir/acceptance" "$acceptance_uri"
     done
 }
 

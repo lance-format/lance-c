@@ -85,6 +85,28 @@ class CrossSdkIndexMetadataAdapterTest {
   }
 
   @Test
+  void preservesVectorDetailsAsOpaqueAnyBytes() throws Exception {
+    byte[] details =
+        Any.newBuilder()
+            .setTypeUrl("type.googleapis.com/lance.index.pb.VectorIndexDetails")
+            .setValue(com.google.protobuf.ByteString.copyFrom(new byte[] {8, 0, 32, 4}))
+            .build()
+            .toByteArray();
+    IndexMetadataProto.IndexMetadata metadata =
+        validMetadata().toBuilder()
+            .setName("ivfpq_cross_sdk")
+            .setIndexDetails(Any.parseFrom(details))
+            .setIndexVersion(1)
+            .build();
+
+    Index index = CrossSdkIndexMetadataAdapter.toJavaIndex(metadata.toByteArray());
+
+    assertEquals("ivfpq_cross_sdk", index.name());
+    assertEquals(1, index.indexVersion());
+    assertArrayEquals(details, index.indexDetails().orElseThrow());
+  }
+
+  @Test
   void rejectsV14ClusteringAndSegmentMetadata() {
     byte[] clustering = validMetadata().toBuilder().setClusteringId(7).build().toByteArray();
     IllegalArgumentException clusteringError =

@@ -27,7 +27,7 @@ jobs:
       # directly on the runner. A literal `image: ''` fails schema validation,
       # but an expression does not, which is what makes this pattern work.
       image: ${{ matrix.container }}
-    timeout-minutes: 90
+    timeout-minutes: ${{ matrix.timeout_minutes || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +61,7 @@ jobs:
           # Intel execution rather than a cross-build or arm64 translation.
           - target: x86_64-apple-darwin
             runner: macos-15-intel
+            timeout_minutes: 180
             os_label: macos
             container: ""
             artifact_suffix: ""
@@ -191,9 +192,89 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-windows:
+    name: Build (x86_64-pc-windows-msvc)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Record Windows runtime baseline
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            Format-List
+          rustc --version --verbose
+          cmake --version
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          $version = '29.3'
+          $archive = "protoc-$version-win64.zip"
+          Invoke-WebRequest `
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$version/$archive" `
+            -OutFile "$env:RUNNER_TEMP\$archive"
+          Expand-Archive "$env:RUNNER_TEMP\$archive" `
+            -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
+          "$env:RUNNER_TEMP\protoc\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
+      - name: Configure
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Install to staging prefix
+        run: cmake --install build --prefix stage --config Release
+      - name: Verify staged package and installed consumers
+        run: >
+          pwsh -File .github/scripts/verify-windows-staging.ps1
+          -Prefix stage -SourceRoot .
+          -WorkDir "$env:RUNNER_TEMP\lance-c-windows-acceptance"
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.version }}"
+          } else {
+            $version = "${{ github.ref_name }}".TrimStart('v')
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Tar
+        id: pack
+        shell: bash
+        env:
+          XZ_OPT: -T0
+        run: |
+          VERSION=${{ steps.ver.outputs.version }}
+          TARGET=x86_64-pc-windows-msvc
+          ARCHIVE="lance-c-v${VERSION}-${TARGET}.tar.xz"
+          tar -C stage -cJf "${ARCHIVE}" .
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          sha512sum "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          echo "archive=${ARCHIVE}" >>"$GITHUB_OUTPUT"
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-pc-windows-msvc
+          path: |
+            ${{ steps.pack.outputs.archive }}
+            ${{ steps.pack.outputs.archive }}.sha256
+            ${{ steps.pack.outputs.archive }}.sha512
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/v')
     steps:

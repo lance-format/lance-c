@@ -52779,6 +52779,224 @@ fn test_native_update_offsets_and_key_existence_filter_values() {
 }
 
 #[test]
+fn test_native_updated_fragment_offsets_copy_at_contract() {
+    let dense: Vec<u32> = (0..=65_536).collect();
+    let sparse = [1u32, 65_535, 65_536, u32::MAX];
+    let repeated = [7u32, 1, 7, 1];
+    let expected = BTreeMap::from([
+        (10u64, dense.clone()),
+        (20, sparse.to_vec()),
+        (30, vec![1, 7]),
+        (40, Vec::new()),
+    ]);
+    let entries = [
+        LanceFragmentOffsetsView {
+            fragment_id: 10,
+            offsets: dense.as_ptr(),
+            offset_count: dense.len(),
+        },
+        LanceFragmentOffsetsView {
+            fragment_id: 20,
+            offsets: sparse.as_ptr(),
+            offset_count: sparse.len(),
+        },
+        LanceFragmentOffsetsView {
+            fragment_id: 30,
+            offsets: repeated.as_ptr(),
+            offset_count: repeated.len(),
+        },
+        LanceFragmentOffsetsView {
+            fragment_id: 40,
+            offsets: ptr::null(),
+            offset_count: 0,
+        },
+    ];
+    let offsets = unsafe { lance_updated_fragment_offsets_new(entries.as_ptr(), entries.len()) };
+    assert!(!offsets.is_null(), "{}", take_last_error_message());
+
+    let mut entry_count = 0u64;
+    assert_eq!(
+        unsafe { lance_updated_fragment_offsets_count(offsets, &mut entry_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(entry_count, 4);
+
+    let mut indices = BTreeMap::new();
+    let mut observed = BTreeMap::new();
+    for index in 0..entry_count as usize {
+        let mut fragment_id = u64::MAX;
+        assert_eq!(
+            unsafe {
+                lance_updated_fragment_offsets_fragment_id_at(offsets, index, &mut fragment_id)
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let expected_values = expected.get(&fragment_id).unwrap();
+        let mut count = u64::MAX;
+        assert_eq!(
+            unsafe { lance_updated_fragment_offsets_offset_count_at(offsets, index, &mut count) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert_eq!(count as usize, expected_values.len());
+
+        let mut copied = vec![u32::MAX; expected_values.len()];
+        assert_eq!(
+            unsafe {
+                lance_updated_fragment_offsets_copy_at(
+                    offsets,
+                    index,
+                    copied.as_mut_ptr(),
+                    copied.len(),
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert_eq!(&copied, expected_values);
+
+        let mut indexed = Vec::new();
+        for position in 0..count as usize {
+            let mut offset = u32::MAX;
+            assert_eq!(
+                unsafe {
+                    lance_updated_fragment_offsets_offset_at(offsets, index, position, &mut offset)
+                },
+                0,
+                "{}",
+                take_last_error_message()
+            );
+            indexed.push(offset);
+        }
+        assert_eq!(indexed, copied, "indexed and bulk getters disagree");
+        indices.insert(fragment_id, index);
+        observed.insert(fragment_id, copied);
+    }
+    assert_eq!(observed, expected);
+
+    let dense_index = indices[&10];
+    let empty_index = indices[&40];
+    assert_eq!(
+        unsafe { lance_updated_fragment_offsets_copy_at(offsets, empty_index, ptr::null_mut(), 0) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut unused_empty_output = [91u32];
+    assert_eq!(
+        unsafe {
+            lance_updated_fragment_offsets_copy_at(
+                offsets,
+                empty_index,
+                unused_empty_output.as_mut_ptr(),
+                0,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unused_empty_output, [91]);
+
+    let expect_invalid = |offsets: *const LanceUpdatedFragmentOffsets,
+                          index: usize,
+                          output: &mut [u32],
+                          count: usize| {
+        let before = output.to_vec();
+        assert_eq!(
+            unsafe {
+                lance_updated_fragment_offsets_copy_at(offsets, index, output.as_mut_ptr(), count)
+            },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert!(!take_last_error_message().is_empty());
+        assert_eq!(output, before, "failed copy must not write its output");
+    };
+
+    let mut sentinel = [41u32, 42, 43];
+    for invalid_index in [entry_count as usize, usize::MAX] {
+        expect_invalid(offsets, invalid_index, &mut sentinel, 0);
+    }
+    for wrong_count in [0, dense.len() - 1, dense.len() + 1, usize::MAX] {
+        expect_invalid(offsets, dense_index, &mut sentinel, wrong_count);
+    }
+    expect_invalid(offsets, empty_index, &mut sentinel, 1);
+    expect_invalid(ptr::null(), 0, &mut sentinel, 1);
+
+    assert_eq!(
+        unsafe {
+            lance_updated_fragment_offsets_copy_at(
+                offsets,
+                dense_index,
+                ptr::null_mut(),
+                dense.len(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("out_offsets"));
+
+    let cloned = unsafe { lance_updated_fragment_offsets_clone(offsets) };
+    assert!(!cloned.is_null(), "{}", take_last_error_message());
+    unsafe { lance_updated_fragment_offsets_close(offsets) };
+    assert_eq!(observed[&10], dense, "copied values outlive their source");
+
+    let mut cloned_dense_index = None;
+    let mut cloned_count = 0u64;
+    assert_eq!(
+        unsafe { lance_updated_fragment_offsets_count(cloned, &mut cloned_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    for index in 0..cloned_count as usize {
+        let mut fragment_id = u64::MAX;
+        assert_eq!(
+            unsafe {
+                lance_updated_fragment_offsets_fragment_id_at(cloned, index, &mut fragment_id)
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        if fragment_id == 10 {
+            cloned_dense_index = Some(index);
+            break;
+        }
+    }
+    let mut cloned_dense = vec![u32::MAX; dense.len()];
+    assert_eq!(
+        unsafe {
+            lance_updated_fragment_offsets_copy_at(
+                cloned,
+                cloned_dense_index.expect("clone must retain the dense entry"),
+                cloned_dense.as_mut_ptr(),
+                cloned_dense.len(),
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(cloned_dense, dense);
+    unsafe { lance_updated_fragment_offsets_close(cloned) };
+    assert_eq!(cloned_dense, dense);
+
+    let empty_container = unsafe { lance_updated_fragment_offsets_new(ptr::null(), 0) };
+    assert!(!empty_container.is_null(), "{}", take_last_error_message());
+    expect_invalid(empty_container, 0, &mut sentinel, 0);
+    unsafe { lance_updated_fragment_offsets_close(empty_container) };
+}
+
+#[test]
 fn test_native_rewrite_and_update_mem_wal_state_values() {
     use lance::dataset::transaction::{Operation, RewriteGroup, RewrittenIndex};
     use lance_table::format::Fragment;

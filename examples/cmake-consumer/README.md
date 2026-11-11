@@ -1,6 +1,11 @@
 # lance-c CMake consumer example
 
-Minimal C++ program that opens a Lance dataset via `find_package(LanceC)`.
+The example builds two executables:
+
+- `consumer` opens the dataset URI passed on the command line.
+- `acceptance` creates, closes, reopens and scans a dataset, verifies Arrow
+  release callback counts, consumes a thread-local error message, and uses an
+  independent cloned dataset handle. Pass a writable `file://` URI.
 
 ## Build
 

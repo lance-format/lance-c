@@ -636,6 +636,24 @@ static void test_update_columns(const char *uri) {
         lance_updated_fragment_offsets_new(&entry, 1);
     ASSERT(offset_owner != NULL, "construct UpdatedFragmentOffsets");
     check_ok("UpdatedFragmentOffsets");
+    uint32_t typed_offsets[2] = {UINT32_MAX, UINT32_MAX};
+    ASSERT(lance_updated_fragment_offsets_copy_at(offset_owner, 0,
+                                                   typed_offsets, 2) == 0,
+           "copy UpdatedFragmentOffsets entry");
+    check_ok("copy UpdatedFragmentOffsets entry");
+    ASSERT(memcmp(typed_offsets, copied_offsets, sizeof(typed_offsets)) == 0,
+           "bulk UpdatedFragmentOffsets values match indexed getter");
+    uint32_t failed_offsets[2] = {41, 42};
+    ASSERT(lance_updated_fragment_offsets_copy_at(offset_owner, 1,
+                                                   failed_offsets, 0) == -1,
+           "invalid UpdatedFragmentOffsets entry is not empty success");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid UpdatedFragmentOffsets entry error code");
+    ASSERT(failed_offsets[0] == 41 && failed_offsets[1] == 42,
+           "failed UpdatedFragmentOffsets copy leaves output unchanged");
+    const char *copy_error = lance_last_error_message();
+    ASSERT(copy_error != NULL, "invalid UpdatedFragmentOffsets entry message");
+    lance_free_string(copy_error);
     const LanceFragment *updated_fragments[1] = {updated};
     const uint32_t fields_modified[1] = {modified_field};
     LanceUpdateOperationOptions options;
