@@ -129,7 +129,7 @@ unsafe fn fragment_schema_clone_inner(
         ));
     }
     let fragment = unsafe { fragment_ref(fragment) }?;
-    let schema = fragment.schema().clone();
+    let schema = fragment.schema()?.clone();
     unsafe {
         *out_schema = Box::into_raw(Box::new(LanceSchema { inner: schema }));
     }
@@ -365,7 +365,7 @@ unsafe fn operation_project_new_inner(
         preserves_nullability,
     };
     unsafe {
-        *out_operation = Box::into_raw(Box::new(LanceOperation { inner: operation }));
+        *out_operation = Box::into_raw(Box::new(LanceOperation::from_native(operation)?));
     }
     Ok(0)
 }
@@ -795,12 +795,11 @@ mod tests {
     #[test]
     fn operation_schema_and_nullability_inspection() {
         let (_tmp, _uri, expected) = create_fixture();
-        let project = LanceOperation {
-            inner: Operation::Project {
-                schema: expected.clone(),
-                preserves_nullability: true,
-            },
-        };
+        let project = LanceOperation::from_native(Operation::Project {
+            schema: expected.clone(),
+            preserves_nullability: true,
+        })
+        .unwrap();
         let mut cloned = std::ptr::null_mut();
         assert_eq!(
             unsafe { lance_operation_schema_clone(&project, &mut cloned) },
@@ -816,13 +815,12 @@ mod tests {
         );
         assert!(preserves);
 
-        let merge = LanceOperation {
-            inner: Operation::Merge {
-                fragments: vec![],
-                schema: expected.clone(),
-                preserves_nullability: false,
-            },
-        };
+        let merge = LanceOperation::from_native(Operation::Merge {
+            fragments: vec![],
+            schema: expected.clone(),
+            preserves_nullability: false,
+        })
+        .unwrap();
         let mut merge_clone = std::ptr::null_mut();
         assert_eq!(
             unsafe { lance_operation_schema_clone(&merge, &mut merge_clone) },
@@ -836,14 +834,13 @@ mod tests {
         );
         assert!(!preserves);
 
-        let overwrite = LanceOperation {
-            inner: Operation::Overwrite {
-                fragments: vec![],
-                schema: expected.clone(),
-                config_upsert_values: None,
-                initial_bases: None,
-            },
-        };
+        let overwrite = LanceOperation::from_native(Operation::Overwrite {
+            fragments: vec![],
+            schema: expected.clone(),
+            config_upsert_values: None,
+            initial_bases: None,
+        })
+        .unwrap();
         let mut overwrite_clone = std::ptr::null_mut();
         assert_eq!(
             unsafe { lance_operation_schema_clone(&overwrite, &mut overwrite_clone) },
@@ -852,13 +849,12 @@ mod tests {
         assert_eq!(unsafe { (*overwrite_clone).inner.clone() }, expected);
         unsafe { lance_schema_close(overwrite_clone) };
 
-        let delete = LanceOperation {
-            inner: Operation::Delete {
-                updated_fragments: vec![],
-                deleted_fragment_ids: vec![],
-                predicate: "id = 1".to_string(),
-            },
-        };
+        let delete = LanceOperation::from_native(Operation::Delete {
+            updated_fragments: vec![],
+            deleted_fragment_ids: vec![],
+            predicate: "id = 1".to_string(),
+        })
+        .unwrap();
         let sentinel = Box::into_raw(Box::new(LanceSchema {
             inner: expected.clone(),
         }));

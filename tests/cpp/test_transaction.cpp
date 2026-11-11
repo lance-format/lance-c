@@ -1206,6 +1206,199 @@ static void test_blob_writer_data_replacement(const std::string& blob_uri) {
     std::printf("C++ blob writer publication OK\n");
 }
 
+
+static void test_native_operations(const std::string& source_uri,
+                                   const std::string& base) {
+    const std::string uri = base + "/cpp_native_operations";
+    const auto source_rows =
+        lance::Dataset::open(source_uri).count_rows();
+
+    lance::UncommittedWriteOptions options;
+    options.write.params.max_rows_per_file = 1;
+    auto seed = lance::Dataset::commit(
+        uri, write_uncommitted(source_uri, uri, lance::WriteMode::Create,
+                               options));
+    CHECK(seed.version() == 1);
+    CHECK(seed.fragment_count() > 1);
+    const auto seed_fragments = seed.fragment_count();
+
+    uint64_t read_version = 0;
+    std::vector<lance::Fragment> detached;
+    std::vector<std::string> detached_json;
+    {
+        auto staged = write_uncommitted(
+            source_uri, uri, lance::WriteMode::Append, options);
+        read_version = staged.read_version();
+        CHECK(read_version == 1);
+        auto operation = staged.operation();
+        CHECK(operation.kind() == lance::OperationKind::Append);
+        CHECK(operation.append_fragment_count() > 0);
+        CHECK(operation.append_fragment_count() == operation.fragment_count());
+        for (size_t i = 0; i < operation.append_fragment_count(); ++i) {
+            detached.push_back(operation.append_fragment_at(i));
+            CHECK(!detached.back().is_bound());
+            CHECK(detached.back().data_file_count() > 0);
+            auto file = detached.back().data_file_at(0);
+            CHECK(!file.path().empty());
+            auto field_file = detached.back().data_file_for_field(0);
+            CHECK(field_file.has_value());
+            CHECK(!field_file->path().empty());
+            detached_json.push_back(detached.back().metadata_json());
+            CHECK(!detached_json.back().empty());
+        }
+    }
+    for (size_t i = 0; i < detached.size(); ++i) {
+        CHECK(detached[i].metadata_json() == detached_json[i]);
+    }
+
+    bool detached_rejected = false;
+    try {
+        (void)detached.front().physical_rows();
+    } catch (const lance::Error& error) {
+        detached_rejected = error.code == LANCE_ERR_NOT_SUPPORTED;
+    }
+    CHECK(detached_rejected);
+
+    std::vector<const lance::Fragment*> pointers;
+    pointers.reserve(detached.size());
+    for (const auto& fragment : detached) pointers.push_back(&fragment);
+    auto append = lance::Operation::make_append(pointers);
+    CHECK(append.append_fragment_count() == detached.size());
+    auto append_transaction =
+        lance::Transaction::from_operation(read_version, append);
+    auto appended = lance::Dataset::commit(uri, append_transaction);
+    CHECK(appended.version() == 2);
+    CHECK(appended.count_rows() == source_rows * 2);
+    CHECK(appended.fragment_count() == seed_fragments * 2);
+    const auto appended_ids = appended.fragment_ids();
+    const auto max_after_append =
+        *std::max_element(appended_ids.begin(), appended_ids.end());
+
+    auto restore = lance::Operation::make_restore(1);
+    CHECK(restore.restore_version() == 1);
+    auto restored = lance::Dataset::commit(
+        uri, lance::Transaction::from_operation(2, restore));
+    CHECK(restored.version() == 3);
+    CHECK(restored.count_rows() == source_rows);
+    CHECK(restored.fragment_count() == seed_fragments);
+
+    auto reserve_zero = lance::Operation::make_reserve_fragments(0);
+    CHECK(reserve_zero.reserve_fragments_count() == 0);
+    auto reserved_zero = lance::Dataset::commit(
+        uri, lance::Transaction::from_operation(3, reserve_zero));
+    CHECK(reserved_zero.version() == 4);
+    CHECK(reserved_zero.count_rows() == source_rows);
+
+    auto reserve_two = lance::Operation::make_reserve_fragments(2);
+    CHECK(reserve_two.reserve_fragments_count() == 2);
+    auto reserved = lance::Dataset::commit(
+        uri, lance::Transaction::from_operation(4, reserve_two));
+    CHECK(reserved.version() == 5);
+    CHECK(reserved.fragment_count() == seed_fragments);
+
+    std::vector<lance::Fragment> reserved_fragments;
+    uint64_t reserved_read_version = 0;
+    {
+        auto staged = write_uncommitted(
+            source_uri, uri, lance::WriteMode::Append, options);
+        reserved_read_version = staged.read_version();
+        CHECK(reserved_read_version == 5);
+        auto operation = staged.operation();
+        for (size_t i = 0; i < operation.append_fragment_count(); ++i) {
+            reserved_fragments.push_back(operation.append_fragment_at(i));
+            CHECK(!reserved_fragments.back().metadata_json().empty());
+        }
+    }
+    std::vector<const lance::Fragment*> reserved_pointers;
+    reserved_pointers.reserve(reserved_fragments.size());
+    for (const auto& fragment : reserved_fragments) {
+        reserved_pointers.push_back(&fragment);
+    }
+    auto reserved_append = lance::Operation::make_append(reserved_pointers);
+    auto reserved_commit = lance::Dataset::commit(
+        uri, lance::Transaction::from_operation(reserved_read_version,
+                                                reserved_append));
+    CHECK(reserved_commit.version() == 6);
+    CHECK(reserved_commit.fragment_count() ==
+          seed_fragments + reserved_fragments.size());
+    const auto reserved_ids = reserved_commit.fragment_ids();
+    CHECK(*std::max_element(reserved_ids.begin(), reserved_ids.end()) ==
+          max_after_append + 2 + reserved_fragments.size());
+
+    const std::string base_a = uri + "_cpp_base_a";
+    const std::string base_b = uri + "_cpp_base_b";
+    std::vector<lance::BasePath> bases;
+    lance::BasePath first_base;
+    first_base.id = 7;
+    first_base.path = base_a;
+    first_base.name = std::nullopt;
+    first_base.is_dataset_root = false;
+    bases.push_back(first_base);
+    lance::BasePath second_base;
+    second_base.id = 0;
+    second_base.path = base_b;
+    second_base.name = std::string();
+    second_base.is_dataset_root = true;
+    bases.push_back(second_base);
+
+    auto update_bases = lance::Operation::make_update_bases(bases);
+    CHECK(update_bases.update_bases_count() == 2);
+    auto first_view = update_bases.update_bases_at(0);
+    CHECK(first_view.id == 7);
+    CHECK(first_view.name == nullptr);
+    CHECK(std::string(first_view.path) == base_a);
+    auto second_view = update_bases.update_bases_at(1);
+    CHECK(second_view.name != nullptr);
+    CHECK(std::string(second_view.name).empty());
+    CHECK(second_view.is_dataset_root);
+    auto typed_bases = update_bases.update_bases();
+    CHECK(typed_bases.size() == 2);
+    CHECK(!typed_bases[0].name.has_value());
+    CHECK(typed_bases[1].name.has_value());
+    CHECK(typed_bases[1].name->empty());
+
+    auto bases_committed = lance::Dataset::commit(
+        uri, lance::Transaction::from_operation(6, update_bases));
+    CHECK(bases_committed.version() == 7);
+    const auto bases_json = bases_committed.base_paths_json();
+    CHECK(bases_json.find(base_a) != std::string::npos);
+    CHECK(bases_json.find(base_b) != std::string::npos);
+
+    lance::BasePath conflict_base;
+    conflict_base.path = base_a;
+    auto conflict = lance::Operation::make_update_bases({conflict_base});
+    bool conflict_rejected = false;
+    try {
+        auto failed = lance::Dataset::commit(
+            uri, lance::Transaction::from_operation(7, conflict));
+        (void)failed;
+    } catch (const lance::Error& error) {
+        conflict_rejected =
+            error.code == LANCE_ERR_INVALID_ARGUMENT &&
+            std::string(error.what()).find("Conflict detected") !=
+                std::string::npos;
+    }
+    CHECK(conflict_rejected);
+
+    auto empty_bases = lance::Operation::make_update_bases({});
+    CHECK(empty_bases.update_bases_count() == 0);
+    auto empty_committed = lance::Dataset::commit(
+        uri, lance::Transaction::from_operation(7, empty_bases));
+    CHECK(empty_committed.version() == 8);
+    CHECK(empty_committed.base_paths_json() == bases_json);
+
+    bool null_fragment_rejected = false;
+    try {
+        std::vector<const lance::Fragment*> nulls{nullptr};
+        (void)lance::Operation::make_append(nulls);
+    } catch (const lance::Error& error) {
+        null_fragment_rejected = error.code == LANCE_ERR_INVALID_ARGUMENT;
+    }
+    CHECK(null_fragment_rejected);
+
+    std::printf("C++ native operation construction OK\n");
+}
+
 int main(int argc, char** argv) {
     if (argc != 5) {
         std::fprintf(stderr,
@@ -1223,6 +1416,7 @@ int main(int argc, char** argv) {
 
         test_native_schema(argv[3]);
         test_blob_writer_data_replacement(argv[4]);
+        test_native_operations(argv[1], argv[2]);
     } catch (const lance::Error& error) {
         std::fprintf(stderr, "lance::Error(%d): %s\n",
                      static_cast<int>(error.code), error.what());

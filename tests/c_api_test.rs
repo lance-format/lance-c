@@ -43155,6 +43155,29 @@ fn diagnostics_fts_tokenize_matches_native_profiles_and_unicode() {
     }
 }
 
+fn fragment_json_for_test(fragment: *const LanceFragment) -> String {
+    let json = unsafe { lance_fragment_metadata_json(fragment) };
+    assert!(!json.is_null(), "{}", take_last_error_message());
+    let value = unsafe { CStr::from_ptr(json) }.to_str().unwrap().to_owned();
+    unsafe { lance_free_string(json) };
+    value
+}
+
+fn native_transaction_append_fragments(
+    transaction: *const LanceTransaction,
+) -> Vec<lance_table::format::Fragment> {
+    use lance_table::format::pb;
+    use prost::Message;
+
+    let bytes = transaction_proto_bytes(transaction);
+    let message = pb::Transaction::decode(bytes.as_slice()).unwrap();
+    let native = lance::dataset::transaction::Transaction::try_from(message).unwrap();
+    match native.operation {
+        lance::dataset::transaction::Operation::Append { fragments } => fragments,
+        _ => panic!("native transaction operation is not Append"),
+    }
+}
+
 #[test]
 fn diagnostics_fts_tokenize_max_length_presence() {
     let long_token = "x".repeat(41);
@@ -43393,4 +43416,805 @@ fn diagnostics_process_counters_and_dataset_io_stats_match_native() {
     let _ = take_last_error_message();
 
     unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_native_operation_append_restore_reserve_and_update_bases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("native_operations")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let uri_c = c_str(&uri);
+
+    let mut write_options: LanceUncommittedWriteOptions = unsafe { std::mem::zeroed() };
+    write_options.write.params.max_rows_per_file = 2;
+    let create = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        &write_options,
+    );
+    let created = commit_native_transaction(&uri, create, ptr::null());
+    unsafe {
+        lance_transaction_close(create);
+        lance_dataset_close(created);
+    }
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let delete_predicate = c_str("id = 2");
+    let mut deleted_rows = 0u64;
+    assert_eq!(
+        unsafe { lance_dataset_delete(dataset, delete_predicate.as_ptr(), &mut deleted_rows) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(deleted_rows, 1);
+    let version_after_delete = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(version_after_delete, 2);
+    let fragments_after_delete = unsafe { lance_dataset_fragment_count(dataset) };
+    let mut ids_after_delete = vec![u64::MAX; fragments_after_delete as usize];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, ids_after_delete.as_mut_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let staged = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![4, 5, 6], vec![4.0, 5.0, 6.0]),
+        LanceWriteMode::Append,
+        &write_options,
+    );
+    let mut staged_read_version = 0u64;
+    assert_eq!(
+        unsafe { lance_transaction_read_version(staged, &mut staged_read_version) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(staged_read_version, version_after_delete);
+
+    let staged_operation = native_transaction_operation(staged);
+    assert_eq!(
+        native_operation_kind(staged_operation),
+        LanceOperationKind::Append
+    );
+    let native_fragments = native_transaction_append_fragments(staged);
+    assert!(native_fragments.len() > 1, "append must span fragments");
+    let mut append_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_count(staged_operation, &mut append_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(append_count, native_fragments.len() as u64);
+    assert_eq!(
+        native_operation_fragment_count(staged_operation),
+        append_count
+    );
+
+    let mut detached_handles = Vec::with_capacity(native_fragments.len());
+    for (index, native_fragment) in native_fragments.iter().enumerate() {
+        let mut handle = ptr::null_mut();
+        assert_eq!(
+            unsafe { lance_operation_append_fragment_at(staged_operation, index, &mut handle) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert!(!handle.is_null());
+
+        let mut is_bound = true;
+        assert_eq!(
+            unsafe { lance_fragment_is_bound(handle, &mut is_bound) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert!(!is_bound, "append getter must yield detached metadata");
+        assert_eq!(unsafe { lance_fragment_id(handle) }, native_fragment.id);
+        assert_eq!(
+            fragment_json_for_test(handle),
+            serde_json::to_string(native_fragment).unwrap()
+        );
+        assert_eq!(
+            unsafe { lance_fragment_data_file_count(handle) },
+            native_fragment.files.len() as u64
+        );
+        for (file_index, native_file) in native_fragment.files.iter().enumerate() {
+            let mut file = ptr::null_mut();
+            assert_eq!(
+                unsafe { lance_fragment_data_file_at(handle, file_index, &mut file) },
+                0,
+                "{}",
+                take_last_error_message()
+            );
+            assert!(!file.is_null());
+            assert_eq!(
+                data_file_snapshot(file),
+                (
+                    native_file.path.clone(),
+                    native_file.fields.to_vec(),
+                    native_file.column_indices.to_vec(),
+                    (
+                        native_file.file_major_version,
+                        native_file.file_minor_version,
+                    ),
+                    native_file.file_size_bytes.get().map(|size| size.get()),
+                    native_file.base_id,
+                )
+            );
+            unsafe { lance_data_file_close(file) };
+        }
+
+        let mut field_file = ptr::null_mut();
+        assert_eq!(
+            unsafe { lance_fragment_data_file_for_field(handle, 0, &mut field_file) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        if let Some(expected_file) = native_fragment
+            .files
+            .iter()
+            .find(|file| file.fields.contains(&0))
+        {
+            assert!(!field_file.is_null());
+            assert_eq!(
+                data_file_snapshot(field_file),
+                (
+                    expected_file.path.clone(),
+                    expected_file.fields.to_vec(),
+                    expected_file.column_indices.to_vec(),
+                    (
+                        expected_file.file_major_version,
+                        expected_file.file_minor_version,
+                    ),
+                    expected_file.file_size_bytes.get().map(|size| size.get()),
+                    expected_file.base_id,
+                )
+            );
+            unsafe { lance_data_file_close(field_file) };
+        } else {
+            assert!(field_file.is_null());
+        }
+        let mut absent_file = ptr::without_provenance_mut::<LanceDataFile>(0x1234);
+        assert_eq!(
+            unsafe { lance_fragment_data_file_for_field(handle, 99, &mut absent_file) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert!(absent_file.is_null());
+
+        let mut rows = 0xBEEFu64;
+        assert_eq!(
+            unsafe { lance_fragment_physical_rows(handle, &mut rows) },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+        assert_eq!(rows, 0xBEEF);
+        assert!(unsafe { lance_fragment_scan(handle) }.is_null());
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+
+        let mut schema = schema_to_ffi(&write_schema());
+        assert_eq!(unsafe { lance_fragment_schema(handle, &mut schema) }, -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+
+        let column = c_str("id");
+        let columns = [column.as_ptr()];
+        let indices = [0u32];
+        let mut stream: FFI_ArrowArrayStream = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                lance_fragment_take(handle, indices.as_ptr(), 1, columns.as_ptr(), &mut stream)
+            },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+        assert!(stream.release.is_none());
+
+        let mut filtered_rows = 0xCAFEu64;
+        assert_eq!(
+            unsafe { lance_fragment_count_rows(handle, ptr::null(), &mut filtered_rows) },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+        assert_eq!(filtered_rows, 0xCAFE);
+
+        let predicate = c_str("id = 4");
+        let mut updated: *mut LanceFragment = ptr::without_provenance_mut(0x5678);
+        assert_eq!(
+            unsafe { lance_fragment_delete(handle, predicate.as_ptr(), &mut updated) },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+        assert_eq!(updated as usize, 0x5678);
+
+        let mut out_of_range = ptr::without_provenance_mut::<LanceDataFile>(0x9999);
+        assert_eq!(
+            unsafe {
+                lance_fragment_data_file_at(handle, native_fragment.files.len(), &mut out_of_range)
+            },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert_eq!(out_of_range as usize, 0x9999);
+
+        detached_handles.push(handle);
+    }
+
+    unsafe {
+        lance_operation_close(staged_operation);
+        lance_transaction_close(staged);
+    }
+    for (handle, native_fragment) in detached_handles.iter().zip(&native_fragments) {
+        assert_eq!(
+            fragment_json_for_test(*handle),
+            serde_json::to_string(native_fragment).unwrap(),
+            "detached metadata must outlive the transaction and operation"
+        );
+    }
+
+    let append_handles = detached_handles
+        .iter()
+        .map(|handle| *handle as *const LanceFragment)
+        .collect::<Vec<_>>();
+    let typed_append =
+        unsafe { lance_operation_append_new(append_handles.as_ptr(), append_handles.len()) };
+    assert!(!typed_append.is_null(), "{}", take_last_error_message());
+    let mut typed_count = 0u64;
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_count(typed_append, &mut typed_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(typed_count, append_handles.len() as u64);
+
+    let mut untouched_version = 123u64;
+    assert_eq!(
+        unsafe { lance_operation_restore_version(typed_append, &mut untouched_version) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(untouched_version, 123);
+
+    for handle in &detached_handles {
+        unsafe { lance_fragment_close(*handle) };
+    }
+    let typed_append_operation = typed_append;
+    let append_transaction =
+        unsafe { lance_transaction_new(staged_read_version, typed_append_operation, ptr::null()) };
+    assert!(
+        !append_transaction.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let appended = commit_native_transaction(&uri, append_transaction, ptr::null());
+    unsafe {
+        lance_transaction_close(append_transaction);
+        lance_operation_close(typed_append_operation);
+    }
+    assert_eq!(unsafe { lance_dataset_version(appended) }, 3);
+    assert_eq!(unsafe { lance_dataset_count_rows(appended) }, 5);
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(appended) };
+
+    let (pairs, committed_fragments) = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("val")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let mut pairs = ids
+            .values()
+            .iter()
+            .copied()
+            .zip(values.values().iter().copied())
+            .collect::<Vec<_>>();
+        pairs.sort_by_key(|(id, _)| *id);
+        let fragments = dataset
+            .get_fragments()
+            .into_iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect::<Vec<_>>();
+        (pairs, fragments)
+    });
+    assert_eq!(
+        pairs,
+        vec![(1, 1.0), (3, 3.0), (4, 4.0), (5, 5.0), (6, 6.0)]
+    );
+    assert_eq!(
+        committed_fragments.len(),
+        fragments_after_delete as usize + append_count as usize
+    );
+    let retained_deletion = committed_fragments
+        .iter()
+        .find(|fragment| fragment.id == 0)
+        .expect("fragment 0 must survive deletion and append");
+    assert!(
+        retained_deletion.deletion_file.is_some(),
+        "deletion metadata must survive append"
+    );
+    let appended_ids = committed_fragments
+        .iter()
+        .filter(|fragment| !ids_after_delete.contains(&fragment.id))
+        .map(|fragment| fragment.id)
+        .collect::<Vec<_>>();
+    assert_eq!(appended_ids.len(), append_count as usize);
+    assert!(
+        appended_ids.windows(2).all(|ids| ids[1] == ids[0] + 1),
+        "native append must assign contiguous fragment ids: {appended_ids:?}"
+    );
+
+    let restore_operation = unsafe { lance_operation_restore_new(1) };
+    assert!(!restore_operation.is_null());
+    assert_eq!(
+        native_operation_kind(restore_operation),
+        LanceOperationKind::Restore
+    );
+    let mut restore_version = 0u64;
+    assert_eq!(
+        unsafe { lance_operation_restore_version(restore_operation, &mut restore_version) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(restore_version, 1);
+    let mut wrong_count = 77u64;
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_count(restore_operation, &mut wrong_count) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(wrong_count, 77);
+    let restore_transaction = unsafe { lance_transaction_new(3, restore_operation, ptr::null()) };
+    assert!(!restore_transaction.is_null());
+    let restored = commit_native_transaction(&uri, restore_transaction, ptr::null());
+    unsafe {
+        lance_transaction_close(restore_transaction);
+        lance_operation_close(restore_operation);
+        lance_dataset_close(restored);
+    }
+    let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_version(reopened) }, 4);
+    assert_eq!(unsafe { lance_dataset_count_rows(reopened) }, 3);
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(reopened) };
+
+    let reserve_zero = unsafe { lance_operation_reserve_fragments_new(0) };
+    assert!(!reserve_zero.is_null());
+    let mut reserved_count = 0u32;
+    assert_eq!(
+        unsafe { lance_operation_reserve_fragments_count(reserve_zero, &mut reserved_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(reserved_count, 0);
+    let zero_transaction = unsafe { lance_transaction_new(4, reserve_zero, ptr::null()) };
+    assert!(!zero_transaction.is_null());
+    let zero_committed = commit_native_transaction(&uri, zero_transaction, ptr::null());
+    unsafe {
+        lance_transaction_close(zero_transaction);
+        lance_operation_close(reserve_zero);
+        lance_dataset_close(zero_committed);
+    }
+
+    let before_reserve = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        dataset.manifest().max_fragment_id()
+    });
+    let before_reserve = before_reserve.expect("dataset must have a max fragment id");
+    let reserve_five = unsafe { lance_operation_reserve_fragments_new(5) };
+    assert!(!reserve_five.is_null());
+    assert_eq!(
+        unsafe { lance_operation_reserve_fragments_count(reserve_five, &mut reserved_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(reserved_count, 5);
+    let reserve_transaction = unsafe { lance_transaction_new(5, reserve_five, ptr::null()) };
+    assert!(!reserve_transaction.is_null());
+    let reserved_dataset = commit_native_transaction(&uri, reserve_transaction, ptr::null());
+    unsafe {
+        lance_transaction_close(reserve_transaction);
+        lance_operation_close(reserve_five);
+        lance_dataset_close(reserved_dataset);
+    }
+    let after_reserve = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        dataset.manifest().max_fragment_id()
+    });
+    assert_eq!(after_reserve, Some(before_reserve + 5));
+
+    let post_reserve_staged = write_uncommitted_for_batch(
+        &uri,
+        write_batch(vec![7, 8], vec![7.0, 8.0]),
+        LanceWriteMode::Append,
+        &write_options,
+    );
+    let mut post_reserve_read_version = 0u64;
+    assert_eq!(
+        unsafe {
+            lance_transaction_read_version(post_reserve_staged, &mut post_reserve_read_version)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(post_reserve_read_version, 6);
+    let post_reserve_operation = native_transaction_operation(post_reserve_staged);
+    let mut post_reserve_count = 0u64;
+    assert_eq!(
+        unsafe {
+            lance_operation_append_fragment_count(post_reserve_operation, &mut post_reserve_count)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut post_reserve_handles = Vec::new();
+    for index in 0..post_reserve_count as usize {
+        let mut handle = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lance_operation_append_fragment_at(post_reserve_operation, index, &mut handle)
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        post_reserve_handles.push(handle);
+    }
+    let post_reserve_ptrs = post_reserve_handles
+        .iter()
+        .map(|handle| *handle as *const LanceFragment)
+        .collect::<Vec<_>>();
+    let post_reserve_typed =
+        unsafe { lance_operation_append_new(post_reserve_ptrs.as_ptr(), post_reserve_ptrs.len()) };
+    assert!(!post_reserve_typed.is_null());
+    for handle in &post_reserve_handles {
+        unsafe { lance_fragment_close(*handle) };
+    }
+    unsafe {
+        lance_operation_close(post_reserve_operation);
+        lance_transaction_close(post_reserve_staged);
+    }
+    let post_reserve_transaction = unsafe {
+        lance_transaction_new(post_reserve_read_version, post_reserve_typed, ptr::null())
+    };
+    assert!(!post_reserve_transaction.is_null());
+    let post_reserve_committed =
+        commit_native_transaction(&uri, post_reserve_transaction, ptr::null());
+    unsafe {
+        lance_transaction_close(post_reserve_transaction);
+        lance_operation_close(post_reserve_typed);
+        lance_dataset_close(post_reserve_committed);
+    }
+    let post_reserve_fragments = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .get_fragments()
+            .into_iter()
+            .map(|fragment| fragment.metadata().id)
+            .collect::<Vec<_>>()
+    });
+    let appended_after_reserve = post_reserve_fragments
+        .iter()
+        .copied()
+        .filter(|id| *id > before_reserve + 5)
+        .collect::<Vec<_>>();
+    assert_eq!(appended_after_reserve.len(), post_reserve_count as usize);
+    for id in appended_after_reserve {
+        assert!(id > before_reserve + 5);
+    }
+
+    let current_version =
+        lance_c::runtime::block_on(async { Dataset::open(&uri).await.unwrap().version().version });
+    assert_eq!(current_version, 7);
+    let base_a = c_str(&format!("{uri}_update_base_a"));
+    let base_b = c_str(&format!("{uri}_update_base_b"));
+    let empty_name = c_str("");
+    let update_bases = [
+        LanceBasePath {
+            id: 7,
+            path: base_a.as_ptr(),
+            name: ptr::null(),
+            is_dataset_root: false,
+        },
+        LanceBasePath {
+            id: 0,
+            path: base_b.as_ptr(),
+            name: empty_name.as_ptr(),
+            is_dataset_root: true,
+        },
+    ];
+    let update_operation =
+        unsafe { lance_operation_update_bases_new(update_bases.as_ptr(), update_bases.len()) };
+    assert!(!update_operation.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        native_operation_kind(update_operation),
+        LanceOperationKind::UpdateBases
+    );
+    let mut update_count = 0u64;
+    assert_eq!(
+        unsafe { lance_operation_update_bases_count(update_operation, &mut update_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(update_count, 2);
+    let mut first_view = std::mem::MaybeUninit::<LanceBasePathView>::zeroed();
+    assert_eq!(
+        unsafe { lance_operation_update_bases_at(update_operation, 0, first_view.as_mut_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let first_view = unsafe { first_view.assume_init() };
+    assert_eq!(first_view.id, 7);
+    assert!(first_view.name.is_null());
+    assert_eq!(
+        unsafe { CStr::from_ptr(first_view.path) }.to_str().unwrap(),
+        base_a.to_str().unwrap()
+    );
+    assert!(!first_view.is_dataset_root);
+    let mut second_view = std::mem::MaybeUninit::<LanceBasePathView>::zeroed();
+    assert_eq!(
+        unsafe { lance_operation_update_bases_at(update_operation, 1, second_view.as_mut_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let second_view = unsafe { second_view.assume_init() };
+    assert_eq!(second_view.id, 0);
+    assert!(!second_view.name.is_null());
+    assert_eq!(
+        unsafe { CStr::from_ptr(second_view.name) }
+            .to_str()
+            .unwrap(),
+        ""
+    );
+    assert!(second_view.is_dataset_root);
+    let mut out_of_range_view = LanceBasePathView {
+        id: 0x3333,
+        path: ptr::null(),
+        name: ptr::null(),
+        is_dataset_root: false,
+    };
+    assert_eq!(
+        unsafe { lance_operation_update_bases_at(update_operation, 2, &mut out_of_range_view) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out_of_range_view.id, 0x3333);
+    let update_transaction =
+        unsafe { lance_transaction_new(current_version, update_operation, ptr::null()) };
+    assert!(!update_transaction.is_null());
+    let updated = commit_native_transaction(&uri, update_transaction, ptr::null());
+    unsafe {
+        lance_transaction_close(update_transaction);
+        lance_operation_close(update_operation);
+        lance_dataset_close(updated);
+    }
+    let updated_dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!updated_dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_version(updated_dataset) }, 8);
+    let bases_after = c_base_paths_json(updated_dataset);
+    let native_bases = lance_c::runtime::block_on(async {
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .manifest()
+            .base_paths
+            .clone()
+    });
+    assert_eq!(bases_after.len(), native_bases.len());
+    for (id, base) in &native_bases {
+        let entry = &bases_after[id];
+        assert_eq!(entry["id"], serde_json::json!(base.id));
+        assert_eq!(entry["path"], serde_json::json!(base.path.as_str()));
+        assert_eq!(
+            entry["is_dataset_root"],
+            serde_json::json!(base.is_dataset_root)
+        );
+        match &base.name {
+            Some(name) => assert_eq!(entry["name"], serde_json::json!(name.as_str())),
+            None => assert_eq!(entry["name"], serde_json::Value::Null),
+        }
+    }
+    let named_base = bases_after
+        .values()
+        .find(|entry| entry["path"] == serde_json::json!(base_a.to_str().unwrap()))
+        .expect("explicitly identified base path must be published");
+    assert_eq!(named_base["id"], serde_json::json!(7));
+    assert_eq!(named_base["name"], serde_json::Value::Null);
+    let empty_named_base = bases_after
+        .values()
+        .find(|entry| entry["path"] == serde_json::json!(base_b.to_str().unwrap()))
+        .expect("empty-named base path must be published");
+    assert_eq!(empty_named_base["name"], serde_json::json!(""));
+    unsafe { lance_dataset_close(updated_dataset) };
+
+    let conflict_path = c_str(&format!("{uri}_update_base_a"));
+    let conflict_bases = [LanceBasePath {
+        id: 0,
+        path: conflict_path.as_ptr(),
+        name: ptr::null(),
+        is_dataset_root: false,
+    }];
+    let conflict_operation =
+        unsafe { lance_operation_update_bases_new(conflict_bases.as_ptr(), 1) };
+    assert!(!conflict_operation.is_null());
+    let conflict_transaction = unsafe { lance_transaction_new(8, conflict_operation, ptr::null()) };
+    assert!(!conflict_transaction.is_null());
+    let mut failed_dataset = ptr::null_mut();
+    let conflict_rc = unsafe {
+        lance_transaction_commit(
+            uri_c.as_ptr(),
+            conflict_transaction,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &mut failed_dataset,
+        )
+    };
+    assert_eq!(conflict_rc, -1);
+    assert!(failed_dataset.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("Conflict detected"),
+        "native conflict must surface unchanged"
+    );
+    unsafe {
+        lance_transaction_close(conflict_transaction);
+        lance_operation_close(conflict_operation);
+    }
+
+    let conflict_name_path = c_str(&format!("{uri}_update_base_c"));
+    let conflict_name_bases = [LanceBasePath {
+        id: 0,
+        path: conflict_name_path.as_ptr(),
+        name: empty_name.as_ptr(),
+        is_dataset_root: false,
+    }];
+    let conflict_name_operation =
+        unsafe { lance_operation_update_bases_new(conflict_name_bases.as_ptr(), 1) };
+    assert!(!conflict_name_operation.is_null());
+    let conflict_name_transaction =
+        unsafe { lance_transaction_new(8, conflict_name_operation, ptr::null()) };
+    assert!(!conflict_name_transaction.is_null());
+    let name_rc = unsafe {
+        lance_transaction_commit(
+            uri_c.as_ptr(),
+            conflict_name_transaction,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &mut failed_dataset,
+        )
+    };
+    assert_eq!(name_rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe {
+        lance_transaction_close(conflict_name_transaction);
+        lance_operation_close(conflict_name_operation);
+    }
+
+    let empty_operation = unsafe { lance_operation_update_bases_new(ptr::null(), 0) };
+    assert!(!empty_operation.is_null());
+    let mut empty_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_update_bases_count(empty_operation, &mut empty_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(empty_count, 0);
+    let empty_transaction = unsafe { lance_transaction_new(8, empty_operation, ptr::null()) };
+    assert!(!empty_transaction.is_null());
+    let empty_committed = commit_native_transaction(&uri, empty_transaction, ptr::null());
+    unsafe {
+        lance_transaction_close(empty_transaction);
+        lance_operation_close(empty_operation);
+    }
+    assert_eq!(unsafe { lance_dataset_version(empty_committed) }, 9);
+    let empty_bases = c_base_paths_json(empty_committed);
+    assert_eq!(empty_bases, bases_after);
+    unsafe { lance_dataset_close(empty_committed) };
+
+    let empty_append = unsafe { lance_operation_append_new(ptr::null(), 0) };
+    assert!(!empty_append.is_null());
+    let mut empty_append_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_count(empty_append, &mut empty_append_count) },
+        0
+    );
+    assert_eq!(empty_append_count, 0);
+    let mut out_of_range_fragment = ptr::without_provenance_mut::<LanceFragment>(0x2222);
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_at(empty_append, 0, &mut out_of_range_fragment) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out_of_range_fragment as usize, 0x2222);
+    unsafe { lance_operation_close(empty_append) };
+
+    let null_append = unsafe { lance_operation_append_new(ptr::null(), 1) };
+    assert!(null_append.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let null_entry = [ptr::null::<LanceFragment>()];
+    let null_entry_append = unsafe { lance_operation_append_new(null_entry.as_ptr(), 1) };
+    assert!(null_entry_append.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let huge_append = unsafe { lance_operation_append_new(null_entry.as_ptr(), usize::MAX) };
+    assert!(huge_append.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let null_bases = unsafe { lance_operation_update_bases_new(ptr::null(), 1) };
+    assert!(null_bases.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let huge_bases = unsafe { lance_operation_update_bases_new(update_bases.as_ptr(), usize::MAX) };
+    assert!(huge_bases.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let inspect_operation = unsafe { lance_operation_restore_new(1) };
+    assert!(!inspect_operation.is_null());
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_count(inspect_operation, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let mut index_handle = ptr::without_provenance_mut::<LanceFragment>(0x4321);
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_at(inspect_operation, 0, &mut index_handle) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(index_handle as usize, 0x4321);
+    unsafe { lance_operation_close(inspect_operation) };
+
+    let empty_bases_operation = unsafe { lance_operation_append_new(ptr::null(), 0) };
+    assert!(!empty_bases_operation.is_null());
+    let mut view = std::mem::MaybeUninit::<LanceBasePathView>::zeroed();
+    assert_eq!(
+        unsafe { lance_operation_update_bases_at(empty_bases_operation, 0, view.as_mut_ptr()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    unsafe { lance_operation_close(empty_bases_operation) };
 }

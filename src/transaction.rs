@@ -16,10 +16,13 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::Result;
-use lance_table::format::{Fragment, IndexMetadata, pb};
+use lance_table::format::{BasePath, Fragment, IndexMetadata, pb};
 use lance_table::transaction::DataReplacementGroup;
 use prost::Message;
 
+use crate::base_paths::{
+    LanceBasePath, LanceBasePathView, OwnedBasePath, own_base_paths, parse_base_paths,
+};
 use crate::data_file::LanceDataFile;
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
@@ -36,6 +39,19 @@ pub struct LanceTransaction {
 /// Owned native operation value cloned from a transaction.
 pub struct LanceOperation {
     pub(crate) inner: Operation,
+    /// Owned C-string storage backing borrowed `UpdateBases` views.
+    base_paths: Vec<OwnedBasePath>,
+}
+
+impl LanceOperation {
+    /// Wrap a native operation, retaining C-string storage for borrowed views.
+    pub(crate) fn from_native(inner: Operation) -> Result<Self> {
+        let base_paths = match &inner {
+            Operation::UpdateBases { new_bases } => own_base_paths(new_bases)?,
+            _ => Vec::new(),
+        };
+        Ok(Self { inner, base_paths })
+    }
 }
 
 /// Owned native `DataReplacementGroup` snapshot.
@@ -385,9 +401,9 @@ unsafe fn operation_data_replacement_new_inner(
             .collect::<Result<Vec<_>>>()?
     };
 
-    Ok(Box::into_raw(Box::new(LanceOperation {
-        inner: Operation::DataReplacement { replacements },
-    })))
+    Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+        Operation::DataReplacement { replacements },
+    )?)))
 }
 
 /// Construct an owned native Delete operation.
@@ -474,13 +490,13 @@ unsafe fn operation_delete_new_inner(
         unsafe { std::slice::from_raw_parts(deleted_fragment_ids, deleted_fragment_count) }.to_vec()
     };
 
-    Ok(Box::into_raw(Box::new(LanceOperation {
-        inner: Operation::Delete {
+    Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+        Operation::Delete {
             updated_fragments,
             deleted_fragment_ids,
             predicate: predicate.to_string(),
         },
-    })))
+    )?)))
 }
 
 unsafe fn clone_index_metadata_array(
@@ -557,12 +573,149 @@ unsafe fn operation_create_index_new_inner(
     let removed_indices = unsafe {
         clone_index_metadata_array(removed_indices, removed_index_count, "removed_indices")
     }?;
-    Ok(Box::into_raw(Box::new(LanceOperation {
-        inner: Operation::CreateIndex {
+    Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+        Operation::CreateIndex {
             new_indices,
             removed_indices,
         },
-    })))
+    )?)))
+}
+
+/// Clone a borrowed array of fragment handles into complete native metadata.
+unsafe fn clone_fragment_array(
+    fragments: *const *const LanceFragment,
+    fragment_count: usize,
+) -> Result<Vec<Fragment>> {
+    if fragments.is_null() {
+        if fragment_count == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(lance_core::Error::invalid_input_source(
+            format!("fragments must not be NULL when fragment_count = {fragment_count}").into(),
+        ));
+    }
+    if fragment_count == 0 {
+        return Ok(Vec::new());
+    }
+    if fragment_count > isize::MAX as usize / std::mem::size_of::<*const LanceFragment>() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "fragment_count {fragment_count} exceeds the maximum addressable pointer slice length"
+            )
+            .into(),
+        ));
+    }
+    if fragment_count > isize::MAX as usize / std::mem::size_of::<Fragment>() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("fragment_count {fragment_count} exceeds the maximum cloneable fragment count")
+                .into(),
+        ));
+    }
+    let fragments = unsafe { std::slice::from_raw_parts(fragments, fragment_count) };
+    let mut cloned = Vec::with_capacity(fragment_count);
+    for (index, fragment) in fragments.iter().enumerate() {
+        if fragment.is_null() {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "fragments[{index}] must not be NULL when fragment_count = {fragment_count}"
+                )
+                .into(),
+            ));
+        }
+        cloned.push(unsafe { &**fragment }.metadata().clone());
+    }
+    Ok(cloned)
+}
+
+/// Construct an owned native Append operation.
+///
+/// Every fragment handle is borrowed; its complete native metadata, including
+/// pre-assigned IDs, row ID metadata and data files, is copied before this
+/// function returns. NULL arrays are accepted only with a zero count. Native
+/// commit validation owns schema coverage, ID assignment and row-ID assignment;
+/// explicit fields and non-zero reserved IDs are passed through unchanged.
+/// Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_append_new(
+    fragments: *const *const LanceFragment,
+    fragment_count: usize,
+) -> *mut LanceOperation {
+    ffi_try!(
+        unsafe { operation_append_new_inner(fragments, fragment_count) },
+        null
+    )
+}
+
+unsafe fn operation_append_new_inner(
+    fragments: *const *const LanceFragment,
+    fragment_count: usize,
+) -> Result<*mut LanceOperation> {
+    let fragments = unsafe { clone_fragment_array(fragments, fragment_count) }?;
+    Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+        Operation::Append { fragments },
+    )?)))
+}
+
+/// Construct an owned native Restore operation.
+///
+/// `version` is passed through unchanged; native commit validation owns whether
+/// the version exists and is restorable. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_restore_new(version: u64) -> *mut LanceOperation {
+    ffi_try!(
+        {
+            Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+                Operation::Restore { version },
+            )?)))
+        },
+        null
+    )
+}
+
+/// Construct an owned native ReserveFragments operation.
+///
+/// `num_fragments == 0` is a native no-op version; larger values advance the
+/// manifest's maximum fragment ID so later commits allocate from the reserved
+/// range. Allocation remains native. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_reserve_fragments_new(
+    num_fragments: u32,
+) -> *mut LanceOperation {
+    ffi_try!(
+        {
+            Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+                Operation::ReserveFragments { num_fragments },
+            )?)))
+        },
+        null
+    )
+}
+
+/// Construct an owned native UpdateBases operation.
+///
+/// Each `LanceBasePath` entry is parsed into native `BasePath` storage that the
+/// returned operation owns. NULL arrays are accepted only with a zero count.
+/// Native commit validation owns conflict detection and zero-ID allocation;
+/// this constructor does not add binding-side policies. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_bases_new(
+    new_bases: *const LanceBasePath,
+    new_base_count: usize,
+) -> *mut LanceOperation {
+    ffi_try!(
+        unsafe { operation_update_bases_new_inner(new_bases, new_base_count) },
+        null
+    )
+}
+
+unsafe fn operation_update_bases_new_inner(
+    new_bases: *const LanceBasePath,
+    new_base_count: usize,
+) -> Result<*mut LanceOperation> {
+    let new_bases = unsafe { parse_base_paths(new_bases, new_base_count) }?;
+    Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+        Operation::UpdateBases { new_bases },
+    )?)))
 }
 
 /// Construct an owned native transaction from an operation.
@@ -897,9 +1050,9 @@ unsafe fn transaction_operation_inner(
         ));
     }
     let transaction = transaction_at(transaction)?;
-    let operation = Box::new(LanceOperation {
-        inner: transaction.inner.operation.clone(),
-    });
+    let operation = Box::new(LanceOperation::from_native(
+        transaction.inner.operation.clone(),
+    )?);
     unsafe {
         ptr::write(out_operation, Box::into_raw(operation));
     }
@@ -1359,6 +1512,276 @@ unsafe fn operation_data_replacement_at_inner(
     });
     unsafe {
         ptr::write(out_group, Box::into_raw(group));
+    }
+    Ok(0)
+}
+
+fn append_operation_parts(operation: &LanceOperation) -> Result<&[Fragment]> {
+    match &operation.inner {
+        Operation::Append { fragments } => Ok(fragments),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "Append inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+fn restore_operation_version(operation: &LanceOperation) -> Result<u64> {
+    match &operation.inner {
+        Operation::Restore { version } => Ok(*version),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "Restore inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+fn reserve_fragments_operation_count(operation: &LanceOperation) -> Result<u32> {
+    match &operation.inner {
+        Operation::ReserveFragments { num_fragments } => Ok(*num_fragments),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "ReserveFragments inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+fn update_bases_operation_parts(operation: &LanceOperation) -> Result<&[BasePath]> {
+    match &operation.inner {
+        Operation::UpdateBases { new_bases } => Ok(new_bases),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "UpdateBases inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+/// Read the number of fragments in an Append operation.
+///
+/// Returns 0 on success, -1 on error. Other variants return
+/// `LANCE_ERR_NOT_SUPPORTED`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_append_fragment_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_append_fragment_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_append_fragment_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let fragments = append_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_count, fragments.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Clone one fragment from an Append operation as an independent detached
+/// handle.
+///
+/// The returned handle owns the complete native `Fragment` metadata and remains
+/// valid after this operation and every source dataset are closed. It supports
+/// metadata inspection and operation construction but not dataset-dependent
+/// reads. Missing indices are invalid arguments. Returns 0 on success, -1 on
+/// error, and leaves `out_fragment` unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_append_fragment_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_fragment: *mut *mut LanceFragment,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_append_fragment_at_inner(operation, index, out_fragment) },
+        neg
+    )
+}
+
+unsafe fn operation_append_fragment_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_fragment: *mut *mut LanceFragment,
+) -> Result<i32> {
+    if out_fragment.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_fragment must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let fragments = append_operation_parts(operation)?;
+    let fragment = fragments.get(index).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "append fragment index {index} is out of range for {} fragments",
+                fragments.len()
+            )
+            .into(),
+        )
+    })?;
+    let fragment = Box::into_raw(Box::new(LanceFragment::from_metadata(fragment.clone())));
+    unsafe {
+        ptr::write(out_fragment, fragment);
+    }
+    Ok(0)
+}
+
+/// Read the target version of a Restore operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_restore_version(
+    operation: *const LanceOperation,
+    out_version: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_restore_version_inner(operation, out_version) },
+        neg
+    )
+}
+
+unsafe fn operation_restore_version_inner(
+    operation: *const LanceOperation,
+    out_version: *mut u64,
+) -> Result<i32> {
+    if out_version.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_version must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let version = restore_operation_version(operation)?;
+    unsafe {
+        ptr::write(out_version, version);
+    }
+    Ok(0)
+}
+
+/// Read the reserved fragment count of a ReserveFragments operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_reserve_fragments_count(
+    operation: *const LanceOperation,
+    out_count: *mut u32,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_reserve_fragments_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_reserve_fragments_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u32,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let count = reserve_fragments_operation_count(operation)?;
+    unsafe {
+        ptr::write(out_count, count);
+    }
+    Ok(0)
+}
+
+/// Read the number of new base paths in an UpdateBases operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_bases_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_update_bases_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_update_bases_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let new_bases = update_bases_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_count, new_bases.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Read one borrowed new base path from an UpdateBases operation.
+///
+/// `path` and `name` point into the operation handle and remain valid until it
+/// is closed. `name == NULL` represents native `None`; an empty string is an
+/// explicit empty name. Returns 0 on success, -1 on error, and leaves
+/// `out_base` unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_bases_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_base: *mut LanceBasePathView,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_update_bases_at_inner(operation, index, out_base) },
+        neg
+    )
+}
+
+unsafe fn operation_update_bases_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_base: *mut LanceBasePathView,
+) -> Result<i32> {
+    if out_base.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_base must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let new_bases = update_bases_operation_parts(operation)?;
+    if operation.base_paths.len() != new_bases.len() {
+        return Err(lance_core::Error::internal(
+            "UpdateBases base path view storage is inconsistent with native metadata".to_string(),
+        ));
+    }
+    if index >= new_bases.len() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "update bases index {index} is out of range for {} base paths",
+                new_bases.len()
+            )
+            .into(),
+        ));
+    }
+    let view = operation.base_paths[index].view();
+    unsafe {
+        ptr::write(out_base, view);
     }
     Ok(0)
 }
