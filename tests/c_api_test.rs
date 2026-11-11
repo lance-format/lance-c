@@ -10703,6 +10703,7 @@ fn scan_used_rtree(stats: &CapturedScanStatistics) -> bool {
 
 #[test]
 fn test_rtree_scalar_index_geometry_queries_and_lifecycle() {
+    assert_eq!(LanceScalarIndexType::RTree as i32, 9);
     let fixture = create_rtree_geometry_fixture();
     let uri = fixture.uri.as_str();
     let uri_c = c_str(uri);
