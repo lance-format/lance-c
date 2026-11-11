@@ -45563,11 +45563,14 @@ fn test_native_operation_typed_publication_paths() {
     assert!(!stale_merge.is_null(), "{}", take_last_error_message());
     let stale_transaction =
         unsafe { lance_transaction_new(merged_version, stale_merge, ptr::null()) };
+    // Merge carries a complete schema from its read version, so a concurrent
+    // schema-metadata update is a native retryable conflict. A config-only
+    // UpdateConfig would rebase cleanly and the stale Merge would succeed.
     let concurrent_map = build_native_update_map(&[("concurrent", Some("1"))], false);
     let concurrent_options = LanceUpdateConfigOperationOptions {
-        config_updates: concurrent_map,
+        config_updates: ptr::null(),
         table_metadata_updates: ptr::null(),
-        schema_metadata_updates: ptr::null(),
+        schema_metadata_updates: concurrent_map,
         field_metadata_updates: ptr::null(),
         field_metadata_update_count: 0,
     };
