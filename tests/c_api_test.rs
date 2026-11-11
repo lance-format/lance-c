@@ -22,7 +22,7 @@ use arrow_array::{
     Array, BinaryArray, Float32Array, Int32Array, LargeBinaryArray, RecordBatch, StringArray,
     StructArray, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::refs::BranchContents;
@@ -37,6 +37,8 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur,
     Operator, PhraseQuery,
 };
+use lance_index::scalar::minhash_lsh::MinHashQuery as NativeMinHashQuery;
+use lance_select::{RowAddrMask as NativeRowAddrMask, RowAddrTreeMap as NativeRowAddrTreeMap};
 
 /// Helper: create a test dataset in a temp directory and return its path.
 fn create_test_dataset() -> (tempfile::TempDir, String) {
@@ -9677,6 +9679,192 @@ fn create_native_scalar_index_dataset() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+const MINHASH_BASE: &str = "the quick brown fox jumps over the lazy dog and runs away very fast";
+const MINHASH_NEAR: &str = "the quick brown fox jumps over the lazy dog and runs away very quickly";
+const MINHASH_UNRELATED: &str =
+    "completely unrelated sentence about columnar storage in lance files";
+
+fn create_minhash_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("minhash_lsh_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let texts = vec![
+        Some(MINHASH_BASE),
+        Some(MINHASH_NEAR),
+        Some(MINHASH_UNRELATED),
+        Some(MINHASH_BASE),
+        None,
+        Some(""),
+        Some("shared apple banana cherry"),
+        Some("shared apple banana cherry dragonfruit"),
+        Some("another unrelated row discussing vector indices and recall"),
+        Some("yet another unrelated row discussing full text search tokenizers"),
+        Some("a row about fragments compaction and stable row identifiers"),
+        Some("a row about the manifest and transaction commit protocol"),
+    ];
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..12)),
+            Arc::new(StringArray::from(texts)),
+        ],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 3);
+    });
+
+    (tmp, uri)
+}
+
+fn append_minhash_rows(uri: &str, first_id: i32, texts: &[Option<&str>]) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let ids = Int32Array::from_iter_values(first_id..first_id + texts.len() as i32);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(ids), Arc::new(StringArray::from(texts.to_vec()))],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+                None,
+            )
+            .await
+            .unwrap();
+    });
+}
+
+fn native_minhash_hits<F>(
+    uri: &str,
+    text: &str,
+    limit: i64,
+    offset: Option<i64>,
+    configure: F,
+) -> Vec<(i32, f32)>
+where
+    F: FnOnce(&Dataset, &mut lance::dataset::scanner::Scanner),
+{
+    let uri = uri.to_string();
+    let text = text.to_string();
+    lance_c::runtime::block_on(async move {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .minhash_search(NativeMinHashQuery::new(text, "text"))
+            .unwrap();
+        scanner.limit(Some(limit), offset).unwrap();
+        configure(&dataset, &mut scanner);
+        scanner.project(&["id"]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let distances = batch["_distance"]
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        ids.values()
+            .iter()
+            .copied()
+            .zip(distances.values().iter().copied())
+            .collect()
+    })
+}
+
+fn native_minhash_error<F>(
+    uri: &str,
+    column: &str,
+    text: &str,
+    limit: Option<i64>,
+    configure: F,
+) -> String
+where
+    F: FnOnce(&Dataset, &mut lance::dataset::scanner::Scanner),
+{
+    let uri = uri.to_string();
+    let column = column.to_string();
+    let text = text.to_string();
+    lance_c::runtime::block_on(async move {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .minhash_search(NativeMinHashQuery::new(text, column))
+            .unwrap();
+        if let Some(limit) = limit {
+            scanner.limit(Some(limit), None).unwrap();
+        }
+        configure(&dataset, &mut scanner);
+        scanner.project(&["id"]).unwrap();
+        match scanner.try_into_batch().await {
+            Ok(_) => panic!("expected native MinHash search to fail"),
+            Err(error) => error.to_string(),
+        }
+    })
+}
+
+fn collect_minhash_hits(scanner: *mut LanceScanner) -> (SchemaRef, Vec<(i32, f32)>) {
+    let (schema, batches) = collect_scanner(scanner);
+    let mut hits = Vec::new();
+    for batch in &batches {
+        let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let distances = batch["_distance"]
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        hits.extend(
+            ids.values()
+                .iter()
+                .copied()
+                .zip(distances.values().iter().copied()),
+        );
+    }
+    (schema, hits)
+}
+
+fn assert_minhash_hits_match(actual: &[(i32, f32)], expected: &[(i32, f32)]) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "actual={actual:?} expected={expected:?}"
+    );
+    for ((actual_id, actual_distance), (expected_id, expected_distance)) in
+        actual.iter().zip(expected)
+    {
+        assert_eq!(
+            actual_id, expected_id,
+            "actual={actual:?} expected={expected:?}"
+        );
+        assert!(
+            (actual_distance - expected_distance).abs() <= 1e-6,
+            "distance mismatch for id {actual_id}: {actual_distance} != {expected_distance}"
+        );
+    }
+}
+
 fn scan_index_ids(
     dataset: *const LanceDataset,
     filter: &str,
@@ -9971,6 +10159,7 @@ fn test_native_scalar_index_segment_metadata_types() {
     };
     let zone_params = c_str(r#"{"rows_per_zone":2,"use_seeds":false}"#);
     let bloom_params = c_str(r#"{"number_of_items":8,"probability":0.01}"#);
+    let minhash_params = c_str(r#"{"num_hashes":32,"num_bands":8,"shingle_size":2}"#);
 
     for (column, index_type, params, expected_type, details_suffix) in [
         (
@@ -9993,6 +10182,13 @@ fn test_native_scalar_index_segment_metadata_types() {
             bloom_params.as_ptr(),
             7,
             "BloomFilterIndexDetails",
+        ),
+        (
+            "text",
+            LanceScalarIndexType::MinHashLsh,
+            minhash_params.as_ptr(),
+            8,
+            "MinHashLshIndexDetails",
         ),
     ] {
         let column = c_str(column);
@@ -10132,14 +10328,65 @@ fn test_native_scalar_index_native_parameter_and_type_validation() {
             ds,
             id.as_ptr(),
             c_str("bad_type").as_ptr(),
-            8,
+            99,
             ptr::null(),
             false,
         )
     };
     assert_eq!(rc, -1);
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    assert!(take_last_error_message().contains("invalid scalar index type: 8"));
+    assert!(take_last_error_message().contains("invalid scalar index type: 99"));
+
+    let text = c_str("text");
+    for (name, params, expected) in [
+        (
+            "bad_minhash_zero_bands",
+            r#"{"num_bands":0}"#,
+            "1 <= num_bands <= 256",
+        ),
+        (
+            "bad_minhash_divisibility",
+            r#"{"num_hashes":64,"num_bands":3}"#,
+            "num_hashes to be a multiple of num_bands",
+        ),
+        (
+            "bad_minhash_unknown",
+            r#"{"signature_version":0}"#,
+            "unknown field",
+        ),
+    ] {
+        let rc = unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                text.as_ptr(),
+                c_str(name).as_ptr(),
+                LanceScalarIndexType::MinHashLsh as i32,
+                c_str(params).as_ptr(),
+                false,
+            )
+        };
+        assert_eq!(rc, -1, "{name}");
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = take_last_error_message();
+        assert!(message.contains(expected), "{name}: {message}");
+    }
+
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            ds,
+            id.as_ptr(),
+            c_str("bad_minhash_type").as_ptr(),
+            LanceScalarIndexType::MinHashLsh as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("string column"),
+        "MinHash must reject non-string columns natively"
+    );
 
     let rc = unsafe {
         lance_dataset_create_scalar_index(
@@ -10156,6 +10403,786 @@ fn test_native_scalar_index_native_parameter_and_type_validation() {
     assert!(take_last_error_message().contains("dataset and column must not be NULL"));
 
     assert_eq!(unsafe { lance_dataset_index_count(ds) }, 0);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_minhash_lsh_index_search_and_lifecycle() {
+    let (_tmp, uri) = create_minhash_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 3);
+    let mut stable_row_ids = false;
+    assert_eq!(
+        unsafe { lance_dataset_has_stable_row_ids(ds, &mut stable_row_ids) },
+        0
+    );
+    assert!(stable_row_ids);
+
+    let column = c_str("text");
+    let index_name = c_str("text_minhash");
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                LanceScalarIndexType::MinHashLsh as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 1);
+
+    let index_list = take_scanner_string(unsafe { lance_dataset_index_list_json(ds) });
+    let indices: serde_json::Value = serde_json::from_str(&index_list).unwrap();
+    let minhash_index = indices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "text_minhash")
+        .unwrap_or_else(|| panic!("missing MinHash index: {index_list}"));
+    assert_eq!(minhash_index["type"], "MinHashLsh", "{index_list}");
+    assert_eq!(minhash_index["columns"], serde_json::json!(["text"]));
+
+    let segments_json = take_scanner_string(unsafe { lance_dataset_index_segments_json(ds) });
+    let segments: serde_json::Value = serde_json::from_str(&segments_json).unwrap();
+    let minhash_segment = segments
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "text_minhash")
+        .unwrap_or_else(|| panic!("missing MinHash segment: {segments_json}"));
+    assert_eq!(minhash_segment["type"], "MinHashLsh", "{segments_json}");
+    assert_eq!(
+        minhash_segment["fragment_ids"],
+        serde_json::json!([0, 1, 2])
+    );
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 3) }, 0);
+    let (schema, hits) = collect_minhash_hits(scanner);
+    assert!(schema.field_with_name("_distance").is_ok(), "{schema:?}");
+    assert_eq!(hits[0], (0, 0.0));
+    assert_eq!(hits[1], (3, 0.0));
+    let native_hits = native_minhash_hits(&uri, MINHASH_BASE, 3, None, |_, _| {});
+    assert_minhash_hits_match(&hits, &native_hits);
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_NEAR).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 2) }, 0);
+    let (_, near_hits) = collect_minhash_hits(scanner);
+    assert_eq!(near_hits[0].0, 1);
+    assert_eq!(near_hits[0].1, 0.0);
+    let native_near = native_minhash_hits(&uri, MINHASH_NEAR, 2, None, |_, _| {});
+    assert_minhash_hits_match(&near_hits, &native_near);
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_minhash_query(scanner, column.as_ptr(), c"".as_ptr()) },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 3) }, 0);
+    let (_, empty_text_hits) = collect_minhash_hits(scanner);
+    assert!(empty_text_hits.is_empty(), "{empty_text_hits:?}");
+    assert!(native_minhash_hits(&uri, "", 3, None, |_, _| {}).is_empty());
+    unsafe { lance_scanner_close(scanner) };
+
+    assert_eq!(
+        unsafe { lance_dataset_prewarm_index(ds, index_name.as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(ds) };
+
+    let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    let scanner = unsafe { lance_scanner_new(reopened, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(
+                scanner,
+                column.as_ptr(),
+                c_str(MINHASH_UNRELATED).as_ptr(),
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 1) }, 0);
+    let (_, unrelated_hits) = collect_minhash_hits(scanner);
+    assert_eq!(unrelated_hits, vec![(2, 0.0)]);
+    unsafe { lance_scanner_close(scanner) };
+
+    let custom_params = c_str(r#"{"num_hashes":64,"num_bands":16,"shingle_size":2}"#);
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                reopened,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                LanceScalarIndexType::MinHashLsh as i32,
+                custom_params.as_ptr(),
+                true,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(reopened) }, 1);
+    let scanner = unsafe { lance_scanner_new(reopened, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 4) }, 0);
+    let (_, replaced_hits) = collect_minhash_hits(scanner);
+    assert_eq!(replaced_hits[0], (0, 0.0));
+    assert_eq!(replaced_hits[1], (3, 0.0));
+    let native_replaced = native_minhash_hits(&uri, MINHASH_BASE, 4, None, |_, _| {});
+    assert_minhash_hits_match(&replaced_hits, &native_replaced);
+    unsafe { lance_scanner_close(scanner) };
+
+    assert_eq!(
+        unsafe { lance_dataset_drop_index(reopened, index_name.as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(reopened) }, 0);
+    unsafe { lance_dataset_close(reopened) };
+}
+
+#[test]
+fn test_minhash_search_partial_coverage_filters_masks_and_projection() {
+    let (_tmp, uri) = create_minhash_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    let column = c_str("text");
+    let index_name = c_str("text_minhash");
+    let params = c_str(r#"{"num_hashes":64,"num_bands":16,"shingle_size":3}"#);
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                LanceScalarIndexType::MinHashLsh as i32,
+                params.as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(ds) };
+
+    append_minhash_rows(&uri, 12, &[Some(MINHASH_BASE), Some(MINHASH_BASE)]);
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset.delete("id = 1").await.unwrap();
+        assert_eq!(dataset.fragments().len(), 4);
+    });
+
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 4);
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 4) }, 0);
+    let (_, hits) = collect_minhash_hits(scanner);
+    assert_eq!(hits, vec![(0, 0.0), (3, 0.0), (12, 0.0), (13, 0.0)]);
+    let native_hits = native_minhash_hits(&uri, MINHASH_BASE, 4, None, |_, _| {});
+    assert_minhash_hits_match(&hits, &native_hits);
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 2) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_offset(scanner, 1) }, 0);
+    let (_, offset_hits) = collect_minhash_hits(scanner);
+    let native_offset = native_minhash_hits(&uri, MINHASH_BASE, 2, Some(1), |_, _| {});
+    assert_minhash_hits_match(&offset_hits, &native_offset);
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 4) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, true) }, 0);
+    let (_, fast_hits) = collect_minhash_hits(scanner);
+    assert_eq!(fast_hits, vec![(0, 0.0), (3, 0.0)]);
+    let native_fast = native_minhash_hits(&uri, MINHASH_BASE, 4, None, |_, scan| {
+        scan.fast_search();
+    });
+    assert_minhash_hits_match(&fast_hits, &native_fast);
+    unsafe { lance_scanner_close(scanner) };
+
+    for prefilter in [true, false] {
+        let filter = c_str("id >= 1");
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), filter.as_ptr()) };
+        assert!(!scanner.is_null());
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_minhash_query(
+                    scanner,
+                    column.as_ptr(),
+                    c_str(MINHASH_BASE).as_ptr(),
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { lance_scanner_set_limit(scanner, 2) }, 0);
+        assert_eq!(
+            unsafe { lance_scanner_set_prefilter(scanner, prefilter) },
+            0
+        );
+        let (_, filtered_hits) = collect_minhash_hits(scanner);
+        let native_filtered = native_minhash_hits(&uri, MINHASH_BASE, 2, None, |_, scan| {
+            scan.filter("id >= 1").unwrap().prefilter(prefilter);
+        });
+        assert_minhash_hits_match(&filtered_hits, &native_filtered);
+        unsafe { lance_scanner_close(scanner) };
+    }
+
+    let row_ids = ordering_row_ids(ds);
+    let append_row_12 = row_ids[&12];
+    let append_row_13 = row_ids[&13];
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let allowed = [append_row_12, append_row_13];
+    let blocked = [append_row_12];
+    assert_eq!(
+        unsafe { lance_scanner_set_row_addr_allowlist(scanner, allowed.as_ptr(), allowed.len()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_row_addr_blocklist(scanner, blocked.as_ptr(), blocked.len()) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 1) }, 0);
+    let (_, masked_hits) = collect_minhash_hits(scanner);
+    assert_eq!(masked_hits, vec![(13, 0.0)]);
+    let native_masked = native_minhash_hits(&uri, MINHASH_BASE, 1, None, |_, scan| {
+        let allowed = NativeRowAddrTreeMap::from_iter([append_row_13]);
+        let blocked = NativeRowAddrTreeMap::from_iter([append_row_12]);
+        scan.with_row_id_prefilter(NativeRowAddrMask::from_allowed(allowed).also_block(blocked));
+    });
+    assert_minhash_hits_match(&masked_hits, &native_masked);
+    unsafe { lance_scanner_close(scanner) };
+
+    let mut fragment_ids = vec![0_u64; 4];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let appended_fragment = fragment_ids[3];
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, &appended_fragment, 1) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 2) }, 0);
+    let (_, fragment_hits) = collect_minhash_hits(scanner);
+    assert_eq!(fragment_hits, vec![(12, 0.0), (13, 0.0)]);
+    let native_fragment = native_minhash_hits(&uri, MINHASH_BASE, 2, None, |dataset, scan| {
+        scan.with_fragments(vec![dataset.fragments().last().unwrap().clone()]);
+    });
+    assert_minhash_hits_match(&fragment_hits, &native_fragment);
+    unsafe { lance_scanner_close(scanner) };
+
+    let next_id_name = c_str("next_id");
+    let id_expression = c_str("id + 1");
+    let body_name = c_str("body");
+    let text_expression = c_str("text");
+    let distance_name = c_str("distance");
+    let distance_expression = c_str("_distance");
+    let projection = [
+        LanceProjectionColumn {
+            output_name: next_id_name.as_ptr(),
+            expression: id_expression.as_ptr(),
+        },
+        LanceProjectionColumn {
+            output_name: body_name.as_ptr(),
+            expression: text_expression.as_ptr(),
+        },
+        LanceProjectionColumn {
+            output_name: distance_name.as_ptr(),
+            expression: distance_expression.as_ptr(),
+        },
+    ];
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_projection(scanner, projection.as_ptr(), projection.len()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_scanner_disable_scoring_autoprojection(scanner) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 1) }, 0);
+    let (schema, batches) = collect_scanner(scanner);
+    assert!(schema.field_with_name("next_id").is_ok(), "{schema:?}");
+    assert!(schema.field_with_name("body").is_ok(), "{schema:?}");
+    assert!(schema.field_with_name("distance").is_ok(), "{schema:?}");
+    assert!(schema.field_with_name("_distance").is_err(), "{schema:?}");
+    assert_eq!(batches.len(), 1);
+    let next_id = batches[0]["next_id"]
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let body = batches[0]["body"]
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let distance = batches[0]["distance"]
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    assert_eq!(next_id.value(0), 1);
+    assert_eq!(body.value(0), MINHASH_BASE);
+    assert_eq!(distance.value(0), 0.0);
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 3) }, 0);
+    let schema = scanner_introspection_schema(scanner);
+    assert!(schema.field_with_name("_distance").is_ok(), "{schema:?}");
+    let explain = take_scanner_string(unsafe { lance_scanner_explain_plan(scanner, false) });
+    assert!(explain.contains("MinHashSearch"), "{explain}");
+    assert!(explain.contains("MinHashFlatSearch"), "{explain}");
+    let analyze = take_scanner_string(unsafe { lance_scanner_analyze_plan(scanner) });
+    assert!(!analyze.is_empty());
+    unsafe { lance_scanner_close(scanner) };
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_minhash_search_validation_copy_and_native_errors() {
+    let (_tmp, uri) = create_minhash_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    let column = c_str("text");
+    let index_name = c_str("text_minhash");
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                LanceScalarIndexType::MinHashLsh as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut column_buffer = c_str("text").into_bytes_with_nul();
+    let mut text_buffer = c_str(MINHASH_UNRELATED).into_bytes_with_nul();
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(
+                scanner,
+                column_buffer.as_ptr().cast(),
+                text_buffer.as_ptr().cast(),
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    column_buffer[0] = b'z';
+    text_buffer[0] = b'z';
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 1) }, 0);
+    let (_, copied_hits) = collect_minhash_hits(scanner);
+    assert_eq!(copied_hits, vec![(2, 0.0)]);
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, c"".as_ptr(), c_str(MINHASH_NEAR).as_ptr())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("column to search"), "{message}");
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 2) }, 0);
+    let (_, retained_hits) = collect_minhash_hits(scanner);
+    assert_eq!(retained_hits[0], (0, 0.0));
+    assert_eq!(retained_hits[1], (3, 0.0));
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, ptr::null(), c_str(MINHASH_BASE).as_ptr())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("column must not be NULL"),
+        "NULL column must be rejected"
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_minhash_query(scanner, column.as_ptr(), ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("text must not be NULL"),
+        "NULL text must be rejected"
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, c"".as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("column to search"),
+        "empty column must fail during native query construction"
+    );
+    let native_message = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        match scanner.minhash_search(NativeMinHashQuery::new(MINHASH_BASE, "")) {
+            Ok(_) => panic!("empty MinHash column must fail natively"),
+            Err(error) => error.to_string(),
+        }
+    });
+    assert!(
+        native_message.contains("column to search"),
+        "{native_message}"
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("requires a limit"),
+        "native MinHash limit validation must be preserved"
+    );
+    let native_message = native_minhash_error(&uri, "text", MINHASH_BASE, None, |_, _| {});
+    assert!(
+        native_message.contains("requires a limit"),
+        "{native_message}"
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 3) }, 0);
+    assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("Cannot use limit/offset with aggregate"),
+        "MinHash count must preserve native aggregate planning"
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, c"id".as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 3) }, 0);
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("No MinHash LSH index found for column id"),
+        "{message}"
+    );
+    let native_message = native_minhash_error(&uri, "id", MINHASH_BASE, Some(3), |_, _| {});
+    assert!(
+        native_message.contains("No MinHash LSH index found for column id"),
+        "{native_message}"
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let fts_params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                column.as_ptr(),
+                c"text_fts".as_ptr(),
+                LanceScalarIndexType::Inverted as i32,
+                fts_params.as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    let fts_columns = [column.as_ptr(), ptr::null()];
+    assert_eq!(
+        unsafe {
+            lance_scanner_full_text_search(scanner, c"fox".as_ptr(), fts_columns.as_ptr(), 0)
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 3) }, 0);
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("Cannot combine a MinHash search"),
+        "{message}"
+    );
+    let native_message = native_minhash_error(&uri, "text", MINHASH_BASE, Some(3), |_, scan| {
+        scan.full_text_search(FullTextSearchQuery::new("fox".to_string()))
+            .unwrap();
+    });
+    assert!(
+        native_message.contains("Cannot combine a MinHash search"),
+        "{native_message}"
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset.delete("id = 3").await.unwrap();
+    });
+    unsafe { lance_dataset_close(ds) };
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(unsafe { lance_scanner_with_row_id(scanner, true) }, 0);
+    assert_eq!(
+        unsafe { lance_scanner_set_include_deleted_rows(scanner, true) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 3) }, 0);
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("deleted rows"), "{message}");
+    let native_message = native_minhash_error(&uri, "text", MINHASH_BASE, Some(3), |_, scan| {
+        scan.with_row_id();
+        scan.include_deleted_rows();
+    });
+    assert!(native_message.contains("deleted rows"), "{native_message}");
+    unsafe { lance_scanner_close(scanner) };
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                c"id".as_ptr(),
+                c"id_btree".as_ptr(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut segment_uuid = [0_u8; 16];
+    let mut segment_count = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                ds,
+                c"id_btree".as_ptr(),
+                segment_uuid.as_mut_ptr(),
+                1,
+                &mut segment_count,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(segment_count, 1);
+    let mut fragments = vec![0_u64; 3];
+    let fragment_count = unsafe { lance_dataset_fragment_count(ds) } as usize;
+    fragments.resize(fragment_count, 0);
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, fragments.as_mut_ptr()) },
+        0
+    );
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), c"id >= 0".as_ptr()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, fragments.as_ptr(), fragments.len()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_scalar_index_segment(scanner, segment_uuid.as_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_minhash_query(scanner, column.as_ptr(), c_str(MINHASH_BASE).as_ptr())
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 3) }, 0);
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("scalar_index_segment requires an ordinary scan")
+            && message.contains("MinHash"),
+        "{message}"
+    );
+    unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
 }
 

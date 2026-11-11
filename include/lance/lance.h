@@ -141,6 +141,7 @@ typedef enum {
     LANCE_SCALAR_NGRAM        = 5,
     LANCE_SCALAR_ZONE_MAP     = 6,
     LANCE_SCALAR_BLOOM_FILTER = 7,
+    LANCE_SCALAR_MINHASH_LSH  = 8,
 } LanceScalarIndexType;
 
 typedef enum {
@@ -2581,9 +2582,9 @@ int32_t lance_scanner_set_projection(
  * Disable automatic `_score` / `_distance` projection for this scanner.
  *
  * With the published default, an explicit projection still receives `_score`
- * for full-text search or `_distance` for vector search. After this call
- * succeeds, those columns are included only when explicitly requested by the
- * projection, matching Lance `Scanner::disable_scoring_autoprojection()`.
+ * for full-text search or `_distance` for vector and MinHash search. After this
+ * call succeeds, those columns are included only when explicitly requested by
+ * the projection, matching Lance `Scanner::disable_scoring_autoprojection()`.
  *
  * The change is one-way for the lifetime of the scanner. Must be called before
  * the scan starts.
@@ -3000,6 +3001,8 @@ const char* lance_scanner_analyze_plan(const LanceScanner* scanner);
  * This applies the native `COUNT(*)` aggregate to the configured scanner plan
  * and executes that count plan. It does not count batches from a stream.
  * Native aggregate planning rejects any configured limit, offset, or ordering.
+ * MinHash search requires a limit, so it cannot be combined with this count
+ * operation; use a limited MinHash scan and count the returned rows instead.
  * Count execution uses the native count operation's execution options; the
  * registered scan-statistics callback is not invoked for this separate count
  * operation.
@@ -3232,7 +3235,9 @@ int32_t lance_dataset_create_vector_index(
  *                    Lance scalar-index plugin, or NULL for plugin defaults.
  *                    Plugin field names and validation apply; for example
  *                    ZoneMap uses `rows_per_zone`/`use_seeds` and BloomFilter
- *                    uses `number_of_items`/`probability`.
+ *                    uses `number_of_items`/`probability`. MinHash LSH uses
+ *                    `num_hashes`, `num_bands`, `shingle_size`, and
+ *                    `tokenizer`.
  * @return 0 on success, -1 on error.
  */
 int32_t lance_dataset_create_scalar_index(
@@ -3885,8 +3890,9 @@ int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
 /**
  * Configure native indexed-only fast search.
  *
- * This weak-consistency mode applies to vector queries, scalar-indexed filters
- * and full-text search. Index-backed paths can omit unindexed data. Ordinary
+ * This weak-consistency mode applies to vector queries, scalar-indexed filters,
+ * full-text search and MinHash search. Index-backed paths can omit unindexed
+ * data; for MinHash search it omits appended/unindexed fragments. Ordinary
  * scans and expressions without an indexable path follow the native planner's
  * behavior.
  *
@@ -3906,10 +3912,11 @@ int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
 int32_t lance_scanner_set_fast_search(LanceScanner* scanner, bool enable);
 
 /**
- * Choose when scanner filter expressions are applied during nearest-neighbor search.
- * When enabled, filters constrain ANN candidates; when disabled, they refine the
- * candidates after ANN and may produce fewer than k rows. This does not change the
- * fragment search domain set by lance_scanner_set_fragment_ids().
+ * Choose when scanner filter expressions are applied during vector or MinHash
+ * search. When enabled, filters constrain candidates before ranking; when
+ * disabled, they refine the ranked candidates afterward and may produce fewer
+ * than the configured limit. This does not change the fragment search domain set
+ * by lance_scanner_set_fragment_ids().
  */
 int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
 
@@ -3962,8 +3969,9 @@ int32_t lance_scanner_set_index_segments(
  * overlays, fragment reuse, unsupported index types / result domains
  * and missing coverage use the same domain without an index. No filter also
  * falls back. LIMIT/OFFSET apply after the complete scanner filter, never to the
- * unfiltered candidate set. Vector/FTS queries and include_deleted_rows=true
- * are rejected even when use_scalar_index=false; segment mode is live-row-only.
+ * unfiltered candidate set. Vector/MinHash/FTS queries and
+ * include_deleted_rows=true are rejected even when use_scalar_index=false;
+ * segment mode is live-row-only.
  *
  * UUID bytes are copied. Metadata and final option compatibility are validated
  * when creating the stream. Index corruption or I/O failures remain errors.
@@ -4356,6 +4364,33 @@ int32_t lance_scanner_set_fts_query(
 int32_t lance_scanner_set_fts_query_context(
     LanceScanner* scanner,
     const LanceFtsQueryContext* context
+);
+
+/**
+ * Set a native MinHash LSH text-similarity query on the scanner.
+ *
+ * The column and text are copied and may be released after this call. A valid
+ * earlier query remains attached when this call fails. An empty column is
+ * rejected by the native query builder; an empty text is accepted by native
+ * Lance and produces no matching signatures.
+ *
+ * The scanner limit is required when planning this query and controls the
+ * number of returned rows. Native planning searches rows with the column's
+ * MinHash LSH index, covers unindexed fragments by default, and adds
+ * `_distance`, equal to one minus the estimated Jaccard similarity. Filters,
+ * prefiltering, fast search, fragment scope, row masks, projection, offset, and
+ * query-combination errors follow native Lance behavior.
+ *
+ * @param scanner Scanner handle. Must not be NULL.
+ * @param column  Text column with a MinHash LSH index. Must not be NULL or
+ *                empty after native validation.
+ * @param text    Query text. Must not be NULL; empty text is allowed.
+ * @return 0 on success, -1 on error (check `lance_last_error_*`).
+ */
+int32_t lance_scanner_set_minhash_query(
+    LanceScanner* scanner,
+    const char* column,
+    const char* text
 );
 
 /**

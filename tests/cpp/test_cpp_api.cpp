@@ -2826,6 +2826,143 @@ static void test_native_scalar_indexes(const std::string& uri) {
     PASS();
 }
 
+static int collect_minhash_alice(ArrowArrayStream& stream) {
+    ArrowSchema schema{};
+    assert(stream.get_schema(&stream, &schema) == 0);
+    int id_column = -1;
+    int distance_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        const ArrowSchema* child = schema.children[i];
+        if (!child || !child->name) continue;
+        if (strcmp(child->name, "id") == 0) id_column = static_cast<int>(i);
+        if (strcmp(child->name, "_distance") == 0) {
+            distance_column = static_cast<int>(i);
+        }
+    }
+    assert(id_column >= 0);
+    assert(distance_column >= 0);
+    schema.release(&schema);
+
+    int found_alice = 0;
+    int64_t total_rows = 0;
+    while (true) {
+        ArrowArray array{};
+        assert(stream.get_next(&stream, &array) == 0);
+        if (!array.release) break;
+        const ArrowArray* ids = array.children[id_column];
+        const ArrowArray* distances = array.children[distance_column];
+        assert(ids && ids->buffers[1]);
+        assert(distances && distances->buffers[1]);
+        const auto* id_values = static_cast<const int32_t*>(ids->buffers[1]);
+        const auto* distance_values =
+            static_cast<const float*>(distances->buffers[1]);
+        for (int64_t row = 0; row < array.length; ++row) {
+            const int32_t id = id_values[ids->offset + row];
+            const float distance = distance_values[distances->offset + row];
+            assert(distance >= 0.0f);
+            total_rows += 1;
+            if (id == 1) {
+                assert(distance == 0.0f);
+                found_alice += 1;
+            }
+        }
+        array.release(&array);
+    }
+    stream.release(&stream);
+    assert(total_rows > 0);
+    return found_alice;
+}
+
+static void test_minhash_lsh(const std::string& uri) {
+    TEST(test_minhash_lsh);
+
+    auto ds = lance::Dataset::open(uri);
+    ds.create_scalar_index(
+        "name", LANCE_SCALAR_MINHASH_LSH, "cpp_minhash",
+        R"({"num_hashes":64,"num_bands":16,"shingle_size":1})");
+    auto json = ds.list_indices_json();
+    assert(json.find("\"name\":\"cpp_minhash\"") != std::string::npos);
+    assert(json.find("\"type\":\"MinHashLsh\"") != std::string::npos);
+    json = ds.index_segments_json();
+    assert(json.find("\"name\":\"cpp_minhash\"") != std::string::npos);
+    assert(json.find("\"type\":\"MinHashLsh\"") != std::string::npos);
+    ds.prewarm_index("cpp_minhash");
+
+    {
+        auto scanner = ds.scan({"id", "name"});
+        scanner.minhash_search("name", "alice").limit(10);
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        assert(collect_minhash_alice(stream) == 1);
+    }
+
+    {
+        auto scanner = ds.scan({"id", "name"});
+        scanner.minhash_search("name", "alice").limit(3);
+        bool caught = false;
+        try {
+            scanner.minhash_search("", "alice");
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::string(error.what()).find("column to search") !=
+                   std::string::npos);
+        }
+        assert(caught);
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        assert(collect_minhash_alice(stream) == 1);
+    }
+
+    {
+        auto scanner = ds.scan({"id"});
+        scanner.minhash_search("name", "alice");
+        bool caught = false;
+        try {
+            ArrowArrayStream stream;
+            memset(&stream, 0, sizeof(stream));
+            scanner.to_arrow_stream(&stream);
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::string(error.what()).find("requires a limit") !=
+                   std::string::npos);
+        }
+        assert(caught);
+    }
+
+    {
+        auto scanner = ds.scan({"id"});
+        scanner.minhash_search("score", "alice").limit(5);
+        bool caught = false;
+        try {
+            ArrowArrayStream stream;
+            memset(&stream, 0, sizeof(stream));
+            scanner.to_arrow_stream(&stream);
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::string(error.what()).find(
+                       "No MinHash LSH index found for column score") !=
+                   std::string::npos);
+        }
+        assert(caught);
+    }
+
+    {
+        auto reopened = lance::Dataset::open(uri);
+        json = reopened.list_indices_json();
+        assert(json.find("\"name\":\"cpp_minhash\"") != std::string::npos);
+        reopened.drop_index("cpp_minhash");
+        json = reopened.list_indices_json();
+        assert(json.find("cpp_minhash") == std::string::npos);
+    }
+
+    PASS();
+}
+
 static const ArrowSchema* find_schema_child(
     const ArrowSchema& schema,
     const char* name) {
@@ -3179,6 +3316,7 @@ int main(int argc, char** argv) {
     test_error_exception(uri);
     test_index_lifecycle(uri);
     test_native_scalar_indexes(uri);
+    test_minhash_lsh(uri);
     test_batch_nearest(uri);
     test_scanner_materialization_fast_search(uri);
     test_nearest_smoke(uri);
