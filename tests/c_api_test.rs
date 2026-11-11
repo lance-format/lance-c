@@ -10676,7 +10676,7 @@ fn native_rtree_ids(uri: &str, filter: &str, use_scalar_index: bool) -> Vec<i32>
     lance_c::runtime::block_on(async move {
         let dataset = Dataset::open(&uri).await.unwrap();
         let mut scanner = dataset.scan();
-        scanner.filter(filter).unwrap();
+        scanner.filter(&filter).unwrap();
         scanner.use_scalar_index(use_scalar_index);
         scanner.project(&["id"]).unwrap();
         let batch = scanner.try_into_batch().await.unwrap();

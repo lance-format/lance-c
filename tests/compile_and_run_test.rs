@@ -729,7 +729,7 @@ fn test_c_compilation_and_execution() {
     let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk(false);
     let (_fragment_read_tmp, fragment_read_uri) = create_fragment_dataset_on_disk(true);
     let (_cleanup_tmp, cleanup_uri) = create_cleanup_dataset_on_disk();
-    let (_rtree_geometry_tmp, rtree_geometry_uri) = create_rtree_geometry_fixture();
+    let rtree_geometry = create_rtree_geometry_fixture();
     let config_base_files = create_config_base_files_fixture();
     let build_dir = tempfile::tempdir().unwrap();
 
@@ -755,7 +755,7 @@ fn test_c_compilation_and_execution() {
         &fragment_uri,
         &fragment_read_uri,
         &cleanup_uri,
-        &rtree_geometry_uri.uri,
+        &rtree_geometry.uri,
         &aggregate_plan_path,
         &config_base_files,
     );
@@ -778,7 +778,7 @@ fn test_cpp_compilation_and_execution() {
     let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk(false);
     let (_fragment_read_tmp, fragment_read_uri) = create_fragment_dataset_on_disk(true);
     let (_cleanup_tmp, cleanup_uri) = create_cleanup_dataset_on_disk();
-    let (_rtree_geometry_tmp, rtree_geometry_uri) = create_rtree_geometry_fixture();
+    let rtree_geometry = create_rtree_geometry_fixture();
     let config_base_files = create_config_base_files_fixture();
     let build_dir = tempfile::tempdir().unwrap();
 
@@ -804,7 +804,7 @@ fn test_cpp_compilation_and_execution() {
         &fragment_uri,
         &fragment_read_uri,
         &cleanup_uri,
-        &rtree_geometry_uri.uri,
+        &rtree_geometry.uri,
         &aggregate_plan_path,
         &config_base_files,
     );
