@@ -362,6 +362,7 @@ typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
 typedef struct LanceIvfModel LanceIvfModel;
+typedef struct LanceSchema LanceSchema;
 
 /* ─── Shared session ─── */
 
@@ -2970,6 +2971,97 @@ int32_t lance_dataset_schema(
     struct ArrowSchema* out
 );
 
+/**
+ * Clone the dataset's current native schema into an independently owned
+ * handle.
+ *
+ * The clone preserves field and parent IDs, logical types, encodings,
+ * dictionary values, nested metadata, field order, and nullability. It does
+ * not pass through Arrow. The handle remains valid after the dataset is
+ * closed.
+ *
+ * @param dataset     Open dataset snapshot. Must not be NULL.
+ * @param out_schema  Receives the owned schema on success; unchanged on error.
+ * @return 0 on success, -1 on error. Close the result with
+ *         lance_schema_close().
+ */
+int32_t lance_dataset_schema_clone(
+    const LanceDataset* dataset,
+    LanceSchema** out_schema
+);
+
+/* ─── Native schema values ─── */
+
+/**
+ * Close and free a native schema handle. Safe to call with NULL.
+ *
+ * Closing the dataset, fragment, or operation that produced the schema does
+ * not invalidate an independently cloned handle.
+ */
+void lance_schema_close(LanceSchema* schema);
+
+/**
+ * Clone a native schema handle into an independently owned handle.
+ *
+ * The clone preserves the complete native schema value, including field IDs,
+ * nested metadata, encodings, and dictionary values. It does not pass through
+ * Arrow. Returns NULL on error.
+ */
+LanceSchema* lance_schema_clone(const LanceSchema* schema);
+
+/**
+ * Export a native schema as an Arrow C Data Interface view.
+ *
+ * This is an interoperability view only: Arrow does not represent every native
+ * detail, including Lance field IDs and encodings. Use lance_schema_clone() or
+ * the dataset/fragment/operation schema-clone functions when the native value
+ * must be preserved. `out` is caller-allocated and remains caller-owned;
+ * invoke its non-NULL release callback exactly once.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_schema_to_arrow(
+    const LanceSchema* schema,
+    struct ArrowSchema* out
+);
+
+/**
+ * Project a native schema onto an ordered list of column paths.
+ *
+ * Field paths, ordering, unknown-column errors, nested projection, and empty
+ * selection all follow native `Schema::project`. A NULL `columns` array is
+ * accepted only when `num_columns == 0`. Every non-NULL entry must be UTF-8.
+ * This function does not rebuild the schema through Arrow.
+ *
+ * On success writes an independently owned handle to `*out_schema` and
+ * returns 0. On error the output slot is untouched.
+ *
+ * @param schema       Native schema handle. Must not be NULL.
+ * @param columns      Array of column paths, or NULL when num_columns is 0.
+ * @param num_columns  Number of entries in `columns`.
+ * @param out_schema   Receives the projected handle on success.
+ * @return 0 on success, -1 on error. Close the result with
+ *         lance_schema_close().
+ */
+int32_t lance_schema_project(
+    const LanceSchema* schema,
+    const char* const* columns,
+    size_t num_columns,
+    LanceSchema** out_schema
+);
+
+/**
+ * Resolve a column path to its native Lance field ID.
+ *
+ * Nested paths use native field-path syntax. On success writes
+ * `*out_field_id` and returns 0. On error the output slot is untouched.
+ */
+int32_t lance_schema_field_id(
+    const LanceSchema* schema,
+    const char* column,
+    int32_t* out_field_id
+);
+
 /* ─── Fragment enumeration ─── */
 
 /**
@@ -3047,6 +3139,22 @@ const char* lance_fragment_metadata_json(const LanceFragment* fragment);
 int32_t lance_fragment_schema(
     const LanceFragment* fragment,
     struct ArrowSchema* out
+);
+
+/**
+ * Clone the fragment's native logical dataset schema.
+ *
+ * This is `FileFragment::schema()` from the fragment's staged snapshot, not a
+ * physical file schema. The clone preserves native field identities and
+ * metadata without an Arrow round trip and remains valid after the fragment is
+ * closed.
+ *
+ * On success writes `*out_schema` and returns 0; on error the output slot is
+ * untouched.
+ */
+int32_t lance_fragment_schema_clone(
+    const LanceFragment* fragment,
+    LanceSchema** out_schema
 );
 
 /**
@@ -6771,8 +6879,10 @@ int32_t lance_data_file_base_id(
  * Native operation variant. Discriminants are ABI-stable.
  *
  * Append and Overwrite are constructed by the native writer. Delete,
- * CreateIndex and DataReplacement have typed constructors and inspection. The
- * other variants can be read from history and inspected by kind; their
+ * CreateIndex and DataReplacement have typed constructors and inspection.
+ * Project has a native-schema constructor carrying the explicit
+ * `preserves_nullability` assertion. The other variants can be read from
+ * history and inspected by kind; their
  * constructors and variant-specific mutation helpers remain later issue #112
  * scope.
  */
@@ -7246,9 +7356,60 @@ int32_t lance_operation_data_replacement_at(
 );
 
 /**
- * Export an Overwrite operation's schema as Arrow C Data Interface.
- * The caller owns and releases the output ArrowSchema exactly once.
- * Append has no schema; other variants return LANCE_ERR_NOT_SUPPORTED.
+ * Clone the in-memory native schema of an Overwrite, Merge, or Project
+ * operation.
+ *
+ * The clone preserves field and parent IDs, nested metadata, encodings,
+ * dictionary values, order, and nullability. It remains valid after the
+ * operation is closed. Other operation kinds return
+ * LANCE_ERR_NOT_SUPPORTED and leave `*out_schema` untouched.
+ *
+ * @return 0 on success, -1 on error. Close the result with
+ *         lance_schema_close().
+ */
+int32_t lance_operation_schema_clone(
+    const LanceOperation* operation,
+    LanceSchema** out_schema
+);
+
+/**
+ * Construct an owned native Project operation from a native schema.
+ *
+ * `preserves_nullability` is the caller's explicit declaration that the
+ * projection does not tighten field nullability. It is stored in the native
+ * operation unchanged; conflict resolution and rebase semantics belong to Lance
+ * core. The schema is cloned, so `schema` may be closed immediately after this
+ * call. No binding-side schema validation is added.
+ *
+ * On success writes `*out_operation` and returns 0. On error the output slot is
+ * untouched. Close the result with lance_operation_close().
+ */
+int32_t lance_operation_project_new(
+    const LanceSchema* schema,
+    bool preserves_nullability,
+    LanceOperation** out_operation
+);
+
+/**
+ * Read the native `preserves_nullability` assertion from a Merge or Project
+ * operation.
+ *
+ * On success writes `*out_preserves_nullability` and returns 0. Other
+ * operation kinds return LANCE_ERR_NOT_SUPPORTED and leave the output
+ * untouched.
+ */
+int32_t lance_operation_preserves_nullability(
+    const LanceOperation* operation,
+    bool* out_preserves_nullability
+);
+
+/**
+ * Export an Overwrite operation's schema as an Arrow C Data Interface view.
+ *
+ * This is the existing lossy interoperability view; use
+ * lance_operation_schema_clone() when native field identities matter. The
+ * caller owns and releases the output ArrowSchema exactly once. Append has no
+ * schema; other variants return LANCE_ERR_NOT_SUPPORTED.
  * Returns 0 on success, -1 on error.
  */
 int32_t lance_operation_schema(

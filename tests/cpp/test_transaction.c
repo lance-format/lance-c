@@ -1048,9 +1048,500 @@ static void test_data_replacement(const char *src_uri, const char *base) {
     printf("data replacement OK\n");
 }
 
+
+/* ─── Native schema and Project ─────────────────────────────────────────── */
+
+typedef struct RowPair {
+    int64_t id;
+    uint64_t rowid;
+} RowPair;
+
+static size_t read_id_rowid_pairs(LanceDataset *dataset,
+                                  RowPair *pairs,
+                                  size_t capacity) {
+    const char *columns[] = {"id", NULL};
+    LanceScanner *scanner = lance_scanner_new(dataset, columns, NULL);
+    ASSERT(scanner != NULL, "create schema fixture scanner");
+    CHECK_OK();
+    ASSERT(lance_scanner_with_row_id(scanner, true) == 0,
+           "enable row IDs on schema fixture scanner");
+    CHECK_OK();
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "export schema fixture scanner stream");
+    CHECK_OK();
+    size_t count = 0;
+    for (;;) {
+        struct ArrowArray batch = {0};
+        ASSERT(stream.get_next(&stream, &batch) == 0,
+               "read schema fixture batch");
+        CHECK_OK();
+        if (!batch.release) break;
+        ASSERT(batch.n_children == 2,
+               "schema fixture scan must return id and _rowid");
+        const struct ArrowArray *ids = batch.children[0];
+        const struct ArrowArray *rowids = batch.children[1];
+        ASSERT(ids->buffers[1] != NULL && rowids->buffers[1] != NULL,
+               "schema fixture id/_rowid buffers");
+        const int64_t *id_values = (const int64_t *)ids->buffers[1];
+        const uint64_t *rowid_values = (const uint64_t *)rowids->buffers[1];
+        for (int64_t i = 0; i < batch.length; i++) {
+            ASSERT(count < capacity, "schema fixture row capacity");
+            pairs[count].id = id_values[ids->offset + i];
+            pairs[count].rowid = rowid_values[rowids->offset + i];
+            count++;
+        }
+        batch.release(&batch);
+    }
+    stream.release(&stream);
+    lance_scanner_close(scanner);
+    return count;
+}
+
+static LanceSchema *clone_dataset_schema(LanceDataset *dataset) {
+    LanceSchema *schema = NULL;
+    ASSERT(lance_dataset_schema_clone(dataset, &schema) == 0,
+           "clone dataset native schema");
+    CHECK_OK();
+    ASSERT(schema != NULL, "native schema output");
+    return schema;
+}
+
+static void check_field_id(const LanceSchema *schema,
+                           const char *column,
+                           int32_t expected) {
+    int32_t id = -1;
+    ASSERT(lance_schema_field_id(schema, column, &id) == 0,
+           "read native schema field ID");
+    CHECK_OK();
+    ASSERT(id == expected, "native schema field ID mismatch");
+}
+
+static void test_native_schema(const char *uri) {
+    LanceDataset *old_dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(old_dataset != NULL, "open native schema fixture");
+    CHECK_OK();
+    const uint64_t old_version = lance_dataset_version(old_dataset);
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(old_dataset) == 8,
+           "native schema fixture row count");
+    CHECK_OK();
+
+    LanceSchema *schema = clone_dataset_schema(old_dataset);
+    check_field_id(schema, "id", 0);
+    check_field_id(schema, "name", 2);
+    check_field_id(schema, "profile", 3);
+    check_field_id(schema, "profile.score", 4);
+    check_field_id(schema, "profile.tags", 5);
+
+    struct ArrowSchema arrow = {0};
+    ASSERT(lance_schema_to_arrow(schema, &arrow) == 0,
+           "export native schema to Arrow");
+    CHECK_OK();
+    ASSERT(arrow.n_children == 3, "native schema Arrow field count");
+    ASSERT(strcmp(arrow.children[0]->name, "id") == 0,
+           "native schema Arrow first field");
+    ASSERT(strcmp(arrow.children[2]->name, "profile") == 0,
+           "native schema Arrow third field");
+    arrow.release(&arrow);
+
+    uint64_t fragment_ids[16] = {0};
+    ASSERT(lance_dataset_fragment_count(old_dataset) == 3,
+           "native schema fixture fragment count");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_ids(old_dataset, fragment_ids) == 0,
+           "native schema fixture fragment IDs");
+    CHECK_OK();
+    LanceFragment *fragment =
+        lance_dataset_open_fragment(old_dataset, fragment_ids[0]);
+    ASSERT(fragment != NULL, "open native schema fragment");
+    CHECK_OK();
+    LanceSchema *fragment_schema = NULL;
+    ASSERT(lance_fragment_schema_clone(fragment, &fragment_schema) == 0,
+           "clone fragment native schema");
+    CHECK_OK();
+    lance_fragment_close(fragment);
+    /* The clone must outlive its fragment owner. */
+    check_field_id(fragment_schema, "profile.tags", 5);
+    lance_schema_close(fragment_schema);
+
+    RowPair before[16] = {0};
+    size_t before_count = read_id_rowid_pairs(old_dataset, before, 16);
+    ASSERT(before_count == 8, "native schema fixture row ID count");
+
+    const char *project_columns[] = {"id", "name"};
+    LanceSchema *projected = NULL;
+    ASSERT(lance_schema_project(schema, project_columns, 2, &projected) == 0,
+           "project native schema");
+    CHECK_OK();
+    check_field_id(projected, "id", 0);
+    check_field_id(projected, "name", 2);
+    int32_t missing_id = -7;
+    const char *missing_column = "profile.tags";
+    ASSERT(lance_schema_field_id(projected, missing_column, &missing_id) == -1,
+           "projected schema has no dropped field");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INTERNAL,
+           "dropped field error code");
+    ASSERT(missing_id == -7, "failed field ID lookup leaves output");
+
+    LanceSchema *clone = lance_schema_clone(schema);
+    ASSERT(clone != NULL, "clone native schema value");
+    CHECK_OK();
+    lance_schema_close(schema);
+    check_field_id(clone, "profile.score", 4);
+    struct ArrowSchema clone_arrow = {0};
+    ASSERT(lance_schema_to_arrow(clone, &clone_arrow) == 0,
+           "arrow export from independent native schema clone");
+    CHECK_OK();
+    ASSERT(clone_arrow.n_children == 3, "clone Arrow field count");
+    clone_arrow.release(&clone_arrow);
+    lance_schema_close(clone);
+
+    LanceOperation *project_operation = NULL;
+    ASSERT(lance_operation_project_new(projected, false,
+                                       &project_operation) == 0,
+           "construct Project operation");
+    CHECK_OK();
+    LanceOperationKind kind = LANCE_OPERATION_UNKNOWN;
+    ASSERT(lance_operation_kind(project_operation, &kind) == 0,
+           "Project operation kind");
+    CHECK_OK();
+    ASSERT(kind == LANCE_OPERATION_PROJECT, "Project operation enum value");
+    bool preserves = true;
+    ASSERT(lance_operation_preserves_nullability(project_operation,
+                                                 &preserves) == 0,
+           "read Project preserves_nullability");
+    CHECK_OK();
+    ASSERT(!preserves, "Project preserves_nullability false");
+
+    LanceSchema *operation_schema = NULL;
+    ASSERT(lance_operation_schema_clone(project_operation,
+                                        &operation_schema) == 0,
+           "clone Project operation schema");
+    CHECK_OK();
+    check_field_id(operation_schema, "name", 2);
+    lance_schema_close(operation_schema);
+    lance_operation_close(project_operation);
+
+    LanceOperation *preserving_operation = NULL;
+    ASSERT(lance_operation_project_new(projected, true,
+                                       &preserving_operation) == 0,
+           "construct preserving Project operation");
+    CHECK_OK();
+    preserves = false;
+    ASSERT(lance_operation_preserves_nullability(preserving_operation,
+                                                 &preserves) == 0,
+           "read preserving Project flag");
+    CHECK_OK();
+    ASSERT(preserves, "Project preserves_nullability true");
+    lance_operation_close(preserving_operation);
+
+    /* Rebuild the operation used for publication, then close its schema
+       source before committing: publication must own its schema. */
+    project_operation = NULL;
+    ASSERT(lance_operation_project_new(projected, false,
+                                       &project_operation) == 0,
+           "rebuild Project operation");
+    CHECK_OK();
+    lance_schema_close(projected);
+
+    LanceTransaction *transaction =
+        lance_transaction_new(old_version, project_operation, NULL);
+    ASSERT(transaction != NULL, "construct Project transaction");
+    CHECK_OK();
+    ASSERT(transaction_read_version(transaction) == old_version,
+           "Project transaction read version");
+    ASSERT(transaction_operation_kind(transaction) == LANCE_OPERATION_PROJECT,
+           "Project transaction kind");
+
+    LanceDataset *committed = commit_transaction(uri, transaction, NULL);
+    ASSERT(lance_dataset_version(committed) == old_version + 1,
+           "Project publication version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(committed) == 8,
+           "Project publication row count");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(committed) == 3,
+           "Project publication fragment count");
+    CHECK_OK();
+    lance_transaction_close(transaction);
+    lance_operation_close(project_operation);
+    lance_dataset_close(committed);
+
+    LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen projected dataset");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(reopened) == old_version + 1,
+           "projected dataset persisted version");
+    ASSERT(lance_dataset_count_rows(reopened) == 8,
+           "projected dataset persisted rows");
+    CHECK_OK();
+    schema = clone_dataset_schema(reopened);
+    check_field_id(schema, "id", 0);
+    check_field_id(schema, "name", 2);
+    int32_t dropped_id = -9;
+    ASSERT(lance_schema_field_id(schema, "profile.tags", &dropped_id) == -1,
+           "projected dataset dropped profile");
+    ASSERT(dropped_id == -9, "projected dataset dropped output unchanged");
+    struct ArrowSchema projected_arrow = {0};
+    ASSERT(lance_schema_to_arrow(schema, &projected_arrow) == 0,
+           "projected dataset Arrow export");
+    CHECK_OK();
+    ASSERT(projected_arrow.n_children == 2,
+           "projected dataset Arrow field count");
+    projected_arrow.release(&projected_arrow);
+    lance_schema_close(schema);
+
+    ASSERT(lance_dataset_count_rows_filtered(reopened, "id = 2") == 0,
+           "projected dataset keeps deletion");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows_filtered(reopened, "name = 'alpha'") == 3,
+           "projected dictionary value alpha");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows_filtered(reopened, "name = 'beta'") == 2,
+           "projected dictionary value beta");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows_filtered(reopened, "name = 'gamma'") == 3,
+           "projected dictionary value gamma");
+    CHECK_OK();
+
+    RowPair after[16] = {0};
+    size_t after_count = read_id_rowid_pairs(reopened, after, 16);
+    ASSERT(after_count == before_count,
+           "projected dataset stable row ID count");
+    for (size_t i = 0; i < after_count; i++) {
+        ASSERT(after[i].id == before[i].id,
+               "projected dataset row order and values");
+        ASSERT(after[i].rowid == before[i].rowid,
+               "projected dataset row IDs unchanged");
+    }
+
+    /* Two Project operations staged at the same version: the stale one must
+       report a native commit conflict, and its output slot must stay untouched. */
+    LanceSchema *winner_schema = clone_dataset_schema(reopened);
+    const char *winner_columns[] = {"name"};
+    LanceSchema *winner_projected = NULL;
+    ASSERT(lance_schema_project(winner_schema, winner_columns, 1,
+                                &winner_projected) == 0,
+           "project winner schema");
+    CHECK_OK();
+    lance_schema_close(winner_schema);
+    LanceOperation *winner_operation = NULL;
+    ASSERT(lance_operation_project_new(winner_projected, false,
+                                       &winner_operation) == 0,
+           "construct winner Project");
+    CHECK_OK();
+    lance_schema_close(winner_projected);
+    LanceTransaction *winner_transaction =
+        lance_transaction_new(old_version + 1, winner_operation, NULL);
+    ASSERT(winner_transaction != NULL, "construct winner transaction");
+    CHECK_OK();
+
+    LanceSchema *stale_schema = clone_dataset_schema(reopened);
+    const char *stale_columns[] = {"id"};
+    LanceSchema *stale_projected = NULL;
+    ASSERT(lance_schema_project(stale_schema, stale_columns, 1,
+                                &stale_projected) == 0,
+           "project stale schema");
+    CHECK_OK();
+    lance_schema_close(stale_schema);
+    LanceOperation *stale_operation = NULL;
+    ASSERT(lance_operation_project_new(stale_projected, false,
+                                       &stale_operation) == 0,
+           "construct stale Project");
+    CHECK_OK();
+    lance_schema_close(stale_projected);
+    LanceTransaction *stale_transaction =
+        lance_transaction_new(old_version + 1, stale_operation, NULL);
+    ASSERT(stale_transaction != NULL, "construct stale transaction");
+    CHECK_OK();
+
+    LanceCommitOptions zero_retries;
+    memset(&zero_retries, 0, sizeof(zero_retries));
+    zero_retries.has_max_retries = true;
+    zero_retries.max_retries = 0;
+    zero_retries.timeout_mode = LANCE_COMMIT_TIMEOUT_DISABLED;
+    LanceDataset *winner_dataset =
+        commit_transaction(uri, winner_transaction, &zero_retries);
+    ASSERT(lance_dataset_version(winner_dataset) == old_version + 2,
+           "winner Project version");
+    CHECK_OK();
+    lance_dataset_close(winner_dataset);
+
+    LanceDataset *conflict_sentinel = (LanceDataset *)(uintptr_t)0x4;
+    LanceDataset *conflict_output = conflict_sentinel;
+    ASSERT(lance_transaction_commit(uri, stale_transaction, &zero_retries,
+                                    NULL, NULL, &conflict_output) == -1,
+           "stale Project commit must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_COMMIT_CONFLICT,
+           "stale Project commit conflict code");
+    ASSERT(conflict_output == conflict_sentinel,
+           "stale Project commit leaves output unchanged");
+    lance_operation_close(winner_operation);
+    lance_transaction_close(winner_transaction);
+    lance_operation_close(stale_operation);
+    lance_transaction_close(stale_transaction);
+
+    LanceDataset *winner_reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(winner_reopened != NULL, "reopen winner Project dataset");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(winner_reopened) == old_version + 2,
+           "winner Project persisted version");
+    CHECK_OK();
+    LanceSchema *winner_schema_after = clone_dataset_schema(winner_reopened);
+    check_field_id(winner_schema_after, "name", 2);
+    int32_t id_after_conflict = -1;
+    ASSERT(lance_schema_field_id(winner_schema_after, "id",
+                                 &id_after_conflict) == -1,
+           "winner Project dropped id");
+    ASSERT(id_after_conflict == -1, "winner Project leaves field id untouched");
+    lance_schema_close(winner_schema_after);
+    lance_dataset_close(winner_reopened);
+
+    /* The pre-commit snapshot remains readable with its original schema and
+       deletion state. */
+    ASSERT(lance_dataset_count_rows(old_dataset) == 8,
+           "old snapshot rows unchanged");
+    CHECK_OK();
+    LanceSchema *old_schema = clone_dataset_schema(old_dataset);
+    check_field_id(old_schema, "profile.tags", 5);
+    lance_schema_close(old_schema);
+    lance_dataset_close(old_dataset);
+    lance_dataset_close(reopened);
+
+    /* Null, kind, and output-slot guards. */
+    LanceSchema *null_clone = lance_schema_clone(NULL);
+    ASSERT(null_clone == NULL, "NULL schema clone returns NULL");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL schema clone error code");
+
+    LanceSchema *sentinel_schema = (LanceSchema *)(uintptr_t)0x1;
+    LanceSchema *schema_out = sentinel_schema;
+    ASSERT(lance_dataset_schema_clone(NULL, &schema_out) == -1,
+           "NULL dataset schema clone");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL dataset schema clone code");
+    ASSERT(schema_out == sentinel_schema,
+           "NULL dataset schema clone leaves output");
+
+    schema_out = sentinel_schema;
+    ASSERT(lance_fragment_schema_clone(NULL, &schema_out) == -1,
+           "NULL fragment schema clone");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL fragment schema clone code");
+    ASSERT(schema_out == sentinel_schema,
+           "NULL fragment schema clone leaves output");
+
+    LanceSchema *empty = NULL;
+    ASSERT(lance_schema_project(NULL, NULL, 0, &empty) == -1,
+           "NULL schema project");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL schema project code");
+    ASSERT(empty == NULL, "NULL schema project leaves output");
+
+    LanceDataset *guard_dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(guard_dataset != NULL, "open dataset for schema guards");
+    CHECK_OK();
+    schema = clone_dataset_schema(guard_dataset);
+    lance_dataset_close(guard_dataset);
+    LanceSchema *projected_sentinel = (LanceSchema *)(uintptr_t)0x2;
+    LanceSchema *projected_out = projected_sentinel;
+    const char *unknown_columns[] = {"does_not_exist"};
+    ASSERT(lance_schema_project(schema, unknown_columns, 1,
+                                &projected_out) == -1,
+           "unknown project column");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INTERNAL,
+           "unknown project column code");
+    ASSERT(projected_out == projected_sentinel,
+           "unknown project column leaves output");
+
+    projected_out = projected_sentinel;
+    ASSERT(lance_schema_project(schema, NULL, 1, &projected_out) == -1,
+           "NULL project column array");
+    ASSERT(projected_out == projected_sentinel,
+           "NULL project column array leaves output");
+    ASSERT(lance_schema_project(schema, NULL, SIZE_MAX, &projected_out) == -1,
+           "oversized project column count");
+    ASSERT(projected_out == projected_sentinel,
+           "oversized project column count leaves output");
+
+    LanceOperation *unsupported = lance_operation_delete_new(NULL, 0, NULL, 0,
+                                                             "id = 1");
+    ASSERT(unsupported != NULL, "construct Delete for schema guard");
+    CHECK_OK();
+    schema_out = sentinel_schema;
+    ASSERT(lance_operation_schema_clone(unsupported, &schema_out) == -1,
+           "Delete operation schema unsupported");
+    ASSERT(lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED,
+           "Delete operation schema error code");
+    ASSERT(schema_out == sentinel_schema,
+           "Delete operation schema leaves output");
+    bool preserves_sentinel = true;
+    ASSERT(lance_operation_preserves_nullability(unsupported,
+                                                 &preserves_sentinel) == -1,
+           "Delete preserves_nullability unsupported");
+    ASSERT(preserves_sentinel, "Delete preserves_nullability leaves output");
+    lance_operation_close(unsupported);
+
+    LanceOperation *project_sentinel =
+        (LanceOperation *)(uintptr_t)0x3;
+    LanceOperation *project_out = project_sentinel;
+    ASSERT(lance_operation_project_new(NULL, false, &project_out) == -1,
+           "NULL schema Project constructor");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL schema Project constructor code");
+    ASSERT(project_out == project_sentinel,
+           "NULL schema Project constructor leaves output");
+
+    int32_t field_sentinel = -11;
+    ASSERT(lance_schema_field_id(schema, "nope", &field_sentinel) == -1,
+           "unknown field ID");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INTERNAL,
+           "unknown field ID code");
+    ASSERT(field_sentinel == -11, "unknown field ID leaves output");
+
+    /* Pinned native core accepts an empty Project schema; assert the observed
+       behavior so a silent policy change is visible. */
+    LanceSchema *empty_schema = NULL;
+    ASSERT(lance_schema_project(schema, NULL, 0, &empty_schema) == 0,
+           "empty native schema projection");
+    CHECK_OK();
+    lance_schema_close(schema);
+    LanceOperation *empty_operation = NULL;
+    ASSERT(lance_operation_project_new(empty_schema, false,
+                                       &empty_operation) == 0,
+           "empty schema Project operation");
+    CHECK_OK();
+    lance_schema_close(empty_schema);
+    LanceDataset *empty_reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(empty_reopened != NULL, "open dataset before empty Project");
+    CHECK_OK();
+    uint64_t empty_version = lance_dataset_version(empty_reopened);
+    lance_dataset_close(empty_reopened);
+    LanceTransaction *empty_transaction =
+        lance_transaction_new(empty_version, empty_operation, NULL);
+    ASSERT(empty_transaction != NULL, "empty Project transaction");
+    CHECK_OK();
+    LanceDataset *empty_committed = NULL;
+    int32_t empty_rc = lance_transaction_commit(
+        uri, empty_transaction, NULL, NULL, NULL, &empty_committed);
+    printf("empty-schema Project commit rc=%d code=%d\n", empty_rc,
+           (int)lance_last_error_code());
+    fflush(stdout);
+    ASSERT(empty_rc == 0, "empty-schema Project commit");
+    CHECK_OK();
+    ASSERT(empty_committed != NULL, "empty-schema Project commit output");
+    lance_dataset_close(empty_committed);
+    lance_transaction_close(empty_transaction);
+    lance_operation_close(empty_operation);
+    printf("native schema and Project OK\n");
+}
+
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <source-dataset-uri> <base-path>\n",
+    if (argc != 4) {
+        fprintf(stderr,
+                "usage: %s <source-dataset-uri> <base-path> "
+                "<native-schema-uri>\n",
                 argv[0]);
         return 2;
     }
@@ -1058,6 +1549,8 @@ int main(int argc, char **argv) {
     test_validation(argv[2]);
     test_fragment_delete(argv[1], argv[2]);
     test_data_replacement(argv[1], argv[2]);
+
+    test_native_schema(argv[3]);
     printf("All C transaction tests passed!\n");
     return 0;
 }
