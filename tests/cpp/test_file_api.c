@@ -125,8 +125,17 @@ static int verify_stream(
     int expected_rows,
     int first_id) {
     ArrowSchema schema = {0};
-    if (stream->get_schema(stream, &schema) != 0) return 0;
+    if (stream->get_schema(stream, &schema) != 0) {
+        const char *error = stream->get_last_error(stream);
+        fprintf(stderr, "VERIFY get_schema failed: %s\n",
+                error ? error : "none");
+        return 0;
+    }
     int valid_schema = strcmp(schema.format, "+s") == 0 && schema.n_children == 2;
+    if (!valid_schema) {
+        fprintf(stderr, "VERIFY schema format=%s children=%lld\n",
+                schema.format, (long long)schema.n_children);
+    }
     if (schema.release) schema.release(&schema);
     if (!valid_schema) return 0;
 
@@ -134,19 +143,37 @@ static int verify_stream(
     ArrowArray batch = {0};
     while (stream->get_next(stream, &batch) == 0) {
         if (!batch.release) break;
-        if (batch.n_children != 2) return 0;
+        if (batch.n_children != 2) {
+            fprintf(stderr, "VERIFY batch children=%lld rows=%d\n",
+                    (long long)batch.n_children, rows);
+            return 0;
+        }
         const ArrowArray *id = batch.children[0];
         const ArrowArray *label = batch.children[1];
         const int32_t *ids = (const int32_t *)id->buffers[1];
         for (int64_t row = 0; row < batch.length; row++) {
-            if (ids[row] != first_id + rows) return 0;
+            if (ids[row] != first_id + rows) {
+                fprintf(stderr,
+                        "VERIFY id mismatch row=%lld value=%d expected=%d "
+                        "batch_len=%lld rows=%d\n",
+                        (long long)row, ids[row], first_id + rows,
+                        (long long)batch.length, rows);
+                return 0;
+            }
         }
         if (rows == 0 && batch.length > 2) {
             if (strcmp(label_at(label, 1), "two") != 0) return 0;
             if (label_at(label, 2) != NULL) return 0;
         }
+        fprintf(stderr, "VERIFY batch len=%lld first_id=%d rows=%d\n",
+                (long long)batch.length, first_id, rows);
         rows += (int)batch.length;
         batch.release(&batch);
+    }
+    if (rows != expected_rows) {
+        const char *error = stream->get_last_error(stream);
+        fprintf(stderr, "VERIFY rows=%d expected=%d error=%s\n", rows,
+                expected_rows, error ? error : "none");
     }
     return rows == expected_rows;
 }
