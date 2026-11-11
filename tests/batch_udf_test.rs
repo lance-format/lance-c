@@ -229,6 +229,68 @@ impl StoreState {
 struct CallbackContext {
     mapper: Arc<MapperState>,
     store: Arc<StoreState>,
+    independent_reads: Option<CallbackReads>,
+}
+
+struct CallbackRead {
+    callback: &'static str,
+    count: u64,
+    ids: Result<Vec<i32>, String>,
+}
+
+struct CallbackReads {
+    dataset: *const LanceDataset,
+    scanners: Mutex<Vec<*mut LanceScanner>>,
+    results: Mutex<Vec<CallbackRead>>,
+}
+
+impl CallbackReads {
+    fn record(&self, index: usize, callback: &'static str) {
+        let scanner = {
+            let mut scanners = self.scanners.lock().unwrap();
+            mem::replace(&mut scanners[index], ptr::null_mut())
+        };
+        if scanner.is_null() {
+            return;
+        }
+        let count = unsafe { lance_dataset_count_rows(self.dataset) };
+        let ids = (|| {
+            let mut stream = FFI_ArrowArrayStream::empty();
+            if unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) } != 0 {
+                return Err(format!("scanner export failed: {:?}", take_error()));
+            }
+            let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }
+                .map_err(|error| error.to_string())?;
+            if reader.schema().field_with_name("derived").is_ok() {
+                return Err("pre-existing scanner lost its snapshot".to_owned());
+            }
+            let mut ids = Vec::new();
+            for batch in reader {
+                let batch = batch.map_err(|error| error.to_string())?;
+                let column = batch
+                    .column_by_name("id")
+                    .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+                    .ok_or_else(|| "scanner did not return Int32 ids".to_owned())?;
+                ids.extend_from_slice(column.values());
+            }
+            ids.sort_unstable();
+            Ok(ids)
+        })();
+        unsafe { lance_scanner_close(scanner) };
+        self.results.lock().unwrap().push(CallbackRead {
+            callback,
+            count,
+            ids,
+        });
+    }
+}
+
+impl Drop for CallbackReads {
+    fn drop(&mut self) {
+        for scanner in self.scanners.get_mut().unwrap().drain(..) {
+            unsafe { lance_scanner_close(scanner) };
+        }
+    }
 }
 
 #[repr(C)]
@@ -335,6 +397,9 @@ unsafe extern "C" fn mapper_callback(
     error: *mut LanceCallbackError,
 ) -> i32 {
     let context = unsafe { &*(callback_ctx.cast::<CallbackContext>()) };
+    if let Some(reads) = &context.independent_reads {
+        reads.record(0, "mapper");
+    }
     let input_schema = Schema::try_from(unsafe { &*input_schema }).unwrap();
     let rows = unsafe { (*input).length as usize };
     context.mapper.calls.fetch_add(1, Ordering::SeqCst);
@@ -409,6 +474,9 @@ unsafe extern "C" fn store_get_batch(
     error: *mut LanceCallbackError,
 ) -> i32 {
     let context = unsafe { &*(callback_ctx.cast::<CallbackContext>()) };
+    if let Some(reads) = &context.independent_reads {
+        reads.record(1, "get_batch");
+    }
     let info = unsafe { &*info };
     context.store.record(format!(
         "get_batch:{}:{}",
@@ -441,6 +509,9 @@ unsafe extern "C" fn store_insert_batch(
     error: *mut LanceCallbackError,
 ) -> i32 {
     let context = unsafe { &*(callback_ctx.cast::<CallbackContext>()) };
+    if let Some(reads) = &context.independent_reads {
+        reads.record(2, "insert_batch");
+    }
     let info = unsafe { &*info };
     context.store.record(format!(
         "insert_batch:{}:{}",
@@ -473,6 +544,9 @@ unsafe extern "C" fn store_get_fragment(
     error: *mut LanceCallbackError,
 ) -> i32 {
     let context = unsafe { &*(callback_ctx.cast::<CallbackContext>()) };
+    if let Some(reads) = &context.independent_reads {
+        reads.record(3, "get_fragment");
+    }
     context.store.record(format!("get_fragment:{fragment_id}"));
     if let Some((code, message)) = context.store.should_fail(StoreMethod::GetFragment) {
         unsafe { set_callback_error(error, code, &message, &context.store.string_releases) };
@@ -500,6 +574,9 @@ unsafe extern "C" fn store_insert_fragment(
     error: *mut LanceCallbackError,
 ) -> i32 {
     let context = unsafe { &*(callback_ctx.cast::<CallbackContext>()) };
+    if let Some(reads) = &context.independent_reads {
+        reads.record(4, "insert_fragment");
+    }
     context
         .store
         .record(format!("insert_fragment:{fragment_id}"));
@@ -602,7 +679,11 @@ fn make_context(
     (
         mapper.clone(),
         store.clone(),
-        CallbackContext { mapper, store },
+        CallbackContext {
+            mapper,
+            store,
+            independent_reads: None,
+        },
     )
 }
 
@@ -667,6 +748,72 @@ fn checkpoint_file_exists(uri: &str, path: &str) -> bool {
             .join("data")
             .join(std::path::Path::new(relative).file_name().unwrap())
             .exists()
+}
+
+#[test]
+fn test_batch_udf_all_callbacks_read_independent_handles_and_existing_scanners() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = fixture_uri(&tmp, "reentrant_reads");
+    create_batch_udf_dataset(&uri, true);
+    let dataset = open(&uri);
+    let independent = open(&uri);
+    let baseline = unsafe { lance_dataset_version(independent) };
+    let scanners = (0..5)
+        .map(|_| unsafe { lance_scanner_new(independent, ptr::null(), ptr::null()) })
+        .collect::<Vec<_>>();
+    assert!(scanners.iter().all(|scanner| !scanner.is_null()));
+    assert_eq!(unsafe { lance_dataset_count_rows(independent) }, 8);
+
+    let declared = output_schema();
+    let ffi_schema = schema_to_ffi(&declared);
+    let (_mapper, _store, mut context) = make_context(declared, MapperMode::Constant(77));
+    context.independent_reads = Some(CallbackReads {
+        dataset: independent,
+        scanners: Mutex::new(scanners),
+        results: Mutex::new(Vec::new()),
+    });
+    assert_eq!(
+        run_batch_udf(dataset, &ffi_schema, &context, None, Some(2), true),
+        0,
+        "reentrant callback UDF failed: {:?}",
+        take_error()
+    );
+    let results = context
+        .independent_reads
+        .as_ref()
+        .unwrap()
+        .results
+        .lock()
+        .unwrap();
+    assert_eq!(results.len(), 5, "all callback kinds must execute");
+    for read in results.iter() {
+        eprintln!(
+            "callback {}: count={}, ids={:?}",
+            read.callback, read.count, read.ids
+        );
+        assert_eq!(read.count, 8, "{} independent-handle read", read.callback);
+        assert_eq!(
+            read.ids.as_ref().unwrap(),
+            &(0..8).collect::<Vec<_>>(),
+            "{} pre-existing scanner read",
+            read.callback
+        );
+    }
+    assert_eq!(unsafe { lance_dataset_version(independent) }, baseline);
+    assert!(
+        exported_schema(independent)
+            .field_with_name("derived")
+            .is_err()
+    );
+    assert!(
+        derive_map(dataset, "derived")
+            .values()
+            .all(|value| *value == Some(77))
+    );
+    unsafe {
+        lance_dataset_close(independent);
+        lance_dataset_close(dataset);
+    }
 }
 
 #[test]
