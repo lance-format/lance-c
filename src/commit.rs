@@ -465,6 +465,7 @@ unsafe fn write_uncommitted_stream_inner(
     let expected_schema = ArrowSchema::try_from(unsafe { &*schema }).map_err(|error| {
         lance_core::Error::invalid_input_source(format!("invalid schema: {error}").into())
     })?;
+    #[allow(unused_unsafe)]
     let params = match storage {
         CommitStorageSource::Static(storage_opts) => unsafe {
             writer_params_from_ffi(mode, options, storage_opts, session)?

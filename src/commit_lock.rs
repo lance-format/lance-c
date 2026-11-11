@@ -276,7 +276,7 @@ pub(crate) fn commit_handler_from_ffi(
         return None;
     }
     // SAFETY: non-NULL lock handles are caller-owned and valid for this call.
-    Some(unsafe { &*lock }.inner.clone())
+    Some(unsafe { &*lock }.inner.clone() as Arc<dyn CommitHandler>)
 }
 
 /// Create a foreign commit lock.

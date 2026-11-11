@@ -202,7 +202,7 @@ unsafe fn open_dataset_with_commit_lock_inner(
     session: *const LanceSession,
     commit_lock: *const LanceCommitLock,
     out_dataset: *mut *mut LanceDataset,
-) -> Result<()> {
+) -> Result<i32> {
     if out_dataset.is_null() {
         return Err(lance_core::Error::invalid_input_source(
             "out_dataset must not be NULL".into(),
@@ -238,7 +238,7 @@ unsafe fn open_dataset_with_commit_lock_inner(
     // SAFETY: `out_dataset` is non-NULL and writable; the output is written
     // only on success.
     unsafe { *out_dataset = Box::into_raw(Box::new(handle)) };
-    Ok(())
+    Ok(0)
 }
 
 unsafe fn open_dataset_inner(

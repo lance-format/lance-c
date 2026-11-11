@@ -159,12 +159,14 @@ static void validate_token(void *lease) {
 
 static void bump_dataset_version(LockState *state) {
     StreamInput input = make_source_stream();
-    LanceDataset *dataset = lance_dataset_write(
+    LanceDataset *dataset = NULL;
+    int32_t rc = lance_dataset_write(
         state->uri, &input.schema, &input.stream, LANCE_WRITE_APPEND, NULL,
-        NULL);
+        &dataset);
     if (input.schema.release) input.schema.release(&input.schema);
-    ASSERT(dataset != NULL, "independent append inside acquire");
+    ASSERT(rc == 0, "independent append inside acquire");
     CHECK_OK();
+    ASSERT(dataset != NULL, "independent append output");
     state->bump_append_rows += 20;
     lance_dataset_close(dataset);
 }
@@ -283,10 +285,13 @@ static LanceDataset *lock_write(const char *uri, LanceCommitLock *lock,
                                 LanceWriteMode mode,
                                 const LanceWriteOptions *options) {
     StreamInput input = make_source_stream();
-    LanceDataset *dataset = lance_dataset_write_with_options_with_commit_lock(
+    LanceDataset *dataset = NULL;
+    int32_t rc = lance_dataset_write_with_options_with_commit_lock(
         uri, &input.schema, &input.stream, (int32_t)mode, options, NULL, NULL,
-        lock, NULL);
+        lock, &dataset);
     if (input.schema.release) input.schema.release(&input.schema);
+    ASSERT(rc == 0, "lock-enabled write");
+    CHECK_OK();
     return dataset;
 }
 
