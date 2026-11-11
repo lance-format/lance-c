@@ -47,12 +47,13 @@ use lance::dataset::mem_wal::{
 use lance_index::mem_wal::{ShardingField, ShardingSpec};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::distance::DistanceType;
+use lance_table::system_index::mem_wal::CompactedSsTable;
 use uuid::Uuid;
 
 use crate::batch::LanceBatch;
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, set_last_error, swallow_unwind};
-use crate::helpers::{parse_c_string, take_arrow_array_stream};
+use crate::helpers::{parse_c_string, take_arrow_array_stream, validate_slice_length};
 use crate::runtime::{RT, block_on};
 use crate::schema::LanceSchema;
 use crate::stream_guard::{GuardedReader, guarded_ffi_stream_from_reader};
@@ -68,6 +69,46 @@ use crate::stream_guard::{GuardedReader, guarded_ffi_stream_from_reader};
 pub struct LanceCompactedSsTable {
     pub shard_id: [u8; 16],
     pub generation: u64,
+}
+
+impl LanceCompactedSsTable {
+    /// Project one native compaction-progress value into the shared C ABI form.
+    pub(crate) fn from_native(value: &CompactedSsTable) -> Self {
+        Self {
+            shard_id: *value.shard_id.as_bytes(),
+            generation: value.generation,
+        }
+    }
+}
+
+/// Convert one caller-supplied compaction-progress value into native form.
+///
+/// This is the single conversion used by every C ABI surface that accepts a
+/// `LanceCompactedSsTable`: merge-insert compaction and the
+/// `UpdateMemWalState` operation share the same native value.
+pub(crate) fn compacted_ss_table_native(value: &LanceCompactedSsTable) -> CompactedSsTable {
+    CompactedSsTable::new(Uuid::from_bytes(value.shard_id), value.generation)
+}
+
+/// Copy caller-supplied compacted SSTable values into native form.
+pub(crate) unsafe fn parse_compacted_sstables(
+    compacted_sstables: *const LanceCompactedSsTable,
+    num_compacted_sstables: usize,
+) -> lance_core::Result<Vec<CompactedSsTable>> {
+    if num_compacted_sstables == 0 {
+        return Ok(Vec::new());
+    }
+    if compacted_sstables.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "compacted_sstables must not be NULL when num_compacted_sstables is {num_compacted_sstables}"
+            )
+            .into(),
+        ));
+    }
+    validate_slice_length::<LanceCompactedSsTable>(num_compacted_sstables, "compacted_sstables")?;
+    let entries = unsafe { slice::from_raw_parts(compacted_sstables, num_compacted_sstables) };
+    Ok(entries.iter().map(compacted_ss_table_native).collect())
 }
 
 /// Per-index HNSW build parameters.

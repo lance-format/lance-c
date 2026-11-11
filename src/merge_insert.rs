@@ -17,7 +17,7 @@ use lance_core::Result;
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
-use crate::mem_wal::LanceCompactedSsTable;
+use crate::mem_wal::{LanceCompactedSsTable, parse_compacted_sstables};
 use crate::runtime::block_on;
 
 /// Behavior when a target row matches a source row on the join keys.
@@ -378,38 +378,6 @@ pub unsafe extern "C" fn lance_dataset_merge_insert_with_compaction(
         },
         neg
     )
-}
-
-/// Copy caller-supplied compacted SSTable values into native form.
-unsafe fn parse_compacted_sstables(
-    compacted_sstables: *const LanceCompactedSsTable,
-    num_compacted_sstables: usize,
-) -> Result<Vec<lance_table::system_index::mem_wal::CompactedSsTable>> {
-    if num_compacted_sstables == 0 {
-        return Ok(Vec::new());
-    }
-    if compacted_sstables.is_null() {
-        return Err(lance_core::Error::invalid_input_source(
-            format!(
-                "compacted_sstables must not be NULL when num_compacted_sstables is {num_compacted_sstables}"
-            )
-            .into(),
-        ));
-    }
-    helpers::validate_slice_length::<LanceCompactedSsTable>(
-        num_compacted_sstables,
-        "compacted_sstables",
-    )?;
-    let entries = unsafe { std::slice::from_raw_parts(compacted_sstables, num_compacted_sstables) };
-    Ok(entries
-        .iter()
-        .map(|entry| {
-            lance_table::system_index::mem_wal::CompactedSsTable::new(
-                uuid::Uuid::from_bytes(entry.shard_id),
-                entry.generation,
-            )
-        })
-        .collect())
 }
 
 /// Translate caller-supplied `LanceMergeInsertParams` (or NULL) into the
