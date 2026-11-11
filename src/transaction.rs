@@ -682,7 +682,13 @@ pub unsafe extern "C" fn lance_operation_reserve_fragments_new(
     num_fragments: u64,
 ) -> *mut LanceOperation {
     ffi_try!(
-        unsafe {
+        {
+            let num_fragments = u32::try_from(num_fragments).map_err(|_| {
+                lance_core::Error::invalid_input_source(format!(
+                    "num_fragments {num_fragments} exceeds the native maximum of {}",
+                    u32::MAX
+                ))
+            })?;
             Ok(Box::into_raw(Box::new(LanceOperation::from_native(
                 Operation::ReserveFragments { num_fragments },
             )?)))
@@ -1544,7 +1550,7 @@ fn restore_operation_version(operation: &LanceOperation) -> Result<u64> {
 
 fn reserve_fragments_operation_count(operation: &LanceOperation) -> Result<u64> {
     match &operation.inner {
-        Operation::ReserveFragments { num_fragments } => Ok(*num_fragments),
+        Operation::ReserveFragments { num_fragments } => Ok(u64::from(*num_fragments)),
         other => Err(lance_core::Error::not_supported_source(
             format!(
                 "ReserveFragments inspection is not supported for {} operations",
@@ -1767,7 +1773,7 @@ unsafe fn operation_update_bases_at_inner(
     let new_bases = update_bases_operation_parts(operation)?;
     if operation.base_paths.len() != new_bases.len() {
         return Err(lance_core::Error::internal(
-            "UpdateBases base path view storage is inconsistent with native metadata".into(),
+            "UpdateBases base path view storage is inconsistent with native metadata".to_string(),
         ));
     }
     if index >= new_bases.len() {

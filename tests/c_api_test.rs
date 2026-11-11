@@ -43474,6 +43474,15 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
         take_last_error_message()
     );
     assert_eq!(reserved_count, 0);
+    let oversized_reserve =
+        unsafe { lance_operation_reserve_fragments_new(u64::from(u32::MAX) + 1) };
+    assert!(oversized_reserve.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let oversized_error = take_last_error_message();
+    assert!(
+        oversized_error.contains("num_fragments 4294967296 exceeds the native maximum"),
+        "{oversized_error}"
+    );
     let zero_transaction = unsafe { lance_transaction_new(4, reserve_zero, ptr::null()) };
     assert!(!zero_transaction.is_null());
     let zero_committed = commit_native_transaction(&uri, zero_transaction, ptr::null());
