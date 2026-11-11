@@ -52,6 +52,75 @@ static void check_dataset(const std::string& uri,
     CHECK(dataset.count_rows() == rows);
 }
 
+static uint64_t write_cpp_replacement_file(
+    const std::string& uri,
+    const lance::Fragment& fragment,
+    const std::string& filename) {
+    auto scanner = fragment.scan();
+    ArrowArrayStream raw_stream{};
+    scanner.to_arrow_stream(&raw_stream);
+    lance::ArrowStream stream(raw_stream);
+
+    ArrowSchema schema{};
+    if (stream->get_schema(stream.get(), &schema) != 0) {
+        throw lance::Error(LANCE_ERR_INVALID_ARGUMENT,
+                           "failed to read replacement stream schema");
+    }
+
+    lance::FileWriterOptions options;
+    options.version = std::string("2.1");
+    lance::FileSession files("file://" + uri + "/data");
+    auto writer = files.open_writer(filename, &schema, options);
+
+    while (true) {
+        ArrowArray batch{};
+        if (stream->get_next(stream.get(), &batch) != 0) {
+            if (schema.release) schema.release(&schema);
+            throw lance::Error(LANCE_ERR_INVALID_ARGUMENT,
+                               "failed to read replacement batch");
+        }
+        if (!batch.release) break;
+        CHECK(batch.n_children > 0, "replacement batch has an id column");
+        auto* ids = static_cast<int32_t*>(
+            const_cast<void*>(batch.children[0]->buffers[1]));
+        for (int64_t row = 0; row < batch.length; ++row) {
+            ids[row] += 999;
+        }
+        writer.write_batch(lance::Batch::from_arrow(&batch, &schema));
+    }
+    if (schema.release) schema.release(&schema);
+
+    const auto summary = writer.finish();
+    CHECK(summary.num_rows == 4, "replacement file must preserve four rows");
+    CHECK(summary.size_bytes > 0, "replacement file must be non-empty");
+    return summary.num_rows;
+}
+
+static std::vector<int32_t> collect_cpp_ids(const std::string& uri) {
+    auto dataset = lance::Dataset::open(uri);
+    auto scanner = dataset.scan();
+    ArrowArrayStream raw_stream{};
+    scanner.to_arrow_stream(&raw_stream);
+    lance::ArrowStream stream(raw_stream);
+
+    std::vector<int32_t> ids;
+    while (true) {
+        ArrowArray batch{};
+        if (stream->get_next(stream.get(), &batch) != 0) {
+            throw lance::Error(LANCE_ERR_INVALID_ARGUMENT,
+                               "failed to read replacement result");
+        }
+        if (!batch.release) break;
+        CHECK(batch.n_children > 0, "result batch has an id column");
+        const auto* values =
+            static_cast<const int32_t*>(batch.children[0]->buffers[1]);
+        ids.insert(ids.end(), values, values + batch.length);
+        if (batch.release) batch.release(&batch);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
 static void test_create_append_overwrite_and_batch(
     const std::string& source_uri,
     const std::string& base) {
@@ -488,6 +557,94 @@ static void test_create_index_operation(const std::string& source_uri,
     std::printf("C++ CreateIndex transaction OK\n");
 }
 
+static void test_data_replacement(const std::string& source_uri,
+                                  const std::string& base) {
+    const std::string uri = base + "/cpp_data_replacement";
+    lance::UncommittedWriteOptions options;
+    options.write.params.max_rows_per_file = 4;
+    options.write.params.data_storage_version = std::string("2.1");
+    auto create = write_uncommitted(
+        source_uri, uri, lance::WriteMode::Create, options);
+    auto dataset = lance::Dataset::commit(uri, create);
+    CHECK(dataset.version() == 1);
+    CHECK(dataset.count_rows() == 20);
+    CHECK(dataset.fragment_count() == 5);
+    const auto ids = dataset.fragment_ids();
+
+    const std::string filename = "cpp-data-replacement.lance";
+    auto fragment = dataset.open_fragment(ids[0]);
+    CHECK(fragment.has_value());
+    CHECK(write_cpp_replacement_file(uri, *fragment, filename) == 4);
+
+    auto file = dataset.create_data_file(filename);
+    CHECK(file.path() == filename);
+    CHECK(!file.fields().empty());
+    CHECK(!file.column_indices().empty());
+    CHECK(file.file_version() == std::make_pair(uint32_t{2}, uint32_t{1}));
+    CHECK(file.file_size().has_value() && *file.file_size() > 0);
+    CHECK(!file.base_id().has_value());
+
+    auto file_clone = file.clone();
+    CHECK(file_clone.path() == file.path());
+    CHECK(file_clone.fields() == file.fields());
+    auto moved_file = std::move(file_clone);
+    CHECK(moved_file.path() == file.path());
+
+    auto group = lance::DataReplacementGroup(ids[0], file);
+    CHECK(group.fragment_id() == ids[0]);
+    CHECK(group.file().path() == filename);
+    auto group_clone = group.clone();
+    CHECK(group_clone.fragment_id() == ids[0]);
+
+    auto operation = lance::Operation::make_data_replacement({&group});
+    CHECK(operation.kind() == lance::OperationKind::DataReplacement);
+    CHECK(operation.data_replacement_count() == 1);
+    auto inspected = operation.data_replacement_at(0);
+    CHECK(inspected.fragment_id() == ids[0]);
+    CHECK(inspected.file().fields() == file.fields());
+    bool out_of_range = false;
+    try {
+        (void)operation.data_replacement_at(1);
+    } catch (const lance::Error& error) {
+        out_of_range = true;
+        CHECK(error.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    CHECK(out_of_range);
+
+    auto empty = lance::Operation::make_data_replacement({});
+    CHECK(empty.kind() == lance::OperationKind::DataReplacement);
+    CHECK(empty.data_replacement_count() == 0);
+
+    CHECK(dataset.delete_rows("id = 2") == 1);
+    CHECK(dataset.version() == 2);
+    auto transaction =
+        lance::Transaction::from_operation(dataset.version(), operation);
+    lance::CommitOptions commit_options;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = lance::CommitTimeoutMode::Disabled;
+    auto committed =
+        lance::Dataset::commit(uri, transaction, commit_options);
+    CHECK(committed.version() == 3);
+    CHECK(committed.count_rows() == 19);
+    CHECK(committed.fragment_count() == 5);
+
+    auto history = committed.read_transaction();
+    CHECK(history.has_value());
+    CHECK(history->operation().kind() ==
+          lance::OperationKind::DataReplacement);
+    CHECK(history->operation().data_replacement_count() == 1);
+    CHECK(history->operation().data_replacement_at(0).fragment_id() == ids[0]);
+
+    auto actual = collect_cpp_ids(uri);
+    std::vector<int32_t> expected{1000, 1002, 1003, 5, 6, 7, 8, 9, 10,
+                                  11,   12,   13,   14, 15, 16, 17, 18,
+                                  19,   20};
+    std::sort(expected.begin(), expected.end());
+    CHECK(actual == expected);
+
+    std::printf("C++ data replacement OK\n");
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) {
         std::fprintf(stderr,
@@ -499,6 +656,7 @@ int main(int argc, char** argv) {
         test_detached_conflict_and_errors(argv[1], argv[2]);
         test_fragment_delete(argv[1], argv[2]);
         test_create_index_operation(argv[1], argv[2]);
+        test_data_replacement(argv[1], argv[2]);
     } catch (const lance::Error& error) {
         std::fprintf(stderr, "lance::Error(%d): %s\n",
                      static_cast<int>(error.code), error.what());
