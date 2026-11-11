@@ -50,6 +50,7 @@ typedef struct LeaseToken {
 
 typedef struct LockState {
     char uri[2048];
+    char read_uri[2048];
     int acquire_calls;
     int acquire_success;
     int acquire_version_seen;
@@ -181,7 +182,8 @@ static int32_t lock_acquire(void *callback_ctx, uint64_t version,
     if (version > 0) state->acquire_version_seen++;
 
     if (state->read_in_callbacks) {
-        if (callback_snapshot_rows(state->uri) < 0) {
+        const char *read_uri = state->read_uri[0] ? state->read_uri : state->uri;
+        if (callback_snapshot_rows(read_uri) < 0) {
             fill_error(error, LANCE_ERR_IO, "callback snapshot read failed");
             return -1;
         }
@@ -410,6 +412,7 @@ static void test_multi_fragment_and_deferred_context(const char *base) {
     LockState state;
     memset(&state, 0, sizeof(state));
     snprintf(state.uri, sizeof(state.uri), "%s", uri);
+    snprintf(state.read_uri, sizeof(state.read_uri), "%s", g_source_uri);
     state.read_in_callbacks = 1;
     LanceCommitLock *lock = new_lock(&state);
 
