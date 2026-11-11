@@ -24424,7 +24424,7 @@ fn test_dataset_base_paths_and_add_bases_match_native() {
     let native_fixture = create_config_base_files_fixture();
     let native = Arc::new(lance_c::runtime::block_on(Dataset::open(&native_fixture.uri)).unwrap());
     let native_version = native.version().version;
-    let native_bases = serde_json::to_value(&native.manifest().base_paths).unwrap();
+    let native_bases = native.manifest().base_paths.clone();
     let native_rows = lance_c::runtime::block_on(native.count_rows(None)).unwrap();
     let native = Arc::new(lance_c::runtime::block_on(native.add_bases(Vec::new(), None)).unwrap());
     let native = lance_c::runtime::block_on(
@@ -24432,10 +24432,7 @@ fn test_dataset_base_paths_and_add_bases_match_native() {
     )
     .unwrap();
     assert_eq!(native.version().version, native_version + 2);
-    assert_eq!(
-        serde_json::to_value(&native.manifest().base_paths).unwrap(),
-        native_bases
-    );
+    assert_eq!(native.manifest().base_paths, native_bases);
     assert_eq!(
         lance_c::runtime::block_on(native.count_rows(None)).unwrap(),
         native_rows
