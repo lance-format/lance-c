@@ -1487,6 +1487,336 @@ fn test_native_namespace_compilation_and_execution() {
     run_test_binary_with_dataset(&cpp_binary, root);
 }
 
+/// Create the multi-fragment SQL dataset: three fragments of ten rows each.
+///
+/// Version 1 creates ids 1..=10, then two appends add 11..=20 and 21..=30, so
+/// the dataset also serves as the plain (non-stable-row-id) dataset the delta
+/// consumer compares between versions 1 and 2.
+fn create_sql_multi_fragment_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("sql_multi_fragment")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Int32, true),
+    ]));
+
+    let make_batch = |first_id: i32| {
+        let ids: Vec<i32> = (first_id..first_id + 10).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.clone())),
+                Arc::new(StringArray::from_iter_values(
+                    ids.iter().map(|id| format!("name-{id}")),
+                )),
+                Arc::new(Int32Array::from_iter_values(ids.iter().map(|id| id * 10))),
+            ],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        for (first_id, mode) in [
+            (1i32, WriteMode::Create),
+            (11, WriteMode::Append),
+            (21, WriteMode::Append),
+        ] {
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(
+                    vec![Ok(make_batch(first_id))],
+                    schema.clone(),
+                ),
+                &uri,
+                Some(WriteParams {
+                    mode,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    (tmp, uri)
+}
+
+/// Create the history dataset the SQL and delta consumers share.
+///
+/// Version history, with stable row ids from the start:
+///
+/// - v1 creates ids 1..=4 (`a`..`d`)
+/// - v2 appends ids 5 and 6 (`e`, `f`)
+/// - v3 updates id 2 to `updated-2`
+/// - v4 deletes id 3
+/// - v5 upserts id 6 and inserts id 7
+///
+/// Returns the commit timestamps so the caller can turn two of them into a
+/// date-mode window.
+fn create_sql_delta_history_dataset() -> (tempfile::TempDir, String, Vec<(i64, u32)>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("sql_delta_history")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Int32, true),
+    ]));
+
+    let make_batch = |rows: &[(i32, &str)]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(Int32Array::from_iter_values(
+                    rows.iter().map(|row| row.0 * 10),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+
+    let iterator = |batch: RecordBatch| {
+        arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
+    };
+
+    let timestamps = lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::write(
+            iterator(make_batch(&[(1, "a"), (2, "b"), (3, "c"), (4, "d")])),
+            &uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .append(iterator(make_batch(&[(5, "e"), (6, "f")])), None)
+            .await
+            .unwrap();
+        lance::dataset::UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id = 2")
+            .unwrap()
+            .set("name", "'updated-2'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset.delete("id = 3").await.unwrap();
+
+        let mut merge = lance::dataset::write::merge_insert::MergeInsertBuilder::try_new(
+            Arc::new(dataset.clone()),
+            vec!["id".to_string()],
+        )
+        .unwrap();
+        merge
+            .when_matched(lance::dataset::write::merge_insert::WhenMatched::UpdateAll)
+            .when_not_matched(lance::dataset::write::merge_insert::WhenNotMatched::InsertAll);
+        merge
+            .try_build()
+            .unwrap()
+            .execute_batches(vec![make_batch(&[(6, "upserted-6"), (7, "g")])])
+            .await
+            .unwrap();
+
+        let versions = Dataset::open(&uri).await.unwrap().versions().await.unwrap();
+        assert_eq!(versions.len(), 5, "history records one version per commit");
+        versions
+            .iter()
+            .map(|version| {
+                (
+                    version.timestamp.timestamp(),
+                    version.timestamp.timestamp_subsec_nanos(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+
+    (tmp, uri, timestamps)
+}
+
+/// Create the blob-v2 dataset the SQL blob-handling modes read.
+///
+/// Three rows: an inline-sized payload, a null and a longer payload.
+fn create_sql_delta_blob_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("sql_delta_blob")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        lance::blob_field_with_options(
+            "blob",
+            true,
+            lance::BlobFieldOptions {
+                inline_size_threshold: Some(8),
+                dedicated_size_threshold: std::num::NonZeroUsize::new(64),
+            },
+        ),
+    ]));
+
+    let mut blobs = lance::BlobArrayBuilder::new(3);
+    blobs.push_bytes(b"inline-blob").unwrap();
+    blobs.push_null().unwrap();
+    blobs
+        .push_bytes(b"another-blob-value-longer-than-inline")
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(1..=3)),
+            blobs.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    (tmp, uri)
+}
+
+/// Resolve a date window to the version range the native delta reader uses:
+/// the begin timestamp is exclusive, the end timestamp inclusive.
+fn resolve_sql_delta_window(uri: &str, begin: (i64, u32), end: (i64, u32)) -> (u64, u64) {
+    let versions = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        dataset.versions().await.unwrap()
+    });
+    let mut begin_version = 0_u64;
+    let mut end_version = 0_u64;
+    for version in &versions {
+        let stamp = (
+            version.timestamp.timestamp(),
+            version.timestamp.timestamp_subsec_nanos(),
+        );
+        if stamp < begin && version.version > begin_version {
+            begin_version = version.version;
+        }
+        if stamp <= end && version.version > end_version {
+            end_version = version.version;
+        }
+    }
+    (begin_version, end_version)
+}
+
+/// Real C11 and C++17 consumers of the native SQL and delta APIs.
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_sql_delta_compilation_and_execution"]
+fn test_native_sql_delta_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (_sql_tmp, sql_uri) = create_sql_multi_fragment_dataset();
+    let (_history_tmp, history_uri, timestamps) = create_sql_delta_history_dataset();
+    let (_blob_tmp, blob_uri) = create_sql_delta_blob_dataset();
+    assert_eq!(timestamps.len(), 5, "history fixture versions");
+
+    // A window from version 2 (exclusive) to version 5 (inclusive): the
+    // inserted, updated and deleted change sets are all non-empty there. The
+    // begin date is exclusive, so opening the window at version 3's commit
+    // timestamp resolves the begin to version 2.
+    let begin = timestamps[2];
+    let end = timestamps[4];
+    let (resolved_begin, resolved_end) = resolve_sql_delta_window(&history_uri, begin, end);
+    assert_eq!(resolved_begin, 2, "begin resolves to the exclusive version");
+    assert_eq!(resolved_end, 5, "end resolves to the inclusive version");
+
+    let begin_seconds = begin.0.to_string();
+    let begin_nanos = begin.1.to_string();
+    let end_seconds = end.0.to_string();
+    let end_nanos = end.1.to_string();
+    let resolved_begin = resolved_begin.to_string();
+    let resolved_end = resolved_end.to_string();
+
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_sql.c");
+    let c_binary = build_dir.path().join("test_sql_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C native SQL test compilation failed"
+    );
+    run_test_binary_with_args(
+        &c_binary,
+        &[sql_uri.as_str(), history_uri.as_str(), blob_uri.as_str()],
+    );
+
+    let delta_source = tests_dir.join("test_delta.c");
+    let delta_binary = build_dir.path().join("test_delta_c");
+    assert!(
+        compile_c_test(&delta_source, &delta_binary, &include_dir, &lib_path),
+        "C native delta test compilation failed"
+    );
+    run_test_binary_with_args(
+        &delta_binary,
+        &[
+            sql_uri.as_str(),
+            history_uri.as_str(),
+            blob_uri.as_str(),
+            begin_seconds.as_str(),
+            begin_nanos.as_str(),
+            end_seconds.as_str(),
+            end_nanos.as_str(),
+            resolved_begin.as_str(),
+            resolved_end.as_str(),
+        ],
+    );
+
+    let cpp_source = tests_dir.join("test_sql_delta.cpp");
+    let cpp_binary = build_dir.path().join("test_sql_delta_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "C++ native SQL and delta test compilation failed"
+    );
+    run_test_binary_with_args(
+        &cpp_binary,
+        &[
+            sql_uri.as_str(),
+            history_uri.as_str(),
+            blob_uri.as_str(),
+            begin_seconds.as_str(),
+            begin_nanos.as_str(),
+            end_seconds.as_str(),
+            end_nanos.as_str(),
+            resolved_begin.as_str(),
+            resolved_end.as_str(),
+        ],
+    );
+}
+
 fn create_mem_wal_dataset_on_disk() -> (tempfile::TempDir, String) {
     use std::collections::HashMap;
 
