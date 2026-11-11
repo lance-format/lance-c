@@ -10811,7 +10811,7 @@ fn test_rtree_scalar_index_geometry_queries_and_lifecycle() {
             lance_dataset_create_scalar_index(
                 dataset,
                 geometry.as_ptr(),
-                ptr::null(),
+                index_name.as_ptr(),
                 LanceScalarIndexType::RTree as i32,
                 ptr::null(),
                 false,
