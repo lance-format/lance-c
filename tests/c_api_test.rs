@@ -52716,20 +52716,21 @@ fn test_native_dataset_deep_clone_refs_and_sentinels() {
     assert!(sentinel.is_null());
     assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
 
-    let empty_uri = c_str("");
-    assert_eq!(
-        unsafe {
-            lance_dataset_deep_clone(
-                ds,
-                empty_uri.as_ptr(),
-                ptr::null(),
-                ptr::null(),
-                &mut sentinel,
-            )
-        },
-        -1
-    );
-    assert!(sentinel.is_null());
+    // Native resolves the source reference before interpreting the target.
+    // A missing reference prevents empty or whitespace paths from creating
+    // anything relative to this process's working directory.
+    for target in ["", " \t"] {
+        let target = c_str(target);
+        let mut unchanged = ptr::dangling_mut::<LanceDataset>();
+        assert_eq!(
+            unsafe {
+                lance_dataset_deep_clone(ds, target.as_ptr(), missing, ptr::null(), &mut unchanged)
+            },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
+        assert_eq!(unchanged, ptr::dangling_mut::<LanceDataset>());
+    }
 
     assert_eq!(
         unsafe {
