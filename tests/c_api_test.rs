@@ -45474,14 +45474,30 @@ fn test_native_operation_typed_publication_paths() {
     let merged_version = unsafe { lance_dataset_version(merged_snapshot) };
     unsafe { lance_dataset_close(merged_snapshot) };
     let stale_transaction = unsafe { lance_transaction_new(merged_version, merge, ptr::null()) };
-    let concurrent = write_uncommitted_for_batch(
-        &source_uri,
-        write_batch(vec![7], vec![7.0]),
-        LanceWriteMode::Append,
-        ptr::null(),
+    let concurrent_map = build_native_update_map(&[("concurrent", Some("1"))], false);
+    let concurrent_options = LanceUpdateConfigOperationOptions {
+        config_updates: concurrent_map,
+        table_metadata_updates: ptr::null(),
+        schema_metadata_updates: ptr::null(),
+        field_metadata_updates: ptr::null(),
+        field_metadata_update_count: 0,
+    };
+    let concurrent_operation = unsafe { lance_operation_update_config_new(&concurrent_options) };
+    assert!(
+        !concurrent_operation.is_null(),
+        "{}",
+        take_last_error_message()
     );
+    let concurrent =
+        unsafe { lance_transaction_new(merged_version, concurrent_operation, ptr::null()) };
+    assert!(!concurrent.is_null(), "{}", take_last_error_message());
     let concurrent_dataset = commit_native_transaction(&source_uri, concurrent, ptr::null());
-    unsafe { lance_dataset_close(concurrent_dataset) };
+    unsafe {
+        lance_dataset_close(concurrent_dataset);
+        lance_update_map_close(concurrent_map);
+        lance_operation_close(concurrent_operation);
+        lance_transaction_close(concurrent);
+    }
     let mut zero_retries: LanceCommitOptions = unsafe { std::mem::zeroed() };
     zero_retries.has_max_retries = true;
     zero_retries.max_retries = 0;

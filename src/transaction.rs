@@ -16,7 +16,8 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::Result;
-use lance_table::format::{BasePath, Fragment, IndexMetadata, Schema, pb};
+use lance_core::datatypes::Schema;
+use lance_table::format::{BasePath, Fragment, IndexMetadata, pb};
 use lance_table::transaction::{DataReplacementGroup, UpdateMap};
 use prost::Message;
 
@@ -2226,7 +2227,7 @@ unsafe fn operation_update_config_new_inner(
                     .into(),
                 ));
             }
-            let updates = unsafe { update_map_at(entry.updates) }?.inner.clone();
+            let updates = update_map_at(entry.updates)?.inner.clone();
             field_metadata_updates.insert(entry.field_id, updates);
         }
     }

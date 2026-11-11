@@ -2610,13 +2610,11 @@ static void test_native_typed_operations(const char *src_uri,
                                          const char *base) {
     char seed_uri[4096];
     char overwrite_uri[4096];
-    char merge_uri[4096];
     char clone_uri[4096];
     char deep_uri[4096];
     char rejection_uri[4096];
     snprintf(seed_uri, sizeof(seed_uri), "%s/c_typed_seed", base);
     snprintf(overwrite_uri, sizeof(overwrite_uri), "%s/c_typed_overwrite", base);
-    snprintf(merge_uri, sizeof(merge_uri), "%s/c_typed_merge", base);
     snprintf(clone_uri, sizeof(clone_uri), "%s/c_typed_clone", base);
     snprintf(deep_uri, sizeof(deep_uri), "%s/c_typed_clone_deep", base);
     snprintf(rejection_uri, sizeof(rejection_uri), "%s/c_typed_rejection", base);
@@ -2834,12 +2832,12 @@ static void test_native_typed_operations(const char *src_uri,
            "Merge preserves nullability");
     CHECK_OK();
     ASSERT(!preserves, "Merge nullability assertion");
-    LanceTransaction *merge_transaction = lance_transaction_new(0, merge, NULL);
+    LanceTransaction *merge_transaction = lance_transaction_new(1, merge, NULL);
     ASSERT(merge_transaction != NULL, "typed Merge transaction");
     CHECK_OK();
     LanceDataset *merged =
-        commit_transaction(merge_uri, merge_transaction, NULL);
-    ASSERT(lance_dataset_version(merged) == 1, "typed Merge version");
+        commit_transaction(seed_uri, merge_transaction, NULL);
+    ASSERT(lance_dataset_version(merged) == 2, "typed Merge version");
     CHECK_OK();
     ASSERT(lance_dataset_count_rows(merged) == source_rows,
            "typed Merge rows");

@@ -1451,7 +1451,6 @@ static void test_typed_native_operations(const std::string& source_uri,
                                          const std::string& base) {
     const std::string seed_uri = base + "/cpp_typed_seed";
     const std::string overwrite_uri = base + "/cpp_typed_overwrite";
-    const std::string merge_uri = base + "/cpp_typed_merge";
     const std::string clone_uri = base + "/cpp_typed_clone";
     const std::string deep_uri = base + "/cpp_typed_clone_deep";
     const std::string rejection_uri = base + "/cpp_typed_rejection";
@@ -1555,8 +1554,8 @@ static void test_typed_native_operations(const std::string& source_uri,
     CHECK(!merge.merge_preserves_nullability());
     CHECK(merge.merge_schema().field_id("id") == seed_id_field);
     auto merged = lance::Dataset::commit(
-        merge_uri, lance::Transaction::from_operation(0, merge));
-    CHECK(merged.version() == 1);
+        seed_uri, lance::Transaction::from_operation(seed.version(), merge));
+    CHECK(merged.version() == 2);
     CHECK(merged.count_rows() == source_rows);
     CHECK(merged.fragment_count() == 2);
 
