@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
 
 #define CHECK(condition)                                                        \
@@ -80,6 +81,31 @@ int main(int argc, char** argv) {
     writer.close();
     CHECK(writer.stats().put_count == 1);
 
+    // Persist a second generation and read the resulting native snapshot.
+    auto next_writer = dataset.mem_wal_writer(
+        "00000000-0000-0000-0000-000000000000", config);
+    auto next_source = dataset.scan();
+    ArrowArrayStream next_stream{};
+    next_source.to_arrow_stream(&next_stream);
+    next_writer.put(&next_stream);
+    next_writer.close();
+    auto snapshot_writer = dataset.mem_wal_writer(
+        "00000000-0000-0000-0000-000000000000", config);
+    auto flushed_snapshot = snapshot_writer.snapshot();
+    CHECK(flushed_snapshot.has_value());
+    const auto flushed_tables = flushed_snapshot->sstables();
+    CHECK(!flushed_tables.empty());
+    uint64_t compacted_generation = 0;
+    for (const auto& sstable : flushed_tables) {
+        CHECK(!sstable.path.empty());
+        if (sstable.generation > compacted_generation) {
+            compacted_generation = sstable.generation;
+        }
+    }
+    CHECK(compacted_generation > 0);
+    const auto compacted_shard = flushed_snapshot->shard_id();
+    snapshot_writer.close();
+
     // Planner execution keeps native dataset/snapshot owners alive.
     lance::LsmPointLookupPlanner point_planner(dataset, {}, std::nullopt);
     auto key_source = lance::LsmScanner::from_snapshots(dataset, {});
@@ -102,16 +128,23 @@ int main(int argc, char** argv) {
     // Atomic merge-insert with both halves of the compacted SSTable value.
     LanceMergeInsertParams merge_params{};
     merge_params.when_matched = LANCE_MERGE_WHEN_MATCHED_UPDATE_ALL;
-    auto merge_source = dataset.scan();
-    ArrowArrayStream merge_stream{};
-    merge_source.to_arrow_stream(&merge_stream);
+    std::vector<lance::ShardSnapshot> merge_snapshots;
+    merge_snapshots.push_back(std::move(*flushed_snapshot));
+    auto merge_source = lance::LsmScanner::from_snapshots(
+        dataset, std::move(merge_snapshots));
+    auto merge_stream = merge_source.to_reader();
     std::vector<lance::CompactedSsTable> compacted_values;
     compacted_values.push_back(lance::CompactedSsTable::from_uuid(
-        "00000000-0000-0000-0000-000000000000", 3));
+        compacted_shard, compacted_generation));
+    const auto before_compaction = dataset.version();
     auto merge = dataset.merge_insert_with_compaction(
-        {"id"}, &merge_stream, &merge_params, compacted_values);
+        {"id"}, merge_stream.get(), &merge_params, compacted_values);
     CHECK(merge.num_updated_rows == 3);
     CHECK(merge.num_inserted_rows == 0);
+    CHECK(dataset.version() == before_compaction + 1);
+    auto compacted_dataset = lance::Dataset::open(uri);
+    CHECK(compacted_dataset.version() == before_compaction + 1);
+    CHECK(compacted_dataset.count_rows() == 3);
 
     // Snapshot values carry native generations and SSTable values.
     auto value = lance::ShardSnapshot::create(

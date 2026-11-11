@@ -45754,19 +45754,93 @@ fn test_memwal_merge_insert_with_compaction() {
     let ds = mw_open(&uri);
     assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
 
+    let shard = "00000000-0000-0000-0000-000000000000";
+    for batch in [
+        mw_batch(&[2, 4], &[Some("bb"), Some("dd")], &[[0.0; 4], [0.0; 4]]),
+        mw_batch(&[4], &[Some("dd-final")], &[[0.0; 4]]),
+    ] {
+        let writer = mw_writer_open(ds, shard);
+        mw_put(writer, batch);
+        assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+        unsafe { lance_shard_writer_free(writer) };
+    }
+
+    // Closing each writer flushes a real generation before the next opens.
+    let writer = mw_writer_open(ds, shard);
+    let mut snapshot = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_snapshot(writer, &mut snapshot) },
+        0
+    );
+    assert!(!snapshot.is_null());
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    unsafe { lance_shard_writer_free(writer) };
+
+    let count = unsafe { lance_mem_wal_shard_snapshot_sstable_count(snapshot) };
+    assert!(count > 0, "close must persist the written rows in SSTables");
+    let mut max_generation = 0;
+    for index in 0..count {
+        let mut generation = 0;
+        let mut path = ptr::null();
+        assert_eq!(
+            unsafe {
+                lance_mem_wal_shard_snapshot_sstable_at(snapshot, index, &mut generation, &mut path)
+            },
+            0
+        );
+        assert!(!unsafe { CStr::from_ptr(path) }.to_bytes().is_empty());
+        max_generation = max_generation.max(generation);
+    }
+    assert!(max_generation > 0);
+    let mut compacted = LanceCompactedSsTable {
+        shard_id: [0; 16],
+        generation: 0,
+    };
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_compacted_sstable_new(
+                lance_mem_wal_shard_snapshot_shard_id(snapshot),
+                max_generation,
+                &mut compacted,
+            )
+        },
+        0
+    );
+
+    let mut scanner = ptr::null_mut();
+    let snapshots = [snapshot as *const LanceMemWalShardSnapshot];
+    assert_eq!(
+        unsafe {
+            lance_lsm_scanner_from_snapshots(ds, snapshots.as_ptr(), snapshots.len(), &mut scanner)
+        },
+        0
+    );
+    let filter = c_str("id = 2 OR id = 4");
+    assert_eq!(
+        unsafe { lance_lsm_scanner_filter(scanner, filter.as_ptr()) },
+        0
+    );
+    let mut source = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+    assert_eq!(
+        unsafe { lance_lsm_scanner_to_arrow_stream(scanner, source.as_mut_ptr()) },
+        0
+    );
+    let mut source = unsafe { source.assume_init() };
+    unsafe {
+        lance_lsm_scanner_free(scanner);
+        lance_mem_wal_shard_snapshot_free(snapshot);
+    }
+
+    let old = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let version = unsafe { lance_dataset_version(ds) };
     let on = c_str("id");
     let on_columns = [on.as_ptr()];
-    let source = mw_batch(&[2, 4], &[Some("bb"), Some("dd")], &[[0.0; 4], [0.0; 4]]);
     let params = LanceMergeInsertParams {
         when_matched: MW_MERGE_UPDATE_ALL,
         when_matched_expr: ptr::null(),
         when_not_matched: MW_MERGE_INSERT_ALL,
         when_not_matched_by_source: MW_MERGE_KEEP,
         when_not_matched_by_source_expr: ptr::null(),
-    };
-    let compacted = LanceCompactedSsTable {
-        shard_id: [0_u8; 16],
-        generation: 1,
     };
     let mut result = LanceMergeInsertResult::default();
     assert_eq!(
@@ -45775,7 +45849,7 @@ fn test_memwal_merge_insert_with_compaction() {
                 ds,
                 on_columns.as_ptr(),
                 on_columns.len(),
-                &mut batch_to_ffi_stream(source),
+                &mut source,
                 &params,
                 &compacted,
                 1,
@@ -45788,6 +45862,67 @@ fn test_memwal_merge_insert_with_compaction() {
     );
     assert_eq!(result.num_inserted_rows, 1);
     assert_eq!(result.num_updated_rows, 1);
+    assert_eq!(unsafe { lance_dataset_version(ds) }, version + 1);
+
+    // Inspect the persisted data and native progress from the same version.
+    lance_c::runtime::block_on(async {
+        use futures::TryStreamExt;
+        use lance::dataset::mem_wal::DatasetMemWalExt;
+
+        let reopened = Dataset::open(&uri).await.unwrap();
+        assert_eq!(reopened.version().version, version + 1);
+        let details = reopened.mem_wal_index_details().await.unwrap().unwrap();
+        assert_eq!(details.compacted_sstables.len(), 1);
+        assert_eq!(
+            details.compacted_sstables[0].shard_id.as_bytes(),
+            &compacted.shard_id
+        );
+        assert_eq!(details.compacted_sstables[0].generation, max_generation);
+
+        let batches = reopened
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), names.value(i).to_string())));
+        }
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a".into()),
+                (2, "bb".into()),
+                (3, "c".into()),
+                (4, "dd-final".into())
+            ]
+        );
+        assert_eq!(old.count_rows(None).await.unwrap(), 3);
+        assert!(
+            old.mem_wal_index_details()
+                .await
+                .unwrap()
+                .unwrap()
+                .compacted_sstables
+                .is_empty()
+        );
+    });
 
     // Empty compaction list behaves like the plain merge-insert entry point.
     let source = mw_batch(&[5], &[Some("ee")], &[[0.0; 4]]);
