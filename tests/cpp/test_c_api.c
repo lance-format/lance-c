@@ -6901,12 +6901,20 @@ static void test_dataset_deep_clone(const char *feature_uri) {
 
     LanceDatasetConfig *config = lance_dataset_config(snapshot);
     ASSERT(config != NULL, "deep clone target config read failed");
-    ASSERT(lance_dataset_config_count(config) == 1,
-           "deep clone target config count mismatch");
-    ASSERT(strcmp(lance_dataset_config_key_at(config, 0), "clone.owner") == 0,
-           "deep clone target config key mismatch");
-    ASSERT(strcmp(lance_dataset_config_value_at(config, 0), "native-c") == 0,
-           "deep clone target config value mismatch");
+    /* The legacy C write path adds the auto-cleanup policy, so the clone must
+       preserve every source key instead of a fixed count. */
+    const uint64_t config_count = lance_dataset_config_count(config);
+    ASSERT(config_count >= 1, "deep clone target config is empty");
+    bool found_owner = false;
+    for (uint64_t i = 0; i < config_count; i++) {
+        if (strcmp(lance_dataset_config_key_at(config, i), "clone.owner") == 0) {
+            ASSERT(strcmp(lance_dataset_config_value_at(config, i), "native-c") ==
+                       0,
+                   "deep clone target config value mismatch");
+            found_owner = true;
+        }
+    }
+    ASSERT(found_owner, "deep clone target lost the clone.owner config");
     lance_dataset_config_close(config);
     ASSERT(lance_dataset_index_count(snapshot) >= 1,
            "deep clone target lost the scalar index");
