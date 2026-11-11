@@ -1498,8 +1498,8 @@ static void test_blob_planned_reads(const char *blob_uri) {
         (((uint64_t)1) << 32) | 4,
         0,
     };
-    const size_t expected_sizes[] = {128, 128, 0, 0, 0, 8};
-    const size_t expected_seeds[] = {100, 0, 0, 0, 0, 0};
+    const size_t expected_sizes[] = {1024, 1024, 0, 0, 0, 8};
+    const size_t expected_seeds[] = {0, 0, 0, 0, 0, 0};
     const int expected_null[] = {0, 0, 0, 1, 1, 0};
 
     LanceBlobReadOptions options = {0};

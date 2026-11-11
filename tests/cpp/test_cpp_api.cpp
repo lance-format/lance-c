@@ -1226,7 +1226,7 @@ static void test_blob_planned_reads(const std::string& blob_uri) {
         (uint64_t{1} << 32) | 4,
         0,
     };
-    const size_t expected_sizes[] = {128, 128, 0, 0, 0, 8};
+    const size_t expected_sizes[] = {1024, 1024, 0, 0, 0, 8};
     const bool expected_null[] = {false, false, false, true, true, false};
     for (size_t row = 0; row < 6; ++row) {
         ArrowArray array{};
