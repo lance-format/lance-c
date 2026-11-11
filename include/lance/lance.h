@@ -1305,9 +1305,8 @@ LanceDataset* lance_dataset_checkout_ref(
  * `target_storage_options` is an existing storage-options accessor, or NULL.
  * Its native accessor Arc is forwarded into `ObjectStoreParams` without
  * resolving, snapshotting, or copying credentials, so a dynamic provider keeps
- * its refresh behavior. NULL passes native `None`; a non-NULL accessor that
- * holds static options and/or a provider contributes its native `Arc`, while
- * an accessor created with neither contributes native `None`.
+ * its refresh behavior. NULL passes native `None`; a non-NULL accessor is
+ * forwarded as `Some` even when it has no static options or provider.
  *
  * Files are copied and the target dataset is published by native Lance. The
  * out handle is written only on success. On failure the out parameter is
