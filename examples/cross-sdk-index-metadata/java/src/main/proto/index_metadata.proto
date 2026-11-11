@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+//
+// Field-for-field subset of protos/table.proto at Lance commit
+// 40f15ed1b71b66950961b175829fdf17a763f108. Keep IDs, types, presence, and
+// wire semantics identical to the authoritative schema.
+
+syntax = "proto3";
+
+package lance.table;
+
+option java_package = "org.lance.crosssdk.proto";
+option java_outer_classname = "IndexMetadataProto";
+
+import "google/protobuf/any.proto";
+
+message UUID {
+  bytes uuid = 1;
+}
+
+message IndexMetadata {
+  UUID uuid = 1;
+  repeated int32 fields = 2;
+  string name = 3;
+  uint64 dataset_version = 4;
+  bytes fragment_bitmap = 5;
+  google.protobuf.Any index_details = 6;
+  optional int32 index_version = 7;
+  optional uint64 created_at = 8;
+  optional uint32 base_id = 9;
+  repeated IndexFile files = 10;
+  repeated int32 covering_fields = 11;
+  optional uint32 clustering_id = 12;
+  map<string, string> metadata = 13;
+}
+
+message IndexFile {
+  string path = 1;
+  uint64 size_bytes = 2;
+}
