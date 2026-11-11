@@ -48,7 +48,7 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::minhash_lsh::MinHashQuery as NativeMinHashQuery;
 use lance_select::{RowAddrMask as NativeRowAddrMask, RowAddrTreeMap as NativeRowAddrTreeMap};
 
-use common::create_config_base_files_fixture;
+use common::{create_config_base_files_fixture, create_rtree_geometry_fixture};
 
 #[path = "support/substrait_aggregate.rs"]
 mod substrait_aggregate;
@@ -11387,6 +11387,391 @@ fn test_native_scalar_index_native_parameter_and_type_validation() {
 
     assert_eq!(unsafe { lance_dataset_index_count(ds) }, 0);
     unsafe { lance_dataset_close(ds) };
+}
+
+fn scan_geometry_ids(
+    dataset: *const LanceDataset,
+    filter: &str,
+    use_scalar_index: bool,
+) -> (Vec<i32>, CapturedScanStatistics, String) {
+    let filter = c_str(filter);
+    let id = c_str("id");
+    let columns = [id.as_ptr(), ptr::null()];
+    let scanner = unsafe { lance_scanner_new(dataset, columns.as_ptr(), filter.as_ptr()) };
+    assert!(!scanner.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(scanner, use_scalar_index) },
+        0
+    );
+
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+    let plan = take_scanner_string(unsafe { lance_scanner_explain_plan(scanner, false) });
+    let (_, batches) = collect_scanner(scanner);
+    let mut ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    unsafe { lance_scanner_close(scanner) };
+    (ids, captured, plan)
+}
+
+fn native_rtree_ids(uri: &str, filter: &str, use_scalar_index: bool) -> Vec<i32> {
+    let uri = uri.to_string();
+    let filter = filter.to_string();
+    lance_c::runtime::block_on(async move {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.filter(&filter).unwrap();
+        scanner.use_scalar_index(use_scalar_index);
+        scanner.project(&["id"]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut ids = batch["id"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    })
+}
+
+fn scan_used_rtree(stats: &CapturedScanStatistics) -> bool {
+    stats.indices_loaded > 0
+        || stats.metrics.iter().any(|(name, _, value)| {
+            name == "ScalarIndexExec_elapsed_compute"
+                || ((name == "index_cache_hits" || name == "index_cache_misses") && *value > 0)
+        })
+}
+
+#[test]
+fn test_rtree_scalar_index_geometry_queries_and_lifecycle() {
+    assert_eq!(LanceScalarIndexType::RTree as i32, 9);
+    let fixture = create_rtree_geometry_fixture();
+    let uri = fixture.uri.as_str();
+    let uri_c = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_fragment_count(dataset) }, 3);
+
+    let geometry = c_str("geometry");
+    let index_name = c_str("geometry_rtree");
+
+    let invalid_page_size = c_str(r#"{"page_size":1}"#);
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                geometry.as_ptr(),
+                c_str("bad_rtree_page_size").as_ptr(),
+                LanceScalarIndexType::RTree as i32,
+                invalid_page_size.as_ptr(),
+                false,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("page_size must be at least 2"),
+        "{message}"
+    );
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                c_str("id").as_ptr(),
+                c_str("bad_rtree_schema").as_ptr(),
+                LanceScalarIndexType::RTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::IndexError);
+    let message = take_last_error_message();
+    assert!(
+        message.contains("Construct GeoArrowArray from an Arrow Array failed"),
+        "{message}"
+    );
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                geometry.as_ptr(),
+                c_str("empty_params_rtree").as_ptr(),
+                LanceScalarIndexType::RTree as i32,
+                c_str("").as_ptr(),
+                false,
+            )
+        },
+        0,
+        "empty params must retain native default handling: {}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_drop_index(dataset, c_str("empty_params_rtree").as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ptr::null_mut(),
+                geometry.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::RTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("dataset and column must not be NULL"),
+        "NULL dataset must fail at the FFI boundary"
+    );
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                c_str("").as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::RTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("column must not be empty"),
+        "empty column must fail at the FFI boundary"
+    );
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                geometry.as_ptr(),
+                index_name.as_ptr(),
+                LanceScalarIndexType::RTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 1);
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+
+    let list = take_scanner_string(unsafe { lance_dataset_index_list_json(dataset) });
+    let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+    let entry = &list.as_array().unwrap()[0];
+    assert_eq!(entry["name"], "geometry_rtree");
+    assert_eq!(entry["type"], "RTree");
+    assert_eq!(entry["columns"], serde_json::json!(["geometry"]));
+
+    let segments = take_scanner_string(unsafe { lance_dataset_index_segments_json(dataset) });
+    let segments: serde_json::Value = serde_json::from_str(&segments).unwrap();
+    let entry = &segments.as_array().unwrap()[0];
+    assert_eq!(entry["name"], "geometry_rtree");
+    assert_eq!(entry["type"], "RTree");
+    assert_eq!(entry["fragment_ids"], serde_json::json!([0, 1, 2]));
+
+    let fragment_id = 0_u32;
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &fragment_id,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let page_size = c_str(r#"{"page_size":4}"#);
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            geometry.as_ptr(),
+            c_str("worker_geometry_rtree").as_ptr(),
+            LanceScalarIndexType::RTree as i32,
+            page_size.as_ptr(),
+            &options,
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    let mut bytes = ptr::null_mut();
+    let mut len = 0_usize;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_index_type(metadata) },
+        LanceScalarIndexType::RTree as i32
+    );
+    let type_url = unsafe {
+        CStr::from_ptr(lance_index_segment_metadata_index_details_type_url(
+            metadata,
+        ))
+    }
+    .to_str()
+    .unwrap();
+    assert!(type_url.ends_with("RTreeIndexDetails"), "{type_url}");
+    unsafe {
+        lance_index_segment_metadata_free(metadata);
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+    }
+
+    let queries = [
+        (
+            "ST_Intersects(geometry, ST_GeomFromText('POINT (0 10)'))",
+            vec![101, 114],
+        ),
+        (
+            "ST_Intersects(geometry, ST_GeomFromText('LINESTRING (25 25, 26 26)'))",
+            vec![106],
+        ),
+        (
+            "ST_Intersects(geometry, ST_GeomFromText('POINT (0 0)'))",
+            vec![100],
+        ),
+        ("geometry IS NULL", vec![103, 108]),
+    ];
+    for (filter, expected) in &queries {
+        let (ids, stats, plan) = scan_geometry_ids(dataset, filter, true);
+        assert_eq!(&ids, expected, "{filter}");
+        assert!(
+            scan_used_rtree(&stats),
+            "RTree execution metrics missing for {filter}: {:?}",
+            stats.metrics
+        );
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "index plan missing for {filter}: {plan}"
+        );
+        assert_eq!(&native_rtree_ids(uri, filter, true), expected, "{filter}");
+        assert_eq!(
+            &native_rtree_ids(uri, filter, false),
+            expected,
+            "native unindexed oracle: {filter}"
+        );
+
+        let (ids, stats, plan) = scan_geometry_ids(dataset, filter, false);
+        assert_eq!(&ids, expected, "disabled scalar index: {filter}");
+        assert_eq!(
+            stats.indices_loaded, 0,
+            "disabled scalar index loaded an RTree for {filter}"
+        );
+        assert!(
+            !plan.contains("ScalarIndexQuery"),
+            "disabled scalar index plan contains an index query for {filter}: {plan}"
+        );
+    }
+
+    assert_eq!(
+        unsafe { lance_dataset_prewarm_index(dataset, index_name.as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    let (ids, stats, _) = scan_geometry_ids(
+        reopened,
+        "ST_Intersects(geometry, ST_GeomFromText('LINESTRING (25 25, 26 26)'))",
+        true,
+    );
+    assert_eq!(ids, vec![106]);
+    assert!(stats.indices_loaded > 0);
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                reopened,
+                geometry.as_ptr(),
+                index_name.as_ptr(),
+                LanceScalarIndexType::RTree as i32,
+                c_str(r#"{"page_size":8}"#).as_ptr(),
+                true,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(reopened) }, 1);
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(reopened, index_name.as_ptr()) },
+        1
+    );
+    let (ids, stats, _) = scan_geometry_ids(
+        reopened,
+        "ST_Intersects(geometry, ST_GeomFromText('POINT (0 10)'))",
+        true,
+    );
+    assert_eq!(ids, vec![101, 114]);
+    assert!(stats.indices_loaded > 0);
+
+    assert_eq!(
+        unsafe { lance_dataset_drop_index(reopened, index_name.as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(reopened) }, 0);
+    unsafe { lance_dataset_close(reopened) };
 }
 
 #[test]
@@ -31637,6 +32022,84 @@ fn test_scalar_segment_zonemap_and_bloom_filter_fall_back() {
                     .any(|(name, _, value)| { name == "scalar_segments_searched" && *value != 0 })
             );
         }
+    }
+}
+
+#[test]
+fn test_scalar_segment_rtree_falls_back_with_scope_and_full_filter() {
+    let fixture = create_rtree_geometry_fixture();
+    let uri_c = c_str(&fixture.uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let geometry = c_str("geometry");
+    let index_name = c_str("geometry_rtree");
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                geometry.as_ptr(),
+                index_name.as_ptr(),
+                LanceScalarIndexType::RTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut uuid = [0_u8; 16];
+    let mut segment_count = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                uuid.as_mut_ptr(),
+                1,
+                &mut segment_count,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(segment_count, 1);
+    unsafe { lance_dataset_close(dataset) };
+
+    let point = "ST_Intersects(geometry, ST_GeomFromText('POINT (0 10)'))";
+    for (fragments, filter, expected) in [
+        (vec![0], point, vec![101]),
+        (vec![0, 1, 2], point, vec![101, 114]),
+        (
+            vec![0],
+            "ST_Intersects(geometry, ST_GeomFromText('POINT (0 10)')) AND id = 114",
+            vec![],
+        ),
+        (
+            vec![1],
+            "ST_Intersects(geometry, ST_GeomFromText('LINESTRING (25 25, 26 26)'))",
+            vec![106],
+        ),
+    ] {
+        let (mut ids, stats) = scalar_segment_ids(&fixture.uri, &uuid, &fragments, filter, None, 0);
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "{fragments:?}: {filter}");
+        assert!(
+            stats.metrics.iter().any(|(name, _, value)| name
+                == "scalar_segment_fallback_index_type"
+                && *value == 1),
+            "{fragments:?}: {filter}: {:?}",
+            stats.metrics
+        );
+        assert!(
+            !stats
+                .metrics
+                .iter()
+                .any(|(name, _, value)| name == "scalar_segments_searched" && *value != 0),
+            "RTree must not be treated as an exact scalar segment: {:?}",
+            stats.metrics
+        );
     }
 }
 
