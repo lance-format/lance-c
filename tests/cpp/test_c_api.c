@@ -6475,6 +6475,149 @@ static void test_fragment_read_operations(const char *uri) {
     printf("OK\n");
 }
 
+static void test_clone_handle(const char *uri) {
+    printf("  test_clone_handle... ");
+
+    LanceDataset *missing = lance_dataset_clone_handle(NULL);
+    ASSERT(missing == NULL, "clone_handle(NULL) must return NULL");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "clone_handle(NULL) must report INVALID_ARGUMENT");
+    const char *message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "dataset is NULL") != NULL,
+           "clone_handle(NULL) must name the NULL dataset");
+    lance_free_string(message);
+
+    LanceDataset *source = lance_dataset_open(uri, NULL, 0);
+    ASSERT(source != NULL, "clone source open failed");
+    CHECK_OK();
+    const uint64_t source_version = lance_dataset_version(source);
+    CHECK_OK();
+    ASSERT(source_version == 3, "unexpected clone fixture version");
+    ASSERT(lance_dataset_count_rows(source) == 6,
+           "unexpected clone fixture row count");
+    CHECK_OK();
+
+    bool stable_row_ids = false;
+    ASSERT(lance_dataset_has_stable_row_ids(source, &stable_row_ids) == 0,
+           "clone source stable-row-ID inspection failed");
+    CHECK_OK();
+    ASSERT(stable_row_ids, "clone fixture must use stable row IDs");
+
+    uint64_t fragments[2] = {0, 0};
+    ASSERT(lance_dataset_fragment_ids(source, fragments) == 0,
+           "clone source fragment enumeration failed");
+    CHECK_OK();
+    ASSERT(fragments[0] != fragments[1],
+           "clone fixture must have two fragments");
+
+    LanceDataset *clone = lance_dataset_clone_handle(source);
+    ASSERT(clone != NULL, "clone_handle failed");
+    CHECK_OK();
+    ASSERT(clone != source, "clone_handle must return a distinct handle");
+    ASSERT(lance_dataset_version(clone) == source_version,
+           "clone must start at the source version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(clone) == 6,
+           "clone must start with the source rows");
+    CHECK_OK();
+
+    struct ArrowSchema schema = {0};
+    ASSERT(lance_dataset_schema(source, &schema) == 0,
+           "clone source schema export failed");
+    CHECK_OK();
+    ASSERT(schema.n_children == 3, "unexpected clone fixture schema");
+    schema.release(&schema);
+
+    uint64_t deleted = 0;
+    ASSERT(lance_dataset_delete(clone, "id = 2", &deleted) == 0,
+           "clone delete failed");
+    CHECK_OK();
+    ASSERT(deleted == 1, "clone delete must remove one row");
+    const uint64_t clone_version = source_version + 1;
+    ASSERT(lance_dataset_version(clone) == clone_version,
+           "clone must advance its own version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(clone) == 5,
+           "clone must reflect its mutation");
+    CHECK_OK();
+
+    ASSERT(lance_dataset_version(source) == source_version,
+           "source version must not follow the clone");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(source) == 6,
+           "source row count must not follow the clone");
+    CHECK_OK();
+
+    const uint64_t all_indices[] = {0, 1, 2, 3, 4, 5};
+    const int32_t expected_source[] = {0, 2, 3, 10, 11, 13};
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_dataset_take(source, all_indices, 6, NULL, &stream) == 0,
+           "source take after clone mutation failed");
+    CHECK_OK();
+    check_fragment_take_ids(
+        &stream, "source rows and schema after clone mutation",
+        expected_source, 6, 0);
+
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(source, &schema) == 0,
+           "source schema after clone mutation failed");
+    CHECK_OK();
+    ASSERT(schema.n_children == 3,
+           "source schema must not follow the clone");
+    schema.release(&schema);
+
+    const uint64_t clone_indices[] = {0, 1, 2, 3, 4};
+    const int32_t expected_clone[] = {0, 3, 10, 11, 13};
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_take(clone, clone_indices, 5, NULL, &stream) == 0,
+           "clone take after delete failed");
+    CHECK_OK();
+    check_fragment_take_ids(
+        &stream, "clone rows after delete", expected_clone, 5, 0);
+
+    /* Closing the source first must leave the clone fully usable. */
+    lance_dataset_close(source);
+    ASSERT(lance_dataset_version(clone) == clone_version,
+           "clone version after source close");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(clone) == 5,
+           "clone rows after source close");
+    CHECK_OK();
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_take(clone, clone_indices, 5, NULL, &stream) == 0,
+           "clone take after source close failed");
+    CHECK_OK();
+    check_fragment_take_ids(
+        &stream, "clone data after source close", expected_clone, 5, 0);
+    lance_dataset_close(clone);
+
+    /* Closing the clone first must leave a reopened source fully usable. */
+    source = lance_dataset_open(uri, NULL, 0);
+    ASSERT(source != NULL, "clone source reopen failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(source) == clone_version,
+           "reopened source must observe the committed clone mutation");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(source) == 5,
+           "reopened source row count after clone mutation");
+    CHECK_OK();
+
+    clone = lance_dataset_clone_handle(source);
+    ASSERT(clone != NULL, "second clone_handle failed");
+    CHECK_OK();
+    lance_dataset_close(clone);
+    ASSERT(lance_dataset_version(source) == clone_version,
+           "source version after clone close");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(source) == 5,
+           "source rows after clone close");
+    CHECK_OK();
+    lance_dataset_close(source);
+    lance_dataset_close(NULL);
+
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -6515,6 +6658,7 @@ int main(int argc, char **argv) {
     test_scanner_substrait_aggregate(ordering_uri, aggregate_plan_path);
     test_fragment_snapshot(fragment_uri);
     test_fragment_read_operations(fragment_read_uri);
+    test_clone_handle(fragment_read_uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_blob_native_read_slice(blob_uri);

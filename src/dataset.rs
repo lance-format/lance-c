@@ -190,6 +190,40 @@ unsafe fn open_dataset_inner(
     Ok(Box::into_raw(Box::new(handle)))
 }
 
+/// Clone a dataset handle as an independent in-memory snapshot.
+///
+/// The returned handle is backed by the same `Arc<Dataset>` snapshot as
+/// `dataset`, but has its own lock. Mutating either handle therefore does not
+/// change the other's version, schema, or rows, and does not hold the other
+/// handle's lock. Cloning performs no storage I/O and does not create a new
+/// session, object-store registry, or cache.
+///
+/// This is in-memory handle duplication, not Lance's on-disk shallow or deep
+/// clone. Close the returned handle with `lance_dataset_close`; the source and
+/// clone may be closed in either order.
+///
+/// Returns NULL with `LANCE_ERR_INVALID_ARGUMENT` when `dataset` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_clone_handle(
+    dataset: *const LanceDataset,
+) -> *mut LanceDataset {
+    ffi_try!(unsafe { dataset_clone_handle_inner(dataset) }, null)
+}
+
+unsafe fn dataset_clone_handle_inner(dataset: *const LanceDataset) -> Result<*mut LanceDataset> {
+    if dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
+    }
+    let dataset = unsafe { &*dataset };
+    let snapshot = dataset.snapshot();
+    let handle = LanceDataset {
+        inner: RwLock::new(snapshot),
+    };
+    Ok(Box::into_raw(Box::new(handle)))
+}
+
 /// Close and free a dataset handle.
 /// Safe to call with NULL. A non-NULL handle must be closed exactly once and
 /// must not be used again afterwards.
@@ -710,8 +744,21 @@ unsafe fn dataset_fragment_ids_inner(
 mod tests {
     use super::*;
 
+    use std::sync::mpsc;
+    use std::thread;
+
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+
+    /// Unblock a scoped writer even if an assertion panics before the test
+    /// reaches its explicit release point.
+    struct ReleaseOnDrop(mpsc::Sender<()>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
 
     /// Build a real 3-row dataset in a tempdir and wrap it in a handle.
     /// (The default panic hook prints to stderr during the panic test; that
@@ -756,6 +803,64 @@ mod tests {
         let snap = handle.snapshot();
         assert_eq!(snap.version().version, 2);
         assert_eq!(block_on(snap.count_rows(None)).unwrap(), 2);
+    }
+
+    #[test]
+    fn clone_handle_shares_snapshot_without_sharing_lock() {
+        let (_tmp, handle) = create_test_handle();
+        let source_snapshot = handle.snapshot();
+
+        let clone_ptr = unsafe { lance_dataset_clone_handle(&handle) };
+        assert!(!clone_ptr.is_null());
+        assert!(!std::ptr::eq(
+            clone_ptr as *const LanceDataset,
+            &handle as *const LanceDataset
+        ));
+        let cloned = unsafe { &*clone_ptr };
+
+        // The clone must reuse the exact native snapshot instead of reopening
+        // the dataset (which would create a new Arc and perform storage I/O).
+        let cloned_snapshot = cloned.snapshot();
+        assert!(Arc::ptr_eq(&source_snapshot, &cloned_snapshot));
+        assert_eq!(
+            cloned_snapshot.version().version,
+            source_snapshot.version().version
+        );
+
+        // Hold the clone's exclusive mutation lock at a controlled point, then
+        // prove the source handle can still be read. try_read is deterministic:
+        // a shared lock fails immediately instead of hanging the test.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                cloned.with_mut(|ds| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    block_on(ds.delete("id = 1")).unwrap()
+                })
+            });
+
+            let release = ReleaseOnDrop(release_tx);
+            entered_rx.recv().unwrap();
+            let source_guard = handle
+                .inner
+                .try_read()
+                .expect("source read must not wait for a cloned handle mutation");
+            assert_eq!(source_guard.version().version, 1);
+            assert_eq!(block_on(source_guard.count_rows(None)).unwrap(), 3);
+            drop(source_guard);
+
+            drop(release);
+            assert_eq!(writer.join().unwrap().num_deleted_rows, 1);
+        });
+
+        // The clone advanced independently; the source snapshot did not.
+        assert_eq!(cloned.snapshot().version().version, 2);
+        assert_eq!(handle.snapshot().version().version, 1);
+        assert_eq!(block_on(handle.snapshot().count_rows(None)).unwrap(), 3);
+
+        unsafe { lance_dataset_close(clone_ptr) };
     }
 
     #[test]
