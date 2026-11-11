@@ -3288,8 +3288,8 @@ static void test_rtree_scalar_index(const std::string& uri) {
         R"({"page_size":8})", true);
     assert(reopened.index_count() == 1);
     ScanStatisticsCapture stats;
-    assert(scan_rtree_ids(uri, point_filter, true, stats) ==
-           std::vector<int32_t>{101, 114});
+    assert((scan_rtree_ids(uri, point_filter, true, stats) ==
+            std::vector<int32_t>{101, 114}));
     assert(stats.indices_loaded > 0);
     reopened.drop_index("cpp_geometry_rtree");
     assert(reopened.index_count() == 0);
