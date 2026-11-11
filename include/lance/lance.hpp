@@ -9485,19 +9485,19 @@ inline Table LsmScanner::to_table() const {
 }
 
 inline ArrowSchemaOwner ExecutionPlan::schema() const {
-    ArrowSchemaOwner owner;
-    if (lance_mem_wal_plan_schema(handle_.get(), owner.get()) != 0) {
+    ArrowSchema raw{};
+    if (lance_mem_wal_plan_schema(handle_.get(), &raw) != 0) {
         check_error();
     }
-    return owner;
+    return ArrowSchemaOwner(raw);
 }
 
 inline ArrowSchemaOwner ExecutionPlan::dataset_schema() const {
-    ArrowSchemaOwner owner;
-    if (lance_mem_wal_plan_dataset_schema(handle_.get(), owner.get()) != 0) {
+    ArrowSchema raw{};
+    if (lance_mem_wal_plan_dataset_schema(handle_.get(), &raw) != 0) {
         check_error();
     }
-    return owner;
+    return ArrowSchemaOwner(raw);
 }
 
 inline Batch ExecutionPlan::to_batch() const {
