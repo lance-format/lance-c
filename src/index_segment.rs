@@ -1618,7 +1618,7 @@ unsafe fn commit_index_segments_inner(
     }
     let bytes_array = unsafe { slice::from_raw_parts(segment_metadata_bytes, segment_count) };
     let lens_array = unsafe { slice::from_raw_parts(segment_metadata_lens, segment_count) };
-    let mut segments = Vec::with_capacity(segment_count);
+    let mut segments = Vec::new();
     for (position, (&bytes, &len)) in bytes_array.iter().zip(lens_array.iter()).enumerate() {
         if bytes.is_null() || len == 0 {
             return Err(invalid_input(format!(
