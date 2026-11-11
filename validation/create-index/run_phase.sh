@@ -47,7 +47,8 @@ clippy)
 focused)
     failed=0
     run metadata-clone cargo +1.94.0 test --locked --lib \
-        metadata_clone_preserves_in_memory_optionals_without_protobuf -- --exact || failed=1
+        index_segment::tests::metadata_clone_preserves_in_memory_optionals_without_protobuf \
+        -- --exact || failed=1
     run metadata-inspection cargo +1.94.0 test --locked --test c_api_test \
         test_index_metadata_complete_inspection_clone_and_native_oracle -- --exact || failed=1
     run constructor cargo +1.94.0 test --locked --test c_api_test \
