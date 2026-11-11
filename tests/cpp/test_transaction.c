@@ -1556,6 +1556,14 @@ static void release_publication_array_leaf(struct ArrowArray *array) {
     if (array) array->release = NULL;
 }
 
+static void release_publication_ids(struct ArrowArray *array) {
+    if (!array || !array->release) return;
+    free((void *)array->buffers[1]);
+    free((void *)array->buffers);
+    array->buffers = NULL;
+    array->release = NULL;
+}
+
 static void release_publication_schema(struct ArrowSchema *schema) {
     if (!schema || !schema->release) return;
     for (int64_t i = 0; i < schema->n_children; i++) {
@@ -1573,9 +1581,12 @@ static void release_publication_array(struct ArrowArray *array) {
     for (int64_t i = 0; i < array->n_children; i++) {
         struct ArrowArray *child = array->children[i];
         if (child && child->release) child->release(child);
+        free(child);
     }
     free(array->children);
+    free((void *)array->buffers);
     array->children = NULL;
+    array->buffers = NULL;
     array->n_children = 0;
     array->release = NULL;
 }
@@ -1605,23 +1616,28 @@ static void write_publication_batch(
     const struct ArrowSchema *schema) {
     ASSERT(blob_array->length == row_count,
            "descriptor row count must match replacement rows");
-    static const void *id_buffers[2];
-    id_buffers[0] = NULL;
-    id_buffers[1] = ids;
-    struct ArrowArray id_array;
-    memset(&id_array, 0, sizeof(id_array));
-    id_array.length = row_count;
-    id_array.n_buffers = 2;
-    id_array.buffers = id_buffers;
-    id_array.release = release_publication_array_leaf;
+    struct ArrowArray *id_array = calloc(1, sizeof(*id_array));
+    const void **id_buffers = calloc(2, sizeof(*id_buffers));
+    uint32_t *id_values = malloc((size_t)row_count * sizeof(*id_values));
+    struct ArrowArray *owned_blob_array = malloc(sizeof(*owned_blob_array));
+    ASSERT(id_array && id_buffers && id_values && owned_blob_array,
+           "allocate owned replacement inputs");
+    memcpy(id_values, ids, (size_t)row_count * sizeof(*id_values));
+    id_buffers[1] = id_values;
+    id_array->length = row_count;
+    id_array->n_buffers = 2;
+    id_array->buffers = id_buffers;
+    id_array->release = release_publication_ids;
+    *owned_blob_array = *blob_array;
+    blob_array->release = NULL;
 
     struct ArrowArray **children =
         (struct ArrowArray **)calloc(2, sizeof(*children));
     ASSERT(children != NULL, "allocate replacement array children");
-    children[0] = &id_array;
-    children[1] = blob_array;
-    static const void *root_buffers[1];
-    root_buffers[0] = NULL;
+    children[0] = id_array;
+    children[1] = owned_blob_array;
+    const void **root_buffers = calloc(1, sizeof(*root_buffers));
+    ASSERT(root_buffers != NULL, "allocate replacement root buffers");
     struct ArrowArray root;
     memset(&root, 0, sizeof(root));
     root.length = row_count;
@@ -1648,6 +1664,8 @@ static LanceFileWriter *open_publication_writer(
     LanceFileWriterOptions options;
     memset(&options, 0, sizeof(options));
     options.version = "2.2";
+    options.has_keep_original_array = 1;
+    options.keep_original_array = 1;
     LanceFileWriter *writer =
         lance_file_session_open_writer(session, filename, schema, &options);
     ASSERT(writer != NULL, "open publication raw writer");

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -796,16 +797,26 @@ void publication_release_array(ArrowArray* array) {
     if (array) array->release = nullptr;
 }
 
-/// Root release callback for the stack-built replacement record batches.
-/// The root owns the child arrays, so releasing the root must release each
-/// child once (notably the prepared descriptor array from the blob writer).
+struct PublicationBatchData {
+    std::vector<uint32_t> ids;
+    std::array<const void*, 2> id_buffers{};
+    ArrowArray id_array{};
+    ArrowArray blob_array{};
+    std::array<ArrowArray*, 2> children{};
+    std::array<const void*, 1> root_buffers{};
+};
+
+/// The native writer may retain the input after write_batch returns.
+/// Its Arrow owner releases these headers and buffers together.
 void publication_release_root_array(ArrowArray* array) {
-    if (!array) return;
+    if (!array || !array->release) return;
+    array->release = nullptr;
     for (int64_t i = 0; i < array->n_children; ++i) {
         ArrowArray* child = array->children[i];
         if (child && child->release) child->release(child);
     }
-    array->release = nullptr;
+    delete static_cast<PublicationBatchData*>(array->private_data);
+    array->private_data = nullptr;
 }
 
 struct PublicationRow {
@@ -939,26 +950,29 @@ void write_blob_replacement_file(
     lance::FileSession files("file://" + uri + "/data");
     lance::FileWriterOptions options;
     options.version = std::string("2.2");
+    options.keep_original_array = true;
     auto writer = files.open_writer(filename, &root_schema, options);
 
     uint64_t written = 0;
     for (const auto& replacement : batches) {
-        const void* id_buffers[2] = {nullptr, replacement.ids.data()};
-        ArrowArray id_array{};
-        id_array.length = static_cast<int64_t>(replacement.ids.size());
-        id_array.n_buffers = 2;
-        id_array.buffers = id_buffers;
-        id_array.release = &publication_release_array;
-
-        ArrowArray* array_children[2] = {&id_array, replacement.blob_array};
-        const void* root_buffers[1] = {nullptr};
+        auto data = std::make_unique<PublicationBatchData>();
+        data->ids = replacement.ids;
+        data->id_buffers = {nullptr, data->ids.data()};
+        data->id_array.length = static_cast<int64_t>(data->ids.size());
+        data->id_array.n_buffers = 2;
+        data->id_array.buffers = data->id_buffers.data();
+        data->id_array.release = &publication_release_array;
+        data->blob_array = *replacement.blob_array;
+        replacement.blob_array->release = nullptr;
+        data->children = {&data->id_array, &data->blob_array};
         ArrowArray root_array{};
-        root_array.length = static_cast<int64_t>(replacement.ids.size());
+        root_array.length = static_cast<int64_t>(data->ids.size());
         root_array.n_buffers = 1;
-        root_array.buffers = root_buffers;
+        root_array.buffers = data->root_buffers.data();
         root_array.n_children = 2;
-        root_array.children = array_children;
+        root_array.children = data->children.data();
         root_array.release = &publication_release_root_array;
+        root_array.private_data = data.release();
 
         auto batch = lance::Batch::from_arrow(&root_array, &root_schema);
         writer.write_batch(batch);

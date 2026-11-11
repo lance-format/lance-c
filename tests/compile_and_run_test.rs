@@ -1242,7 +1242,12 @@ fn test_native_transaction_compilation_and_execution() {
     );
     run_test_binary_with_args(
         &cpp_binary,
-        &[&dataset_uri, base, &cpp_schema_uri, &cpp_blob_publication_uri],
+        &[
+            &dataset_uri,
+            base,
+            &cpp_schema_uri,
+            &cpp_blob_publication_uri,
+        ],
     );
 }
 

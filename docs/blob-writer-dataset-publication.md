@@ -53,37 +53,19 @@ The C API follows the same sequence with `lance_file_session_open_*`,
 
 ### C11 caller notes
 
-A C11 caller performs the publication explicitly:
-
-```c
-LanceFileSession *session = lance_file_session_new(data_uri, NULL, NULL, NULL);
-LancePackedBlobWriter *writer =
-    lance_file_session_open_packed_blob_writer(session, data_file_name, blob_id);
-lance_packed_blob_writer_write_blobs(writer, &payload_array, &payload_schema);
-lance_packed_blob_writer_finish_array(
-    writer, "blob", &descriptor_array, &descriptor_schema);
-lance_packed_blob_writer_close(writer);
-
-/* Build id + descriptor_array as one top-level struct batch. */
-lance_batch_from_arrow(&top_array, &top_schema, &batch);
-lance_file_writer_write_batch(raw_writer, batch);
-
-lance_dataset_create_data_file(dataset, data_file_name, NULL, &data_file);
-lance_data_replacement_group_new(fragment_id, data_file);
-lance_operation_data_replacement_new(groups, group_count);
-lance_transaction_new(dataset_version, operation, NULL);
-lance_transaction_commit(dataset_uri, transaction, commit_options, NULL, NULL,
-                         &committed);
-```
+The complete C11 example is `test_blob_writer_publication` in the
+[native transaction consumer](../tests/cpp/test_transaction.c). It finishes the
+raw writer before creating the `DataFile`, then constructs the replacement
+operation and commits through the existing transaction APIs. The
+[C++17 consumer](../tests/cpp/test_transaction.cpp) follows the same workflow.
 
 `lance_batch_from_arrow` consumes the top-level array, including the prepared
 descriptor child; do not close or release that child again. The top-level
-schema borrows the prepared descriptor field. `lance_*_finish_array` writes
+schema is borrowed by `lance_batch_from_arrow`; the caller retains ownership
+of that schema and the prepared descriptor field. `lance_*_finish_array` writes
 the sidecar before it returns, so the raw data file must use the same relative
 name and a compatible file version. `lance_dataset_create_data_file` and the
-subsequent transaction calls are the only publication step. A C and a C++
-consumer should publish against separate dataset snapshots rather than reuse
-one language's replacement output as the other's expected fixture.
+subsequent transaction calls are the only publication step.
 
 ## File layout and replacement rules
 
