@@ -28498,6 +28498,1136 @@ fn test_compact_out_metrics_untouched_on_error() {
     assert_eq!(out, sentinel, "out slot must be untouched on error");
 }
 
+#[test]
+fn test_legacy_compaction_options_layout_is_frozen() {
+    assert_eq!(std::mem::size_of::<LanceCompactionOptions>(), 40);
+    assert_eq!(
+        std::mem::offset_of!(LanceCompactionOptions, target_rows_per_fragment),
+        0
+    );
+    assert_eq!(
+        std::mem::offset_of!(LanceCompactionOptions, max_rows_per_group),
+        8
+    );
+    assert_eq!(
+        std::mem::offset_of!(LanceCompactionOptions, max_bytes_per_file),
+        16
+    );
+    assert_eq!(
+        std::mem::offset_of!(LanceCompactionOptions, num_threads),
+        24
+    );
+    assert_eq!(std::mem::offset_of!(LanceCompactionOptions, batch_size), 32);
+}
+
+fn set_native_dataset_config(uri: &str, entries: &[(&str, &str)]) {
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        dataset
+            .update_config(entries.iter().copied())
+            .await
+            .unwrap();
+    });
+}
+
+fn compaction_plan_json(plan: *const LanceCompactionPlan) -> serde_json::Value {
+    let json = unsafe { lance_compaction_plan_json(plan) };
+    assert!(!json.is_null(), "{}", take_last_error_message());
+    serde_json::from_str(&take_c_owned_string(json)).unwrap()
+}
+
+fn compaction_task_fragment_ids(task: *const LanceCompactionTask) -> Vec<u64> {
+    let count = unsafe { lance_compaction_task_fragment_count(task) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    (0..count)
+        .map(|index| {
+            let json = unsafe { lance_compaction_task_fragment_metadata_json_at(task, index) };
+            assert!(!json.is_null(), "{}", take_last_error_message());
+            let value: serde_json::Value =
+                serde_json::from_str(&take_c_owned_string(json)).unwrap();
+            value["id"].as_u64().unwrap()
+        })
+        .collect()
+}
+
+fn plan_source_fragment_ids(plan: *const LanceCompactionPlan) -> Vec<u64> {
+    let count = unsafe { lance_compaction_plan_task_count(plan) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut ids = Vec::new();
+    for index in 0..count {
+        let task = unsafe { lance_compaction_plan_task_at(plan, index) };
+        assert!(!task.is_null(), "{}", take_last_error_message());
+        ids.extend(compaction_task_fragment_ids(task));
+        unsafe { lance_compaction_task_close(task) };
+    }
+    ids
+}
+
+fn dataset_fragment_ids(dataset: *const LanceDataset) -> Vec<u32> {
+    let count = unsafe { lance_dataset_fragment_count(dataset) } as usize;
+    let mut ids = vec![0_u32; count];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, ids.as_mut_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    ids
+}
+
+fn indexed_fragment_ids(dataset: *const LanceDataset) -> std::collections::BTreeSet<u32> {
+    let json = unsafe { lance_dataset_index_segments_json(dataset) };
+    assert!(!json.is_null(), "{}", take_last_error_message());
+    let segments: serde_json::Value = serde_json::from_str(&take_c_owned_string(json)).unwrap();
+    segments
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|segment| {
+            segment["fragment_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|id| u32::try_from(id.as_u64().unwrap()).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn test_compaction_options_v2_config_defaults_and_presence() {
+    let (_tmp, uri) = create_many_small_fragments(4);
+    set_native_dataset_config(
+        &uri,
+        &[
+            ("lance.compaction.target_rows_per_fragment", "2"),
+            ("lance.compaction.max_rows_per_group", "7"),
+            ("lance.compaction.max_bytes_per_file", "4096"),
+            ("lance.compaction.materialize_deletions", "false"),
+            ("lance.compaction.materialize_deletions_threshold", "0.25"),
+            ("lance.compaction.defer_index_remap", "true"),
+            ("lance.compaction.index_remap_mode", "compact"),
+            ("lance.compaction.compaction_mode", "try_binary_copy"),
+            ("lance.compaction.max_source_fragments", "3"),
+            ("lance.compaction.max_overlays_per_fragment", "none"),
+            ("lance.compaction.data_storage_version", "2.1"),
+        ],
+    );
+
+    let c_uri = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let fragment_ids = dataset_fragment_ids(dataset);
+    assert_eq!(fragment_ids.len(), 4);
+
+    let configured = unsafe { lance_compaction_options_v2_from_dataset(dataset) };
+    assert!(!configured.is_null(), "{}", take_last_error_message());
+    let configured_plan = unsafe { lance_dataset_plan_compaction(dataset, configured) };
+    assert!(!configured_plan.is_null(), "{}", take_last_error_message());
+    let configured_json = compaction_plan_json(configured_plan);
+    let configured_options = &configured_json["options"];
+    assert_eq!(
+        configured_options["target_rows_per_fragment"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(configured_options["max_rows_per_group"].as_u64(), Some(7));
+    assert_eq!(
+        configured_options["max_bytes_per_file"].as_u64(),
+        Some(4096)
+    );
+    assert_eq!(
+        configured_options["materialize_deletions"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        configured_options["materialize_deletions_threshold"].as_f64(),
+        Some(0.25)
+    );
+    assert_eq!(
+        configured_options["defer_index_remap"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        configured_options["index_remap_mode"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase(),
+        "compact"
+    );
+    assert_eq!(
+        configured_options["compaction_mode"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase(),
+        "trybinarycopy"
+    );
+    assert_eq!(configured_options["max_source_fragments"].as_u64(), Some(3));
+    assert!(configured_options["max_overlays_per_fragment"].is_null());
+    assert_eq!(
+        configured_options["data_storage_version"].as_str(),
+        Some("2.1")
+    );
+    assert_eq!(configured_json["tasks"].as_array().unwrap().len(), 3);
+    assert_eq!(plan_source_fragment_ids(configured_plan).len(), 3);
+
+    let defaults = unsafe { lance_compaction_options_v2_new() };
+    assert!(!defaults.is_null(), "{}", take_last_error_message());
+    let defaults_plan = unsafe { lance_dataset_plan_compaction(dataset, defaults) };
+    assert!(!defaults_plan.is_null(), "{}", take_last_error_message());
+    let defaults_json = compaction_plan_json(defaults_plan);
+    let default_options = &defaults_json["options"];
+    assert_eq!(
+        default_options["target_rows_per_fragment"].as_u64(),
+        Some(1_048_576)
+    );
+    assert_eq!(default_options["max_rows_per_group"].as_u64(), Some(1024));
+    assert!(default_options["max_bytes_per_file"].is_null());
+    assert_eq!(
+        default_options["materialize_deletions"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        default_options["max_overlays_per_fragment"].as_u64(),
+        Some(10)
+    );
+    assert!(default_options["max_source_fragments"].is_null());
+    assert!(default_options["compaction_mode"].is_null());
+    assert_eq!(defaults_json["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(plan_source_fragment_ids(defaults_plan).len(), 4);
+
+    let overridden = unsafe { lance_compaction_options_v2_from_dataset(dataset) };
+    assert!(!overridden.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_target_rows_per_fragment(overridden, 100) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_max_source_fragments(overridden, false, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_max_overlays_per_fragment(overridden, false, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_compaction_mode(overridden, false, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_defer_index_remap(overridden, false) },
+        0
+    );
+    let excluded = fragment_ids[1];
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_excluded_fragment_ids(overridden, &excluded, 1,) },
+        0
+    );
+    let version_selector = c_str("2.2");
+    assert_eq!(
+        unsafe {
+            lance_compaction_options_v2_set_data_storage_version(
+                overridden,
+                version_selector.as_ptr(),
+            )
+        },
+        0
+    );
+    let overridden_plan = unsafe { lance_dataset_plan_compaction(dataset, overridden) };
+    assert!(!overridden_plan.is_null(), "{}", take_last_error_message());
+    let overridden_json = compaction_plan_json(overridden_plan);
+    let override_options = &overridden_json["options"];
+    assert_eq!(
+        override_options["target_rows_per_fragment"].as_u64(),
+        Some(100)
+    );
+    assert!(override_options["max_source_fragments"].is_null());
+    assert!(override_options["max_overlays_per_fragment"].is_null());
+    assert!(override_options["compaction_mode"].is_null());
+    assert_eq!(
+        override_options["data_storage_version"].as_str(),
+        Some("2.2")
+    );
+    let overridden_ids = plan_source_fragment_ids(overridden_plan);
+    assert_eq!(overridden_ids.len(), 3);
+    assert!(!overridden_ids.contains(&u64::from(excluded)));
+
+    let zero_budget = unsafe { lance_compaction_options_v2_new() };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_max_source_fragments(zero_budget, true, 0) },
+        0
+    );
+    let zero_plan = unsafe { lance_dataset_plan_compaction(dataset, zero_budget) };
+    assert!(zero_plan.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let invalid = unsafe { lance_compaction_options_v2_new() };
+    let invalid_selector = c_str("not-a-version");
+    assert_eq!(
+        unsafe {
+            lance_compaction_options_v2_set_data_storage_version(invalid, invalid_selector.as_ptr())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_excluded_fragment_ids(invalid, ptr::null(), 1) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_index_remap_mode(invalid, 99) },
+        -1
+    );
+
+    for options in [configured, defaults, overridden, zero_budget, invalid] {
+        unsafe { lance_compaction_options_v2_free(options) };
+    }
+    unsafe {
+        lance_compaction_plan_close(configured_plan);
+        lance_compaction_plan_close(defaults_plan);
+        lance_compaction_plan_close(overridden_plan);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_compaction_distributed_tasks_results_and_partial_commits() {
+    let (_tmp, uri) = create_many_small_fragments(4);
+    let c_uri = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+
+    let options = unsafe { lance_compaction_options_v2_new() };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_target_rows_per_fragment(options, 4) },
+        0
+    );
+    let plan = unsafe { lance_dataset_plan_compaction(dataset, options) };
+    assert!(!plan.is_null(), "{}", take_last_error_message());
+    let plan_version = unsafe { lance_compaction_plan_read_version(plan) };
+    assert_eq!(plan_version, unsafe { lance_dataset_version(dataset) });
+    assert_eq!(unsafe { lance_compaction_plan_task_count(plan) }, 2);
+    assert_eq!(plan_source_fragment_ids(plan).len(), 4);
+    let plan_json = compaction_plan_json(plan);
+    assert_eq!(plan_json["tasks"].as_array().unwrap().len(), 2);
+
+    let plan_json_string = take_c_owned_string(unsafe { lance_compaction_plan_json(plan) });
+    let decoded_plan =
+        unsafe { lance_compaction_plan_from_json(c_str(&plan_json_string).as_ptr()) };
+    assert!(!decoded_plan.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_compaction_plan_read_version(decoded_plan) },
+        plan_version
+    );
+    assert_eq!(unsafe { lance_compaction_plan_task_count(decoded_plan) }, 2);
+
+    let task0 = unsafe { lance_compaction_plan_task_at(plan, 0) };
+    let task1 = unsafe { lance_compaction_plan_task_at(plan, 1) };
+    assert!(!task0.is_null() && !task1.is_null());
+    let plan_options = unsafe { lance_compaction_plan_options_clone(plan) };
+    assert!(!plan_options.is_null(), "{}", take_last_error_message());
+    unsafe {
+        lance_compaction_options_v2_free(plan_options);
+        lance_compaction_plan_close(decoded_plan);
+        lance_compaction_plan_close(plan);
+    }
+
+    let task0_json = take_c_owned_string(unsafe { lance_compaction_task_json(task0) });
+    let task0_from_json = unsafe { lance_compaction_task_from_json(c_str(&task0_json).as_ptr()) };
+    assert!(!task0_from_json.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_compaction_task_read_version(task0_from_json) },
+        plan_version
+    );
+    assert_eq!(
+        compaction_task_fragment_ids(task0_from_json),
+        compaction_task_fragment_ids(task0)
+    );
+    unsafe { lance_compaction_task_close(task0) };
+
+    let task1_json = take_c_owned_string(unsafe { lance_compaction_task_json(task1) });
+    let task1_from_json = unsafe { lance_compaction_task_from_json(c_str(&task1_json).as_ptr()) };
+    assert!(!task1_from_json.is_null(), "{}", take_last_error_message());
+    unsafe { lance_compaction_task_close(task1) };
+
+    let result0 = unsafe { lance_compaction_task_execute(dataset, task0_from_json) };
+    assert!(!result0.is_null(), "{}", take_last_error_message());
+    let mut result0_metrics = LanceCompactionMetrics::default();
+    assert_eq!(
+        unsafe { lance_rewrite_result_metrics(result0, &mut result0_metrics) },
+        0
+    );
+    assert_eq!(result0_metrics.fragments_removed, 2);
+    assert_eq!(result0_metrics.fragments_added, 1);
+    assert_eq!(
+        unsafe { lance_rewrite_result_original_fragment_count(result0) },
+        2
+    );
+    assert_eq!(
+        unsafe { lance_rewrite_result_new_fragment_count(result0) },
+        1
+    );
+    assert_eq!(
+        unsafe { lance_rewrite_result_read_version(result0) },
+        plan_version
+    );
+    let result0_json = take_c_owned_string(unsafe { lance_rewrite_result_json(result0) });
+    let result0_from_json =
+        unsafe { lance_rewrite_result_from_json(c_str(&result0_json).as_ptr()) };
+    assert!(
+        !result0_from_json.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_rewrite_result_close(result0) };
+
+    let keys = [c_str("job")];
+    let values = [c_str("compaction-distributed")];
+    let key_ptrs = [keys[0].as_ptr()];
+    let value_ptrs = [values[0].as_ptr()];
+    let properties = LanceTransactionProperties {
+        keys: key_ptrs.as_ptr(),
+        values: value_ptrs.as_ptr(),
+        count: 1,
+    };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_transaction_properties(options, &properties) },
+        0
+    );
+
+    let result0_ptrs = [result0_from_json];
+    let mut commit_metrics = LanceCompactionMetrics::default();
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_compaction(
+                dataset,
+                result0_ptrs.as_ptr(),
+                result0_ptrs.len(),
+                options,
+                &mut commit_metrics,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(commit_metrics, result0_metrics);
+    let version_after_first = unsafe { lance_dataset_version(dataset) };
+    assert!(version_after_first > plan_version);
+
+    let transaction = lance_c::runtime::block_on(async {
+        let reopened = Dataset::open(&uri).await.unwrap();
+        reopened.read_transaction().await.unwrap().unwrap()
+    });
+    assert_eq!(
+        transaction
+            .inner
+            .transaction_properties
+            .as_ref()
+            .unwrap()
+            .get("job")
+            .map(String::as_str),
+        Some("compaction-distributed")
+    );
+
+    let result1 = unsafe { lance_compaction_task_execute(dataset, task1_from_json) };
+    assert!(!result1.is_null(), "{}", take_last_error_message());
+    let result1_ptrs = [result1];
+    let mut second_commit_metrics = LanceCompactionMetrics::default();
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_compaction(
+                dataset,
+                result1_ptrs.as_ptr(),
+                result1_ptrs.len(),
+                options,
+                &mut second_commit_metrics,
+            )
+        },
+        0,
+        "second partial commit must follow native rebase behavior: {}",
+        take_last_error_message()
+    );
+    assert_eq!(second_commit_metrics.fragments_removed, 2);
+    assert_eq!(second_commit_metrics.fragments_added, 1);
+    assert!(unsafe { lance_dataset_version(dataset) } > version_after_first);
+    assert_eq!(unsafe { lance_dataset_fragment_count(dataset) }, 2);
+    assert_eq!(unsafe { lance_dataset_count_rows(dataset) }, 12);
+
+    unsafe {
+        lance_compaction_task_close(task0_from_json);
+        lance_compaction_task_close(task1_from_json);
+        lance_rewrite_result_close(result0_from_json);
+        lance_rewrite_result_close(result1);
+        lance_compaction_options_v2_free(options);
+        lance_dataset_close(dataset);
+    }
+
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert_eq!(unsafe { lance_dataset_count_rows(reopened) }, 12);
+    assert_eq!(unsafe { lance_dataset_fragment_count(reopened) }, 2);
+    unsafe { lance_dataset_close(reopened) };
+}
+
+#[test]
+fn test_compaction_binary_copy_budgets_and_exclusions() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let c_uri = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let predicate = c_str("id = 1");
+    assert_eq!(
+        unsafe { lance_dataset_delete(dataset, predicate.as_ptr(), ptr::null_mut()) },
+        0
+    );
+    let version_before = unsafe { lance_dataset_version(dataset) };
+
+    let force = unsafe { lance_compaction_options_v2_new() };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_target_rows_per_fragment(force, 100) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_compaction_options_v2_set_compaction_mode(
+                force,
+                true,
+                LanceCompactionMode::ForceBinaryCopy as i32,
+            )
+        },
+        0
+    );
+    let rc = unsafe { lance_dataset_compact_files_v2(dataset, force, ptr::null_mut()) };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+
+    let try_copy = unsafe { lance_compaction_options_v2_new() };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_target_rows_per_fragment(try_copy, 100) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_compaction_options_v2_set_compaction_mode(
+                try_copy,
+                true,
+                LanceCompactionMode::TryBinaryCopy as i32,
+            )
+        },
+        0
+    );
+    let mut metrics = LanceCompactionMetrics::default();
+    assert_eq!(
+        unsafe { lance_dataset_compact_files_v2(dataset, try_copy, &mut metrics) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(metrics.fragments_added, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(dataset) }, 5);
+    assert_eq!(unsafe { lance_dataset_fragment_count(dataset) }, 1);
+    unsafe {
+        lance_compaction_options_v2_free(force);
+        lance_compaction_options_v2_free(try_copy);
+        lance_dataset_close(dataset);
+    }
+
+    let (_budget_tmp, budget_uri) = create_many_small_fragments(4);
+    let budget_c_uri = c_str(&budget_uri);
+    let budget_dataset = unsafe { lance_dataset_open(budget_c_uri.as_ptr(), ptr::null(), 0) };
+    let fragments = dataset_fragment_ids(budget_dataset);
+    assert_eq!(fragments.len(), 4);
+
+    let excluded_options = unsafe { lance_compaction_options_v2_new() };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_target_rows_per_fragment(excluded_options, 100,) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_compaction_options_v2_set_excluded_fragment_ids(
+                excluded_options,
+                &fragments[1],
+                1,
+            )
+        },
+        0
+    );
+    let excluded_plan = unsafe { lance_dataset_plan_compaction(budget_dataset, excluded_options) };
+    assert!(!excluded_plan.is_null(), "{}", take_last_error_message());
+    let included = plan_source_fragment_ids(excluded_plan);
+    assert_eq!(included.len(), 3);
+    assert!(!included.contains(&u64::from(fragments[1])));
+
+    let budget_options = unsafe { lance_compaction_options_v2_new() };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_target_rows_per_fragment(budget_options, 4) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_max_source_fragments(budget_options, true, 2,) },
+        0
+    );
+    let budget_plan = unsafe { lance_dataset_plan_compaction(budget_dataset, budget_options) };
+    assert!(!budget_plan.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_compaction_plan_task_count(budget_plan) }, 1);
+    assert_eq!(plan_source_fragment_ids(budget_plan).len(), 2);
+
+    let zero = unsafe { lance_compaction_options_v2_new() };
+    assert_eq!(
+        unsafe { lance_compaction_options_v2_set_max_source_fragments(zero, true, 0) },
+        0
+    );
+    assert!(unsafe { lance_dataset_plan_compaction(budget_dataset, zero) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe {
+        lance_compaction_plan_close(excluded_plan);
+        lance_compaction_plan_close(budget_plan);
+        lance_compaction_options_v2_free(excluded_options);
+        lance_compaction_options_v2_free(budget_options);
+        lance_compaction_options_v2_free(zero);
+        lance_dataset_close(budget_dataset);
+    }
+}
+
+fn prepare_partially_indexed_dataset(uri: &str) {
+    let c_uri = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                c"id".as_ptr(),
+                c"id_idx".as_ptr(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    for start in [10, 15] {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(start..start + 5))],
+        )
+        .unwrap();
+        append_batch(uri, schema.clone(), batch);
+    }
+}
+
+#[test]
+fn test_optimize_indices_options_empty_names_and_append() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    prepare_partially_indexed_dataset(&uri);
+    let c_uri = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let version_before = unsafe { lance_dataset_version(dataset) };
+
+    let empty = unsafe { lance_optimize_indices_options_new() };
+    assert!(!empty.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_optimize_indices_options_set_index_names(empty, true, ptr::null(), 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_optimize_indices(dataset, empty) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+
+    let append = unsafe { lance_optimize_indices_options_new() };
+    assert_eq!(
+        unsafe { lance_optimize_indices_options_set_num_indices_to_merge(append, true, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_dataset_optimize_indices(dataset, append) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(unsafe { lance_dataset_version(dataset) } > version_before);
+    let filter = c_str("id = 19");
+    assert_eq!(scan_filtered_with_index(dataset, &filter), 1);
+
+    let invalid = unsafe { lance_optimize_indices_options_new() };
+    assert_eq!(
+        unsafe { lance_optimize_indices_options_set_enable_partition_rebalancing(invalid, true) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_optimize_indices_options_set_num_indices_to_merge(invalid, true, 1) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_optimize_indices_options_set_max_rows_per_task(invalid, true, 5) },
+        0
+    );
+    assert!(unsafe { lance_dataset_plan_optimize_indices(dataset, invalid) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe {
+        lance_optimize_indices_options_free(empty);
+        lance_optimize_indices_options_free(append);
+        lance_optimize_indices_options_free(invalid);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_optimize_indices_distributed_plan_tasks_merges_and_partial_commits() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    prepare_partially_indexed_dataset(&uri);
+    let c_uri = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+
+    let options = unsafe { lance_optimize_indices_options_new() };
+    assert_eq!(
+        unsafe { lance_optimize_indices_options_set_num_indices_to_merge(options, true, 1) },
+        0
+    );
+    let names = [c_str("id_idx")];
+    let name_ptrs = [names[0].as_ptr()];
+    assert_eq!(
+        unsafe {
+            lance_optimize_indices_options_set_index_names(
+                options,
+                true,
+                name_ptrs.as_ptr(),
+                name_ptrs.len(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_optimize_indices_options_set_max_rows_per_task(options, true, 5) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_optimize_indices_options_set_max_rows_per_segment(options, true, 10) },
+        0
+    );
+    let property_keys = [c_str("job")];
+    let property_values = [c_str("index-distributed")];
+    let property_key_ptrs = [property_keys[0].as_ptr()];
+    let property_value_ptrs = [property_values[0].as_ptr()];
+    let properties = LanceTransactionProperties {
+        keys: property_key_ptrs.as_ptr(),
+        values: property_value_ptrs.as_ptr(),
+        count: 1,
+    };
+    assert_eq!(
+        unsafe { lance_optimize_indices_options_set_transaction_properties(options, &properties,) },
+        0
+    );
+
+    let plan = unsafe { lance_dataset_plan_optimize_indices(dataset, options) };
+    assert!(!plan.is_null(), "{}", take_last_error_message());
+    let plan_version = unsafe { lance_optimize_indices_plan_read_version(plan) };
+    let mut plan_uuid = [0_u8; 16];
+    assert_eq!(
+        unsafe { lance_optimize_indices_plan_id(plan, plan_uuid.as_mut_ptr()) },
+        0
+    );
+    assert!(plan_uuid.iter().any(|byte| *byte != 0));
+    let task_count = unsafe { lance_optimize_indices_plan_task_count(plan) };
+    let merge_count = unsafe { lance_optimize_indices_plan_merge_count(plan) };
+    assert_eq!(task_count, 2);
+    assert_eq!(merge_count, 2);
+
+    let task0 = unsafe { lance_optimize_indices_plan_task_at(plan, 0) };
+    let task1 = unsafe { lance_optimize_indices_plan_task_at(plan, 1) };
+    let merge0 = unsafe { lance_optimize_indices_plan_merge_at(plan, 0) };
+    let merge1 = unsafe { lance_optimize_indices_plan_merge_at(plan, 1) };
+    assert!(
+        !task0.is_null() && !task1.is_null() && !merge0.is_null() && !merge1.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let plan_json_string = take_c_owned_string(unsafe { lance_optimize_indices_plan_json(plan) });
+    let decoded_plan =
+        unsafe { lance_optimize_indices_plan_from_json(c_str(&plan_json_string).as_ptr()) };
+    assert!(!decoded_plan.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_optimize_indices_plan_task_count(decoded_plan) },
+        2
+    );
+    unsafe {
+        lance_optimize_indices_plan_close(decoded_plan);
+        lance_optimize_indices_plan_close(plan);
+    }
+
+    let mut task_uuid = [0_u8; 16];
+    assert_eq!(
+        unsafe { lance_optimize_index_task_plan_id(task0, task_uuid.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(task_uuid, plan_uuid);
+    assert_eq!(
+        unsafe { lance_optimize_index_task_read_version(task0) },
+        plan_version
+    );
+    let reference = unsafe { lance_optimize_index_task_reference(task0) };
+    assert!(!reference.is_null(), "{}", take_last_error_message());
+    {
+        let name = unsafe { lance_index_segment_metadata_name(reference) };
+        assert!(!name.is_null());
+        assert_eq!(unsafe { CStr::from_ptr(name) }.to_str().unwrap(), "id_idx");
+    }
+    unsafe { lance_index_segment_metadata_free(reference) };
+    let task0_json = take_c_owned_string(unsafe { lance_optimize_index_task_json(task0) });
+    let task0_from_json =
+        unsafe { lance_optimize_index_task_from_json(c_str(&task0_json).as_ptr()) };
+    assert!(!task0_from_json.is_null(), "{}", take_last_error_message());
+    let mut cloned_has_value = false;
+    let mut cloned_merge_count = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_optimize_index_task_num_indices_to_merge(
+                task0_from_json,
+                &mut cloned_has_value,
+                &mut cloned_merge_count,
+            )
+        },
+        0
+    );
+    assert!(cloned_has_value);
+
+    let mut merge_uuid = [0_u8; 16];
+    assert_eq!(
+        unsafe { lance_optimize_index_merge_plan_id(merge0, merge_uuid.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(merge_uuid, plan_uuid);
+    assert_eq!(
+        unsafe { lance_optimize_index_merge_read_version(merge0) },
+        plan_version
+    );
+    let merge0_json = take_c_owned_string(unsafe { lance_optimize_index_merge_json(merge0) });
+    let merge0_from_json =
+        unsafe { lance_optimize_index_merge_from_json(c_str(&merge0_json).as_ptr()) };
+    assert!(!merge0_from_json.is_null(), "{}", take_last_error_message());
+
+    let result0 = unsafe {
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            lance_optimize_index_task_execute(dataset, task0_from_json, &mut result,),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        result
+    };
+    let result1 = unsafe {
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            lance_optimize_index_task_execute(dataset, task1, &mut result),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        result
+    };
+    assert!(!result0.is_null() && !result1.is_null());
+    let mut result_uuid = [0_u8; 16];
+    assert_eq!(
+        unsafe { lance_index_segment_result_plan_id(result0, result_uuid.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(result_uuid, plan_uuid);
+    let segment = unsafe { lance_index_segment_result_segment(result0) };
+    assert!(!segment.is_null(), "{}", take_last_error_message());
+    unsafe { lance_index_segment_metadata_free(segment) };
+    let result0_json = take_c_owned_string(unsafe { lance_index_segment_result_json(result0) });
+    let result0_from_json =
+        unsafe { lance_index_segment_result_from_json(c_str(&result0_json).as_ptr()) };
+    assert!(
+        !result0_from_json.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+
+    let other_plan = unsafe { lance_dataset_plan_optimize_indices(dataset, options) };
+    assert!(!other_plan.is_null(), "{}", take_last_error_message());
+    let other_task = unsafe { lance_optimize_indices_plan_task_at(other_plan, 0) };
+    assert!(!other_task.is_null(), "{}", take_last_error_message());
+    let other_result = unsafe {
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            lance_optimize_index_task_execute(dataset, other_task, &mut result),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        result
+    };
+    assert!(!other_result.is_null());
+    let other_results = [other_result];
+    let sentinel = std::ptr::dangling_mut::<LanceIndexSegmentResult>();
+    let mut rejected_result = sentinel;
+    assert_eq!(
+        unsafe {
+            lance_optimize_index_merge_execute(
+                dataset,
+                merge0_from_json,
+                other_results.as_ptr(),
+                other_results.len(),
+                &mut rejected_result,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(rejected_result, sentinel);
+    unsafe {
+        lance_optimize_indices_plan_close(other_plan);
+        lance_optimize_index_task_close(other_task);
+        lance_index_segment_result_close(other_result);
+    }
+
+    let task_results = [result0, result1];
+    let merged0 = unsafe {
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            lance_optimize_index_merge_execute(
+                dataset,
+                merge0_from_json,
+                task_results.as_ptr(),
+                task_results.len(),
+                &mut result,
+            ),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        result
+    };
+    let merged1 = unsafe {
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            lance_optimize_index_merge_execute(
+                dataset,
+                merge1,
+                task_results.as_ptr(),
+                task_results.len(),
+                &mut result,
+            ),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        result
+    };
+    assert!(!merged0.is_null() && !merged1.is_null());
+
+    let first_commit = [merged0];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_optimize_indices(
+                dataset,
+                first_commit.as_ptr(),
+                first_commit.len(),
+                options,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let version_after_first = unsafe { lance_dataset_version(dataset) };
+    assert!(version_after_first > plan_version);
+    let transaction = lance_c::runtime::block_on(async {
+        let reopened = Dataset::open(&uri).await.unwrap();
+        reopened.read_transaction().await.unwrap().unwrap()
+    });
+    assert_eq!(
+        transaction
+            .inner
+            .transaction_properties
+            .as_ref()
+            .unwrap()
+            .get("job")
+            .map(String::as_str),
+        Some("index-distributed")
+    );
+
+    let second_commit = [merged1];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_optimize_indices(
+                dataset,
+                second_commit.as_ptr(),
+                second_commit.len(),
+                options,
+            )
+        },
+        0,
+        "second partial index commit must follow native rebase behavior: {}",
+        take_last_error_message()
+    );
+    assert!(unsafe { lance_dataset_version(dataset) } > version_after_first);
+    let filter = c_str("id = 19");
+    assert_eq!(scan_filtered_with_index(dataset, &filter), 1);
+    assert_eq!(indexed_fragment_ids(dataset).len(), 4);
+    assert_eq!(
+        unsafe { lance_dataset_validate(dataset) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    unsafe {
+        lance_optimize_index_task_close(task0_from_json);
+        lance_optimize_index_task_close(task1);
+        lance_optimize_index_merge_close(merge0_from_json);
+        lance_optimize_index_merge_close(merge1);
+        lance_index_segment_result_close(result0_from_json);
+        lance_index_segment_result_close(result1);
+        lance_index_segment_result_close(merged0);
+        lance_index_segment_result_close(merged1);
+        lance_optimize_indices_options_free(options);
+        lance_dataset_close(dataset);
+    }
+
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    assert_eq!(indexed_fragment_ids(reopened).len(), 4);
+    assert_eq!(scan_filtered_with_index(reopened, &filter), 1);
+    unsafe { lance_dataset_close(reopened) };
+}
+
+fn manifest_file_names(uri: &str) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(std::path::Path::new(uri).join("_versions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".manifest"))
+        .collect()
+}
+
+fn dataset_schema_signature(dataset: *const LanceDataset) -> Vec<(String, DataType, bool)> {
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(unsafe { lance_dataset_schema(dataset, &mut ffi_schema) }, 0);
+    let schema = Schema::try_from(&ffi_schema).unwrap();
+    schema_signature(&schema)
+}
+
+#[test]
+fn test_manifest_v2_migration_and_truncate_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("manifest_v2_migration")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    lance_c::runtime::block_on(async {
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..4))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            Some(WriteParams {
+                enable_v2_manifest_paths: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let second = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(4..8))],
+        )
+        .unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
+                None,
+            )
+            .await
+            .unwrap();
+    });
+
+    let v1_files = manifest_file_names(&uri);
+    assert!(v1_files.contains("1.manifest"));
+    assert!(v1_files.contains("2.manifest"));
+
+    let c_uri = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(version_before, 2);
+    let schema_before = dataset_schema_signature(dataset);
+
+    assert_eq!(
+        unsafe { lance_dataset_migrate_manifest_paths_v2(dataset) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    let v2_files = manifest_file_names(&uri);
+    assert!(!v2_files.contains("1.manifest"));
+    assert!(!v2_files.contains("2.manifest"));
+    for version in 1..=version_before {
+        assert!(
+            v2_files.contains(&format!("{:020}.manifest", u64::MAX - version)),
+            "missing migrated manifest for version {version}: {v2_files:?}"
+        );
+    }
+
+    let files_after_first = v2_files;
+    assert_eq!(
+        unsafe { lance_dataset_migrate_manifest_paths_v2(dataset) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(manifest_file_names(&uri), files_after_first);
+
+    assert_eq!(
+        unsafe { lance_dataset_truncate_table(dataset) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(unsafe { lance_dataset_version(dataset) } > version_before);
+    assert_eq!(unsafe { lance_dataset_count_rows(dataset) }, 0);
+    assert_eq!(dataset_schema_signature(dataset), schema_before);
+    let truncated_version = unsafe { lance_dataset_version(dataset) };
+    unsafe { lance_dataset_close(dataset) };
+
+    let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_dataset_version(reopened) },
+        truncated_version
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(reopened) }, 0);
+    assert_eq!(dataset_schema_signature(reopened), schema_before);
+    unsafe { lance_dataset_close(reopened) };
+
+    let historical = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 1) };
+    assert!(!historical.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(historical) }, 4);
+    unsafe { lance_dataset_close(historical) };
+}
+
 // ---------------------------------------------------------------------------
 // Distributed vector search via index segments
 // ---------------------------------------------------------------------------
