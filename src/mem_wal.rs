@@ -34,7 +34,6 @@ use datafusion::common::ScalarValue;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::SessionContext;
-use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::mem_wal::scanner::{
     LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
