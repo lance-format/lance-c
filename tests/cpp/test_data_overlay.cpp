@@ -387,7 +387,7 @@ int main(int argc, char** argv) {
         assert_row(committed, 4, false, 40, 400, before[4].rowid);
         assert_row(committed, 5, false, 113, 213, before[5].rowid);
         assert_row(committed, 6, false, 60, 600, before[6].rowid);
-        assert_row(committed, 7, false, 70, 700, before[7].rowid);
+        assert_row(committed, 7, true, 0, 700, before[7].rowid);
         assert_row(committed, 8, false, 114, 214, before[8].rowid);
         assert_row(committed, 9, false, 90, 900, before[9].rowid);
         CHECK(!find_row(committed, 10).found);

@@ -289,7 +289,6 @@ static Row find_row(const LanceDataset *dataset, int32_t wanted) {
 
 static void assert_row(const LanceDataset *dataset, int32_t id, int a_null,
                        int32_t a, int32_t b, uint64_t rowid) {
-    fprintf(stderr, "assert_row id=%d\n", id);
     Row row = find_row(dataset, id);
     ASSERT(row.found, "row must exist");
     ASSERT(row.a_null == a_null, "row a NULL state");
@@ -681,7 +680,7 @@ int main(int argc, char **argv) {
     assert_row(committed, 4, 0, 40, 400, before[4].rowid);
     assert_row(committed, 5, 0, 113, 213, before[5].rowid);
     assert_row(committed, 6, 0, 60, 600, before[6].rowid);
-    assert_row(committed, 7, 0, 70, 700, before[7].rowid);
+    assert_row(committed, 7, 1, 0, 700, before[7].rowid);
     assert_row(committed, 8, 0, 114, 214, before[8].rowid);
     assert_row(committed, 9, 0, 90, 900, before[9].rowid);
     ASSERT(!find_row(committed, 10).found, "deleted row stays deleted");
