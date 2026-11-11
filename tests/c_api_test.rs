@@ -37690,6 +37690,72 @@ fn native_vector_ids(dataset: &Dataset, query: &[f32], k: u32, args: ProbeArgs) 
     ids
 }
 
+unsafe fn cold_probe_partitions_loaded(
+    uri: &CString,
+    query: &[f32],
+    k: u32,
+    args: ProbeArgs,
+) -> u64 {
+    // A fresh session keeps partition loads observable: the same C query with
+    // a fixed count must load one partition while full effort must load every
+    // available partition, regardless of randomized IVF training.
+    unsafe {
+        let session = lance_session_new(64 * 1024 * 1024, 16 * 1024 * 1024);
+        assert!(!session.is_null(), "{}", take_last_error_message());
+        let dataset = lance_dataset_open_with_session(uri.as_ptr(), ptr::null(), 0, session);
+        assert!(!dataset.is_null(), "{}", take_last_error_message());
+        let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+        assert!(!scanner.is_null(), "{}", take_last_error_message());
+        let column = c_str("embedding");
+        assert_eq!(
+            lance_scanner_nearest(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr().cast(),
+                query.len(),
+                LanceDataType::Float32 as i32,
+                k,
+            ),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        if args.effort_first
+            && let Some(effort) = args.effort
+        {
+            assert_eq!(lance_scanner_set_search_effort(scanner, effort), 0);
+        }
+        if let Some(nprobes) = args.nprobes {
+            assert_eq!(lance_scanner_set_nprobes(scanner, nprobes), 0);
+        }
+        if let Some(minimum) = args.minimum {
+            assert_eq!(lance_scanner_set_minimum_nprobes(scanner, minimum), 0);
+        }
+        if let Some(maximum) = args.maximum {
+            assert_eq!(lance_scanner_set_maximum_nprobes(scanner, maximum), 0);
+        }
+        if !args.effort_first
+            && let Some(effort) = args.effort
+        {
+            assert_eq!(lance_scanner_set_search_effort(scanner, effort), 0);
+        }
+        let mut captured = CapturedScanStatistics::default();
+        assert_eq!(
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            ),
+            0
+        );
+        scan_all_rows_from_scanner(scanner);
+        let loaded = captured.index_partitions_loaded;
+        lance_session_close(session);
+        lance_dataset_close(dataset);
+        loaded
+    }
+}
+
 #[test]
 fn test_describe_and_statistics_match_native_metadata() {
     use chrono::SecondsFormat;
@@ -38073,6 +38139,7 @@ fn test_search_effort_preserves_native_probe_precedence() {
         take_last_error_message()
     );
     let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let query = [20.0, 20.1, 20.2, 20.3, 20.4, 20.5, 20.6, 20.7];
     let fixed_probe = ProbeArgs {
         nprobes: Some(1),
         minimum: None,
@@ -38087,17 +38154,6 @@ fn test_search_effort_preserves_native_probe_precedence() {
         effort: Some(1.0),
         effort_first: false,
     };
-    // Avoid relying on an accidental difference at one query. Choose an
-    // asymmetric boundary query where the same persisted native index itself
-    // distinguishes one fixed partition from full search effort.
-    let (query, k) = (0..192)
-        .find_map(|id| {
-            let query = [id as f32 + 0.8; 8];
-            (native_vector_ids(&native, &query, 1, fixed_probe)
-                != native_vector_ids(&native, &query, 1, full_effort_probe))
-            .then_some((query, 1))
-        })
-        .expect("persisted index must distinguish a fixed partition from full effort");
 
     let configurations = [
         fixed_probe,
@@ -38131,10 +38187,17 @@ fn test_search_effort_preserves_native_probe_precedence() {
         },
     ];
     for args in configurations {
-        let actual = c_vector_ids(dataset, &query, k, args);
-        let expected = native_vector_ids(&native, &query, k, args);
+        let actual = c_vector_ids(dataset, &query, 60, args);
+        let expected = native_vector_ids(&native, &query, 60, args);
         assert_eq!(actual, expected, "probe config mismatch: {args:?}");
     }
+    let fixed_loaded = unsafe { cold_probe_partitions_loaded(&uri_c, &query, 1, fixed_probe) };
+    let effort_loaded =
+        unsafe { cold_probe_partitions_loaded(&uri_c, &query, 1, full_effort_probe) };
+    assert!(
+        effort_loaded > fixed_loaded,
+        "full search effort must probe more partitions than a fixed count: fixed={fixed_loaded}, effort={effort_loaded}"
+    );
 
     let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
     for invalid in [f64::NAN, -0.1, 1.1, f64::INFINITY] {
