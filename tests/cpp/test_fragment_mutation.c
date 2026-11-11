@@ -4,6 +4,7 @@
 #include "lance/lance.h"
 
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -150,7 +151,35 @@ static void scan_fragment_value(const LanceFragment *fragment,
 static void release_schema(ArrowSchema *schema) { schema->release = NULL; }
 static void release_array(ArrowArray *array) { array->release = NULL; }
 
+/* Exported schemas and batches can outlive their stream and each other. */
 typedef struct {
+    atomic_size_t references;
+} StreamStorage;
+
+static void retain_storage(StreamStorage *storage) {
+    atomic_fetch_add(&storage->references, 1);
+}
+
+static void release_storage(StreamStorage *storage) {
+    if (atomic_fetch_sub(&storage->references, 1) == 1) free(storage);
+}
+
+static void release_owned_schema(ArrowSchema *schema) {
+    StreamStorage *storage = (StreamStorage *)schema->private_data;
+    schema->release = NULL;
+    schema->private_data = NULL;
+    release_storage(storage);
+}
+
+static void release_owned_array(ArrowArray *array) {
+    StreamStorage *storage = (StreamStorage *)array->private_data;
+    array->release = NULL;
+    array->private_data = NULL;
+    release_storage(storage);
+}
+
+typedef struct {
+    StreamStorage storage; /* First member so the last owner frees the allocation. */
     ArrowArrayStream stream;
     ArrowSchema schema;
     ArrowSchema child_schema[2];
@@ -168,6 +197,7 @@ typedef struct {
 } TwoColumnStream;
 
 typedef struct {
+    StreamStorage storage;
     ArrowArrayStream stream;
     ArrowSchema schema;
     ArrowSchema child_schema;
@@ -193,6 +223,7 @@ static void one_stream_release(ArrowArrayStream *stream);
 static int two_stream_get_schema(ArrowArrayStream *stream, ArrowSchema *out) {
     if (stream->private_data == NULL) return -1;
     TwoColumnStream *data = (TwoColumnStream *)stream->private_data;
+    retain_storage(&data->storage);
     *out = data->schema;
     return 0;
 }
@@ -202,6 +233,7 @@ static int two_stream_get_next(ArrowArrayStream *stream, ArrowArray *out) {
     TwoColumnStream *data = (TwoColumnStream *)stream->private_data;
     memset(out, 0, sizeof(*out));
     if (data->emitted) return 0;
+    retain_storage(&data->storage);
     *out = data->batch;
     data->emitted = 1;
     return 0;
@@ -210,6 +242,7 @@ static int two_stream_get_next(ArrowArrayStream *stream, ArrowArray *out) {
 static int one_stream_get_schema(ArrowArrayStream *stream, ArrowSchema *out) {
     if (stream->private_data == NULL) return -1;
     OneColumnStream *data = (OneColumnStream *)stream->private_data;
+    retain_storage(&data->storage);
     *out = data->schema;
     return 0;
 }
@@ -219,6 +252,7 @@ static int one_stream_get_next(ArrowArrayStream *stream, ArrowArray *out) {
     OneColumnStream *data = (OneColumnStream *)stream->private_data;
     memset(out, 0, sizeof(*out));
     if (data->emitted) return 0;
+    retain_storage(&data->storage);
     *out = data->batch;
     data->emitted = 1;
     return 0;
@@ -231,16 +265,18 @@ static const char *stream_last_error(ArrowArrayStream *stream) {
 
 static void two_stream_release(ArrowArrayStream *stream) {
     if (stream == NULL) return;
-    void *private_data = stream->private_data;
+    TwoColumnStream *data = (TwoColumnStream *)stream->private_data;
     stream->release = NULL;
-    free(private_data);
+    stream->private_data = NULL;
+    release_storage(&data->storage);
 }
 
 static void one_stream_release(ArrowArrayStream *stream) {
     if (stream == NULL) return;
-    void *private_data = stream->private_data;
+    OneColumnStream *data = (OneColumnStream *)stream->private_data;
     stream->release = NULL;
-    free(private_data);
+    stream->private_data = NULL;
+    release_storage(&data->storage);
 }
 
 static TwoColumnStream *two_column_stream(const char *left_name,
@@ -252,6 +288,7 @@ static TwoColumnStream *two_column_stream(const char *left_name,
     ASSERT(len <= 8, "two-column stream length");
     TwoColumnStream *data = (TwoColumnStream *)calloc(1, sizeof(*data));
     ASSERT(data != NULL, "allocate two-column stream");
+    atomic_init(&data->storage.references, 1);
     data->len = len;
     memcpy(data->ids, ids, len * sizeof(int64_t));
     memcpy(data->values, values, len * sizeof(int32_t));
@@ -259,7 +296,8 @@ static TwoColumnStream *two_column_stream(const char *left_name,
     data->schema.format = "+s";
     data->schema.name = "";
     data->schema.n_children = 2;
-    data->schema.release = release_schema;
+    data->schema.release = release_owned_schema;
+    data->schema.private_data = &data->storage;
     data->schema_children[0] = &data->child_schema[0];
     data->schema_children[1] = &data->child_schema[1];
     data->schema.children = data->schema_children;
@@ -295,7 +333,8 @@ static TwoColumnStream *two_column_stream(const char *left_name,
     data->batch.buffers = data->root_buffers;
     data->batch.n_children = 2;
     data->batch.children = data->batch_children;
-    data->batch.release = release_array;
+    data->batch.release = release_owned_array;
+    data->batch.private_data = &data->storage;
     data->stream.get_schema = two_stream_get_schema;
     data->stream.get_next = two_stream_get_next;
     data->stream.get_last_error = stream_last_error;
@@ -310,13 +349,15 @@ static OneColumnStream *one_column_stream(const char *name, const char *format,
     ASSERT(strcmp(format, "i") == 0, "one-column stream int32");
     OneColumnStream *data = (OneColumnStream *)calloc(1, sizeof(*data));
     ASSERT(data != NULL, "allocate one-column stream");
+    atomic_init(&data->storage.references, 1);
     data->len = len;
     memcpy(data->values, values, len * sizeof(int32_t));
 
     data->schema.format = "+s";
     data->schema.name = "";
     data->schema.n_children = 1;
-    data->schema.release = release_schema;
+    data->schema.release = release_owned_schema;
+    data->schema.private_data = &data->storage;
     data->schema_children[0] = &data->child_schema;
     data->schema.children = data->schema_children;
     data->child_schema.format = format;
@@ -338,7 +379,8 @@ static OneColumnStream *one_column_stream(const char *name, const char *format,
     data->batch.buffers = data->root_buffers;
     data->batch.n_children = 1;
     data->batch.children = data->batch_children;
-    data->batch.release = release_array;
+    data->batch.release = release_owned_array;
+    data->batch.private_data = &data->storage;
     data->stream.get_schema = one_stream_get_schema;
     data->stream.get_next = one_stream_get_next;
     data->stream.get_last_error = stream_last_error;
