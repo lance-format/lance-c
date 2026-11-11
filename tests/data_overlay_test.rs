@@ -606,7 +606,7 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
         (4, Some(40), Some(400)),
         (5, Some(113), Some(215)),
         (6, Some(60), Some(600)),
-        (7, Some(70), Some(700)),
+        (7, None, Some(700)),
         (8, Some(80), Some(800)),
         (9, Some(90), Some(900)),
     ];
@@ -621,7 +621,7 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
         (13, Some(130), Some(1300)),
         (14, Some(1001), Some(1400)),
         (15, Some(150), Some(1500)),
-        (16, Some(160), Some(1600)),
+        (16, None, Some(1600)),
         (17, Some(170), Some(2000)),
         (18, Some(180), Some(1800)),
         (19, Some(190), Some(2001)),
@@ -908,8 +908,12 @@ fn data_overlay_validation_errors() {
     unsafe { lance_batch_free(imported) };
     assert_eq!(
         unsafe { lance_fragment_overlay_writer_finish(active_writer, ptr::null_mut()) },
-        0
+        -1
     );
+    assert!(error_is(
+        lance_last_error_code(),
+        LanceErrorCode::InvalidArgument
+    ));
     assert_eq!(
         unsafe { lance_fragment_overlay_writer_finish(ptr::null_mut(), &mut group_out) },
         -1
