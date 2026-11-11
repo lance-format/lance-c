@@ -1966,3 +1966,32 @@ fn test_mem_wal_cpp_compilation_and_execution() {
     );
     run_test_binary_with_dataset(&binary, &uri);
 }
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_commit_lock_native_compilation_and_execution"]
+fn test_commit_lock_native_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (_source, source_uri) = create_test_dataset_on_disk();
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch_path = scratch.path().to_str().unwrap();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_commit_lock.c");
+    let c_binary = build_dir.path().join("test_commit_lock_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C commit-lock test compilation failed"
+    );
+    run_test_binary_with_two_args(&c_binary, &source_uri, scratch_path);
+
+    let cpp_source = tests_dir.join("test_commit_lock.cpp");
+    let cpp_binary = build_dir.path().join("test_commit_lock_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "C++ commit-lock test compilation failed"
+    );
+    run_test_binary_with_two_args(&cpp_binary, &source_uri, scratch_path);
+}

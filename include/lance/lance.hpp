@@ -1972,6 +1972,151 @@ inline int32_t insert_fragment_trampoline(
 
 }  // namespace callback_detail
 
+// ─── Commit lock ─────────────────────────────────────────────────────────────
+
+/// One acquired commit lease.
+///
+/// `release` mirrors native `CommitLease::release`: `success` is true after the
+/// manifest is published and false when the attempt is abandoned. It may be
+/// called more than once and must be idempotent. Throw `lance::Error` to report
+/// a specific code; any other exception maps to LANCE_ERR_INTERNAL. The object
+/// is destroyed exactly once, after the final release callback.
+class CommitLease {
+public:
+    virtual ~CommitLease() noexcept = default;
+    virtual void release(bool success) = 0;
+};
+
+namespace commit_lock_detail {
+struct State;
+}  // namespace commit_lock_detail
+
+class CommitLock {
+    Handle<LanceCommitLock, lance_commit_lock_close> handle_;
+    std::unique_ptr<commit_lock_detail::State> state_;
+
+public:
+    /// Acquire a lease for a manifest base version. Returning `nullptr` is a
+    /// stateless lock. Throw `lance::Error` to report a specific code.
+    using Acquire = std::function<std::unique_ptr<CommitLease>(uint64_t)>;
+
+    explicit CommitLock(Acquire acquire);
+    ~CommitLock();
+
+    CommitLock(CommitLock&&) noexcept;
+    CommitLock& operator=(CommitLock&&) noexcept;
+    CommitLock(const CommitLock&) = delete;
+    CommitLock& operator=(const CommitLock&) = delete;
+
+    const LanceCommitLock* c_handle() const { return handle_.get(); }
+};
+
+namespace commit_lock_detail {
+
+struct State {
+    CommitLock::Acquire acquire;
+};
+
+struct LeaseHolder {
+    std::unique_ptr<CommitLease> lease;
+};
+
+extern "C" inline int32_t acquire_trampoline(
+    void* callback_ctx,
+    uint64_t version,
+    void** out_lease,
+    LanceCallbackError* error) noexcept {
+    if (out_lease == nullptr) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INVALID_ARGUMENT, "out_lease must not be null");
+        return -1;
+    }
+    *out_lease = nullptr;
+    auto* state = static_cast<State*>(callback_ctx);
+    try {
+        auto lease = state->acquire(version);
+        if (lease) {
+            *out_lease = new LeaseHolder{std::move(lease)};
+        }
+        return 0;
+    } catch (const lance::Error& exception) {
+        callback_detail::set_callback_error(
+            error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+extern "C" inline int32_t release_trampoline(
+    void*,
+    void* lease,
+    bool success,
+    LanceCallbackError* error) noexcept {
+    if (lease == nullptr) {
+        return 0;
+    }
+    auto* holder = static_cast<LeaseHolder*>(lease);
+    try {
+        holder->lease->release(success);
+        return 0;
+    } catch (const lance::Error& exception) {
+        callback_detail::set_callback_error(
+            error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+extern "C" inline void destroy_lease_trampoline(void*, void* lease) noexcept {
+    delete static_cast<LeaseHolder*>(lease);
+}
+
+extern "C" inline void release_context_trampoline(void* callback_ctx) noexcept {
+    delete static_cast<State*>(callback_ctx);
+}
+
+}  // namespace commit_lock_detail
+
+inline CommitLock::CommitLock(Acquire acquire)
+    : handle_(nullptr),
+      state_(new commit_lock_detail::State{std::move(acquire)}) {
+    LanceCommitLockCallbacks callbacks = {};
+    callbacks.lock = &commit_lock_detail::acquire_trampoline;
+    callbacks.release = &commit_lock_detail::release_trampoline;
+    callbacks.destroy_lease = &commit_lock_detail::destroy_lease_trampoline;
+    callbacks.callback_ctx = state_.get();
+    callbacks.release_context = &commit_lock_detail::release_context_trampoline;
+
+    auto* raw = lance_commit_lock_new(&callbacks);
+    // On failure the library never takes context ownership, so `state_`
+    // remains local and is destroyed here.
+    if (raw == nullptr) check_error();
+    handle_ = Handle<LanceCommitLock, lance_commit_lock_close>(raw);
+    // On success the native context owns the state and releases it exactly
+    // once when the last owner drops.
+    (void)state_.release();
+}
+
+inline CommitLock::~CommitLock() = default;
+
+inline CommitLock::CommitLock(CommitLock&&) noexcept = default;
+
+inline CommitLock& CommitLock::operator=(CommitLock&&) noexcept = default;
+
 // ─── Storage options ─────────────────────────────────────────────────────────
 
 using StorageOptions = std::map<std::string, std::string>;
@@ -5395,6 +5540,27 @@ class Dataset {
         return c_options;
     }
 
+    static LanceUncommittedWriteOptions to_c_uncommitted_write_options(
+        const UncommittedWriteOptions& options,
+        LanceAutoCleanupParams& cleanup,
+        std::vector<const char*>& properties) {
+
+        LanceWriteOptions c_write = to_c_write_options(options.write, cleanup);
+        if (options.transaction_properties) {
+            properties.reserve(options.transaction_properties->size() * 2 + 1);
+            for (const auto& [key, value] : *options.transaction_properties) {
+                properties.push_back(key.c_str());
+                properties.push_back(value.c_str());
+            }
+            properties.push_back(nullptr);
+        }
+        LanceUncommittedWriteOptions c_options = {};
+        c_options.write = c_write;
+        c_options.transaction_properties =
+            options.transaction_properties ? properties.data() : nullptr;
+        return c_options;
+    }
+
     static LanceCommitOptions to_c_commit_options(const CommitOptions& options) {
         LanceCommitOptions c_options = {};
         if (options.use_stable_row_ids) {
@@ -5916,6 +6082,35 @@ public:
         return Dataset(ds);
     }
 
+    /// Open through a foreign commit lock and optional dynamic storage accessor.
+    ///
+    /// The returned dataset retains the native handler and accessor owners, so
+    /// destroying either input afterwards does not invalidate this dataset,
+    /// its scanners, or later commits. NULL pointers keep native defaults.
+    static Dataset open_with_commit_lock(
+        const std::string& uri,
+        const StorageOptionsAccessor* storage_accessor,
+        uint64_t version,
+        const Session* session,
+        const CommitLock* commit_lock) {
+
+        LanceDataset* ds = nullptr;
+        int32_t rc = lance_dataset_open_with_commit_lock(
+            uri.c_str(),
+            storage_accessor ? storage_accessor->c_handle() : nullptr,
+            version,
+            session ? session->c_handle() : nullptr,
+            commit_lock ? commit_lock->c_handle() : nullptr,
+            &ds);
+        if (rc != 0) check_error();
+        if (ds == nullptr) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_dataset_open_with_commit_lock returned success "
+                        "with a null dataset");
+        }
+        return Dataset(ds);
+    }
+
     /// Write an Arrow record batch stream to a Lance dataset and return the
     /// open dataset at the committed version.
     ///
@@ -6046,6 +6241,50 @@ public:
             &storage_options_accessor);
     }
 
+    /// Write using native defaults through a foreign commit lock and optional
+    /// dynamic storage accessor.
+    ///
+    /// The accessor and lock owners are retained by the committed dataset.
+    /// NULL pointers keep native defaults. The stream is consumed on every
+    /// return path. Throws `lance::Error` on failure.
+    static Dataset write_with_options_with_commit_lock(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteOptions& options,
+        const StorageOptionsAccessor* storage_accessor,
+        const Session* session,
+        const CommitLock* commit_lock) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+
+        LanceAutoCleanupParams c_cleanup = {};
+        LanceWriteOptions c_options = to_c_write_options(options, c_cleanup);
+
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceDataset* out = nullptr;
+        if (lance_dataset_write_with_options_with_commit_lock(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                &c_options,
+                storage_accessor ? storage_accessor->c_handle() : nullptr,
+                session ? session->c_handle() : nullptr,
+                commit_lock ? commit_lock->c_handle() : nullptr,
+                &out) != 0) {
+            check_error();
+        }
+        if (!out) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_with_options_with_commit_lock returned "
+                "success with null out_dataset");
+        }
+        return Dataset(out);
+    }
+
     /// Open through a native namespace. Namespace location/storage options and
     /// managed-version behavior follow `DatasetBuilder::from_namespace`.
     static Dataset open_namespace(
@@ -6099,22 +6338,9 @@ public:
         const ArrowSchema* schema = input.read_schema();
 
         LanceAutoCleanupParams cleanup = {};
-        LanceWriteOptions c_write = to_c_write_options(options.write, cleanup);
-
         std::vector<const char*> properties;
-        if (options.transaction_properties) {
-            properties.reserve(options.transaction_properties->size() * 2 + 1);
-            for (const auto& [key, value] : *options.transaction_properties) {
-                properties.push_back(key.c_str());
-                properties.push_back(value.c_str());
-            }
-            properties.push_back(nullptr);
-        }
-
-        LanceUncommittedWriteOptions c_options = {};
-        c_options.write = c_write;
-        c_options.transaction_properties =
-            options.transaction_properties ? properties.data() : nullptr;
+        LanceUncommittedWriteOptions c_options =
+            to_c_uncommitted_write_options(options, cleanup, properties);
 
         auto storage_kv = to_c_key_values(storage_opts);
         const char* const* storage_ptr =
@@ -6200,6 +6426,54 @@ public:
         return Transaction(transaction);
     }
 
+    /// Stage an Arrow stream through a foreign commit lock and optional
+    /// dynamic storage accessor.
+    ///
+    /// Staging uses the accessor and session exactly like `write_uncommitted`.
+    /// The lock is retained for this call. Keep its handle alive and pass it
+    /// to the matching commit method when publishing the returned transaction.
+    /// NULL pointers keep native defaults. The stream is consumed on every
+    /// return path.
+    static Transaction write_uncommitted_with_commit_lock(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const UncommittedWriteOptions& options,
+        const StorageOptionsAccessor* storage_accessor,
+        const Session* session,
+        const CommitLock* commit_lock) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+
+        LanceAutoCleanupParams cleanup = {};
+        std::vector<const char*> properties;
+        LanceUncommittedWriteOptions c_options =
+            to_c_uncommitted_write_options(options, cleanup, properties);
+
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceTransaction* transaction = nullptr;
+        if (lance_dataset_write_uncommitted_stream_with_commit_lock(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                &c_options,
+                storage_accessor ? storage_accessor->c_handle() : nullptr,
+                session ? session->c_handle() : nullptr,
+                commit_lock ? commit_lock->c_handle() : nullptr,
+                &transaction) != 0) {
+            check_error();
+        }
+        if (!transaction) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_uncommitted_stream_with_commit_lock "
+                "returned success with null out_transaction");
+        }
+        return Transaction(transaction);
+    }
+
     /// Publish one native transaction through the URI's native CommitBuilder.
     /// The transaction handle remains valid and is cloned by the C API.
     static Dataset commit(
@@ -6261,6 +6535,41 @@ public:
         return Dataset(dataset);
     }
 
+    /// Publish one native transaction through a foreign commit lock and
+    /// optional dynamic storage accessor.
+    ///
+    /// Conflict handling, retries, manifest construction, cancellation and the
+    /// final version stay native. NULL pointers keep native defaults. The
+    /// transaction handle remains valid.
+    static Dataset commit_with_commit_lock(
+        const std::string& uri,
+        const Transaction& transaction,
+        const CommitOptions& options,
+        const StorageOptionsAccessor* storage_accessor,
+        const Session* session,
+        const CommitLock* commit_lock) {
+
+        LanceCommitOptions c_options = to_c_commit_options(options);
+        LanceDataset* dataset = nullptr;
+        if (lance_transaction_commit_with_commit_lock(
+                uri.c_str(),
+                transaction.c_handle(),
+                &c_options,
+                storage_accessor ? storage_accessor->c_handle() : nullptr,
+                session ? session->c_handle() : nullptr,
+                commit_lock ? commit_lock->c_handle() : nullptr,
+                &dataset) != 0) {
+            check_error();
+        }
+        if (!dataset) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_transaction_commit_with_commit_lock returned success "
+                "with null out_dataset");
+        }
+        return Dataset(dataset);
+    }
+
     /// Commit native append transactions as one version. Native eligibility and
     /// merge semantics apply; non-append batches throw LANCE_ERR_NOT_SUPPORTED.
     static BatchCommitResult commit_batch(
@@ -6279,6 +6588,16 @@ public:
         const StorageOptionsAccessor& storage_options_accessor,
         const CommitOptions& options = {},
         const Session* session = nullptr);
+
+    /// Commit native append transactions as one version through a foreign
+    /// commit lock and optional dynamic storage accessor.
+    static BatchCommitResult commit_batch_with_commit_lock(
+        const std::string& uri,
+        const std::vector<std::reference_wrapper<const Transaction>>& transactions,
+        const CommitOptions& options,
+        const StorageOptionsAccessor* storage_accessor,
+        const Session* session,
+        const CommitLock* commit_lock);
 
     /// Clone this handle as an independent in-memory snapshot.
     ///
@@ -8523,6 +8842,46 @@ inline BatchCommitResult Dataset::commit_batch_with_accessor(
         throw Error(
             LANCE_ERR_INTERNAL,
             "lance_transaction_commit_batch_with_accessor returned success "
+            "with null output");
+    }
+    return BatchCommitResult(Dataset(dataset), Transaction(merged));
+}
+
+inline BatchCommitResult Dataset::commit_batch_with_commit_lock(
+    const std::string& uri,
+    const std::vector<std::reference_wrapper<const Transaction>>& transactions,
+    const CommitOptions& options,
+    const StorageOptionsAccessor* storage_accessor,
+    const Session* session,
+    const CommitLock* commit_lock) {
+
+    std::vector<const LanceTransaction*> raw;
+    raw.reserve(transactions.size());
+    for (const auto& transaction : transactions) {
+        raw.push_back(transaction.get().c_handle());
+    }
+
+    LanceCommitOptions c_options = to_c_commit_options(options);
+    LanceDataset* dataset = nullptr;
+    LanceTransaction* merged = nullptr;
+    if (lance_transaction_commit_batch_with_commit_lock(
+            uri.c_str(),
+            raw.data(),
+            raw.size(),
+            &c_options,
+            storage_accessor ? storage_accessor->c_handle() : nullptr,
+            session ? session->c_handle() : nullptr,
+            commit_lock ? commit_lock->c_handle() : nullptr,
+            &dataset,
+            &merged) != 0) {
+        check_error();
+    }
+    if (!dataset || !merged) {
+        if (dataset) lance_dataset_close(dataset);
+        if (merged) lance_transaction_close(merged);
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_transaction_commit_batch_with_commit_lock returned success "
             "with null output");
     }
     return BatchCommitResult(Dataset(dataset), Transaction(merged));

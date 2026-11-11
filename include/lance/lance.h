@@ -379,6 +379,8 @@ typedef struct LanceIvfModel LanceIvfModel;
 typedef struct LanceSchema LanceSchema;
 typedef struct LanceNamespace LanceNamespace;
 typedef struct LanceRestAdapter LanceRestAdapter;
+typedef struct LanceCommitLock LanceCommitLock;
+typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
 
 /* ─── Shared session ─── */
 
@@ -601,6 +603,31 @@ LanceDataset* lance_dataset_open_with_options(
     const char* uri,
     const LanceDatasetOpenOptions* options,
     const LanceSession* session
+);
+
+/**
+ * Open a Lance dataset through a foreign commit lock and an optional dynamic
+ * storage-options accessor.
+ *
+ * A non-NULL `storage_accessor` forwards its native accessor owner; NULL, or
+ * an accessor constructed without an inner owner, selects native omission.
+ * `commit_lock` may be NULL to keep the URI-derived native handler. `session`
+ * may be NULL. `version == 0` opens the latest version.
+ *
+ * The returned dataset retains the native handler and accessor owners, so
+ * closing either input handle afterwards does not invalidate this dataset,
+ * its scanners, or later commits performed through it.
+ *
+ * @param out_dataset receives the dataset handle on success; must not be NULL
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_open_with_commit_lock(
+    const char* uri,
+    const LanceStorageOptionsAccessor* storage_accessor,
+    uint64_t version,
+    const LanceSession* session,
+    const LanceCommitLock* commit_lock,
+    LanceDataset** out_dataset
 );
 
 /** Close and free a dataset handle. Safe to call with NULL. */
@@ -2319,6 +2346,104 @@ int32_t lance_dataset_add_columns_batch_udf(
     const char* const* read_columns,
     const uint32_t* batch_size
 );
+
+/* ─── Commit lock ─────────────────────────────────────────────────────────── */
+
+/**
+ * Acquire the lock for a manifest base version.
+ *
+ * On success return 0 and either store an owned opaque token in `*out_lease`
+ * or leave it NULL for a stateless lock. On failure return nonzero, fill
+ * `error`, and leave `*out_lease` NULL. A non-NULL partial token left on a
+ * failed acquire is destroyed exactly once and never released.
+ *
+ * The callback runs synchronously on a native runtime thread, may perform
+ * blocking I/O through an independent dataset or scanner handle, and must be
+ * thread-safe and non-unwinding. It must not re-enter the dataset handle that
+ * is currently committing.
+ */
+typedef int32_t (*LanceCommitLockAcquire)(
+    void* callback_ctx,
+    uint64_t version,
+    void** out_lease,
+    LanceCallbackError* error
+);
+
+/**
+ * Report whether the commit that acquired a lease succeeded.
+ *
+ * `success` is true after the manifest is published and false when native
+ * conflict handling or cancellation abandons the attempt. Release may be
+ * called more than once for one token and must be idempotent. It does not
+ * destroy the token. On failure return nonzero and fill `error`; the token
+ * stays owned by the library until `destroy_lease`.
+ */
+typedef int32_t (*LanceCommitLockRelease)(
+    void* callback_ctx,
+    void* lease,
+    bool success,
+    LanceCallbackError* error
+);
+
+/**
+ * Destroy one lease token. Called exactly once per acquired lease, after any
+ * final release callback, including for a NULL stateless token. Must not
+ * throw and must not call back into Lance.
+ */
+typedef void (*LanceCommitLeaseDestroy)(
+    void* callback_ctx,
+    void* lease
+);
+
+/**
+ * Release the lock context exactly once, when the last native owner drops.
+ * Optional; absent means the caller keeps ownership of `callback_ctx`. Must
+ * not throw.
+ */
+typedef void (*LanceCommitLockContextRelease)(
+    void* callback_ctx
+);
+
+/**
+ * Foreign commit lock.
+ *
+ * `lock` and `release` are required; `destroy_lease` and `release_context` are
+ * optional. The table is copied by `lance_commit_lock_new`. `callback_ctx` is
+ * borrowed by every callback and may be NULL. Context ownership transfers
+ * only when construction succeeds: on failure `release_context` is never
+ * called.
+ *
+ * Datasets, scanners and in-flight native jobs retain their own native context
+ * owner. Closing a `LanceCommitLock` handle only drops that handle's owner;
+ * retained datasets keep working. Keep the lock handle alive when staging a
+ * transaction and pass it to the matching commit entry point.
+ */
+typedef struct LanceCommitLockCallbacks {
+    LanceCommitLockAcquire lock;
+    LanceCommitLockRelease release;
+    LanceCommitLeaseDestroy destroy_lease;
+    void* callback_ctx;
+    LanceCommitLockContextRelease release_context;
+} LanceCommitLockCallbacks;
+
+/**
+ * Construct a foreign commit lock from a callback table.
+ *
+ * `callbacks` and its `lock`/`release` entries must be non-NULL.
+ * `destroy_lease` and `release_context` may be NULL.
+ *
+ * @return Owned lock handle, or NULL on error
+ */
+LanceCommitLock* lance_commit_lock_new(
+    const LanceCommitLockCallbacks* callbacks
+);
+
+/**
+ * Close a commit-lock handle. Safe to call with NULL.
+ *
+ * Retained datasets and leases keep their native context owner.
+ */
+void lance_commit_lock_close(LanceCommitLock* lock);
 
 /* ─── lance_dataset_compact_files ─────────────────────────────────────────── */
 
@@ -7037,6 +7162,34 @@ int32_t lance_dataset_write_with_options_and_accessor(
     LanceDataset** out_dataset
 );
 
+/**
+ * Same as lance_dataset_write_with_options but composes with a foreign commit
+ * lock and an optional dynamic storage-options accessor.
+ *
+ * A non-NULL `storage_accessor` forwards its native accessor owner; NULL, or
+ * an accessor without an inner owner, selects native omission. A non-NULL
+ * `commit_lock` replaces the URI-derived handler; NULL keeps the native
+ * default. `session` may be NULL. The committed dataset retains both owners
+ * after this call returns.
+ *
+ * The stream is consumed on every return path except a NULL `stream`.
+ * `out_dataset` follows the same success-only contract as
+ * lance_dataset_write_with_options.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_write_with_options_with_commit_lock(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceWriteOptions* options,
+    const LanceStorageOptionsAccessor* storage_accessor,
+    const LanceSession* session,
+    const LanceCommitLock* commit_lock,
+    LanceDataset** out_dataset
+);
+
 /* ─── Native data files ─── */
 
 /** Owned native `DataFile` metadata snapshot. */
@@ -7414,6 +7567,33 @@ int32_t lance_dataset_write_uncommitted_stream_with_accessor(
     const LanceUncommittedWriteOptions* options,
     const LanceStorageOptionsAccessor* storage_options_accessor,
     const LanceSession* session,
+    LanceTransaction** out_transaction
+);
+
+/**
+ * Stage an Arrow stream into uncommitted data files through a foreign commit
+ * lock and an optional dynamic storage-options accessor.
+ *
+ * Staging uses the accessor `Arc` and optional session exactly like
+ * lance_dataset_write_uncommitted_stream. The lock is retained for this call
+ * while native writes data files. The returned transaction carries metadata;
+ * keep the lock handle alive and pass it to the matching commit entry point.
+ * NULL handles keep native defaults.
+ *
+ * Stream consumption, schema matching and `out_transaction` success-only
+ * output match lance_dataset_write_uncommitted_stream.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_write_uncommitted_stream_with_commit_lock(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceUncommittedWriteOptions* options,
+    const LanceStorageOptionsAccessor* storage_accessor,
+    const LanceSession* session,
+    const LanceCommitLock* commit_lock,
     LanceTransaction** out_transaction
 );
 
@@ -8503,6 +8683,30 @@ int32_t lance_transaction_commit_with_accessor(
 );
 
 /**
+ * Publish one native transaction through a foreign commit lock and an optional
+ * dynamic storage-options accessor.
+ *
+ * Conflict detection, retries, manifest construction, cancellation and the
+ * final version stay native. A NULL lock or a NULL/empty accessor keeps the
+ * corresponding native default. `session` may be NULL.
+ *
+ * Output and failure semantics match lance_transaction_commit: the dataset is
+ * written only on success, and the caller must reopen the URI to establish the
+ * committed state after an I/O failure.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_transaction_commit_with_commit_lock(
+    const char* uri,
+    const LanceTransaction* transaction,
+    const LanceCommitOptions* options,
+    const LanceStorageOptionsAccessor* storage_accessor,
+    const LanceSession* session,
+    const LanceCommitLock* commit_lock,
+    LanceDataset** out_dataset
+);
+
+/**
  * Publish append transactions through CommitBuilder::execute_batch.
  *
  * Each input transaction is borrowed and cloned. Native batch rules determine
@@ -8541,6 +8745,27 @@ int32_t lance_transaction_commit_batch_with_accessor(
     const LanceCommitOptions* options,
     const LanceStorageOptionsAccessor* storage_options_accessor,
     const LanceSession* session,
+    LanceDataset** out_dataset,
+    LanceTransaction** out_merged_transaction
+);
+
+/**
+ * Publish append transactions through a foreign commit lock and an optional
+ * dynamic storage-options accessor.
+ *
+ * Eligibility, merge order, conflicts, retries and the merged read version
+ * stay native. Both output pointers are required and written only on success.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_transaction_commit_batch_with_commit_lock(
+    const char* uri,
+    const LanceTransaction* const* transactions,
+    size_t transaction_count,
+    const LanceCommitOptions* options,
+    const LanceStorageOptionsAccessor* storage_accessor,
+    const LanceSession* session,
+    const LanceCommitLock* commit_lock,
     LanceDataset** out_dataset,
     LanceTransaction** out_merged_transaction
 );
