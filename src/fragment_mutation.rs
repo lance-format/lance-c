@@ -778,7 +778,7 @@ mod tests {
                 assert_eq!(sentinel, [41, 42]);
                 assert_eq!(
                     crate::lance_last_error_code(),
-                    crate::LanceErrorCode::LANCE_ERR_INVALID_ARGUMENT
+                    crate::LanceErrorCode::InvalidArgument
                 );
             }
             assert_eq!(
