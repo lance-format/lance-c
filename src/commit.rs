@@ -20,6 +20,7 @@ use lance::dataset::{CommitBuilder, InsertBuilder, WriteParams};
 use lance::session::Session;
 use lance_core::Result;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+use lance_table::io::commit::CommitHandler;
 
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
@@ -124,7 +125,24 @@ unsafe fn commit_builder_from_ffi<'a>(
     storage_opts: *const *const c_char,
     session: *const LanceSession,
 ) -> Result<CommitBuilder<'a>> {
+    unsafe { commit_builder_from_ffi_with_handler(uri, None, options, storage_opts, session) }
+}
+
+/// Build a `CommitBuilder` with an optional native commit handler.
+///
+/// Namespace URI commits supply `ExternalManifestCommitHandler`; all other
+/// conversions stay exactly the same as the plain URI entry points.
+pub(crate) unsafe fn commit_builder_from_ffi_with_handler<'a>(
+    uri: &'a str,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
+    options: *const LanceCommitOptions,
+    storage_opts: *const *const c_char,
+    session: *const LanceSession,
+) -> Result<CommitBuilder<'a>> {
     let mut builder = CommitBuilder::new(uri);
+    if let Some(commit_handler) = commit_handler {
+        builder = builder.with_commit_handler(commit_handler);
+    }
     if let Some(store_params) = storage_options_from_ffi(storage_opts)? {
         builder = builder.with_store_params(store_params);
     }
@@ -330,7 +348,7 @@ unsafe fn write_uncommitted_stream_inner(
     Ok(0)
 }
 
-fn dataset_handle(dataset: Dataset) -> LanceDataset {
+pub(crate) fn dataset_handle(dataset: Dataset) -> LanceDataset {
     LanceDataset {
         inner: RwLock::new(Arc::new(dataset)),
     }
