@@ -15,6 +15,7 @@ use std::ops::Range;
 use std::ptr;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, to_ffi};
+use arrow_array::Array;
 use arrow_schema::Field;
 use lance::dataset::BlobFile;
 use lance::{
