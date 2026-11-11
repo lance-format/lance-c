@@ -12036,6 +12036,53 @@ fn create_multi_fragment_vector_dataset(
     (tmp, uri)
 }
 
+fn create_float16_vector_dataset(num_rows: i32, dim: i32) -> (tempfile::TempDir, String) {
+    use arrow_array::PrimitiveArray;
+    use arrow_array::types::Float16Type;
+    use half::f16;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("f16_vec_ds").to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float16, true)), dim),
+            false,
+        ),
+    ]));
+    let values = (0..num_rows)
+        .flat_map(|row| {
+            (0..dim).map(move |component| f16::from_f32(row as f32 + component as f32 / dim as f32))
+        })
+        .collect::<Vec<_>>();
+    let embeddings = arrow_array::FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float16, true)),
+        dim,
+        Arc::new(PrimitiveArray::<Float16Type>::from(values)),
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from((0..num_rows).collect::<Vec<_>>())),
+            Arc::new(embeddings),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+    (tmp, uri)
+}
+
 fn train_segment_pq_models(
     dataset: *const LanceDataset,
     column: &CString,
@@ -12113,25 +12160,39 @@ fn nearest_ids_and_statistics(
     use_index: bool,
     k: u32,
 ) -> (Vec<i32>, CapturedScanStatistics) {
+    nearest_ids_and_statistics_typed(
+        dataset,
+        column,
+        query.as_ptr().cast(),
+        query.len(),
+        LanceDataType::Float32,
+        use_index,
+        k,
+    )
+}
+
+fn nearest_ids_and_statistics_typed(
+    dataset: *mut LanceDataset,
+    column: &str,
+    query: *const c_void,
+    query_len: usize,
+    dtype: LanceDataType,
+    use_index: bool,
+    k: u32,
+) -> (Vec<i32>, CapturedScanStatistics) {
     let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
     assert!(!scanner.is_null(), "{}", take_last_error_message());
     let column = c_str(column);
     assert_eq!(
         unsafe {
-            lance_scanner_nearest(
-                scanner,
-                column.as_ptr(),
-                query.as_ptr().cast(),
-                query.len(),
-                LanceDataType::Float32 as i32,
-                k,
-            )
+            lance_scanner_nearest(scanner, column.as_ptr(), query, query_len, dtype as i32, k)
         },
         0,
         "{}",
         take_last_error_message()
     );
     assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 2) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_refine_factor(scanner, 8) }, 0);
     assert_eq!(
         unsafe { lance_scanner_set_use_index(scanner, use_index) },
         0
@@ -15873,8 +15934,8 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
     {
         let mut options = vector_index_options(index_type, LanceMetricType::L2);
         options.num_partitions = set_option(2);
-        options.max_iters = set_option(2);
-        options.sample_rate = set_option(16);
+        options.max_iters = set_option(10);
+        options.sample_rate = set_option(128);
         match index_type {
             LanceVectorIndexType::IvfPq | LanceVectorIndexType::IvfHnswPq => {
                 options.num_sub_vectors = set_option(2);
@@ -15921,7 +15982,7 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
             "{expected_type} must return the exact source row through the index"
         );
         assert!(
-            indexed_statistics.indices_loaded > 0,
+            indexed_statistics.index_partitions_loaded > 0,
             "{expected_type} scan must load the persisted index"
         );
 
@@ -15932,7 +15993,11 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
             "{expected_type} indexed versus flat ids"
         );
         assert_eq!(
-            flat_statistics.indices_loaded, 0,
+            (
+                flat_statistics.indices_loaded,
+                flat_statistics.index_partitions_loaded
+            ),
+            (0, 0),
             "{expected_type} disabled-index control must not load an index"
         );
 
@@ -16572,7 +16637,7 @@ fn test_vector_index_options_shared_models_and_single_version_publication() {
     let (indexed_ids, statistics) =
         nearest_ids_and_statistics(pq_dataset, "embedding", &query, true, 3);
     assert_eq!(indexed_ids.first(), Some(&5));
-    assert!(statistics.indices_loaded > 0);
+    assert!(statistics.index_partitions_loaded > 0);
     unsafe { lance_dataset_close(pq_dataset) };
 
     let reopened = unsafe { lance_dataset_open(pq_uri_c.as_ptr(), ptr::null(), 0) };
@@ -16724,7 +16789,7 @@ fn test_vector_index_options_shared_models_and_single_version_publication() {
     let (rq_ids, rq_statistics) =
         nearest_ids_and_statistics(rq_dataset, "embedding", &query, true, 3);
     assert_eq!(rq_ids.first(), Some(&5));
-    assert!(rq_statistics.indices_loaded > 0);
+    assert!(rq_statistics.index_partitions_loaded > 0);
     unsafe { lance_dataset_close(rq_dataset) };
     let reopened = unsafe { lance_dataset_open(rq_uri_c.as_ptr(), ptr::null(), 0) };
     let (rq_reopened_ids, _) = nearest_ids_and_statistics(reopened, "embedding", &query, true, 3);
@@ -16750,7 +16815,7 @@ fn test_vector_index_options_accept_native_float16_ivf_model() {
     use arrow_array::types::Float16Type;
     use half::f16;
 
-    let (_tmp, uri) = create_multi_fragment_vector_dataset(1, 64, 8, false);
+    let (_tmp, uri) = create_float16_vector_dataset(64, 8);
     let uri_c = c_str(&uri);
     let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     let column = c_str("embedding");
@@ -16824,12 +16889,20 @@ fn test_vector_index_options_accept_native_float16_ivf_model() {
         "{}",
         take_last_error_message()
     );
-    let query: Vec<f32> = (0..8)
-        .map(|component| 5.0 + component as f32 / 8.0)
-        .collect();
-    let (ids, statistics) = nearest_ids_and_statistics(dataset, "embedding", &query, true, 3);
+    let query = (0..8)
+        .map(|component| f16::from_f32(5.0 + component as f32 / 8.0))
+        .collect::<Vec<_>>();
+    let (ids, statistics) = nearest_ids_and_statistics_typed(
+        dataset,
+        "embedding",
+        query.as_ptr().cast(),
+        query.len(),
+        LanceDataType::Float16,
+        true,
+        3,
+    );
     assert_eq!(ids.first(), Some(&5));
-    assert!(statistics.indices_loaded > 0);
+    assert!(statistics.index_partitions_loaded > 0);
 
     unsafe {
         lance_free_bytes(bytes);
