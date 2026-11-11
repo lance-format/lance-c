@@ -26135,25 +26135,6 @@ fn version_manifest_stems(uri: &str) -> Vec<String> {
     stems
 }
 
-fn count_files_with_extension(root: &std::path::Path, extension: &str) -> usize {
-    let mut count = 0;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(directory).unwrap() {
-            let entry = entry.unwrap();
-            let file_type = entry.file_type().unwrap();
-            if file_type.is_dir() {
-                pending.push(entry.path());
-            } else if file_type.is_file()
-                && entry.path().extension().and_then(|value| value.to_str()) == Some(extension)
-            {
-                count += 1;
-            }
-        }
-    }
-    count
-}
-
 fn dataset_file_base_ids(dataset: *const LanceDataset) -> Vec<Option<u64>> {
     let count = unsafe { lance_dataset_fragment_count(dataset) };
     let mut ids = vec![0_u64; count as usize];
