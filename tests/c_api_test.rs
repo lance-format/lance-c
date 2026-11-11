@@ -44464,7 +44464,7 @@ fn test_native_dataset_deep_clone_cross_store() {
 
     let source = deep_clone_source(&src_uri);
     assert!(source.manifest.config.is_empty());
-    let expected_schema = source.schema().clone();
+    let expected_schema = Schema::from(source.schema());
 
     let src_c = c_str(&src_uri);
     let ds = unsafe { lance_dataset_open(src_c.as_ptr(), ptr::null(), 0) };

@@ -338,6 +338,7 @@ typedef struct LanceVersions LanceVersions;
 typedef struct LanceVersion  LanceVersion;
 typedef struct LanceVersionRefs LanceVersionRefs;
 typedef struct LanceRef      LanceRef;
+typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
 typedef struct LanceTag      LanceTag;
 typedef struct LanceTags     LanceTags;
 typedef struct LanceDataStatistics LanceDataStatistics;
@@ -1330,7 +1331,7 @@ int32_t lance_dataset_deep_clone(
     const LanceDataset* dataset,
     const char* target_path,
     const LanceRef* reference,
-    const struct LanceStorageOptionsAccessor* target_storage_options,
+    const LanceStorageOptionsAccessor* target_storage_options,
     LanceDataset** out
 );
 
@@ -7768,7 +7769,6 @@ int32_t lance_transaction_commit_batch(
 
 /* ─── Storage options ─────────────────────────────────────────────────────── */
 
-typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
 typedef struct LanceStorageOptionsProvider LanceStorageOptionsProvider;
 typedef struct LanceStorageOptionsSnapshot LanceStorageOptionsSnapshot;
 

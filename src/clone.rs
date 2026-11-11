@@ -116,7 +116,9 @@ mod tests {
     use std::ffi::CString;
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, StructArray};
+    use arrow_array::{
+        Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance::Dataset;
@@ -295,14 +297,14 @@ mod tests {
     }
 
     fn list_objects(store: &ObjectStore, prefix: &ObjectPath) -> Vec<String> {
-        let entries: Vec<_> = block_on(store.list(Some(prefix)).try_collect()).unwrap();
+        let entries: Vec<_> = block_on(store.list(Some(prefix.clone())).try_collect()).unwrap();
         entries
             .into_iter()
             .map(|meta| meta.location.to_string())
             .collect()
     }
 
-    fn store(registry: Arc<ObjectStoreRegistry>, uri: &str) -> ObjectStore {
+    fn store(registry: Arc<ObjectStoreRegistry>, uri: &str) -> Arc<ObjectStore> {
         block_on(ObjectStore::from_uri_and_params(
             registry,
             uri,
@@ -343,7 +345,7 @@ mod tests {
         assert!(!dataset.is_null(), "source open failed");
         // Advance the source after the C handle was opened. The handle keeps
         // its snapshot; a NULL reference must clone that snapshot, not latest.
-        let appended_schema = source.schema().clone();
+        let appended_schema = Arc::new(Schema::from(source.schema()));
         let mut advanced = Dataset::clone(&source);
         block_on(advanced.append(
             RecordBatchIterator::new(
@@ -390,7 +392,10 @@ mod tests {
         assert_eq!(reopened.version_id(), 1);
         assert_eq!(block_on(reopened.count_rows(None)).unwrap(), 5);
         assert_eq!(rows(&reopened), expected);
-        assert_eq!(reopened.schema().metadata(), source.schema().metadata());
+        assert_eq!(
+            reopened.schema().to_arrow_schema().metadata(),
+            source.schema().to_arrow_schema().metadata()
+        );
         assert!(
             block_on(
                 DatasetBuilder::from_uri(&src_uri)
@@ -488,7 +493,7 @@ mod tests {
         );
         assert_eq!(
             unsafe { lance_dataset_count_rows(out_head) },
-            block_on(source.count_rows(None)).unwrap()
+            block_on(source.count_rows(None)).unwrap() as u64
         );
 
         // Missing tag fails through the native ref resolver.

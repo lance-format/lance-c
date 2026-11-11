@@ -6830,7 +6830,7 @@ static void test_dataset_deep_clone(const char *src_uri) {
     CHECK_OK();
     lance_dataset_close(cloned);
 
-    PASS();
+    printf("OK\n");
 }
 
 int main(int argc, char **argv) {
