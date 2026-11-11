@@ -25,7 +25,7 @@ use arrow_array::make_array;
 use arrow_array::types::{Int8Type, Int32Type};
 use arrow_array::{
     Array, BinaryArray, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
-    LargeBinaryArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
+    LargeBinaryArray, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
     UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
@@ -22010,6 +22010,118 @@ fn create_typed_fts_dataset() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+fn create_typed_fts_list_dataset() -> (tempfile::TempDir, String) {
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("typed_fts_list_dataset")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+
+    let make_batch = |ids: Vec<i32>, lists: &[Option<Vec<Option<&str>>>]| {
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        for list in lists {
+            match list {
+                Some(items) => {
+                    for item in items {
+                        match item {
+                            Some(value) => tags.values().append_value(*value),
+                            None => tags.values().append_null(),
+                        }
+                    }
+                    tags.append(true);
+                }
+                None => tags.append(false),
+            }
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(tags.finish())],
+        )
+        .unwrap()
+    };
+    let first = make_batch(
+        vec![1, 2, 3, 4, 5],
+        &[
+            Some(vec![
+                Some("alpha beta"),
+                Some("gamma alpha"),
+                None,
+                Some(""),
+                Some("delta"),
+            ]),
+            Some(vec![Some("alpha"), Some("beta alpha")]),
+            None,
+            Some(Vec::new()),
+            Some(vec![None, None]),
+        ],
+    );
+    let second = make_batch(
+        vec![6, 7, 8, 9, 10, 11],
+        &[
+            Some(vec![Some("!!!"), Some("epsilon")]),
+            Some(vec![Some("")]),
+            Some(vec![Some("alpha"), Some("alpha")]),
+            Some(vec![Some("alpha beta gamma")]),
+            Some(vec![Some("zeta"), Some("alpha beta")]),
+            Some(vec![Some("beta"), Some("gamma")]),
+        ],
+    );
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap()
+        .append(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let params = c_str(
+        r#"{"base_tokenizer":"simple","language":"English","with_position":true,"document_granularity":"list_element"}"#,
+    );
+    let column = c_str("tags");
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::Inverted as i32,
+                params.as_ptr(),
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    (tmp, uri)
+}
+
 fn initialized_match_options() -> LanceFtsMatchOptions {
     let mut options = std::mem::MaybeUninit::<LanceFtsMatchOptions>::uninit();
     unsafe { lance_fts_query_match_options_init(options.as_mut_ptr()) };
@@ -22458,6 +22570,241 @@ fn collect_native_row_metadata(uri: &str) -> std::collections::HashMap<i32, (u64
         }
         rows
     })
+}
+
+fn collect_typed_element_hits(
+    dataset: *const LanceDataset,
+    query: *const LanceFtsQuery,
+    row_ids: Option<&[u64]>,
+) -> Vec<(i32, Vec<u32>, f32)> {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query(scanner, query) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    if let Some(row_ids) = row_ids {
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_row_addr_allowlist(scanner, row_ids.as_ptr(), row_ids.len())
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+    }
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let mut hits = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let coordinates = batch
+            .column_by_name("_doc_index")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let scores = batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let coordinates = coordinates.value(row);
+            let coordinates = coordinates.as_any().downcast_ref::<UInt32Array>().unwrap();
+            hits.push((
+                ids.value(row),
+                (0..coordinates.len())
+                    .map(|index| coordinates.value(index))
+                    .collect(),
+                scores.value(row),
+            ));
+        }
+    }
+    unsafe { lance_scanner_close(scanner) };
+    hits.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    hits
+}
+
+fn collect_native_fts_element_hits(
+    uri: &str,
+    query: FtsQuery,
+    row_ids: Option<&[u64]>,
+) -> Vec<(i32, Vec<u32>, f32)> {
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap();
+        if let Some(row_ids) = row_ids {
+            let allowed: RowAddrTreeMap = row_ids.iter().copied().collect();
+            scanner.with_row_id_prefilter(RowAddrMask::from_allowed(allowed));
+        }
+        let mut stream = scanner.try_into_stream().await.unwrap();
+        let mut hits = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let coordinates = batch
+                .column_by_name("_doc_index")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let scores = batch
+                .column_by_name("_score")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let coordinates = coordinates.value(row);
+                let coordinates = coordinates.as_any().downcast_ref::<UInt32Array>().unwrap();
+                hits.push((
+                    ids.value(row),
+                    (0..coordinates.len())
+                        .map(|index| coordinates.value(index))
+                        .collect(),
+                    scores.value(row),
+                ));
+            }
+        }
+        hits.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        hits
+    })
+}
+
+fn native_fts_stream_error(uri: &str, query: FtsQuery) -> String {
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap();
+        match scanner.try_into_stream().await {
+            Ok(_) => panic!("native list-element query unexpectedly succeeded"),
+            Err(error) => error.to_string(),
+        }
+    })
+}
+
+fn typed_fts_stream_error(
+    dataset: *const LanceDataset,
+    query: *const LanceFtsQuery,
+) -> (LanceErrorCode, String) {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_scanner_set_fts_query(scanner, query) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1,
+        "unsupported list-element combination must fail when the stream is built"
+    );
+    let code = lance_last_error_code();
+    let message = take_last_error_message();
+    unsafe { lance_scanner_close(scanner) };
+    (code, message)
+}
+
+fn assert_element_membership(
+    actual: &[(i32, Vec<u32>, f32)],
+    expected: &[(i32, &[u32])],
+    context: &str,
+) {
+    let actual = actual
+        .iter()
+        .map(|(id, coordinates, _)| (*id, coordinates.clone()))
+        .collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .map(|(id, coordinates)| (*id, coordinates.to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "{context}: element membership differs");
+}
+
+fn assert_element_hits_match(
+    actual: &[(i32, Vec<u32>, f32)],
+    expected: &[(i32, Vec<u32>, f32)],
+    context: &str,
+) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{context}: hit count differs: {actual:?} vs {expected:?}"
+    );
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert_eq!(
+            (actual.0, &actual.1),
+            (expected.0, &expected.1),
+            "{context}: element membership or coordinates differ"
+        );
+        let tolerance = 1e-5 * expected.2.abs().max(1.0);
+        assert!(
+            (actual.2 - expected.2).abs() <= tolerance,
+            "{context}: id {} at {:?} score {} != native {}",
+            actual.0,
+            actual.1,
+            actual.2,
+            expected.2
+        );
+    }
+}
+
+fn assert_element_scores_scaled(
+    actual: &[(i32, Vec<u32>, f32)],
+    baseline: &[(i32, Vec<u32>, f32)],
+    factor: f32,
+    context: &str,
+) {
+    assert_eq!(
+        actual.len(),
+        baseline.len(),
+        "{context}: hit count differs: {actual:?} vs {baseline:?}"
+    );
+    for (actual, baseline) in actual.iter().zip(baseline) {
+        assert_eq!(
+            (actual.0, &actual.1),
+            (baseline.0, &baseline.1),
+            "{context}: element membership or coordinates differ"
+        );
+        let expected = baseline.2 * factor;
+        let tolerance = 1e-5 * expected.abs().max(1.0);
+        assert!(
+            (actual.2 - expected).abs() <= tolerance,
+            "{context}: id {} at {:?} score {} != {} x {}",
+            actual.0,
+            actual.1,
+            actual.2,
+            factor,
+            baseline.2
+        );
+    }
 }
 
 #[test]
@@ -23562,6 +23909,215 @@ fn test_typed_fts_query_ownership_filters_and_replacement() {
     }
 
     unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_typed_fts_list_element_execution_matches_native_semantics() {
+    let (_tmp, uri) = create_typed_fts_list_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+
+    let mut match_options = initialized_match_options();
+    match_options.document_granularity = LanceFtsDocumentGranularity::ListElement as i32;
+    let alpha = typed_match("alpha", Some("tags"), &match_options);
+    let alpha_hits = collect_typed_element_hits(dataset, alpha, None);
+    assert_element_membership(
+        &alpha_hits,
+        &[
+            (1, &[0]),
+            (1, &[1]),
+            (2, &[0]),
+            (2, &[1]),
+            (8, &[0]),
+            (8, &[1]),
+            (9, &[0]),
+            (10, &[1]),
+        ],
+        "explicit list-element match",
+    );
+    assert_element_hits_match(
+        &alpha_hits,
+        &collect_native_fts_element_hits(
+            &uri,
+            native_match_query("alpha", Some("tags"), &match_options),
+            None,
+        ),
+        "explicit list-element match vs native",
+    );
+
+    let mut auto_options = initialized_match_options();
+    auto_options.document_granularity = LanceFtsDocumentGranularity::Unspecified as i32;
+    let auto_alpha = typed_match("alpha", Some("tags"), &auto_options);
+    let auto_hits = collect_typed_element_hits(dataset, auto_alpha, None);
+    assert_element_membership(
+        &auto_hits,
+        &[
+            (1, &[0]),
+            (1, &[1]),
+            (2, &[0]),
+            (2, &[1]),
+            (8, &[0]),
+            (8, &[1]),
+            (9, &[0]),
+            (10, &[1]),
+        ],
+        "unspecified list-element match",
+    );
+    assert_element_hits_match(
+        &auto_hits,
+        &alpha_hits,
+        "unspecified granularity resolves to the list-element index",
+    );
+    assert_element_hits_match(
+        &auto_hits,
+        &collect_native_fts_element_hits(
+            &uri,
+            native_match_query("alpha", Some("tags"), &auto_options),
+            None,
+        ),
+        "unspecified list-element match vs native",
+    );
+
+    let mut boosted_options = match_options;
+    boosted_options.boost = 2.0;
+    let boosted_alpha = typed_match("alpha", Some("tags"), &boosted_options);
+    let boosted_hits = collect_typed_element_hits(dataset, boosted_alpha, None);
+    assert_element_scores_scaled(
+        &boosted_hits,
+        &alpha_hits,
+        2.0,
+        "boosted list-element match",
+    );
+    assert_element_hits_match(
+        &boosted_hits,
+        &collect_native_fts_element_hits(
+            &uri,
+            native_match_query("alpha", Some("tags"), &boosted_options),
+            None,
+        ),
+        "boosted list-element match vs native",
+    );
+
+    let mut phrase_options = initialized_phrase_options();
+    phrase_options.document_granularity = LanceFtsDocumentGranularity::ListElement as i32;
+    let phrase_cases: [(&str, &[(i32, &[u32])]); 3] = [
+        ("alpha beta", &[(1, &[0]), (9, &[0]), (10, &[1])]),
+        ("beta alpha", &[(2, &[1])]),
+        ("beta gamma", &[(9, &[0])]),
+    ];
+    for (terms, expected) in phrase_cases {
+        let query = typed_phrase(terms, Some("tags"), &phrase_options);
+        let hits = collect_typed_element_hits(dataset, query, None);
+        assert_element_membership(&hits, expected, &format!("list-element phrase {terms}"));
+        assert_element_hits_match(
+            &hits,
+            &collect_native_fts_element_hits(
+                &uri,
+                native_phrase_query(terms, Some("tags"), &phrase_options),
+                None,
+            ),
+            &format!("list-element phrase {terms} vs native"),
+        );
+        unsafe { lance_fts_query_close(query) };
+    }
+
+    let delta = typed_match("delta", Some("tags"), &match_options);
+    let delta_hits = collect_typed_element_hits(dataset, delta, None);
+    assert_element_membership(
+        &delta_hits,
+        &[(1, &[4])],
+        "element after a null and an empty element",
+    );
+    assert_element_hits_match(
+        &delta_hits,
+        &collect_native_fts_element_hits(
+            &uri,
+            native_match_query("delta", Some("tags"), &match_options),
+            None,
+        ),
+        "element after a null and an empty element vs native",
+    );
+
+    let row_metadata = collect_native_row_metadata(&uri);
+    let allowlisted = [row_metadata[&1].0, row_metadata[&2].0];
+    let filtered_hits = collect_typed_element_hits(dataset, alpha, Some(&allowlisted));
+    assert_element_membership(
+        &filtered_hits,
+        &[(1, &[0]), (1, &[1]), (2, &[0]), (2, &[1])],
+        "row-id allowlist",
+    );
+    let expected_filtered = alpha_hits
+        .iter()
+        .filter(|(id, _, _)| *id == 1 || *id == 2)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_element_hits_match(
+        &filtered_hits,
+        &expected_filtered,
+        "row-id allowlist keeps scores",
+    );
+    assert_element_hits_match(
+        &filtered_hits,
+        &collect_native_fts_element_hits(
+            &uri,
+            native_match_query("alpha", Some("tags"), &match_options),
+            Some(&allowlisted),
+        ),
+        "row-id allowlist vs native",
+    );
+
+    let mut row_options = initialized_match_options();
+    row_options.document_granularity = LanceFtsDocumentGranularity::Row as i32;
+    let row_query = typed_match("alpha", Some("tags"), &row_options);
+    let (code, message) = typed_fts_stream_error(dataset, row_query);
+    assert_eq!(code, LanceErrorCode::InvalidArgument, "{message}");
+    assert!(
+        message.contains("requested Row") && message.contains("ListElement"),
+        "{message}"
+    );
+    let native_message = native_fts_stream_error(
+        &uri,
+        native_match_query("alpha", Some("tags"), &row_options),
+    );
+    assert!(
+        native_message.contains("requested Row") && native_message.contains("ListElement"),
+        "{native_message}"
+    );
+
+    let multi_query = typed_multi_match("alpha", &["tags"], &initialized_multi_match_options());
+    let (code, message) = typed_fts_stream_error(dataset, multi_query);
+    assert_eq!(code, LanceErrorCode::NotSupported, "{message}");
+    let multi_needle = "MultiMatch does not support ListElement document granularity";
+    assert!(message.contains(multi_needle), "{message}");
+    let native_message = native_fts_stream_error(
+        &uri,
+        native_multi_match_query("alpha", &["tags"], &initialized_multi_match_options()),
+    );
+    assert!(native_message.contains(multi_needle), "{native_message}");
+
+    let combined_query =
+        typed_combined_fields("alpha", &["tags"], &initialized_combined_fields_options());
+    let (code, message) = typed_fts_stream_error(dataset, combined_query);
+    assert_eq!(code, LanceErrorCode::NotSupported, "{message}");
+    let combined_needle = "combined_fields (BM25F) scores whole rows";
+    assert!(message.contains(combined_needle), "{message}");
+    let native_message = native_fts_stream_error(
+        &uri,
+        native_combined_fields_query("alpha", &["tags"], &initialized_combined_fields_options()),
+    );
+    assert!(native_message.contains(combined_needle), "{native_message}");
+
+    unsafe {
+        lance_fts_query_close(alpha);
+        lance_fts_query_close(auto_alpha);
+        lance_fts_query_close(boosted_alpha);
+        lance_fts_query_close(delta);
+        lance_fts_query_close(row_query);
+        lance_fts_query_close(multi_query);
+        lance_fts_query_close(combined_query);
+        lance_dataset_close(dataset);
+    }
 }
 
 fn collect_context_fts_scores(
