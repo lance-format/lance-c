@@ -99,7 +99,7 @@ unsafe fn data_file_path_inner(file: *const LanceDataFile) -> Result<*const c_ch
 /// `lance_last_error_code()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_data_file_field_count(file: *const LanceDataFile) -> usize {
-    ffi_try!(unsafe { Ok(data_file_at(file)?.inner.fields.len()) }, 0)
+    ffi_try!(Ok(data_file_at(file)?.inner.fields.len()), 0)
 }
 
 /// Read one native field ID.
@@ -146,10 +146,7 @@ unsafe fn data_file_field_id_at_inner(
 /// `lance_last_error_code()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_data_file_column_index_count(file: *const LanceDataFile) -> usize {
-    ffi_try!(
-        unsafe { Ok(data_file_at(file)?.inner.column_indices.len()) },
-        0
-    )
+    ffi_try!(Ok(data_file_at(file)?.inner.column_indices.len()), 0)
 }
 
 /// Read one native column index, including the native `-1` marker.

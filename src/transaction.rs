@@ -291,7 +291,7 @@ unsafe fn data_replacement_group_clone_inner(
 pub unsafe extern "C" fn lance_data_replacement_group_fragment_id(
     group: *const LanceDataReplacementGroup,
 ) -> u64 {
-    ffi_try!(unsafe { Ok(data_replacement_group_at(group)?.inner.0) }, 0)
+    ffi_try!(Ok(data_replacement_group_at(group)?.inner.0), 0)
 }
 
 /// Clone the data file owned by a data replacement group.
