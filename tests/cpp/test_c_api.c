@@ -18,11 +18,25 @@
 
 #include "lance/lance.h"
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+
+_Static_assert(sizeof(LanceCompactionOptions) == 40,
+               "legacy compaction options ABI must stay 40 bytes");
+_Static_assert(offsetof(LanceCompactionOptions, target_rows_per_fragment) == 0,
+               "legacy compaction field 0 moved");
+_Static_assert(offsetof(LanceCompactionOptions, max_rows_per_group) == 8,
+               "legacy compaction field 1 moved");
+_Static_assert(offsetof(LanceCompactionOptions, max_bytes_per_file) == 16,
+               "legacy compaction field 2 moved");
+_Static_assert(offsetof(LanceCompactionOptions, num_threads) == 24,
+               "legacy compaction field 3 moved");
+_Static_assert(offsetof(LanceCompactionOptions, batch_size) == 32,
+               "legacy compaction field 4 moved");
 
 /* Arrow C Data Interface flag bits — mirror arrow_schema/arrow_c_data_interface.h
  * so we don't depend on the full Arrow header just to read schema flags. */
@@ -4893,6 +4907,116 @@ static void test_compact_files(const char *write_uri) {
     ASSERT(rc == -1, "NULL dataset must fail");
     ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
            "expected INVALID_ARGUMENT");
+
+    LanceCompactionOptionsV2 *v2 = lance_compaction_options_v2_new();
+    ASSERT(v2 != NULL, "create compaction options v2 failed");
+    ASSERT(lance_compaction_options_v2_set_target_rows_per_fragment(v2, 100) == 0,
+           "set compaction target failed");
+    ASSERT(lance_compaction_options_v2_set_max_source_rows(v2, true, 0) == 0,
+           "set explicit zero source rows failed");
+    ASSERT(lance_compaction_options_v2_set_max_source_rows(v2, false, 0) == 0,
+           "clear source rows failed");
+    ASSERT(lance_compaction_options_v2_set_max_bytes_per_file(v2, false, 0) == 0,
+           "clear max bytes failed");
+    ASSERT(lance_compaction_options_v2_set_num_threads(v2, true, 0) == 0,
+           "set explicit zero threads failed");
+    ASSERT(lance_compaction_options_v2_set_batch_size(v2, false, 0) == 0,
+           "clear batch size failed");
+    ASSERT(lance_compaction_options_v2_set_io_buffer_size(v2, true, 0) == 0,
+           "set explicit zero IO buffer failed");
+    ASSERT(lance_compaction_options_v2_set_materialize_deletions(v2, true) == 0,
+           "set materialize deletions failed");
+    ASSERT(lance_compaction_options_v2_set_materialize_deletions_threshold(v2, 0.5f) == 0,
+           "set deletion threshold failed");
+    ASSERT(lance_compaction_options_v2_set_defer_index_remap(v2, false) == 0,
+           "set defer remap failed");
+    ASSERT(lance_compaction_options_v2_set_index_remap_mode(
+               v2, LANCE_INDEX_REMAP_DIRECT) == 0,
+           "set remap mode failed");
+    ASSERT(lance_compaction_options_v2_set_compaction_mode(
+               v2, true, LANCE_COMPACTION_REENCODE) == 0,
+           "set compaction mode failed");
+    ASSERT(lance_compaction_options_v2_set_binary_copy_read_batch_bytes(
+               v2, false, 0) == 0,
+           "clear binary-copy batch failed");
+    ASSERT(lance_compaction_options_v2_set_max_source_fragments(v2, false, 0) == 0,
+           "clear source fragments failed");
+    ASSERT(lance_compaction_options_v2_set_max_source_bytes(v2, false, 0) == 0,
+           "clear source bytes failed");
+    ASSERT(lance_compaction_options_v2_set_excluded_fragment_ids(v2, NULL, 0) == 0,
+           "clear excluded fragments failed");
+    ASSERT(lance_compaction_options_v2_set_max_overlays_per_fragment(v2, true, 0) == 0,
+           "set overlay trigger failed");
+    ASSERT(lance_compaction_options_v2_set_data_storage_version(v2, "2.1") == 0,
+           "set storage version failed");
+    LanceCompactionOptionsV2 *v2_clone = lance_compaction_options_v2_clone(v2);
+    ASSERT(v2_clone != NULL, "clone compaction options failed");
+    LanceCompactionOptionsV2 *v2_from_dataset =
+        lance_compaction_options_v2_from_dataset(ds);
+    ASSERT(v2_from_dataset != NULL, "from-dataset compaction options failed");
+
+    memset(&metrics, 0, sizeof(metrics));
+    rc = lance_dataset_compact_files_v2(ds, v2, &metrics);
+    ASSERT(rc == 0, "compact_files_v2 failed");
+    ASSERT(metrics.fragments_removed == 0 && metrics.fragments_added == 0,
+           "expected v2 no-op metrics");
+    ASSERT(lance_dataset_version(ds) == v_before,
+           "v2 no-op compaction must not bump the version");
+
+    LanceCompactionPlan *plan = lance_dataset_plan_compaction(ds, v2);
+    ASSERT(plan != NULL, "plan compaction failed");
+    ASSERT(lance_compaction_plan_read_version(plan) == v_before,
+           "plan read version mismatch");
+    ASSERT(lance_compaction_plan_task_count(plan) == 0,
+           "clean smoke fixture must have no compaction tasks");
+    const char *plan_json = lance_compaction_plan_json(plan);
+    ASSERT(plan_json != NULL, "serialize compaction plan failed");
+    LanceCompactionPlan *decoded_plan = lance_compaction_plan_from_json(plan_json);
+    ASSERT(decoded_plan != NULL, "decode compaction plan failed");
+    lance_free_string(plan_json);
+    lance_compaction_plan_close(decoded_plan);
+    lance_compaction_plan_close(plan);
+
+    LanceOptimizeIndicesOptions *index_options =
+        lance_optimize_indices_options_new();
+    ASSERT(index_options != NULL, "create index options failed");
+    ASSERT(lance_optimize_indices_options_set_index_names(
+               index_options, true, NULL, 0) == 0,
+           "set empty index names failed");
+    ASSERT(lance_optimize_indices_options_set_num_indices_to_merge(
+               index_options, true, 0) == 0,
+           "set append mode failed");
+    LanceOptimizeIndicesOptions *index_options_clone =
+        lance_optimize_indices_options_clone(index_options);
+    ASSERT(index_options_clone != NULL, "clone index options failed");
+    LanceOptimizeIndicesPlan *index_plan =
+        lance_dataset_plan_optimize_indices(ds, index_options);
+    ASSERT(index_plan != NULL, "plan index optimization failed");
+    uint8_t plan_uuid[16];
+    ASSERT(lance_optimize_indices_plan_id(index_plan, plan_uuid) == 0,
+           "read index plan id failed");
+    const char *index_plan_json = lance_optimize_indices_plan_json(index_plan);
+    ASSERT(index_plan_json != NULL, "serialize index plan failed");
+    LanceOptimizeIndicesPlan *decoded_index_plan =
+        lance_optimize_indices_plan_from_json(index_plan_json);
+    ASSERT(decoded_index_plan != NULL, "decode index plan failed");
+    lance_free_string(index_plan_json);
+    lance_optimize_indices_plan_close(decoded_index_plan);
+    lance_optimize_indices_plan_close(index_plan);
+    lance_optimize_indices_options_free(index_options_clone);
+    lance_optimize_indices_options_free(index_options);
+    lance_compaction_options_v2_free(v2_clone);
+    lance_compaction_options_v2_free(v2_from_dataset);
+    lance_compaction_options_v2_free(v2);
+
+    rc = lance_dataset_migrate_manifest_paths_v2(NULL);
+    ASSERT(rc == -1, "NULL migration must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT for NULL migration");
+    rc = lance_dataset_truncate_table(NULL);
+    ASSERT(rc == -1, "NULL truncate must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT for NULL truncate");
 
     lance_dataset_close(ds);
     printf("OK\n");

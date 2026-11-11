@@ -309,6 +309,15 @@ typedef struct LanceTags     LanceTags;
 typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceCleanupExplanation LanceCleanupExplanation;
 typedef struct LanceDatasetConfig LanceDatasetConfig;
+typedef struct LanceCompactionOptionsV2 LanceCompactionOptionsV2;
+typedef struct LanceCompactionPlan LanceCompactionPlan;
+typedef struct LanceCompactionTask LanceCompactionTask;
+typedef struct LanceRewriteResult LanceRewriteResult;
+typedef struct LanceOptimizeIndicesOptions LanceOptimizeIndicesOptions;
+typedef struct LanceOptimizeIndicesPlan LanceOptimizeIndicesPlan;
+typedef struct LanceOptimizeIndexTask LanceOptimizeIndexTask;
+typedef struct LanceOptimizeIndexMerge LanceOptimizeIndexMerge;
+typedef struct LanceIndexSegmentResult LanceIndexSegmentResult;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
@@ -2185,6 +2194,10 @@ int32_t lance_dataset_add_columns_batch_udf(
  * upstream defaults. Each numeric field uses 0 as a "keep upstream default"
  * sentinel; non-zero values are forwarded after a usize range check so the
  * API does not silently truncate on 32-bit hosts.
+ *
+ * This five-field layout is frozen. New callers should use
+ * LanceCompactionOptionsV2, which preserves native None/Some(0)/Some(empty)
+ * choices and exposes every native compaction option.
  */
 typedef struct LanceCompactionOptions {
     /* Target row count per output fragment. Fragments below this size are
@@ -2239,6 +2252,446 @@ int32_t lance_dataset_compact_files(
     LanceDataset* dataset,
     const LanceCompactionOptions* options,
     LanceCompactionMetrics* out_metrics
+);
+
+/* ─── Native maintenance lifecycle ────────────────────────────────────────── */
+
+/** Migrate this dataset's manifest paths to v2 naming. Native rename behavior. */
+int32_t lance_dataset_migrate_manifest_paths_v2(LanceDataset* dataset);
+
+/** Delete all rows through native Dataset::truncate_table. */
+int32_t lance_dataset_truncate_table(LanceDataset* dataset);
+
+/* ─── Native compaction options V2 ────────────────────────────────────────── */
+
+/** Controls how data is rewritten during compaction. */
+typedef enum LanceCompactionMode {
+    LANCE_COMPACTION_REENCODE          = 0,
+    LANCE_COMPACTION_TRY_BINARY_COPY   = 1,
+    LANCE_COMPACTION_FORCE_BINARY_COPY = 2
+} LanceCompactionMode;
+
+/** Controls how the old-to-new row-address mapping is represented. */
+typedef enum LanceIndexRemapMode {
+    LANCE_INDEX_REMAP_COMPACT = 0,
+    LANCE_INDEX_REMAP_DIRECT  = 1
+} LanceIndexRemapMode;
+
+/** Create options from native CompactionOptions::default(). */
+LanceCompactionOptionsV2* lance_compaction_options_v2_new(void);
+
+/** Create options from native CompactionOptions::from_dataset_config(). */
+LanceCompactionOptionsV2* lance_compaction_options_v2_from_dataset(
+    const LanceDataset* dataset
+);
+
+/** Clone an owned native options value. */
+LanceCompactionOptionsV2* lance_compaction_options_v2_clone(
+    const LanceCompactionOptionsV2* options
+);
+
+/** Free options. NULL-safe. */
+void lance_compaction_options_v2_free(LanceCompactionOptionsV2* options);
+
+int32_t lance_compaction_options_v2_set_target_rows_per_fragment(
+    LanceCompactionOptionsV2* options,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_max_rows_per_group(
+    LanceCompactionOptionsV2* options,
+    uint64_t value
+);
+/** `has_value == false` selects native None; true preserves zero. */
+int32_t lance_compaction_options_v2_set_max_bytes_per_file(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_materialize_deletions(
+    LanceCompactionOptionsV2* options,
+    bool value
+);
+int32_t lance_compaction_options_v2_set_materialize_deletions_threshold(
+    LanceCompactionOptionsV2* options,
+    float value
+);
+int32_t lance_compaction_options_v2_set_num_threads(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_batch_size(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_io_buffer_size(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_defer_index_remap(
+    LanceCompactionOptionsV2* options,
+    bool value
+);
+int32_t lance_compaction_options_v2_set_index_remap_mode(
+    LanceCompactionOptionsV2* options,
+    int32_t mode
+);
+/** `has_value == false` selects native None; true selects the given mode. */
+int32_t lance_compaction_options_v2_set_compaction_mode(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    int32_t mode
+);
+int32_t lance_compaction_options_v2_set_binary_copy_read_batch_bytes(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_max_source_fragments(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_max_source_rows(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_max_source_bytes(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+/** Replace excluded IDs. NULL with count=0 is the empty list. */
+int32_t lance_compaction_options_v2_set_excluded_fragment_ids(
+    LanceCompactionOptionsV2* options,
+    const uint32_t* fragment_ids,
+    size_t count
+);
+int32_t lance_compaction_options_v2_set_max_overlays_per_fragment(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+/** Parse the selector with native LanceFileVersion::from_str(). NULL = None. */
+int32_t lance_compaction_options_v2_set_data_storage_version(
+    LanceCompactionOptionsV2* options,
+    const char* selector
+);
+/** NULL = native None; non-NULL with count=0 = Some(empty map). */
+int32_t lance_compaction_options_v2_set_transaction_properties(
+    LanceCompactionOptionsV2* options,
+    const LanceTransactionProperties* properties
+);
+
+/**
+ * Compact using native CompactionOptions.
+ * NULL options select from_dataset_config. Metrics are written only on
+ * success.
+ */
+int32_t lance_dataset_compact_files_v2(
+    LanceDataset* dataset,
+    const LanceCompactionOptionsV2* options,
+    LanceCompactionMetrics* out_metrics
+);
+
+/** Plan compaction. NULL options select from_dataset_config. */
+LanceCompactionPlan* lance_dataset_plan_compaction(
+    const LanceDataset* dataset,
+    const LanceCompactionOptionsV2* options
+);
+
+uint64_t lance_compaction_plan_read_version(const LanceCompactionPlan* plan);
+size_t lance_compaction_plan_task_count(const LanceCompactionPlan* plan);
+
+/** Owned task snapshot; free with lance_compaction_task_close(). */
+LanceCompactionTask* lance_compaction_plan_task_at(
+    const LanceCompactionPlan* plan,
+    size_t index
+);
+
+/** Clone effective plan options, including the resolved exact storage version. */
+LanceCompactionOptionsV2* lance_compaction_plan_options_clone(
+    const LanceCompactionPlan* plan
+);
+
+/** Native serde transport. Free strings with lance_free_string(). */
+const char* lance_compaction_plan_json(const LanceCompactionPlan* plan);
+LanceCompactionPlan* lance_compaction_plan_from_json(const char* json);
+void lance_compaction_plan_close(LanceCompactionPlan* plan);
+
+uint64_t lance_compaction_task_read_version(const LanceCompactionTask* task);
+size_t lance_compaction_task_fragment_count(const LanceCompactionTask* task);
+const char* lance_compaction_task_fragment_metadata_json_at(
+    const LanceCompactionTask* task,
+    size_t index
+);
+LanceCompactionOptionsV2* lance_compaction_task_options_clone(
+    const LanceCompactionTask* task
+);
+
+/** Execute against the dataset at the task's planned read version. */
+LanceRewriteResult* lance_compaction_task_execute(
+    const LanceDataset* dataset,
+    const LanceCompactionTask* task
+);
+
+const char* lance_compaction_task_json(const LanceCompactionTask* task);
+LanceCompactionTask* lance_compaction_task_from_json(const char* json);
+void lance_compaction_task_close(LanceCompactionTask* task);
+
+uint64_t lance_rewrite_result_read_version(const LanceRewriteResult* result);
+int32_t lance_rewrite_result_metrics(
+    const LanceRewriteResult* result,
+    LanceCompactionMetrics* out_metrics
+);
+size_t lance_rewrite_result_original_fragment_count(
+    const LanceRewriteResult* result
+);
+size_t lance_rewrite_result_new_fragment_count(
+    const LanceRewriteResult* result
+);
+const char* lance_rewrite_result_original_fragment_metadata_json_at(
+    const LanceRewriteResult* result,
+    size_t index
+);
+const char* lance_rewrite_result_new_fragment_metadata_json_at(
+    const LanceRewriteResult* result,
+    size_t index
+);
+const char* lance_rewrite_result_json(const LanceRewriteResult* result);
+LanceRewriteResult* lance_rewrite_result_from_json(const char* json);
+void lance_rewrite_result_close(LanceRewriteResult* result);
+
+/**
+ * Commit rewrite results through native commit_compaction.
+ * NULL options select CompactionOptions::default(). Metrics are written only
+ * on success.
+ */
+int32_t lance_dataset_commit_compaction(
+    LanceDataset* dataset,
+    const LanceRewriteResult* const* results,
+    size_t result_count,
+    const LanceCompactionOptionsV2* options,
+    LanceCompactionMetrics* out_metrics
+);
+
+/* ─── Native index optimization ───────────────────────────────────────────── */
+
+/** Create options from native OptimizeOptions::default(). */
+LanceOptimizeIndicesOptions* lance_optimize_indices_options_new(void);
+LanceOptimizeIndicesOptions* lance_optimize_indices_options_clone(
+    const LanceOptimizeIndicesOptions* options
+);
+void lance_optimize_indices_options_free(LanceOptimizeIndicesOptions* options);
+
+int32_t lance_optimize_indices_options_set_num_indices_to_merge(
+    LanceOptimizeIndicesOptions* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_optimize_indices_options_set_enable_partition_rebalancing(
+    LanceOptimizeIndicesOptions* options,
+    bool value
+);
+/** false = native None; true + count=0 = native Some(empty). */
+int32_t lance_optimize_indices_options_set_index_names(
+    LanceOptimizeIndicesOptions* options,
+    bool has_value,
+    const char* const* names,
+    size_t count
+);
+int32_t lance_optimize_indices_options_set_retrain(
+    LanceOptimizeIndicesOptions* options,
+    bool value
+);
+int32_t lance_optimize_indices_options_set_transaction_properties(
+    LanceOptimizeIndicesOptions* options,
+    const LanceTransactionProperties* properties
+);
+int32_t lance_optimize_indices_options_set_max_rows_per_task(
+    LanceOptimizeIndicesOptions* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_optimize_indices_options_set_max_rows_per_segment(
+    LanceOptimizeIndicesOptions* options,
+    bool has_value,
+    uint64_t value
+);
+
+/** Single-process native optimize_indices. NULL options use defaults. */
+int32_t lance_dataset_optimize_indices(
+    LanceDataset* dataset,
+    const LanceOptimizeIndicesOptions* options
+);
+
+/** Plan the native distributed optimize workflow. */
+LanceOptimizeIndicesPlan* lance_dataset_plan_optimize_indices(
+    const LanceDataset* dataset,
+    const LanceOptimizeIndicesOptions* options
+);
+
+/** Copy a native UUID as 16 raw RFC 4122 bytes. */
+int32_t lance_optimize_indices_plan_id(
+    const LanceOptimizeIndicesPlan* plan,
+    uint8_t out_uuid[16]
+);
+uint64_t lance_optimize_indices_plan_read_version(
+    const LanceOptimizeIndicesPlan* plan
+);
+size_t lance_optimize_indices_plan_task_count(
+    const LanceOptimizeIndicesPlan* plan
+);
+size_t lance_optimize_indices_plan_merge_count(
+    const LanceOptimizeIndicesPlan* plan
+);
+LanceOptimizeIndexTask* lance_optimize_indices_plan_task_at(
+    const LanceOptimizeIndicesPlan* plan,
+    size_t index
+);
+LanceOptimizeIndexMerge* lance_optimize_indices_plan_merge_at(
+    const LanceOptimizeIndicesPlan* plan,
+    size_t index
+);
+const char* lance_optimize_indices_plan_json(
+    const LanceOptimizeIndicesPlan* plan
+);
+LanceOptimizeIndicesPlan* lance_optimize_indices_plan_from_json(
+    const char* json
+);
+void lance_optimize_indices_plan_close(LanceOptimizeIndicesPlan* plan);
+
+int32_t lance_optimize_index_task_plan_id(
+    const LanceOptimizeIndexTask* task,
+    uint8_t out_uuid[16]
+);
+uint64_t lance_optimize_index_task_read_version(
+    const LanceOptimizeIndexTask* task
+);
+uint32_t lance_optimize_index_task_group(
+    const LanceOptimizeIndexTask* task
+);
+size_t lance_optimize_index_task_fragment_count(
+    const LanceOptimizeIndexTask* task
+);
+int32_t lance_optimize_index_task_fragment_id_at(
+    const LanceOptimizeIndexTask* task,
+    size_t index,
+    uint32_t* out_id
+);
+/** Owned LanceIndexSegmentMetadata; free with its existing free function. */
+LanceIndexSegmentMetadata* lance_optimize_index_task_reference(
+    const LanceOptimizeIndexTask* task
+);
+size_t lance_optimize_index_task_old_segment_count(
+    const LanceOptimizeIndexTask* task
+);
+LanceIndexSegmentMetadata* lance_optimize_index_task_old_segment_at(
+    const LanceOptimizeIndexTask* task,
+    size_t index
+);
+int32_t lance_optimize_index_task_num_indices_to_merge(
+    const LanceOptimizeIndexTask* task,
+    bool* out_has_value,
+    uint64_t* out_value
+);
+int32_t lance_optimize_index_task_enable_partition_rebalancing(
+    const LanceOptimizeIndexTask* task,
+    bool* out_value
+);
+int32_t lance_optimize_index_task_retrain(
+    const LanceOptimizeIndexTask* task,
+    bool* out_value
+);
+
+/** `*out_result` receives NULL when native returns None; untouched on error. */
+int32_t lance_optimize_index_task_execute(
+    const LanceDataset* dataset,
+    const LanceOptimizeIndexTask* task,
+    LanceIndexSegmentResult** out_result
+);
+
+const char* lance_optimize_index_task_json(
+    const LanceOptimizeIndexTask* task
+);
+LanceOptimizeIndexTask* lance_optimize_index_task_from_json(const char* json);
+void lance_optimize_index_task_close(LanceOptimizeIndexTask* task);
+
+int32_t lance_optimize_index_merge_plan_id(
+    const LanceOptimizeIndexMerge* merge,
+    uint8_t out_uuid[16]
+);
+uint64_t lance_optimize_index_merge_read_version(
+    const LanceOptimizeIndexMerge* merge
+);
+uint32_t lance_optimize_index_merge_group(
+    const LanceOptimizeIndexMerge* merge
+);
+size_t lance_optimize_index_merge_old_segment_count(
+    const LanceOptimizeIndexMerge* merge
+);
+LanceIndexSegmentMetadata* lance_optimize_index_merge_old_segment_at(
+    const LanceOptimizeIndexMerge* merge,
+    size_t index
+);
+size_t lance_optimize_index_merge_replace_count(
+    const LanceOptimizeIndexMerge* merge
+);
+int32_t lance_optimize_index_merge_replace_uuid_at(
+    const LanceOptimizeIndexMerge* merge,
+    size_t index,
+    uint8_t out_uuid[16]
+);
+/** Native plan/group/version checks remain authoritative. */
+int32_t lance_optimize_index_merge_execute(
+    const LanceDataset* dataset,
+    const LanceOptimizeIndexMerge* merge,
+    const LanceIndexSegmentResult* const* task_results,
+    size_t task_result_count,
+    LanceIndexSegmentResult** out_result
+);
+const char* lance_optimize_index_merge_json(
+    const LanceOptimizeIndexMerge* merge
+);
+LanceOptimizeIndexMerge* lance_optimize_index_merge_from_json(const char* json);
+void lance_optimize_index_merge_close(LanceOptimizeIndexMerge* merge);
+
+int32_t lance_index_segment_result_plan_id(
+    const LanceIndexSegmentResult* result,
+    uint8_t out_uuid[16]
+);
+uint64_t lance_index_segment_result_read_version(
+    const LanceIndexSegmentResult* result
+);
+uint32_t lance_index_segment_result_group(
+    const LanceIndexSegmentResult* result
+);
+LanceIndexSegmentMetadata* lance_index_segment_result_segment(
+    const LanceIndexSegmentResult* result
+);
+size_t lance_index_segment_result_replace_count(
+    const LanceIndexSegmentResult* result
+);
+int32_t lance_index_segment_result_replace_uuid_at(
+    const LanceIndexSegmentResult* result,
+    size_t index,
+    uint8_t out_uuid[16]
+);
+const char* lance_index_segment_result_json(
+    const LanceIndexSegmentResult* result
+);
+LanceIndexSegmentResult* lance_index_segment_result_from_json(const char* json);
+void lance_index_segment_result_close(LanceIndexSegmentResult* result);
+
+/** Commit merged results. Empty results retain native no-op/MemWAL behavior. */
+int32_t lance_dataset_commit_optimize_indices(
+    LanceDataset* dataset,
+    const LanceIndexSegmentResult* const* results,
+    size_t result_count,
+    const LanceOptimizeIndicesOptions* options
 );
 
 /* ─── lance_dataset_drop_columns ──────────────────────────────────────────── */

@@ -27,6 +27,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -161,10 +162,20 @@ public:
 // ─── Forward Declarations ────────────────────────────────────────────────────
 
 class Scanner;
+class Dataset;
 class Fragment;
 class IndexModel;
 class IndexSegmentBuilder;
 class IndexSegmentMetadata;
+class CompactionOptions;
+class CompactionPlan;
+class CompactionTask;
+class RewriteResult;
+class OptimizeIndicesOptions;
+class OptimizeIndicesPlan;
+class OptimizeIndexTask;
+class OptimizeIndexMerge;
+class IndexSegmentResult;
 class FtsQueryContext;
 class FtsQuery;
 
@@ -2103,6 +2114,815 @@ struct VectorIndexOptions {
     }
 };
 
+// ─── Native maintenance options and plans ───────────────────────────────────
+
+/// Presence-preserving owner of native `CompactionOptions`.
+class CompactionOptions {
+    Handle<LanceCompactionOptionsV2, lance_compaction_options_v2_free> handle_;
+
+public:
+    CompactionOptions() : handle_(lance_compaction_options_v2_new()) {
+        if (!handle_) check_error();
+    }
+
+    explicit CompactionOptions(LanceCompactionOptionsV2* options)
+        : handle_(options) {}
+
+    CompactionOptions(CompactionOptions&&) noexcept = default;
+    CompactionOptions& operator=(CompactionOptions&&) noexcept = default;
+    CompactionOptions(const CompactionOptions&) = delete;
+    CompactionOptions& operator=(const CompactionOptions&) = delete;
+
+    /// Native `CompactionOptions::from_dataset_config(dataset.config())`.
+    static CompactionOptions from_dataset(const Dataset& dataset);
+
+    CompactionOptions& set_target_rows_per_fragment(uint64_t value) {
+        if (lance_compaction_options_v2_set_target_rows_per_fragment(
+                handle_.get(), value) != 0) check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_rows_per_group(uint64_t value) {
+        if (lance_compaction_options_v2_set_max_rows_per_group(
+                handle_.get(), value) != 0) check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_bytes_per_file(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_max_bytes_per_file(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_materialize_deletions(bool value) {
+        if (lance_compaction_options_v2_set_materialize_deletions(
+                handle_.get(), value) != 0) check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_materialize_deletions_threshold(float value) {
+        if (lance_compaction_options_v2_set_materialize_deletions_threshold(
+                handle_.get(), value) != 0) check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_num_threads(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_num_threads(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_batch_size(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_batch_size(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_io_buffer_size(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_io_buffer_size(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_defer_index_remap(bool value) {
+        if (lance_compaction_options_v2_set_defer_index_remap(
+                handle_.get(), value) != 0) check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_index_remap_mode(LanceIndexRemapMode value) {
+        if (lance_compaction_options_v2_set_index_remap_mode(
+                handle_.get(), static_cast<int32_t>(value)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_compaction_mode(
+        std::optional<LanceCompactionMode> value) {
+        int32_t raw = value ? static_cast<int32_t>(*value) : 0;
+        if (lance_compaction_options_v2_set_compaction_mode(
+                handle_.get(), value.has_value(), raw) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_binary_copy_read_batch_bytes(
+        std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_binary_copy_read_batch_bytes(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_source_fragments(
+        std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_max_source_fragments(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_source_rows(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_max_source_rows(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_source_bytes(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_max_source_bytes(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_excluded_fragment_ids(
+        const std::vector<uint32_t>& fragment_ids) {
+        if (lance_compaction_options_v2_set_excluded_fragment_ids(
+                handle_.get(),
+                fragment_ids.empty() ? nullptr : fragment_ids.data(),
+                fragment_ids.size()) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_overlays_per_fragment(
+        std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_max_overlays_per_fragment(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_data_storage_version(
+        std::optional<std::string> selector) {
+        if (lance_compaction_options_v2_set_data_storage_version(
+                handle_.get(), selector ? selector->c_str() : nullptr) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_transaction_properties(
+        std::optional<std::vector<std::pair<std::string, std::string>>> value =
+            std::nullopt) {
+        std::vector<const char*> keys;
+        std::vector<const char*> values;
+        LanceTransactionProperties properties{};
+        const LanceTransactionProperties* properties_ptr = nullptr;
+        if (value) {
+            keys.reserve(value->size());
+            values.reserve(value->size());
+            for (const auto& [key, property_value] : *value) {
+                keys.push_back(key.c_str());
+                values.push_back(property_value.c_str());
+            }
+            properties.keys = keys.empty() ? nullptr : keys.data();
+            properties.values = values.empty() ? nullptr : values.data();
+            properties.count = value->size();
+            properties_ptr = &properties;
+        }
+        if (lance_compaction_options_v2_set_transaction_properties(
+                handle_.get(), properties_ptr) != 0)
+            check_error();
+        return *this;
+    }
+
+    const LanceCompactionOptionsV2* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native compaction rewrite result.
+class RewriteResult {
+    Handle<LanceRewriteResult, lance_rewrite_result_close> handle_;
+
+public:
+    explicit RewriteResult(LanceRewriteResult* result) : handle_(result) {}
+
+    RewriteResult(RewriteResult&&) noexcept = default;
+    RewriteResult& operator=(RewriteResult&&) noexcept = default;
+    RewriteResult(const RewriteResult&) = delete;
+    RewriteResult& operator=(const RewriteResult&) = delete;
+
+    uint64_t read_version() const {
+        uint64_t value = lance_rewrite_result_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    LanceCompactionMetrics metrics() const {
+        LanceCompactionMetrics value{};
+        if (lance_rewrite_result_metrics(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    size_t original_fragment_count() const {
+        size_t count =
+            lance_rewrite_result_original_fragment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    size_t new_fragment_count() const {
+        size_t count = lance_rewrite_result_new_fragment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    std::string original_fragment_metadata_json(size_t index) const {
+        const char* json =
+            lance_rewrite_result_original_fragment_metadata_json_at(
+                handle_.get(), index);
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
+    }
+
+    std::string new_fragment_metadata_json(size_t index) const {
+        const char* json =
+            lance_rewrite_result_new_fragment_metadata_json_at(
+                handle_.get(), index);
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
+    }
+
+    std::string json() const {
+        const char* raw = lance_rewrite_result_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static RewriteResult from_json(std::string_view json) {
+        std::string owned(json);
+        auto* result = lance_rewrite_result_from_json(owned.c_str());
+        if (!result) check_error();
+        return RewriteResult(result);
+    }
+
+    const LanceRewriteResult* c_handle() const { return handle_.get(); }
+};
+
+/// Owned snapshot of one native compaction task.
+class CompactionTask {
+    Handle<LanceCompactionTask, lance_compaction_task_close> handle_;
+
+public:
+    explicit CompactionTask(LanceCompactionTask* task) : handle_(task) {}
+
+    CompactionTask(CompactionTask&&) noexcept = default;
+    CompactionTask& operator=(CompactionTask&&) noexcept = default;
+    CompactionTask(const CompactionTask&) = delete;
+    CompactionTask& operator=(const CompactionTask&) = delete;
+
+    uint64_t read_version() const {
+        uint64_t value = lance_compaction_task_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    size_t fragment_count() const {
+        size_t count = lance_compaction_task_fragment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    std::string fragment_metadata_json(size_t index) const {
+        const char* raw =
+            lance_compaction_task_fragment_metadata_json_at(
+                handle_.get(), index);
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    std::vector<std::string> fragment_metadata_json() const {
+        std::vector<std::string> out;
+        out.reserve(fragment_count());
+        for (size_t index = 0; index < fragment_count(); ++index)
+            out.push_back(fragment_metadata_json(index));
+        return out;
+    }
+
+    CompactionOptions options() const {
+        auto* options =
+            lance_compaction_task_options_clone(handle_.get());
+        if (!options) check_error();
+        return CompactionOptions(options);
+    }
+
+    RewriteResult execute(const Dataset& dataset) const;
+
+    std::string json() const {
+        const char* raw = lance_compaction_task_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static CompactionTask from_json(std::string_view json) {
+        std::string owned(json);
+        auto* task = lance_compaction_task_from_json(owned.c_str());
+        if (!task) check_error();
+        return CompactionTask(task);
+    }
+
+    const LanceCompactionTask* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native compaction plan.
+class CompactionPlan {
+    Handle<LanceCompactionPlan, lance_compaction_plan_close> handle_;
+
+public:
+    explicit CompactionPlan(LanceCompactionPlan* plan) : handle_(plan) {}
+
+    CompactionPlan(CompactionPlan&&) noexcept = default;
+    CompactionPlan& operator=(CompactionPlan&&) noexcept = default;
+    CompactionPlan(const CompactionPlan&) = delete;
+    CompactionPlan& operator=(const CompactionPlan&) = delete;
+
+    uint64_t read_version() const {
+        uint64_t value = lance_compaction_plan_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    size_t num_tasks() const {
+        size_t count = lance_compaction_plan_task_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    CompactionTask task(size_t index) const {
+        auto* task = lance_compaction_plan_task_at(handle_.get(), index);
+        if (!task) check_error();
+        return CompactionTask(task);
+    }
+
+    CompactionOptions options() const {
+        auto* options =
+            lance_compaction_plan_options_clone(handle_.get());
+        if (!options) check_error();
+        return CompactionOptions(options);
+    }
+
+    std::string json() const {
+        const char* raw = lance_compaction_plan_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static CompactionPlan from_json(std::string_view json) {
+        std::string owned(json);
+        auto* plan = lance_compaction_plan_from_json(owned.c_str());
+        if (!plan) check_error();
+        return CompactionPlan(plan);
+    }
+
+    const LanceCompactionPlan* c_handle() const { return handle_.get(); }
+};
+
+/// Presence-preserving owner of native `OptimizeOptions`.
+class OptimizeIndicesOptions {
+    Handle<LanceOptimizeIndicesOptions, lance_optimize_indices_options_free>
+        handle_;
+
+public:
+    OptimizeIndicesOptions() : handle_(lance_optimize_indices_options_new()) {
+        if (!handle_) check_error();
+    }
+
+    explicit OptimizeIndicesOptions(LanceOptimizeIndicesOptions* options)
+        : handle_(options) {}
+
+    OptimizeIndicesOptions(OptimizeIndicesOptions&&) noexcept = default;
+    OptimizeIndicesOptions& operator=(OptimizeIndicesOptions&&) noexcept =
+        default;
+    OptimizeIndicesOptions(const OptimizeIndicesOptions&) = delete;
+    OptimizeIndicesOptions& operator=(const OptimizeIndicesOptions&) = delete;
+
+    OptimizeIndicesOptions& set_num_indices_to_merge(
+        std::optional<uint64_t> value) {
+        if (lance_optimize_indices_options_set_num_indices_to_merge(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_enable_partition_rebalancing(bool value) {
+        if (lance_optimize_indices_options_set_enable_partition_rebalancing(
+                handle_.get(), value) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_index_names(
+        std::optional<std::vector<std::string>> names) {
+        std::vector<const char*> raw;
+        if (names) {
+            raw.reserve(names->size());
+            for (const auto& name : *names) raw.push_back(name.c_str());
+        }
+        if (lance_optimize_indices_options_set_index_names(
+                handle_.get(),
+                names.has_value(),
+                raw.empty() ? nullptr : raw.data(),
+                raw.size()) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_retrain(bool value) {
+        if (lance_optimize_indices_options_set_retrain(
+                handle_.get(), value) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_transaction_properties(
+        std::optional<std::vector<std::pair<std::string, std::string>>> value =
+            std::nullopt) {
+        std::vector<const char*> keys;
+        std::vector<const char*> values;
+        LanceTransactionProperties properties{};
+        const LanceTransactionProperties* properties_ptr = nullptr;
+        if (value) {
+            keys.reserve(value->size());
+            values.reserve(value->size());
+            for (const auto& [key, property_value] : *value) {
+                keys.push_back(key.c_str());
+                values.push_back(property_value.c_str());
+            }
+            properties.keys = keys.empty() ? nullptr : keys.data();
+            properties.values = values.empty() ? nullptr : values.data();
+            properties.count = value->size();
+            properties_ptr = &properties;
+        }
+        if (lance_optimize_indices_options_set_transaction_properties(
+                handle_.get(), properties_ptr) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_max_rows_per_task(
+        std::optional<uint64_t> value) {
+        if (lance_optimize_indices_options_set_max_rows_per_task(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_max_rows_per_segment(
+        std::optional<uint64_t> value) {
+        if (lance_optimize_indices_options_set_max_rows_per_segment(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    const LanceOptimizeIndicesOptions* c_handle() const {
+        return handle_.get();
+    }
+};
+
+/// Owned native optimized index segment result.
+class IndexSegmentResult {
+    Handle<LanceIndexSegmentResult, lance_index_segment_result_close> handle_;
+
+public:
+    explicit IndexSegmentResult(LanceIndexSegmentResult* result)
+        : handle_(result) {}
+
+    IndexSegmentResult(IndexSegmentResult&&) noexcept = default;
+    IndexSegmentResult& operator=(IndexSegmentResult&&) noexcept = default;
+    IndexSegmentResult(const IndexSegmentResult&) = delete;
+    IndexSegmentResult& operator=(const IndexSegmentResult&) = delete;
+
+    std::array<uint8_t, 16> plan_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_index_segment_result_plan_id(
+                handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    uint64_t read_version() const {
+        uint64_t value = lance_index_segment_result_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    uint32_t group() const {
+        uint32_t value = lance_index_segment_result_group(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    IndexSegmentMetadata segment() const;
+
+    size_t replace_count() const {
+        size_t count = lance_index_segment_result_replace_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    std::array<uint8_t, 16> replace_uuid(size_t index) const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_index_segment_result_replace_uuid_at(
+                handle_.get(), index, out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    std::string json() const {
+        const char* raw = lance_index_segment_result_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static IndexSegmentResult from_json(std::string_view json) {
+        std::string owned(json);
+        auto* result = lance_index_segment_result_from_json(owned.c_str());
+        if (!result) check_error();
+        return IndexSegmentResult(result);
+    }
+
+    const LanceIndexSegmentResult* c_handle() const { return handle_.get(); }
+};
+
+/// Owned snapshot of one native distributed index build task.
+class OptimizeIndexTask {
+    Handle<LanceOptimizeIndexTask, lance_optimize_index_task_close> handle_;
+
+public:
+    explicit OptimizeIndexTask(LanceOptimizeIndexTask* task) : handle_(task) {}
+
+    OptimizeIndexTask(OptimizeIndexTask&&) noexcept = default;
+    OptimizeIndexTask& operator=(OptimizeIndexTask&&) noexcept = default;
+    OptimizeIndexTask(const OptimizeIndexTask&) = delete;
+    OptimizeIndexTask& operator=(const OptimizeIndexTask&) = delete;
+
+    std::array<uint8_t, 16> plan_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_optimize_index_task_plan_id(
+                handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    uint64_t read_version() const {
+        uint64_t value = lance_optimize_index_task_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    uint32_t group() const {
+        uint32_t value = lance_optimize_index_task_group(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    size_t fragment_count() const {
+        size_t count = lance_optimize_index_task_fragment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    uint32_t fragment_id(size_t index) const {
+        uint32_t value = 0;
+        if (lance_optimize_index_task_fragment_id_at(
+                handle_.get(), index, &value) != 0)
+            check_error();
+        return value;
+    }
+
+    std::vector<uint32_t> fragment_ids() const {
+        std::vector<uint32_t> out;
+        out.reserve(fragment_count());
+        for (size_t index = 0; index < fragment_count(); ++index)
+            out.push_back(fragment_id(index));
+        return out;
+    }
+
+    IndexSegmentMetadata reference() const;
+
+    size_t old_segment_count() const {
+        size_t count =
+            lance_optimize_index_task_old_segment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    IndexSegmentMetadata old_segment(size_t index) const;
+
+    std::optional<uint64_t> num_indices_to_merge() const {
+        bool has_value = false;
+        uint64_t value = 0;
+        if (lance_optimize_index_task_num_indices_to_merge(
+                handle_.get(), &has_value, &value) != 0)
+            check_error();
+        return has_value ? std::optional<uint64_t>(value) : std::nullopt;
+    }
+
+    bool enable_partition_rebalancing() const {
+        bool value = false;
+        if (lance_optimize_index_task_enable_partition_rebalancing(
+                handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    bool retrain() const {
+        bool value = false;
+        if (lance_optimize_index_task_retrain(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    std::optional<IndexSegmentResult> execute(const Dataset& dataset) const;
+
+    std::string json() const {
+        const char* raw = lance_optimize_index_task_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static OptimizeIndexTask from_json(std::string_view json) {
+        std::string owned(json);
+        auto* task = lance_optimize_index_task_from_json(owned.c_str());
+        if (!task) check_error();
+        return OptimizeIndexTask(task);
+    }
+
+    const LanceOptimizeIndexTask* c_handle() const { return handle_.get(); }
+};
+
+/// Owned snapshot of one native distributed index merge.
+class OptimizeIndexMerge {
+    Handle<LanceOptimizeIndexMerge, lance_optimize_index_merge_close> handle_;
+
+public:
+    explicit OptimizeIndexMerge(LanceOptimizeIndexMerge* merge)
+        : handle_(merge) {}
+
+    OptimizeIndexMerge(OptimizeIndexMerge&&) noexcept = default;
+    OptimizeIndexMerge& operator=(OptimizeIndexMerge&&) noexcept = default;
+    OptimizeIndexMerge(const OptimizeIndexMerge&) = delete;
+    OptimizeIndexMerge& operator=(const OptimizeIndexMerge&) = delete;
+
+    std::array<uint8_t, 16> plan_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_optimize_index_merge_plan_id(
+                handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    uint64_t read_version() const {
+        uint64_t value = lance_optimize_index_merge_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    uint32_t group() const {
+        uint32_t value = lance_optimize_index_merge_group(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    size_t old_segment_count() const {
+        size_t count =
+            lance_optimize_index_merge_old_segment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    IndexSegmentMetadata old_segment(size_t index) const;
+
+    size_t replace_count() const {
+        size_t count = lance_optimize_index_merge_replace_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    std::array<uint8_t, 16> replace_uuid(size_t index) const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_optimize_index_merge_replace_uuid_at(
+                handle_.get(), index, out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    std::optional<IndexSegmentResult> execute(
+        const Dataset& dataset,
+        const std::vector<IndexSegmentResult>& task_results) const;
+
+    std::string json() const {
+        const char* raw = lance_optimize_index_merge_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static OptimizeIndexMerge from_json(std::string_view json) {
+        std::string owned(json);
+        auto* merge = lance_optimize_index_merge_from_json(owned.c_str());
+        if (!merge) check_error();
+        return OptimizeIndexMerge(merge);
+    }
+
+    const LanceOptimizeIndexMerge* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native distributed index optimization plan.
+class OptimizeIndicesPlan {
+    Handle<LanceOptimizeIndicesPlan, lance_optimize_indices_plan_close>
+        handle_;
+
+public:
+    explicit OptimizeIndicesPlan(LanceOptimizeIndicesPlan* plan)
+        : handle_(plan) {}
+
+    OptimizeIndicesPlan(OptimizeIndicesPlan&&) noexcept = default;
+    OptimizeIndicesPlan& operator=(OptimizeIndicesPlan&&) noexcept = default;
+    OptimizeIndicesPlan(const OptimizeIndicesPlan&) = delete;
+    OptimizeIndicesPlan& operator=(const OptimizeIndicesPlan&) = delete;
+
+    std::array<uint8_t, 16> plan_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_optimize_indices_plan_id(
+                handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    uint64_t read_version() const {
+        uint64_t value =
+            lance_optimize_indices_plan_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    size_t num_tasks() const {
+        size_t count = lance_optimize_indices_plan_task_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    size_t num_merges() const {
+        size_t count = lance_optimize_indices_plan_merge_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    OptimizeIndexTask task(size_t index) const {
+        auto* task = lance_optimize_indices_plan_task_at(handle_.get(), index);
+        if (!task) check_error();
+        return OptimizeIndexTask(task);
+    }
+
+    OptimizeIndexMerge merge(size_t index) const {
+        auto* merge =
+            lance_optimize_indices_plan_merge_at(handle_.get(), index);
+        if (!merge) check_error();
+        return OptimizeIndexMerge(merge);
+    }
+
+    std::string json() const {
+        const char* raw = lance_optimize_indices_plan_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static OptimizeIndicesPlan from_json(std::string_view json) {
+        std::string owned(json);
+        auto* plan = lance_optimize_indices_plan_from_json(owned.c_str());
+        if (!plan) check_error();
+        return OptimizeIndicesPlan(plan);
+    }
+
+    const LanceOptimizeIndicesPlan* c_handle() const { return handle_.get(); }
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -3635,6 +4455,90 @@ public:
         return metrics;
     }
 
+    /// Compact using the complete native options surface. NULL selects
+    /// `CompactionOptions::from_dataset_config`.
+    LanceCompactionMetrics compact_files_with_options(
+        const CompactionOptions* options = nullptr) {
+        LanceCompactionMetrics metrics{};
+        if (lance_dataset_compact_files_v2(
+                handle_.get(),
+                options ? options->c_handle() : nullptr,
+                &metrics) != 0)
+            check_error();
+        return metrics;
+    }
+
+    /// Plan native compaction. NULL options select dataset config.
+    CompactionPlan plan_compaction(
+        const CompactionOptions* options = nullptr) const {
+        auto* plan = lance_dataset_plan_compaction(
+            handle_.get(), options ? options->c_handle() : nullptr);
+        if (!plan) check_error();
+        return CompactionPlan(plan);
+    }
+
+    /// Commit native rewrite results. NULL options select native defaults.
+    LanceCompactionMetrics commit_compaction(
+        const std::vector<RewriteResult>& results,
+        const CompactionOptions* options = nullptr) {
+        std::vector<const LanceRewriteResult*> raw;
+        raw.reserve(results.size());
+        for (const auto& result : results) raw.push_back(result.c_handle());
+        LanceCompactionMetrics metrics{};
+        if (lance_dataset_commit_compaction(
+                handle_.get(),
+                raw.empty() ? nullptr : raw.data(),
+                raw.size(),
+                options ? options->c_handle() : nullptr,
+                &metrics) != 0)
+            check_error();
+        return metrics;
+    }
+
+    /// Run native single-process index optimization. NULL uses native defaults.
+    void optimize_indices(
+        const OptimizeIndicesOptions* options = nullptr) {
+        if (lance_dataset_optimize_indices(
+                handle_.get(),
+                options ? options->c_handle() : nullptr) != 0)
+            check_error();
+    }
+
+    /// Plan the native distributed index optimization workflow.
+    OptimizeIndicesPlan plan_optimize_indices(
+        const OptimizeIndicesOptions* options = nullptr) const {
+        auto* plan = lance_dataset_plan_optimize_indices(
+            handle_.get(), options ? options->c_handle() : nullptr);
+        if (!plan) check_error();
+        return OptimizeIndicesPlan(plan);
+    }
+
+    /// Commit merged native index segments.
+    void commit_optimize_indices(
+        const std::vector<IndexSegmentResult>& results,
+        const OptimizeIndicesOptions* options = nullptr) {
+        std::vector<const LanceIndexSegmentResult*> raw;
+        raw.reserve(results.size());
+        for (const auto& result : results) raw.push_back(result.c_handle());
+        if (lance_dataset_commit_optimize_indices(
+                handle_.get(),
+                raw.empty() ? nullptr : raw.data(),
+                raw.size(),
+                options ? options->c_handle() : nullptr) != 0)
+            check_error();
+    }
+
+    /// Migrate manifest paths to native v2 naming through core.
+    void migrate_manifest_paths_v2() {
+        if (lance_dataset_migrate_manifest_paths_v2(handle_.get()) != 0)
+            check_error();
+    }
+
+    /// Delete every row through native `Dataset::truncate_table`.
+    void truncate_table() {
+        if (lance_dataset_truncate_table(handle_.get()) != 0) check_error();
+    }
+
     /// Drop columns from the dataset's schema and commit a new manifest.
     /// Metadata-only — data files remain until a later `compact_files()`
     /// call rewrites them. Mutates this dataset in place; the handle
@@ -4299,6 +5203,49 @@ private:
     explicit Dataset(LanceDataset* ptr) : handle_(ptr) {}
 };
 
+inline CompactionOptions CompactionOptions::from_dataset(
+    const Dataset& dataset) {
+    auto* options =
+        lance_compaction_options_v2_from_dataset(dataset.c_handle());
+    if (!options) check_error();
+    return CompactionOptions(options);
+}
+
+inline RewriteResult CompactionTask::execute(const Dataset& dataset) const {
+    auto* result =
+        lance_compaction_task_execute(dataset.c_handle(), handle_.get());
+    if (!result) check_error();
+    return RewriteResult(result);
+}
+
+inline std::optional<IndexSegmentResult> OptimizeIndexTask::execute(
+    const Dataset& dataset) const {
+    LanceIndexSegmentResult* result = nullptr;
+    if (lance_optimize_index_task_execute(
+            dataset.c_handle(), handle_.get(), &result) != 0)
+        check_error();
+    if (!result) return std::nullopt;
+    return IndexSegmentResult(result);
+}
+
+inline std::optional<IndexSegmentResult> OptimizeIndexMerge::execute(
+    const Dataset& dataset,
+    const std::vector<IndexSegmentResult>& task_results) const {
+    std::vector<const LanceIndexSegmentResult*> raw;
+    raw.reserve(task_results.size());
+    for (const auto& result : task_results) raw.push_back(result.c_handle());
+    LanceIndexSegmentResult* result = nullptr;
+    if (lance_optimize_index_merge_execute(
+            dataset.c_handle(),
+            handle_.get(),
+            raw.empty() ? nullptr : raw.data(),
+            raw.size(),
+            &result) != 0)
+        check_error();
+    if (!result) return std::nullopt;
+    return IndexSegmentResult(result);
+}
+
 /// Result of Dataset::commit_batch. The dataset and the actual native merged
 /// transaction are independently owned.
 struct BatchCommitResult {
@@ -4631,6 +5578,34 @@ public:
 
     const LanceIndexSegmentMetadata* c_handle() const { return handle_.get(); }
 };
+
+inline IndexSegmentMetadata IndexSegmentResult::segment() const {
+    auto* metadata = lance_index_segment_result_segment(handle_.get());
+    if (!metadata) check_error();
+    return IndexSegmentMetadata(metadata);
+}
+
+inline IndexSegmentMetadata OptimizeIndexTask::reference() const {
+    auto* metadata = lance_optimize_index_task_reference(handle_.get());
+    if (!metadata) check_error();
+    return IndexSegmentMetadata(metadata);
+}
+
+inline IndexSegmentMetadata OptimizeIndexTask::old_segment(
+    size_t index) const {
+    auto* metadata =
+        lance_optimize_index_task_old_segment_at(handle_.get(), index);
+    if (!metadata) check_error();
+    return IndexSegmentMetadata(metadata);
+}
+
+inline IndexSegmentMetadata OptimizeIndexMerge::old_segment(
+    size_t index) const {
+    auto* metadata =
+        lance_optimize_index_merge_old_segment_at(handle_.get(), index);
+    if (!metadata) check_error();
+    return IndexSegmentMetadata(metadata);
+}
 
 /// Move-only builder for one uncommitted physical index segment.
 class IndexSegmentBuilder {

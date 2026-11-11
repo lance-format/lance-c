@@ -3725,6 +3725,7 @@ dependencies = [
  "opendal",
  "pin-project",
  "prost",
+ "serde",
  "serde_json",
  "snafu",
  "tempfile",
