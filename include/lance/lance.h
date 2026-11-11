@@ -2393,9 +2393,10 @@ typedef void (*LanceCommitLockContextRelease)(
  * only when construction succeeds: on failure `release_context` is never
  * called.
  *
- * Datasets, scanners, transactions and in-flight native jobs retain their own
- * native context owner. Closing a `LanceCommitLock` handle only drops that
- * handle's owner; retained datasets keep working.
+ * Datasets, scanners and in-flight native jobs retain their own native context
+ * owner. Closing a `LanceCommitLock` handle only drops that handle's owner;
+ * retained datasets keep working. Keep the lock handle alive when staging a
+ * transaction and pass it to the matching commit entry point.
  */
 typedef struct LanceCommitLockCallbacks {
     LanceCommitLockAcquire lock;
@@ -7376,9 +7377,10 @@ int32_t lance_dataset_write_uncommitted_stream_with_accessor(
  * lock and an optional dynamic storage-options accessor.
  *
  * Staging uses the accessor `Arc` and optional session exactly like
- * lance_dataset_write_uncommitted_stream. The lock is validated and retained
- * for symmetry with the matching commit entry point; it does not participate
- * in writing data files. NULL handles keep native defaults.
+ * lance_dataset_write_uncommitted_stream. The lock is retained for this call
+ * while native writes data files. The returned transaction carries metadata;
+ * keep the lock handle alive and pass it to the matching commit entry point.
+ * NULL handles keep native defaults.
  *
  * Stream consumption, schema matching and `out_transaction` success-only
  * output match lance_dataset_write_uncommitted_stream.

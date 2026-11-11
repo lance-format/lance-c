@@ -5635,9 +5635,10 @@ public:
     /// dynamic storage accessor.
     ///
     /// Staging uses the accessor and session exactly like `write_uncommitted`.
-    /// The lock is validated and retained for symmetry with the matching
-    /// commit method. NULL pointers keep native defaults. The stream is
-    /// consumed on every return path.
+    /// The lock is retained for this call. Keep its handle alive and pass it
+    /// to the matching commit method when publishing the returned transaction.
+    /// NULL pointers keep native defaults. The stream is consumed on every
+    /// return path.
     static Transaction write_uncommitted_with_commit_lock(
         const std::string& uri,
         ArrowArrayStream* stream,

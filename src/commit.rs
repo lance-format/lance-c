@@ -339,10 +339,9 @@ pub unsafe extern "C" fn lance_dataset_write_uncommitted_stream_with_accessor(
 /// Stage an Arrow stream into uncommitted data files through a foreign commit
 /// lock and optional dynamic storage-options accessor.
 ///
-/// The lock does not participate in staging; it is validated and retained for
-/// symmetry with the matching commit entry point so the same lock always
-/// accompanies the write that follows. The accessor `Arc` is forwarded to the
-/// native store params. `session` is optional.
+/// The lock is retained for this call. Keep its handle alive and pass it to the
+/// matching commit entry point when publishing the returned transaction. The
+/// accessor `Arc` is forwarded to the native store params. `session` is optional.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn lance_dataset_write_uncommitted_stream_with_commit_lock(
