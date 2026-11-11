@@ -43609,6 +43609,14 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
         assert_eq!(unsafe { lance_fragment_schema(handle, &mut schema) }, -1);
         assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
 
+        let mut native_schema = ptr::null_mut();
+        assert_eq!(
+            unsafe { lance_fragment_schema_clone(handle, &mut native_schema) },
+            -1
+        );
+        assert!(native_schema.is_null());
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+
         let column = c_str("id");
         let columns = [column.as_ptr()];
         let indices = [0u32];
@@ -44217,4 +44225,77 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
     unsafe { lance_operation_close(empty_bases_operation) };
+}
+
+#[test]
+fn test_update_bases_proto_preserves_native_names_with_embedded_nul() {
+    use lance::dataset::transaction::{Operation, TransactionBuilder};
+    use lance_table::format::{BasePath, pb};
+    use prost::Message;
+
+    let native = TransactionBuilder::new(
+        4,
+        Operation::UpdateBases {
+            new_bases: vec![
+                BasePath::new(1, "memory://history/base-a".to_owned(), None, false),
+                BasePath::new(
+                    2,
+                    "memory://history/base-b".to_owned(),
+                    Some("native\0name".to_owned()),
+                    false,
+                ),
+            ],
+        },
+    )
+    .build();
+    let message = pb::Transaction::try_from(&native).unwrap();
+    let bytes = message.encode_to_vec();
+    let transaction = unsafe { lance_transaction_from_proto(bytes.as_ptr(), bytes.len()) };
+    assert!(!transaction.is_null(), "{}", take_last_error_message());
+    let mut operation = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_transaction_operation(transaction, &mut operation) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_transaction_close(transaction) };
+
+    let mut count = 0;
+    assert_eq!(
+        unsafe { lance_operation_update_bases_count(operation, &mut count) },
+        0
+    );
+    assert_eq!(count, 2);
+    let mut view = LanceBasePathView {
+        id: 0,
+        path: ptr::null(),
+        name: ptr::null(),
+        is_dataset_root: false,
+    };
+    assert_eq!(
+        unsafe { lance_operation_update_bases_at(operation, 0, &mut view) },
+        0
+    );
+    assert_eq!(view.id, 1);
+    assert_eq!(
+        unsafe { CStr::from_ptr(view.path) }.to_str().unwrap(),
+        "memory://history/base-a"
+    );
+    let original_path = view.path;
+    assert_eq!(
+        unsafe { lance_operation_update_bases_at(operation, 1, &mut view) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    assert_eq!(view.id, 1);
+    assert_eq!(view.path, original_path);
+
+    let rebuilt = unsafe { lance_transaction_new(4, operation, ptr::null()) };
+    assert!(!rebuilt.is_null(), "{}", take_last_error_message());
+    unsafe { lance_operation_close(operation) };
+    let actual = transaction_proto_bytes(rebuilt);
+    let actual = pb::Transaction::decode(actual.as_slice()).unwrap();
+    assert_eq!(actual.operation, message.operation);
+    unsafe { lance_transaction_close(rebuilt) };
 }
