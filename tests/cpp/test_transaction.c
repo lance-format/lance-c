@@ -1204,7 +1204,7 @@ static void test_native_operation_construction(const char *src_uri,
     LanceOperation *reserve_zero = lance_operation_reserve_fragments_new(0);
     ASSERT(reserve_zero != NULL, "construct zero reserve");
     CHECK_OK();
-    uint64_t reserve_count = UINT64_MAX;
+    uint32_t reserve_count = UINT32_MAX;
     ASSERT(lance_operation_reserve_fragments_count(reserve_zero,
                                                    &reserve_count) == 0,
            "zero reserve getter");

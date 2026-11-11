@@ -679,16 +679,10 @@ pub unsafe extern "C" fn lance_operation_restore_new(version: u64) -> *mut Lance
 /// range. Allocation remains native. Returns NULL on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_operation_reserve_fragments_new(
-    num_fragments: u64,
+    num_fragments: u32,
 ) -> *mut LanceOperation {
     ffi_try!(
         {
-            let num_fragments = u32::try_from(num_fragments).map_err(|_| {
-                lance_core::Error::invalid_input_source(format!(
-                    "num_fragments {num_fragments} exceeds the native maximum of {}",
-                    u32::MAX
-                ))
-            })?;
             Ok(Box::into_raw(Box::new(LanceOperation::from_native(
                 Operation::ReserveFragments { num_fragments },
             )?)))
@@ -1548,9 +1542,9 @@ fn restore_operation_version(operation: &LanceOperation) -> Result<u64> {
     }
 }
 
-fn reserve_fragments_operation_count(operation: &LanceOperation) -> Result<u64> {
+fn reserve_fragments_operation_count(operation: &LanceOperation) -> Result<u32> {
     match &operation.inner {
-        Operation::ReserveFragments { num_fragments } => Ok(u64::from(*num_fragments)),
+        Operation::ReserveFragments { num_fragments } => Ok(*num_fragments),
         other => Err(lance_core::Error::not_supported_source(
             format!(
                 "ReserveFragments inspection is not supported for {} operations",
@@ -1687,7 +1681,7 @@ unsafe fn operation_restore_version_inner(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_operation_reserve_fragments_count(
     operation: *const LanceOperation,
-    out_count: *mut u64,
+    out_count: *mut u32,
 ) -> i32 {
     ffi_try!(
         unsafe { operation_reserve_fragments_count_inner(operation, out_count) },
@@ -1697,7 +1691,7 @@ pub unsafe extern "C" fn lance_operation_reserve_fragments_count(
 
 unsafe fn operation_reserve_fragments_count_inner(
     operation: *const LanceOperation,
-    out_count: *mut u64,
+    out_count: *mut u32,
 ) -> Result<i32> {
     if out_count.is_null() {
         return Err(lance_core::Error::invalid_input_source(

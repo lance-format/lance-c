@@ -43466,7 +43466,7 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
 
     let reserve_zero = unsafe { lance_operation_reserve_fragments_new(0) };
     assert!(!reserve_zero.is_null());
-    let mut reserved_count = u64::MAX;
+    let mut reserved_count = 0u32;
     assert_eq!(
         unsafe { lance_operation_reserve_fragments_count(reserve_zero, &mut reserved_count) },
         0,
@@ -43474,15 +43474,6 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
         take_last_error_message()
     );
     assert_eq!(reserved_count, 0);
-    let oversized_reserve =
-        unsafe { lance_operation_reserve_fragments_new(u64::from(u32::MAX) + 1) };
-    assert!(oversized_reserve.is_null());
-    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    let oversized_error = take_last_error_message();
-    assert!(
-        oversized_error.contains("num_fragments 4294967296 exceeds the native maximum"),
-        "{oversized_error}"
-    );
     let zero_transaction = unsafe { lance_transaction_new(4, reserve_zero, ptr::null()) };
     assert!(!zero_transaction.is_null());
     let zero_committed = commit_native_transaction(&uri, zero_transaction, ptr::null());
@@ -43669,6 +43660,18 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
         ""
     );
     assert!(second_view.is_dataset_root);
+    let mut out_of_range_view = LanceBasePathView {
+        id: 0x3333,
+        path: ptr::null(),
+        name: ptr::null(),
+        is_dataset_root: false,
+    };
+    assert_eq!(
+        unsafe { lance_operation_update_bases_at(update_operation, 2, &mut out_of_range_view) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out_of_range_view.id, 0x3333);
     let update_transaction =
         unsafe { lance_transaction_new(current_version, update_operation, ptr::null()) };
     assert!(!update_transaction.is_null());
@@ -43812,6 +43815,13 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
         0
     );
     assert_eq!(empty_append_count, 0);
+    let mut out_of_range_fragment = ptr::without_provenance_mut::<LanceFragment>(0x2222);
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_at(empty_append, 0, &mut out_of_range_fragment) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out_of_range_fragment as usize, 0x2222);
     unsafe { lance_operation_close(empty_append) };
 
     let null_append = unsafe { lance_operation_append_new(ptr::null(), 1) };

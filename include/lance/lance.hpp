@@ -774,8 +774,8 @@ public:
     }
 
     /// Reserved fragment count of a ReserveFragments operation.
-    uint64_t reserve_fragments_count() const {
-        uint64_t count = 0;
+    uint32_t reserve_fragments_count() const {
+        uint32_t count = 0;
         if (lance_operation_reserve_fragments_count(handle_.get(), &count) != 0) {
             check_error();
         }
@@ -816,7 +816,7 @@ public:
     }
 
     /// Construct an owned native ReserveFragments operation.
-    static Operation make_reserve_fragments(uint64_t num_fragments) {
+    static Operation make_reserve_fragments(uint32_t num_fragments) {
         auto* operation = lance_operation_reserve_fragments_new(num_fragments);
         if (!operation) check_error();
         return Operation(operation);

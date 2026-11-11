@@ -7087,7 +7087,7 @@ LanceOperation* lance_operation_restore_new(uint64_t version);
  * manifest maximum fragment ID for later native allocation. Returns an owned
  * operation, or NULL on error.
  */
-LanceOperation* lance_operation_reserve_fragments_new(uint64_t num_fragments);
+LanceOperation* lance_operation_reserve_fragments_new(uint32_t num_fragments);
 
 /**
  * Construct an owned native UpdateBases operation.
@@ -7268,7 +7268,7 @@ int32_t lance_operation_restore_version(
  */
 int32_t lance_operation_reserve_fragments_count(
     const LanceOperation* operation,
-    uint64_t* out_count
+    uint32_t* out_count
 );
 
 /**
