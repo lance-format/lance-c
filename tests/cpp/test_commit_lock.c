@@ -68,6 +68,7 @@ typedef struct LockState {
     int fail_release_once;
     int bump_version_once;
     int bump_append_rows;
+    int stateless;
 } LockState;
 
 typedef struct StreamInput {
@@ -195,6 +196,10 @@ static int32_t lock_acquire(void *callback_ctx, uint64_t version,
     if (state->fail_io) {
         fill_error(error, LANCE_ERR_IO, "simulated io failure");
         return -1;
+    }
+    if (state->stateless) {
+        state->acquire_success++;
+        return 0;
     }
     if (state->fail_partial_once) {
         state->fail_partial_once = 0;
@@ -373,6 +378,7 @@ static void test_constructor_contract(const char *base) {
 
     char *uri = scratch_path(base, "stateless_lock");
     memset(&state, 0, sizeof(state));
+    state.stateless = 1;
     snprintf(state.uri, sizeof(state.uri), "%s", uri);
     LanceCommitLock *lock = new_lock(&state);
     LanceWriteOptions options;

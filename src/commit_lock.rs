@@ -186,15 +186,15 @@ impl ForeignCommitLockContext {
 
         if status != 0 {
             let failure = map_callback_failure(&mut error, status, "commit lock acquire");
-            if !out_lease.is_null() {
-                if let Some(destroy_lease) = self.destroy_lease {
-                    let callback_ctx = self.callback_ctx;
-                    swallow_unwind("commit lease partial destroy", || {
-                        // SAFETY: the foreign contract promises `out_lease` is
-                        // either NULL or a valid token owned by the library.
-                        unsafe { destroy_lease(callback_ctx, out_lease) };
-                    });
-                }
+            if !out_lease.is_null()
+                && let Some(destroy_lease) = self.destroy_lease
+            {
+                let callback_ctx = self.callback_ctx;
+                swallow_unwind("commit lease partial destroy", || {
+                    // SAFETY: the foreign contract promises `out_lease` is
+                    // either NULL or a valid token owned by the library.
+                    unsafe { destroy_lease(callback_ctx, out_lease) };
+                });
             }
             return Err(failure);
         }
