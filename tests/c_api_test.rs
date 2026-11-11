@@ -44690,7 +44690,7 @@ fn test_native_operation_typed_four_variants_representation() {
     );
     assert_eq!(
         native_schema_field_id_for_test(overwrite_schema, "payload.tag"),
-        11
+        2
     );
     let mut shared_schema = ptr::null_mut();
     assert_eq!(
@@ -44701,7 +44701,7 @@ fn test_native_operation_typed_four_variants_representation() {
     );
     assert_eq!(
         native_schema_field_id_for_test(shared_schema, "payload.score"),
-        4
+        3
     );
 
     let mut has_config = false;
@@ -44911,7 +44911,7 @@ fn test_native_operation_typed_four_variants_representation() {
         "{}",
         take_last_error_message()
     );
-    assert_eq!(native_schema_field_id_for_test(merge_schema, "payload"), 3);
+    assert_eq!(native_schema_field_id_for_test(merge_schema, "payload"), 1);
 
     // Clone carries optional native strings and the shallow flag verbatim.
     let ref_name = c_str("refs/heads/main");
@@ -45542,15 +45542,16 @@ fn test_native_operation_typed_publication_paths() {
     // fragment list, so an explicit zero-retry commit reports a conflict.
     let merged_snapshot = open_dataset_for_test(&source_uri);
     let merged_version = unsafe { lance_dataset_version(merged_snapshot) };
-    unsafe { lance_dataset_close(merged_snapshot) };
     // The operation must cover every fragment of the latest manifest; otherwise
     // native fragment-coverage validation rejects it before the read-version
-    // conflict is observed.
-    let stale_merge_fragments = [
-        first_fragment as *const LanceFragment,
-        second_fragment as *const LanceFragment,
-        staged_fragment as *const LanceFragment,
-    ];
+    // conflict is observed. The uncommitted append fragment uses id 0, so the
+    // committed identities must be reopened from the merged snapshot.
+    let merged_fragment_ids = native_typed_fragment_ids(merged_snapshot);
+    assert_eq!(merged_fragment_ids, vec![0, 1, 2]);
+    let stale_merge_fragments: Vec<*const LanceFragment> = merged_fragment_ids
+        .iter()
+        .map(|&id| open_fragment_for_test(merged_snapshot, id) as *const LanceFragment)
+        .collect();
     let stale_merge = unsafe {
         lance_operation_merge_new(
             merge_schema,
@@ -45618,6 +45619,10 @@ fn test_native_operation_typed_publication_paths() {
     unsafe {
         lance_transaction_close(stale_transaction);
         lance_operation_close(stale_merge);
+        for fragment in &stale_merge_fragments {
+            lance_fragment_close(*fragment as *mut LanceFragment);
+        }
+        lance_dataset_close(merged_snapshot);
     }
 
     // Merge changing a retained field's nullability without rewriting it is a
