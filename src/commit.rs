@@ -7,6 +7,7 @@
 //! commit eligibility, conflict resolution, retries, detached versions,
 //! cleanup and normalization stay in the selected Lance core.
 
+use std::collections::HashMap;
 use std::ffi::c_char;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -22,11 +23,13 @@ use lance_core::Result;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lance_table::io::commit::CommitHandler;
 
+use crate::commit_lock::{LanceCommitLock, commit_handler_from_ffi, storage_accessor_from_ffi};
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
 use crate::runtime::block_on;
 use crate::session::LanceSession;
+use crate::storage_options::LanceStorageOptionsAccessor;
 use crate::transaction::LanceTransaction;
 use crate::writer::{
     LanceWriteMode, LanceWriteOptions, parse_storage_version, write_params_from_ffi,
@@ -119,15 +122,6 @@ fn session_from_ffi(session: *const LanceSession) -> Option<Arc<Session>> {
     }
 }
 
-unsafe fn commit_builder_from_ffi<'a>(
-    uri: &'a str,
-    options: *const LanceCommitOptions,
-    storage_opts: *const *const c_char,
-    session: *const LanceSession,
-) -> Result<CommitBuilder<'a>> {
-    unsafe { commit_builder_from_ffi_with_handler(uri, None, options, storage_opts, session) }
-}
-
 /// Build a `CommitBuilder` with an optional native commit handler.
 ///
 /// Namespace URI commits supply `ExternalManifestCommitHandler`; all other
@@ -139,11 +133,42 @@ pub(crate) unsafe fn commit_builder_from_ffi_with_handler<'a>(
     storage_opts: *const *const c_char,
     session: *const LanceSession,
 ) -> Result<CommitBuilder<'a>> {
+    let store_params = storage_options_from_ffi(storage_opts)?;
+    unsafe { build_commit_builder(uri, commit_handler, options, store_params, session) }
+}
+
+/// Build a `CommitBuilder` that composes a foreign commit lock with an
+/// optional dynamic storage-options accessor.
+///
+/// The accessor `Arc` is forwarded as-is; native resolution, caching and
+/// refresh stay inside the existing accessor owner.
+pub(crate) unsafe fn commit_builder_from_ffi_with_handler_and_accessor<'a>(
+    uri: &'a str,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
+    options: *const LanceCommitOptions,
+    accessor: Option<Arc<StorageOptionsAccessor>>,
+    session: *const LanceSession,
+) -> Result<CommitBuilder<'a>> {
+    let store_params = accessor.map(|accessor| ObjectStoreParams {
+        storage_options_accessor: Some(accessor),
+        ..ObjectStoreParams::default()
+    });
+    unsafe { build_commit_builder(uri, commit_handler, options, store_params, session) }
+}
+
+/// Shared commit-builder core for static and native accessor storage owners.
+unsafe fn build_commit_builder<'a>(
+    uri: &'a str,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
+    options: *const LanceCommitOptions,
+    store_params: Option<ObjectStoreParams>,
+    session: *const LanceSession,
+) -> Result<CommitBuilder<'a>> {
     let mut builder = CommitBuilder::new(uri);
     if let Some(commit_handler) = commit_handler {
         builder = builder.with_commit_handler(commit_handler);
     }
-    if let Some(store_params) = storage_options_from_ffi(storage_opts)? {
+    if let Some(store_params) = store_params {
         builder = builder.with_store_params(store_params);
     }
     if let Some(session) = session_from_ffi(session) {
@@ -206,26 +231,70 @@ pub(crate) unsafe fn commit_builder_from_ffi_with_handler<'a>(
     Ok(builder)
 }
 
+/// Storage owner selected by a commit entry point.
+pub(crate) enum CommitStorageSource {
+    /// NULL-terminated static key/value list from the legacy ABI.
+    Static(*const *const c_char),
+    /// Native dynamic accessor owner; `None` selects native omission.
+    Accessor(Option<Arc<StorageOptionsAccessor>>),
+}
+
+impl CommitStorageSource {
+    unsafe fn builder<'a>(
+        &self,
+        uri: &'a str,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
+        options: *const LanceCommitOptions,
+        session: *const LanceSession,
+    ) -> Result<CommitBuilder<'a>> {
+        match self {
+            Self::Static(storage_opts) => unsafe {
+                commit_builder_from_ffi_with_handler(
+                    uri,
+                    commit_handler,
+                    options,
+                    *storage_opts,
+                    session,
+                )
+            },
+            Self::Accessor(accessor) => unsafe {
+                commit_builder_from_ffi_with_handler_and_accessor(
+                    uri,
+                    commit_handler,
+                    options,
+                    accessor.clone(),
+                    session,
+                )
+            },
+        }
+    }
+}
+
+unsafe fn uncommitted_options_from_ffi(
+    options: *const LanceUncommittedWriteOptions,
+) -> Result<(*const LanceWriteOptions, Option<HashMap<String, String>>)> {
+    if options.is_null() {
+        return Ok((std::ptr::null(), None));
+    }
+    // SAFETY: the caller guarantees a non-NULL `options` is valid for this
+    // call. All referenced values are copied before this function returns.
+    let options = unsafe { &*options };
+    let properties = unsafe {
+        helpers::parse_optional_c_string_map(
+            options.transaction_properties,
+            "transaction properties",
+        )?
+    };
+    Ok((&options.write as *const LanceWriteOptions, properties))
+}
+
 fn writer_params_from_ffi(
     mode: LanceWriteMode,
     options: *const LanceUncommittedWriteOptions,
     storage_opts: *const *const c_char,
     session: *const LanceSession,
 ) -> Result<WriteParams> {
-    let (write_options, transaction_properties) = if options.is_null() {
-        (std::ptr::null(), None)
-    } else {
-        // SAFETY: the caller guarantees a non-NULL `options` is valid for this
-        // call. All referenced values are copied before this function returns.
-        let options = unsafe { &*options };
-        let properties = unsafe {
-            helpers::parse_optional_c_string_map(
-                options.transaction_properties,
-                "transaction properties",
-            )?
-        };
-        (&options.write as *const LanceWriteOptions, properties)
-    };
+    let (write_options, transaction_properties) = unsafe { uncommitted_options_from_ffi(options)? };
 
     let mut params = unsafe {
         write_params_from_ffi(
@@ -237,6 +306,36 @@ fn writer_params_from_ffi(
             session_from_ffi(session),
         )?
     };
+    params.transaction_properties = transaction_properties.map(Arc::new);
+    Ok(params)
+}
+
+/// Uncommitted write params backed by a dynamic accessor and commit lock.
+unsafe fn writer_params_from_ffi_with_lock(
+    mode: LanceWriteMode,
+    options: *const LanceUncommittedWriteOptions,
+    accessor: Option<Arc<StorageOptionsAccessor>>,
+    session: Option<Arc<Session>>,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
+) -> Result<WriteParams> {
+    let (write_options, transaction_properties) = unsafe { uncommitted_options_from_ffi(options)? };
+    let mut params = unsafe {
+        write_params_from_ffi(
+            mode,
+            std::ptr::null(),
+            write_options,
+            false,
+            std::ptr::null(),
+            session,
+        )?
+    };
+    if let Some(accessor) = accessor {
+        params.store_params = Some(ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..ObjectStoreParams::default()
+        });
+    }
+    params.commit_handler = commit_handler;
     params.transaction_properties = transaction_properties.map(Arc::new);
     Ok(params)
 }
@@ -273,7 +372,46 @@ pub unsafe extern "C" fn lance_dataset_write_uncommitted_stream(
                 stream,
                 mode,
                 options,
-                storage_opts,
+                CommitStorageSource::Static(storage_opts),
+                None,
+                session,
+                out_transaction,
+            )
+        },
+        neg
+    )
+}
+
+/// Stage an Arrow stream into uncommitted data files through a foreign commit
+/// lock and optional dynamic storage-options accessor.
+///
+/// The lock does not participate in staging; it is validated and retained for
+/// symmetry with the matching commit entry point so the same lock always
+/// accompanies the write that follows. The accessor `Arc` is forwarded to the
+/// native store params. `session` is optional.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_dataset_write_uncommitted_stream_with_commit_lock(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    options: *const LanceUncommittedWriteOptions,
+    storage_accessor: *const LanceStorageOptionsAccessor,
+    session: *const LanceSession,
+    commit_lock: *const LanceCommitLock,
+    out_transaction: *mut *mut LanceTransaction,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_uncommitted_stream_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                options,
+                CommitStorageSource::Accessor(storage_accessor_from_ffi(storage_accessor)),
+                commit_handler_from_ffi(commit_lock),
                 session,
                 out_transaction,
             )
@@ -289,7 +427,8 @@ unsafe fn write_uncommitted_stream_inner(
     stream: *mut FFI_ArrowArrayStream,
     mode: i32,
     options: *const LanceUncommittedWriteOptions,
-    storage_opts: *const *const c_char,
+    storage: CommitStorageSource,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
     session: *const LanceSession,
     out_transaction: *mut *mut LanceTransaction,
 ) -> Result<i32> {
@@ -326,7 +465,20 @@ unsafe fn write_uncommitted_stream_inner(
     let expected_schema = ArrowSchema::try_from(unsafe { &*schema }).map_err(|error| {
         lance_core::Error::invalid_input_source(format!("invalid schema: {error}").into())
     })?;
-    let params = writer_params_from_ffi(mode, options, storage_opts, session)?;
+    let params = match storage {
+        CommitStorageSource::Static(storage_opts) => unsafe {
+            writer_params_from_ffi(mode, options, storage_opts, session)?
+        },
+        CommitStorageSource::Accessor(accessor) => unsafe {
+            writer_params_from_ffi_with_lock(
+                mode,
+                options,
+                accessor,
+                session_from_ffi(session),
+                commit_handler,
+            )?
+        },
+    };
 
     let stream_schema = reader.schema();
     if stream_schema.fields() != expected_schema.fields() {
@@ -381,7 +533,42 @@ pub unsafe extern "C" fn lance_transaction_commit(
                 uri,
                 transaction,
                 options,
-                storage_opts,
+                CommitStorageSource::Static(storage_opts),
+                None,
+                session,
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Publish one native transaction through a foreign commit lock and optional
+/// dynamic storage-options accessor.
+///
+/// NULL `commit_lock` and a NULL or empty accessor keep native defaults. The
+/// accessor `Arc` and lock context are retained by the native handler while
+/// the commit runs. `session` is optional. Output semantics match
+/// `lance_transaction_commit`: `*out_dataset` is written only on success.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_transaction_commit_with_commit_lock(
+    uri: *const c_char,
+    transaction: *const LanceTransaction,
+    options: *const LanceCommitOptions,
+    storage_accessor: *const LanceStorageOptionsAccessor,
+    session: *const LanceSession,
+    commit_lock: *const LanceCommitLock,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            transaction_commit_inner(
+                uri,
+                transaction,
+                options,
+                CommitStorageSource::Accessor(storage_accessor_from_ffi(storage_accessor)),
+                commit_handler_from_ffi(commit_lock),
                 session,
                 out_dataset,
             )
@@ -395,7 +582,8 @@ unsafe fn transaction_commit_inner(
     uri: *const c_char,
     transaction: *const LanceTransaction,
     options: *const LanceCommitOptions,
-    storage_opts: *const *const c_char,
+    storage: CommitStorageSource,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
     session: *const LanceSession,
     out_dataset: *mut *mut LanceDataset,
 ) -> Result<i32> {
@@ -414,7 +602,7 @@ unsafe fn transaction_commit_inner(
         .ok_or_else(|| lance_core::Error::invalid_input("uri must not be empty"))?;
 
     let transaction = unsafe { &*transaction }.inner.clone();
-    let builder = unsafe { commit_builder_from_ffi(uri, options, storage_opts, session)? };
+    let builder = unsafe { storage.builder(uri, commit_handler, options, session)? };
     let dataset = block_on(builder.execute(transaction))?;
     let handle = Box::new(dataset_handle(dataset));
     unsafe {
@@ -450,7 +638,44 @@ pub unsafe extern "C" fn lance_transaction_commit_batch(
                 transactions,
                 transaction_count,
                 options,
-                storage_opts,
+                CommitStorageSource::Static(storage_opts),
+                None,
+                session,
+                out_dataset,
+                out_merged_transaction,
+            )
+        },
+        neg
+    )
+}
+
+/// Commit a batch of native append transactions through a foreign commit lock
+/// and optional dynamic storage-options accessor.
+///
+/// Eligibility, conflict handling, retries and merge order stay native.
+/// Outputs are written only on success. Both output pointers are required.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_transaction_commit_batch_with_commit_lock(
+    uri: *const c_char,
+    transactions: *const *const LanceTransaction,
+    transaction_count: usize,
+    options: *const LanceCommitOptions,
+    storage_accessor: *const LanceStorageOptionsAccessor,
+    session: *const LanceSession,
+    commit_lock: *const LanceCommitLock,
+    out_dataset: *mut *mut LanceDataset,
+    out_merged_transaction: *mut *mut LanceTransaction,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            transaction_commit_batch_inner(
+                uri,
+                transactions,
+                transaction_count,
+                options,
+                CommitStorageSource::Accessor(storage_accessor_from_ffi(storage_accessor)),
+                commit_handler_from_ffi(commit_lock),
                 session,
                 out_dataset,
                 out_merged_transaction,
@@ -466,7 +691,8 @@ unsafe fn transaction_commit_batch_inner(
     transactions: *const *const LanceTransaction,
     transaction_count: usize,
     options: *const LanceCommitOptions,
-    storage_opts: *const *const c_char,
+    storage: CommitStorageSource,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
     session: *const LanceSession,
     out_dataset: *mut *mut LanceDataset,
     out_merged_transaction: *mut *mut LanceTransaction,
@@ -501,7 +727,7 @@ unsafe fn transaction_commit_batch_inner(
         native_transactions.push(unsafe { &**transaction }.inner.clone());
     }
 
-    let builder = unsafe { commit_builder_from_ffi(uri, options, storage_opts, session)? };
+    let builder = unsafe { storage.builder(uri, commit_handler, options, session)? };
     let result = block_on(builder.execute_batch(native_transactions))?;
     let dataset = Box::new(dataset_handle(result.dataset));
     let merged = Box::new(LanceTransaction {

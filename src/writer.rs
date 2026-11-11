@@ -22,11 +22,15 @@ use lance::session::Session;
 use lance_core::Result;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+use lance_table::io::commit::CommitHandler;
 
+use crate::commit_lock::{LanceCommitLock, commit_handler_from_ffi, storage_accessor_from_ffi};
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
 use crate::runtime::block_on;
+use crate::session::LanceSession;
+use crate::storage_options::LanceStorageOptionsAccessor;
 
 /// Write mode for `lance_dataset_write`.
 ///
@@ -286,6 +290,59 @@ pub unsafe extern "C" fn lance_dataset_write_with_options(
     )
 }
 
+/// Same as `lance_dataset_write_with_options` but composes with an optional
+/// dynamic storage-options accessor and a foreign commit lock.
+///
+/// A non-NULL `storage_accessor` forwards its native `Arc` owner directly; a
+/// NULL handle, or an accessor without an inner owner, selects native `None`.
+/// A non-NULL `commit_lock` replaces the URI-derived handler with the foreign
+/// handler; NULL keeps the native default. Both owners are retained by the
+/// committed dataset after this call returns. `session` is optional.
+///
+/// `out_dataset` follows `lance_dataset_write_with_options`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_dataset_write_with_options_with_commit_lock(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    options: *const LanceWriteOptions,
+    storage_accessor: *const LanceStorageOptionsAccessor,
+    session: *const LanceSession,
+    commit_lock: *const LanceCommitLock,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            let session = if session.is_null() {
+                None
+            } else {
+                Some((*session).inner.clone())
+            };
+            write_dataset_inner_with_overrides(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options,
+                    legacy_auto_cleanup: false,
+                },
+                std::ptr::null(),
+                Some(WriteNativeOverrides {
+                    storage_accessor: storage_accessor_from_ffi(storage_accessor),
+                    session,
+                    commit_handler: commit_handler_from_ffi(commit_lock),
+                }),
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
 /// Internal selection between the legacy write entry points and the native
 /// options entry point. Raw pointers stay valid for the synchronous FFI call.
 #[derive(Clone, Copy)]
@@ -293,6 +350,14 @@ struct WriteSettings {
     params: *const LanceWriteParams,
     options: *const LanceWriteOptions,
     legacy_auto_cleanup: bool,
+}
+
+/// Native owners that replace the legacy static storage options path while
+/// keeping a single underlying write implementation.
+struct WriteNativeOverrides {
+    storage_accessor: Option<Arc<StorageOptionsAccessor>>,
+    session: Option<Arc<Session>>,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
 }
 
 /// Build native `WriteParams` from the writer option representations.
@@ -362,6 +427,31 @@ unsafe fn write_dataset_inner(
     storage_opts: *const *const c_char,
     out_dataset: *mut *mut LanceDataset,
 ) -> Result<i32> {
+    unsafe {
+        write_dataset_inner_with_overrides(
+            uri,
+            schema,
+            stream,
+            mode,
+            settings,
+            storage_opts,
+            None,
+            out_dataset,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_dataset_inner_with_overrides(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    settings: WriteSettings,
+    storage_opts: *const *const c_char,
+    overrides: Option<WriteNativeOverrides>,
+    out_dataset: *mut *mut LanceDataset,
+) -> Result<i32> {
     // The stream NULL check is the only validation that runs *before* the
     // stream is consumed; once `from_raw` succeeds, every other return path
     // drops `reader`, which fires the FFI release callback. Reordering the
@@ -414,15 +504,37 @@ unsafe fn write_dataset_inner(
         lance_core::Error::invalid_input_source(format!("invalid schema: {e}").into())
     })?;
 
-    let write_params = unsafe {
-        write_params_from_ffi(
-            mode,
-            settings.params,
-            settings.options,
-            settings.legacy_auto_cleanup,
-            storage_opts,
-            None,
-        )?
+    let write_params = match overrides {
+        Some(overrides) => {
+            let mut params = unsafe {
+                write_params_from_ffi(
+                    mode,
+                    settings.params,
+                    settings.options,
+                    settings.legacy_auto_cleanup,
+                    std::ptr::null(),
+                    overrides.session,
+                )?
+            };
+            if let Some(accessor) = overrides.storage_accessor {
+                params.store_params = Some(ObjectStoreParams {
+                    storage_options_accessor: Some(accessor),
+                    ..ObjectStoreParams::default()
+                });
+            }
+            params.commit_handler = overrides.commit_handler;
+            params
+        }
+        None => unsafe {
+            write_params_from_ffi(
+                mode,
+                settings.params,
+                settings.options,
+                settings.legacy_auto_cleanup,
+                storage_opts,
+                None,
+            )?
+        },
     };
 
     // Fail fast: compare the stream schema against the caller-provided schema.
