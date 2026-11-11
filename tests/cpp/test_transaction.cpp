@@ -80,7 +80,7 @@ static uint64_t write_cpp_replacement_file(
                                "failed to read replacement batch");
         }
         if (!batch.release) break;
-        CHECK(batch.n_children > 0, "replacement batch has an id column");
+        CHECK(batch.n_children > 0);
         auto* ids = static_cast<int32_t*>(
             const_cast<void*>(batch.children[0]->buffers[1]));
         for (int64_t row = 0; row < batch.length; ++row) {
@@ -91,8 +91,8 @@ static uint64_t write_cpp_replacement_file(
     if (schema.release) schema.release(&schema);
 
     const auto summary = writer.finish();
-    CHECK(summary.num_rows == 4, "replacement file must preserve four rows");
-    CHECK(summary.size_bytes > 0, "replacement file must be non-empty");
+    CHECK(summary.num_rows == 4);
+    CHECK(summary.size_bytes > 0);
     return summary.num_rows;
 }
 
@@ -111,7 +111,7 @@ static std::vector<int32_t> collect_cpp_ids(const std::string& uri) {
                                "failed to read replacement result");
         }
         if (!batch.release) break;
-        CHECK(batch.n_children > 0, "result batch has an id column");
+        CHECK(batch.n_children > 0);
         const auto* values =
             static_cast<const int32_t*>(batch.children[0]->buffers[1]);
         ids.insert(ids.end(), values, values + batch.length);
@@ -573,8 +573,7 @@ static void test_data_replacement(const std::string& source_uri,
 
     const std::string filename = "cpp-data-replacement.lance";
     auto fragment = dataset.open_fragment(ids[0]);
-    CHECK(fragment.has_value());
-    CHECK(write_cpp_replacement_file(uri, *fragment, filename) == 4);
+    CHECK(write_cpp_replacement_file(uri, fragment, filename) == 4);
 
     auto file = dataset.create_data_file(filename);
     CHECK(file.path() == filename);
