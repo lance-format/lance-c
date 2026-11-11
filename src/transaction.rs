@@ -40,17 +40,17 @@ pub struct LanceTransaction {
 pub struct LanceOperation {
     pub(crate) inner: Operation,
     /// Owned C-string storage backing borrowed `UpdateBases` views.
-    base_paths: Vec<OwnedBasePath>,
+    base_paths: Vec<Result<OwnedBasePath>>,
 }
 
 impl LanceOperation {
     /// Wrap a native operation, retaining C-string storage for borrowed views.
-    pub(crate) fn from_native(inner: Operation) -> Result<Self> {
+    pub(crate) fn from_native(inner: Operation) -> Self {
         let base_paths = match &inner {
-            Operation::UpdateBases { new_bases } => own_base_paths(new_bases)?,
+            Operation::UpdateBases { new_bases } => own_base_paths(new_bases),
             _ => Vec::new(),
         };
-        Ok(Self { inner, base_paths })
+        Self { inner, base_paths }
     }
 }
 
@@ -403,7 +403,7 @@ unsafe fn operation_data_replacement_new_inner(
 
     Ok(Box::into_raw(Box::new(LanceOperation::from_native(
         Operation::DataReplacement { replacements },
-    )?)))
+    ))))
 }
 
 /// Construct an owned native Delete operation.
@@ -496,7 +496,7 @@ unsafe fn operation_delete_new_inner(
             deleted_fragment_ids,
             predicate: predicate.to_string(),
         },
-    )?)))
+    ))))
 }
 
 unsafe fn clone_index_metadata_array(
@@ -578,7 +578,7 @@ unsafe fn operation_create_index_new_inner(
             new_indices,
             removed_indices,
         },
-    )?)))
+    ))))
 }
 
 /// Clone a borrowed array of fragment handles into complete native metadata.
@@ -653,7 +653,7 @@ unsafe fn operation_append_new_inner(
     let fragments = unsafe { clone_fragment_array(fragments, fragment_count) }?;
     Ok(Box::into_raw(Box::new(LanceOperation::from_native(
         Operation::Append { fragments },
-    )?)))
+    ))))
 }
 
 /// Construct an owned native Restore operation.
@@ -666,7 +666,7 @@ pub unsafe extern "C" fn lance_operation_restore_new(version: u64) -> *mut Lance
         {
             Ok(Box::into_raw(Box::new(LanceOperation::from_native(
                 Operation::Restore { version },
-            )?)))
+            ))))
         },
         null
     )
@@ -685,7 +685,7 @@ pub unsafe extern "C" fn lance_operation_reserve_fragments_new(
         {
             Ok(Box::into_raw(Box::new(LanceOperation::from_native(
                 Operation::ReserveFragments { num_fragments },
-            )?)))
+            ))))
         },
         null
     )
@@ -715,7 +715,7 @@ unsafe fn operation_update_bases_new_inner(
     let new_bases = unsafe { parse_base_paths(new_bases, new_base_count) }?;
     Ok(Box::into_raw(Box::new(LanceOperation::from_native(
         Operation::UpdateBases { new_bases },
-    )?)))
+    ))))
 }
 
 /// Construct an owned native transaction from an operation.
@@ -1052,7 +1052,7 @@ unsafe fn transaction_operation_inner(
     let transaction = transaction_at(transaction)?;
     let operation = Box::new(LanceOperation::from_native(
         transaction.inner.operation.clone(),
-    )?);
+    ));
     unsafe {
         ptr::write(out_operation, Box::into_raw(operation));
     }
@@ -1779,7 +1779,10 @@ unsafe fn operation_update_bases_at_inner(
             .into(),
         ));
     }
-    let view = operation.base_paths[index].view();
+    let view = operation.base_paths[index]
+        .as_ref()
+        .map_err(|error| lance_core::Error::internal(error.to_string()))?
+        .view();
     unsafe {
         ptr::write(out_base, view);
     }

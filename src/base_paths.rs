@@ -99,8 +99,9 @@ impl OwnedBasePath {
     }
 }
 
-/// Copy native base paths into owned C-string storage.
-pub(crate) fn own_base_paths(bases: &[BasePath]) -> Result<Vec<OwnedBasePath>> {
+/// Retain each view conversion independently. Native metadata can contain NUL
+/// bytes even though a borrowed C-string view cannot represent them.
+pub(crate) fn own_base_paths(bases: &[BasePath]) -> Vec<Result<OwnedBasePath>> {
     bases.iter().map(OwnedBasePath::from_native).collect()
 }
 
