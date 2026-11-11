@@ -95,6 +95,28 @@ unsafe fn parse_writer_options(
     Ok(ParsedWriterOptions { native, version })
 }
 
+/// Parse the shared raw-file writer option struct for a dataset write.
+///
+/// Dataset writes select the file grammar through
+/// `WriteParams::data_storage_version`, so the raw-file `version` field is
+/// rejected rather than silently ignored.
+pub(crate) unsafe fn dataset_file_writer_options_from_ffi(
+    options: *const LanceFileWriterOptions,
+) -> Result<Option<FileWriterOptions>> {
+    if options.is_null() {
+        return Ok(None);
+    }
+    let raw = unsafe { &*options };
+    if !raw.version.is_null() {
+        return Err(Error::invalid_input(
+            "file_writer_options.version must be NULL for dataset writes; use \
+             data_storage_version instead",
+        ));
+    }
+    let parsed = unsafe { parse_writer_options(options)? };
+    Ok(Some(parsed.native))
+}
+
 pub(crate) unsafe fn open_writer_at(
     session: &FileSessionInner,
     path: Path,

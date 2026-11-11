@@ -114,6 +114,67 @@ static int contains(const char* haystack, const char* needle) {
     return haystack != NULL && strstr(haystack, needle) != NULL;
 }
 
+typedef struct {
+    int describe_table;
+    int describe_table_version;
+    int create_table_version;
+    int list_table_versions;
+    int releases;
+} DispatchCounts;
+
+static void release_owned_callback_string(LanceOwnedString* value) {
+    free(value->data);
+    value->data = NULL;
+    value->release = NULL;
+}
+
+static void set_owned_callback_string(LanceOwnedString* out, const char* value) {
+    size_t length = strlen(value) + 1;
+    char* copy = malloc(length);
+    if (copy == NULL) {
+        out->data = NULL;
+        out->release = NULL;
+        return;
+    }
+    memcpy(copy, value, length);
+    out->data = copy;
+    out->release = release_owned_callback_string;
+}
+
+static int32_t dispatch_callback(
+    void* context,
+    const char* operation,
+    const char* request_json,
+    LanceOwnedString* out_response_json,
+    LanceCallbackError* out_error) {
+    DispatchCounts* counts = (DispatchCounts*)context;
+    (void)request_json;
+    (void)out_error;
+    if (strcmp(operation, "describe_table") == 0) {
+        counts->describe_table++;
+        set_owned_callback_string(out_response_json, "{}");
+    } else if (strcmp(operation, "describe_table_version") == 0) {
+        counts->describe_table_version++;
+        set_owned_callback_string(
+            out_response_json,
+            "{\"version\":{\"version\":1,\"manifest_path\":\"manifest\"}}");
+    } else if (strcmp(operation, "create_table_version") == 0) {
+        counts->create_table_version++;
+        set_owned_callback_string(out_response_json, "{}");
+    } else if (strcmp(operation, "list_table_versions") == 0) {
+        counts->list_table_versions++;
+        set_owned_callback_string(out_response_json, "{\"versions\":[]}");
+    } else {
+        set_owned_callback_string(out_response_json, "{}");
+    }
+    return 0;
+}
+
+static void dispatch_release(void* context) {
+    DispatchCounts* counts = (DispatchCounts*)context;
+    counts->releases++;
+}
+
 static void check_call(
     LanceNamespace* ns, const char* operation, const char* request, const char* expected) {
     LanceNamespaceResult result;
@@ -214,6 +275,30 @@ int main(int argc, char** argv) {
     CHECK(unsupported.namespace_error_code == 0 || unsupported.has_namespace_error == 0,
           "native unsupported code must stay zero when present");
     lance_namespace_result_close(&unsupported);
+
+    DispatchCounts dispatch_counts = {0};
+    LanceNamespaceCustomClientDispatchSpec dispatch_spec;
+    memset(&dispatch_spec, 0, sizeof(dispatch_spec));
+    dispatch_spec.dispatch = dispatch_callback;
+    dispatch_spec.release = dispatch_release;
+    dispatch_spec.client_ctx = &dispatch_counts;
+    LanceNamespace* dispatch_ns = lance_namespace_custom_dispatch_new(&dispatch_spec);
+    CHECK(dispatch_ns != NULL, "custom dispatch namespace");
+    check_call(dispatch_ns, "describe_table",
+               "{\"id\":[\"workspace\",\"numbers\"],\"version\":1}", NULL);
+    check_call(dispatch_ns, "describe_table_version",
+               "{\"id\":[\"workspace\",\"numbers\"],\"version\":1}", NULL);
+    check_call(dispatch_ns, "create_table_version",
+               "{\"id\":[\"workspace\",\"numbers\"],\"version\":1,"
+               "\"manifest_path\":\"manifest\"}", NULL);
+    check_call(dispatch_ns, "list_table_versions",
+               "{\"id\":[\"workspace\",\"numbers\"],\"version\":1}", NULL);
+    CHECK(dispatch_counts.describe_table == 1, "dispatch describe_table");
+    CHECK(dispatch_counts.describe_table_version == 1, "dispatch describe_table_version");
+    CHECK(dispatch_counts.create_table_version == 1, "dispatch create_table_version");
+    CHECK(dispatch_counts.list_table_versions == 1, "dispatch list_table_versions");
+    lance_namespace_close(dispatch_ns);
+    CHECK(dispatch_counts.releases == 1, "dispatch context release");
 
     lance_namespace_close(ns);
     puts("native namespace C test passed");
