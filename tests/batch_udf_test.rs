@@ -743,7 +743,7 @@ fn test_batch_udf_native_oracle_metadata_and_retained_payloads() {
             .iter()
             .position(|event| event == &format!("get_batch:{fragment_id}:0"))
             .unwrap();
-        let mapper = events
+        let mapper_index = events
             .iter()
             .enumerate()
             .skip(get_batch + 1)
@@ -759,8 +759,8 @@ fn test_batch_udf_native_oracle_metadata_and_retained_payloads() {
             .position(|event| event == &format!("insert_fragment:{fragment_id}"))
             .unwrap();
         assert!(get_fragment < get_batch);
-        assert!(get_batch < mapper);
-        assert!(mapper < insert_batch);
+        assert!(get_batch < mapper_index);
+        assert!(mapper_index < insert_batch);
         assert!(insert_batch < insert_fragment);
     }
 
