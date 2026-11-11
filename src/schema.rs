@@ -28,7 +28,7 @@ pub struct LanceSchema {
     pub(crate) inner: NativeSchema,
 }
 
-unsafe fn schema_ref<'a>(schema: *const LanceSchema) -> Result<&'a LanceSchema> {
+pub(crate) unsafe fn schema_ref<'a>(schema: *const LanceSchema) -> Result<&'a LanceSchema> {
     if schema.is_null() {
         return Err(lance_core::Error::invalid_input_source(
             "schema must not be NULL".into(),

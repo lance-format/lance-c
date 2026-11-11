@@ -47826,3 +47826,1729 @@ fn test_dataset_write_and_commit_with_dynamic_accessor_retain_provider() {
         "every successful provider fetch snapshot must be released exactly once"
     );
 }
+
+fn native_schema_field_id_for_test(schema: *const LanceSchema, path: &str) -> i32 {
+    let path = c_str(path);
+    let mut field_id = -1;
+    assert_eq!(
+        unsafe { lance_schema_field_id(schema, path.as_ptr(), &mut field_id) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    field_id
+}
+
+fn native_schema_arrow(schema: *const LanceSchema) -> Schema {
+    let mut ffi = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_schema_to_arrow(schema, &mut ffi) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let arrow = Schema::try_from(&ffi).expect("native schema must convert to Arrow");
+    unsafe {
+        if let Some(release) = ffi.release {
+            release(&mut ffi);
+        }
+    }
+    arrow
+}
+
+fn native_update_map_entries(map: *const LanceUpdateMap) -> Vec<(String, Option<String>)> {
+    let count = unsafe { lance_update_map_count(map) };
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "{}",
+        take_last_error_message()
+    );
+    (0..count)
+        .map(|index| {
+            let key = unsafe { lance_update_map_key_at(map, index) };
+            assert!(!key.is_null(), "{}", take_last_error_message());
+            let key = unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned();
+            let mut has_value = false;
+            let mut value = ptr::null();
+            assert_eq!(
+                unsafe { lance_update_map_value_at(map, index, &mut has_value, &mut value) },
+                0,
+                "{}",
+                take_last_error_message()
+            );
+            let value = has_value.then(|| {
+                assert!(!value.is_null());
+                unsafe { CStr::from_ptr(value) }
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            });
+            (key, value)
+        })
+        .collect()
+}
+
+fn build_native_update_map(entries: &[(&str, Option<&str>)], replace: bool) -> *mut LanceUpdateMap {
+    let keys: Vec<CString> = entries.iter().map(|(key, _)| c_str(key)).collect();
+    let values: Vec<Option<CString>> = entries.iter().map(|(_, value)| value.map(c_str)).collect();
+    let key_ptrs: Vec<*const c_char> = keys.iter().map(|key| key.as_ptr()).collect();
+    let value_ptrs: Vec<*const c_char> = values
+        .iter()
+        .map(|value| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+        .collect();
+    let map = unsafe {
+        lance_update_map_new(
+            key_ptrs.as_ptr(),
+            value_ptrs.as_ptr(),
+            entries.len(),
+            replace,
+        )
+    };
+    assert!(!map.is_null(), "{}", take_last_error_message());
+    map
+}
+
+fn open_dataset_for_test(uri: &str) -> *mut LanceDataset {
+    let uri = c_str(uri);
+    let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    dataset
+}
+
+fn native_typed_fragment_ids(dataset: *const LanceDataset) -> Vec<u64> {
+    let count = unsafe { lance_dataset_fragment_count(dataset) };
+    let mut ids = vec![0u64; count as usize];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, ids.as_mut_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    ids
+}
+
+fn open_fragment_for_test(dataset: *const LanceDataset, fragment_id: u64) -> *mut LanceFragment {
+    let fragment = unsafe { lance_dataset_open_fragment(dataset, fragment_id) };
+    assert!(!fragment.is_null(), "{}", take_last_error_message());
+    fragment
+}
+
+fn operation_fragment_at(operation: *const LanceOperation, index: usize) -> *mut LanceFragment {
+    let mut fragment = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_overwrite_fragment_at(operation, index, &mut fragment) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!fragment.is_null());
+    fragment
+}
+
+fn update_map_from_operation(
+    getter: unsafe extern "C" fn(*const LanceOperation, *mut *mut LanceUpdateMap) -> i32,
+    operation: *const LanceOperation,
+) -> *mut LanceUpdateMap {
+    let mut map = ptr::null_mut();
+    assert_eq!(
+        unsafe { getter(operation, &mut map) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    map
+}
+
+#[test]
+fn test_native_operation_typed_four_variants_representation() {
+    use lance_table::format::pb;
+    use prost::Message;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("typed_operation_source")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let tag_field = Field::new(
+        "tag",
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        true,
+    )
+    .with_metadata(HashMap::from([(
+        "lance:field_id".to_string(),
+        "11".to_string(),
+    )]));
+    let score_field = Field::new("score", DataType::Float32, true).with_metadata(HashMap::from([
+        ("lance:field_id".to_string(), "4".to_string()),
+        ("source".to_string(), "score-field".to_string()),
+    ]));
+    let payload_field = Field::new(
+        "payload",
+        DataType::Struct(Fields::from(vec![tag_field.clone(), score_field.clone()])),
+        true,
+    )
+    .with_metadata(HashMap::from([
+        ("lance:field_id".to_string(), "3".to_string()),
+        ("owner".to_string(), "typed-op-tests".to_string()),
+    ]));
+    let id_field = Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+        "lance:field_id".to_string(),
+        "7".to_string(),
+    )]));
+    let schema = Arc::new(Schema::new(vec![id_field, payload_field]));
+
+    let tags = DictionaryArray::<Int32Type>::from_iter(vec![Some("a"), Some("b"), Some("a")]);
+    let scores = Float32Array::from(vec![Some(1.0), None, Some(3.0)]);
+    let payload = StructArray::new(
+        Fields::from(vec![tag_field, score_field]),
+        vec![Arc::new(tags), Arc::new(scores)],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(payload)],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let dataset = open_dataset_for_test(&uri);
+    let fragment_ids = native_typed_fragment_ids(dataset);
+    assert_eq!(fragment_ids.len(), 3, "one fragment per row");
+    let first_fragment = open_fragment_for_test(dataset, fragment_ids[0]);
+    let second_fragment = open_fragment_for_test(dataset, fragment_ids[1]);
+
+    let mut native_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_schema_clone(dataset, &mut native_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!native_schema.is_null());
+    // Native Overwrite assigns fresh field IDs at commit: the Arrow-provided
+    // `lance:field_id` metadata is provisional and the committed dataset uses
+    // the native identity assigned by the writer.
+    assert_eq!(native_schema_field_id_for_test(native_schema, "id"), 0);
+    assert_eq!(native_schema_field_id_for_test(native_schema, "payload"), 1);
+    assert_eq!(
+        native_schema_field_id_for_test(native_schema, "payload.tag"),
+        2
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(native_schema, "payload.score"),
+        3
+    );
+    let arrow_schema = native_schema_arrow(native_schema);
+    assert_eq!(arrow_schema.field(1).metadata()["owner"], "typed-op-tests");
+    let payload_arrow = match arrow_schema.field(1).data_type() {
+        DataType::Struct(fields) => fields.clone(),
+        other => panic!("expected struct payload, got {other:?}"),
+    };
+    assert!(matches!(
+        payload_arrow[0].data_type(),
+        DataType::Dictionary(_, _)
+    ));
+    assert_eq!(payload_arrow[1].metadata()["source"], "score-field");
+
+    // A native transaction decoded from protobuf can carry nonconsecutive and
+    // nested field IDs. Schema cloning and typed operation construction must
+    // retain them verbatim instead of renumbering the fields.
+    let custom_native_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+    let custom_fields = lance_file::datatypes::Fields::from(&custom_native_schema);
+    let custom_message = pb::Transaction {
+        read_version: 0,
+        uuid: "typed-custom-field-ids".to_string(),
+        tag: String::new(),
+        transaction_properties: HashMap::new(),
+        operation: Some(pb::transaction::Operation::Overwrite(
+            pb::transaction::Overwrite {
+                fragments: Vec::new(),
+                schema: custom_fields.0,
+                schema_metadata: HashMap::new(),
+                config_upsert_values: HashMap::new(),
+                initial_bases: Vec::new(),
+            },
+        )),
+    };
+    let custom_transaction = transaction_from_proto_bytes(&custom_message.encode_to_vec());
+    let custom_operation = native_transaction_operation(custom_transaction);
+    let mut custom_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_overwrite_schema_clone(custom_operation, &mut custom_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(native_schema_field_id_for_test(custom_schema, "id"), 7);
+    assert_eq!(native_schema_field_id_for_test(custom_schema, "payload"), 3);
+    assert_eq!(
+        native_schema_field_id_for_test(custom_schema, "payload.tag"),
+        11
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(custom_schema, "payload.score"),
+        4
+    );
+    let custom_merge = unsafe { lance_operation_merge_new(custom_schema, ptr::null(), 0, false) };
+    assert!(!custom_merge.is_null(), "{}", take_last_error_message());
+    let mut custom_merge_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_merge_schema_clone(custom_merge, &mut custom_merge_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(custom_merge_schema, "id"),
+        7
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(custom_merge_schema, "payload.tag"),
+        11
+    );
+    unsafe {
+        lance_schema_close(custom_merge_schema);
+        lance_operation_close(custom_merge);
+        lance_schema_close(custom_schema);
+        lance_operation_close(custom_operation);
+        lance_transaction_close(custom_transaction);
+    }
+
+    let fragments = [
+        first_fragment as *const LanceFragment,
+        second_fragment as *const LanceFragment,
+    ];
+    let config_keys = [c_str("owner"), c_str("empty")];
+    let config_values = [c_str("alice"), c_str("")];
+    let config_key_ptrs = [config_keys[0].as_ptr(), config_keys[1].as_ptr()];
+    let config_value_ptrs = [config_values[0].as_ptr(), config_values[1].as_ptr()];
+    let config = LanceStringMap {
+        keys: config_key_ptrs.as_ptr(),
+        values: config_value_ptrs.as_ptr(),
+        count: 2,
+    };
+    let base_path = c_str(tmp.path().join("base-a").to_str().unwrap());
+    let base_name = c_str("");
+    let bases = [
+        LanceBasePath {
+            id: 42,
+            path: base_path.as_ptr(),
+            name: ptr::null(),
+            is_dataset_root: false,
+        },
+        LanceBasePath {
+            id: 43,
+            path: base_path.as_ptr(),
+            name: base_name.as_ptr(),
+            is_dataset_root: false,
+        },
+    ];
+    let base_list = LanceBasePathList {
+        items: bases.as_ptr(),
+        count: bases.len(),
+    };
+
+    let overwrite = unsafe {
+        lance_operation_overwrite_new(
+            native_schema,
+            fragments.as_ptr(),
+            fragments.len(),
+            &config,
+            &base_list,
+        )
+    };
+    assert!(!overwrite.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        native_operation_kind(overwrite),
+        LanceOperationKind::Overwrite
+    );
+    assert_eq!(native_operation_fragment_count(overwrite), 2);
+
+    let mut count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_overwrite_fragment_count(overwrite, &mut count) },
+        0
+    );
+    assert_eq!(count, 2);
+    let cloned_fragment = operation_fragment_at(overwrite, 1);
+    assert_eq!(
+        fragment_json_for_test(cloned_fragment),
+        fragment_json_for_test(second_fragment)
+    );
+    unsafe { lance_fragment_close(cloned_fragment) };
+    let mut untouched_fragment: *mut LanceFragment = ptr::without_provenance_mut(0xDEAD_BEEF);
+    assert_eq!(
+        unsafe { lance_operation_overwrite_fragment_at(overwrite, 2, &mut untouched_fragment) },
+        -1
+    );
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::InvalidArgument,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        untouched_fragment,
+        std::ptr::without_provenance_mut(0xDEAD_BEEF)
+    );
+
+    let mut overwrite_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_overwrite_schema_clone(overwrite, &mut overwrite_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(overwrite_schema, "payload.tag"),
+        2
+    );
+    let mut shared_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_schema_clone(overwrite, &mut shared_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(shared_schema, "payload.score"),
+        3
+    );
+
+    let mut has_config = false;
+    assert_eq!(
+        unsafe { lance_operation_overwrite_has_config_upsert_values(overwrite, &mut has_config) },
+        0
+    );
+    assert!(has_config);
+    let mut config_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_overwrite_config_upsert_count(overwrite, &mut config_count) },
+        0
+    );
+    assert_eq!(config_count, 2);
+    let mut config_pairs = Vec::new();
+    for index in 0..config_count as usize {
+        let key = unsafe { lance_operation_overwrite_config_upsert_key_at(overwrite, index) };
+        let value = unsafe { lance_operation_overwrite_config_upsert_value_at(overwrite, index) };
+        assert!(!key.is_null(), "{}", take_last_error_message());
+        assert!(!value.is_null(), "{}", take_last_error_message());
+        config_pairs.push((
+            unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned(),
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        ));
+    }
+    config_pairs.sort();
+    assert_eq!(
+        config_pairs,
+        vec![
+            ("empty".to_string(), String::new()),
+            ("owner".to_string(), "alice".to_string()),
+        ]
+    );
+
+    let mut has_bases = false;
+    assert_eq!(
+        unsafe { lance_operation_overwrite_has_initial_bases(overwrite, &mut has_bases) },
+        0
+    );
+    assert!(has_bases);
+    let mut base_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_overwrite_initial_base_count(overwrite, &mut base_count) },
+        0
+    );
+    assert_eq!(base_count, 2);
+    let mut first_base: LanceBasePathView = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { lance_operation_overwrite_initial_base_at(overwrite, 0, &mut first_base) },
+        0
+    );
+    assert_eq!(first_base.id, 42);
+    assert_eq!(
+        unsafe { CStr::from_ptr(first_base.path) }.to_str().unwrap(),
+        base_path.to_str().unwrap()
+    );
+    assert!(first_base.name.is_null());
+    assert!(!first_base.is_dataset_root);
+    let mut second_base: LanceBasePathView = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { lance_operation_overwrite_initial_base_at(overwrite, 1, &mut second_base) },
+        0
+    );
+    assert_eq!(second_base.id, 43);
+    assert_eq!(
+        unsafe { CStr::from_ptr(second_base.name) }
+            .to_str()
+            .unwrap(),
+        ""
+    );
+
+    // Wrong-kind accessors fail with NOT_SUPPORTED and leave their outputs alone.
+    let mut sentinel_bool = false;
+    assert_eq!(
+        unsafe { lance_operation_merge_preserves_nullability(overwrite, &mut sentinel_bool) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert!(!sentinel_bool);
+    let mut sentinel_count = u64::MAX;
+    assert_eq!(
+        unsafe {
+            lance_operation_update_config_field_metadata_count(overwrite, &mut sentinel_count)
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(sentinel_count, u64::MAX);
+    let mut sentinel_present = true;
+    let mut sentinel_value: *const c_char = std::ptr::without_provenance(0xDEAD_BEEF);
+    assert_eq!(
+        unsafe {
+            lance_operation_clone_ref_name(overwrite, &mut sentinel_present, &mut sentinel_value)
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert!(sentinel_present);
+    assert_eq!(sentinel_value, std::ptr::without_provenance(0xDEAD_BEEF));
+    assert_eq!(
+        unsafe { lance_operation_overwrite_fragment_count(overwrite, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // UpdateMap C value keeps duplicates, order and None (delete) entries.
+    let update_map = build_native_update_map(
+        &[
+            ("dup", Some("first")),
+            ("deleted", None),
+            ("dup", Some("second")),
+            ("empty", Some("")),
+        ],
+        true,
+    );
+    assert_eq!(unsafe { lance_update_map_count(update_map) }, 4);
+    assert!(unsafe { lance_update_map_replace(update_map) });
+    let entries = native_update_map_entries(update_map);
+    assert_eq!(
+        entries,
+        vec![
+            ("dup".to_string(), Some("first".to_string())),
+            ("deleted".to_string(), None),
+            ("dup".to_string(), Some("second".to_string())),
+            ("empty".to_string(), Some(String::new())),
+        ]
+    );
+    let cloned_map = unsafe { lance_update_map_clone(update_map) };
+    assert!(!cloned_map.is_null(), "{}", take_last_error_message());
+    unsafe { lance_update_map_close(update_map) };
+    assert_eq!(unsafe { lance_update_map_count(cloned_map) }, 4);
+    assert_eq!(native_update_map_entries(cloned_map).len(), 4);
+    assert_eq!(
+        unsafe { lance_update_map_key_at(cloned_map, 4) },
+        ptr::null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_update_map_close(cloned_map) };
+
+    // Invalid keys, values and sizes are rejected at the C boundary.
+    let null_map = unsafe { lance_update_map_new(ptr::null(), ptr::null(), 1, false) };
+    assert!(null_map.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let invalid_utf8 = [0xFFu8, 0];
+    let invalid_keys = [invalid_utf8.as_ptr() as *const c_char];
+    let valid_value = [c_str("v")];
+    let valid_value_ptrs = [valid_value[0].as_ptr()];
+    let map =
+        unsafe { lance_update_map_new(invalid_keys.as_ptr(), valid_value_ptrs.as_ptr(), 1, false) };
+    assert!(map.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let valid_key = [c_str("k")];
+    let valid_key_ptrs = [valid_key[0].as_ptr()];
+    let invalid_values = [invalid_utf8.as_ptr() as *const c_char];
+    let map =
+        unsafe { lance_update_map_new(valid_key_ptrs.as_ptr(), invalid_values.as_ptr(), 1, false) };
+    assert!(map.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let map = unsafe { lance_update_map_new(ptr::null(), ptr::null(), 0, false) };
+    assert!(!map.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_update_map_count(map) }, 0);
+    unsafe { lance_update_map_close(map) };
+
+    // Merge carries a complete fragment list and the nullability assertion.
+    let merge = unsafe {
+        lance_operation_merge_new(native_schema, fragments.as_ptr(), fragments.len(), true)
+    };
+    assert!(!merge.is_null(), "{}", take_last_error_message());
+    assert_eq!(native_operation_kind(merge), LanceOperationKind::Merge);
+    let mut merge_count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_merge_fragment_count(merge, &mut merge_count) },
+        0
+    );
+    assert_eq!(merge_count, 2);
+    let mut merge_fragment = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_merge_fragment_at(merge, 1, &mut merge_fragment) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        fragment_json_for_test(merge_fragment),
+        fragment_json_for_test(second_fragment)
+    );
+    unsafe { lance_fragment_close(merge_fragment) };
+    let mut preserves = false;
+    assert_eq!(
+        unsafe { lance_operation_merge_preserves_nullability(merge, &mut preserves) },
+        0
+    );
+    assert!(preserves);
+    let mut shared_preserves = false;
+    assert_eq!(
+        unsafe { lance_operation_preserves_nullability(merge, &mut shared_preserves) },
+        0
+    );
+    assert!(shared_preserves);
+    let mut merge_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_merge_schema_clone(merge, &mut merge_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(native_schema_field_id_for_test(merge_schema, "payload"), 1);
+
+    // Clone carries optional native strings and the shallow flag verbatim.
+    let ref_name = c_str("refs/heads/main");
+    let branch_name = c_str("");
+    let ref_path = c_str(&uri);
+    let clone = unsafe {
+        lance_operation_clone_new(
+            true,
+            ref_name.as_ptr(),
+            7,
+            ref_path.as_ptr(),
+            branch_name.as_ptr(),
+        )
+    };
+    assert!(!clone.is_null(), "{}", take_last_error_message());
+    assert_eq!(native_operation_kind(clone), LanceOperationKind::Clone);
+    let mut is_shallow = false;
+    assert_eq!(
+        unsafe { lance_operation_clone_is_shallow(clone, &mut is_shallow) },
+        0
+    );
+    assert!(is_shallow);
+    let mut present = false;
+    let mut value = ptr::null();
+    assert_eq!(
+        unsafe { lance_operation_clone_ref_name(clone, &mut present, &mut value) },
+        0
+    );
+    assert!(present);
+    assert_eq!(
+        unsafe { CStr::from_ptr(value) }.to_str().unwrap(),
+        "refs/heads/main"
+    );
+    let mut version = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_clone_ref_version(clone, &mut version) },
+        0
+    );
+    assert_eq!(version, 7);
+    let path = unsafe { lance_operation_clone_ref_path(clone) };
+    assert!(!path.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { CStr::from_ptr(path) }.to_str().unwrap(), uri);
+    assert_eq!(
+        unsafe { lance_operation_clone_branch_name(clone, &mut present, &mut value) },
+        0
+    );
+    assert!(present);
+    assert_eq!(unsafe { CStr::from_ptr(value) }.to_str().unwrap(), "");
+
+    let clone_without_optionals =
+        unsafe { lance_operation_clone_new(false, ptr::null(), 0, ref_path.as_ptr(), ptr::null()) };
+    assert!(
+        !clone_without_optionals.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let mut present = true;
+    let mut value: *const c_char = std::ptr::without_provenance(0xDEAD_BEEF);
+    assert_eq!(
+        unsafe {
+            lance_operation_clone_ref_name(clone_without_optionals, &mut present, &mut value)
+        },
+        0
+    );
+    assert!(!present);
+    assert!(value.is_null());
+    assert_eq!(
+        unsafe {
+            lance_operation_clone_branch_name(clone_without_optionals, &mut present, &mut value)
+        },
+        0
+    );
+    assert!(!present);
+    assert_eq!(
+        unsafe { lance_operation_clone_is_shallow(clone_without_optionals, &mut is_shallow) },
+        0
+    );
+    assert!(!is_shallow);
+
+    // UpdateConfig preserves option presence, order, duplicates and last-map-wins.
+    let empty_map = unsafe { lance_update_map_new(ptr::null(), ptr::null(), 0, false) };
+    assert!(!empty_map.is_null(), "{}", take_last_error_message());
+    let schema_map = build_native_update_map(
+        &[
+            ("owner", Some("native")),
+            ("owner", Some("")),
+            ("gone", None),
+        ],
+        false,
+    );
+    let field_map_a = build_native_update_map(&[("a", Some("1"))], true);
+    let field_map_b = build_native_update_map(&[("b", None)], false);
+    let field_3_map = unsafe { lance_update_map_new(ptr::null(), ptr::null(), 0, false) };
+    assert!(!field_3_map.is_null(), "{}", take_last_error_message());
+    let field_updates = [
+        LanceFieldMetadataUpdateMap {
+            field_id: 7,
+            updates: field_map_a,
+        },
+        LanceFieldMetadataUpdateMap {
+            field_id: 3,
+            updates: field_3_map,
+        },
+        LanceFieldMetadataUpdateMap {
+            field_id: 7,
+            updates: field_map_b,
+        },
+    ];
+    let options = LanceUpdateConfigOperationOptions {
+        config_updates: empty_map,
+        table_metadata_updates: ptr::null(),
+        schema_metadata_updates: schema_map,
+        field_metadata_updates: field_updates.as_ptr(),
+        field_metadata_update_count: field_updates.len(),
+    };
+    let update_config = unsafe { lance_operation_update_config_new(&options) };
+    assert!(!update_config.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        native_operation_kind(update_config),
+        LanceOperationKind::UpdateConfig
+    );
+    let mut config_map = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_update_config_config_updates(update_config, &mut config_map) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(
+        !config_map.is_null(),
+        "Some(empty) must be an owned map handle"
+    );
+    assert_eq!(unsafe { lance_update_map_count(config_map) }, 0);
+    unsafe { lance_update_map_close(config_map) };
+    let mut table_map: *mut LanceUpdateMap = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+    assert_eq!(
+        unsafe {
+            lance_operation_update_config_table_metadata_updates(update_config, &mut table_map)
+        },
+        0
+    );
+    assert!(table_map.is_null(), "native None must report NULL");
+    let schema_updates = update_map_from_operation(
+        lance_operation_update_config_schema_metadata_updates,
+        update_config,
+    );
+    assert_eq!(
+        native_update_map_entries(schema_updates),
+        vec![
+            ("owner".to_string(), Some("native".to_string())),
+            ("owner".to_string(), Some(String::new())),
+            ("gone".to_string(), None),
+        ]
+    );
+    let mut field_count = u64::MAX;
+    assert_eq!(
+        unsafe {
+            lance_operation_update_config_field_metadata_count(update_config, &mut field_count)
+        },
+        0
+    );
+    assert_eq!(
+        field_count, 2,
+        "duplicate field ids collapse to the last map"
+    );
+    let mut seen = BTreeMap::new();
+    for index in 0..field_count as usize {
+        let mut field_id = -1i32;
+        let mut map = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lance_operation_update_config_field_metadata_at(
+                    update_config,
+                    index,
+                    &mut field_id,
+                    &mut map,
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert!(!map.is_null());
+        seen.insert(field_id, native_update_map_entries(map));
+        unsafe { lance_update_map_close(map) };
+    }
+    assert_eq!(
+        seen.get(&7).unwrap(),
+        &vec![("b".to_string(), None)],
+        "the last whole map for a duplicate field id wins"
+    );
+    assert!(seen.get(&3).unwrap().is_empty());
+    let mut sentinel_field_id = 1234i32;
+    let mut sentinel_map: *mut LanceUpdateMap = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+    assert_eq!(
+        unsafe {
+            lance_operation_update_config_field_metadata_at(
+                update_config,
+                2,
+                &mut sentinel_field_id,
+                &mut sentinel_map,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(sentinel_field_id, 1234);
+    assert_eq!(sentinel_map, std::ptr::without_provenance_mut(0xDEAD_BEEF));
+    assert_eq!(
+        unsafe {
+            lance_operation_update_config_schema_metadata_updates(update_config, ptr::null_mut())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // Invalid constructor inputs are rejected without producing an operation.
+    let bad_map = unsafe { lance_update_map_new(valid_key_ptrs.as_ptr(), ptr::null(), 1, false) };
+    assert!(bad_map.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let bad_overwrite = unsafe {
+        lance_operation_overwrite_new(native_schema, ptr::null(), 1, ptr::null(), ptr::null())
+    };
+    assert!(bad_overwrite.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let bad_clone =
+        unsafe { lance_operation_clone_new(true, ptr::null(), 0, ptr::null(), ptr::null()) };
+    assert!(bad_clone.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let bad_merge = unsafe { lance_operation_merge_new(native_schema, ptr::null(), 1, false) };
+    assert!(bad_merge.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let bad_update_config = unsafe { lance_operation_update_config_new(ptr::null()) };
+    assert!(bad_update_config.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let bad_options = LanceUpdateConfigOperationOptions {
+        config_updates: ptr::null(),
+        table_metadata_updates: ptr::null(),
+        schema_metadata_updates: ptr::null(),
+        field_metadata_updates: ptr::null(),
+        field_metadata_update_count: 1,
+    };
+    let bad_update_config = unsafe { lance_operation_update_config_new(&bad_options) };
+    assert!(bad_update_config.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // A history proto may contain embedded NULs that no C string can carry.
+    // The native value stays complete; only the affected per-entry C view fails.
+    {
+        use lance_table::format::pb;
+        use prost::Message;
+
+        let mut field_metadata_updates = HashMap::new();
+        field_metadata_updates.insert(
+            7,
+            pb::transaction::UpdateMap {
+                update_entries: vec![pb::transaction::UpdateMapEntry {
+                    key: "nul\0key".to_string(),
+                    value: Some("nul\0value".to_string()),
+                }],
+                replace: false,
+            },
+        );
+        let message = pb::Transaction {
+            read_version: 1,
+            uuid: "embedded-nul-update-config".to_string(),
+            tag: String::new(),
+            transaction_properties: HashMap::new(),
+            operation: Some(pb::transaction::Operation::UpdateConfig(
+                pb::transaction::UpdateConfig {
+                    config_updates: None,
+                    table_metadata_updates: None,
+                    schema_metadata_updates: Some(pb::transaction::UpdateMap {
+                        update_entries: vec![
+                            pb::transaction::UpdateMapEntry {
+                                key: "nul\0history".to_string(),
+                                value: Some("kept".to_string()),
+                            },
+                            pb::transaction::UpdateMapEntry {
+                                key: "plain".to_string(),
+                                value: Some("nul\0value".to_string()),
+                            },
+                        ],
+                        replace: true,
+                    }),
+                    field_metadata_updates,
+                    ..Default::default()
+                },
+            )),
+        };
+        let bytes = message.encode_to_vec();
+        let transaction = unsafe { lance_transaction_from_proto(bytes.as_ptr(), bytes.len()) };
+        assert!(!transaction.is_null(), "{}", take_last_error_message());
+        let operation = native_transaction_operation(transaction);
+        let map = update_map_from_operation(
+            lance_operation_update_config_schema_metadata_updates,
+            operation,
+        );
+        assert_eq!(unsafe { lance_update_map_count(map) }, 2);
+        // First entry key is undeliverable as a C string.
+        assert!(unsafe { lance_update_map_key_at(map, 0) }.is_null());
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+        // ...but its value remains independently readable.
+        let mut has_value = false;
+        let mut value = ptr::null();
+        assert_eq!(
+            unsafe { lance_update_map_value_at(map, 0, &mut has_value, &mut value) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert!(has_value);
+        assert_eq!(unsafe { CStr::from_ptr(value) }.to_str().unwrap(), "kept");
+        // Second entry has a valid key and an undeliverable value.
+        let key = unsafe { lance_update_map_key_at(map, 1) };
+        assert!(!key.is_null(), "{}", take_last_error_message());
+        assert_eq!(unsafe { CStr::from_ptr(key) }.to_str().unwrap(), "plain");
+        assert_eq!(
+            unsafe { lance_update_map_value_at(map, 1, &mut has_value, &mut value) },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+        // Clone and field-map views keep the complete native data.
+        let cloned = unsafe { lance_update_map_clone(map) };
+        assert!(!cloned.is_null(), "{}", take_last_error_message());
+        assert_eq!(unsafe { lance_update_map_count(cloned) }, 2);
+        unsafe { lance_update_map_close(cloned) };
+        let mut field_count = 0u64;
+        assert_eq!(
+            unsafe {
+                lance_operation_update_config_field_metadata_count(operation, &mut field_count)
+            },
+            0
+        );
+        assert_eq!(field_count, 1);
+        let mut field_id = -1i32;
+        let mut field_map = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lance_operation_update_config_field_metadata_at(
+                    operation,
+                    0,
+                    &mut field_id,
+                    &mut field_map,
+                )
+            },
+            0
+        );
+        assert_eq!(field_id, 7);
+        assert_eq!(unsafe { lance_update_map_count(field_map) }, 1);
+        assert!(unsafe { lance_update_map_key_at(field_map, 0) }.is_null());
+        unsafe { lance_update_map_close(field_map) };
+        unsafe { lance_update_map_close(map) };
+        unsafe {
+            lance_operation_close(operation);
+            lance_transaction_close(transaction);
+        }
+    }
+
+    unsafe {
+        lance_operation_close(update_config);
+        lance_operation_close(clone_without_optionals);
+        lance_operation_close(clone);
+        lance_operation_close(merge);
+        lance_operation_close(overwrite);
+        lance_schema_close(merge_schema);
+        lance_schema_close(shared_schema);
+        lance_schema_close(overwrite_schema);
+        lance_schema_close(native_schema);
+        lance_fragment_close(second_fragment);
+        lance_fragment_close(first_fragment);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_native_operation_typed_publication_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_uri = tmp
+        .path()
+        .join("typed_publication_source")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(
+                vec![Ok(write_batch(vec![1, 2, 3, 4], vec![1.0, 2.0, 3.0, 4.0]))],
+                write_schema(),
+            ),
+            &source_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let source = open_dataset_for_test(&source_uri);
+    let source_version = unsafe { lance_dataset_version(source) };
+    let source_fragment_ids = native_typed_fragment_ids(source);
+    assert_eq!(source_fragment_ids.len(), 2);
+    let first_fragment = open_fragment_for_test(source, source_fragment_ids[0]);
+    let second_fragment = open_fragment_for_test(source, source_fragment_ids[1]);
+    let mut source_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_schema_clone(source, &mut source_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    // Overwrite publishes a create with fresh fragment IDs, config upserts and
+    // initial bases. Fragments are reused from the source snapshot.
+    let overwrite_uri = tmp
+        .path()
+        .join("typed_publication_overwrite")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let config_keys = [c_str("owner"), c_str("empty")];
+    let config_values = [c_str("alice"), c_str("")];
+    let config_key_ptrs = [config_keys[0].as_ptr(), config_keys[1].as_ptr()];
+    let config_value_ptrs = [config_values[0].as_ptr(), config_values[1].as_ptr()];
+    let config = LanceStringMap {
+        keys: config_key_ptrs.as_ptr(),
+        values: config_value_ptrs.as_ptr(),
+        count: 2,
+    };
+    let base_path = c_str(tmp.path().join("overwrite-base").to_str().unwrap());
+    let base_name = c_str("primary");
+    let bases = [LanceBasePath {
+        id: 9,
+        path: base_path.as_ptr(),
+        name: base_name.as_ptr(),
+        is_dataset_root: false,
+    }];
+    let base_list = LanceBasePathList {
+        items: bases.as_ptr(),
+        count: 1,
+    };
+    let fragments = [
+        first_fragment as *const LanceFragment,
+        second_fragment as *const LanceFragment,
+    ];
+    let overwrite = unsafe {
+        lance_operation_overwrite_new(
+            source_schema,
+            fragments.as_ptr(),
+            fragments.len(),
+            &config,
+            &base_list,
+        )
+    };
+    assert!(!overwrite.is_null(), "{}", take_last_error_message());
+    let transaction = unsafe { lance_transaction_new(0, overwrite, ptr::null()) };
+    assert!(!transaction.is_null(), "{}", take_last_error_message());
+    let published = commit_native_transaction(&overwrite_uri, transaction, ptr::null());
+    assert_eq!(unsafe { lance_dataset_version(published) }, 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(published) }, 4);
+    let published_ids = native_typed_fragment_ids(published);
+    assert_eq!(published_ids.len(), 2);
+    assert_eq!(
+        published_ids,
+        vec![0, 1],
+        "Overwrite assigns fresh fragment IDs at commit"
+    );
+    let config_handle = unsafe { lance_dataset_config(published) };
+    assert!(!config_handle.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_config_count(config_handle) }, 2);
+    let mut published_config = BTreeMap::new();
+    for index in 0..2 {
+        let key = unsafe { lance_dataset_config_key_at(config_handle, index) };
+        let value = unsafe { lance_dataset_config_value_at(config_handle, index) };
+        assert!(!key.is_null());
+        assert!(!value.is_null());
+        published_config.insert(
+            unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned(),
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    assert_eq!(published_config.get("owner").unwrap(), "alice");
+    assert_eq!(published_config.get("empty").unwrap(), "");
+    unsafe { lance_dataset_config_close(config_handle) };
+    let bases_json_ptr = unsafe { lance_dataset_base_paths_json(published) };
+    assert!(!bases_json_ptr.is_null(), "{}", take_last_error_message());
+    let bases_json = unsafe { CStr::from_ptr(bases_json_ptr) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    unsafe { lance_free_string(bases_json_ptr as *mut c_char) };
+    assert!(bases_json.contains("\"9\""), "{bases_json}");
+    assert!(bases_json.contains("overwrite-base"), "{bases_json}");
+    assert!(bases_json.contains("primary"), "{bases_json}");
+    let mut published_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_schema_clone(published, &mut published_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(published_schema, "id"),
+        native_schema_field_id_for_test(source_schema, "id")
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(published_schema, "val"),
+        native_schema_field_id_for_test(source_schema, "val")
+    );
+    unsafe {
+        lance_schema_close(published_schema);
+        lance_operation_close(overwrite);
+        lance_transaction_close(transaction);
+        lance_dataset_close(published);
+    }
+
+    // A staged append fragment is the only place Merge can introduce rows; the
+    // caller must pass the complete final fragment list.
+    let staged_append = write_uncommitted_for_batch(
+        &source_uri,
+        write_batch(vec![5, 6], vec![5.0, 6.0]),
+        LanceWriteMode::Append,
+        ptr::null(),
+    );
+    let staged_operation = native_transaction_operation(staged_append);
+    let mut staged_count = 0u64;
+    assert_eq!(
+        unsafe { lance_operation_fragment_count(staged_operation, &mut staged_count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(staged_count, 1);
+    let mut staged_fragment: *mut LanceFragment = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_at(staged_operation, 0, &mut staged_fragment) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!staged_fragment.is_null());
+
+    // The Merge schema is sourced from a staged Create with the expanded Arrow
+    // schema; existing field names/types and IDs remain compatible.
+    let expanded_schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Float32, true),
+        Field::new("tag", DataType::Utf8, true),
+    ]);
+    let expanded_batch = RecordBatch::try_new(
+        Arc::new(expanded_schema.clone()),
+        vec![
+            Arc::new(Int32Array::from(vec![100, 101])),
+            Arc::new(Float32Array::from(vec![Some(1.0), Some(2.0)])),
+            Arc::new(StringArray::from(vec![Some("x"), None])),
+        ],
+    )
+    .unwrap();
+    let scratch_uri = tmp
+        .path()
+        .join("typed_publication_schema_scratch")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let scratch_transaction = write_uncommitted_for_batch(
+        &scratch_uri,
+        expanded_batch,
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    let scratch_operation = native_transaction_operation(scratch_transaction);
+    let mut merge_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_overwrite_schema_clone(scratch_operation, &mut merge_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let merge_fragments = [
+        first_fragment as *const LanceFragment,
+        second_fragment as *const LanceFragment,
+        staged_fragment as *const LanceFragment,
+    ];
+    let merge = unsafe {
+        lance_operation_merge_new(
+            merge_schema,
+            merge_fragments.as_ptr(),
+            merge_fragments.len(),
+            true,
+        )
+    };
+    assert!(!merge.is_null(), "{}", take_last_error_message());
+    let merge_transaction = unsafe { lance_transaction_new(source_version, merge, ptr::null()) };
+    assert!(
+        !merge_transaction.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let merged = commit_native_transaction(&source_uri, merge_transaction, ptr::null());
+    assert_eq!(unsafe { lance_dataset_version(merged) }, source_version + 1);
+    assert_eq!(unsafe { lance_dataset_count_rows(merged) }, 6);
+    assert_eq!(native_typed_fragment_ids(merged).len(), 3);
+    let mut merged_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_schema_clone(merged, &mut merged_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let tag_id = native_schema_field_id_for_test(merged_schema, "tag");
+    assert!(tag_id >= 0);
+    let merged_arrow = native_schema_arrow(merged_schema);
+    assert_eq!(merged_arrow.fields().len(), 3);
+    assert!(merged_arrow.field(2).is_nullable());
+    unsafe {
+        lance_schema_close(merged_schema);
+        lance_dataset_close(merged);
+    }
+
+    // Concurrent appends after the Merge snapshot are not part of its complete
+    // fragment list, so an explicit zero-retry commit reports a conflict.
+    let merged_snapshot = open_dataset_for_test(&source_uri);
+    let merged_version = unsafe { lance_dataset_version(merged_snapshot) };
+    // The operation must cover every fragment of the latest manifest; otherwise
+    // native fragment-coverage validation rejects it before the read-version
+    // conflict is observed. The uncommitted append fragment uses id 0, so the
+    // committed identities must be reopened from the merged snapshot.
+    let merged_fragment_ids = native_typed_fragment_ids(merged_snapshot);
+    assert_eq!(merged_fragment_ids, vec![0, 1, 2]);
+    let stale_merge_fragments: Vec<*const LanceFragment> = merged_fragment_ids
+        .iter()
+        .map(|&id| open_fragment_for_test(merged_snapshot, id) as *const LanceFragment)
+        .collect();
+    let stale_merge = unsafe {
+        lance_operation_merge_new(
+            merge_schema,
+            stale_merge_fragments.as_ptr(),
+            stale_merge_fragments.len(),
+            true,
+        )
+    };
+    assert!(!stale_merge.is_null(), "{}", take_last_error_message());
+    let stale_transaction =
+        unsafe { lance_transaction_new(merged_version, stale_merge, ptr::null()) };
+    // Merge carries a complete schema from its read version, so a concurrent
+    // schema-metadata update is a native retryable conflict. A config-only
+    // UpdateConfig would rebase cleanly and the stale Merge would succeed.
+    let concurrent_map = build_native_update_map(&[("concurrent", Some("1"))], false);
+    let concurrent_options = LanceUpdateConfigOperationOptions {
+        config_updates: ptr::null(),
+        table_metadata_updates: ptr::null(),
+        schema_metadata_updates: concurrent_map,
+        field_metadata_updates: ptr::null(),
+        field_metadata_update_count: 0,
+    };
+    let concurrent_operation = unsafe { lance_operation_update_config_new(&concurrent_options) };
+    assert!(
+        !concurrent_operation.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let concurrent =
+        unsafe { lance_transaction_new(merged_version, concurrent_operation, ptr::null()) };
+    assert!(!concurrent.is_null(), "{}", take_last_error_message());
+    let concurrent_dataset = commit_native_transaction(&source_uri, concurrent, ptr::null());
+    unsafe {
+        lance_dataset_close(concurrent_dataset);
+        lance_update_map_close(concurrent_map);
+        lance_operation_close(concurrent_operation);
+        lance_transaction_close(concurrent);
+    }
+    let mut zero_retries: LanceCommitOptions = unsafe { std::mem::zeroed() };
+    zero_retries.has_max_retries = true;
+    zero_retries.max_retries = 0;
+    zero_retries.timeout_mode = LanceCommitTimeoutMode::Disabled as i32;
+    let mut conflict_dataset: *mut LanceDataset = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+    let source_uri_c = c_str(&source_uri);
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                source_uri_c.as_ptr(),
+                stale_transaction,
+                &zero_retries,
+                ptr::null(),
+                ptr::null(),
+                &mut conflict_dataset,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::CommitConflict,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        conflict_dataset,
+        std::ptr::without_provenance_mut(0xDEAD_BEEF)
+    );
+    unsafe {
+        lance_transaction_close(stale_transaction);
+        lance_operation_close(stale_merge);
+        for fragment in &stale_merge_fragments {
+            lance_fragment_close(*fragment as *mut LanceFragment);
+        }
+        lance_dataset_close(merged_snapshot);
+    }
+
+    // Merge changing a retained field's nullability without rewriting it is a
+    // native validation failure, reported verbatim.
+    let tightened_schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Float32, false),
+        Field::new("tag", DataType::Utf8, true),
+    ]);
+    let tightened_batch = RecordBatch::try_new(
+        Arc::new(tightened_schema.clone()),
+        vec![
+            Arc::new(Int32Array::from(vec![200, 201])),
+            Arc::new(Float32Array::from(vec![Some(1.0), Some(2.0)])),
+            Arc::new(StringArray::from(vec![Some("y"), None])),
+        ],
+    )
+    .unwrap();
+    let tightened_uri = tmp
+        .path()
+        .join("typed_publication_tightened")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let tightened_transaction = write_uncommitted_for_batch(
+        &tightened_uri,
+        tightened_batch,
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    let tightened_operation = native_transaction_operation(tightened_transaction);
+    let mut tightened_schema_handle = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_operation_overwrite_schema_clone(
+                tightened_operation,
+                &mut tightened_schema_handle,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let stale_snapshot = open_dataset_for_test(&source_uri);
+    let stale_version = unsafe { lance_dataset_version(stale_snapshot) };
+    let stale_fragment_ids = native_typed_fragment_ids(stale_snapshot);
+    let stale_fragments: Vec<*mut LanceFragment> = stale_fragment_ids
+        .iter()
+        .map(|fragment_id| open_fragment_for_test(stale_snapshot, *fragment_id))
+        .collect();
+    let stale_fragment_ptrs: Vec<*const LanceFragment> = stale_fragments
+        .iter()
+        .map(|fragment| *fragment as *const LanceFragment)
+        .collect();
+    let tight_merge = unsafe {
+        lance_operation_merge_new(
+            tightened_schema_handle,
+            stale_fragment_ptrs.as_ptr(),
+            stale_fragment_ptrs.len(),
+            false,
+        )
+    };
+    // The tightened schema only changes nullability, so commit validation
+    // reports the field-binding conflict for the retained fragments.
+    assert!(!tight_merge.is_null(), "{}", take_last_error_message());
+    let tight_transaction =
+        unsafe { lance_transaction_new(stale_version, tight_merge, ptr::null()) };
+    let tight_uri = c_str(&source_uri);
+    let mut tight_dataset: *mut LanceDataset = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                tight_uri.as_ptr(),
+                tight_transaction,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &mut tight_dataset,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let tight_message = take_last_error_message();
+    assert!(
+        tight_message.contains("nullable true -> false"),
+        "{tight_message}"
+    );
+    assert!(tight_dataset.is_null());
+
+    // Clone: shallow is supported through the ordinary commit path; deep is
+    // rejected natively with the documented message.
+    let clone_uri = tmp
+        .path()
+        .join("typed_publication_clone_shallow")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let ref_path = c_str(&source_uri);
+    let shallow = unsafe {
+        lance_operation_clone_new(
+            true,
+            ptr::null(),
+            stale_version,
+            ref_path.as_ptr(),
+            ptr::null(),
+        )
+    };
+    assert!(!shallow.is_null(), "{}", take_last_error_message());
+    let shallow_transaction = unsafe { lance_transaction_new(stale_version, shallow, ptr::null()) };
+    let cloned = commit_native_transaction(&clone_uri, shallow_transaction, ptr::null());
+    // A shallow clone copies the source manifest, including its version, so
+    // the new dataset reports the cloned source version (`ref_version`).
+    assert_eq!(unsafe { lance_dataset_version(cloned) }, stale_version);
+    let current_rows = {
+        let current = open_dataset_for_test(&source_uri);
+        let rows = unsafe { lance_dataset_count_rows(current) };
+        unsafe { lance_dataset_close(current) };
+        rows
+    };
+    assert_eq!(unsafe { lance_dataset_count_rows(cloned) }, current_rows);
+    unsafe {
+        lance_dataset_close(cloned);
+        lance_operation_close(shallow);
+        lance_transaction_close(shallow_transaction);
+    }
+
+    let deep_uri = tmp
+        .path()
+        .join("typed_publication_clone_deep")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let deep = unsafe {
+        lance_operation_clone_new(
+            false,
+            ptr::null(),
+            stale_version,
+            ref_path.as_ptr(),
+            ptr::null(),
+        )
+    };
+    assert!(!deep.is_null(), "{}", take_last_error_message());
+    let deep_transaction = unsafe { lance_transaction_new(stale_version, deep, ptr::null()) };
+    let deep_uri_c = c_str(&deep_uri);
+    let mut deep_dataset: *mut LanceDataset = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                deep_uri_c.as_ptr(),
+                deep_transaction,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &mut deep_dataset,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let deep_message = take_last_error_message();
+    assert!(
+        deep_message.contains("deep Clone cannot be committed directly"),
+        "{deep_message}"
+    );
+
+    // UpdateConfig: replace clears then skips None entries; incremental removes
+    // None keys; table/schema/field scopes land on the committed manifest.
+    let seed_config =
+        build_native_update_map(&[("keep", Some("old")), ("drop", Some("old"))], false);
+    let seed_options = LanceUpdateConfigOperationOptions {
+        config_updates: seed_config,
+        table_metadata_updates: ptr::null(),
+        schema_metadata_updates: ptr::null(),
+        field_metadata_updates: ptr::null(),
+        field_metadata_update_count: 0,
+    };
+    let seed_operation = unsafe { lance_operation_update_config_new(&seed_options) };
+    assert!(!seed_operation.is_null(), "{}", take_last_error_message());
+    let current = open_dataset_for_test(&source_uri);
+    let current_version = unsafe { lance_dataset_version(current) };
+    unsafe { lance_dataset_close(current) };
+    let seed_transaction =
+        unsafe { lance_transaction_new(current_version, seed_operation, ptr::null()) };
+    let seeded = commit_native_transaction(&source_uri, seed_transaction, ptr::null());
+    unsafe {
+        lance_dataset_close(seeded);
+        lance_operation_close(seed_operation);
+        lance_transaction_close(seed_transaction);
+        lance_update_map_close(seed_config);
+    }
+
+    let config_updates = build_native_update_map(
+        &[
+            ("keep", Some("new")),
+            ("drop", None),
+            ("added", Some("yes")),
+        ],
+        true,
+    );
+    let table_updates = build_native_update_map(&[("table-key", Some("table-value"))], false);
+    let schema_updates = build_native_update_map(
+        &[
+            ("schema-key", Some("schema-value")),
+            ("schema-key", Some("")),
+        ],
+        false,
+    );
+    let field_updates_map = build_native_update_map(
+        &[("field-key", Some("field-value")), ("field-old", None)],
+        true,
+    );
+    let field_updates = [LanceFieldMetadataUpdateMap {
+        field_id: 1,
+        updates: field_updates_map,
+    }];
+    let update_options = LanceUpdateConfigOperationOptions {
+        config_updates,
+        table_metadata_updates: table_updates,
+        schema_metadata_updates: schema_updates,
+        field_metadata_updates: field_updates.as_ptr(),
+        field_metadata_update_count: 1,
+    };
+    let update_config = unsafe { lance_operation_update_config_new(&update_options) };
+    assert!(!update_config.is_null(), "{}", take_last_error_message());
+    let current = open_dataset_for_test(&source_uri);
+    let current_version = unsafe { lance_dataset_version(current) };
+    unsafe { lance_dataset_close(current) };
+    let update_transaction =
+        unsafe { lance_transaction_new(current_version, update_config, ptr::null()) };
+    let updated = commit_native_transaction(&source_uri, update_transaction, ptr::null());
+    let updated_config = unsafe { lance_dataset_config(updated) };
+    assert!(!updated_config.is_null());
+    let mut updated_pairs = BTreeMap::new();
+    for index in 0..unsafe { lance_dataset_config_count(updated_config) } {
+        let key = unsafe { lance_dataset_config_key_at(updated_config, index as usize) };
+        let value = unsafe { lance_dataset_config_value_at(updated_config, index as usize) };
+        updated_pairs.insert(
+            unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned(),
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    unsafe { lance_dataset_config_close(updated_config) };
+    assert_eq!(updated_pairs.get("keep").unwrap(), "new");
+    assert!(!updated_pairs.contains_key("drop"), "{updated_pairs:?}");
+    assert_eq!(updated_pairs.get("added").unwrap(), "yes");
+    let table_json_ptr = unsafe { lance_dataset_metadata_json(updated) };
+    assert!(!table_json_ptr.is_null());
+    let table_json = unsafe { CStr::from_ptr(table_json_ptr) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    unsafe { lance_free_string(table_json_ptr as *mut c_char) };
+    assert!(table_json.contains("table-key"), "{table_json}");
+    assert!(table_json.contains("table-value"), "{table_json}");
+    let mut updated_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_schema_clone(updated, &mut updated_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let updated_arrow = native_schema_arrow(updated_schema);
+    assert_eq!(
+        updated_arrow
+            .metadata()
+            .get("schema-key")
+            .map(String::as_str),
+        Some("")
+    );
+    let val_field = updated_arrow
+        .fields()
+        .iter()
+        .find(|field| field.name() == "val")
+        .expect("val field");
+    assert_eq!(
+        val_field.metadata().get("field-key").map(String::as_str),
+        Some("field-value")
+    );
+    assert!(!val_field.metadata().contains_key("field-old"));
+    unsafe {
+        lance_schema_close(updated_schema);
+        lance_dataset_close(updated);
+        lance_operation_close(update_config);
+        lance_transaction_close(update_transaction);
+        lance_update_map_close(config_updates);
+        lance_update_map_close(table_updates);
+        lance_update_map_close(schema_updates);
+        lance_update_map_close(field_updates_map);
+    }
+
+    // An overwrite fragment carrying a deletion file is rejected natively.
+    let mut deleted = 0u64;
+    let delete_predicate = c_str("id = 2");
+    let deletable = open_dataset_for_test(&source_uri);
+    assert_eq!(
+        unsafe { lance_dataset_delete(deletable, delete_predicate.as_ptr(), &mut deleted) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(deleted, 1);
+    let deleted_fragment_ids = native_typed_fragment_ids(deletable);
+    assert_eq!(deleted_fragment_ids.len(), 3);
+    let mut fragment_with_deletion = ptr::null_mut();
+    for fragment_id in deleted_fragment_ids {
+        let candidate = open_fragment_for_test(deletable, fragment_id);
+        let json = fragment_json_for_test(candidate);
+        if json.contains("deletion_file") {
+            fragment_with_deletion = candidate;
+            break;
+        }
+        unsafe { lance_fragment_close(candidate) };
+    }
+    assert!(
+        !fragment_with_deletion.is_null(),
+        "delete must attach a deletion file to one fragment"
+    );
+    let mut deletion_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_dataset_schema_clone(deletable, &mut deletion_schema) },
+        0
+    );
+    let deletion_fragments = [fragment_with_deletion as *const LanceFragment];
+    let deletion_uri = tmp
+        .path()
+        .join("typed_publication_deletion_rejected")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let deletion_overwrite = unsafe {
+        lance_operation_overwrite_new(
+            deletion_schema,
+            deletion_fragments.as_ptr(),
+            1,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(
+        !deletion_overwrite.is_null(),
+        "{}",
+        take_last_error_message()
+    );
+    let deletion_transaction = unsafe { lance_transaction_new(0, deletion_overwrite, ptr::null()) };
+    let deletion_uri_c = c_str(&deletion_uri);
+    let mut rejection_dataset: *mut LanceDataset = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                deletion_uri_c.as_ptr(),
+                deletion_transaction,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &mut rejection_dataset,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let rejection_message = take_last_error_message();
+    assert!(
+        rejection_message.contains("carries deletion file"),
+        "{rejection_message}"
+    );
+    assert!(rejection_dataset.is_null());
+
+    unsafe {
+        lance_fragment_close(fragment_with_deletion);
+        lance_schema_close(deletion_schema);
+        lance_operation_close(deletion_overwrite);
+        lance_transaction_close(deletion_transaction);
+        lance_dataset_close(deletable);
+        lance_fragment_close(staged_fragment);
+        lance_operation_close(staged_operation);
+        lance_transaction_close(staged_append);
+        lance_schema_close(merge_schema);
+        lance_operation_close(merge);
+        lance_transaction_close(merge_transaction);
+        lance_operation_close(tight_merge);
+        lance_transaction_close(tight_transaction);
+        for fragment in stale_fragments {
+            lance_fragment_close(fragment);
+        }
+        lance_dataset_close(stale_snapshot);
+        lance_operation_close(scratch_operation);
+        lance_transaction_close(scratch_transaction);
+        lance_operation_close(deep);
+        lance_transaction_close(deep_transaction);
+        lance_schema_close(source_schema);
+        lance_fragment_close(second_fragment);
+        lance_fragment_close(first_fragment);
+        lance_dataset_close(source);
+    }
+}

@@ -16,12 +16,14 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::Result;
+use lance_core::datatypes::Schema;
 use lance_table::format::{BasePath, Fragment, IndexMetadata, pb};
-use lance_table::transaction::{DataOverlayGroup, DataReplacementGroup};
+use lance_table::transaction::{DataOverlayGroup, DataReplacementGroup, UpdateMap};
 use prost::Message;
 
 use crate::base_paths::{
-    LanceBasePath, LanceBasePathView, OwnedBasePath, own_base_paths, parse_base_paths,
+    LanceBasePath, LanceBasePathList, LanceBasePathView, OwnedBasePath, own_base_paths,
+    parse_base_path_list, parse_base_paths,
 };
 use crate::data_file::LanceDataFile;
 use crate::data_overlay::LanceDataOverlayGroup;
@@ -29,8 +31,11 @@ use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::fragment::{LanceFragment, fragment_metadata_json};
 use crate::helpers;
+use crate::index::{LanceStringMap, parse_string_map};
 use crate::index_segment::{LanceIndexSegmentMetadata, metadata_handle};
 use crate::runtime::block_on;
+use crate::schema::{LanceSchema, schema_ref};
+use crate::update_map::{LanceUpdateMap, parse_update_map, update_map_at};
 
 /// Owned native transaction value.
 pub struct LanceTransaction {
@@ -40,8 +45,47 @@ pub struct LanceTransaction {
 /// Owned native operation value cloned from a transaction.
 pub struct LanceOperation {
     pub(crate) inner: Operation,
-    /// Owned C-string storage backing borrowed `UpdateBases` views.
+    /// Owned C-string storage backing borrowed `UpdateBases` and Overwrite
+    /// initial-base views.
     base_paths: Vec<Result<OwnedBasePath>>,
+    /// Owned C-string storage backing borrowed Overwrite config views. The
+    /// order matches native `HashMap` iteration for the operation's lifetime.
+    config_upserts: Vec<Result<(CString, CString)>>,
+    /// Owned C-string storage backing borrowed Clone string views.
+    clone_strings: CloneStrings,
+}
+
+/// Owned C-string conversions for the native Clone string fields.
+///
+/// Each conversion result is retained independently so that a field which
+/// cannot be represented as a C string only fails its own getter.
+#[derive(Default)]
+struct CloneStrings {
+    ref_name: Option<Result<CString>>,
+    ref_path: Option<Result<CString>>,
+    branch_name: Option<Result<CString>>,
+}
+
+impl CloneStrings {
+    fn from_native(operation: &Operation) -> Self {
+        match operation {
+            Operation::Clone {
+                ref_name,
+                ref_path,
+                branch_name,
+                ..
+            } => Self {
+                ref_name: ref_name
+                    .as_deref()
+                    .map(|value| owned_c_string(value, "Clone ref_name")),
+                ref_path: Some(owned_c_string(ref_path, "Clone ref_path")),
+                branch_name: branch_name
+                    .as_deref()
+                    .map(|value| owned_c_string(value, "Clone branch_name")),
+            },
+            _ => Self::default(),
+        }
+    }
 }
 
 impl LanceOperation {
@@ -49,9 +93,34 @@ impl LanceOperation {
     pub(crate) fn from_native(inner: Operation) -> Self {
         let base_paths = match &inner {
             Operation::UpdateBases { new_bases } => own_base_paths(new_bases),
+            Operation::Overwrite {
+                initial_bases: Some(bases),
+                ..
+            } => own_base_paths(bases),
             _ => Vec::new(),
         };
-        Self { inner, base_paths }
+        let config_upserts = match &inner {
+            Operation::Overwrite {
+                config_upsert_values: Some(values),
+                ..
+            } => values
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        owned_c_string(key, "Overwrite config key")?,
+                        owned_c_string(value, "Overwrite config value")?,
+                    ))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let clone_strings = CloneStrings::from_native(&inner);
+        Self {
+            inner,
+            base_paths,
+            config_upserts,
+            clone_strings,
+        }
     }
 }
 
@@ -1942,6 +2011,1302 @@ unsafe fn operation_update_bases_at_inner(
         .view();
     unsafe {
         ptr::write(out_base, view);
+    }
+    Ok(0)
+}
+
+// ─── Native Overwrite, Merge, Clone and UpdateConfig operations ─────────────
+
+/// Native parts of one Overwrite operation.
+struct OverwriteOperationParts<'a> {
+    fragments: &'a [Fragment],
+    schema: &'a Schema,
+    config_upsert_values: &'a Option<HashMap<String, String>>,
+    initial_bases: &'a Option<Vec<BasePath>>,
+}
+
+fn overwrite_operation_parts(operation: &LanceOperation) -> Result<OverwriteOperationParts<'_>> {
+    match &operation.inner {
+        Operation::Overwrite {
+            fragments,
+            schema,
+            config_upsert_values,
+            initial_bases,
+        } => Ok(OverwriteOperationParts {
+            fragments,
+            schema,
+            config_upsert_values,
+            initial_bases,
+        }),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "Overwrite inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+/// Native parts of one Merge operation.
+struct MergeOperationParts<'a> {
+    fragments: &'a [Fragment],
+    schema: &'a Schema,
+    preserves_nullability: bool,
+}
+
+fn merge_operation_parts(operation: &LanceOperation) -> Result<MergeOperationParts<'_>> {
+    match &operation.inner {
+        Operation::Merge {
+            fragments,
+            schema,
+            preserves_nullability,
+        } => Ok(MergeOperationParts {
+            fragments,
+            schema,
+            preserves_nullability: *preserves_nullability,
+        }),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "Merge inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+/// Native parts of one Project operation.
+fn project_operation_parts(operation: &LanceOperation) -> Result<(&Schema, bool)> {
+    match &operation.inner {
+        Operation::Project {
+            schema,
+            preserves_nullability,
+        } => Ok((schema, *preserves_nullability)),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "Project inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+/// Native parts of one Clone operation.
+struct CloneOperationParts<'a> {
+    is_shallow: bool,
+    ref_name: &'a Option<String>,
+    ref_version: u64,
+    ref_path: &'a String,
+    branch_name: &'a Option<String>,
+}
+
+fn clone_operation_parts(operation: &LanceOperation) -> Result<CloneOperationParts<'_>> {
+    match &operation.inner {
+        Operation::Clone {
+            is_shallow,
+            ref_name,
+            ref_version,
+            ref_path,
+            branch_name,
+        } => Ok(CloneOperationParts {
+            is_shallow: *is_shallow,
+            ref_name,
+            ref_version: *ref_version,
+            ref_path,
+            branch_name,
+        }),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "Clone inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+/// Native parts of one UpdateConfig operation.
+struct UpdateConfigOperationParts<'a> {
+    config_updates: &'a Option<UpdateMap>,
+    table_metadata_updates: &'a Option<UpdateMap>,
+    schema_metadata_updates: &'a Option<UpdateMap>,
+    field_metadata_updates: &'a HashMap<i32, UpdateMap>,
+}
+
+fn update_config_operation_parts(
+    operation: &LanceOperation,
+) -> Result<UpdateConfigOperationParts<'_>> {
+    match &operation.inner {
+        Operation::UpdateConfig {
+            config_updates,
+            table_metadata_updates,
+            schema_metadata_updates,
+            field_metadata_updates,
+        } => Ok(UpdateConfigOperationParts {
+            config_updates,
+            table_metadata_updates,
+            schema_metadata_updates,
+            field_metadata_updates,
+        }),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "UpdateConfig inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+/// Construct an owned native Overwrite operation from a native schema and
+/// fragment handles.
+///
+/// The schema is cloned, so the caller may close `schema` immediately. Every
+/// fragment handle is borrowed and its complete native metadata is copied;
+/// NULL arrays are accepted only with a zero count. `config_upsert_values ==
+/// NULL` maps to native `None`; a non-NULL map with `count == 0` maps to
+/// native `Some(empty map)`. `initial_bases == NULL` maps to native `None`; a
+/// non-NULL list with `count == 0` maps to native `Some(empty list)`.
+///
+/// Native commit code assigns fresh fragment IDs to the copied fragments,
+/// rejects fragments that carry deletion files, and replaces the manifest's
+/// schema and config. This constructor adds no binding-side ID, deletion-file
+/// or schema policy. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_new(
+    schema: *const LanceSchema,
+    fragments: *const *const LanceFragment,
+    fragment_count: usize,
+    config_upsert_values: *const LanceStringMap,
+    initial_bases: *const LanceBasePathList,
+) -> *mut LanceOperation {
+    ffi_try!(
+        unsafe {
+            operation_overwrite_new_inner(
+                schema,
+                fragments,
+                fragment_count,
+                config_upsert_values,
+                initial_bases,
+            )
+        },
+        null
+    )
+}
+
+unsafe fn operation_overwrite_new_inner(
+    schema: *const LanceSchema,
+    fragments: *const *const LanceFragment,
+    fragment_count: usize,
+    config_upsert_values: *const LanceStringMap,
+    initial_bases: *const LanceBasePathList,
+) -> Result<*mut LanceOperation> {
+    let schema = unsafe { schema_ref(schema) }?.inner.clone();
+    let fragments = unsafe { clone_fragment_array(fragments, fragment_count) }?;
+    let config_upsert_values =
+        unsafe { parse_string_map(config_upsert_values, "config_upsert_values") }?;
+    let initial_bases = unsafe { parse_base_path_list(initial_bases) }?;
+    Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+        Operation::Overwrite {
+            fragments,
+            schema,
+            config_upsert_values,
+            initial_bases,
+        },
+    ))))
+}
+
+/// Construct an owned native Merge operation from a native schema and fragment
+/// handles.
+///
+/// The schema is cloned, so the caller may close `schema` immediately. Every
+/// fragment handle is borrowed and its complete native metadata is copied;
+/// NULL arrays are accepted only with a zero count. `preserves_nullability` is
+/// stored unchanged as the caller's explicit assertion that the merge makes no
+/// nullability-affecting schema change. Native commit code owns schema-change
+/// validation and concurrent-append conflict handling. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_merge_new(
+    schema: *const LanceSchema,
+    fragments: *const *const LanceFragment,
+    fragment_count: usize,
+    preserves_nullability: bool,
+) -> *mut LanceOperation {
+    ffi_try!(
+        unsafe {
+            operation_merge_new_inner(schema, fragments, fragment_count, preserves_nullability)
+        },
+        null
+    )
+}
+
+unsafe fn operation_merge_new_inner(
+    schema: *const LanceSchema,
+    fragments: *const *const LanceFragment,
+    fragment_count: usize,
+    preserves_nullability: bool,
+) -> Result<*mut LanceOperation> {
+    let schema = unsafe { schema_ref(schema) }?.inner.clone();
+    let fragments = unsafe { clone_fragment_array(fragments, fragment_count) }?;
+    Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+        Operation::Merge {
+            fragments,
+            schema,
+            preserves_nullability,
+        },
+    ))))
+}
+
+/// Construct an owned native Clone operation.
+///
+/// `ref_name == NULL` maps to native `None`; a non-NULL pointer, including an
+/// empty string, maps to `Some(name)`. `ref_path` is required and may be empty.
+/// `branch_name` follows the same NULL/`Some` mapping as `ref_name`. Native
+/// commit code owns shallow-clone publication and deep-clone rejection; this
+/// constructor adds no binding-side policy. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_clone_new(
+    is_shallow: bool,
+    ref_name: *const c_char,
+    ref_version: u64,
+    ref_path: *const c_char,
+    branch_name: *const c_char,
+) -> *mut LanceOperation {
+    ffi_try!(
+        unsafe {
+            operation_clone_new_inner(is_shallow, ref_name, ref_version, ref_path, branch_name)
+        },
+        null
+    )
+}
+
+unsafe fn operation_clone_new_inner(
+    is_shallow: bool,
+    ref_name: *const c_char,
+    ref_version: u64,
+    ref_path: *const c_char,
+    branch_name: *const c_char,
+) -> Result<*mut LanceOperation> {
+    let ref_name = unsafe { helpers::parse_c_string(ref_name) }?.map(str::to_owned);
+    let ref_path = required_c_string(ref_path, "ref_path")?.to_string();
+    let branch_name = unsafe { helpers::parse_c_string(branch_name) }?.map(str::to_owned);
+    Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+        Operation::Clone {
+            is_shallow,
+            ref_name,
+            ref_version,
+            ref_path,
+            branch_name,
+        },
+    ))))
+}
+
+/// One field's metadata updates for `lance_operation_update_config_new`.
+///
+/// `updates` is borrowed and cloned into native `field_metadata_updates`.
+/// Duplicate field IDs follow native `HashMap` last-write-wins semantics where
+/// the last complete map replaces earlier maps.
+#[repr(C)]
+pub struct LanceFieldMetadataUpdateMap {
+    pub field_id: i32,
+    pub updates: *const LanceUpdateMap,
+}
+
+/// Borrowed UpdateConfig operation inputs.
+///
+/// Each `LanceUpdateMap` pointer is optional: NULL maps to native `None` and a
+/// non-NULL handle is cloned, including an explicitly empty map. The field
+/// metadata array may be NULL only with a zero count.
+#[repr(C)]
+pub struct LanceUpdateConfigOperationOptions {
+    pub config_updates: *const LanceUpdateMap,
+    pub table_metadata_updates: *const LanceUpdateMap,
+    pub schema_metadata_updates: *const LanceUpdateMap,
+    pub field_metadata_updates: *const LanceFieldMetadataUpdateMap,
+    pub field_metadata_update_count: usize,
+}
+
+/// Construct an owned native UpdateConfig operation.
+///
+/// The three metadata maps and every per-field map are cloned, so all input
+/// handles may be closed immediately. Native commit code applies replacement
+/// and incremental semantics, including None-entry handling within each map.
+/// Duplicate field IDs keep the last complete map. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_config_new(
+    options: *const LanceUpdateConfigOperationOptions,
+) -> *mut LanceOperation {
+    ffi_try!(unsafe { operation_update_config_new_inner(options) }, null)
+}
+
+unsafe fn operation_update_config_new_inner(
+    options: *const LanceUpdateConfigOperationOptions,
+) -> Result<*mut LanceOperation> {
+    if options.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "options must not be NULL".into(),
+        ));
+    }
+    let options = unsafe { &*options };
+    let config_updates = unsafe { parse_update_map(options.config_updates) }?;
+    let table_metadata_updates = unsafe { parse_update_map(options.table_metadata_updates) }?;
+    let schema_metadata_updates = unsafe { parse_update_map(options.schema_metadata_updates) }?;
+
+    let field_count = options.field_metadata_update_count;
+    if options.field_metadata_updates.is_null() && field_count > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "field_metadata_updates must not be NULL when field_metadata_update_count = {field_count}"
+            )
+            .into(),
+        ));
+    }
+    if field_count > isize::MAX as usize / std::mem::size_of::<LanceFieldMetadataUpdateMap>() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "field_metadata_update_count {field_count} exceeds the maximum addressable field metadata length"
+            )
+            .into(),
+        ));
+    }
+    let mut field_metadata_updates = HashMap::with_capacity(field_count);
+    if field_count > 0 {
+        let entries =
+            unsafe { std::slice::from_raw_parts(options.field_metadata_updates, field_count) };
+        for (index, entry) in entries.iter().enumerate() {
+            if entry.updates.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    format!(
+                        "field_metadata_updates[{index}].updates must not be NULL when field_metadata_update_count = {field_count}"
+                    )
+                    .into(),
+                ));
+            }
+            let updates = update_map_at(entry.updates)?.inner.clone();
+            field_metadata_updates.insert(entry.field_id, updates);
+        }
+    }
+
+    Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+        Operation::UpdateConfig {
+            config_updates,
+            table_metadata_updates,
+            schema_metadata_updates,
+            field_metadata_updates,
+        },
+    ))))
+}
+
+/// Read the number of fragments in an Overwrite operation.
+///
+/// Returns 0 on success, -1 on error. Other variants return
+/// `LANCE_ERR_NOT_SUPPORTED`. The generic `lance_operation_fragment_count()`
+/// keeps its Append/Overwrite behavior.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_fragment_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_overwrite_fragment_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_overwrite_fragment_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = overwrite_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_count, parts.fragments.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Clone one Overwrite fragment as an independent detached handle.
+///
+/// The clone owns the complete native `Fragment` metadata and remains valid
+/// after the operation and every source dataset are closed. It supports
+/// metadata inspection and operation construction but not dataset-dependent
+/// reads. Missing indices are invalid arguments. Returns 0 on success, -1 on
+/// error, and leaves `out_fragment` unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_fragment_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_fragment: *mut *mut LanceFragment,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_overwrite_fragment_at_inner(operation, index, out_fragment) },
+        neg
+    )
+}
+
+unsafe fn operation_overwrite_fragment_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_fragment: *mut *mut LanceFragment,
+) -> Result<i32> {
+    if out_fragment.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_fragment must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = overwrite_operation_parts(operation)?;
+    let fragment = parts.fragments.get(index).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "overwrite fragment index {index} is out of range for {} fragments",
+                parts.fragments.len()
+            )
+            .into(),
+        )
+    })?;
+    let fragment = Box::into_raw(Box::new(LanceFragment::from_metadata(fragment.clone())));
+    unsafe {
+        ptr::write(out_fragment, fragment);
+    }
+    Ok(0)
+}
+
+/// Clone the in-memory schema of an Overwrite operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_schema_clone(
+    operation: *const LanceOperation,
+    out_schema: *mut *mut LanceSchema,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_overwrite_schema_clone_inner(operation, out_schema) },
+        neg
+    )
+}
+
+unsafe fn operation_overwrite_schema_clone_inner(
+    operation: *const LanceOperation,
+    out_schema: *mut *mut LanceSchema,
+) -> Result<i32> {
+    if out_schema.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_schema must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = overwrite_operation_parts(operation)?;
+    let schema = Box::new(LanceSchema {
+        inner: parts.schema.clone(),
+    });
+    unsafe {
+        ptr::write(out_schema, Box::into_raw(schema));
+    }
+    Ok(0)
+}
+
+/// Report whether an Overwrite operation carries native `Some` config upserts.
+///
+/// `Some(empty)` is distinct from `None`. Returns 0 on success, -1 on error;
+/// the output is written only on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_has_config_upsert_values(
+    operation: *const LanceOperation,
+    out_has_values: *mut bool,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_overwrite_has_config_upsert_values_inner(operation, out_has_values) },
+        neg
+    )
+}
+
+unsafe fn operation_overwrite_has_config_upsert_values_inner(
+    operation: *const LanceOperation,
+    out_has_values: *mut bool,
+) -> Result<i32> {
+    if out_has_values.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_has_values must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = overwrite_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_has_values, parts.config_upsert_values.is_some());
+    }
+    Ok(0)
+}
+
+/// Read the number of config upsert entries in an Overwrite operation.
+///
+/// Native `None` reports 0. Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_config_upsert_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_overwrite_config_upsert_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_overwrite_config_upsert_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = overwrite_operation_parts(operation)?;
+    let count = parts.config_upsert_values.as_ref().map_or(0, HashMap::len);
+    unsafe {
+        ptr::write(out_count, count as u64);
+    }
+    Ok(0)
+}
+
+fn overwrite_config_entry(operation: &LanceOperation, index: usize) -> Result<&(CString, CString)> {
+    let parts = overwrite_operation_parts(operation)?;
+    let count = parts.config_upsert_values.as_ref().map_or(0, HashMap::len);
+    if operation.config_upserts.len() != count {
+        return Err(lance_core::Error::internal(
+            "Overwrite config view storage is inconsistent with native metadata".to_string(),
+        ));
+    }
+    let entry = operation.config_upserts.get(index).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!("Overwrite config index {index} is out of range for {count} entries").into(),
+        )
+    })?;
+    entry
+        .as_ref()
+        .map_err(|error| lance_core::Error::internal(error.to_string()))
+}
+
+/// Read one borrowed config upsert key from an Overwrite operation.
+///
+/// The pointer remains valid until the operation handle is closed. Returns
+/// NULL on error. Keys are native UTF-8 strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_config_upsert_key_at(
+    operation: *const LanceOperation,
+    index: usize,
+) -> *const c_char {
+    ffi_try!(
+        unsafe { operation_overwrite_config_upsert_key_at_inner(operation, index) },
+        ptr::null()
+    )
+}
+
+unsafe fn operation_overwrite_config_upsert_key_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+) -> Result<*const c_char> {
+    let operation = operation_at(operation)?;
+    Ok(overwrite_config_entry(operation, index)?.0.as_ptr())
+}
+
+/// Read one borrowed config upsert value from an Overwrite operation.
+///
+/// The pointer remains valid until the operation handle is closed. Returns
+/// NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_config_upsert_value_at(
+    operation: *const LanceOperation,
+    index: usize,
+) -> *const c_char {
+    ffi_try!(
+        unsafe { operation_overwrite_config_upsert_value_at_inner(operation, index) },
+        ptr::null()
+    )
+}
+
+unsafe fn operation_overwrite_config_upsert_value_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+) -> Result<*const c_char> {
+    let operation = operation_at(operation)?;
+    Ok(overwrite_config_entry(operation, index)?.1.as_ptr())
+}
+
+/// Report whether an Overwrite operation carries native `Some` initial bases.
+///
+/// `Some(empty)` is distinct from `None`. Returns 0 on success, -1 on error;
+/// the output is written only on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_has_initial_bases(
+    operation: *const LanceOperation,
+    out_has_bases: *mut bool,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_overwrite_has_initial_bases_inner(operation, out_has_bases) },
+        neg
+    )
+}
+
+unsafe fn operation_overwrite_has_initial_bases_inner(
+    operation: *const LanceOperation,
+    out_has_bases: *mut bool,
+) -> Result<i32> {
+    if out_has_bases.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_has_bases must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = overwrite_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_has_bases, parts.initial_bases.is_some());
+    }
+    Ok(0)
+}
+
+/// Read the number of initial base paths in an Overwrite operation.
+///
+/// Native `None` reports 0. Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_initial_base_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_overwrite_initial_base_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_overwrite_initial_base_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = overwrite_operation_parts(operation)?;
+    let count = parts.initial_bases.as_ref().map_or(0, Vec::len);
+    unsafe {
+        ptr::write(out_count, count as u64);
+    }
+    Ok(0)
+}
+
+/// Read one borrowed initial base path from an Overwrite operation.
+///
+/// `path` and `name` point into the operation handle and remain valid until it
+/// is closed. `name == NULL` represents native `None`; an empty string is an
+/// explicit empty name. Returns 0 on success, -1 on error, and leaves
+/// `out_base` unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_overwrite_initial_base_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_base: *mut LanceBasePathView,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_overwrite_initial_base_at_inner(operation, index, out_base) },
+        neg
+    )
+}
+
+unsafe fn operation_overwrite_initial_base_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_base: *mut LanceBasePathView,
+) -> Result<i32> {
+    if out_base.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_base must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = overwrite_operation_parts(operation)?;
+    let count = parts.initial_bases.as_ref().map_or(0, Vec::len);
+    if operation.base_paths.len() != count {
+        return Err(lance_core::Error::internal(
+            "Overwrite initial base view storage is inconsistent with native metadata".to_string(),
+        ));
+    }
+    if index >= count {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("overwrite initial base index {index} is out of range for {count} base paths")
+                .into(),
+        ));
+    }
+    let view = operation.base_paths[index]
+        .as_ref()
+        .map_err(|error| lance_core::Error::internal(error.to_string()))?
+        .view();
+    unsafe {
+        ptr::write(out_base, view);
+    }
+    Ok(0)
+}
+
+/// Read the number of fragments in a Merge operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_merge_fragment_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_merge_fragment_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_merge_fragment_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = merge_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_count, parts.fragments.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Clone one Merge fragment as an independent detached handle.
+///
+/// The clone owns the complete native `Fragment` metadata. Missing indices are
+/// invalid arguments. Returns 0 on success, -1 on error, and leaves
+/// `out_fragment` unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_merge_fragment_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_fragment: *mut *mut LanceFragment,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_merge_fragment_at_inner(operation, index, out_fragment) },
+        neg
+    )
+}
+
+unsafe fn operation_merge_fragment_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_fragment: *mut *mut LanceFragment,
+) -> Result<i32> {
+    if out_fragment.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_fragment must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = merge_operation_parts(operation)?;
+    let fragment = parts.fragments.get(index).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "merge fragment index {index} is out of range for {} fragments",
+                parts.fragments.len()
+            )
+            .into(),
+        )
+    })?;
+    let fragment = Box::into_raw(Box::new(LanceFragment::from_metadata(fragment.clone())));
+    unsafe {
+        ptr::write(out_fragment, fragment);
+    }
+    Ok(0)
+}
+
+/// Clone the in-memory schema of a Merge operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_merge_schema_clone(
+    operation: *const LanceOperation,
+    out_schema: *mut *mut LanceSchema,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_merge_schema_clone_inner(operation, out_schema) },
+        neg
+    )
+}
+
+unsafe fn operation_merge_schema_clone_inner(
+    operation: *const LanceOperation,
+    out_schema: *mut *mut LanceSchema,
+) -> Result<i32> {
+    if out_schema.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_schema must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = merge_operation_parts(operation)?;
+    let schema = Box::new(LanceSchema {
+        inner: parts.schema.clone(),
+    });
+    unsafe {
+        ptr::write(out_schema, Box::into_raw(schema));
+    }
+    Ok(0)
+}
+
+/// Read the native `preserves_nullability` assertion from a Merge operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_merge_preserves_nullability(
+    operation: *const LanceOperation,
+    out_preserves_nullability: *mut bool,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            operation_merge_preserves_nullability_inner(operation, out_preserves_nullability)
+        },
+        neg
+    )
+}
+
+unsafe fn operation_merge_preserves_nullability_inner(
+    operation: *const LanceOperation,
+    out_preserves_nullability: *mut bool,
+) -> Result<i32> {
+    if out_preserves_nullability.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_preserves_nullability must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = merge_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_preserves_nullability, parts.preserves_nullability);
+    }
+    Ok(0)
+}
+
+/// Clone the in-memory schema of a Project operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_project_schema_clone(
+    operation: *const LanceOperation,
+    out_schema: *mut *mut LanceSchema,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_project_schema_clone_inner(operation, out_schema) },
+        neg
+    )
+}
+
+unsafe fn operation_project_schema_clone_inner(
+    operation: *const LanceOperation,
+    out_schema: *mut *mut LanceSchema,
+) -> Result<i32> {
+    if out_schema.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_schema must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let (schema, _) = project_operation_parts(operation)?;
+    let schema = Box::new(LanceSchema {
+        inner: schema.clone(),
+    });
+    unsafe {
+        ptr::write(out_schema, Box::into_raw(schema));
+    }
+    Ok(0)
+}
+
+/// Read the native `preserves_nullability` assertion from a Project operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_project_preserves_nullability(
+    operation: *const LanceOperation,
+    out_preserves_nullability: *mut bool,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            operation_project_preserves_nullability_inner(operation, out_preserves_nullability)
+        },
+        neg
+    )
+}
+
+unsafe fn operation_project_preserves_nullability_inner(
+    operation: *const LanceOperation,
+    out_preserves_nullability: *mut bool,
+) -> Result<i32> {
+    if out_preserves_nullability.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_preserves_nullability must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let (_, preserves_nullability) = project_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_preserves_nullability, preserves_nullability);
+    }
+    Ok(0)
+}
+
+/// Read the shallow-clone flag of a Clone operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_clone_is_shallow(
+    operation: *const LanceOperation,
+    out_is_shallow: *mut bool,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_clone_is_shallow_inner(operation, out_is_shallow) },
+        neg
+    )
+}
+
+unsafe fn operation_clone_is_shallow_inner(
+    operation: *const LanceOperation,
+    out_is_shallow: *mut bool,
+) -> Result<i32> {
+    if out_is_shallow.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_is_shallow must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = clone_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_is_shallow, parts.is_shallow);
+    }
+    Ok(0)
+}
+
+/// Read the optional native reference name of a Clone operation.
+///
+/// Both output pointers are required. On success `*out_present` reports
+/// native `Some`/`None`; `*out_value` receives a borrowed pointer into the
+/// operation when present and NULL otherwise. Returns 0 on success, -1 on
+/// error, and leaves both outputs unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_clone_ref_name(
+    operation: *const LanceOperation,
+    out_present: *mut bool,
+    out_value: *mut *const c_char,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_clone_ref_name_inner(operation, out_present, out_value) },
+        neg
+    )
+}
+
+unsafe fn operation_clone_ref_name_inner(
+    operation: *const LanceOperation,
+    out_present: *mut bool,
+    out_value: *mut *const c_char,
+) -> Result<i32> {
+    if out_present.is_null() || out_value.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_present and out_value must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = clone_operation_parts(operation)?;
+    if parts.ref_name.is_some() != operation.clone_strings.ref_name.is_some() {
+        return Err(lance_core::Error::internal(
+            "Clone ref_name view storage is inconsistent with native metadata".to_string(),
+        ));
+    }
+    let (present, value) = match &operation.clone_strings.ref_name {
+        Some(Ok(value)) => (true, value.as_ptr()),
+        Some(Err(error)) => {
+            return Err(lance_core::Error::internal(error.to_string()));
+        }
+        None => (false, ptr::null()),
+    };
+    unsafe {
+        ptr::write(out_present, present);
+        ptr::write(out_value, value);
+    }
+    Ok(0)
+}
+
+/// Read the native reference version of a Clone operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_clone_ref_version(
+    operation: *const LanceOperation,
+    out_version: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_clone_ref_version_inner(operation, out_version) },
+        neg
+    )
+}
+
+unsafe fn operation_clone_ref_version_inner(
+    operation: *const LanceOperation,
+    out_version: *mut u64,
+) -> Result<i32> {
+    if out_version.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_version must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = clone_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_version, parts.ref_version);
+    }
+    Ok(0)
+}
+
+/// Read the borrowed native reference path of a Clone operation.
+///
+/// The pointer remains valid until the operation handle is closed. Returns
+/// NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_clone_ref_path(
+    operation: *const LanceOperation,
+) -> *const c_char {
+    ffi_try!(
+        unsafe { operation_clone_ref_path_inner(operation) },
+        ptr::null()
+    )
+}
+
+unsafe fn operation_clone_ref_path_inner(
+    operation: *const LanceOperation,
+) -> Result<*const c_char> {
+    let operation = operation_at(operation)?;
+    let parts = clone_operation_parts(operation)?;
+    if !parts.ref_path.is_empty() && operation.clone_strings.ref_path.is_none() {
+        return Err(lance_core::Error::internal(
+            "Clone ref_path view storage is inconsistent with native metadata".to_string(),
+        ));
+    }
+    match &operation.clone_strings.ref_path {
+        Some(Ok(value)) => Ok(value.as_ptr()),
+        Some(Err(error)) => Err(lance_core::Error::internal(error.to_string())),
+        None => Err(lance_core::Error::internal(
+            "Clone ref_path view storage is missing".to_string(),
+        )),
+    }
+}
+
+/// Read the optional native branch name of a Clone operation.
+///
+/// Both output pointers are required. On success `*out_present` reports
+/// native `Some`/`None`; `*out_value` receives a borrowed pointer into the
+/// operation when present and NULL otherwise. Returns 0 on success, -1 on
+/// error, and leaves both outputs unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_clone_branch_name(
+    operation: *const LanceOperation,
+    out_present: *mut bool,
+    out_value: *mut *const c_char,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_clone_branch_name_inner(operation, out_present, out_value) },
+        neg
+    )
+}
+
+unsafe fn operation_clone_branch_name_inner(
+    operation: *const LanceOperation,
+    out_present: *mut bool,
+    out_value: *mut *const c_char,
+) -> Result<i32> {
+    if out_present.is_null() || out_value.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_present and out_value must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = clone_operation_parts(operation)?;
+    if parts.branch_name.is_some() != operation.clone_strings.branch_name.is_some() {
+        return Err(lance_core::Error::internal(
+            "Clone branch_name view storage is inconsistent with native metadata".to_string(),
+        ));
+    }
+    let (present, value) = match &operation.clone_strings.branch_name {
+        Some(Ok(value)) => (true, value.as_ptr()),
+        Some(Err(error)) => {
+            return Err(lance_core::Error::internal(error.to_string()));
+        }
+        None => (false, ptr::null()),
+    };
+    unsafe {
+        ptr::write(out_present, present);
+        ptr::write(out_value, value);
+    }
+    Ok(0)
+}
+
+enum UpdateConfigMapField {
+    Config,
+    TableMetadata,
+    SchemaMetadata,
+}
+
+unsafe fn update_config_map_getter_inner(
+    operation: *const LanceOperation,
+    out_map: *mut *mut LanceUpdateMap,
+    field: UpdateConfigMapField,
+) -> Result<i32> {
+    if out_map.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_map must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = update_config_operation_parts(operation)?;
+    let updates = match field {
+        UpdateConfigMapField::Config => parts.config_updates,
+        UpdateConfigMapField::TableMetadata => parts.table_metadata_updates,
+        UpdateConfigMapField::SchemaMetadata => parts.schema_metadata_updates,
+    };
+    let map = updates
+        .as_ref()
+        .map(|updates| Box::into_raw(Box::new(LanceUpdateMap::from_native(updates.clone()))));
+    unsafe {
+        ptr::write(out_map, map.unwrap_or(ptr::null_mut()));
+    }
+    Ok(0)
+}
+
+/// Clone the optional native config updates map from an UpdateConfig operation.
+///
+/// On success `*out_map` receives either an independently owned map handle or
+/// NULL for native `None`. An owned handle may wrap an explicitly empty map.
+/// Returns 0 on success, -1 on error, and leaves the output unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_config_config_updates(
+    operation: *const LanceOperation,
+    out_map: *mut *mut LanceUpdateMap,
+) -> i32 {
+    ffi_try!(
+        unsafe { update_config_map_getter_inner(operation, out_map, UpdateConfigMapField::Config) },
+        neg
+    )
+}
+
+/// Clone the optional native table metadata updates map from an UpdateConfig
+/// operation. `NULL` represents native `None`. Returns 0 on success, -1 on
+/// error, and leaves the output unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_config_table_metadata_updates(
+    operation: *const LanceOperation,
+    out_map: *mut *mut LanceUpdateMap,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            update_config_map_getter_inner(operation, out_map, UpdateConfigMapField::TableMetadata)
+        },
+        neg
+    )
+}
+
+/// Clone the optional native schema metadata updates map from an UpdateConfig
+/// operation. `NULL` represents native `None`. Returns 0 on success, -1 on
+/// error, and leaves the output unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_config_schema_metadata_updates(
+    operation: *const LanceOperation,
+    out_map: *mut *mut LanceUpdateMap,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            update_config_map_getter_inner(operation, out_map, UpdateConfigMapField::SchemaMetadata)
+        },
+        neg
+    )
+}
+
+/// Read the number of per-field metadata update maps.
+///
+/// The count follows native `HashMap` contents; iteration order is unspecified
+/// but stable for one operation handle. Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_config_field_metadata_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_update_config_field_metadata_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_update_config_field_metadata_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = update_config_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_count, parts.field_metadata_updates.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Clone one per-field metadata update map.
+///
+/// On success both outputs are written: the native field ID and an
+/// independently owned map handle. Native `HashMap` iteration order is
+/// unspecified but stable for one operation handle. Returns 0 on success, -1 on
+/// error, and leaves both outputs unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_config_field_metadata_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_field_id: *mut i32,
+    out_map: *mut *mut LanceUpdateMap,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            operation_update_config_field_metadata_at_inner(operation, index, out_field_id, out_map)
+        },
+        neg
+    )
+}
+
+unsafe fn operation_update_config_field_metadata_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_field_id: *mut i32,
+    out_map: *mut *mut LanceUpdateMap,
+) -> Result<i32> {
+    if out_field_id.is_null() || out_map.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_field_id and out_map must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let parts = update_config_operation_parts(operation)?;
+    let count = parts.field_metadata_updates.len();
+    let (field_id, updates) = parts
+        .field_metadata_updates
+        .iter()
+        .nth(index)
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source(
+                format!(
+                    "field metadata update index {index} is out of range for {count} field IDs"
+                )
+                .into(),
+            )
+        })?;
+    let map = Box::into_raw(Box::new(LanceUpdateMap::from_native(updates.clone())));
+    unsafe {
+        ptr::write(out_field_id, *field_id);
+        ptr::write(out_map, map);
     }
     Ok(0)
 }
