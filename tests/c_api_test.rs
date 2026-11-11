@@ -44870,7 +44870,7 @@ fn test_memwal_string_sharding_and_schema_factory() {
     assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
 
     // Shared Arrow -> native schema factory. `name` gets a fresh native id.
-    let arrow_schema = FFI_ArrowSchema::try_from(mw_schema()).unwrap();
+    let arrow_schema = FFI_ArrowSchema::try_from(mw_schema().as_ref()).unwrap();
     let mut native_schema = ptr::null_mut();
     assert_eq!(
         unsafe { lance_schema_from_arrow(&arrow_schema, &mut native_schema) },

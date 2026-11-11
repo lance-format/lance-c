@@ -3015,7 +3015,8 @@ LanceSchema* lance_schema_clone(const LanceSchema* schema);
  *
  * The input schema is borrowed and not consumed. Native conversion preserves
  * `lance:field_id` metadata when present and assigns fresh consecutive field
- * IDs to fields without one, following native `Schema::try_from`. The resulting
+ * IDs to fields without one, starting at one greater than the highest existing
+ * field ID (0 when none), following native `Schema::try_from`. The resulting
  * schema is validated for duplicate and unknown field IDs, encodings, and
  * primary-key metadata.
  *
