@@ -44265,7 +44265,7 @@ fn test_memwal_null_and_error_edges() {
 
 fn mw_append_batch(uri: &str, batch: RecordBatch) {
     let schema = batch.schema();
-    lance::runtime::block_on(async {
+    lance_c::runtime::block_on(async {
         Dataset::write(
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
             uri,
@@ -44312,7 +44312,7 @@ fn mw_create_indexed_vector_dataset() -> (tempfile::TempDir, String) {
         &vectors,
     );
     let write_schema = batch.schema();
-    lance::runtime::block_on(async {
+    lance_c::runtime::block_on(async {
         Dataset::write(
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], write_schema),
             &uri,
@@ -44472,13 +44472,12 @@ fn test_memwal_vector_search_indexed() {
         "{}",
         take_last_error_message()
     );
-    let mut scan_plan = ptr::null_mut();
+    let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
     assert_eq!(
-        unsafe { lance_mem_wal_plan_to_arrow_stream(plan, &mut scan_plan) },
+        unsafe { lance_mem_wal_plan_to_arrow_stream(plan, stream.as_mut_ptr()) },
         0
     );
-    let stream = unsafe { std::ptr::read(scan_plan) };
-    let (batches, _) = c_stream_batches(stream);
+    let (batches, _) = c_stream_batches(unsafe { stream.assume_init() });
     let ids = mw_int32_values(&batches, "id");
     assert_eq!(ids.len(), 5);
     assert!(ids.iter().all(|id| (0..400).contains(id)));
