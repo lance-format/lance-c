@@ -14106,6 +14106,41 @@ fn test_vector_segment_options_preserve_dot_pq_fragment_scope_guard() {
         assert!(!centroids.is_released());
         assert!(!codebook.is_released());
 
+        // Definition-only builds do not assign PQ codes to fragment rows.
+        options.has_train = true;
+        options.train = false;
+        let builder = unsafe {
+            lance_index_segment_builder_new_vector_with_options(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &options,
+                &scope,
+            )
+        };
+        assert!(
+            !builder.is_null(),
+            "definition-only {index_type:?}: {}",
+            take_last_error_message()
+        );
+        let mut bytes = ptr::null_mut();
+        let mut len = 0;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len)
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert!(!bytes.is_null());
+        assert!(len > 0);
+        unsafe {
+            lance_free_bytes(bytes);
+            lance_index_segment_builder_free(builder);
+        }
+        options.has_train = false;
+
         // Implicit and explicit full coverage use native L2 PQ assignment.
         for fragment_count in [0, fragment_ids.len()] {
             scope.fragment_ids = if fragment_count == 0 {
