@@ -24988,23 +24988,23 @@ fn test_native_data_file_and_data_replacement_metadata() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 
     let mut sentinel_major = 17;
-    let mut sentinel_minor = 19;
+    let sentinel_minor = 19;
     assert_eq!(
         unsafe { lance_data_file_file_version(file, &mut sentinel_major, ptr::null_mut()) },
         -1
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!((sentinel_major, sentinel_minor), (17, 19));
-    sentinel_minor = 19;
+    let mut second_minor = 19;
     assert_eq!(
-        unsafe { lance_data_file_file_version(file, ptr::null_mut(), &mut sentinel_minor) },
+        unsafe { lance_data_file_file_version(file, ptr::null_mut(), &mut second_minor) },
         -1
     );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    assert_eq!(sentinel_minor, 19);
+    assert_eq!(second_minor, 19);
 
     let mut sentinel_present = false;
-    let mut sentinel_size = 23;
+    let sentinel_size = 23;
     assert_eq!(
         unsafe { lance_data_file_file_size(file, &mut sentinel_present, ptr::null_mut()) },
         -1
@@ -25014,7 +25014,7 @@ fn test_native_data_file_and_data_replacement_metadata() {
     assert_eq!(sentinel_size, 23);
 
     let mut sentinel_base_present = false;
-    let mut sentinel_base_id = 29;
+    let sentinel_base_id = 29;
     assert_eq!(
         unsafe { lance_data_file_base_id(file, &mut sentinel_base_present, ptr::null_mut()) },
         -1
