@@ -324,9 +324,7 @@ unsafe fn resolved_compaction_options(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_compaction_options_v2_new() -> *mut LanceCompactionOptionsV2 {
     ffi_try!(
-        (|| -> Result<*mut LanceCompactionOptionsV2> {
-            Ok(options_box(CompactionOptions::default()))
-        })(),
+        Ok::<_, lance_core::Error>(options_box(CompactionOptions::default())),
         null
     )
 }

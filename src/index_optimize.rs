@@ -6,10 +6,8 @@
 
 use std::ffi::c_char;
 use std::ptr;
-use std::slice;
 use std::sync::Arc;
 
-use lance::Dataset;
 use lance::index::DatasetIndexExt;
 use lance::index::optimize::{
     IndexSegmentResult, OptimizeIndexMerge, OptimizeIndexTask, OptimizeIndicesPlan,
@@ -17,7 +15,6 @@ use lance::index::optimize::{
 };
 use lance_core::Result;
 use lance_index::optimize::OptimizeOptions;
-use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 use crate::dataset::LanceDataset;
@@ -123,9 +120,7 @@ fn clone_options(options: *const LanceOptimizeIndicesOptions) -> Result<Optimize
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_optimize_indices_options_new() -> *mut LanceOptimizeIndicesOptions {
     ffi_try!(
-        (|| -> Result<*mut LanceOptimizeIndicesOptions> {
-            Ok(options_box(OptimizeOptions::default()))
-        })(),
+        Ok::<_, lance_core::Error>(options_box(OptimizeOptions::default())),
         null
     )
 }
