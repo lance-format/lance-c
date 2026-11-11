@@ -15,6 +15,7 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance_core::Result;
 
+use crate::commit_lock::{LanceCommitLock, commit_handler_from_ffi, storage_accessor_from_ffi};
 use crate::data_file::LanceDataFile;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::file_session::LanceObjectStoreIoStats;
@@ -217,6 +218,84 @@ unsafe fn open_dataset_with_options_inner(
         Some(unsafe { &*session })
     };
     unsafe { open_dataset_inner(uri, ptr::null(), version, session, accessor) }
+}
+
+/// Open a dataset through a foreign commit lock and optional dynamic storage
+/// options.
+///
+/// The dataset retains the native handler and accessor owners. Closing
+/// `commit_lock` or `storage_accessor` after this call does not invalidate the
+/// returned dataset or its later commits. A NULL lock selects the native
+/// default handler. `session` is optional.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_open_with_commit_lock(
+    uri: *const c_char,
+    storage_accessor: *const crate::storage_options::LanceStorageOptionsAccessor,
+    version: u64,
+    session: *const LanceSession,
+    commit_lock: *const LanceCommitLock,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            open_dataset_with_commit_lock_inner(
+                uri,
+                storage_accessor,
+                version,
+                session,
+                commit_lock,
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn open_dataset_with_commit_lock_inner(
+    uri: *const c_char,
+    storage_accessor: *const crate::storage_options::LanceStorageOptionsAccessor,
+    version: u64,
+    session: *const LanceSession,
+    commit_lock: *const LanceCommitLock,
+    out_dataset: *mut *mut LanceDataset,
+) -> Result<i32> {
+    if out_dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_dataset must not be NULL".into(),
+        ));
+    }
+
+    let uri_str = unsafe { helpers::parse_c_string(uri)? }
+        .ok_or_else(|| lance_core::Error::invalid_input_source("uri must not be NULL".into()))?;
+
+    let storage_accessor = unsafe { storage_accessor_from_ffi(storage_accessor) };
+    let commit_handler = commit_handler_from_ffi(commit_lock);
+
+    let mut builder = DatasetBuilder::from_uri(uri_str);
+    if let Some(accessor) = storage_accessor {
+        builder = builder.with_storage_options_accessor(accessor);
+    }
+    if version != 0 {
+        builder = builder.with_version(version);
+    }
+    if !session.is_null() {
+        // SAFETY: a non-NULL session is caller-owned and valid for this call.
+        let session = unsafe { &*session };
+        builder = builder.with_session(session.inner.clone());
+    }
+    if let Some(handler) = commit_handler {
+        builder = builder.with_commit_handler(handler);
+    }
+
+    let dataset = block_on(builder.load())?;
+    let handle = LanceDataset {
+        inner: RwLock::new(Arc::new(dataset)),
+    };
+    // SAFETY: `out_dataset` is non-NULL and writable; the output is written
+    // only on success.
+    unsafe { *out_dataset = Box::into_raw(Box::new(handle)) };
+    Ok(0)
 }
 
 unsafe fn open_dataset_inner(
