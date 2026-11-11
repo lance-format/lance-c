@@ -85,7 +85,7 @@ class CrossSdkIndexMetadataAdapterTest {
   }
 
   @Test
-  void preservesVectorDetailsAsOpaqueAnyBytes() {
+  void preservesVectorDetailsAsOpaqueAnyBytes() throws Exception {
     byte[] details =
         Any.newBuilder()
             .setTypeUrl("type.googleapis.com/lance.index.pb.VectorIndexDetails")
