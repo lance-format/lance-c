@@ -19,7 +19,7 @@ use arrow_array::Array;
 use arrow_schema::Field;
 use lance::dataset::BlobFile;
 use lance::{
-    BlobDescriptor, BlobDescriptorArrayBuilder, BlobFieldOptions, BlobRange, blob_field,
+    BlobDescriptor, BlobDescriptorArrayBuilder, BlobFieldOptions, BlobRange,
     blob_field_with_options,
 };
 use lance_core::Result;

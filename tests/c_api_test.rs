@@ -29,7 +29,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::files::TrackedFilesOptions as NativeTrackedFilesOptions;
 use lance::dataset::refs::BranchContents;
@@ -35019,7 +35019,7 @@ fn test_dataset_read_blobs_all_selectors_and_native_identity() {
     let unique_indices = [7usize, 2, 9, 0];
     let unique_rows = unique_indices
         .iter()
-        .map(|index| index as u64)
+        .map(|index| *index as u64)
         .collect::<Vec<_>>();
     let (rc, stream) = c_read_blobs(
         dataset,
@@ -35494,13 +35494,13 @@ fn test_managed_blob_descriptor_append_reuse_reopen_and_base_validation() {
     assert_eq!(rc, 0, "{}", take_last_error_message());
     let mut arrow_array = FFI_ArrowArray::empty();
     let get_next = stream.get_next.unwrap();
+    let next_status = unsafe { get_next(&mut stream, &mut arrow_array) };
     assert_ne!(
-        get_next(&mut stream, &mut arrow_array),
-        0,
+        next_status, 0,
         "the missing managed payload must fail while consuming the stream"
     );
     let get_last_error = stream.get_last_error.unwrap();
-    let error = get_last_error(&mut stream);
+    let error = unsafe { get_last_error(&mut stream) };
     assert!(!error.is_null());
     let error = unsafe { CStr::from_ptr(error) }.to_string_lossy();
     assert!(
@@ -35511,7 +35511,7 @@ fn test_managed_blob_descriptor_append_reuse_reopen_and_base_validation() {
     );
     if stream.release.is_some() {
         let release = stream.release.unwrap();
-        release(&mut stream);
+        unsafe { release(&mut stream) };
     }
     unsafe { lance_dataset_close(dataset) };
 
