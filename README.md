@@ -593,6 +593,9 @@ target_link_libraries(myapp PRIVATE LanceC::lance_c)
 See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
 working example.
 
+See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
+for a reproducible native-14 C segment to Java-12 commit/query PoC.
+
 ### vcpkg
 
 ```bash
