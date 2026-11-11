@@ -43881,7 +43881,8 @@ fn test_memwal_writer_scan_mutation_and_durable_reopen() {
     assert!(!batches.is_empty());
     assert!(batches[0].column_by_name("_rowaddr").is_some());
     assert!(batches[0].column_by_name("_memtable_gen").is_some());
-    assert!(batches[0].column_by_name("id").is_none());
+    // Native projection keeps primary-key columns for deduplication.
+    assert!(batches[0].column_by_name("id").is_some());
     unsafe { lance_lsm_scanner_free(scanner) };
 
     let mut count = 0_u64;
@@ -44258,6 +44259,259 @@ fn test_memwal_null_and_error_edges() {
     assert!(!message.is_empty(), "native bucket error must be reported");
     unsafe {
         lance_dataset_close(ds2);
+        lance_dataset_close(ds);
+    }
+}
+
+fn mw_append_batch(uri: &str, batch: RecordBatch) {
+    let schema = batch.schema();
+    lance::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(lance::dataset::WriteParams {
+                mode: lance::dataset::WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+}
+
+fn mw_create_indexed_vector_dataset() -> (tempfile::TempDir, String) {
+    use lance::index::DatasetIndexExt;
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("mem_wal_vector_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = mw_schema();
+    let ids: Vec<i32> = (0..400).collect();
+    let names: Vec<String> = ids.iter().map(|id| format!("row-{id}")).collect();
+    let vectors: Vec<[f32; 4]> = ids
+        .iter()
+        .map(|id| {
+            let value = *id as f32;
+            [
+                (value * 0.37).sin(),
+                (value * 0.11).cos(),
+                (value * 0.07).sin(),
+                (value * 0.23).cos(),
+            ]
+        })
+        .collect();
+    let batch = mw_batch(
+        &ids,
+        &names.iter().map(|v| Some(v.as_str())).collect::<Vec<_>>(),
+        &vectors,
+    );
+    let write_schema = batch.schema();
+    lance::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], write_schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                lance_index::IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+                false,
+            )
+            .await
+            .unwrap();
+    });
+    (tmp, uri)
+}
+
+#[test]
+fn test_memwal_writer_delete_fencing_and_replay() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let shard = "00000000-0000-0000-0000-000000000000";
+
+    // A second writer for the same shard fences the first.
+    let first = mw_writer_open(ds, shard);
+    let second = mw_writer_open(ds, shard);
+    let batched = mw_batch(&[10], &[Some("j")], &[[0.0; 4]]);
+    let mut result = LanceShardWriteResult::default();
+    assert_eq!(
+        unsafe { lance_shard_writer_put(first, &mut batch_to_ffi_stream(batched), &mut result,) },
+        -1,
+        "a fenced writer must reject writes"
+    );
+    assert!(!take_last_error_message().is_empty());
+
+    // The current writer deletes by primary key, and the delete is durable.
+    let key = mw_batch(&[2], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    assert_eq!(
+        unsafe { lance_shard_writer_delete(second, &mut batch_to_ffi_stream(key), &mut result,) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_shard_writer_close(second) }, 0);
+    unsafe { lance_shard_writer_free(second) };
+
+    // Closing and reopening replays the durable WAL without duplicate rows.
+    let reopened = mw_writer_open(ds, shard);
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(reopened, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    let ids = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    assert_eq!(ids, vec![1, 3]);
+    unsafe {
+        lance_lsm_scanner_free(scanner);
+        lance_shard_writer_free(first);
+        lance_shard_writer_close(reopened);
+        lance_shard_writer_free(reopened);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_scanner_multi_fragment_and_multi_shard() {
+    let (_tmp, uri) = mw_create_dataset();
+    let extra = mw_batch(&[4, 5], &[Some("d"), Some("e")], &[[0.0; 4], [0.0; 4]]);
+    mw_append_batch(&uri, extra);
+
+    let ds = mw_open(&uri);
+    let mut details = ptr::null_mut();
+    assert_eq!(unsafe { lance_mem_wal_index_details(ds, &mut details) }, 0);
+    assert!(details.is_null());
+    assert_eq!(mw_initialize(ds, MW_SHARDING_BUCKET, Some("id"), 8), 0);
+
+    let shard_a = "00000000-0000-0000-0000-000000000000";
+    let shard_b = "00000000-0000-0000-0000-000000000001";
+    let writer_a = mw_writer_open(ds, shard_a);
+    let writer_b = mw_writer_open(ds, shard_b);
+    mw_put(writer_a, mw_batch(&[10], &[Some("x")], &[[0.0; 4]]));
+    mw_put(writer_b, mw_batch(&[11], &[Some("y")], &[[0.0; 4]]));
+
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(writer_a, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    let ids = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    // Two base fragments are visible; only shard A's live row is attached.
+    assert!(ids.contains(&1) && ids.contains(&5) && ids.contains(&10));
+    assert!(!ids.contains(&11));
+    unsafe {
+        lance_lsm_scanner_free(scanner);
+        lance_shard_writer_close(writer_a);
+        lance_shard_writer_free(writer_a);
+        lance_shard_writer_close(writer_b);
+        lance_shard_writer_free(writer_b);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_vector_search_indexed() {
+    use std::collections::HashSet;
+
+    let (_tmp, uri) = mw_create_indexed_vector_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_vector_search_planner_new(
+                ds,
+                ptr::null(),
+                0,
+                c_str("vector").as_ptr(),
+                0,
+                ptr::null(),
+                0,
+                MW_DISTANCE_L2,
+                ptr::null(),
+                &mut planner,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let query = [0.0_f32, 1.0, 0.0, 1.0];
+    let mut plan = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_vector_search_planner_plan(
+                planner,
+                query.as_ptr(),
+                query.len(),
+                5,
+                2,
+                0,
+                ptr::null(),
+                0,
+                0,
+                1.0,
+                &mut plan,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut scan_plan = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_to_arrow_stream(plan, &mut scan_plan) },
+        0
+    );
+    let stream = unsafe { std::ptr::read(scan_plan) };
+    let (batches, _) = c_stream_batches(stream);
+    let ids = mw_int32_values(&batches, "id");
+    assert_eq!(ids.len(), 5);
+    assert!(ids.iter().all(|id| (0..400).contains(id)));
+
+    // Independent flat L2 oracle: returned neighbors stay within the exact
+    // top-20 set; randomized PQ ordering is not compared to exact top-k.
+    let mut exact: Vec<(i32, f32)> = (0..400)
+        .map(|id| {
+            let value = id as f32;
+            let candidate = [
+                (value * 0.37).sin(),
+                (value * 0.11).cos(),
+                (value * 0.07).sin(),
+                (value * 0.23).cos(),
+            ];
+            let distance: f32 = candidate
+                .iter()
+                .zip(query.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            (id, distance)
+        })
+        .collect();
+    exact.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let top20: HashSet<i32> = exact.iter().take(20).map(|(id, _)| *id).collect();
+    assert!(
+        ids.iter().all(|id| top20.contains(id)),
+        "{ids:?} not in top20"
+    );
+
+    unsafe {
+        lance_mem_wal_plan_free(plan);
+        lance_lsm_vector_search_planner_free(planner);
         lance_dataset_close(ds);
     }
 }
