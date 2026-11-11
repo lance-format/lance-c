@@ -25,6 +25,8 @@ async-trait = "0.1"
 bytes = "1"
 # Keep every Lance crate on the upstream v14.0.2 release commit.
 lance = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
+# Direct to reuse the native Binary/LargeBinary/BinaryView/FixedSizeBinary iterator.
+lance-arrow = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-core = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-encoding = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-file = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }

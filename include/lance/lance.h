@@ -7253,6 +7253,8 @@ void lance_storage_options_snapshot_close(
 typedef struct LanceFileSession LanceFileSession;
 typedef struct LanceFileReader LanceFileReader;
 typedef struct LanceFileWriter LanceFileWriter;
+typedef struct LancePackedBlobWriter LancePackedBlobWriter;
+typedef struct LanceDedicatedBlobWriter LanceDedicatedBlobWriter;
 typedef struct LanceFileMetadata LanceFileMetadata;
 typedef struct LanceFileStatistics LanceFileStatistics;
 typedef struct LancePathList LancePathList;
@@ -7391,6 +7393,178 @@ LanceFileWriter* lance_file_session_open_writer(
     const char* relative_path,
     const struct ArrowSchema* schema,
     const LanceFileWriterOptions* options
+);
+
+/**
+ * Open a native packed blob writer through an existing raw-file session.
+ *
+ * `data_file_path` is relative to the session base. Native validates the
+ * `.lance` suffix, derives the sidecar path, and rejects blob ID zero. The
+ * writer retains the session's native object store; closing the session,
+ * accessor, or provider does not invalidate the writer.
+ *
+ * Callers choose unique data-file names and blob IDs. No collision check or
+ * ID allocation is added by the binding. Returns NULL on error.
+ */
+LancePackedBlobWriter* lance_file_session_open_packed_blob_writer(
+    const LanceFileSession* session,
+    const char* data_file_path,
+    uint32_t blob_id
+);
+
+/**
+ * Open a native dedicated blob writer through an existing raw-file session.
+ *
+ * Path derivation and ownership match the packed constructor. Returns NULL on
+ * error.
+ */
+LanceDedicatedBlobWriter* lance_file_session_open_dedicated_blob_writer(
+    const LanceFileSession* session,
+    const char* data_file_path,
+    uint32_t blob_id
+);
+
+/**
+ * Return the native packed writer blob ID.
+ *
+ * Returns 0 and sets the thread-local error for a NULL, finished, or otherwise
+ * invalid handle. Blob ID zero is reserved, so 0 is never a success value.
+ */
+uint32_t lance_packed_blob_writer_blob_id(
+    const LancePackedBlobWriter* writer
+);
+
+/**
+ * Return a library-allocated copy of the native packed sidecar path.
+ *
+ * Release the returned string with lance_free_string(). Returns NULL on error.
+ */
+const char* lance_packed_blob_writer_path(
+    const LancePackedBlobWriter* writer
+);
+
+/**
+ * Append one payload to the packed sidecar.
+ *
+ * `data == NULL && len == 0` is a valid empty payload. A NULL data pointer
+ * with non-zero len is rejected before native invocation. Foreign bytes are
+ * copied by the native writer before this call returns.
+ *
+ * Native packed write failures can leave the writer without an active upload.
+ * The binding forwards that state without adding a second poison flag.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_packed_blob_writer_write_blob(
+    LancePackedBlobWriter* writer,
+    const uint8_t* data,
+    size_t len
+);
+
+/**
+ * Append one packed row per payload array element.
+ *
+ * Ownership of a non-NULL `payloads` transfers on every return path, including
+ * writer, schema, type, data, and native-write failures. The source slot is
+ * left in canonical released state. `schema` is borrowed and describes one
+ * Binary, LargeBinary, BinaryView, or FixedSizeBinary field.
+ *
+ * Arrow null rows become native Null descriptors. Empty non-null rows become
+ * zero-size Packed descriptors. Slices, row order, and repeated calls are
+ * preserved. A C ArrowArray represents one chunk; pass chunk arrays in order.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_packed_blob_writer_write_blobs(
+    LancePackedBlobWriter* writer,
+    struct ArrowArray* payloads,
+    const struct ArrowSchema* schema
+);
+
+/**
+ * Consume the native packed writer and export its prepared descriptor parts.
+ *
+ * Preflight requires an active writer, a non-NULL UTF-8 `field_name` (empty is
+ * allowed), and non-NULL output pointers. Preflight failure leaves the writer
+ * active. Once native finish starts, the writer is consumed on every return.
+ *
+ * On error both outputs are unchanged. On success `out_array` is an owned
+ * ArrowArray and `out_schema` is the complete native prepared field. Release
+ * each non-NULL output exactly once. The C writer allocation remains valid
+ * until close; later calls report its finished state.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_packed_blob_writer_finish_array(
+    LancePackedBlobWriter* writer,
+    const char* field_name,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Free a packed writer allocation. NULL is a no-op. Close never calls native
+ * finish; an unfinished writer is dropped with native cleanup semantics.
+ */
+void lance_packed_blob_writer_close(
+    LancePackedBlobWriter* writer
+);
+
+/**
+ * Return the native dedicated writer blob ID.
+ *
+ * Returns 0 and sets the thread-local error for a NULL, finished, or otherwise
+ * invalid handle.
+ */
+uint32_t lance_dedicated_blob_writer_blob_id(
+    const LanceDedicatedBlobWriter* writer
+);
+
+/**
+ * Return a library-allocated copy of the native dedicated sidecar path.
+ *
+ * Release the returned string with lance_free_string(). Returns NULL on error.
+ */
+const char* lance_dedicated_blob_writer_path(
+    const LanceDedicatedBlobWriter* writer
+);
+
+/**
+ * Append bytes to the dedicated sidecar.
+ *
+ * Repeated writes concatenate. `data == NULL && len == 0` is valid; a NULL
+ * data pointer with non-zero len is rejected before native invocation.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dedicated_blob_writer_write(
+    LanceDedicatedBlobWriter* writer,
+    const uint8_t* data,
+    size_t len
+);
+
+/**
+ * Consume the native dedicated writer and export its prepared descriptor parts.
+ *
+ * The success result has exactly one Dedicated row covering the concatenated
+ * payload, including size zero. Preflight, consumption, output ownership, and
+ * error handling match the packed finish.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dedicated_blob_writer_finish_array(
+    LanceDedicatedBlobWriter* writer,
+    const char* field_name,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Free a dedicated writer allocation. NULL is a no-op. Close never calls
+ * native finish.
+ */
+void lance_dedicated_blob_writer_close(
+    LanceDedicatedBlobWriter* writer
 );
 
 int32_t lance_file_session_contains(
