@@ -79,11 +79,38 @@ int main(int argc, char** argv) {
     writer.close();
     CHECK(writer.stats().put_count == 1);
 
-    // Planner constructors compile and borrow the dataset/snapshots.
+    // Planner execution keeps native dataset/snapshot owners alive.
     lance::LsmPointLookupPlanner point_planner(dataset, {}, std::nullopt);
+    auto key_source = lance::LsmScanner::from_snapshots(dataset, {});
+    key_source.project({"id"}).filter("id = 1").limit(1);
+    auto key = key_source.to_batch();
+    auto lookup = point_planner.plan_lookup(key, std::vector<std::string>{"name"});
+    CHECK(!lookup.explain().empty());
+    CHECK(static_cast<bool>(lookup.schema()));
+    CHECK(static_cast<bool>(lookup.dataset_schema()));
+    CHECK(lookup.to_table().batches.size() == 1);
+
     lance::LsmVectorSearchPlanner vector_planner(
         dataset, {}, "vector", std::nullopt, lance::MemWalDistanceType::L2,
         std::nullopt);
+    auto search = vector_planner.plan_search({0.1f, 0.2f, 0.3f, 0.4f}, 3, 20);
+    CHECK(!search.explain().empty());
+    auto reader = search.to_reader();
+    (void)reader;
+
+    // Atomic merge-insert with both halves of the compacted SSTable value.
+    LanceMergeInsertParams merge_params{};
+    merge_params.when_matched = LANCE_MERGE_WHEN_MATCHED_UPDATE_ALL;
+    auto merge_source = dataset.scan();
+    ArrowArrayStream merge_stream{};
+    merge_source.to_arrow_stream(&merge_stream);
+    std::vector<lance::CompactedSsTable> compacted_values;
+    compacted_values.push_back(lance::CompactedSsTable::from_uuid(
+        "00000000-0000-0000-0000-000000000000", 3));
+    auto merge = dataset.merge_insert_with_compaction(
+        {"id"}, &merge_stream, &merge_params, compacted_values);
+    CHECK(merge.num_updated_rows == 3);
+    CHECK(merge.num_inserted_rows == 0);
 
     // Snapshot values carry native generations and SSTable values.
     auto value = lance::ShardSnapshot::create(
