@@ -912,9 +912,7 @@ pub unsafe extern "C" fn lance_optimize_index_merge_execute(
     out_result: *mut *mut LanceIndexSegmentResult,
 ) -> i32 {
     ffi_try!(
-        unsafe {
-            merge_execute_inner(dataset, merge, task_results, task_result_count, out_result)
-        },
+        unsafe { merge_execute_inner(dataset, merge, task_results, task_result_count, out_result) },
         neg
     )
 }
