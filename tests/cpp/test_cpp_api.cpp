@@ -1226,8 +1226,8 @@ static void test_blob_planned_reads(const std::string& blob_uri) {
         (uint64_t{1} << 32) | 4,
         0,
     };
-    const size_t expected_sizes[] = {128, 128, 0, 0, 128, 8};
-    const bool expected_null[] = {false, false, false, true, false, false};
+    const size_t expected_sizes[] = {128, 128, 0, 0, 0, 8};
+    const bool expected_null[] = {false, false, false, true, true, false};
     for (size_t row = 0; row < 6; ++row) {
         ArrowArray array{};
         assert(stream->get_next(stream.get(), &array) == 0);
@@ -1242,7 +1242,8 @@ static void test_blob_planned_reads(const std::string& blob_uri) {
             assert(!cpp_array_value_is_null(data, 0));
             const auto* offsets =
                 static_cast<const int64_t*>(data->buffers[1]);
-            assert(static_cast<size_t>(offsets[1] - offsets[0]) ==
+            int64_t first = data->offset;
+            assert(static_cast<size_t>(offsets[first + 1] - offsets[first]) ==
                    expected_sizes[row]);
         }
         array.release(&array);

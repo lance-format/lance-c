@@ -86,7 +86,7 @@ impl BlobReadOrder {
 
 /// Optional scheduler I/O buffer and ordering controls for planned reads.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct LanceBlobReadOptions {
     /// Whether `io_buffer_size` is present. An explicit zero is forwarded to
     /// native and rejected there.
@@ -95,16 +95,6 @@ pub struct LanceBlobReadOptions {
     pub io_buffer_size: u64,
     /// `0` preserves requested order; `1` permits unordered completion.
     pub order: i32,
-}
-
-impl Default for LanceBlobReadOptions {
-    fn default() -> Self {
-        Self {
-            has_io_buffer_size: false,
-            io_buffer_size: 0,
-            order: 0,
-        }
-    }
 }
 
 /// One row-specific blob-range request.

@@ -1498,9 +1498,9 @@ static void test_blob_planned_reads(const char *blob_uri) {
         (((uint64_t)1) << 32) | 4,
         0,
     };
-    const size_t expected_sizes[] = {128, 128, 0, 0, 128, 8};
-    const size_t expected_seeds[] = {100, 0, 0, 0, 100, 0};
-    const int expected_null[] = {0, 0, 0, 1, 0, 0};
+    const size_t expected_sizes[] = {128, 128, 0, 0, 0, 8};
+    const size_t expected_seeds[] = {100, 0, 0, 0, 0, 0};
+    const int expected_null[] = {0, 0, 0, 1, 1, 0};
 
     LanceBlobReadOptions options = {0};
     options.order = LANCE_BLOB_READ_PRESERVE_ORDER;
@@ -1536,10 +1536,12 @@ static void test_blob_planned_reads(const char *blob_uri) {
             ASSERT(!array_value_is_null(data, 0),
                    "non-NULL blob must not be NULL");
             const int64_t *offsets = (const int64_t *)data->buffers[1];
-            size_t len = (size_t)(offsets[1] - offsets[0]);
+            int64_t first = data->offset;
+            size_t len =
+                (size_t)(offsets[first + 1] - offsets[first]);
             ASSERT(len == expected_sizes[row], "whole payload length");
             assert_blob_payload_with_seed(
-                (const uint8_t *)data->buffers[2] + offsets[0],
+                (const uint8_t *)data->buffers[2] + offsets[first],
                 len, 0, expected_seeds[row]);
         }
         array.release(&array);
@@ -1599,7 +1601,8 @@ static void test_blob_planned_reads(const char *blob_uri) {
             ASSERT(!array_value_is_null(data, 0),
                    "non-NULL range must not be NULL");
             const int64_t *offsets = (const int64_t *)data->buffers[1];
-            ASSERT((size_t)(offsets[1] - offsets[0]) ==
+            int64_t first = data->offset;
+            ASSERT((size_t)(offsets[first + 1] - offsets[first]) ==
                        expected_range_sizes[request],
                    "range payload length");
         }
