@@ -54,6 +54,9 @@ static int64_t integer_value(const ArrowArray *array, int64_t row,
     if (strcmp(format, "l") == 0) {
         return ((const int64_t *)array->buffers[1])[index];
     }
+    if (strcmp(format, "L") == 0) {
+        return (int64_t)((const uint64_t *)array->buffers[1])[index];
+    }
     fprintf(stderr, "unsupported integer format %s\n", format);
     exit(1);
 }
@@ -119,6 +122,10 @@ static void scan_dataset_value(const char *uri, const char *column,
     LanceScanner *scanner = lance_scanner_new(dataset, NULL, NULL);
     ASSERT(scanner != NULL, "create scanner");
     check_ok("lance_scanner_new");
+    if (strcmp(column, "_rowid") == 0) {
+        ASSERT(lance_scanner_with_row_id(scanner, true) == 0, "project row IDs");
+        check_ok("project row IDs");
+    }
     ArrowArrayStream stream = {0};
     ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
            "export scanner stream");
@@ -793,6 +800,13 @@ int main(int argc, char **argv) {
     test_update_columns(argv[3]);
     test_write_columns(argv[4]);
     test_delete_rows(argv[5]);
+    for (int i = 1; i < argc; ++i) {
+        int found = 0, is_null = 0;
+        int64_t row_id = -1;
+        scan_dataset_value(argv[i], "_rowid", 3, &found, &is_null, &row_id);
+        ASSERT(found && !is_null && row_id == 2,
+               "published mutation preserves the original stable row ID");
+    }
     printf("all C11 fragment mutation publication checks passed\n");
     return 0;
 }

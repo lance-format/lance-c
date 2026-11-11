@@ -463,6 +463,16 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
     assert_eq!(fragment_metadata(fragment), before_metadata);
     assert_eq!(fragment_read_version(fragment), 5);
     unsafe {
+        lance_fragment_close(fragment);
+        lance_dataset_close(independent);
+    }
+    drop(null_arrow_schema);
+    drop(udf_ffi_schema);
+    assert_eq!(schema_field_id(sql_schema, "sql_value"), sql_field_id);
+    assert!(schema_field_id(udf_schema_out, "udf_value") > 5);
+    assert_eq!(fragment_metadata(reader_fragment)["physical_rows"], 4);
+    assert_eq!(fragment_metadata(null_fragment)["physical_rows"], 4);
+    unsafe {
         lance_fragment_close(udf_fragment);
         lance_schema_close(udf_schema_out);
         lance_fragment_close(null_fragment);
@@ -471,8 +481,6 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
         lance_schema_close(reader_schema);
         lance_fragment_close(sql_fragment);
         lance_schema_close(sql_schema);
-        lance_fragment_close(fragment);
-        lance_dataset_close(independent);
     }
 }
 
@@ -869,7 +877,67 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
     let (_, message) = take_error();
     assert_eq!(message, native_v1_error.to_string());
 
+    for (name, values) in [
+        ("value", vec![]),
+        ("value", vec![Some(1)]),
+        ("wrong_column", vec![Some(1); 4]),
+    ] {
+        let input_schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, true)]));
+        let batches = if values.is_empty() {
+            vec![]
+        } else {
+            vec![
+                RecordBatch::try_new(
+                    input_schema.clone(),
+                    vec![Arc::new(Int32Array::from(values))],
+                )
+                .unwrap(),
+            ]
+        };
+        let native_error = lance_c::runtime::block_on(async {
+            let native = native_fragment(&oracle_uri, 0).await;
+            let schema = native.dataset().schema().project(&["value"]).unwrap();
+            native
+                .write_columns(
+                    futures::stream::iter(batches.clone().into_iter().map(Ok)),
+                    &schema,
+                )
+                .await
+                .unwrap_err()
+        });
+        let mut input = arrow_stream(input_schema, batches);
+        let mut output = unchanged_group;
+        assert_eq!(
+            unsafe {
+                lance_fragment_write_columns(fragment, value_schema, &mut input, &mut output)
+            },
+            -1
+        );
+        assert_eq!(output, unchanged_group);
+        take_stream_consumed(&input);
+        assert_eq!(take_error().1, native_error.to_string());
+    }
+
     let second = open_bound_fragment(&uri, 1);
+    let native_empty = lance_c::runtime::block_on(async {
+        native_fragment(&oracle_uri, 1)
+            .await
+            .extend_deletions([])
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    let mut empty_delete = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_fragment_delete_rows(second, ptr::null(), 0, &mut empty_delete) },
+        0
+    );
+    assert_eq!(
+        fragment_logical_rows(empty_delete),
+        lance_c::runtime::block_on(native_empty.count_rows(None)).unwrap() as u64
+    );
+    assert_eq!(fragment_logical_rows(empty_delete), 4);
+    unsafe { lance_fragment_close(empty_delete) };
     let native_delete = lance_c::runtime::block_on(async {
         native_fragment(&oracle_uri, 1)
             .await

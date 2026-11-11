@@ -48,6 +48,10 @@ int64_t integer_value(const ArrowArray& array, int64_t row,
     if (std::strcmp(format, "l") == 0) {
         return static_cast<const int64_t*>(array.buffers[1])[index];
     }
+    if (std::strcmp(format, "L") == 0) {
+        return static_cast<int64_t>(
+            static_cast<const uint64_t*>(array.buffers[1])[index]);
+    }
     throw lance::Error(LANCE_ERR_INVALID_ARGUMENT,
                        std::string("unsupported integer format ") + format);
 }
@@ -112,6 +116,7 @@ Value scan_dataset_value(const std::string& uri, const std::string& column,
                          int64_t wanted_id) {
     auto dataset = lance::Dataset::open(uri);
     auto scanner = dataset.scan();
+    if (column == "_rowid") scanner.with_row_id();
     ArrowArrayStream raw{};
     scanner.to_arrow_stream(&raw);
     lance::ArrowStream stream(raw);
@@ -554,6 +559,10 @@ int main(int argc, char** argv) {
         test_update_columns(argv[3]);
         test_write_columns(argv[4]);
         test_delete_rows(argv[5]);
+        for (int i = 1; i < argc; ++i) {
+            auto row_id = scan_dataset_value(argv[i], "_rowid", 3);
+            CHECK(row_id.found && !row_id.is_null && row_id.value == 2);
+        }
     } catch (const lance::Error& error) {
         std::fprintf(stderr, "lance::Error (%d): %s\n",
                      static_cast<int>(error.code), error.what());
