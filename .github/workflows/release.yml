@@ -173,9 +173,21 @@ jobs:
           retention-days: 14
 
   build-windows:
-    name: Build (x86_64-pc-windows-msvc)
-    runs-on: windows-2022
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            generator: Visual Studio 17 2022
+            architecture: x64
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            generator: Visual Studio 18 2026
+            architecture: ARM64
     env:
       RUST_BACKTRACE: "1"
     steps:
@@ -184,6 +196,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Assert native Windows ARM64 toolchain
+        if: matrix.architecture == 'ARM64'
+        shell: pwsh
+        run: pwsh -File .github/scripts/assert-windows-arm64-host.ps1
       - name: Record Windows runtime baseline
         shell: pwsh
         run: |
@@ -191,6 +207,7 @@ jobs:
             Select-Object Caption, Version, BuildNumber, OSArchitecture |
             Format-List
           rustc --version --verbose
+          cargo --version
           cmake --version
       - name: Install protoc
         shell: pwsh
@@ -207,7 +224,8 @@ jobs:
           & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
       - name: Configure
         run: >
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          cmake -S . -B build -G "${{ matrix.generator }}"
+          -A ${{ matrix.architecture }}
           -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release --parallel 4
@@ -217,7 +235,9 @@ jobs:
         run: >
           pwsh -File .github/scripts/verify-windows-staging.ps1
           -Prefix stage -SourceRoot .
-          -WorkDir "$env:RUNNER_TEMP\lance-c-windows-acceptance"
+          -WorkDir "$env:RUNNER_TEMP\lance-c-windows-${{ matrix.architecture }}-acceptance"
+          -Architecture ${{ matrix.architecture }}
+          -CMakeGenerator "${{ matrix.generator }}"
       - name: Resolve version
         id: ver
         shell: pwsh
@@ -235,7 +255,7 @@ jobs:
           XZ_OPT: -T0
         run: |
           VERSION=${{ steps.ver.outputs.version }}
-          TARGET=x86_64-pc-windows-msvc
+          TARGET=${{ matrix.target }}
           ARCHIVE="lance-c-v${VERSION}-${TARGET}.tar.xz"
           tar -C stage -cJf "${ARCHIVE}" .
           sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
@@ -244,7 +264,7 @@ jobs:
       - name: Upload as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: x86_64-pc-windows-msvc
+          name: ${{ matrix.target }}
           path: |
             ${{ steps.pack.outputs.archive }}
             ${{ steps.pack.outputs.archive }}.sha256

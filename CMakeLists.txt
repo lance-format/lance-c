@@ -171,6 +171,12 @@ endif()
 install(FILES LICENSE
     DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/lance-c)
 
+# Windows archives are distributed as standalone SDK bundles.
+if(WIN32)
+    install(FILES README.md
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/lance-c)
+endif()
+
 # Generate LanceCConfig.cmake from the template.
 configure_package_config_file(
     "${CMAKE_CURRENT_LIST_DIR}/cmake/LanceCConfig.cmake.in"

@@ -10,7 +10,9 @@
 param(
     [Parameter(Mandatory = $true)][string]$Prefix,
     [Parameter(Mandatory = $true)][string]$SourceRoot,
-    [Parameter(Mandatory = $true)][string]$WorkDir
+    [Parameter(Mandatory = $true)][string]$WorkDir,
+    [ValidateSet('x64', 'ARM64')][string]$Architecture = 'x64',
+    [string]$CMakeGenerator = 'Visual Studio 17 2022'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,14 +34,25 @@ $prefixPath = (Resolve-Path -LiteralPath $Prefix).Path
 $sourcePath = (Resolve-Path -LiteralPath $SourceRoot).Path
 New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
 $workPath = (Resolve-Path -LiteralPath $WorkDir).Path
+$expectedMachine = "machine ($Architecture)"
 
 $dll = Join-Path $prefixPath 'lib\lance_c.dll'
 $importLibrary = Join-Path $prefixPath 'lib\lance_c.dll.lib'
 $staticLibrary = Join-Path $prefixPath 'lib\lance_c.lib'
 $header = Join-Path $prefixPath 'include\lance\lance.h'
 $headerCpp = Join-Path $prefixPath 'include\lance\lance.hpp'
+$readme = Join-Path $prefixPath 'share\doc\lance-c\README.md'
+$license = Join-Path $prefixPath 'share\licenses\lance-c\LICENSE'
 
-foreach ($required in @($dll, $importLibrary, $staticLibrary, $header, $headerCpp)) {
+foreach ($required in @(
+    $dll,
+    $importLibrary,
+    $staticLibrary,
+    $header,
+    $headerCpp,
+    $readme,
+    $license
+)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "staged package is missing $required"
     }
@@ -48,19 +61,31 @@ foreach ($required in @($dll, $importLibrary, $staticLibrary, $header, $headerCp
     }
 }
 
+$msvcComponent = if ($Architecture -eq 'ARM64') {
+    'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+} else {
+    'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
+}
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
     throw "vswhere.exe not found at $vswhere"
 }
 $visualStudio = & $vswhere -latest -products * `
-    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+    -requires $msvcComponent `
     -property installationPath
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($visualStudio)) {
-    throw "no Visual Studio installation with the MSVC x64 toolset was found"
+    throw "no Visual Studio installation with MSVC component $msvcComponent was found"
+}
+$dumpbinRelativePaths = if ($Architecture -eq 'ARM64') {
+    @('bin\Hostarm64\arm64\dumpbin.exe', 'bin\Hostx64\arm64\dumpbin.exe')
+} else {
+    @('bin\Hostx64\x64\dumpbin.exe')
 }
 $dumpbinCandidates = Get-ChildItem -LiteralPath (Join-Path $visualStudio 'VC\Tools\MSVC') `
     -Directory | Sort-Object Name -Descending | ForEach-Object {
-        Join-Path $_.FullName 'bin\Hostx64\x64\dumpbin.exe'
+        foreach ($relativePath in $dumpbinRelativePaths) {
+            Join-Path $_.FullName $relativePath
+        }
     }
 $script:Dumpbin = $dumpbinCandidates |
     Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
@@ -69,14 +94,24 @@ if (-not $script:Dumpbin) {
     throw "dumpbin.exe not found under $visualStudio"
 }
 
+function Assert-PeImage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $headers = (Invoke-Dumpbin @('/headers', $Path)) -join "`n"
+    if ($headers -notmatch [regex]::Escape($expectedMachine)) {
+        throw "$Description is not $Architecture`n$headers"
+    }
+    if ($headers -notmatch 'magic # \(PE32\+\)') {
+        throw "$Description is not PE32+:`n$headers"
+    }
+}
+
+Write-Host "==> Verifying $Architecture package with $CMakeGenerator"
 Write-Host "==> Inspecting $dll with $script:Dumpbin"
-$headers = (Invoke-Dumpbin @('/headers', $dll)) -join "`n"
-if ($headers -notmatch 'machine \(x64\)') {
-    throw "staged DLL is not x64:`n$headers"
-}
-if ($headers -notmatch 'magic # \(PE32\+\)') {
-    throw "staged DLL is not PE32+:`n$headers"
-}
+Assert-PeImage -Path $dll -Description 'staged DLL'
 
 $headerText = ((Get-Content -LiteralPath $header) |
     Where-Object { $_ -notmatch '^\s*\*' }) -join "`n"
@@ -150,8 +185,8 @@ function Test-InstalledConsumer {
     $configureArguments = @(
         '-S', $consumerSource,
         '-B', $buildDir,
-        '-G', 'Visual Studio 17 2022',
-        '-A', 'x64',
+        '-G', $CMakeGenerator,
+        '-A', $Architecture,
         "-DCMAKE_PREFIX_PATH=$prefixPath",
         "-DLanceC_LINK=$Linkage",
         '-DCMAKE_BUILD_TYPE=Release'
@@ -172,6 +207,7 @@ function Test-InstalledConsumer {
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
         throw "acceptance executable was not built: $executable"
     }
+    Assert-PeImage -Path $executable -Description "$Linkage acceptance executable"
 
     $executableDependents = (Invoke-Dumpbin @('/dependents', $executable)) -join "`n"
     if ($Linkage -eq 'shared') {
