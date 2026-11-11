@@ -1017,7 +1017,7 @@ static void test_blob_native_read_slice(const std::string& blob_uri) {
     const size_t sizes[] = {20, 0, 16, 8, 1, 128};
     for (size_t i = 0; i < parts.size(); i++) {
         assert(parts[i].size() == sizes[i]);
-        assert_blob_payload(parts[i], ranges[i].offset);
+        assert_blob_payload(parts[i], ranges[i].offset, 100);
     }
     assert(packed.tell() == 5);
     assert(packed.read_ranges(std::vector<lance::BlobRange>{}).empty());
@@ -1029,7 +1029,7 @@ static void test_blob_native_read_slice(const std::string& blob_uri) {
     size_t bytes_read = packed.read_into(tail.data(), tail.size());
     assert(bytes_read == 8);
     std::vector<uint8_t> tail_bytes(tail.begin(), tail.begin() + 8);
-    assert_blob_payload(tail_bytes, 120);
+    assert_blob_payload(tail_bytes, 120, 100);
     assert(packed.tell() == 128);
     assert(packed.read_into(nullptr, 0) == 0);
 

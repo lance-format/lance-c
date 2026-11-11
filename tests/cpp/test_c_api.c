@@ -1170,11 +1170,11 @@ static void test_blob_native_read_slice(const char *blob_uri) {
     rc = lance_blob_file_read_ranges(
         packed, ranges, 6, destinations, destination_lens);
     ASSERT(rc == 0, "read_ranges failed");
-    assert_blob_payload(range0, 20, 100);
-    assert_blob_payload(range2, 16, 40);
-    assert_blob_payload(range3, 8, 100);
-    assert_blob_payload(range4, 1, 127);
-    assert_blob_payload(range5, 128, 0);
+    assert_blob_payload_seeded(range0, 20, 100, 100);
+    assert_blob_payload_seeded(range2, 16, 40, 100);
+    assert_blob_payload_seeded(range3, 8, 100, 100);
+    assert_blob_payload_seeded(range4, 1, 127, 100);
+    assert_blob_payload_seeded(range5, 128, 0, 100);
     for (size_t i = 20; i < sizeof(range0); i++) {
         ASSERT(range0[i] == 0xEE, "range0 tail was modified");
     }
