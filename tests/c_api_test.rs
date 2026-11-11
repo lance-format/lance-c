@@ -26160,12 +26160,17 @@ fn dataset_file_base_ids(dataset: *const LanceDataset) -> Vec<Option<u64>> {
 #[test]
 fn test_native_write_options_create_append_overwrite_and_manifest_scheme() {
     let tmp = tempfile::tempdir().unwrap();
-    let uri = tmp.path().join("native_options_ds").to_str().unwrap();
+    let uri = tmp
+        .path()
+        .join("native_options_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
     let mut spec = native_write_default_spec();
     let options = native_write_options_new(&spec);
 
     let (rc, ds) = native_write_dataset(
-        uri,
+        &uri,
         write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
         LanceWriteMode::Create,
         options,
@@ -26174,14 +26179,14 @@ fn test_native_write_options_create_append_overwrite_and_manifest_scheme() {
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
     unsafe { lance_dataset_close(ds) };
 
-    let stems = version_manifest_stems(uri);
+    let stems = version_manifest_stems(&uri);
     assert!(
         stems.iter().all(|stem| stem.len() == 20),
         "default create should use v2 manifest names, got {stems:?}"
     );
 
     let (rc, ds) = native_write_dataset(
-        uri,
+        &uri,
         write_batch(vec![4, 5], vec![4.0, 5.0]),
         LanceWriteMode::Append,
         options,
@@ -26191,7 +26196,7 @@ fn test_native_write_options_create_append_overwrite_and_manifest_scheme() {
     unsafe { lance_dataset_close(ds) };
 
     let (rc, ds) = native_write_dataset(
-        uri,
+        &uri,
         write_batch(vec![100, 200], vec![100.0, 200.0]),
         LanceWriteMode::Overwrite,
         options,
@@ -26205,9 +26210,10 @@ fn test_native_write_options_create_append_overwrite_and_manifest_scheme() {
         .path()
         .join("native_options_null_handle")
         .to_str()
-        .unwrap();
+        .unwrap()
+        .to_string();
     let (rc, ds) = native_write_dataset(
-        uri_default,
+        &uri_default,
         write_batch(vec![7], vec![7.0]),
         LanceWriteMode::Create,
         ptr::null(),
@@ -26219,9 +26225,14 @@ fn test_native_write_options_create_append_overwrite_and_manifest_scheme() {
     spec.has_enable_v2_manifest_paths = 1;
     spec.enable_v2_manifest_paths = false;
     let v1_options = native_write_options_new(&spec);
-    let v1_uri = tmp.path().join("native_options_v1").to_str().unwrap();
+    let v1_uri = tmp
+        .path()
+        .join("native_options_v1")
+        .to_str()
+        .unwrap()
+        .to_string();
     let (rc, ds) = native_write_dataset(
-        v1_uri,
+        &v1_uri,
         write_batch(vec![1], vec![1.0]),
         LanceWriteMode::Create,
         v1_options,
@@ -26229,7 +26240,7 @@ fn test_native_write_options_create_append_overwrite_and_manifest_scheme() {
     assert_eq!(rc, 0, "{}", take_last_error_message());
     unsafe { lance_dataset_close(ds) };
     unsafe { lance_native_write_options_close(v1_options) };
-    let stems = version_manifest_stems(v1_uri);
+    let stems = version_manifest_stems(&v1_uri);
     assert!(
         stems.iter().any(|stem| stem == "1"),
         "explicit false should create a v1 manifest name, got {stems:?}"
@@ -26256,9 +26267,14 @@ fn test_native_write_options_file_writer_and_validation_errors() {
     spec.write_options = &write_options;
     spec.file_writer_options = &file_options;
     let options = native_write_options_new(&spec);
-    let uri = tmp.path().join("file_writer_ok").to_str().unwrap();
+    let uri = tmp
+        .path()
+        .join("file_writer_ok")
+        .to_str()
+        .unwrap()
+        .to_string();
     let (rc, ds) = native_write_dataset(
-        uri,
+        &uri,
         write_batch(vec![1, 2], vec![1.0, 2.0]),
         LanceWriteMode::Create,
         options,
@@ -26285,9 +26301,10 @@ fn test_native_write_options_file_writer_and_validation_errors() {
         .path()
         .join("file_writer_invalid_page")
         .to_str()
-        .unwrap();
+        .unwrap()
+        .to_string();
     let (rc, ds) = native_write_dataset(
-        invalid_uri,
+        &invalid_uri,
         write_batch(vec![1], vec![1.0]),
         LanceWriteMode::Create,
         invalid_options,
@@ -26297,7 +26314,7 @@ fn test_native_write_options_file_writer_and_validation_errors() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert!(take_last_error_message().contains("max_page_bytes"));
     unsafe { lance_native_write_options_close(invalid_options) };
-    let invalid_uri_c = c_str(invalid_uri);
+    let invalid_uri_c = c_str(&invalid_uri);
     assert!(
         unsafe { lance_dataset_open(invalid_uri_c.as_ptr(), ptr::null(), 0) }.is_null(),
         "failed write must not publish a dataset"
@@ -26328,9 +26345,14 @@ fn test_native_write_options_transaction_properties_and_staged_commit() {
     let options = native_write_options_new(&spec);
     unsafe { lance_session_close(session) };
 
-    let staged_uri = tmp.path().join("staged_properties").to_str().unwrap();
+    let staged_uri = tmp
+        .path()
+        .join("staged_properties")
+        .to_str()
+        .unwrap()
+        .to_string();
     let (rc, transaction) = native_write_uncommitted(
-        staged_uri,
+        &staged_uri,
         write_batch(vec![1, 2], vec![1.0, 2.0]),
         LanceWriteMode::Create,
         options,
@@ -26348,7 +26370,7 @@ fn test_native_write_options_transaction_properties_and_staged_commit() {
         Some("staged")
     );
 
-    let c_uri = c_str(staged_uri);
+    let c_uri = c_str(&staged_uri);
     let mut committed = ptr::null_mut();
     assert_eq!(
         unsafe {
@@ -26385,9 +26407,14 @@ fn test_native_write_options_transaction_properties_and_staged_commit() {
         lance_dataset_close(committed);
     }
 
-    let ordinary_uri = tmp.path().join("ordinary_properties").to_str().unwrap();
+    let ordinary_uri = tmp
+        .path()
+        .join("ordinary_properties")
+        .to_str()
+        .unwrap()
+        .to_string();
     let (rc, ds) = native_write_dataset(
-        ordinary_uri,
+        &ordinary_uri,
         write_batch(vec![3], vec![3.0]),
         LanceWriteMode::Create,
         options,
@@ -26421,9 +26448,14 @@ fn test_native_write_options_transaction_properties_and_staged_commit() {
     let mut empty_spec = native_write_default_spec();
     empty_spec.transaction_properties = &empty_properties;
     let empty_options = native_write_options_new(&empty_spec);
-    let empty_uri = tmp.path().join("empty_properties").to_str().unwrap();
+    let empty_uri = tmp
+        .path()
+        .join("empty_properties")
+        .to_str()
+        .unwrap()
+        .to_string();
     let (rc, empty_transaction) = native_write_uncommitted(
-        empty_uri,
+        &empty_uri,
         write_batch(vec![4], vec![4.0]),
         LanceWriteMode::Create,
         empty_options,
@@ -26806,9 +26838,9 @@ fn test_native_write_options_progress_and_failure_without_commit() {
     spec.progress = &progress;
     let options = native_write_options_new(&spec);
 
-    let uri = tmp.path().join("progress_ds").to_str().unwrap();
+    let uri = tmp.path().join("progress_ds").to_str().unwrap().to_string();
     let (rc, ds) = native_write_dataset(
-        uri,
+        &uri,
         write_batch(vec![1, 2, 3, 4, 5], vec![1.0, 2.0, 3.0, 4.0, 5.0]),
         LanceWriteMode::Create,
         options,
@@ -26842,9 +26874,14 @@ fn test_native_write_options_progress_and_failure_without_commit() {
     let mut failed_spec = native_write_default_spec();
     failed_spec.progress = &failed_progress;
     let failed_options = native_write_options_new(&failed_spec);
-    let failed_uri = tmp.path().join("progress_failure").to_str().unwrap();
+    let failed_uri = tmp
+        .path()
+        .join("progress_failure")
+        .to_str()
+        .unwrap()
+        .to_string();
     let (rc, ds) = native_write_dataset(
-        failed_uri,
+        &failed_uri,
         write_batch(vec![1], vec![1.0]),
         LanceWriteMode::Create,
         failed_options,
@@ -26854,7 +26891,7 @@ fn test_native_write_options_progress_and_failure_without_commit() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert!(take_last_error_message().contains("refused fragment"));
     let (rc, transaction) = native_write_uncommitted(
-        failed_uri,
+        &failed_uri,
         write_batch(vec![2], vec![2.0]),
         LanceWriteMode::Create,
         failed_options,
@@ -26863,7 +26900,7 @@ fn test_native_write_options_progress_and_failure_without_commit() {
     assert!(transaction.is_null());
     unsafe { lance_native_write_options_close(failed_options) };
     assert_eq!(failed_state.releases.load(AtomicOrdering::SeqCst), 1);
-    let failed_uri_c = c_str(failed_uri);
+    let failed_uri_c = c_str(&failed_uri);
     assert!(
         unsafe { lance_dataset_open(failed_uri_c.as_ptr(), ptr::null(), 0) }.is_null(),
         "failed staged and ordinary writes must not publish a version"
@@ -26939,9 +26976,14 @@ fn test_native_write_options_retain_source_owners() {
         lance_commit_lock_close(lock);
     }
 
-    let uri = tmp.path().join("retained_owners").to_str().unwrap();
+    let uri = tmp
+        .path()
+        .join("retained_owners")
+        .to_str()
+        .unwrap()
+        .to_string();
     let (rc, ds) = native_write_dataset(
-        uri,
+        &uri,
         write_batch(vec![1, 2], vec![1.0, 2.0]),
         LanceWriteMode::Create,
         options,
@@ -26986,9 +27028,10 @@ fn test_native_write_options_external_blob_policy() {
         .path()
         .join("external_reference_rejected")
         .to_str()
-        .unwrap();
+        .unwrap()
+        .to_string();
     let (rc, ds) = native_write_dataset(
-        rejected_uri,
+        &rejected_uri,
         batch.clone(),
         LanceWriteMode::Create,
         default_options,
@@ -27009,9 +27052,10 @@ fn test_native_write_options_external_blob_policy() {
         .path()
         .join("external_reference_allowed")
         .to_str()
-        .unwrap();
+        .unwrap()
+        .to_string();
     let (rc, ds) = native_write_dataset(
-        allowed_uri,
+        &allowed_uri,
         batch.clone(),
         LanceWriteMode::Create,
         allow_options,
@@ -27032,8 +27076,9 @@ fn test_native_write_options_external_blob_policy() {
         .path()
         .join("external_ingest_conflict")
         .to_str()
-        .unwrap();
-    let (rc, ds) = native_write_dataset(ingest_uri, batch, LanceWriteMode::Create, ingest_options);
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(&ingest_uri, batch, LanceWriteMode::Create, ingest_options);
     assert_eq!(rc, -1);
     assert!(ds.is_null());
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
