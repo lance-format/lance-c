@@ -199,6 +199,42 @@ int main(int argc, char** argv) {
         }
         require(unsupported, "custom Unsupported");
 
+        std::map<std::string, int> dispatch_operations;
+        lance::Namespace::CustomDispatchSpec dispatch_spec;
+        dispatch_spec.dispatch =
+            [&dispatch_operations](const std::string& operation, const std::string&) {
+                ++dispatch_operations[operation];
+                if (operation == "describe_table_version") {
+                    return std::string(
+                        R"({"version":{"version":1,"manifest_path":"manifest"}})");
+                }
+                if (operation == "list_table_versions") {
+                    return std::string(R"({"versions":[]})");
+                }
+                return std::string("{}");
+            };
+        dispatch_spec.namespace_id = "custom-dispatch-cpp";
+        lance::Namespace dispatch_custom = lance::Namespace::custom_dispatch(dispatch_spec);
+        require(dispatch_custom.id() == "custom-dispatch-cpp", "dispatch custom id");
+        require(dispatch_custom.call("describe_table", "{}").has_json(),
+                "dispatch describe_table");
+        require(dispatch_custom.call("describe_table_version", "{}").has_json(),
+                "dispatch describe_table_version");
+        require(dispatch_custom.call(
+                    "create_table_version",
+                    R"({"id":["workspace","table"],"version":1,"manifest_path":"manifest"})")
+                    .has_json(),
+                "dispatch create_table_version");
+        require(dispatch_custom.call("list_table_versions", "{}").has_json(),
+                "dispatch list_table_versions");
+        require(dispatch_operations["describe_table"] == 1, "dispatch operation describe_table");
+        require(dispatch_operations["describe_table_version"] == 1,
+                "dispatch operation describe_table_version");
+        require(dispatch_operations["create_table_version"] == 1,
+                "dispatch operation create_table_version");
+        require(dispatch_operations["list_table_versions"] == 1,
+                "dispatch operation list_table_versions");
+
         // Native REST adapter + REST client through the public wrappers.
         lance::RestAdapter adapter = lance::RestAdapter::start(backend, "127.0.0.1", 0);
         require(adapter.port() != 0, "adapter port");

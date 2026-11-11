@@ -5,14 +5,16 @@
 //!
 //! These tests deliberately go through the exported C entry points. They use
 //! the native directory backend, the native REST adapter/client pair, and the
-//! four-callback custom client. Payload operations are exercised through the
-//! same dispatch table used by C and C++ callers.
+//! per-method and shared-dispatch custom clients. Payload operations are
+//! exercised through the same dispatch table used by C and C++ callers.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
@@ -546,6 +548,16 @@ unsafe extern "C" fn unsupported_callback(
     7
 }
 
+unsafe extern "C" fn unsupported_dispatch(
+    context: *mut c_void,
+    _operation: *const c_char,
+    request: *const c_char,
+    response: *mut LanceOwnedString,
+    error: *mut LanceCallbackError,
+) -> i32 {
+    unsafe { unsupported_callback(context, request, response, error) }
+}
+
 unsafe extern "C" fn free_owned_string(value: *mut LanceOwnedString) {
     unsafe {
         if value.is_null() || (*value).data.is_null() {
@@ -662,6 +674,215 @@ fn custom_namespace_preserves_native_unsupported_for_all_54_operations() {
     assert_eq!(released.load(Ordering::SeqCst), 1);
 }
 
+struct DispatchConcurrencyContext {
+    entered: Mutex<usize>,
+    entered_cv: Condvar,
+    operations: Mutex<Vec<String>>,
+    released: Arc<AtomicUsize>,
+}
+
+unsafe fn callback_failure(error: *mut LanceCallbackError, message: &str) -> i32 {
+    unsafe {
+        (*error).code = LanceErrorCode::Internal as i32;
+        (*error).message.data = owned_string(message);
+        (*error).message.release = Some(free_owned_string);
+    }
+    1
+}
+
+unsafe extern "C" fn concurrent_dispatch(
+    context: *mut c_void,
+    operation: *const c_char,
+    request_json: *const c_char,
+    response: *mut LanceOwnedString,
+    error: *mut LanceCallbackError,
+) -> i32 {
+    let context = unsafe { &*(context.cast::<DispatchConcurrencyContext>()) };
+    if operation.is_null() || request_json.is_null() {
+        return unsafe { callback_failure(error, "dispatch received a NULL argument") };
+    }
+    let operation = match unsafe { CStr::from_ptr(operation) }.to_str() {
+        Ok(operation) => operation,
+        Err(_) => return unsafe { callback_failure(error, "operation is not UTF-8") },
+    };
+    let request: serde_json::Value = match serde_json::from_str(
+        unsafe { CStr::from_ptr(request_json) }
+            .to_str()
+            .unwrap_or_default(),
+    ) {
+        Ok(request) => request,
+        Err(_) => return unsafe { callback_failure(error, "request JSON is invalid") },
+    };
+    if request["id"] != serde_json::json!(["workspace", "table"]) {
+        return unsafe { callback_failure(error, "unexpected request table identifier") };
+    }
+    context
+        .operations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(operation.to_owned());
+
+    let mut entered = context
+        .entered
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *entered += 1;
+    context.entered_cv.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while *entered < 4 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return unsafe { callback_failure(error, "timed out waiting for concurrent dispatch") };
+        }
+        let (next, timeout) = match context.entered_cv.wait_timeout(entered, remaining) {
+            Ok(result) => result,
+            Err(_) => return unsafe { callback_failure(error, "dispatch wait was poisoned") },
+        };
+        entered = next;
+        if timeout.timed_out() && *entered < 4 {
+            return unsafe { callback_failure(error, "timed out waiting for concurrent dispatch") };
+        }
+    }
+    drop(entered);
+
+    let response_json = match operation {
+        "describe_table" => format!(
+            r#"{{"context":{{"dispatched":"{operation}"}},"location":"file:///tmp/table"}}"#
+        ),
+        "describe_table_version" => format!(
+            r#"{{"context":{{"dispatched":"{operation}"}},"version":{{"version":1,"manifest_path":"manifest"}}}}"#
+        ),
+        "create_table_version" => {
+            format!(r#"{{"context":{{"dispatched":"{operation}"}}}}"#)
+        }
+        "list_table_versions" => {
+            format!(r#"{{"context":{{"dispatched":"{operation}"}},"versions":[]}}"#)
+        }
+        _ => return unsafe { callback_failure(error, "unexpected dispatch operation") },
+    };
+    unsafe {
+        (*response).data = owned_string(&response_json);
+        (*response).release = Some(free_owned_string);
+    }
+    0
+}
+
+unsafe extern "C" fn release_dispatch_concurrency(context: *mut c_void) {
+    let context = unsafe { Box::from_raw(context.cast::<DispatchConcurrencyContext>()) };
+    context.released.fetch_add(1, Ordering::SeqCst);
+}
+
+#[test]
+fn custom_dispatch_identifies_all_managed_versions_concurrently() {
+    let released = Arc::new(AtomicUsize::new(0));
+    let context = Box::into_raw(Box::new(DispatchConcurrencyContext {
+        entered: Mutex::new(0),
+        entered_cv: Condvar::new(),
+        operations: Mutex::new(Vec::new()),
+        released: released.clone(),
+    })) as *mut c_void;
+    let namespace_id = c_string("dispatch-concurrent");
+    let spec = LanceNamespaceCustomClientDispatchSpec {
+        dispatch: Some(concurrent_dispatch),
+        release: Some(release_dispatch_concurrency),
+        client_ctx: context,
+        namespace_id: namespace_id.as_ptr(),
+    };
+    let namespace = unsafe { lance_namespace_custom_dispatch_new(&spec) };
+    assert!(
+        !namespace.is_null(),
+        "dispatch namespace failed: {}",
+        last_error()
+    );
+
+    let requests = [
+        (
+            "describe_table",
+            r#"{"id":["workspace","table"],"version":1}"#,
+        ),
+        (
+            "describe_table_version",
+            r#"{"id":["workspace","table"],"version":1}"#,
+        ),
+        (
+            "create_table_version",
+            r#"{"id":["workspace","table"],"version":1,"manifest_path":"manifest"}"#,
+        ),
+        (
+            "list_table_versions",
+            r#"{"id":["workspace","table"],"version":1}"#,
+        ),
+    ];
+    let namespace_address = namespace as usize;
+    let results = std::thread::scope(|scope| {
+        let handles = requests
+            .into_iter()
+            .map(|(operation, request)| {
+                let namespace = namespace_address;
+                scope.spawn(move || {
+                    let (rc, result) =
+                        call(namespace as *const LanceNamespace, operation, request, None);
+                    (
+                        operation,
+                        rc,
+                        result.json(),
+                        result.native_error(),
+                        last_error(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    for (operation, rc, json, native_error, error) in results {
+        assert_eq!(
+            rc, 0,
+            "{operation} dispatch failed: native={native_error:?} error={error}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&json.unwrap()).unwrap();
+        assert_eq!(
+            json["context"]["dispatched"].as_str(),
+            Some(operation),
+            "callback operation did not select the response model"
+        );
+    }
+
+    let mut operations = unsafe { &*(context.cast::<DispatchConcurrencyContext>()) }
+        .operations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    operations.sort();
+    assert_eq!(
+        operations,
+        vec![
+            "create_table_version",
+            "describe_table",
+            "describe_table_version",
+            "list_table_versions",
+        ]
+    );
+
+    assert_native_unsupported(namespace, "list_tables", r#"{"id":["workspace"]}"#);
+    let operations = unsafe { &*(context.cast::<DispatchConcurrencyContext>()) }
+        .operations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        operations.len(),
+        4,
+        "other operations must keep native Unsupported without dispatch"
+    );
+    drop(operations);
+
+    close_namespace(namespace);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+}
+
 #[derive(Default)]
 struct DelegateContext {
     directory: *const LanceNamespace,
@@ -669,6 +890,7 @@ struct DelegateContext {
     fail_next_version: AtomicUsize,
     read_dataset: *mut LanceDataset,
     reentrant_count: AtomicUsize,
+    released: Arc<AtomicUsize>,
 }
 
 unsafe fn delegate_call(
@@ -780,6 +1002,23 @@ unsafe extern "C" fn delegate_list_table_versions(
     unsafe { delegate_with_name(context, "list_table_versions", request, response, error) }
 }
 
+unsafe extern "C" fn delegate_dispatch(
+    context: *mut c_void,
+    operation: *const c_char,
+    request: *const c_char,
+    response: *mut LanceOwnedString,
+    error: *mut LanceCallbackError,
+) -> i32 {
+    if operation.is_null() {
+        return unsafe { callback_failure(error, "dispatch received a NULL operation") };
+    }
+    let operation = match unsafe { CStr::from_ptr(operation) }.to_str() {
+        Ok(operation) => operation,
+        Err(_) => return unsafe { callback_failure(error, "operation is not UTF-8") },
+    };
+    unsafe { delegate_call(context, operation, request, response, error) }
+}
+
 unsafe fn delegate_with_name(
     context: *mut c_void,
     operation: &str,
@@ -791,11 +1030,47 @@ unsafe fn delegate_with_name(
 }
 
 unsafe extern "C" fn release_delegate(context: *mut c_void) {
-    let _ = unsafe { Box::from_raw(context.cast::<DelegateContext>()) };
+    let context = unsafe { Box::from_raw(context.cast::<DelegateContext>()) };
+    context.released.fetch_add(1, Ordering::SeqCst);
 }
 
-#[test]
-fn custom_namespace_managed_versions_and_reentrant_reads() {
+#[derive(Clone, Copy)]
+enum CustomClientForm {
+    FourCallbacks,
+    Dispatch,
+}
+
+unsafe fn delegate_namespace(
+    form: CustomClientForm,
+    context: *mut c_void,
+    namespace_id: *const c_char,
+) -> *mut LanceNamespace {
+    match form {
+        CustomClientForm::FourCallbacks => {
+            let spec = LanceNamespaceCustomClientSpec {
+                describe_table: Some(delegate_describe_table),
+                describe_table_version: Some(delegate_describe_table_version),
+                create_table_version: Some(delegate_create_table_version),
+                list_table_versions: Some(delegate_list_table_versions),
+                release: Some(release_delegate),
+                client_ctx: context,
+                namespace_id,
+            };
+            unsafe { lance_namespace_custom_new(&spec) }
+        }
+        CustomClientForm::Dispatch => {
+            let spec = LanceNamespaceCustomClientDispatchSpec {
+                dispatch: Some(delegate_dispatch),
+                release: Some(release_delegate),
+                client_ctx: context,
+                namespace_id,
+            };
+            unsafe { lance_namespace_custom_dispatch_new(&spec) }
+        }
+    }
+}
+
+fn run_managed_versions_and_reentrant_reads(form: CustomClientForm) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("namespace");
     std::fs::create_dir_all(&root).unwrap();
@@ -815,24 +1090,17 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
         last_error()
     );
 
+    let released = Arc::new(AtomicUsize::new(0));
     let context = Box::into_raw(Box::new(DelegateContext {
         directory,
         describe_calls: AtomicUsize::new(0),
         fail_next_version: AtomicUsize::new(0),
         read_dataset,
         reentrant_count: AtomicUsize::new(0),
+        released: released.clone(),
     })) as *mut c_void;
     let namespace_id = c_string("custom-managed");
-    let spec = LanceNamespaceCustomClientSpec {
-        describe_table: Some(delegate_describe_table),
-        describe_table_version: Some(delegate_describe_table_version),
-        create_table_version: Some(delegate_create_table_version),
-        list_table_versions: Some(delegate_list_table_versions),
-        release: Some(release_delegate),
-        client_ctx: context,
-        namespace_id: namespace_id.as_ptr(),
-    };
-    let custom = unsafe { lance_namespace_custom_new(&spec) };
+    let custom = unsafe { delegate_namespace(form, context, namespace_id.as_ptr()) };
     assert!(
         !custom.is_null(),
         "custom namespace failed: {}",
@@ -883,8 +1151,117 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
     );
 
     close_namespace(custom);
+    assert_eq!(
+        released.load(Ordering::SeqCst),
+        1,
+        "the callback context must be released with the namespace handle"
+    );
     close_namespace(directory);
     unsafe { lance_dataset_close(read_dataset) };
+}
+
+#[test]
+fn custom_client_forms_managed_versions_and_reentrant_reads() {
+    run_managed_versions_and_reentrant_reads(CustomClientForm::FourCallbacks);
+    run_managed_versions_and_reentrant_reads(CustomClientForm::Dispatch);
+}
+
+#[test]
+fn dispatch_context_releases_after_final_dataset_and_provider_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("namespace");
+    std::fs::create_dir_all(&root).unwrap();
+    let directory = directory_namespace(root.to_str().unwrap());
+    assert_call_ok(directory, "create_namespace", r#"{"id":["workspace"]}"#);
+    let (schema, batch) = make_batch();
+    let table_id = r#"["workspace","managed"]"#;
+    let dataset = write_namespace(directory, table_id, 0, &schema, batch);
+    unsafe { lance_dataset_close(dataset) };
+    let table_id_c = c_string(table_id);
+
+    let released = Arc::new(AtomicUsize::new(0));
+    let context = Box::into_raw(Box::new(DelegateContext {
+        directory,
+        describe_calls: AtomicUsize::new(0),
+        fail_next_version: AtomicUsize::new(0),
+        read_dataset: ptr::null_mut(),
+        reentrant_count: AtomicUsize::new(0),
+        released: released.clone(),
+    })) as *mut c_void;
+    let namespace_id = c_string("dispatch-dataset-owner");
+    let custom =
+        unsafe { delegate_namespace(CustomClientForm::Dispatch, context, namespace_id.as_ptr()) };
+    assert!(
+        !custom.is_null(),
+        "dispatch namespace failed: {}",
+        last_error()
+    );
+    let opened = unsafe {
+        lance_dataset_open_namespace(custom, table_id_c.as_ptr(), ptr::null(), 0, ptr::null())
+    };
+    assert!(
+        !opened.is_null(),
+        "dispatch managed open failed: {}",
+        last_error()
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(opened) }, 3);
+    close_namespace(custom);
+    assert_eq!(
+        released.load(Ordering::SeqCst),
+        0,
+        "a namespace-managed dataset must retain the callback context"
+    );
+    unsafe { lance_dataset_close(opened) };
+    assert_eq!(
+        released.load(Ordering::SeqCst),
+        1,
+        "closing the final namespace-managed dataset must release the context once"
+    );
+
+    let provider_released = Arc::new(AtomicUsize::new(0));
+    let provider_context = Box::into_raw(Box::new(DelegateContext {
+        directory,
+        describe_calls: AtomicUsize::new(0),
+        fail_next_version: AtomicUsize::new(0),
+        read_dataset: ptr::null_mut(),
+        reentrant_count: AtomicUsize::new(0),
+        released: provider_released.clone(),
+    })) as *mut c_void;
+    let provider_namespace_id = c_string("dispatch-provider-owner");
+    let provider_namespace = unsafe {
+        delegate_namespace(
+            CustomClientForm::Dispatch,
+            provider_context,
+            provider_namespace_id.as_ptr(),
+        )
+    };
+    assert!(
+        !provider_namespace.is_null(),
+        "provider namespace failed: {}",
+        last_error()
+    );
+    let provider = unsafe {
+        lance_namespace_storage_options_provider_new(provider_namespace, table_id_c.as_ptr())
+    };
+    assert!(
+        !provider.is_null(),
+        "storage provider failed: {}",
+        last_error()
+    );
+    close_namespace(provider_namespace);
+    assert_eq!(
+        provider_released.load(Ordering::SeqCst),
+        0,
+        "a native storage provider must retain the callback context"
+    );
+    unsafe { lance_storage_options_provider_close(provider) };
+    assert_eq!(
+        provider_released.load(Ordering::SeqCst),
+        1,
+        "closing the final native provider must release the context once"
+    );
+
+    close_namespace(directory);
 }
 
 static CAPTURED_REQUESTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1143,50 +1520,65 @@ fn rest_adapter_client_context_headers_metrics_and_native_errors() {
 fn default_custom_clients_have_isolated_and_stable_provider_identity() {
     let table_id = c_string(r#"["workspace","shared-table"]"#);
     let empty_id = c_string("");
-    let mut identities = Vec::new();
-    for namespace_id in [ptr::null(), ptr::null(), empty_id.as_ptr()] {
-        let spec = LanceNamespaceCustomClientSpec {
-            describe_table: Some(unsupported_callback),
-            describe_table_version: Some(unsupported_callback),
-            create_table_version: Some(unsupported_callback),
-            list_table_versions: Some(unsupported_callback),
-            release: None,
-            client_ctx: ptr::null_mut(),
-            namespace_id,
-        };
-        let namespace = unsafe { lance_namespace_custom_new(&spec) };
-        assert!(!namespace.is_null(), "{}", last_error());
-        let id = take_and_free(unsafe { lance_namespace_id(namespace) });
-        assert!(!id.is_empty());
-        assert_eq!(id, take_and_free(unsafe { lance_namespace_id(namespace) }));
-        let mut provider_ids = Vec::new();
-        for _ in 0..2 {
-            let provider = unsafe {
-                lance_namespace_storage_options_provider_new(namespace, table_id.as_ptr())
+    for form in [CustomClientForm::FourCallbacks, CustomClientForm::Dispatch] {
+        let mut identities = Vec::new();
+        for namespace_id in [ptr::null(), ptr::null(), empty_id.as_ptr()] {
+            let namespace = match form {
+                CustomClientForm::FourCallbacks => {
+                    let spec = LanceNamespaceCustomClientSpec {
+                        describe_table: Some(unsupported_callback),
+                        describe_table_version: Some(unsupported_callback),
+                        create_table_version: Some(unsupported_callback),
+                        list_table_versions: Some(unsupported_callback),
+                        release: None,
+                        client_ctx: ptr::null_mut(),
+                        namespace_id,
+                    };
+                    unsafe { lance_namespace_custom_new(&spec) }
+                }
+                CustomClientForm::Dispatch => {
+                    let spec = LanceNamespaceCustomClientDispatchSpec {
+                        dispatch: Some(unsupported_dispatch),
+                        release: None,
+                        client_ctx: ptr::null_mut(),
+                        namespace_id,
+                    };
+                    unsafe { lance_namespace_custom_dispatch_new(&spec) }
+                }
             };
-            assert!(!provider.is_null(), "{}", last_error());
-            provider_ids.push(take_and_free(unsafe {
-                lance_storage_options_provider_id(provider)
-            }));
-            unsafe { lance_storage_options_provider_close(provider) };
+            assert!(!namespace.is_null(), "{}", last_error());
+            let id = take_and_free(unsafe { lance_namespace_id(namespace) });
+            assert!(!id.is_empty());
+            assert_eq!(id, take_and_free(unsafe { lance_namespace_id(namespace) }));
+            let mut provider_ids = Vec::new();
+            for _ in 0..2 {
+                let provider = unsafe {
+                    lance_namespace_storage_options_provider_new(namespace, table_id.as_ptr())
+                };
+                assert!(!provider.is_null(), "{}", last_error());
+                provider_ids.push(take_and_free(unsafe {
+                    lance_storage_options_provider_id(provider)
+                }));
+                unsafe { lance_storage_options_provider_close(provider) };
+            }
+            close_namespace(namespace);
+            assert_eq!(
+                provider_ids[0], provider_ids[1],
+                "providers for the same client and table must share their native identity"
+            );
+            identities.push((id, provider_ids.remove(0)));
         }
-        close_namespace(namespace);
-        assert_eq!(
-            provider_ids[0], provider_ids[1],
-            "providers for the same client and table must share their native identity"
-        );
-        identities.push((id, provider_ids.remove(0)));
-    }
-    for (index, (namespace_id, provider_id)) in identities.iter().enumerate() {
-        for (other_namespace_id, other_provider_id) in &identities[index + 1..] {
-            assert_ne!(
-                namespace_id, other_namespace_id,
-                "independent default clients must have different namespace identities"
-            );
-            assert_ne!(
-                provider_id, other_provider_id,
-                "independent default clients must isolate native provider cache identities"
-            );
+        for (index, (namespace_id, provider_id)) in identities.iter().enumerate() {
+            for (other_namespace_id, other_provider_id) in &identities[index + 1..] {
+                assert_ne!(
+                    namespace_id, other_namespace_id,
+                    "independent default clients must have different namespace identities"
+                );
+                assert_ne!(
+                    provider_id, other_provider_id,
+                    "independent default clients must isolate native provider cache identities"
+                );
+            }
         }
     }
 }
@@ -1308,6 +1700,18 @@ fn constructor_failures_release_foreign_contexts_exactly_once() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!(released.load(Ordering::SeqCst), 1);
 
+    let dispatch_context = Box::into_raw(Box::new(released.clone())) as *mut c_void;
+    let dispatch_spec = LanceNamespaceCustomClientDispatchSpec {
+        dispatch: None,
+        release: Some(count_release),
+        client_ctx: dispatch_context,
+        namespace_id: ptr::null(),
+    };
+    let namespace = unsafe { lance_namespace_custom_dispatch_new(&dispatch_spec) };
+    assert!(namespace.is_null(), "missing dispatch callback must fail");
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(released.load(Ordering::SeqCst), 2);
+
     let provider_context = Box::into_raw(Box::new(released.clone())) as *mut c_void;
     let provider_spec = LanceNamespaceContextProviderSpec {
         provide_context: Some(dynamic_context),
@@ -1319,7 +1723,7 @@ fn constructor_failures_release_foreign_contexts_exactly_once() {
         unsafe { lance_namespace_rest_new(invalid_properties.as_ptr(), &provider_spec) };
     assert!(namespace.is_null(), "invalid REST properties must fail");
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    assert_eq!(released.load(Ordering::SeqCst), 2);
+    assert_eq!(released.load(Ordering::SeqCst), 3);
 }
 
 static PARTIAL_RESPONSE_RELEASES: AtomicUsize = AtomicUsize::new(0);
@@ -1350,40 +1754,65 @@ unsafe extern "C" fn partial_response_then_error(
     1
 }
 
+unsafe extern "C" fn partial_response_dispatch(
+    context: *mut c_void,
+    _operation: *const c_char,
+    request: *const c_char,
+    response: *mut LanceOwnedString,
+    error: *mut LanceCallbackError,
+) -> i32 {
+    unsafe { partial_response_then_error(context, request, response, error) }
+}
+
 #[test]
 fn failed_custom_callback_releases_partial_response_exactly_once() {
-    PARTIAL_RESPONSE_RELEASES.store(0, Ordering::SeqCst);
-    let released = Arc::new(AtomicUsize::new(0));
-    let context = Box::into_raw(Box::new(released.clone())) as *mut c_void;
-    let namespace_id = c_string("partial");
-    let spec = LanceNamespaceCustomClientSpec {
-        describe_table: Some(partial_response_then_error),
-        describe_table_version: Some(unsupported_callback),
-        create_table_version: Some(unsupported_callback),
-        list_table_versions: Some(unsupported_callback),
-        release: Some(count_release),
-        client_ctx: context,
-        namespace_id: namespace_id.as_ptr(),
-    };
-    let namespace = unsafe { lance_namespace_custom_new(&spec) };
-    assert!(
-        !namespace.is_null(),
-        "custom namespace failed: {}",
-        last_error()
-    );
+    for form in [CustomClientForm::FourCallbacks, CustomClientForm::Dispatch] {
+        PARTIAL_RESPONSE_RELEASES.store(0, Ordering::SeqCst);
+        let released = Arc::new(AtomicUsize::new(0));
+        let context = Box::into_raw(Box::new(released.clone())) as *mut c_void;
+        let namespace_id = c_string("partial");
+        let namespace = match form {
+            CustomClientForm::FourCallbacks => {
+                let spec = LanceNamespaceCustomClientSpec {
+                    describe_table: Some(partial_response_then_error),
+                    describe_table_version: Some(unsupported_callback),
+                    create_table_version: Some(unsupported_callback),
+                    list_table_versions: Some(unsupported_callback),
+                    release: Some(count_release),
+                    client_ctx: context,
+                    namespace_id: namespace_id.as_ptr(),
+                };
+                unsafe { lance_namespace_custom_new(&spec) }
+            }
+            CustomClientForm::Dispatch => {
+                let spec = LanceNamespaceCustomClientDispatchSpec {
+                    dispatch: Some(partial_response_dispatch),
+                    release: Some(count_release),
+                    client_ctx: context,
+                    namespace_id: namespace_id.as_ptr(),
+                };
+                unsafe { lance_namespace_custom_dispatch_new(&spec) }
+            }
+        };
+        assert!(
+            !namespace.is_null(),
+            "custom namespace failed: {}",
+            last_error()
+        );
 
-    let (rc, result) = call(
-        namespace,
-        "describe_table",
-        r#"{"id":["workspace","table"]}"#,
-        None,
-    );
-    assert_ne!(rc, 0);
-    assert_eq!(
-        result.native_error(),
-        Some((18, "callback failed after writing a response".to_owned()))
-    );
-    assert_eq!(PARTIAL_RESPONSE_RELEASES.load(Ordering::SeqCst), 1);
-    close_namespace(namespace);
-    assert_eq!(released.load(Ordering::SeqCst), 1);
+        let (rc, result) = call(
+            namespace,
+            "describe_table",
+            r#"{"id":["workspace","table"]}"#,
+            None,
+        );
+        assert_ne!(rc, 0);
+        assert_eq!(
+            result.native_error(),
+            Some((18, "callback failed after writing a response".to_owned()))
+        );
+        assert_eq!(PARTIAL_RESPONSE_RELEASES.load(Ordering::SeqCst), 1);
+        close_namespace(namespace);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
 }

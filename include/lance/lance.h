@@ -1367,6 +1367,67 @@ LanceDataset* lance_dataset_checkout_ref(
     const LanceRef* reference
 );
 
+/**
+ * Deep clone a dataset snapshot into a new dataset at `target_path`.
+ *
+ * The whole operation is performed by Lance's native
+ * `Dataset::deep_clone` on a private clone of the source handle's snapshot.
+ * The source handle is not modified and no source write lock is held while
+ * files are copied.
+ *
+ * `reference == NULL` clones the source handle's current snapshot: its branch
+ * and version id are pinned into `Ref::Version(branch, Some(version))`. Treat
+ * it as "clone this exact snapshot", not "clone the latest head". Pass an
+ * explicit `LanceRef` from `lance_ref_version(NULL, false, 0)` to clone the
+ * current head of the default branch.
+ *
+ * `target_storage_options` is an existing storage-options accessor, or NULL.
+ * Its native accessor Arc is forwarded into `ObjectStoreParams` without
+ * resolving, snapshotting, or copying credentials, so a dynamic provider keeps
+ * its refresh behavior. NULL passes native `None`; a non-NULL accessor that
+ * holds static options and/or a provider contributes its native `Arc`, while
+ * an accessor created with neither contributes native `None`.
+ *
+ * Files are copied and the target dataset is published by native Lance. The
+ * out handle is written only on success. On failure the out parameter is
+ * untouched. A copy or commit error does not guarantee that the target remains
+ * unpublished. Object-store copies are not transactional: partial objects may
+ * remain under `target_path` and are not rolled back. Reopen the target to
+ * check its state after an error. A target that already contains a published
+ * dataset is rejected by the native preflight before any copy.
+ *
+ * The returned dataset is a normal LanceDataset whose manifest keeps the
+ * cloned snapshot's version id (native clone commit semantics), so its
+ * `lance_dataset_version` is the cloned version rather than always 1.
+ *
+ * Native clone commits resolve the target URI through the default object-store
+ * registry, so `target_path` must use a scheme that registry knows (for
+ * example `file`, `memory`, `s3`, `gs`, `az`, or another built-in). A scheme
+ * registered only on a custom session registry is not visible to the clone
+ * commit. Use `lance_dataset_write`/`lance_dataset_branch_create` with an
+ * explicit session for those schemes.
+ *
+ * For datasets with additional base paths, native deep clone reads every
+ * collected file through the source dataset's object store; per-base distinct
+ * source credentials are not supported. This call does not create extra
+ * providers, caches, registries, or per-base credential sets.
+ *
+ * Caller closes the returned handle with lance_dataset_close().
+ * @param dataset source dataset handle (must not be NULL)
+ * @param target_path UTF-8 target dataset URI (must not be NULL)
+ * @param reference snapshot ref, or NULL for the source handle's snapshot
+ * @param target_storage_options target accessor, or NULL for native None
+ * @param out receives the new dataset handle on success (must not be NULL)
+ * @return 0 on success, -1 on error; the out handle is not written on error
+ */
+int32_t lance_dataset_deep_clone(
+    const LanceDataset* dataset,
+    const char* target_path,
+    const LanceRef* reference,
+    const LanceStorageOptionsAccessor* target_storage_options,
+    LanceDataset** out
+);
+
 /* ─── Branches ─── */
 
 /**
@@ -3304,7 +3365,7 @@ uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
  */
 int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_ids);
 
-/* ─── Read-only fragment snapshots ─── */
+/* ─── Fragment handles ─── */
 
 /**
  * Resolve a fragment by ID from this dataset snapshot.
@@ -3322,6 +3383,34 @@ int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_id
 LanceFragment* lance_dataset_open_fragment(
     const LanceDataset* dataset,
     uint64_t fragment_id
+);
+
+/**
+ * Construct detached native Fragment metadata.
+ *
+ * Starts from native `Fragment::new(fragment_id)`, clones each borrowed
+ * `LanceDataFile` in input order, and optionally sets the native
+ * `physical_rows` value. Deletion-file, overlay, row-ID and row-version
+ * metadata retain their native `Fragment::new` defaults. The binding does not
+ * infer or independently validate schema coverage or row counts; native
+ * commit remains authoritative for publication.
+ *
+ * `data_files` may be NULL only when `data_file_count == 0`. A non-NULL array
+ * must contain only non-NULL handles. `physical_rows` is optional: NULL maps
+ * to native `None`, while a non-NULL value must fit the platform `usize`.
+ * A fragment_id of zero requests native commit-time allocation, matching the
+ * native Append contract.
+ *
+ * The returned detached handle retains independent copies of the data-file
+ * metadata and may outlive those handles. It supports metadata inspection and
+ * operation construction but rejects dataset-bound reads. On success the
+ * caller closes it with `lance_fragment_close()`. Returns NULL on error.
+ */
+LanceFragment* lance_fragment_new(
+    uint64_t fragment_id,
+    const LanceDataFile* const* data_files,
+    size_t data_file_count,
+    const uint64_t* physical_rows
 );
 
 /** Close and free a fragment handle. Safe to call with NULL. */
@@ -7487,6 +7576,132 @@ int32_t lance_dataset_write_uncommitted_stream_with_native_options(
     LanceTransaction** out_transaction
 );
 
+/* ─── Native fragment creation ─── */
+
+/**
+ * Options for the native fragment creation entry points.
+ *
+ * `schema == NULL` leaves native schema inference in place. In APPEND mode
+ * native inference may use the existing dataset's schema, including its field
+ * IDs. A non-NULL schema is borrowed for the call and cloned before the write
+ * starts, so closing the handle during the call is not allowed.
+ *
+ * `mode` is a `LanceWriteMode` value. `write == NULL` selects the native
+ * `WriteParams::default()` writer options. `storage_opts == NULL` and
+ * `session == NULL` keep the native defaults.
+ */
+typedef struct LanceFragmentCreateOptions {
+    /* Native schema to write with. NULL uses native inference. */
+    const LanceSchema*      schema;
+    /* LanceWriteMode: LANCE_WRITE_CREATE, LANCE_WRITE_APPEND or
+     * LANCE_WRITE_OVERWRITE. */
+    int32_t                 mode;
+    /* Native write options. NULL uses native defaults. */
+    const LanceWriteOptions* write;
+    /* NULL-terminated [key, value, ..., NULL] storage options. */
+    const char* const*      storage_opts;
+    /* Shared session for caches and store configuration. NULL means default. */
+    const LanceSession*     session;
+} LanceFragmentCreateOptions;
+
+/**
+ * Create one fragment at `dataset_uri` without publishing a version.
+ *
+ * Maps to native `FragmentCreateBuilder::write(source, Some(fragment_id))`.
+ * Native code owns schema inference and compatibility, file format selection,
+ * the physical row count and all error semantics. A non-empty input is
+ * required; an empty stream fails with the native "Input data was empty."
+ * error. The native API accepts any `fragment_id`, including IDs already used
+ * by existing metadata; duplicate detection happens at commit time.
+ * Non-NULL URI strings, including empty strings, are interpreted by native
+ * code. Native schema validation precedes target storage creation.
+ *
+ * The stream is consumed on every return path except a NULL `stream` pointer,
+ * including validation failures and a NULL output slot. Passing a NULL stream
+ * is an invalid argument and leaves it untouched.
+ *
+ * On success `*out_fragment` receives an independently owned detached
+ * metadata handle that remains valid after the dataset, schema and session
+ * handles are closed. Closing the handle never deletes the written data file.
+ * The output is written only on success.
+ *
+ * @return 0 on success, -1 on error. Errors include
+ *         LANCE_ERR_INVALID_ARGUMENT (NULL stream/uri/output, invalid mode,
+ *         empty input), native schema mismatches, storage errors and
+ *         commit-less I/O failures.
+ */
+int32_t lance_fragment_create(
+    const char* dataset_uri,
+    uint64_t fragment_id,
+    const LanceFragmentCreateOptions* options,
+    struct ArrowArrayStream* stream,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Create zero or more fragments without publishing a version.
+ *
+ * Maps to native `FragmentCreateBuilder::write_fragments`. Native
+ * `max_rows_per_file` splitting, fragment ID assignment, file format and
+ * schema handling apply; the binding implements no splitting of its own.
+ *
+ * The stream follows the same consumption contract as `lance_fragment_create`,
+ * and both output slots are written only on success. On success `*out_fragments`
+ * is a library-allocated array of `*out_count` independently owned detached
+ * handles. Release it with `lance_fragment_array_free(*out_fragments,
+ * *out_count)`, which closes every remaining non-NULL element. A successful
+ * empty result writes NULL and 0.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_create_many(
+    const char* dataset_uri,
+    const LanceFragmentCreateOptions* options,
+    struct ArrowArrayStream* stream,
+    LanceFragment*** out_fragments,
+    size_t* out_count
+);
+
+/**
+ * Close every non-NULL fragment in an array from `lance_fragment_create_many`,
+ * then release the array allocation. NULL-safe. `count` must be the count
+ * returned by `create_many`; slots already cleared by a wrapper are skipped.
+ */
+void lance_fragment_array_free(LanceFragment** fragments, size_t count);
+
+/**
+ * Create one fragment from an existing Lance data file.
+ *
+ * Maps to native `FileFragment::create_from_file(filename, dataset_snapshot,
+ * fragment_id as usize, physical_rows)`. `filename` is relative to the
+ * dataset's data directory and keeps native file-version, schema
+ * compatibility and physical-row validation. Non-NULL filenames, including
+ * empty strings, are passed through unchanged. `physical_rows == NULL` maps to
+ * native `None`; a pointer to zero maps to `Some(0)`, which the current native
+ * format may ignore. Values that do not fit the native `usize` are rejected.
+ *
+ * Native validates the file schema against the dataset snapshot, so a file
+ * whose stored schema is a physical representation that the native version
+ * cannot project to the dataset schema is rejected. Blob v2 data files are
+ * one such case: they store descriptor columns where the dataset schema has
+ * `blob.uri` and `blob.data`, and both the native and the C entry points
+ * report the same schema-mismatch error for them.
+ *
+ * The dataset handle supplies the target snapshot and is not modified. The
+ * output owns complete detached metadata and remains valid after the dataset
+ * is closed; it is written only on success. Closing the handle never deletes
+ * the file.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_create_from_file(
+    const LanceDataset* dataset,
+    const char* filename,
+    uint64_t fragment_id,
+    const uint64_t* physical_rows,
+    LanceFragment** out_fragment
+);
+
 /* ─── Native data files ─── */
 
 /** Owned native `DataFile` metadata snapshot. */
@@ -10288,6 +10503,48 @@ typedef struct LanceNamespaceCustomClientSpec {
 
 LanceNamespace* lance_namespace_custom_new(
     const LanceNamespaceCustomClientSpec* spec
+);
+
+/**
+ * Shared dispatch callback for the same four managed table/version operations.
+ *
+ * `operation` is one of the exact native snake_case names
+ * "describe_table", "describe_table_version", "create_table_version", or
+ * "list_table_versions". It is borrowed for this callback only and must not be
+ * retained. `request_json` has the same call-scoped lifetime. Response JSON
+ * ownership, callback errors, reentrant blocking behavior, and unsupported
+ * operations are identical to the per-operation callbacks above.
+ */
+typedef int32_t (*LanceNamespaceCustomDispatchFn)(
+    void* client_ctx,
+    const char* operation,
+    const char* request_json,
+    LanceOwnedString* out_response_json,
+    LanceCallbackError* out_error
+);
+
+/**
+ * Foreign client with one dispatch callback for the four managed
+ * table/version operations.
+ *
+ * Ownership of `client_ctx` and `release` transfers when this spec is passed
+ * to `lance_namespace_custom_dispatch_new`, including on construction failure.
+ * The context is released exactly once after the final native namespace Arc
+ * drops. `namespace_id` follows the same copied identity and cache semantics as
+ * LanceNamespaceCustomClientSpec. All operations other than the four listed
+ * above keep native Unsupported behavior.
+ */
+typedef struct LanceNamespaceCustomClientDispatchSpec {
+    LanceNamespaceCustomDispatchFn dispatch;
+    void (*release)(void* client_ctx);
+    void* client_ctx;
+    /** Copied identity used in native storage-provider cache keys. NULL or
+     * empty assigns a unique identity stable for this client's lifetime. */
+    const char* namespace_id;
+} LanceNamespaceCustomClientDispatchSpec;
+
+LanceNamespace* lance_namespace_custom_dispatch_new(
+    const LanceNamespaceCustomClientDispatchSpec* spec
 );
 
 /* ─── Raw Lance-file session ──────────────────────────────────────────────── */

@@ -130,7 +130,7 @@ fn storage_options_from_ffi(
     })
 }
 
-fn session_from_ffi(session: *const LanceSession) -> Option<Arc<Session>> {
+pub(crate) fn session_from_ffi(session: *const LanceSession) -> Option<Arc<Session>> {
     if session.is_null() {
         None
     } else {

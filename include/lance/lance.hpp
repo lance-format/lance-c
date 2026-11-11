@@ -713,6 +713,20 @@ public:
     const LanceNativeWriteOptions* c_handle() const { return handle_.get(); }
 };
 
+/// Options for native fragment creation.
+///
+/// `schema == nullptr` leaves native schema inference in place; in Append mode
+/// native inference may reuse the existing dataset's schema and field IDs. A
+/// non-null schema is borrowed for the call and cloned by the C API before the
+/// asynchronous write starts. `write` maps through the same native option
+/// conversion as `Dataset::write_with_options`, so a default-constructed value
+/// selects native `WriteParams::default()`.
+struct FragmentCreateOptions {
+    const LanceSchema* schema = nullptr;
+    WriteMode          mode = WriteMode::Create;
+    WriteOptions       write;
+};
+
 // ─── Native transactions ─────────────────────────────────────────────────────
 
 /// Owned native `DataFile` metadata snapshot. Move-only.
@@ -4222,12 +4236,13 @@ public:
     }
 };
 
-// ─── Read-only fragment snapshot ─────────────────────────────────────────────
+// ─── Fragment handles ────────────────────────────────────────────────────────
 
-/// RAII handle over one fragment from a dataset snapshot. Native
-/// `FileFragment` owns an `Arc<Dataset>`, so this handle remains valid and
-/// keeps reading the same dataset version after the source Dataset is closed
-/// or mutated. Methods expose only read-only metadata and row counts.
+/// RAII handle over a dataset-bound or independently constructed fragment.
+/// Native `FileFragment` owns an `Arc<Dataset>`, so bound handles remain valid
+/// and keep reading the same dataset version after the source Dataset is closed
+/// or mutated. Detached handles own copied native metadata and support
+/// operation construction without dataset access.
 class Fragment {
     Handle<LanceFragment, lance_fragment_close> handle_;
 
@@ -4239,6 +4254,18 @@ public:
     Fragment& operator=(Fragment&&) noexcept = default;
     Fragment(const Fragment&) = delete;
     Fragment& operator=(const Fragment&) = delete;
+
+    /// Construct detached native Fragment metadata from borrowed data files.
+    ///
+    /// The data files are cloned in input order. `physical_rows ==
+    /// std::nullopt` maps to native `None`; all other metadata retains native
+    /// `Fragment::new` defaults. A fragment ID of zero requests native
+    /// commit-time allocation. Schema coverage and `physical_rows` are caller
+    /// metadata; this constructor does not infer or revalidate them.
+    static Fragment from_data_files(
+        uint64_t fragment_id,
+        const std::vector<const DataFile*>& data_files,
+        std::optional<uint64_t> physical_rows = std::nullopt);
 
     /// Native fragment ID.
     uint64_t id() const {
@@ -4369,8 +4396,76 @@ public:
     /// or modifies an overlay dataset, including before publication.
     FragmentOverlayWriter write_overlay(const LanceSchema& schema) const;
 
+    /// Create one fragment without publishing a version.
+    ///
+    /// Maps to native `FragmentCreateBuilder::write(source, Some(fragment_id))`.
+    /// Native owns schema inference and compatibility, file format, physical row
+    /// counts and error semantics; an empty input fails with the native "Input
+    /// data was empty." error. The stream is consumed on every return path,
+    /// including a null stream pointer (which is rejected unconsumed) and local
+    /// conversion failures. A null `options.schema` keeps native inference.
+    ///
+    /// Returns independently owned detached metadata that stays valid after the
+    /// source dataset, schema and session are closed. Closing it never deletes
+    /// the written data file; publish the fragment with an Append transaction.
+    static Fragment create(
+        const std::string& dataset_uri,
+        ArrowArrayStream* stream,
+        uint64_t fragment_id,
+        const FragmentCreateOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
+
+    /// Create zero or more fragments without publishing a version.
+    ///
+    /// Maps to native `FragmentCreateBuilder::write_fragments`, so
+    /// `options.write.params.max_rows_per_file` splitting and fragment ID
+    /// assignment stay native. The stream follows the same consumption contract
+    /// as `create`; an empty input returns an empty vector.
+    static std::vector<Fragment> create_many(
+        const std::string& dataset_uri,
+        ArrowArrayStream* stream,
+        const FragmentCreateOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
+
+    /// Create one fragment from an existing Lance data file in `dataset`'s data
+    /// directory.
+    ///
+    /// Maps to native `FileFragment::create_from_file`. `filename` is relative
+    /// to the dataset's data directory. `physical_rows == std::nullopt` maps to
+    /// native `None`; an engaged value maps to `Some(value)`. Native owns file
+    /// version, schema compatibility and physical-row validation. The dataset
+    /// supplies the target snapshot and is not modified. A file whose stored
+    /// schema native cannot project to the dataset schema is rejected, as with
+    /// Blob v2 data files.
+    static Fragment create_from_file(
+        const Dataset& dataset,
+        const std::string& filename,
+        uint64_t fragment_id,
+        std::optional<uint64_t> physical_rows = std::nullopt);
+
     const LanceFragment* c_handle() const { return handle_.get(); }
 };
+
+inline Fragment Fragment::from_data_files(
+    uint64_t fragment_id,
+    const std::vector<const DataFile*>& data_files,
+    std::optional<uint64_t> physical_rows) {
+    std::vector<const LanceDataFile*> handles;
+    handles.reserve(data_files.size());
+    for (const auto* file : data_files) {
+        handles.push_back(file ? file->c_handle() : nullptr);
+    }
+    uint64_t rows = physical_rows.value_or(0);
+    auto* fragment = lance_fragment_new(
+        fragment_id,
+        handles.empty() ? nullptr : handles.data(),
+        handles.size(),
+        physical_rows ? &rows : nullptr);
+    if (!fragment) check_error();
+    return Fragment(fragment);
+}
 
 inline std::optional<Fragment> Fragment::delete_if(
     const std::string& predicate) const {
@@ -8155,6 +8250,40 @@ public:
         return Dataset(out);
     }
 
+    /// Deep clone this handle's snapshot into `target_path`.
+    ///
+    /// `reference == nullptr` clones the handle's current snapshot (branch and
+    /// version id pinned); it does not select the latest head. Pass
+    /// `Ref::version(std::nullopt, std::nullopt)` to clone the current head of
+    /// the default branch. `storage_options == nullptr` passes native None;
+    /// otherwise the accessor's native Arc is forwarded as-is when it holds
+    /// static options or a provider (an accessor with neither passes None),
+    /// without resolving or copying credentials. The returned dataset keeps
+    /// the cloned snapshot's version id (native clone commit semantics), so
+    /// `version()` is not necessarily 1. Copy or commit errors can leave the
+    /// target's publication state uncertain; reopen it to check its state.
+    /// Partial objects may remain under `target_path` and are not rolled back.
+    /// The target URI must use a scheme known to the default object-store
+    /// registry, because native clone commits resolve it there.
+    /// For datasets with additional base paths, native deep clone reads them
+    /// through the source dataset's object store; per-base distinct source
+    /// credentials are not supported.
+    Dataset deep_clone(
+        const std::string& target_path,
+        const Ref* reference = nullptr,
+        const StorageOptionsAccessor* storage_options = nullptr) const {
+        LanceDataset* out = nullptr;
+        if (lance_dataset_deep_clone(
+                handle_.get(),
+                target_path.c_str(),
+                reference ? reference->c_handle() : nullptr,
+                storage_options ? storage_options->c_handle() : nullptr,
+                &out) != 0) {
+            check_error();
+        }
+        return Dataset(out);
+    }
+
     /// Create a native branch from `reference`.
     ///
     /// `storage_opts == std::nullopt` uses the source dataset's native store
@@ -9521,6 +9650,8 @@ public:
 
     /// Access the underlying C handle (does not transfer ownership).
     const LanceDataset* c_handle() const { return handle_.get(); }
+
+    friend class Fragment;
 
 private:
     explicit Dataset(LanceDataset* ptr) : handle_(ptr) {}
@@ -11508,6 +11639,120 @@ inline void Fragment::take(
     }
 }
 
+inline Fragment Fragment::create(
+    const std::string& dataset_uri,
+    ArrowArrayStream* stream,
+    uint64_t fragment_id,
+    const FragmentCreateOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+    // Native reads the stream schema itself, so this guard deliberately skips
+    // `read_schema()` and only owns the stream until the C call takes it.
+    Dataset::ArrowStreamInput input(stream);
+
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions c_write =
+        Dataset::to_c_write_options(options.write, cleanup);
+    auto kv = Dataset::to_c_key_values(storage_opts);
+    LanceFragmentCreateOptions c_options{};
+    c_options.schema = options.schema ? options.schema->c_handle() : nullptr;
+    c_options.mode = static_cast<int32_t>(options.mode);
+    c_options.write = &c_write;
+    c_options.storage_opts = storage_opts.empty() ? nullptr : kv.data();
+    c_options.session = session ? session->c_handle() : nullptr;
+
+    LanceFragment* out = nullptr;
+    auto* owned_stream = input.consume();
+    if (lance_fragment_create(
+            dataset_uri.c_str(), fragment_id, &c_options, owned_stream,
+            &out) != 0) {
+        check_error();
+    }
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_fragment_create returned success with null out_fragment");
+    }
+    return Fragment(out);
+}
+
+inline std::vector<Fragment> Fragment::create_many(
+    const std::string& dataset_uri,
+    ArrowArrayStream* stream,
+    const FragmentCreateOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+    Dataset::ArrowStreamInput input(stream);
+
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions c_write =
+        Dataset::to_c_write_options(options.write, cleanup);
+    auto kv = Dataset::to_c_key_values(storage_opts);
+    LanceFragmentCreateOptions c_options{};
+    c_options.schema = options.schema ? options.schema->c_handle() : nullptr;
+    c_options.mode = static_cast<int32_t>(options.mode);
+    c_options.write = &c_write;
+    c_options.storage_opts = storage_opts.empty() ? nullptr : kv.data();
+    c_options.session = session ? session->c_handle() : nullptr;
+
+    LanceFragment** raw = nullptr;
+    size_t count = 0;
+    auto* owned_stream = input.consume();
+    if (lance_fragment_create_many(
+            dataset_uri.c_str(), &c_options, owned_stream, &raw, &count) !=
+        0) {
+        check_error();
+    }
+    if (count > 0 && !raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_fragment_create_many returned success with a null "
+                    "fragment array");
+    }
+
+    std::vector<Fragment> fragments;
+    try {
+        // Reserve before adopting: `Fragment` only moves a pointer, so once
+        // the capacity exists `emplace_back` cannot reallocate. Each slot is
+        // cleared right after adoption, which leaves `raw` holding exactly the
+        // handles this vector does not own.
+        fragments.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            fragments.emplace_back(raw[i]);
+            raw[i] = nullptr;
+        }
+    } catch (...) {
+        // Frees every slot that was not adopted; adopted slots are null.
+        lance_fragment_array_free(raw, count);
+        throw;
+    }
+    lance_fragment_array_free(raw, count);
+    return fragments;
+}
+
+inline Fragment Fragment::create_from_file(
+    const Dataset& dataset,
+    const std::string& filename,
+    uint64_t fragment_id,
+    std::optional<uint64_t> physical_rows) {
+    uint64_t rows = physical_rows.value_or(0);
+    LanceFragment* out = nullptr;
+    if (lance_fragment_create_from_file(
+            dataset.c_handle(),
+            filename.c_str(),
+            fragment_id,
+            physical_rows ? &rows : nullptr,
+            &out) != 0) {
+        check_error();
+    }
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_fragment_create_from_file returned success with null "
+            "out_fragment");
+    }
+    return Fragment(out);
+}
+
 inline Scanner Dataset::scan() const {
     return scan(std::nullopt);
 }
@@ -12618,12 +12863,20 @@ class Namespace {
         std::function<std::string(const std::string&)> list_table_versions;
     };
 
+    struct CustomDispatchContext {
+        std::function<std::string(const std::string&, const std::string&)> dispatch;
+    };
+
     static void context_provider_release(void* ctx) noexcept {
         delete static_cast<ContextProviderContext*>(ctx);
     }
 
     static void custom_client_release(void* ctx) noexcept {
         delete static_cast<CustomClientContext*>(ctx);
+    }
+
+    static void custom_dispatch_release(void* ctx) noexcept {
+        delete static_cast<CustomDispatchContext*>(ctx);
     }
 
     static int32_t context_provider_call(
@@ -12663,13 +12916,12 @@ class Namespace {
         return 1;
     }
 
+    template <typename Callback>
     static int32_t invoke_custom(
-        CustomClientContext* ctx,
-        std::function<std::string(const std::string&)>& callback,
+        Callback&& callback,
         const char* request_json,
         LanceOwnedString* out_json,
         LanceCallbackError* out_error) noexcept {
-        (void)ctx;
         try {
             std::string response = callback(request_json ? request_json : "{}");
             namespace_detail::set_owned_string(out_json, std::move(response));
@@ -12692,22 +12944,41 @@ class Namespace {
     static int32_t custom_describe_table(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->describe_table, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->describe_table(request);
+        }, req, out, err);
     }
     static int32_t custom_describe_table_version(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->describe_table_version, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->describe_table_version(request);
+        }, req, out, err);
     }
     static int32_t custom_create_table_version(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->create_table_version, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->create_table_version(request);
+        }, req, out, err);
     }
     static int32_t custom_list_table_versions(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->list_table_versions, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->list_table_versions(request);
+        }, req, out, err);
+    }
+    static int32_t custom_dispatch_call(
+        void* ctx,
+        const char* operation,
+        const char* req,
+        LanceOwnedString* out,
+        LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomDispatchContext*>(ctx);
+        return invoke_custom([client, operation](const char* request) {
+            return client->dispatch(operation ? operation : "", request);
+        }, req, out, err);
     }
 
     static LanceNamespaceContextProviderSpec make_context_spec(
@@ -12733,6 +13004,16 @@ public:
         std::function<std::string(const std::string&)> describe_table_version;
         std::function<std::string(const std::string&)> create_table_version;
         std::function<std::string(const std::string&)> list_table_versions;
+        /// Empty assigns a unique identity stable for this client's lifetime.
+        std::string namespace_id;
+    };
+
+    /// Foreign client using one callback for the same four managed-version
+    /// operations. The callback receives the exact native snake_case operation
+    /// name and native request JSON; both strings are borrowed for the call
+    /// only. Other operations keep native Unsupported.
+    struct CustomDispatchSpec {
+        std::function<std::string(const std::string&, const std::string&)> dispatch;
         /// Empty assigns a unique identity stable for this client's lifetime.
         std::string namespace_id;
     };
@@ -12805,6 +13086,26 @@ public:
         c_spec.client_ctx = ctx;
         c_spec.namespace_id = spec.namespace_id.c_str();
         auto* raw = lance_namespace_custom_new(&c_spec);
+        // The C constructor consumes the context on every invocation.
+        guard.release();
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    static Namespace custom_dispatch(const CustomDispatchSpec& spec) {
+        if (!spec.dispatch) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "custom dispatch namespace requires a dispatch callback");
+        }
+        auto* ctx = new CustomDispatchContext{spec.dispatch};
+        std::unique_ptr<CustomDispatchContext> guard(ctx);
+        LanceNamespaceCustomClientDispatchSpec c_spec{};
+        c_spec.dispatch = &custom_dispatch_call;
+        c_spec.release = &custom_dispatch_release;
+        c_spec.client_ctx = ctx;
+        c_spec.namespace_id = spec.namespace_id.c_str();
+        auto* raw = lance_namespace_custom_dispatch_new(&c_spec);
         // The C constructor consumes the context on every invocation.
         guard.release();
         if (!raw) check_error();
