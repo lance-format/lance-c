@@ -26296,7 +26296,10 @@ fn test_native_write_options_file_writer_and_validation_errors() {
 
     file_options.version = ptr::null();
     file_options.max_page_bytes = 0;
-    let invalid_options = native_write_options_new(&spec);
+    let mut invalid_page_spec = native_write_default_spec();
+    invalid_page_spec.write_options = &write_options;
+    invalid_page_spec.file_writer_options = &file_options;
+    let invalid_options = native_write_options_new(&invalid_page_spec);
     let invalid_uri = tmp
         .path()
         .join("file_writer_invalid_page")
@@ -26324,7 +26327,7 @@ fn test_native_write_options_file_writer_and_validation_errors() {
 #[test]
 fn test_native_write_options_transaction_properties_and_staged_commit() {
     let tmp = tempfile::tempdir().unwrap();
-    let session = unsafe { lance_session_new(4 * 1024 * 1024, 1 * 1024 * 1024) };
+    let session = lance_session_new(4 * 1024 * 1024, 1 * 1024 * 1024);
     assert!(!session.is_null(), "{}", take_last_error_message());
 
     let engine_key = c_str("engine");
@@ -26940,7 +26943,7 @@ unsafe extern "C" fn native_write_lock_release_context(callback_ctx: *mut c_void
 #[test]
 fn test_native_write_options_retain_source_owners() {
     let tmp = tempfile::tempdir().unwrap();
-    let session = unsafe { lance_session_new(4 * 1024 * 1024, 1 * 1024 * 1024) };
+    let session = lance_session_new(4 * 1024 * 1024, 1 * 1024 * 1024);
     let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), ptr::null()) };
     assert!(!session.is_null() && !accessor.is_null());
 
