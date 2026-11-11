@@ -363,6 +363,7 @@ typedef struct LanceDataFile LanceDataFile;
 typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
+typedef struct LanceUpdateMap LanceUpdateMap;
 typedef struct LanceIvfModel LanceIvfModel;
 typedef struct LanceSchema LanceSchema;
 typedef struct LanceNamespace LanceNamespace;
@@ -1734,6 +1735,18 @@ typedef struct LanceBasePathView {
     const char* name;
     bool is_dataset_root;
 } LanceBasePathView;
+
+/**
+ * Borrowed native base-path list with explicit presence.
+ *
+ * `items == NULL` maps to native `None`, including for Overwrite. A non-NULL
+ * pointer with `count == 0` maps to native `Some(empty list)`. Every entry is
+ * parsed with the `LanceBasePath` rules above.
+ */
+typedef struct LanceBasePathList {
+    const LanceBasePath* items;
+    size_t count;
+} LanceBasePathList;
 
 /**
  * Optional transaction properties for one native `add_bases` commit.
@@ -6939,16 +6952,117 @@ int32_t lance_data_file_base_id(
 
 /* ─── Native transactions ─── */
 
+/* ─── Native update maps ─── */
+
+/**
+ * Owned native `UpdateMap` snapshot.
+ *
+ * A native update map is an ordered list of key edits plus a replacement flag,
+ * not a hash map. Duplicate keys, entry order and absent values are native
+ * data. Native commit code applies entries in order: replacement clears the
+ * target and inserts only entries that carry a value, while incremental mode
+ * upserts values and removes keys whose value is `None`.
+ */
+typedef struct LanceUpdateMap LanceUpdateMap;
+
+/**
+ * One native per-field metadata update for
+ * `lance_operation_update_config_new()`.
+ *
+ * `updates` is borrowed and cloned. Duplicate field IDs follow native
+ * `HashMap` last-write-wins semantics where the last complete map wins.
+ */
+typedef struct LanceFieldMetadataUpdateMap {
+    int32_t field_id;
+    const LanceUpdateMap* updates;
+} LanceFieldMetadataUpdateMap;
+
+/**
+ * Borrowed UpdateConfig operation inputs.
+ *
+ * Each map pointer is optional: NULL maps to native `None` and a non-NULL
+ * handle is cloned, including an explicitly empty map.
+ * `field_metadata_updates` may be NULL only when
+ * `field_metadata_update_count == 0`.
+ */
+typedef struct LanceUpdateConfigOperationOptions {
+    const LanceUpdateMap* config_updates;
+    const LanceUpdateMap* table_metadata_updates;
+    const LanceUpdateMap* schema_metadata_updates;
+    const LanceFieldMetadataUpdateMap* field_metadata_updates;
+    size_t field_metadata_update_count;
+} LanceUpdateConfigOperationOptions;
+
+/**
+ * Construct an owned native update map.
+ *
+ * `keys` and `values` are parallel arrays of length `count`; `count == 0`
+ * accepts a NULL array for either. Every key must be non-NULL UTF-8. A NULL
+ * value entry represents native `None` (remove the key); a non-NULL value,
+ * including an empty string, is native `Some`. Duplicate keys and entry order
+ * are retained; native commit code interprets them.
+ *
+ * Returns an owned map, or NULL on error.
+ */
+LanceUpdateMap* lance_update_map_new(
+    const char* const* keys,
+    const char* const* values,
+    size_t count,
+    bool replace
+);
+
+/**
+ * Clone an update map into an independent snapshot.
+ * The clone stays valid after the source is closed.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceUpdateMap* lance_update_map_clone(const LanceUpdateMap* map);
+
+/** Close an update map handle. NULL-safe. Close exactly once. */
+void lance_update_map_close(LanceUpdateMap* map);
+
+/**
+ * Read the number of native update entries. Returns 0 on error; check
+ * `lance_last_error_code()`. Zero is also a valid entry count.
+ */
+size_t lance_update_map_count(const LanceUpdateMap* map);
+
+/**
+ * Read one borrowed entry key. The pointer remains valid until the map handle
+ * is closed. Returns NULL on error, including a key that is not representable
+ * as a C string.
+ */
+const char* lance_update_map_key_at(const LanceUpdateMap* map, size_t index);
+
+/**
+ * Read one borrowed entry value. Both output pointers are required. On success
+ * `*out_has_value` reports native `Some`/`None`; `*out_value` is a borrowed
+ * pointer when present and NULL otherwise. Both outputs are unchanged on
+ * error. Returns 0 on success, -1 on error.
+ */
+int32_t lance_update_map_value_at(
+    const LanceUpdateMap* map,
+    size_t index,
+    bool* out_has_value,
+    const char** out_value
+);
+
+/**
+ * Read the native replacement flag: true replaces the target map, false
+ * applies entries incrementally. Returns false on error; check
+ * `lance_last_error_code()`.
+ */
+bool lance_update_map_replace(const LanceUpdateMap* map);
+
 /**
  * Native operation variant. Discriminants are ABI-stable.
  *
- * Append and Overwrite are constructed by the native writer. Delete,
- * CreateIndex and DataReplacement have typed constructors and inspection.
- * Project has a native-schema constructor carrying the explicit
- * `preserves_nullability` assertion. The other variants can be read from
- * history and inspected by kind; their
- * constructors and variant-specific mutation helpers remain later issue #112
- * scope.
+ * Append and Overwrite are constructed by the native writer. Overwrite,
+ * Merge, Clone and UpdateConfig have typed native constructors and inspection.
+ * Delete, CreateIndex, DataReplacement and Project have their existing typed
+ * constructors and inspection. The other variants can be read from history and
+ * inspected by kind; their constructors and variant-specific mutation helpers
+ * remain later issue #112 scope.
  */
 typedef enum {
     LANCE_OPERATION_UNKNOWN             = 0,
@@ -7203,6 +7317,84 @@ LanceOperation* lance_operation_append_new(
 );
 
 /**
+ * Construct an owned native Overwrite operation.
+ *
+ * The schema is cloned and every fragment handle is borrowed while its complete
+ * native metadata is copied. A NULL fragment array is accepted only with a zero
+ * count. `config_upsert_values == NULL` maps to native `None`; a non-NULL map
+ * with zero entries maps to native `Some(empty)`. `initial_bases == NULL` maps
+ * to native `None`; a non-NULL list with zero entries maps to native
+ * `Some(empty list)`.
+ *
+ * Native commit code owns fragment ID reassignment, deletion-file rejection,
+ * schema and config replacement. This constructor adds no binding-side policy.
+ * Returns an owned operation, or NULL on error. Close it with
+ * lance_operation_close().
+ */
+LanceOperation* lance_operation_overwrite_new(
+    const LanceSchema* schema,
+    const LanceFragment* const* fragments,
+    size_t fragment_count,
+    const LanceStringMap* config_upsert_values, /* NULL None */
+    const LanceBasePathList* initial_bases          /* NULL None */
+);
+
+/**
+ * Construct an owned native Merge operation.
+ *
+ * The schema is cloned and every fragment handle is borrowed while its complete
+ * native metadata is copied. `fragments` is the complete final fragment list;
+ * dropping a fragment removes it, and adding a fragment adds it. A NULL array
+ * is accepted only with a zero count. `preserves_nullability` is stored
+ * unchanged as the caller's assertion about the merge's schema change.
+ *
+ * Native commit code owns schema-change and concurrent-nullability conflict
+ * validation. Returns an owned operation, or NULL on error.
+ */
+LanceOperation* lance_operation_merge_new(
+    const LanceSchema* schema,
+    const LanceFragment* const* fragments,
+    size_t fragment_count,
+    bool preserves_nullability
+);
+
+/**
+ * Construct an owned native Clone operation.
+ *
+ * `ref_name == NULL` maps to native `None`; a non-NULL pointer, including an
+ * empty string, maps to `Some(name)`. `ref_path` must be non-NULL UTF-8 and is
+ * copied; an empty path is accepted. `branch_name` follows the same NULL/`Some`
+ * mapping as `ref_name`.
+ *
+ * Native commit code owns shallow-clone publication and rejects a deep clone
+ * unless the core copied the source files itself. This constructor adds no
+ * binding-side policy. Returns an owned operation, or NULL on error.
+ */
+LanceOperation* lance_operation_clone_new(
+    bool is_shallow,
+    const char* ref_name,     /* NULL None, empty is Some("") */
+    uint64_t ref_version,
+    const char* ref_path,     /* required */
+    const char* branch_name   /* NULL None, empty is Some("") */
+);
+
+/**
+ * Construct an owned native UpdateConfig operation.
+ *
+ * Each non-NULL map is cloned; NULL maps to native `None` and a non-NULL
+ * handle maps to `Some`, including an explicitly empty map. Field metadata
+ * entries are copied in input order into the native map; duplicate field IDs
+ * keep the last complete map. A NULL field array is accepted only with a zero
+ * count.
+ *
+ * Native commit code owns replacement, incremental and `None`-entry semantics.
+ * Returns an owned operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_config_new(
+    const LanceUpdateConfigOperationOptions* options
+);
+
+/**
  * Construct an owned native Restore operation.
  *
  * `version` passes through unchanged. Native commit validation owns whether the
@@ -7424,6 +7616,205 @@ int32_t lance_operation_update_bases_at(
     const LanceOperation* operation,
     size_t index,
     LanceBasePathView* out_base
+);
+
+/**
+ * Read the number of fragments in an Overwrite operation. Other variants
+ * return LANCE_ERR_NOT_SUPPORTED. The generic
+ * lance_operation_fragment_count() keeps its Append/Overwrite behavior.
+ */
+int32_t lance_operation_overwrite_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one Overwrite fragment as an independent detached handle carrying its
+ * complete native metadata. The output slot is unchanged on error.
+ */
+int32_t lance_operation_overwrite_fragment_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/** Clone the in-memory native schema of an Overwrite operation. */
+int32_t lance_operation_overwrite_schema_clone(
+    const LanceOperation* operation,
+    LanceSchema** out_schema
+);
+
+/**
+ * Report whether the Overwrite carries native `Some` config upserts.
+ * `Some(empty)` is distinct from `None`. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_overwrite_has_config_upsert_values(
+    const LanceOperation* operation,
+    bool* out_has
+);
+
+/** Read the number of config upsert entries; native `None` reports 0. */
+int32_t lance_operation_overwrite_config_upsert_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one borrowed config upsert key. The pointer remains valid until the
+ * operation is closed. Returns NULL on error.
+ */
+const char* lance_operation_overwrite_config_upsert_key_at(
+    const LanceOperation* operation,
+    size_t index
+);
+
+/**
+ * Read one borrowed config upsert value. The pointer remains valid until the
+ * operation is closed. Returns NULL on error.
+ */
+const char* lance_operation_overwrite_config_upsert_value_at(
+    const LanceOperation* operation,
+    size_t index
+);
+
+/**
+ * Report whether the Overwrite carries native `Some` initial bases.
+ * `Some(empty)` is distinct from `None`.
+ */
+int32_t lance_operation_overwrite_has_initial_bases(
+    const LanceOperation* operation,
+    bool* out_has
+);
+
+/** Read the number of initial base paths; native `None` reports 0. */
+int32_t lance_operation_overwrite_initial_base_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one borrowed initial base path view. `name == NULL` means native `None`.
+ * The output slot is unchanged on error.
+ */
+int32_t lance_operation_overwrite_initial_base_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceBasePathView* out_base
+);
+
+/** Read the number of fragments in a Merge operation. */
+int32_t lance_operation_merge_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/** Clone one Merge fragment as an independent detached handle. */
+int32_t lance_operation_merge_fragment_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/** Clone the in-memory native schema of a Merge operation. */
+int32_t lance_operation_merge_schema_clone(
+    const LanceOperation* operation,
+    LanceSchema** out_schema
+);
+
+/** Read the native `preserves_nullability` assertion from a Merge operation. */
+int32_t lance_operation_merge_preserves_nullability(
+    const LanceOperation* operation,
+    bool* out_value
+);
+
+/** Clone the in-memory native schema of a Project operation. */
+int32_t lance_operation_project_schema_clone(
+    const LanceOperation* operation,
+    LanceSchema** out_schema
+);
+
+/** Read the native `preserves_nullability` assertion from a Project operation. */
+int32_t lance_operation_project_preserves_nullability(
+    const LanceOperation* operation,
+    bool* out_value
+);
+
+/** Read whether a Clone operation is shallow. */
+int32_t lance_operation_clone_is_shallow(
+    const LanceOperation* operation,
+    bool* out_value
+);
+
+/**
+ * Read the borrowed native `ref_name`. `*out_present` distinguishes `None`
+ * from `Some`, including `Some("")`. Both output slots are unchanged on
+ * error; the pointer remains valid until the operation is closed.
+ */
+int32_t lance_operation_clone_ref_name(
+    const LanceOperation* operation,
+    bool* out_present,
+    const char** out_value
+);
+
+/** Read the native `ref_version` of a Clone operation. */
+int32_t lance_operation_clone_ref_version(
+    const LanceOperation* operation,
+    uint64_t* out_version
+);
+
+/**
+ * Read the borrowed native `ref_path`. The pointer remains valid until the
+ * operation is closed. Returns NULL on error.
+ */
+const char* lance_operation_clone_ref_path(const LanceOperation* operation);
+
+/**
+ * Read the borrowed native `branch_name`. `*out_present` distinguishes `None`
+ * from `Some`, including `Some("")`. Both output slots are unchanged on error.
+ */
+int32_t lance_operation_clone_branch_name(
+    const LanceOperation* operation,
+    bool* out_present,
+    const char** out_value
+);
+
+/**
+ * Clone one UpdateConfig metadata map. On success, a NULL output means native
+ * `None`; an owned handle means `Some`, including `Some(empty)`. Close a
+ * non-NULL result with lance_update_map_close().
+ */
+int32_t lance_operation_update_config_config_updates(
+    const LanceOperation* operation,
+    LanceUpdateMap** out_map
+);
+
+/** Same ownership as config_updates, for table metadata. */
+int32_t lance_operation_update_config_table_metadata_updates(
+    const LanceOperation* operation,
+    LanceUpdateMap** out_map
+);
+
+/** Same ownership as config_updates, for schema metadata. */
+int32_t lance_operation_update_config_schema_metadata_updates(
+    const LanceOperation* operation,
+    LanceUpdateMap** out_map
+);
+
+/** Read the number of per-field UpdateMap entries. */
+int32_t lance_operation_update_config_field_metadata_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one per-field UpdateMap entry. On success both outputs are written; the
+ * map must be closed independently. Both output slots are unchanged on error.
+ */
+int32_t lance_operation_update_config_field_metadata_at(
+    const LanceOperation* operation,
+    size_t index,
+    int32_t* out_field_id,
+    LanceUpdateMap** out_map
 );
 
 /**

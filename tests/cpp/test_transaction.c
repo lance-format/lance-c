@@ -2540,6 +2540,613 @@ static void test_native_operation_construction(const char *src_uri,
     printf("native operation construction OK\n");
 }
 
+
+static const char *arrow_metadata_value(const char *metadata, const char *key) {
+    if (!metadata) return NULL;
+    size_t key_len = strlen(key);
+    const char *cursor = metadata;
+    while (*cursor != '\0') {
+        const char *entry_key = cursor;
+        cursor += strlen(cursor) + 1;
+        const char *entry_value = cursor;
+        cursor += strlen(cursor) + 1;
+        if (strncmp(entry_key, key, key_len) == 0 && entry_key[key_len] == '\0') {
+            return entry_value;
+        }
+    }
+    return NULL;
+}
+
+static void check_dataset_schema_metadata(LanceDataset *dataset,
+                                          const char *key,
+                                          const char *expected) {
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(dataset, &schema) == 0, "export dataset schema");
+    CHECK_OK();
+    const char *value = arrow_metadata_value(schema.metadata, key);
+    if (expected == NULL) {
+        ASSERT(value == NULL, "schema metadata key must be absent");
+    } else {
+        ASSERT(value != NULL && strcmp(value, expected) == 0,
+               "schema metadata value");
+    }
+    if (schema.release) schema.release(&schema);
+}
+
+static void check_field_schema_metadata(LanceDataset *dataset,
+                                        uint64_t field_index,
+                                        const char *key,
+                                        const char *expected) {
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(dataset, &schema) == 0, "export dataset schema");
+    CHECK_OK();
+    ASSERT(field_index < (uint64_t)schema.n_children, "schema field index");
+    const char *value =
+        arrow_metadata_value(schema.children[field_index]->metadata, key);
+    if (expected == NULL) {
+        ASSERT(value == NULL, "field metadata key must be absent");
+    } else {
+        ASSERT(value != NULL && strcmp(value, expected) == 0,
+               "field metadata value");
+    }
+    if (schema.release) schema.release(&schema);
+}
+
+static const char *config_value_for_key(LanceDatasetConfig *config,
+                                        const char *key) {
+    uint64_t count = lance_dataset_config_count(config);
+    for (uint64_t i = 0; i < count; i++) {
+        const char *candidate = lance_dataset_config_key_at(config, i);
+        if (candidate != NULL && strcmp(candidate, key) == 0) {
+            return lance_dataset_config_value_at(config, i);
+        }
+    }
+    return NULL;
+}
+
+static void test_native_typed_operations(const char *src_uri,
+                                         const char *base) {
+    char seed_uri[4096];
+    char overwrite_uri[4096];
+    char merge_uri[4096];
+    char clone_uri[4096];
+    char deep_uri[4096];
+    char rejection_uri[4096];
+    snprintf(seed_uri, sizeof(seed_uri), "%s/c_typed_seed", base);
+    snprintf(overwrite_uri, sizeof(overwrite_uri), "%s/c_typed_overwrite", base);
+    snprintf(merge_uri, sizeof(merge_uri), "%s/c_typed_merge", base);
+    snprintf(clone_uri, sizeof(clone_uri), "%s/c_typed_clone", base);
+    snprintf(deep_uri, sizeof(deep_uri), "%s/c_typed_clone_deep", base);
+    snprintf(rejection_uri, sizeof(rejection_uri), "%s/c_typed_rejection", base);
+
+    LanceDataset *source = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(source != NULL, "open typed operation source");
+    CHECK_OK();
+    uint64_t source_rows = lance_dataset_count_rows(source);
+    CHECK_OK();
+    uint64_t source_version = lance_dataset_version(source);
+    CHECK_OK();
+    lance_dataset_close(source);
+
+    LanceUncommittedWriteOptions write_options;
+    memset(&write_options, 0, sizeof(write_options));
+    write_options.write.params.max_rows_per_file = 2;
+    LanceTransaction *seed_transaction = write_uncommitted_from_source(
+        src_uri, seed_uri, LANCE_WRITE_CREATE, &write_options);
+    LanceDataset *seed = commit_transaction(seed_uri, seed_transaction, NULL);
+    ASSERT(lance_dataset_version(seed) == 1, "typed seed version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(seed) == source_rows, "typed seed rows");
+    CHECK_OK();
+    uint64_t seed_fragments = lance_dataset_fragment_count(seed);
+    CHECK_OK();
+    ASSERT(seed_fragments == 2, "typed seed fragment count");
+    uint64_t seed_ids[8];
+    ASSERT(lance_dataset_fragment_ids(seed, seed_ids) == 0,
+           "typed seed fragment ids");
+    CHECK_OK();
+    LanceFragment *first = lance_dataset_open_fragment(seed, seed_ids[0]);
+    LanceFragment *second = lance_dataset_open_fragment(seed, seed_ids[1]);
+    ASSERT(first != NULL && second != NULL, "open typed seed fragments");
+    CHECK_OK();
+    LanceSchema *schema = NULL;
+    ASSERT(lance_dataset_schema_clone(seed, &schema) == 0,
+           "clone typed seed schema");
+    CHECK_OK();
+    ASSERT(schema != NULL, "typed seed schema output");
+    int32_t seed_id_field = -1;
+    int32_t seed_name_field = -1;
+    ASSERT(lance_schema_field_id(schema, "id", &seed_id_field) == 0,
+           "typed seed id field id");
+    CHECK_OK();
+    ASSERT(lance_schema_field_id(schema, "name", &seed_name_field) == 0,
+           "typed seed name field id");
+    CHECK_OK();
+    ASSERT(seed_id_field >= 0 && seed_name_field >= 0,
+           "typed seed field ids");
+
+    const char *iterator_key_storage[] = {"owner", "empty"};
+    const char *iterator_value_storage[] = {"alice", ""};
+    LanceStringMap config = {iterator_key_storage, iterator_value_storage, 2};
+    char base_path[4096];
+    snprintf(base_path, sizeof(base_path), "%s/c_typed_base", base);
+    LanceBasePath base_entries[] = {
+        {9001, base_path, "primary", false},
+    };
+    LanceBasePathList base_list = {base_entries, 1};
+    const LanceFragment *fragments[] = {first, second};
+
+    LanceOperation *overwrite = lance_operation_overwrite_new(
+        schema, fragments, 2, &config, &base_list);
+    ASSERT(overwrite != NULL, "construct native Overwrite");
+    CHECK_OK();
+    ASSERT(lance_operation_kind(overwrite) == LANCE_OPERATION_OVERWRITE,
+           "Overwrite operation kind");
+    CHECK_OK();
+    uint64_t overwrite_fragments = UINT64_MAX;
+    ASSERT(lance_operation_overwrite_fragment_count(overwrite,
+                                                    &overwrite_fragments) == 0,
+           "Overwrite typed fragment count");
+    CHECK_OK();
+    ASSERT(overwrite_fragments == 2, "Overwrite typed fragment count value");
+    LanceFragment *detached = NULL;
+    ASSERT(lance_operation_overwrite_fragment_at(overwrite, 1, &detached) == 0,
+           "Overwrite typed fragment clone");
+    CHECK_OK();
+    ASSERT(detached != NULL, "Overwrite typed fragment output");
+    const char *detached_json = lance_fragment_metadata_json(detached);
+    ASSERT(detached_json != NULL && detached_json[0] != '\0',
+           "Overwrite detached fragment metadata");
+    lance_free_string(detached_json);
+    lance_fragment_close(detached);
+    bool has_config = false;
+    ASSERT(lance_operation_overwrite_has_config_upsert_values(overwrite,
+                                                              &has_config) == 0,
+           "Overwrite config presence");
+    CHECK_OK();
+    ASSERT(has_config, "Overwrite config must be Some");
+    uint64_t config_count = UINT64_MAX;
+    ASSERT(lance_operation_overwrite_config_upsert_count(overwrite,
+                                                         &config_count) == 0,
+           "Overwrite config count");
+    CHECK_OK();
+    ASSERT(config_count == 2, "Overwrite config count value");
+    const char *config_owner = NULL;
+    for (uint64_t i = 0; i < config_count; i++) {
+        const char *key = lance_operation_overwrite_config_upsert_key_at(
+            overwrite, i);
+        ASSERT(key != NULL, "Overwrite config key");
+        CHECK_OK();
+        if (strcmp(key, "owner") == 0) {
+            config_owner = lance_operation_overwrite_config_upsert_value_at(
+                overwrite, i);
+        }
+    }
+    ASSERT(config_owner != NULL && strcmp(config_owner, "alice") == 0,
+           "Overwrite config owner value");
+    bool has_bases = false;
+    ASSERT(lance_operation_overwrite_has_initial_bases(overwrite,
+                                                       &has_bases) == 0,
+           "Overwrite bases presence");
+    CHECK_OK();
+    ASSERT(has_bases, "Overwrite bases must be Some");
+    uint64_t base_count = UINT64_MAX;
+    ASSERT(lance_operation_overwrite_initial_base_count(overwrite,
+                                                        &base_count) == 0,
+           "Overwrite base count");
+    CHECK_OK();
+    ASSERT(base_count == 1, "Overwrite base count value");
+    LanceBasePathView base_view;
+    memset(&base_view, 0, sizeof(base_view));
+    ASSERT(lance_operation_overwrite_initial_base_at(overwrite, 0,
+                                                     &base_view) == 0,
+           "Overwrite base view");
+    CHECK_OK();
+    ASSERT(base_view.id == 9001, "Overwrite base id");
+    ASSERT(base_view.name != NULL && strcmp(base_view.name, "primary") == 0,
+           "Overwrite base name");
+    ASSERT(!base_view.is_dataset_root, "Overwrite base root flag");
+
+    uint64_t wrong_kind_count = UINT64_MAX;
+    ASSERT(lance_operation_merge_fragment_count(overwrite,
+                                                &wrong_kind_count) == -1,
+           "wrong-kind typed getter fails");
+    ASSERT(lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED,
+           "wrong-kind typed getter code");
+    ASSERT(wrong_kind_count == UINT64_MAX,
+           "wrong-kind typed getter leaves output unchanged");
+    ASSERT(lance_operation_overwrite_fragment_count(overwrite, NULL) == -1,
+           "NULL typed out parameter fails");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL typed out parameter code");
+
+    LanceTransaction *overwrite_transaction =
+        lance_transaction_new(0, overwrite, NULL);
+    ASSERT(overwrite_transaction != NULL, "typed Overwrite transaction");
+    CHECK_OK();
+    LanceDataset *published =
+        commit_transaction(overwrite_uri, overwrite_transaction, NULL);
+    ASSERT(lance_dataset_version(published) == 1,
+           "typed Overwrite published version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(published) == source_rows,
+           "typed Overwrite published rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(published) == 2,
+           "typed Overwrite published fragments");
+    CHECK_OK();
+    uint64_t published_ids[8];
+    ASSERT(lance_dataset_fragment_ids(published, published_ids) == 0,
+           "typed Overwrite published ids");
+    CHECK_OK();
+    ASSERT(published_ids[0] == 0 && published_ids[1] == 1,
+           "typed Overwrite assigns fresh fragment ids");
+    LanceDatasetConfig *published_config = lance_dataset_config(published);
+    ASSERT(published_config != NULL, "typed Overwrite config snapshot");
+    CHECK_OK();
+    const char *config_owner_value = config_value_for_key(published_config,
+                                                          "owner");
+    ASSERT(config_owner_value != NULL &&
+               strcmp(config_owner_value, "alice") == 0,
+           "typed Overwrite committed config");
+    const char *config_empty_value = config_value_for_key(published_config,
+                                                          "empty");
+    ASSERT(config_empty_value != NULL && strcmp(config_empty_value, "") == 0,
+           "typed Overwrite committed empty config value");
+    lance_dataset_config_close(published_config);
+    const char *bases_json = lance_dataset_base_paths_json(published);
+    ASSERT(bases_json != NULL, "typed Overwrite base paths json");
+    CHECK_OK();
+    ASSERT(strstr(bases_json, "\"9001\"") != NULL,
+           "typed Overwrite base path id");
+    ASSERT(strstr(bases_json, "primary") != NULL,
+           "typed Overwrite base path name");
+    lance_free_string(bases_json);
+    LanceSchema *published_schema = NULL;
+    ASSERT(lance_dataset_schema_clone(published, &published_schema) == 0,
+           "typed Overwrite schema clone");
+    CHECK_OK();
+    int32_t published_id_field = -1;
+    ASSERT(lance_schema_field_id(published_schema, "id", &published_id_field) ==
+               0,
+           "typed Overwrite schema field id");
+    CHECK_OK();
+    ASSERT(published_id_field == seed_id_field,
+           "typed Overwrite keeps native field ids");
+    lance_schema_close(published_schema);
+
+    LanceOperation *merge =
+        lance_operation_merge_new(schema, fragments, 2, false);
+    ASSERT(merge != NULL, "construct native Merge");
+    CHECK_OK();
+    ASSERT(lance_operation_kind(merge) == LANCE_OPERATION_MERGE,
+           "Merge operation kind");
+    CHECK_OK();
+    uint64_t merge_fragments = UINT64_MAX;
+    ASSERT(lance_operation_merge_fragment_count(merge, &merge_fragments) == 0,
+           "Merge typed fragment count");
+    CHECK_OK();
+    ASSERT(merge_fragments == 2, "Merge typed fragment count value");
+    bool preserves = true;
+    ASSERT(lance_operation_merge_preserves_nullability(merge, &preserves) == 0,
+           "Merge preserves nullability");
+    CHECK_OK();
+    ASSERT(!preserves, "Merge nullability assertion");
+    LanceTransaction *merge_transaction = lance_transaction_new(0, merge, NULL);
+    ASSERT(merge_transaction != NULL, "typed Merge transaction");
+    CHECK_OK();
+    LanceDataset *merged =
+        commit_transaction(merge_uri, merge_transaction, NULL);
+    ASSERT(lance_dataset_version(merged) == 1, "typed Merge version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(merged) == source_rows,
+           "typed Merge rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(merged) == 2,
+           "typed Merge fragments");
+    lance_dataset_close(merged);
+
+    const char *ref_path = src_uri;
+    LanceOperation *shallow =
+        lance_operation_clone_new(true, NULL, source_version, ref_path, NULL);
+    ASSERT(shallow != NULL, "construct native shallow Clone");
+    CHECK_OK();
+    ASSERT(lance_operation_kind(shallow) == LANCE_OPERATION_CLONE,
+           "Clone operation kind");
+    CHECK_OK();
+    bool is_shallow = false;
+    ASSERT(lance_operation_clone_is_shallow(shallow, &is_shallow) == 0,
+           "Clone shallow getter");
+    CHECK_OK();
+    ASSERT(is_shallow, "Clone shallow flag");
+    bool ref_present = true;
+    const char *ref_value = NULL;
+    ASSERT(lance_operation_clone_ref_name(shallow, &ref_present, &ref_value) ==
+               0,
+           "Clone ref name getter");
+    CHECK_OK();
+    ASSERT(!ref_present && ref_value == NULL, "Clone absent ref name");
+    uint64_t ref_version = 0;
+    ASSERT(lance_operation_clone_ref_version(shallow, &ref_version) == 0,
+           "Clone ref version getter");
+    CHECK_OK();
+    ASSERT(ref_version == source_version, "Clone ref version value");
+    const char *clone_path = lance_operation_clone_ref_path(shallow);
+    ASSERT(clone_path != NULL && strcmp(clone_path, ref_path) == 0,
+           "Clone ref path getter");
+    LanceTransaction *clone_transaction =
+        lance_transaction_new(source_version, shallow, NULL);
+    ASSERT(clone_transaction != NULL, "typed Clone transaction");
+    CHECK_OK();
+    LanceDataset *cloned =
+        commit_transaction(clone_uri, clone_transaction, NULL);
+    ASSERT(lance_dataset_version(cloned) == 1, "typed Clone version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(cloned) == source_rows,
+           "typed Clone rows");
+    CHECK_OK();
+    lance_dataset_close(cloned);
+
+    LanceOperation *deep =
+        lance_operation_clone_new(false, NULL, source_version, ref_path, NULL);
+    ASSERT(deep != NULL, "construct native deep Clone");
+    CHECK_OK();
+    LanceTransaction *deep_transaction =
+        lance_transaction_new(source_version, deep, NULL);
+    ASSERT(deep_transaction != NULL, "typed deep Clone transaction");
+    CHECK_OK();
+    LanceDataset *deep_dataset = NULL;
+    ASSERT(lance_transaction_commit(deep_uri, deep_transaction, NULL, NULL, NULL,
+                                    &deep_dataset) == -1,
+           "deep Clone must be rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "deep Clone error code");
+    const char *deep_message = lance_last_error_message();
+    ASSERT(deep_message != NULL &&
+               strstr(deep_message, "deep Clone cannot be committed directly") !=
+                   NULL,
+           "deep Clone native rejection message");
+    lance_free_string(deep_message);
+    ASSERT(deep_dataset == NULL, "deep Clone has no dataset output");
+
+    const char *replace_keys[] = {"owner", "empty", "added"};
+    const char *replace_values[] = {NULL, NULL, "yes"};
+    LanceUpdateMap *config_updates =
+        lance_update_map_new(replace_keys, replace_values, 3, true);
+    ASSERT(config_updates != NULL, "construct UpdateConfig config map");
+    CHECK_OK();
+    const char *table_keys[] = {"table-key"};
+    const char *table_values[] = {"table-value"};
+    LanceUpdateMap *table_updates =
+        lance_update_map_new(table_keys, table_values, 1, false);
+    ASSERT(table_updates != NULL, "construct UpdateConfig table map");
+    CHECK_OK();
+    const char *schema_keys[] = {"schema-key"};
+    const char *schema_values[] = {""};
+    LanceUpdateMap *schema_updates =
+        lance_update_map_new(schema_keys, schema_values, 1, false);
+    ASSERT(schema_updates != NULL, "construct UpdateConfig schema map");
+    CHECK_OK();
+    const char *field_keys[] = {"field-key", "field-old"};
+    const char *field_values[] = {"field-value", NULL};
+    LanceUpdateMap *field_updates =
+        lance_update_map_new(field_keys, field_values, 2, true);
+    ASSERT(field_updates != NULL, "construct UpdateConfig field map");
+    CHECK_OK();
+    LanceFieldMetadataUpdateMap field_entries[] = {
+        {seed_id_field, field_updates},
+    };
+    LanceUpdateConfigOperationOptions update_options;
+    memset(&update_options, 0, sizeof(update_options));
+    update_options.config_updates = config_updates;
+    update_options.table_metadata_updates = table_updates;
+    update_options.schema_metadata_updates = schema_updates;
+    update_options.field_metadata_updates = field_entries;
+    update_options.field_metadata_update_count = 1;
+    LanceOperation *update_config =
+        lance_operation_update_config_new(&update_options);
+    ASSERT(update_config != NULL, "construct native UpdateConfig");
+    CHECK_OK();
+    ASSERT(lance_operation_kind(update_config) == LANCE_OPERATION_UPDATE_CONFIG,
+           "UpdateConfig operation kind");
+    CHECK_OK();
+    LanceUpdateMap *typed_config_updates = NULL;
+    ASSERT(lance_operation_update_config_config_updates(update_config,
+                                                        &typed_config_updates) == 0,
+           "UpdateConfig typed config map");
+    CHECK_OK();
+    ASSERT(typed_config_updates != NULL, "UpdateConfig typed config output");
+    ASSERT(lance_update_map_count(typed_config_updates) == 3,
+           "UpdateConfig typed config entry count");
+    CHECK_OK();
+    ASSERT(lance_update_map_replace(typed_config_updates),
+           "UpdateConfig typed replace flag");
+    CHECK_OK();
+    bool has_value = false;
+    const char *map_value = NULL;
+    ASSERT(lance_update_map_value_at(typed_config_updates, 0, &has_value,
+                                     &map_value) == 0,
+           "UpdateConfig typed first entry value");
+    CHECK_OK();
+    ASSERT(!has_value && map_value == NULL,
+           "UpdateConfig typed None entry");
+    uint64_t field_update_count = UINT64_MAX;
+    ASSERT(lance_operation_update_config_field_metadata_count(
+               update_config, &field_update_count) == 0,
+           "UpdateConfig typed field count");
+    CHECK_OK();
+    ASSERT(field_update_count == 1, "UpdateConfig typed field count value");
+    int32_t update_field_id = -1;
+    LanceUpdateMap *typed_field_updates = NULL;
+    ASSERT(lance_operation_update_config_field_metadata_at(
+               update_config, 0, &update_field_id, &typed_field_updates) == 0,
+           "UpdateConfig typed field map");
+    CHECK_OK();
+    ASSERT(update_field_id == seed_id_field, "UpdateConfig field id");
+    ASSERT(lance_update_map_count(typed_field_updates) == 2,
+           "UpdateConfig field map entries");
+    lance_update_map_close(typed_field_updates);
+    lance_update_map_close(typed_config_updates);
+
+    LanceTransaction *update_transaction =
+        lance_transaction_new(1, update_config, NULL);
+    ASSERT(update_transaction != NULL, "typed UpdateConfig transaction");
+    CHECK_OK();
+    LanceDataset *updated =
+        commit_transaction(overwrite_uri, update_transaction, NULL);
+    ASSERT(lance_dataset_version(updated) == 2,
+           "typed UpdateConfig version");
+    CHECK_OK();
+    LanceDatasetConfig *updated_config = lance_dataset_config(updated);
+    ASSERT(updated_config != NULL, "typed UpdateConfig config snapshot");
+    CHECK_OK();
+    ASSERT(config_value_for_key(updated_config, "owner") == NULL,
+           "UpdateConfig replace clears existing key");
+    ASSERT(config_value_for_key(updated_config, "empty") == NULL,
+           "UpdateConfig replace clears empty value key");
+    const char *added_value = config_value_for_key(updated_config, "added");
+    ASSERT(added_value != NULL && strcmp(added_value, "yes") == 0,
+           "UpdateConfig replace inserts Some entries");
+    lance_dataset_config_close(updated_config);
+    const char *table_json = lance_dataset_metadata_json(updated);
+    ASSERT(table_json != NULL, "UpdateConfig table metadata json");
+    CHECK_OK();
+    ASSERT(strstr(table_json, "table-key") != NULL &&
+               strstr(table_json, "table-value") != NULL,
+           "UpdateConfig table metadata effect");
+    lance_free_string(table_json);
+    check_dataset_schema_metadata(updated, "schema-key", "");
+    check_field_schema_metadata(updated, 0, "field-key", "field-value");
+    check_field_schema_metadata(updated, 0, "field-old", NULL);
+
+    uint64_t deleted = 0;
+    ASSERT(lance_dataset_delete(updated, "id = 1", &deleted) == 0,
+           "typed deletion seed");
+    CHECK_OK();
+    ASSERT(deleted == 1, "typed deletion count");
+    uint64_t updated_ids[8];
+    uint64_t updated_fragment_count = lance_dataset_fragment_count(updated);
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_ids(updated, updated_ids) == 0,
+           "typed deletion fragment ids");
+    CHECK_OK();
+    LanceFragment *deleted_fragment = NULL;
+    for (uint64_t i = 0; i < updated_fragment_count; i++) {
+        LanceFragment *candidate =
+            lance_dataset_open_fragment(updated, updated_ids[i]);
+        ASSERT(candidate != NULL, "open typed deletion fragment");
+        CHECK_OK();
+        const char *candidate_json = lance_fragment_metadata_json(candidate);
+        ASSERT(candidate_json != NULL, "typed deletion fragment json");
+        bool carries_deletion =
+            strstr(candidate_json, "\"deletion_file\"") != NULL;
+        lance_free_string(candidate_json);
+        if (carries_deletion) {
+            deleted_fragment = candidate;
+            break;
+        }
+        lance_fragment_close(candidate);
+    }
+    ASSERT(deleted_fragment != NULL, "typed deletion fragment found");
+    LanceSchema *updated_schema = NULL;
+    ASSERT(lance_dataset_schema_clone(updated, &updated_schema) == 0,
+           "typed deletion schema clone");
+    CHECK_OK();
+    const LanceFragment *deletion_fragments[] = {deleted_fragment};
+    LanceOperation *deletion_overwrite = lance_operation_overwrite_new(
+        updated_schema, deletion_fragments, 1, NULL, NULL);
+    ASSERT(deletion_overwrite != NULL, "construct deletion Overwrite");
+    CHECK_OK();
+    LanceTransaction *deletion_transaction =
+        lance_transaction_new(0, deletion_overwrite, NULL);
+    ASSERT(deletion_transaction != NULL, "deletion Overwrite transaction");
+    CHECK_OK();
+    LanceDataset *rejection_dataset = NULL;
+    ASSERT(lance_transaction_commit(rejection_uri, deletion_transaction, NULL,
+                                    NULL, NULL, &rejection_dataset) == -1,
+           "deletion Overwrite must be rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "deletion Overwrite error code");
+    const char *deletion_message = lance_last_error_message();
+    ASSERT(deletion_message != NULL &&
+               strstr(deletion_message, "carries deletion file") != NULL,
+           "deletion Overwrite native rejection message");
+    lance_free_string(deletion_message);
+    ASSERT(rejection_dataset == NULL, "deletion Overwrite has no dataset");
+    lance_fragment_close(deleted_fragment);
+    lance_schema_close(updated_schema);
+    lance_operation_close(deletion_overwrite);
+    lance_transaction_close(deletion_transaction);
+
+    // Direct update-map representation keeps ordered duplicates and None.
+    const char *direct_keys[] = {"dup", "deleted", "dup", "empty"};
+    const char *direct_values[] = {"first", NULL, "second", ""};
+    LanceUpdateMap *direct =
+        lance_update_map_new(direct_keys, direct_values, 4, true);
+    ASSERT(direct != NULL, "construct ordered UpdateMap");
+    CHECK_OK();
+    ASSERT(lance_update_map_count(direct) == 4, "ordered UpdateMap count");
+    CHECK_OK();
+    ASSERT(lance_update_map_replace(direct), "ordered UpdateMap replace");
+    CHECK_OK();
+    ASSERT(strcmp(lance_update_map_key_at(direct, 0), "dup") == 0,
+           "ordered UpdateMap first key");
+    ASSERT(strcmp(lance_update_map_key_at(direct, 2), "dup") == 0,
+           "ordered UpdateMap duplicate key");
+    ASSERT(lance_update_map_key_at(direct, 4) == NULL,
+           "ordered UpdateMap out of range key");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "ordered UpdateMap out of range code");
+    bool direct_has_value = true;
+    const char *direct_value = NULL;
+    ASSERT(lance_update_map_value_at(direct, 1, &direct_has_value,
+                                     &direct_value) == 0,
+           "ordered UpdateMap None value");
+    CHECK_OK();
+    ASSERT(!direct_has_value && direct_value == NULL,
+           "ordered UpdateMap keeps None entry");
+    LanceUpdateMap *direct_clone = lance_update_map_clone(direct);
+    ASSERT(direct_clone != NULL, "clone ordered UpdateMap");
+    CHECK_OK();
+    lance_update_map_close(direct);
+    ASSERT(lance_update_map_count(direct_clone) == 4,
+           "cloned ordered UpdateMap keeps entries");
+    CHECK_OK();
+    ASSERT(strcmp(lance_update_map_key_at(direct_clone, 3), "empty") == 0,
+           "cloned ordered UpdateMap keeps order");
+    lance_update_map_close(direct_clone);
+    const char invalid_key[] = {(char)0xFF, '\0'};
+    const char *invalid_keys[] = {invalid_key};
+    ASSERT(lance_update_map_new(invalid_keys, direct_values, 1, false) == NULL,
+           "invalid UTF-8 update map key is rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid UTF-8 update map code");
+
+    lance_update_map_close(config_updates);
+    lance_update_map_close(table_updates);
+    lance_update_map_close(schema_updates);
+    lance_update_map_close(field_updates);
+    lance_dataset_close(published);
+    lance_dataset_close(updated);
+    lance_operation_close(overwrite);
+    lance_transaction_close(overwrite_transaction);
+    lance_operation_close(merge);
+    lance_transaction_close(merge_transaction);
+    lance_operation_close(shallow);
+    lance_transaction_close(clone_transaction);
+    lance_operation_close(deep);
+    lance_transaction_close(deep_transaction);
+    lance_operation_close(update_config);
+    lance_transaction_close(update_transaction);
+    lance_schema_close(schema);
+    lance_fragment_close(first);
+    lance_fragment_close(second);
+    lance_dataset_close(seed);
+    lance_transaction_close(seed_transaction);
+}
+
 int main(int argc, char **argv) {
     if (argc != 5) {
         fprintf(stderr,
@@ -2556,6 +3163,7 @@ int main(int argc, char **argv) {
     test_native_schema(argv[3]);
     test_blob_writer_publication(argv[4]);
     test_native_operation_construction(argv[1], argv[2]);
+    test_native_typed_operations(argv[1], argv[2]);
     printf("All C transaction tests passed!\n");
     return 0;
 }

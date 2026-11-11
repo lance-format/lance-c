@@ -70,6 +70,7 @@ pub mod stream_guard;
 mod transaction;
 mod transaction_properties;
 mod update;
+mod update_map;
 mod versions;
 mod writer;
 
@@ -119,5 +120,6 @@ pub use storage_options::*;
 pub use transaction::*;
 pub use transaction_properties::*;
 pub use update::*;
+pub use update_map::*;
 pub use versions::*;
 pub use writer::*;
