@@ -45381,9 +45381,9 @@ fn test_native_operation_typed_publication_paths() {
         take_last_error_message()
     );
     assert_eq!(staged_count, 1);
-    let mut staged_fragment = ptr::null_mut();
+    let mut staged_fragment: *mut LanceFragment = ptr::null_mut();
     assert_eq!(
-        unsafe { lance_operation_fragment_at(staged_operation, 0, &mut staged_fragment) },
+        unsafe { lance_operation_append_fragment_at(staged_operation, 0, &mut staged_fragment) },
         0,
         "{}",
         take_last_error_message()
@@ -45760,8 +45760,8 @@ fn test_native_operation_typed_publication_paths() {
     assert!(!updated_config.is_null());
     let mut updated_pairs = BTreeMap::new();
     for index in 0..unsafe { lance_dataset_config_count(updated_config) } {
-        let key = unsafe { lance_dataset_config_key_at(updated_config, index) };
-        let value = unsafe { lance_dataset_config_value_at(updated_config, index) };
+        let key = unsafe { lance_dataset_config_key_at(updated_config, index as usize) };
+        let value = unsafe { lance_dataset_config_value_at(updated_config, index as usize) };
         updated_pairs.insert(
             unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned(),
             unsafe { CStr::from_ptr(value) }
