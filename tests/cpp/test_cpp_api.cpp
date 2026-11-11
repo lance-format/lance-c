@@ -2324,42 +2324,58 @@ static void test_native_write_options(const std::string& src_uri,
     const std::string uri = dst_uri + "_cpp_native_options";
     const std::string staged_uri = dst_uri + "_cpp_native_staged";
     auto src = lance::Dataset::open(src_uri);
-    auto fragment_events = std::make_shared<std::size_t>(0);
-    auto stats_events = std::make_shared<std::size_t>(0);
+    const auto source_rows = src.count_rows();
+    auto fragment_events =
+        std::make_shared<std::atomic<std::size_t>>(0);
+    auto stats_events =
+        std::make_shared<std::atomic<std::size_t>>(0);
 
     {
         lance::NativeWriteOptionsSpec spec;
         spec.write.params.max_rows_per_file = 2;
         spec.enable_v2_manifest_paths = false;
+        spec.file_writer_options = lance::DatasetFileWriterOptions{
+            1024 * 1024,
+            4096,
+            false,
+        };
         spec.transaction_properties =
             std::vector<std::pair<std::string, std::string>>{
                 {"engine", "cpp-native-options"}};
         spec.progress.begin_fragment =
             [fragment_events](const lance::FragmentWriteProgressInfo&) {
-                ++*fragment_events;
+                fragment_events->fetch_add(1, std::memory_order_seq_cst);
             };
         spec.progress.complete_fragment =
             [fragment_events](const lance::FragmentWriteProgressInfo&) {
-                ++*fragment_events;
+                fragment_events->fetch_add(1, std::memory_order_seq_cst);
             };
         spec.progress.write_stats =
             [stats_events](const lance::NativeWriteStats& stats) {
-                ++*stats_events;
+                stats_events->fetch_add(1, std::memory_order_seq_cst);
                 assert(stats.rows_written > 0);
             };
 
         lance::NativeWriteOptions options(spec);
-        {
+        auto write_mode = [&](lance::WriteMode mode) {
             auto scanner = src.scan();
-            ArrowArrayStream stream;
-            memset(&stream, 0, sizeof(stream));
+            ArrowArrayStream stream{};
             scanner.to_arrow_stream(&stream);
-            auto ds = lance::Dataset::write_with_native_options(
-                uri, &stream, lance::WriteMode::Create, options);
-            assert(ds.count_rows() > 0);
-        }
-        assert(*fragment_events > 0);
-        assert(*stats_events > 0);
+            return lance::Dataset::write_with_native_options(
+                uri, &stream, mode, options);
+        };
+
+        auto created = write_mode(lance::WriteMode::Create);
+        assert(created.count_rows() == source_rows);
+        auto appended = write_mode(lance::WriteMode::Append);
+        assert(appended.count_rows() == source_rows * 2);
+        auto overwritten = write_mode(lance::WriteMode::Overwrite);
+        assert(overwritten.count_rows() == source_rows);
+        assert(overwritten.read_transaction().has_value());
+        assert(overwritten.read_transaction()->properties().at("engine") ==
+               "cpp-native-options");
+        assert(fragment_events->load(std::memory_order_seq_cst) > 0);
+        assert(stats_events->load(std::memory_order_seq_cst) > 0);
 
         {
             auto scanner = src.scan();
@@ -2371,18 +2387,443 @@ static void test_native_write_options(const std::string& src_uri,
             assert(transaction.has_properties());
             assert(transaction.properties().at("engine") == "cpp-native-options");
             auto committed = lance::Dataset::commit(staged_uri, transaction);
-            assert(committed.count_rows() > 0);
+            assert(committed.count_rows() == source_rows);
+            assert(committed.read_transaction().has_value());
+            assert(committed.read_transaction()->properties().at("engine") ==
+                   "cpp-native-options");
         }
     }
 
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        if (fragment_events.use_count() == 1 &&
+            stats_events.use_count() == 1) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     assert(fragment_events.use_count() == 1);
     assert(stats_events.use_count() == 1);
 
     auto reopened = lance::Dataset::open(uri);
-    assert(reopened.count_rows() == src.count_rows());
+    assert(reopened.count_rows() == source_rows);
+    assert(reopened.read_transaction().has_value());
+    assert(reopened.read_transaction()->properties().at("engine") ==
+           "cpp-native-options");
     auto staged = lance::Dataset::open(staged_uri);
-    assert(staged.count_rows() == src.count_rows());
+    assert(staged.count_rows() == source_rows);
+    assert(staged.read_transaction().has_value());
+    assert(staged.read_transaction()->properties().at("engine") ==
+           "cpp-native-options");
 
+    PASS();
+}
+
+ArrowArrayStream native_write_source_stream(const std::string& uri) {
+    auto source = lance::Dataset::open(uri);
+    auto scanner = source.scan();
+    ArrowArrayStream stream{};
+    scanner.to_arrow_stream(&stream);
+    return stream;
+}
+
+std::vector<std::optional<uint32_t>> native_write_file_base_ids(
+    const lance::Dataset& dataset) {
+    std::vector<std::optional<uint32_t>> base_ids;
+    for (auto fragment_id : dataset.fragment_ids()) {
+        auto fragment = dataset.open_fragment(fragment_id);
+        for (std::size_t index = 0; index < fragment.data_file_count();
+             ++index) {
+            base_ids.push_back(fragment.data_file_at(index).base_id());
+        }
+    }
+    return base_ids;
+}
+
+struct NativeWriteLockState {
+    std::atomic<int> acquires{0};
+    std::atomic<int> releases{0};
+    std::atomic<int> release_true{0};
+    std::atomic<bool> fail_release_once{false};
+};
+
+class NativeWriteLease final : public lance::CommitLease {
+    std::shared_ptr<NativeWriteLockState> state_;
+    bool released_ = false;
+
+public:
+    explicit NativeWriteLease(std::shared_ptr<NativeWriteLockState> state)
+        : state_(std::move(state)) {}
+
+    void release(bool success) override {
+        state_->releases.fetch_add(1, std::memory_order_seq_cst);
+        if (success) {
+            state_->release_true.fetch_add(1, std::memory_order_seq_cst);
+        }
+        released_ = true;
+        if (state_->fail_release_once.exchange(
+                false, std::memory_order_seq_cst)) {
+            throw lance::Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "cpp native write lease release failed after publication");
+        }
+    }
+
+    ~NativeWriteLease() noexcept override { assert(released_); }
+};
+
+lance::CommitLock make_native_write_lock(
+    const std::shared_ptr<NativeWriteLockState>& state) {
+    return lance::CommitLock(
+        [state](uint64_t) -> std::unique_ptr<lance::CommitLease> {
+            state->acquires.fetch_add(1, std::memory_order_seq_cst);
+            return std::unique_ptr<lance::CommitLease>(
+                new NativeWriteLease(state));
+        });
+}
+
+static void test_native_write_base_and_presence(
+    const std::string& src_uri,
+    const std::string& dst_uri) {
+    TEST(test_native_write_base_and_presence);
+
+    auto source = lance::Dataset::open(src_uri);
+    const auto source_rows = source.count_rows();
+    const std::string uri = dst_uri + "_cpp_native_bases";
+    const std::string base_uri = dst_uri + "_cpp_native_registered_base";
+
+    std::vector<std::optional<uint32_t>> before;
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.max_rows_per_file = 5;
+        spec.initial_bases = std::vector<lance::BasePath>{
+            lance::BasePath{
+                7,
+                base_uri,
+                std::string("cpp-registered"),
+                false,
+            },
+        };
+        spec.target_bases = std::vector<uint32_t>{7};
+        lance::DatasetBaseStoreParams store;
+        store.base_path = base_uri;
+        store.block_size = 4096;
+        spec.base_store_params =
+            std::vector<lance::DatasetBaseStoreParams>{store};
+        lance::NativeWriteOptions options(spec);
+
+        auto stream = native_write_source_stream(src_uri);
+        auto created = lance::Dataset::write_with_native_options(
+            uri, &stream, lance::WriteMode::Create, options);
+        assert(created.count_rows() == source_rows);
+        before = native_write_file_base_ids(created);
+        assert(!before.empty());
+        for (const auto& base_id : before) {
+            assert(base_id == std::optional<uint32_t>(7));
+        }
+        assert(created.base_paths_json().find("\"7\"") != std::string::npos);
+    }
+
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.max_rows_per_file = 5;
+        lance::NativeWriteOptions options(spec);
+        auto stream = native_write_source_stream(src_uri);
+        auto appended = lance::Dataset::write_with_native_options(
+            uri, &stream, lance::WriteMode::Append, options);
+        assert(appended.count_rows() == source_rows * 2);
+        auto after = native_write_file_base_ids(appended);
+        assert(after.size() > before.size());
+        for (std::size_t index = before.size(); index < after.size();
+             ++index) {
+            assert(!after[index].has_value());
+        }
+    }
+
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.target_bases = std::vector<uint32_t>{};
+        lance::NativeWriteOptions options(spec);
+        bool caught = false;
+        try {
+            auto stream = native_write_source_stream(src_uri);
+            auto rejected = lance::Dataset::write_with_native_options(
+                uri, &stream, lance::WriteMode::Append, options);
+            (void)rejected;
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::strstr(error.what(), "target_bases cannot be empty") !=
+                   nullptr);
+        }
+        assert(caught);
+    }
+
+    auto reopened = lance::Dataset::open(uri);
+    assert(reopened.count_rows() == source_rows * 2);
+    PASS();
+}
+
+static void test_native_write_data_option_errors(
+    const std::string& src_uri,
+    const std::string& dst_uri) {
+    TEST(test_native_write_data_option_errors);
+
+    const std::string file_uri = dst_uri + "_cpp_native_file_error";
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.data_storage_version = "2.2";
+        spec.file_writer_options = lance::DatasetFileWriterOptions{
+            1024 * 1024,
+            0,
+            false,
+        };
+        lance::NativeWriteOptions options(spec);
+        bool caught = false;
+        try {
+            auto stream = native_write_source_stream(src_uri);
+            auto rejected = lance::Dataset::write_with_native_options(
+                file_uri, &stream, lance::WriteMode::Create, options);
+            (void)rejected;
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            if (std::strstr(error.what(), "max_page_bytes") == nullptr) {
+                std::fprintf(
+                    stderr,
+                    "unexpected file-writer error: %s\n",
+                    error.what());
+            }
+            assert(std::strstr(error.what(), "max_page_bytes") != nullptr);
+        }
+        assert(caught);
+    }
+
+    const std::string output_uri = dst_uri + "_cpp_native_blob_error";
+    uint64_t baseline_rows = 0;
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.data_storage_version = "2.2";
+        spec.blob_pack_file_size_threshold = 1;
+        lance::NativeWriteOptions options(spec);
+        auto stream = native_write_source_stream(src_uri);
+        auto created = lance::Dataset::write_with_native_options(
+            output_uri, &stream, lance::WriteMode::Create, options);
+        baseline_rows = created.count_rows();
+        assert(baseline_rows > 0);
+    }
+
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.data_storage_version = "2.2";
+        spec.allow_external_blob_outside_bases = true;
+        spec.external_blob_mode = lance::ExternalBlobMode::Ingest;
+        lance::NativeWriteOptions options(spec);
+        bool caught = false;
+        try {
+            auto stream = native_write_source_stream(src_uri);
+            auto rejected = lance::Dataset::write_with_native_options(
+                output_uri, &stream, lance::WriteMode::Append, options);
+            (void)rejected;
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::strstr(
+                       error.what(),
+                       "allow_external_blob_outside_bases") != nullptr);
+        }
+        assert(caught);
+    }
+
+    auto reopened = lance::Dataset::open(output_uri);
+    assert(reopened.count_rows() == baseline_rows);
+    PASS();
+}
+
+static void test_native_write_progress_errors(
+    const std::string& src_uri,
+    const std::string& dst_uri) {
+    TEST(test_native_write_progress_errors);
+
+    const std::string baseline_uri = dst_uri + "_cpp_native_progress";
+    auto source = lance::Dataset::open(src_uri);
+    const auto source_rows = source.count_rows();
+    {
+        lance::NativeWriteOptionsSpec spec;
+        lance::NativeWriteOptions options(spec);
+        auto stream = native_write_source_stream(src_uri);
+        auto created = lance::Dataset::write_with_native_options(
+            baseline_uri, &stream, lance::WriteMode::Create, options);
+        assert(created.count_rows() == source_rows);
+    }
+
+    {
+        auto capture = std::make_shared<std::atomic<std::size_t>>(0);
+        {
+            lance::NativeWriteOptionsSpec spec;
+            spec.progress.begin_fragment =
+                [capture](const lance::FragmentWriteProgressInfo&) {
+                    capture->fetch_add(1, std::memory_order_seq_cst);
+                    throw lance::Error(
+                        LANCE_ERR_INVALID_ARGUMENT,
+                        "cpp native write progress refused fragment");
+                };
+            lance::NativeWriteOptions options(spec);
+            bool caught = false;
+            try {
+                auto stream = native_write_source_stream(src_uri);
+                auto rejected = lance::Dataset::write_with_native_options(
+                    baseline_uri,
+                    &stream,
+                    lance::WriteMode::Append,
+                    options);
+                (void)rejected;
+            } catch (const lance::Error& error) {
+                caught = true;
+                assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+                assert(std::strstr(
+                           error.what(),
+                           "cpp native write progress refused") != nullptr);
+            }
+            assert(caught);
+            assert(capture->load(std::memory_order_seq_cst) > 0);
+        }
+        for (int attempt = 0; attempt < 10000; ++attempt) {
+            if (capture.use_count() == 1) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        assert(capture.use_count() == 1);
+    }
+
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.progress.begin_fragment =
+            [](const lance::FragmentWriteProgressInfo&) {
+                throw std::runtime_error(
+                    "cpp native write progress runtime exception");
+            };
+        lance::NativeWriteOptions options(spec);
+        bool caught = false;
+        try {
+            auto stream = native_write_source_stream(src_uri);
+            auto rejected = lance::Dataset::write_with_native_options(
+                baseline_uri,
+                &stream,
+                lance::WriteMode::Append,
+                options);
+            (void)rejected;
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INTERNAL);
+            assert(std::strstr(
+                       error.what(),
+                       "cpp native write progress runtime exception") !=
+                   nullptr);
+        }
+        assert(caught);
+    }
+
+    auto stats_calls =
+        std::make_shared<std::atomic<std::size_t>>(0);
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.progress.write_stats =
+            [stats_calls](const lance::NativeWriteStats&) {
+                stats_calls->fetch_add(1, std::memory_order_seq_cst);
+                throw std::runtime_error(
+                    "stats callback exceptions have no native error channel");
+            };
+        lance::NativeWriteOptions options(spec);
+        auto stream = native_write_source_stream(src_uri);
+        auto appended = lance::Dataset::write_with_native_options(
+            baseline_uri, &stream, lance::WriteMode::Append, options);
+        assert(appended.count_rows() == source_rows * 2);
+    }
+    assert(stats_calls->load(std::memory_order_seq_cst) > 0);
+
+    auto reopened = lance::Dataset::open(baseline_uri);
+    assert(reopened.count_rows() == source_rows * 2);
+    PASS();
+}
+
+static void test_native_write_owner_lifetime_and_commit_error(
+    const std::string& src_uri,
+    const std::string& dst_uri) {
+    TEST(test_native_write_owner_lifetime_and_commit_error);
+
+    auto source = lance::Dataset::open(src_uri);
+    const auto source_rows = source.count_rows();
+    const std::string uri = dst_uri + "_cpp_native_owners";
+    auto lock_state = std::make_shared<NativeWriteLockState>();
+    std::weak_ptr<NativeWriteLockState> lock_weak = lock_state;
+    auto progress_state =
+        std::make_shared<std::atomic<std::size_t>>(0);
+    std::weak_ptr<std::atomic<std::size_t>> progress_weak = progress_state;
+
+    std::optional<lance::NativeWriteOptions> options;
+    {
+        lance::Session session(4 * 1024 * 1024, 1024 * 1024);
+        lance::StorageOptionsAccessor accessor(
+            std::optional<lance::StorageOptions>{lance::StorageOptions{}},
+            nullptr);
+        lance::CommitLock source_lock =
+            make_native_write_lock(lock_state);
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.max_rows_per_file = 4;
+        spec.session = &session;
+        spec.storage_options_accessor = &accessor;
+        spec.commit_lock = &source_lock;
+        spec.progress.begin_fragment =
+            [progress_state](const lance::FragmentWriteProgressInfo&) {
+                progress_state->fetch_add(1, std::memory_order_seq_cst);
+            };
+        spec.progress.write_stats =
+            [progress_state](const lance::NativeWriteStats&) {
+                progress_state->fetch_add(1, std::memory_order_seq_cst);
+            };
+        options.emplace(spec);
+    }
+    lock_state.reset();
+    progress_state.reset();
+
+    {
+        auto stream = native_write_source_stream(src_uri);
+        auto created = lance::Dataset::write_with_native_options(
+            uri, &stream, lance::WriteMode::Create, *options);
+        assert(created.count_rows() == source_rows);
+    }
+    auto state = lock_weak.lock();
+    assert(state);
+    assert(state->acquires.load(std::memory_order_seq_cst) > 0);
+    assert(state->release_true.load(std::memory_order_seq_cst) > 0);
+    state->fail_release_once.store(true, std::memory_order_seq_cst);
+    state.reset();
+
+    bool caught = false;
+    try {
+        auto stream = native_write_source_stream(src_uri);
+        auto failed = lance::Dataset::write_with_native_options(
+            uri, &stream, lance::WriteMode::Append, *options);
+        (void)failed;
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        assert(std::strstr(
+                   error.what(),
+                   "lease release failed after publication") != nullptr);
+    }
+    assert(caught);
+
+    {
+        auto reopened = lance::Dataset::open(uri);
+        assert(reopened.count_rows() == source_rows * 2);
+    }
+    options.reset();
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        if (lock_weak.expired() && progress_weak.expired()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(lock_weak.expired());
+    assert(progress_weak.expired());
     PASS();
 }
 
@@ -5012,6 +5453,10 @@ int main(int argc, char** argv) {
     test_dataset_deep_clone(fragment_read_uri);
     test_write_options_and_config(uri, write_uri);
     test_native_write_options(uri, write_uri);
+    test_native_write_base_and_presence(uri, write_uri);
+    test_native_write_data_option_errors(uri, write_uri);
+    test_native_write_progress_errors(uri, write_uri);
+    test_native_write_owner_lifetime_and_commit_error(uri, write_uri);
     test_data_statistics(write_uri);
     test_diagnostics(uri);
     test_config_replacement(config_base_uri);
