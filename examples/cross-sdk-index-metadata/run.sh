@@ -39,13 +39,6 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   -llance_c \
   -o "${work_dir}/producer"
 
-"${work_dir}/producer" create "${work_dir}/dist"
-cp -a "${work_dir}/dist" "${work_dir}/baseline"
-"${work_dir}/producer" build "${work_dir}/dist" "${work_dir}/metadata" \
-  | tee "${work_dir}/producer.log"
-
-sha256sum "${work_dir}"/metadata/*.pb | tee "${work_dir}/metadata.sha256"
-
 {
   java -version
   mvn -version
@@ -59,11 +52,34 @@ mvn -B -ntp -f "${example_dir}/java/pom.xml" dependency:tree \
 mvn -B -ntp -f "${example_dir}/java/pom.xml" dependency:build-classpath \
   -Dmdep.outputFile="${work_dir}/java-classpath.txt"
 
+"${work_dir}/producer" create "${work_dir}/btree-dist"
+cp -a "${work_dir}/btree-dist" "${work_dir}/btree-baseline"
+"${work_dir}/producer" build "${work_dir}/btree-dist" "${work_dir}/btree-metadata" \
+  | tee "${work_dir}/btree-producer.log"
+sha256sum "${work_dir}"/btree-metadata/*.pb | tee "${work_dir}/btree-metadata.sha256"
+
 java \
   --add-opens=java.base/java.nio=ALL-UNNAMED \
   -cp "${example_dir}/java/target/classes:$(<"${work_dir}/java-classpath.txt")" \
   org.lance.crosssdk.CrossSdkAcceptance \
-  "${work_dir}/dist" \
-  "${work_dir}/baseline" \
-  "${work_dir}/metadata" \
-  | tee "${work_dir}/java-acceptance.log"
+  btree \
+  "${work_dir}/btree-dist" \
+  "${work_dir}/btree-baseline" \
+  "${work_dir}/btree-metadata" \
+  | tee "${work_dir}/btree-java-acceptance.log"
+
+"${work_dir}/producer" create-vector "${work_dir}/vector-dist"
+cp -a "${work_dir}/vector-dist" "${work_dir}/vector-baseline"
+"${work_dir}/producer" build-vector "${work_dir}/vector-dist" "${work_dir}/vector-metadata" \
+  | tee "${work_dir}/vector-producer.log"
+sha256sum "${work_dir}"/vector-metadata/*.pb | tee "${work_dir}/vector-metadata.sha256"
+
+java \
+  --add-opens=java.base/java.nio=ALL-UNNAMED \
+  -cp "${example_dir}/java/target/classes:$(<"${work_dir}/java-classpath.txt")" \
+  org.lance.crosssdk.CrossSdkAcceptance \
+  ivfpq \
+  "${work_dir}/vector-dist" \
+  "${work_dir}/vector-baseline" \
+  "${work_dir}/vector-metadata" \
+  | tee "${work_dir}/vector-java-acceptance.log"

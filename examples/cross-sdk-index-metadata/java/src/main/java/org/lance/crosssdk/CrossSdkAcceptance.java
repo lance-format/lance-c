@@ -3,20 +3,28 @@
 
 package org.lance.crosssdk;
 
+import com.google.protobuf.Any;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.Float4Vector;
+import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ReadOptions;
+import org.lance.crosssdk.proto.VectorIndexDetailsProto.VectorIndexDetails;
+import org.lance.crosssdk.proto.VectorIndexDetailsProto.VectorMetricType;
+import org.lance.index.DistanceType;
 import org.lance.index.Index;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
+import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.LanceScanner;
+import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
 import org.lance.ipc.ScanStats;
 
@@ -38,8 +46,18 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 public final class CrossSdkAcceptance {
-  private static final String INDEX_NAME = "btree_cross_sdk";
-  private static final String COLUMN = "id";
+  private static final String BTREE_INDEX_NAME = "btree_cross_sdk";
+  private static final String BTREE_COLUMN = "id";
+
+  private static final String VECTOR_INDEX_NAME = "ivfpq_cross_sdk";
+  private static final String VECTOR_COLUMN = "embedding";
+  private static final int VECTOR_FIELD_ID = 1;
+  private static final int VECTOR_DIMENSION = 8;
+  private static final int VECTOR_PARTITIONS = 4;
+  private static final int VECTOR_SUB_VECTORS = 2;
+  private static final int VECTOR_BITS = 4;
+  private static final int VECTOR_REFINE_FACTOR = 256;
+  private static final int VECTOR_K = 4;
 
   private CrossSdkAcceptance() {}
 
@@ -59,6 +77,30 @@ public final class CrossSdkAcceptance {
 
     QueryResult(List<Long> ids, ScanStats stats) {
       this.ids = ids;
+      this.stats = stats;
+    }
+  }
+
+  private static final class VectorQueryCase {
+    final int keyId;
+    final List<Integer> expectedIds;
+    final List<Float> expectedDistances;
+
+    VectorQueryCase(int keyId, List<Integer> expectedIds, List<Float> expectedDistances) {
+      this.keyId = keyId;
+      this.expectedIds = expectedIds;
+      this.expectedDistances = expectedDistances;
+    }
+  }
+
+  private static final class VectorQueryResult {
+    final List<Integer> ids;
+    final List<Float> distances;
+    final ScanStats stats;
+
+    VectorQueryResult(List<Integer> ids, List<Float> distances, ScanStats stats) {
+      this.ids = ids;
+      this.distances = distances;
       this.stats = stats;
     }
   }
@@ -104,11 +146,93 @@ public final class CrossSdkAcceptance {
     return result;
   }
 
+  private static void assertArrayEqualsBytes(byte[] expected, byte[] actual, String message) {
+    if (!Arrays.equals(expected, actual)) {
+      throw new IllegalStateException(message);
+    }
+  }
+
+  private static String anyTypeUrl(byte[] bytes) {
+    try {
+      return Any.parseFrom(bytes).getTypeUrl();
+    } catch (Exception e) {
+      throw new IllegalStateException("invalid serialized google.protobuf.Any", e);
+    }
+  }
+
+  private static List<Index> decodeSegments(
+      Path metadataPath,
+      String indexName,
+      long datasetVersion,
+      List<Integer> expectedFragments,
+      List<Integer> expectedFields,
+      int expectedIndexVersion,
+      String detailsSuffix)
+      throws IOException {
+    List<byte[]> payloads = new ArrayList<>();
+    for (int segment = 0; segment < 2; ++segment) {
+      byte[] bytes = readBytes(metadataPath.resolve("segment-" + segment + ".pb"));
+      payloads.add(bytes);
+      System.out.printf(
+          "metadata segment=%d bytes=%d sha256=%s%n", segment, bytes.length, sha256(bytes));
+    }
+
+    List<Index> produced = new ArrayList<>();
+    Set<Integer> union = new HashSet<>();
+    for (int segment = 0; segment < payloads.size(); ++segment) {
+      Index index = CrossSdkIndexMetadataAdapter.toJavaIndex(payloads.get(segment));
+      produced.add(index);
+      require(!index.getFiles().isPresent(), "test adapter must not supply input files");
+      require(!index.getSizeBytes().isPresent(), "test adapter must not supply input sizeBytes");
+      require(indexName.equals(index.name()), "unexpected decoded index name");
+      require(index.datasetVersion() == datasetVersion, "decoded dataset version changed");
+      require(index.fields().equals(expectedFields), "decoded field ids changed");
+      require(index.coveringFields().isEmpty(), "covering fields must remain empty");
+      require(index.indexVersion() == expectedIndexVersion, "decoded index version changed");
+      require(index.fragments().isPresent(), "decoded fragment coverage is missing");
+      require(
+          index.indexDetails().isPresent()
+              && anyTypeUrl(index.indexDetails().orElseThrow()).endsWith(detailsSuffix),
+          "decoded Any type URL does not match " + detailsSuffix);
+      Set<Integer> fragmentIds = coverage(index);
+      require(fragmentIds.size() == 1, "each decoded segment must cover one fragment");
+      require(Collections.disjoint(union, fragmentIds), "decoded segment coverage overlaps");
+      union.addAll(fragmentIds);
+      System.out.printf(
+          "decoded segment=%d uuid=%s fields=%s covering=%s dataset_version=%d "
+              + "fragments=%s index_version=%d any_bytes=%d created_at=%s%n",
+          segment,
+          index.uuid(),
+          index.fields(),
+          index.coveringFields(),
+          index.datasetVersion(),
+          index.fragments().orElseThrow(),
+          index.indexVersion(),
+          index.indexDetails().orElseThrow().length,
+          index.createdAt());
+    }
+
+    require(
+        !produced.get(0).uuid().equals(produced.get(1).uuid()),
+        "C producer returned duplicate UUIDs");
+    require(
+        produced.get(0).fields().equals(produced.get(1).fields()),
+        "C-produced segments disagree on indexed fields");
+    require(
+        union.equals(new HashSet<>(expectedFragments)),
+        "C-produced coverage does not match fixture fragments: " + union);
+    return produced;
+  }
+
   private static void validateSegments(
       List<Index> segments,
+      String indexName,
       List<Integer> expectedFragments,
       List<Integer> expectedFields,
       long datasetVersion,
+      int expectedIndexVersion,
+      IndexType expectedIndexType,
+      String detailsSuffix,
       Map<UUID, Index> produced,
       boolean requirePublishedFiles) {
     require(segments.size() == 2, "expected two physical segments, got " + segments.size());
@@ -118,12 +242,18 @@ public final class CrossSdkAcceptance {
 
     Set<Integer> union = new HashSet<>();
     for (Index segment : segments) {
-      require(INDEX_NAME.equals(segment.name()), "unexpected committed index name");
+      require(indexName.equals(segment.name()), "unexpected committed index name");
       require(segment.datasetVersion() == datasetVersion, "segment dataset version changed");
-      require(segment.indexVersion() == 0, "BTree index version must remain 0");
+      require(
+          segment.indexVersion() == expectedIndexVersion,
+          "segment index version changed: expected " + expectedIndexVersion);
       require(segment.fields().equals(expectedFields), "indexed field ids changed");
       require(segment.coveringFields().isEmpty(), "covering fields must remain empty");
       require(segment.fragments().isPresent(), "fragment coverage is missing");
+      require(
+          segment.indexDetails().isPresent()
+              && anyTypeUrl(segment.indexDetails().orElseThrow()).endsWith(detailsSuffix),
+          "committed Any type URL does not match " + detailsSuffix);
       Set<Integer> fragmentIds = coverage(segment);
       require(fragmentIds.size() == 1, "each segment must cover one fixture fragment");
       require(Collections.disjoint(union, fragmentIds), "segment coverage overlaps");
@@ -147,7 +277,9 @@ public final class CrossSdkAcceptance {
                 .allMatch(file -> !file.getPath().isEmpty() && file.getSizeBytes() >= 0),
             "committed index file entry is invalid");
         require(segment.createdAt().isPresent(), "commit did not record createdAt");
-        require(segment.indexType() == IndexType.BTREE, "committed index type is not BTREE");
+        require(
+            segment.indexType() == expectedIndexType,
+            "committed index type is not " + expectedIndexType);
       }
     }
     require(
@@ -155,22 +287,16 @@ public final class CrossSdkAcceptance {
         "committed coverage does not match fixture fragments: " + union);
   }
 
-  private static void assertArrayEqualsBytes(byte[] expected, byte[] actual, String message) {
-    if (!Arrays.equals(expected, actual)) {
-      throw new IllegalStateException(message);
-    }
-  }
-
-  private static List<Index> namedSegments(Dataset dataset) {
+  private static List<Index> namedSegments(Dataset dataset, String indexName) {
     return dataset.getIndexes().stream()
-        .filter(index -> INDEX_NAME.equals(index.name()))
+        .filter(index -> indexName.equals(index.name()))
         .collect(Collectors.toList());
   }
 
-  private static QueryResult runQuery(Dataset dataset, String filter) {
+  private static QueryResult runScalarQuery(Dataset dataset, String filter) {
     ScanOptions options =
         new ScanOptions.Builder()
-            .columns(List.of(COLUMN))
+            .columns(List.of(BTREE_COLUMN))
             .filter(filter)
             .batchSize(1024)
             .useScalarIndex(true)
@@ -184,7 +310,7 @@ public final class CrossSdkAcceptance {
       try (ArrowReader reader = scanner.scanBatches()) {
         while (reader.loadNextBatch()) {
           VectorSchemaRoot root = reader.getVectorSchemaRoot();
-          BigIntVector vector = (BigIntVector) root.getVector(COLUMN);
+          BigIntVector vector = (BigIntVector) root.getVector(BTREE_COLUMN);
           for (int row = 0; row < root.getRowCount(); ++row) {
             require(!vector.isNull(row), "fixture id column must not contain nulls");
             ids.add(vector.get(row));
@@ -202,19 +328,16 @@ public final class CrossSdkAcceptance {
     Collections.sort(ids);
     if (stats.getIndicesLoaded() == 0 && stats.getIndexComparisons() == 0) {
       throw new IllegalStateException(
-          "query did not exercise a scalar index for filter "
-              + filter
-              + ": "
-              + stats);
+          "query did not exercise a scalar index for filter " + filter + ": " + stats);
     }
     return new QueryResult(ids, stats);
   }
 
-  private static void runQueries(
+  private static void runScalarQueries(
       Dataset crossSdkDataset, Dataset baselineDataset, List<QueryCase> cases) {
     for (QueryCase query : cases) {
-      QueryResult crossSdk = runQuery(crossSdkDataset, query.filter);
-      QueryResult baseline = runQuery(baselineDataset, query.filter);
+      QueryResult crossSdk = runScalarQuery(crossSdkDataset, query.filter);
+      QueryResult baseline = runScalarQuery(baselineDataset, query.filter);
 
       require(
           crossSdk.ids.equals(query.expected),
@@ -253,55 +376,166 @@ public final class CrossSdkAcceptance {
     }
   }
 
-  public static void main(String[] args) throws Exception {
-    if (args.length != 3) {
-      throw new IllegalArgumentException(
-          "usage: CrossSdkAcceptance <cross-sdk-dataset> <baseline-dataset> <metadata-directory>");
-    }
-    Path crossSdkPath = Path.of(args[0]).toAbsolutePath();
-    Path baselinePath = Path.of(args[1]).toAbsolutePath();
-    Path metadataPath = Path.of(args[2]).toAbsolutePath();
+  private static float[] fixtureVector(int id) {
+    float[] vector = new float[VECTOR_DIMENSION];
+    vector[0] = (id * 3) % 29;
+    vector[1] = (id * 5) % 31;
+    vector[2] = (id * 7) % 37;
+    vector[3] = (id * 11) % 41;
+    return vector;
+  }
 
-    List<byte[]> payloads = new ArrayList<>();
-    for (int segment = 0; segment < 2; ++segment) {
-      byte[] bytes = readBytes(metadataPath.resolve("segment-" + segment + ".pb"));
-      payloads.add(bytes);
+  private static VectorQueryResult runVectorQuery(Dataset dataset, float[] key) {
+    Query query =
+        new Query.Builder()
+            .setColumn(VECTOR_COLUMN)
+            .setKey(key)
+            .setK(VECTOR_K)
+            .setNprobes(VECTOR_PARTITIONS)
+            .setRefineFactor(VECTOR_REFINE_FACTOR)
+            .setDistanceType(DistanceType.L2)
+            .setUseIndex(true)
+            .build();
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .columns(List.of("id"))
+            .nearest(query)
+            .batchSize(1024)
+            .fastSearch(true)
+            .collectStats(true)
+            .build();
+
+    List<Integer> ids = new ArrayList<>();
+    List<Float> distances = new ArrayList<>();
+    ScanStats stats;
+    try (LanceScanner scanner = dataset.newScan(options)) {
+      try (ArrowReader reader = scanner.scanBatches()) {
+        while (reader.loadNextBatch()) {
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          IntVector idVector = (IntVector) root.getVector("id");
+          Float4Vector distanceVector = (Float4Vector) root.getVector("_distance");
+          require(
+              idVector.getValueCount() == distanceVector.getValueCount(),
+              "vector id and distance columns have different row counts");
+          for (int row = 0; row < idVector.getValueCount(); ++row) {
+            require(!idVector.isNull(row), "vector fixture id must not contain nulls");
+            require(!distanceVector.isNull(row), "vector distance must not contain nulls");
+            ids.add(idVector.get(row));
+            distances.add(distanceVector.get(row));
+          }
+        }
+      }
+      stats =
+          scanner
+              .getStats()
+              .orElseThrow(() -> new IllegalStateException("scan stats were not collected"));
+    } catch (Exception e) {
+      throw new IllegalStateException("indexed vector scan failed", e);
+    }
+
+    if (stats.getPartsLoaded() == 0
+        && stats.getIndicesLoaded() == 0
+        && stats.getIndexComparisons() == 0) {
+      throw new IllegalStateException("vector query did not load an index: " + stats);
+    }
+    return new VectorQueryResult(ids, distances, stats);
+  }
+
+  private static void requireExpectedDistances(
+      List<Float> actual, List<Float> expected, String description) {
+    require(
+        actual.size() == expected.size(),
+        description + " returned " + actual.size() + " distances, expected " + expected.size());
+    for (int i = 0; i < expected.size(); ++i) {
+      require(
+          Math.abs(actual.get(i) - expected.get(i)) <= 1e-6f,
+          description
+              + " distance "
+              + i
+              + " was "
+              + actual.get(i)
+              + ", expected "
+              + expected.get(i));
+    }
+  }
+
+  private static void runVectorQueries(
+      Dataset crossSdkDataset, Dataset baselineDataset, List<VectorQueryCase> cases) {
+    for (VectorQueryCase query : cases) {
+      VectorQueryResult crossSdk = runVectorQuery(crossSdkDataset, fixtureVector(query.keyId));
+      VectorQueryResult baseline = runVectorQuery(baselineDataset, fixtureVector(query.keyId));
+
+      require(
+          crossSdk.ids.equals(query.expectedIds),
+          "C/Java vector path returned "
+              + crossSdk.ids
+              + " for fixture id "
+              + query.keyId
+              + ", expected "
+              + query.expectedIds);
+      requireExpectedDistances(
+          crossSdk.distances, query.expectedDistances, "C/Java vector path");
+      require(
+          baseline.ids.equals(query.expectedIds),
+          "Java one-shot vector path returned "
+              + baseline.ids
+              + " for fixture id "
+              + query.keyId
+              + ", expected "
+              + query.expectedIds);
+      requireExpectedDistances(
+          baseline.distances, query.expectedDistances, "Java one-shot vector path");
+      require(
+          crossSdk.ids.equals(baseline.ids),
+          "C/Java vector path differs from Java one-shot for fixture id " + query.keyId);
+      requireExpectedDistances(
+          crossSdk.distances,
+          baseline.distances,
+          "C/Java vector distances differ from Java one-shot");
+
       System.out.printf(
-          "metadata segment=%d bytes=%d sha256=%s%n", segment, bytes.length, sha256(bytes));
+          "vector_query key_id=%d expected_ids=%s expected_distances=%s "
+              + "cross_ids=%s cross_distances=%s baseline_ids=%s baseline_distances=%s "
+              + "cross_parts_loaded=%d cross_indices_loaded=%d "
+              + "cross_index_comparisons=%d baseline_parts_loaded=%d "
+              + "baseline_indices_loaded=%d baseline_index_comparisons=%d%n",
+          query.keyId,
+          query.expectedIds,
+          query.expectedDistances,
+          crossSdk.ids,
+          crossSdk.distances,
+          baseline.ids,
+          baseline.distances,
+          crossSdk.stats.getPartsLoaded(),
+          crossSdk.stats.getIndicesLoaded(),
+          crossSdk.stats.getIndexComparisons(),
+          baseline.stats.getPartsLoaded(),
+          baseline.stats.getIndicesLoaded(),
+          baseline.stats.getIndexComparisons());
+      System.out.println("cross_scan_stats=" + crossSdk.stats);
+      System.out.println("baseline_scan_stats=" + baseline.stats);
     }
+  }
 
-    List<Index> produced = new ArrayList<>();
-    for (int segment = 0; segment < payloads.size(); ++segment) {
-      Index index = CrossSdkIndexMetadataAdapter.toJavaIndex(payloads.get(segment));
-      produced.add(index);
-      require(!index.getFiles().isPresent(), "test adapter must not supply input files");
-      require(!index.getSizeBytes().isPresent(), "test adapter must not supply input sizeBytes");
-      System.out.printf(
-          "decoded segment=%d uuid=%s fields=%s covering=%s dataset_version=%d "
-              + "fragments=%s index_version=%d any_bytes=%d created_at=%s%n",
-          segment,
-          index.uuid(),
-          index.fields(),
-          index.coveringFields(),
-          index.datasetVersion(),
-          index.fragments().orElseThrow(),
-          index.indexVersion(),
-          index.indexDetails().orElseThrow().length,
-          index.createdAt());
-    }
-    require(
-        !produced.get(0).uuid().equals(produced.get(1).uuid()),
-        "C producer returned duplicate UUIDs");
-    require(
-        Collections.disjoint(
-            coverage(produced.get(0)), coverage(produced.get(1))),
-        "C-produced segment coverage overlaps");
-    List<Integer> fixtureFields = produced.get(0).fields();
-    require(
-        produced.get(1).fields().equals(fixtureFields),
-        "C-produced segments disagree on indexed fields");
+  private static List<Integer> datasetFragments(Dataset dataset) {
+    return dataset.getFragments().stream()
+        .map(Fragment::getId)
+        .sorted()
+        .collect(Collectors.toList());
+  }
 
+  private static void runBtree(Path crossSdkPath, Path baselinePath, Path metadataPath)
+      throws Exception {
     List<Integer> fixtureFragments = List.of(0, 1);
+    List<Index> produced =
+        decodeSegments(
+            metadataPath,
+            BTREE_INDEX_NAME,
+            2,
+            fixtureFragments,
+            List.of(0),
+            0,
+            "BTreeIndexDetails");
     Map<UUID, Index> producedByUuid = byUuid(produced);
     long beforeVersion;
     long afterVersion;
@@ -310,91 +544,309 @@ public final class CrossSdkAcceptance {
       ReadOptions readOptions = new ReadOptions.Builder().build();
       try (Dataset dataset = Dataset.open(allocator, crossSdkPath.toString(), readOptions)) {
         beforeVersion = dataset.version();
-        List<Integer> actualFragments =
-            dataset.getFragments().stream()
-                .map(Fragment::getId)
-                .sorted()
-                .collect(Collectors.toList());
-        require(beforeVersion == 2, "fixture must start at dataset version 2");
+        List<Integer> fragmentIds = datasetFragments(dataset);
+        require(beforeVersion == 2, "BTree fixture must start at dataset version 2");
         require(
-            actualFragments.equals(fixtureFragments),
-            "fixture fragment ids differ: " + actualFragments);
+            fragmentIds.equals(fixtureFragments),
+            "BTree fixture fragment ids differ: " + fragmentIds);
         validateSegments(
-            produced, actualFragments, fixtureFields, beforeVersion, Map.of(), false);
+            produced,
+            BTREE_INDEX_NAME,
+            fragmentIds,
+            List.of(0),
+            beforeVersion,
+            0,
+            IndexType.BTREE,
+            "BTreeIndexDetails",
+            Map.of(),
+            false);
 
         List<Index> committed =
-            dataset.commitExistingIndexSegments(INDEX_NAME, COLUMN, produced);
+            dataset.commitExistingIndexSegments(BTREE_INDEX_NAME, BTREE_COLUMN, produced);
         afterVersion = dataset.version();
         require(
             afterVersion == beforeVersion + 1,
             "Java commit must publish exactly one dataset version");
         validateSegments(
-            committed, actualFragments, fixtureFields, beforeVersion, producedByUuid, true);
-        System.out.printf(
-            "commit status=success before_version=%d after_version=%d segments=%d%n",
-            beforeVersion, afterVersion, committed.size());
-      }
-
-      try (Dataset reopened =
-          Dataset.open(allocator, crossSdkPath.toString(), readOptions)) {
-        require(
-            reopened.version() == afterVersion,
-            "reopened dataset version does not match the commit");
-        require(reopened.listIndexes().contains(INDEX_NAME), "reopened index name is missing");
-        List<Index> reopenedSegments = namedSegments(reopened);
-        validateSegments(
-            reopenedSegments,
-            fixtureFragments,
-            fixtureFields,
+            committed,
+            BTREE_INDEX_NAME,
+            fragmentIds,
+            List.of(0),
             beforeVersion,
+            0,
+            IndexType.BTREE,
+            "BTreeIndexDetails",
             producedByUuid,
             true);
         System.out.printf(
-            "reopen status=success version=%d segments=%d coverage=%s files=%s%n",
+            "commit mode=btree status=success before_version=%d after_version=%d segments=%d%n",
+            beforeVersion, afterVersion, committed.size());
+      }
+
+      try (Dataset reopened = Dataset.open(allocator, crossSdkPath.toString(), readOptions)) {
+        require(
+            reopened.version() == afterVersion,
+            "reopened dataset version does not match the BTree commit");
+        require(
+            reopened.listIndexes().contains(BTREE_INDEX_NAME),
+            "reopened BTree index name is missing");
+        List<Index> reopenedSegments = namedSegments(reopened, BTREE_INDEX_NAME);
+        validateSegments(
+            reopenedSegments,
+            BTREE_INDEX_NAME,
+            fixtureFragments,
+            List.of(0),
+            beforeVersion,
+            0,
+            IndexType.BTREE,
+            "BTreeIndexDetails",
+            producedByUuid,
+            true);
+        System.out.printf(
+            "reopen mode=btree status=success version=%d segments=%d coverage=%s files=%s%n",
             reopened.version(),
             reopenedSegments.size(),
-            reopenedSegments.stream().map(CrossSdkAcceptance::coverage).collect(Collectors.toList()),
+            reopenedSegments.stream()
+                .map(CrossSdkAcceptance::coverage)
+                .collect(Collectors.toList()),
             reopenedSegments.stream()
                 .map(index -> index.getFiles().orElseThrow().size())
                 .collect(Collectors.toList()));
 
-        try (Dataset baseline =
-            Dataset.open(allocator, baselinePath.toString(), readOptions)) {
-          require(baseline.version() == beforeVersion, "baseline version differs before index build");
+        try (Dataset baseline = Dataset.open(allocator, baselinePath.toString(), readOptions)) {
+          require(
+              baseline.version() == beforeVersion,
+              "BTree baseline version differs before index build");
           IndexParams params =
               IndexParams.builder()
                   .setScalarIndexParams(ScalarIndexParams.create("btree"))
                   .build();
           IndexOptions options =
-              IndexOptions.builder(List.of(COLUMN), IndexType.BTREE, params)
-                  .withIndexName(INDEX_NAME)
+              IndexOptions.builder(List.of(BTREE_COLUMN), IndexType.BTREE, params)
+                  .withIndexName(BTREE_INDEX_NAME)
                   .build();
           Index created = baseline.createIndex(options);
           require(
               baseline.version() == beforeVersion + 1,
-              "Java one-shot build must publish exactly one dataset version");
+              "Java one-shot BTree build must publish exactly one dataset version");
           require(created.indexVersion() == 0, "Java 12 BTree baseline must use version 0");
-          require(baseline.listIndexes().contains(INDEX_NAME), "baseline index name is missing");
+          require(
+              baseline.listIndexes().contains(BTREE_INDEX_NAME),
+              "baseline BTree index name is missing");
           System.out.printf(
-              "baseline status=success before_version=%d after_version=%d segments=%d%n",
+              "baseline mode=btree status=success before_version=%d after_version=%d segments=%d%n",
               beforeVersion,
               baseline.version(),
-              namedSegments(baseline).size());
+              namedSegments(baseline, BTREE_INDEX_NAME).size());
 
           List<QueryCase> cases =
               List.of(
                   new QueryCase("id >= 10 AND id < 20", range(10, 20)),
                   new QueryCase("id >= 1010 AND id < 1020", range(1010, 1020)),
                   new QueryCase("id = 1999", List.of(1999L)));
-          runQueries(reopened, baseline, cases);
+          runScalarQueries(reopened, baseline, cases);
         }
       }
     }
 
     System.out.printf(
-        "acceptance status=passed producer=native14.0.2@40f15ed "
+        "acceptance mode=btree status=passed producer=native14.0.2@40f15ed "
             + "consumer=org.lance:lance-core:12.0.0 source=cbeec97 "
             + "before_version=%d after_version=%d%n",
         beforeVersion, afterVersion);
+  }
+
+  private static void decodeVectorDetails(Index index, int segment) throws Exception {
+    Any any = Any.parseFrom(index.indexDetails().orElseThrow());
+    require(
+        any.getTypeUrl().endsWith("VectorIndexDetails"),
+        "C-produced vector Any has an unexpected type URL: " + any.getTypeUrl());
+    VectorIndexDetails details = VectorIndexDetails.parseFrom(any.getValue());
+    require(details.getMetricType() == VectorMetricType.L2, "vector index metric is not L2");
+    require(details.hasPq(), "vector index compression is not PQ");
+    require(details.getPq().getNumBits() == VECTOR_BITS, "vector PQ num_bits changed");
+    require(
+        details.getPq().getNumSubVectors() == VECTOR_SUB_VECTORS,
+        "vector PQ num_sub_vectors changed");
+    require(
+        !details.hasHnswIndexConfig(), "IVF_PQ vector details unexpectedly contain HNSW");
+    System.out.printf(
+        "vector_details segment=%d type_url=%s metric=%s compression=PQ bits=%d "
+            + "subvectors=%d runtime_hints=%d%n",
+        segment,
+        any.getTypeUrl(),
+        details.getMetricType(),
+        details.getPq().getNumBits(),
+        details.getPq().getNumSubVectors(),
+        details.getRuntimeHintsCount());
+  }
+
+  private static void runVector(Path crossSdkPath, Path baselinePath, Path metadataPath)
+      throws Exception {
+    List<Integer> fixtureFragments = List.of(0, 1);
+    List<Integer> fixtureFields = List.of(VECTOR_FIELD_ID);
+    List<Index> produced =
+        decodeSegments(
+            metadataPath,
+            VECTOR_INDEX_NAME,
+            2,
+            fixtureFragments,
+            fixtureFields,
+            1,
+            "VectorIndexDetails");
+    for (int segment = 0; segment < produced.size(); ++segment) {
+      decodeVectorDetails(produced.get(segment), segment);
+    }
+    Map<UUID, Index> producedByUuid = byUuid(produced);
+    long beforeVersion;
+    long afterVersion;
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      ReadOptions readOptions = new ReadOptions.Builder().build();
+      try (Dataset dataset = Dataset.open(allocator, crossSdkPath.toString(), readOptions)) {
+        beforeVersion = dataset.version();
+        List<Integer> fragmentIds = datasetFragments(dataset);
+        require(beforeVersion == 2, "vector fixture must start at dataset version 2");
+        require(
+            fragmentIds.equals(fixtureFragments),
+            "vector fixture fragment ids differ: " + fragmentIds);
+        validateSegments(
+            produced,
+            VECTOR_INDEX_NAME,
+            fragmentIds,
+            fixtureFields,
+            beforeVersion,
+            1,
+            IndexType.IVF_PQ,
+            "VectorIndexDetails",
+            Map.of(),
+            false);
+
+        List<Index> committed =
+            dataset.commitExistingIndexSegments(VECTOR_INDEX_NAME, VECTOR_COLUMN, produced);
+        afterVersion = dataset.version();
+        require(
+            afterVersion == beforeVersion + 1,
+            "Java vector commit must publish exactly one dataset version");
+        validateSegments(
+            committed,
+            VECTOR_INDEX_NAME,
+            fragmentIds,
+            fixtureFields,
+            beforeVersion,
+            1,
+            IndexType.IVF_PQ,
+            "VectorIndexDetails",
+            producedByUuid,
+            true);
+        System.out.printf(
+            "commit mode=ivfpq status=success before_version=%d after_version=%d segments=%d%n",
+            beforeVersion, afterVersion, committed.size());
+      }
+
+      try (Dataset reopened = Dataset.open(allocator, crossSdkPath.toString(), readOptions)) {
+        require(
+            reopened.version() == afterVersion,
+            "reopened dataset version does not match the vector commit");
+        require(
+            reopened.listIndexes().contains(VECTOR_INDEX_NAME),
+            "reopened vector index name is missing");
+        List<Index> reopenedSegments = namedSegments(reopened, VECTOR_INDEX_NAME);
+        validateSegments(
+            reopenedSegments,
+            VECTOR_INDEX_NAME,
+            fixtureFragments,
+            fixtureFields,
+            beforeVersion,
+            1,
+            IndexType.IVF_PQ,
+            "VectorIndexDetails",
+            producedByUuid,
+            true);
+        System.out.printf(
+            "reopen mode=ivfpq status=success version=%d segments=%d coverage=%s files=%s%n",
+            reopened.version(),
+            reopenedSegments.size(),
+            reopenedSegments.stream()
+                .map(CrossSdkAcceptance::coverage)
+                .collect(Collectors.toList()),
+            reopenedSegments.stream()
+                .map(index -> index.getFiles().orElseThrow().size())
+                .collect(Collectors.toList()));
+
+        try (Dataset baseline = Dataset.open(allocator, baselinePath.toString(), readOptions)) {
+          require(
+              baseline.version() == beforeVersion,
+              "vector baseline version differs before index build");
+          VectorIndexParams vectorParams =
+              VectorIndexParams.ivfPq(
+                  VECTOR_PARTITIONS, VECTOR_BITS, VECTOR_SUB_VECTORS, DistanceType.L2, 4);
+          IndexParams params =
+              IndexParams.builder().setVectorIndexParams(vectorParams).build();
+          IndexOptions options =
+              IndexOptions.builder(List.of(VECTOR_COLUMN), IndexType.IVF_PQ, params)
+                  .withIndexName(VECTOR_INDEX_NAME)
+                  .build();
+          Index created = baseline.createIndex(options);
+          require(
+              baseline.version() == beforeVersion + 1,
+              "Java one-shot vector build must publish exactly one dataset version");
+          require(created.indexVersion() == 1, "Java 12 IVF_PQ baseline must use version 1");
+          require(
+              baseline.listIndexes().contains(VECTOR_INDEX_NAME),
+              "baseline vector index name is missing");
+          System.out.printf(
+              "baseline mode=ivfpq status=success before_version=%d after_version=%d segments=%d%n",
+              beforeVersion,
+              baseline.version(),
+              namedSegments(baseline, VECTOR_INDEX_NAME).size());
+
+          List<VectorQueryCase> cases =
+              List.of(
+                  new VectorQueryCase(
+                      1, List.of(1, 176, 213, 224), List.of(0.0f, 78.0f, 81.0f, 103.0f)),
+                  new VectorQueryCase(
+                      77, List.of(77, 114, 66, 182), List.of(0.0f, 35.0f, 78.0f, 94.0f)));
+          runVectorQueries(reopened, baseline, cases);
+        }
+      }
+    }
+
+    System.out.printf(
+        "acceptance mode=ivfpq status=passed producer=native14.0.2@40f15ed "
+            + "consumer=org.lance:lance-core:12.0.0 source=cbeec97 "
+            + "before_version=%d after_version=%d partitions=%d subvectors=%d bits=%d "
+            + "nprobes=%d refine_factor=%d k=%d%n",
+        beforeVersion,
+        afterVersion,
+        VECTOR_PARTITIONS,
+        VECTOR_SUB_VECTORS,
+        VECTOR_BITS,
+        VECTOR_PARTITIONS,
+        VECTOR_REFINE_FACTOR,
+        VECTOR_K);
+  }
+
+  public static void main(String[] args) throws Exception {
+    if (args.length != 4) {
+      throw new IllegalArgumentException(
+          "usage: CrossSdkAcceptance <btree|ivfpq> <cross-sdk-dataset> "
+              + "<baseline-dataset> <metadata-directory>");
+    }
+    String mode = args[0];
+    Path crossSdkPath = Path.of(args[1]).toAbsolutePath();
+    Path baselinePath = Path.of(args[2]).toAbsolutePath();
+    Path metadataPath = Path.of(args[3]).toAbsolutePath();
+
+    switch (mode) {
+      case "btree":
+        runBtree(crossSdkPath, baselinePath, metadataPath);
+        break;
+      case "ivfpq":
+        runVector(crossSdkPath, baselinePath, metadataPath);
+        break;
+      default:
+        throw new IllegalArgumentException("unknown mode: " + mode);
+    }
   }
 }
