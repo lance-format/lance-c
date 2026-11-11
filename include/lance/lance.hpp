@@ -800,12 +800,6 @@ public:
     const LanceUpdateMap* c_handle() const { return handle_.get(); }
 };
 
-/// One per-field metadata update for UpdateConfigOptions.
-struct FieldMetadataUpdate {
-    int32_t field_id;
-    UpdateMap updates;
-};
-
 /// Options for Operation::make_update_config.
 ///
 /// A disengaged optional maps to native `None`; an engaged empty `UpdateMap`
