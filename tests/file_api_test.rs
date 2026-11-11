@@ -1533,13 +1533,21 @@ fn storage_provider_none_some_empty_error_expiry_and_force() {
         refresh_offset_millis: None,
     };
     let (provider, provider_counters, provider_id) = create_test_provider(context, false);
-    let initial = HashMap::from([("initial".to_owned(), "fallback".to_owned())]);
-    let initial_key = [c"initial".as_ptr()];
-    let initial_value = [c"fallback".as_ptr()];
+    let initial = HashMap::from([
+        ("initial".to_owned(), "fallback".to_owned()),
+        ("expires_at_millis".to_owned(), "0".to_owned()),
+        ("refresh_offset_millis".to_owned(), "0".to_owned()),
+    ]);
+    let initial_keys = [
+        c"initial".as_ptr(),
+        c"expires_at_millis".as_ptr(),
+        c"refresh_offset_millis".as_ptr(),
+    ];
+    let initial_values = [c"fallback".as_ptr(), c"0".as_ptr(), c"0".as_ptr()];
     let initial_input = LanceStorageOptionsInput {
-        keys: initial_key.as_ptr(),
-        values: initial_value.as_ptr(),
-        count: 1,
+        keys: initial_keys.as_ptr(),
+        values: initial_values.as_ptr(),
+        count: 3,
     };
     let accessor = unsafe { lance_storage_options_accessor_new(&initial_input, provider) };
     let options = snapshot_options(accessor).unwrap().unwrap();

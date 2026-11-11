@@ -156,13 +156,13 @@ pub(crate) fn open_file_session_inner(
         storage_options_accessor: storage_options,
         ..ObjectStoreParams::default()
     };
-    let (store, base_path) = block_on(ObjectStore::from_uri_and_params(
-        registry.clone(),
-        base_uri,
-        &params,
-    ))?;
-    let scheduler_config = scheduler_config_from_ffi(scheduler_config, &store)?;
-    let scheduler = ScanScheduler::new(store.clone(), scheduler_config);
+    let (store, base_path, scheduler) = block_on(async {
+        let (store, base_path) =
+            ObjectStore::from_uri_and_params(registry.clone(), base_uri, &params).await?;
+        let scheduler_config = scheduler_config_from_ffi(scheduler_config, &store)?;
+        let scheduler = ScanScheduler::new(store.clone(), scheduler_config);
+        Ok::<_, Error>((store, base_path, scheduler))
+    })?;
     Ok(FileSessionInner {
         session,
         registry,
