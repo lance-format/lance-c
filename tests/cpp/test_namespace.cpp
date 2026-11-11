@@ -83,7 +83,26 @@ struct IntStream {
     void reset() {
         emitted = 0;
         top_array.release = noop_array_release;
+        stream.get_schema = [](ArrowArrayStream* raw, ArrowSchema* out) {
+            auto* self = static_cast<IntStream*>(raw->private_data);
+            *out = self->top_schema;
+            out->release = noop_schema_release;
+            return 0;
+        };
+        stream.get_next = [](ArrowArrayStream* raw, ArrowArray* out) {
+            auto* self = static_cast<IntStream*>(raw->private_data);
+            if (self->emitted) {
+                *out = {};
+                return 0;
+            }
+            self->emitted = 1;
+            *out = self->top_array;
+            out->release = noop_array_release;
+            return 0;
+        };
+        stream.get_last_error = [](ArrowArrayStream*) -> const char* { return nullptr; };
         stream.release = [](ArrowArrayStream* raw) { raw->release = nullptr; };
+        stream.private_data = this;
     }
 };
 
