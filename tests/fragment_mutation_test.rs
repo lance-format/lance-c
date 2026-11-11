@@ -385,7 +385,7 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
 
     struct CallbackState {
         output_schema: Arc<Schema>,
-        uri: CString,
+        dataset: *const LanceDataset,
         calls: AtomicUsize,
         independent_count: AtomicUsize,
     }
@@ -399,12 +399,7 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
     ) -> i32 {
         let state = unsafe { &*callback_ctx.cast::<CallbackState>() };
         state.calls.fetch_add(1, Ordering::SeqCst);
-        let dataset = unsafe { lance_dataset_open(state.uri.as_ptr(), ptr::null(), 0) };
-        if dataset.is_null() {
-            return -1;
-        }
-        let count = unsafe { lance_dataset_count_rows(dataset) };
-        unsafe { lance_dataset_close(dataset) };
+        let count = unsafe { lance_dataset_count_rows(state.dataset) };
         if count != 12 {
             return -1;
         }
@@ -426,9 +421,10 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
         true,
     )]));
     let udf_ffi_schema = FFI_ArrowSchema::try_from(udf_schema.as_ref()).unwrap();
+    let independent = open_dataset(&uri);
     let state = CallbackState {
         output_schema: udf_schema,
-        uri: c_string(&uri),
+        dataset: independent,
         calls: AtomicUsize::new(0),
         independent_count: AtomicUsize::new(0),
     };
@@ -477,6 +473,7 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
         lance_fragment_close(sql_fragment);
         lance_schema_close(sql_schema);
         lance_fragment_close(fragment);
+        lance_dataset_close(independent);
     }
 }
 
