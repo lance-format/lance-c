@@ -25027,7 +25027,10 @@ fn test_native_data_file_and_data_replacement_metadata() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!(unsafe { lance_data_file_field_count(ptr::null()) }, 0);
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    assert_eq!(unsafe { lance_data_file_column_index_count(ptr::null()) }, 0);
+    assert_eq!(
+        unsafe { lance_data_file_column_index_count(ptr::null()) },
+        0
+    );
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 
     let file_clone = unsafe { lance_data_file_clone(file) };
