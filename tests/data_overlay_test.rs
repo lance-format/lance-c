@@ -446,7 +446,7 @@ fn data_overlay_value_and_operation_lifetimes() {
     let lengths: Vec<usize> = bitmaps.iter().map(|bitmap| bitmap.len()).collect();
     let rebuilt = unsafe {
         lance_data_overlay_file_new(
-            unsafe { lance_data_overlay_file_data_file(overlay) },
+            lance_data_overlay_file_data_file(overlay),
             0,
             pointers.as_ptr(),
             lengths.as_ptr(),
@@ -675,11 +675,10 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
 
     let (second, _) = {
         let mut second_writer_schema = ptr::null_mut();
-        let second_fragment;
         let c_uri = c_string(&fixture.uri);
         let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
         assert!(!reopened.is_null());
-        second_fragment = unsafe { lance_dataset_open_fragment(reopened, ids[0]) };
+        let second_fragment = unsafe { lance_dataset_open_fragment(reopened, ids[0]) };
         assert!(!second_fragment.is_null());
         assert_eq!(
             unsafe { lance_fragment_schema_clone(second_fragment, &mut second_writer_schema) },
