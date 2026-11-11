@@ -132,6 +132,7 @@ typedef enum {
     LANCE_INDEX_IVF_HNSW_SQ   = 104,
     LANCE_INDEX_IVF_HNSW_PQ   = 105,
     LANCE_INDEX_IVF_HNSW_FLAT = 106,
+    LANCE_INDEX_IVF_RQ        = 107,
 } LanceVectorIndexType;
 
 typedef enum {
@@ -167,6 +168,12 @@ typedef enum {
     LANCE_DTYPE_INT8    = 4,
 } LanceDataType;
 
+/**
+ * Legacy vector parameters. Values 101-106 retain their existing defaults and
+ * required-field rules. IVF_RQ (107) uses num_partitions and num_bits where
+ * num_bits 0 selects the native RQ default of 5; RQ rotation JSON and richer
+ * absent-versus-zero controls require the additive options entry points.
+ */
 typedef struct {
     LanceVectorIndexType index_type;
     LanceMetricType      metric;
@@ -178,6 +185,105 @@ typedef struct {
     uint32_t hnsw_ef_construction;  /* HNSW; 0 = default */
     uint32_t sample_rate;           /* IVF; 0 = 256 */
 } LanceVectorIndexParams;
+
+typedef enum {
+    LANCE_INDEX_FILE_VERSION_V3 = 0,
+    LANCE_INDEX_FILE_VERSION_LEGACY = 1,
+} LanceIndexFileVersion;
+
+/**
+ * Presence-aware unsigned option. When `is_set` is false the native option is
+ * absent and `value` is ignored. When true, `value` is forwarded verbatim,
+ * including zero. This keeps native automatic sizing and explicit-zero
+ * validation distinguishable.
+ */
+typedef struct {
+    uint64_t value;
+    bool is_set;
+} LanceOptionalU64;
+
+/**
+ * Borrowed UTF-8 key/value arrays with `count` entries. Keys and values may
+ * not be NULL when count is non-zero. Duplicate keys use Rust HashMap
+ * last-write-wins semantics; the last value for a key is retained.
+ */
+typedef struct {
+    const char* const* keys;
+    const char* const* values;
+    size_t count;
+} LanceStringMap;
+
+/**
+ * Precomputed shuffle input. `path` is required. A non-NULL struct with
+ * `buffer_count == 0` represents an explicitly empty buffer list.
+ */
+typedef struct {
+    const char* path;
+    const char* const* buffers;
+    size_t buffer_count;
+} LancePrecomputedShuffleBuffers;
+
+/**
+ * Additive native vector-build options. Zero-initialize this structure.
+ *
+ * Optional numeric fields distinguish absent (`is_set == false`) from an
+ * explicit value, including zero. Native Lance code owns defaults, validation
+ * timing and execution semantics. `num_bits` applies to IVF_PQ and IVF_RQ;
+ * absent PQ bits use the native default and an absent RQ value uses the native
+ * default of 5. `num_partitions` and `target_partition_size` may be absent for
+ * native automatic sizing.
+ *
+ * `ivf_centroids` and `pq_codebook` are native Arrow C Data Interface
+ * FixedSizeList values. The whole options object is borrowed only for this
+ * call. A non-NULL ArrowArray may be replaced while a live caller-owned
+ * equivalent is left in place; the schema remains caller-owned. Both members
+ * of each pair must be NULL or non-NULL. Native model shape and dtype
+ * acceptance is not narrowed here.
+ *
+ * `rabitq_model_json` is the native RabitQuantizationMetadata JSON accepted by
+ * IVF_RQ. Use lance_index_build_rq_model() to mint a portable fast rotation.
+ * `runtime_hints` may contain arbitrary UTF-8 keys and values and does not
+ * enable any accelerator execution in this binding.
+ *
+ * `has_train == false` retains the native default train=true.
+ */
+typedef struct LanceVectorIndexOptions {
+    int32_t index_type;   /* LanceVectorIndexType */
+    int32_t metric;       /* LanceMetricType */
+
+    LanceOptionalU64 num_partitions;
+    LanceOptionalU64 target_partition_size;
+    LanceOptionalU64 max_iters;
+    LanceOptionalU64 sample_rate;
+    LanceOptionalU64 streaming_sample_rate;
+    LanceOptionalU64 streaming_coreset_rate;
+    uint64_t streaming_refine_passes;
+
+    const char* precomputed_partitions_file;
+    const LancePrecomputedShuffleBuffers* precomputed_shuffle_buffers;
+    LanceOptionalU64 shuffle_partition_batches;
+    LanceOptionalU64 shuffle_partition_concurrency;
+    const LanceStringMap* storage_options;
+
+    LanceOptionalU64 num_sub_vectors;
+    LanceOptionalU64 num_bits;
+
+    struct ArrowArray* ivf_centroids;
+    const struct ArrowSchema* ivf_centroids_schema;
+    struct ArrowArray* pq_codebook;
+    const struct ArrowSchema* pq_codebook_schema;
+    const char* rabitq_model_json;
+
+    LanceOptionalU64 hnsw_max_level;
+    LanceOptionalU64 hnsw_m;
+    LanceOptionalU64 hnsw_ef_construction;
+
+    int32_t index_file_version; /* LanceIndexFileVersion */
+    bool skip_transpose;
+    const LanceStringMap* runtime_hints;
+    bool has_train;
+    bool train;
+} LanceVectorIndexOptions;
 
 /** Return the error code from the last failed operation on this thread. */
 LanceErrorCode lance_last_error_code(void);
@@ -3631,6 +3737,26 @@ int32_t lance_dataset_create_vector_index(
 );
 
 /**
+ * Create a vector index from additive native options.
+ *
+ * The native builder commits the index and then reloads committed metadata.
+ * An error can therefore be returned after the dataset version has already
+ * been published. Reopen the dataset to determine its current version; the
+ * binding does not claim storage rollback.
+ *
+ * `options` is borrowed for the call and must not be NULL.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_vector_index_with_options(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexOptions* options,
+    bool replace
+);
+
+/**
  * Create a scalar index on a column.
  * @param params_json Optional JSON params forwarded unchanged to the native
  *                    Lance scalar-index plugin, or NULL for plugin defaults.
@@ -3655,8 +3781,11 @@ int32_t lance_dataset_create_scalar_index(
 /**
  * Options for an uncommitted index segment build.
  *
- * `fragment_ids == NULL && fragment_count == 0` selects the whole dataset.
- * Any non-empty fragment list is copied when the builder is created.
+ * `fragment_ids == NULL && fragment_count == 0` preserves native None and
+ * selects the whole dataset. A non-NULL pointer with `fragment_count == 0`
+ * preserves native Some(empty). Any non-empty list is copied when the builder
+ * is created. Duplicate and missing-ID handling follows the native
+ * CreateIndexBuilder at build time.
  * `index_uuid`, when non-NULL, points to exactly 16 RFC 4122 bytes and is also
  * copied during builder creation. Lance does not support an assigned UUID for
  * fragment-scoped BTree builds; leave it NULL for that combination.
@@ -3722,6 +3851,21 @@ typedef struct LanceVectorIndexSegmentParams {
 } LanceVectorIndexSegmentParams;
 
 /**
+ * Fragment selection and optional segment UUID for the additive vector builder.
+ *
+ * A NULL scope preserves both native selections as None. Within a non-NULL
+ * scope, a NULL `fragment_ids` with count 0 is None, while a non-NULL pointer
+ * with count 0 is Some(empty). IDs and a non-NULL UUID are copied at builder
+ * creation; native Lance code decides duplicate/missing validation and timing.
+ * `index_uuid`, when non-NULL, points to exactly 16 RFC 4122 bytes.
+ */
+typedef struct LanceVectorIndexSegmentScope {
+    const uint32_t* fragment_ids;
+    size_t fragment_count;
+    const uint8_t* index_uuid;
+} LanceVectorIndexSegmentScope;
+
+/**
  * Create a single-use scalar index segment builder bound to the dataset's
  * current snapshot. The dataset handle is not consumed and need not outlive
  * the returned builder.
@@ -3754,6 +3898,23 @@ LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector(
     const char* index_name,
     const LanceVectorIndexSegmentParams* params,
     const LanceIndexSegmentBuildOptions* options
+);
+
+/**
+ * Create a single-use vector segment builder from additive native options.
+ * The builder owns a dataset snapshot. Strings, maps, paths, fragment IDs and
+ * UUID are copied; Arrow models are borrowed synchronously as described by
+ * LanceVectorIndexOptions. The dataset handle need not outlive the builder.
+ *
+ * `scope` may be NULL for whole-dataset/no-UUID semantics. `train` follows
+ * the native builder default unless `options->has_train` is true.
+ */
+LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector_with_options(
+    const LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexOptions* options,
+    const LanceVectorIndexSegmentScope* scope
 );
 
 /**
@@ -3795,6 +3956,21 @@ int32_t lance_index_train_pq_model(
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema
 );
+
+/**
+ * Build a portable IVF_RQ fast-rotation model as native
+ * RabitQuantizationMetadata JSON.
+ *
+ * `dimension` must be positive and divisible by 8. `num_bits == 0` selects the
+ * native RQ default of 5. The returned JSON can be shared across fragment
+ * builds through LanceVectorIndexOptions.rabitq_model_json. Matrix rotations
+ * are not emitted because their dense matrix is skipped by the native JSON
+ * representation.
+ *
+ * Returns a library-owned NUL-terminated string on success, or NULL on error.
+ * Free a successful result with lance_free_string().
+ */
+const char* lance_index_build_rq_model(uint32_t dimension, uint32_t num_bits);
 
 /**
  * Build segment artifacts without committing them to the dataset manifest.
