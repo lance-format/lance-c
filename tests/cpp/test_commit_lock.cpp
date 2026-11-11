@@ -201,8 +201,10 @@ void test_staged_and_batch(const char* base) {
         uri, batch, lance::CommitOptions{}, nullptr, nullptr, &lock);
     ASSERT(merged.dataset.count_rows() == 80, "C++ batch rows");
     ASSERT(merged.dataset.version() == version + 1, "C++ batch version");
-    ASSERT(merged.transaction.read_version() == merged.dataset.version(),
-           "C++ merged transaction read version");
+    // The native merged transaction is the batch input and keeps the base
+    // version it was staged from; the committed dataset advances by one.
+    ASSERT(merged.transaction.read_version() == version,
+           "C++ merged transaction keeps the batch base version");
     (void)first;
     (void)second;
     (void)third;
