@@ -6950,8 +6950,6 @@ int32_t lance_data_file_base_id(
     uint32_t* out_base_id
 );
 
-/* ─── Native transactions ─── */
-
 /* ─── Native update maps ─── */
 
 /**
@@ -7150,6 +7148,8 @@ typedef struct LanceCommitOptions {
     bool skip_auto_cleanup;
     const char* data_storage_version;
 } LanceCommitOptions;
+
+/* ─── Native transactions ─── */
 
 /**
  * Options for one-shot native transaction construction.
