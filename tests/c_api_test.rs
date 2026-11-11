@@ -44291,7 +44291,6 @@ fn mw_create_indexed_vector_dataset() -> (tempfile::TempDir, String) {
         .to_str()
         .unwrap()
         .to_string();
-    let schema = mw_schema();
     let ids: Vec<i32> = (0..400).collect();
     let names: Vec<String> = ids.iter().map(|id| format!("row-{id}")).collect();
     let vectors: Vec<[f32; 4]> = ids
@@ -44477,7 +44476,7 @@ fn test_memwal_vector_search_indexed() {
         unsafe { lance_mem_wal_plan_to_arrow_stream(plan, stream.as_mut_ptr()) },
         0
     );
-    let (batches, _) = c_stream_batches(unsafe { stream.assume_init() });
+    let (_, batches) = c_stream_batches(unsafe { stream.assume_init() });
     let ids = mw_int32_values(&batches, "id");
     assert_eq!(ids.len(), 5);
     assert!(ids.iter().all(|id| (0..400).contains(id)));
