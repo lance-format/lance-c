@@ -984,7 +984,9 @@ fn rest_adapter_client_context_headers_metrics_and_native_errors() {
         release: Some(count_release),
         provider_ctx: context,
     };
-    let properties = c_string(&format!(r#"{{"uri":"http://127.0.0.1:{port}"}}"#));
+    let properties = c_string(&format!(
+        r#"{{"uri":"http://127.0.0.1:{port}","ops_metrics_enabled":"true"}}"#
+    ));
     let client = unsafe { lance_namespace_rest_new(properties.as_ptr(), &provider_spec) };
     assert!(!client.is_null(), "REST namespace failed: {}", last_error());
 
