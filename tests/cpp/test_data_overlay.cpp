@@ -266,13 +266,14 @@ lance::DataOverlayGroup rebuild_group(const lance::DataOverlayGroup& source,
     return lance::DataOverlayGroup(source.fragment_id(), {&rebuilt});
 }
 
-void check_history(const lance::Dataset& dataset, uint64_t version) {
+void check_history(const lance::Dataset& dataset, uint64_t version,
+                   uint64_t expected_group_count) {
     auto transaction = dataset.read_transaction_by_version(version);
     CHECK(transaction.has_value());
     auto operation = transaction->operation();
     CHECK(operation.kind() == lance::OperationKind::DataOverlay);
-    CHECK(operation.data_overlay_group_count() == 2);
-    for (size_t i = 0; i < 2; ++i) {
+    CHECK(operation.data_overlay_group_count() == expected_group_count);
+    for (size_t i = 0; i < expected_group_count; ++i) {
         auto group = operation.data_overlay_group_at(i);
         CHECK(group.overlay_count() == 1);
         auto file = group.overlay_at(0);
@@ -366,7 +367,7 @@ int main(int argc, char** argv) {
 
         auto operation = lance::Operation::make_data_overlay({&group0, &group1});
         CHECK(operation.kind() == lance::OperationKind::DataOverlay);
-        CHECK(operation.data_overlay_group_count() == 2);
+        CHECK(operation.data_overlay_group_count() == expected_group_count);
         {
             auto inspected = operation.data_overlay_group_at(1);
             CHECK(inspected.fragment_id() == fragment_ids[1]);
@@ -401,7 +402,7 @@ int main(int argc, char** argv) {
         assert_row(committed, 19, false, 190, 2001, before[19].rowid);
         assert_row(committed, 20, false, 200, 2000, before[20].rowid);
 
-        check_history(committed, 3);
+        check_history(committed, 3, 2);
 
         auto committed_fragment0 =
             committed.open_fragment(committed.fragment_ids()[0]);
@@ -425,8 +426,8 @@ int main(int argc, char** argv) {
         assert_row(committed2, 1, false, 9999, 211, before[1].rowid);
         assert_row(committed2, 2, false, 20, 200, before[2].rowid);
         assert_row(committed2, 3, true, 0, 212, before[3].rowid);
-        check_history(committed2, 4);
-        check_history(committed2, 3);
+        check_history(committed2, 4, 1);
+        check_history(committed2, 3, 2);
 
         auto old = lance::Dataset::open(uri, 1);
         CHECK(old.version() == 1);
