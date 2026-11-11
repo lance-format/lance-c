@@ -267,6 +267,21 @@ static void lock_context_release(void *callback_ctx) {
     state->context_release_calls++;
 }
 
+static int32_t accessor_fetch(void *callback_ctx,
+                              LanceStorageOptionsFetchResult *out,
+                              LanceCallbackError *error) {
+    int *fetches = (int *)callback_ctx;
+    (*fetches)++;
+    out->has_options = 1;
+    out->keys = NULL;
+    out->values = NULL;
+    out->count = 0;
+    out->snapshot_ctx = NULL;
+    out->release_snapshot = NULL;
+    (void)error;
+    return 0;
+}
+
 static LanceCommitLock *new_lock(LockState *state) {
     LanceCommitLockCallbacks callbacks;
     memset(&callbacks, 0, sizeof(callbacks));
@@ -307,6 +322,22 @@ static LanceTransaction *lock_write_uncommitted(const char *uri,
     CHECK_OK();
     ASSERT(transaction != NULL, "uncommitted transaction output");
     return transaction;
+}
+
+static LanceDataset *lock_write_with_accessor(
+    const char *uri, LanceCommitLock *lock,
+    const LanceStorageOptionsAccessor *accessor) {
+    StreamInput input = make_source_stream();
+    LanceWriteOptions options;
+    memset(&options, 0, sizeof(options));
+    LanceDataset *dataset = NULL;
+    int32_t rc = lance_dataset_write_with_options_with_commit_lock(
+        uri, &input.schema, &input.stream, LANCE_WRITE_CREATE, &options,
+        accessor, NULL, lock, &dataset);
+    if (input.schema.release) input.schema.release(&input.schema);
+    ASSERT(rc == 0, "lock-enabled write with dynamic accessor");
+    CHECK_OK();
+    return dataset;
 }
 
 static char *scratch_path(const char *base, const char *name) {
@@ -681,6 +712,48 @@ static void test_staged_commit_paths(const char *base) {
     free(uri);
 }
 
+static void test_accessor_composition(const char *base) {
+    char *uri = scratch_path(base, "accessor_lock");
+    int fetches = 0;
+
+    LanceStorageOptionsProviderSpec spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.fetch = accessor_fetch;
+    spec.provider_ctx = &fetches;
+    spec.provider_id = "lance-c-commit-lock-test";
+    LanceStorageOptionsProvider *provider =
+        lance_storage_options_provider_new(&spec);
+    ASSERT(provider != NULL, "construct storage options provider");
+    CHECK_OK();
+    LanceStorageOptionsAccessor *accessor =
+        lance_storage_options_accessor_new(NULL, provider);
+    ASSERT(accessor != NULL, "construct storage options accessor");
+    CHECK_OK();
+    /* The accessor retains the provider owner. */
+    lance_storage_options_provider_close(provider);
+
+    LockState state;
+    memset(&state, 0, sizeof(state));
+    snprintf(state.uri, sizeof(state.uri), "%s", uri);
+    LanceCommitLock *lock = new_lock(&state);
+    LanceDataset *dataset = lock_write_with_accessor(uri, lock, accessor);
+    ASSERT(dataset != NULL, "accessor write output");
+    ASSERT(lance_dataset_count_rows(dataset) == 20, "accessor write rows");
+    ASSERT(fetches > 0,
+           "lock-enabled write resolves storage options through the provider");
+    lance_dataset_close(dataset);
+    lance_commit_lock_close(lock);
+    expect_release_context(&state, 1);
+    lance_storage_options_accessor_close(accessor);
+
+    LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen accessor dataset");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(reopened) == 20, "accessor reopen rows");
+    lance_dataset_close(reopened);
+    free(uri);
+}
+
 int main(int argc, char **argv) {
     ASSERT(argc == 3, "usage: test_commit_lock_c <source-uri> <scratch-dir>");
     g_source_uri = argv[1];
@@ -691,6 +764,7 @@ int main(int argc, char **argv) {
     test_conflict_retry(base);
     test_partial_and_release_paths(base);
     test_staged_commit_paths(base);
+    test_accessor_composition(base);
 
     printf("test_commit_lock_c: all checks passed\n");
     return 0;
