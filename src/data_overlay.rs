@@ -198,26 +198,14 @@ unsafe fn data_overlay_file_new_inner(
         ));
     }
     let data_file = unsafe { &*data_file };
-    let bitmaps = unsafe { read_bitmaps(bitmaps, bitmap_lens, bitmap_count)? };
-
-    let coverage = match coverage_kind {
-        SHARED_COVERAGE => {
-            if bitmaps.len() != 1 {
-                return Err(lance_core::Error::invalid_input_source(
-                    format!(
-                        "shared overlay coverage requires exactly one bitmap, got {bitmap_count}"
-                    )
+    match coverage_kind {
+        SHARED_COVERAGE if bitmap_count != 1 => {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("shared overlay coverage requires exactly one bitmap, got {bitmap_count}")
                     .into(),
-                ));
-            }
-            OverlayCoverage::Shared(Arc::new(bitmaps.into_iter().next().expect("one bitmap")))
+            ));
         }
-        PER_FIELD_COVERAGE => OverlayCoverage::PerField(
-            bitmaps
-                .into_iter()
-                .map(Arc::new)
-                .collect::<Vec<Arc<RoaringBitmap>>>(),
-        ),
+        SHARED_COVERAGE | PER_FIELD_COVERAGE => {}
         other => {
             return Err(lance_core::Error::invalid_input_source(
                 format!(
@@ -227,6 +215,20 @@ unsafe fn data_overlay_file_new_inner(
                 .into(),
             ));
         }
+    }
+    let bitmaps = unsafe { read_bitmaps(bitmaps, bitmap_lens, bitmap_count)? };
+
+    let coverage = match coverage_kind {
+        SHARED_COVERAGE => {
+            OverlayCoverage::Shared(Arc::new(bitmaps.into_iter().next().expect("one bitmap")))
+        }
+        PER_FIELD_COVERAGE => OverlayCoverage::PerField(
+            bitmaps
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<Arc<RoaringBitmap>>>(),
+        ),
+        _ => unreachable!("coverage kind validated above"),
     };
 
     let inner = DataOverlayFile {

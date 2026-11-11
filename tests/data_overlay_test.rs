@@ -922,7 +922,6 @@ fn data_overlay_validation_errors() {
     unsafe {
         lance_fragment_overlay_writer_close(ptr::null_mut());
         lance_fragment_overlay_writer_abort(ptr::null_mut());
-        lance_fragment_overlay_writer_close(active_writer);
         lance_data_file_close(data_file);
         lance_data_overlay_file_close(overlay);
         lance_data_overlay_group_close(group);
