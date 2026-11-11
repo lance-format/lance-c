@@ -15880,6 +15880,123 @@ fn test_create_vector_index_ivf_pq() {
 }
 
 #[test]
+fn test_legacy_vector_entrypoints_support_ivf_rq_default_bits() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(1, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let column = c_str("embedding");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfRq,
+        metric: LanceMetricType::L2,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index(
+                dataset,
+                column.as_ptr(),
+                c_str("legacy_rq_idx").as_ptr(),
+                &params,
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let query: Vec<f32> = (0..8)
+        .map(|component| 5.0 + component as f32 / 8.0)
+        .collect();
+    let (ids, statistics) = nearest_ids_and_statistics(dataset, "embedding", &query, true, 3);
+    assert_eq!(ids.first(), Some(&5));
+    assert!(statistics.index_partitions_loaded > 0);
+    let segments_json = unsafe { lance_dataset_index_segments_json(dataset) };
+    assert!(!segments_json.is_null());
+    let segments: serde_json::Value =
+        serde_json::from_str(unsafe { CStr::from_ptr(segments_json) }.to_str().unwrap()).unwrap();
+    unsafe { lance_free_string(segments_json) };
+    let entry = segments
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "legacy_rq_idx")
+        .unwrap();
+    assert_eq!(entry["type"], "IVF_RQ");
+    assert_eq!(entry["index_version"], 2);
+
+    let segment_params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfRq as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let mut fragment_ids = [0_u64; 1];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let fragment_id = fragment_ids[0] as u32;
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &fragment_id,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            c_str("legacy_rq_segment").as_ptr(),
+            &segment_params,
+            &options,
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_index_type(metadata) },
+        LanceVectorIndexType::IvfRq as i32
+    );
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_index_version(metadata) },
+        lance_index::IVF_RQ_INDEX_VERSION as i32
+    );
+    unsafe {
+        lance_index_segment_metadata_free(metadata);
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
 fn test_create_vector_index_ivf_hnsw_sq() {
     let (_tmp, uri) = create_vector_dataset(256, 16);
     let uri_c = c_str(&uri);
