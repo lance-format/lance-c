@@ -26135,6 +26135,25 @@ fn version_manifest_stems(uri: &str) -> Vec<String> {
     stems
 }
 
+fn count_files_with_extension(root: &std::path::Path, extension: &str) -> usize {
+    let mut count = 0;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file()
+                && entry.path().extension().and_then(|value| value.to_str()) == Some(extension)
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 fn dataset_file_base_ids(dataset: *const LanceDataset) -> Vec<Option<u64>> {
     let count = unsafe { lance_dataset_fragment_count(dataset) };
     let mut ids = vec![0_u64; count as usize];
@@ -27085,6 +27104,84 @@ fn test_native_write_options_external_blob_policy() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert!(take_last_error_message().contains("allow_external_blob_outside_bases"));
     unsafe { lance_native_write_options_close(ingest_options) };
+}
+
+#[test]
+fn test_native_write_options_blob_pack_file_threshold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let field = lance::blob_field_with_options(
+        "blob",
+        true,
+        lance::BlobFieldOptions {
+            inline_size_threshold: Some(0),
+            dedicated_size_threshold: None,
+        },
+    );
+    let schema = Arc::new(Schema::new(vec![field]));
+    let mut blobs = lance::BlobArrayBuilder::new(2);
+    blobs.push_bytes(vec![7_u8; 16]).unwrap();
+    blobs.push_bytes(vec![9_u8; 16]).unwrap();
+    let batch = RecordBatch::try_new(schema, vec![blobs.finish().unwrap()]).unwrap();
+
+    let mut write_options: LanceWriteOptions = unsafe { std::mem::zeroed() };
+    let version = c_str("2.2");
+    write_options.params.data_storage_version = version.as_ptr();
+
+    let mut default_spec = native_write_default_spec();
+    default_spec.write_options = &write_options;
+    let default_options = native_write_options_new(&default_spec);
+    let default_uri = tmp
+        .path()
+        .join("blob_pack_default")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &default_uri,
+        batch.clone(),
+        LanceWriteMode::Create,
+        default_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(default_options);
+    }
+    let default_packs = count_files_with_extension(std::path::Path::new(&default_uri), "blob");
+    assert_eq!(
+        default_packs, 1,
+        "default threshold packs both blobs together"
+    );
+
+    let mut threshold_spec = native_write_default_spec();
+    threshold_spec.write_options = &write_options;
+    threshold_spec.has_blob_pack_file_size_threshold = 1;
+    threshold_spec.blob_pack_file_size_threshold = 1;
+    let threshold_options = native_write_options_new(&threshold_spec);
+    let threshold_uri = tmp
+        .path()
+        .join("blob_pack_threshold")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (rc, ds) = native_write_dataset(
+        &threshold_uri,
+        batch,
+        LanceWriteMode::Create,
+        threshold_options,
+    );
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
+    unsafe {
+        lance_dataset_close(ds);
+        lance_native_write_options_close(threshold_options);
+    }
+    let threshold_packs = count_files_with_extension(std::path::Path::new(&threshold_uri), "blob");
+    assert!(
+        threshold_packs >= 2,
+        "threshold 1 must start a new pack per 16-byte blob, got {threshold_packs}"
+    );
 }
 
 // ---------------------------------------------------------------------------
