@@ -12,7 +12,8 @@
  *
  * Usage: test_c_api <dataset_uri> <write_uri> <blob_uri> <ordering_uri>
  *                    <session_uri> <fragment_uri> <fragment_read_uri>
- *                    <cleanup_uri> <config_base_uri> <alternate_base_uri>
+ *                    <cleanup_uri> <aggregate_plan_path>
+ *                    <config_base_uri> <alternate_base_uri>
  */
 
 #include "lance/lance.h"
@@ -4308,6 +4309,100 @@ static void test_scanner_order_by(const char *uri) {
     printf("OK\n");
 }
 
+static uint8_t *read_file_bytes(const char *path, size_t *len) {
+    FILE *file = fopen(path, "rb");
+    ASSERT(file != NULL, "aggregate plan file open");
+    ASSERT(fseek(file, 0, SEEK_END) == 0, "aggregate plan file seek");
+    long size = ftell(file);
+    ASSERT(size >= 0, "aggregate plan file size");
+    ASSERT(fseek(file, 0, SEEK_SET) == 0, "aggregate plan file rewind");
+    uint8_t *bytes = malloc((size_t)size);
+    ASSERT(bytes != NULL || size == 0, "aggregate plan allocation");
+    if (size > 0) {
+        ASSERT(fread(bytes, 1, (size_t)size, file) == (size_t)size,
+               "aggregate plan read");
+    }
+    ASSERT(fclose(file) == 0, "aggregate plan file close");
+    *len = (size_t)size;
+    return bytes;
+}
+
+static void test_scanner_substrait_aggregate(const char *uri, const char *plan_path) {
+    printf("  test_scanner_substrait_aggregate... ");
+
+    size_t len = 0;
+    uint8_t *bytes = read_file_bytes(plan_path, &len);
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "aggregate dataset open failed");
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "aggregate scanner");
+    ASSERT(lance_scanner_set_substrait_aggregate(scanner, bytes, len) == 0,
+           "set substrait aggregate");
+    CHECK_OK();
+    if (len > 0) memset(bytes, 0, len);
+    free(bytes);
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "aggregate stream");
+    CHECK_OK();
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "aggregate schema");
+    ASSERT(schema.n_children == 5, "aggregate field count");
+    const char *expected_names[] = {
+        "rows", "id_sum", "rank_sum", "min_id", "max_id",
+    };
+    const char *expected_formats[] = {"l", "l", "l", "i", "i"};
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        ASSERT(strcmp(schema.children[i]->name, expected_names[i]) == 0,
+               "aggregate field name");
+        ASSERT(strcmp(schema.children[i]->format, expected_formats[i]) == 0,
+               "aggregate field format");
+    }
+    if (schema.release) schema.release(&schema);
+
+    struct ArrowArray array;
+    memset(&array, 0, sizeof(array));
+    ASSERT(stream.get_next(&stream, &array) == 0, "aggregate get_next");
+    ASSERT(array.release != NULL, "aggregate result batch");
+    ASSERT(array.length == 1, "aggregate result count");
+    ASSERT(array.n_children == 5, "aggregate result width");
+    const int64_t *rows =
+        (const int64_t *)array.children[0]->buffers[1] + array.children[0]->offset;
+    const int64_t *id_sum =
+        (const int64_t *)array.children[1]->buffers[1] + array.children[1]->offset;
+    const int64_t *rank_sum =
+        (const int64_t *)array.children[2]->buffers[1] + array.children[2]->offset;
+    const int32_t *min_id =
+        (const int32_t *)array.children[3]->buffers[1] + array.children[3]->offset;
+    const int32_t *max_id =
+        (const int32_t *)array.children[4]->buffers[1] + array.children[4]->offset;
+    ASSERT(rows[0] == 12, "aggregate count");
+    ASSERT(id_sum[0] == 66, "aggregate id sum");
+    ASSERT(rank_sum[0] == 15, "aggregate rank sum");
+    ASSERT(min_id[0] == 0, "aggregate min id");
+    ASSERT(max_id[0] == 11, "aggregate max id");
+    array.release(&array);
+
+    memset(&array, 0, sizeof(array));
+    ASSERT(stream.get_next(&stream, &array) == 0, "aggregate end");
+    ASSERT(array.release == NULL, "aggregate stream ends after one batch");
+    if (stream.release) stream.release(&stream);
+
+    ASSERT(lance_scanner_set_substrait_aggregate(scanner, NULL, 0) == -1,
+           "aggregate setter after scan start must fail");
+    const char *error = lance_last_error_message();
+    ASSERT(error != NULL &&
+               strstr(error, "substrait_aggregate must be set before") != NULL,
+           "aggregate lifecycle error");
+    if (error) lance_free_string(error);
+    lance_scanner_close(scanner);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static const struct ArrowSchema *find_schema_child(
     const struct ArrowSchema *schema,
     const char *name
@@ -4661,11 +4756,11 @@ static void test_fragment_read_operations(const char *uri) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-    if (argc < 11) {
+    if (argc < 12) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
                 "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri> "
-                "<config_base_uri> <alternate_base_uri>\n",
+                "<aggregate_plan_path> <config_base_uri> <alternate_base_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -4678,8 +4773,9 @@ int main(int argc, char **argv) {
     const char *fragment_uri = argv[6];
     const char *fragment_read_uri = argv[7];
     const char *cleanup_uri = argv[8];
-    const char *config_base_uri = argv[9];
-    const char *alternate_base_uri = argv[10];
+    const char *aggregate_plan_path = argv[9];
+    const char *config_base_uri = argv[10];
+    const char *alternate_base_uri = argv[11];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
@@ -4694,6 +4790,7 @@ int main(int argc, char **argv) {
     test_scanner_introspection(uri);
     test_scan_with_row_addr_lists(uri);
     test_scanner_order_by(ordering_uri);
+    test_scanner_substrait_aggregate(ordering_uri, aggregate_plan_path);
     test_fragment_snapshot(fragment_uri);
     test_fragment_read_operations(fragment_read_uri);
     test_scanner_blob_handling(blob_uri);

@@ -16,6 +16,11 @@ use lance::Dataset;
 use lance::io::RecordBatchStream;
 use lance_c::*;
 
+#[path = "support/substrait_aggregate.rs"]
+mod substrait_aggregate;
+
+use substrait_aggregate::{AggregateKind, Cell, aggregate_plan, cells};
+
 fn fixture() -> (tempfile::TempDir, CString) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("vectors.lance");
@@ -245,6 +250,144 @@ fn multivector_search_scores_logical_rows_and_excludes_empty_and_null_rows() {
             lance_scanner_close(scan);
         }
         lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn multivector_aggregate_rewrites_scoring_without_applying_the_result_window() {
+    let (_dir, uri) = fixture();
+    let column = CString::new("vectors").unwrap();
+    let query = [1.0f32, 0., 0., 1.];
+    let projection = [("ignored_id", "id")];
+    let bytes = aggregate_plan(
+        &[],
+        &[AggregateKind::CountStar, AggregateKind::Sum(0)],
+        &["rows", "id_sum"],
+    );
+    unsafe {
+        let dataset = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!dataset.is_null());
+        let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+        assert!(!scanner.is_null());
+        set_projection(scanner, &projection);
+        assert_eq!(lance_scanner_disable_scoring_autoprojection(scanner), 0);
+        assert_eq!(
+            lance_scanner_nearest_multivector(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr().cast(),
+                2,
+                2,
+                LanceDataType::Float32 as i32,
+                3,
+            ),
+            0
+        );
+        assert_eq!(lance_scanner_set_use_index(scanner, false), 0);
+        assert_eq!(lance_scanner_set_prefilter(scanner, true), 0);
+        assert_eq!(
+            lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()),
+            0
+        );
+
+        let (schema, batches) = collect_projected_batches(scanner);
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["rows", "id_sum"],
+            "projection and the private multivector distance must not enter aggregate output"
+        );
+        assert_eq!(cells(&batches), vec![vec![Cell::Int(3), Cell::Int(6)]]);
+        lance_scanner_close(scanner);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn multivector_aggregate_preserves_native_limit_offset_and_order_errors() {
+    let (_dir, uri) = fixture();
+    let column = CString::new("vectors").unwrap();
+    let query = [1.0f32, 0., 0., 1.];
+    let bytes = aggregate_plan(&[], &[AggregateKind::CountStar], &["rows"]);
+    let ordering = LanceColumnOrdering {
+        column_name: c"id".as_ptr(),
+        direction: LanceOrderDirection::Ascending as i32,
+        null_order: LanceNullOrder::NullsLast as i32,
+    };
+    unsafe {
+        let dataset = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!dataset.is_null());
+        for zero_limit in [true, false] {
+            let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+            assert_eq!(
+                lance_scanner_nearest_multivector(
+                    scanner,
+                    column.as_ptr(),
+                    query.as_ptr().cast(),
+                    2,
+                    1,
+                    LanceDataType::Float32 as i32,
+                    3,
+                ),
+                0
+            );
+            assert_eq!(lance_scanner_set_use_index(scanner, false), 0);
+            assert_eq!(
+                lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()),
+                0
+            );
+            if zero_limit {
+                assert_eq!(lance_scanner_set_limit(scanner, 0), 0);
+            } else {
+                assert_eq!(lance_scanner_set_offset(scanner, 0), 0);
+            }
+            let mut stream = FFI_ArrowArrayStream::empty();
+            assert_eq!(lance_scanner_to_arrow_stream(scanner, &mut stream), -1);
+            assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+            let message = std::ffi::CStr::from_ptr(lance_last_error_message())
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                message.contains("Cannot use limit/offset with aggregate"),
+                "{message}"
+            );
+            lance_scanner_close(scanner);
+        }
+
+        let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+        assert_eq!(
+            lance_scanner_nearest_multivector(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr().cast(),
+                2,
+                1,
+                LanceDataType::Float32 as i32,
+                3,
+            ),
+            0
+        );
+        assert_eq!(lance_scanner_set_use_index(scanner, false), 0);
+        assert_eq!(lance_scanner_set_order_by(scanner, &ordering, 1), 0);
+        assert_eq!(
+            lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()),
+            0
+        );
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(lance_scanner_to_arrow_stream(scanner, &mut stream), -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            message.contains("Cannot use order_by with aggregate"),
+            "{message}"
+        );
+        lance_scanner_close(scanner);
+        lance_dataset_close(dataset);
     }
 }
 
