@@ -14056,6 +14056,106 @@ fn test_vector_index_segment_rejects_strict_subset_dot_pq() {
 }
 
 #[test]
+fn test_vector_segment_options_preserve_dot_pq_fragment_scope_guard() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let column = c_str("embedding");
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let fragment_ids = fragment_ids.map(|id| id as u32);
+    let (mut centroids, centroids_schema, mut codebook, codebook_schema) =
+        train_segment_pq_models(dataset, &column, LanceMetricType::Dot);
+
+    for index_type in [LanceVectorIndexType::IvfPq, LanceVectorIndexType::IvfHnswPq] {
+        let mut options = vector_index_options(index_type, LanceMetricType::Dot);
+        options.num_partitions = set_option(2);
+        options.num_sub_vectors = set_option(2);
+        options.num_bits = set_option(4);
+        options.ivf_centroids = &mut centroids;
+        options.ivf_centroids_schema = &centroids_schema;
+        options.pq_codebook = &mut codebook;
+        options.pq_codebook_schema = &codebook_schema;
+        let mut scope = LanceVectorIndexSegmentScope {
+            fragment_ids: fragment_ids.as_ptr(),
+            fragment_count: 1,
+            index_uuid: ptr::null(),
+        };
+        let builder = unsafe {
+            lance_index_segment_builder_new_vector_with_options(
+                dataset,
+                column.as_ptr(),
+                ptr::null(),
+                &options,
+                &scope,
+            )
+        };
+        assert!(
+            builder.is_null(),
+            "DOT precomputed {index_type:?} must reject a strict subset"
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let error = take_last_error_message();
+        assert!(error.contains("metric=DOT"), "{error}");
+        assert!(error.contains("1 of 2 fragments"), "{error}");
+        assert!(!centroids.is_released());
+        assert!(!codebook.is_released());
+
+        // Implicit and explicit full coverage use native L2 PQ assignment.
+        for fragment_count in [0, fragment_ids.len()] {
+            scope.fragment_ids = if fragment_count == 0 {
+                ptr::null()
+            } else {
+                fragment_ids.as_ptr()
+            };
+            scope.fragment_count = fragment_count;
+            let builder = unsafe {
+                lance_index_segment_builder_new_vector_with_options(
+                    dataset,
+                    column.as_ptr(),
+                    ptr::null(),
+                    &options,
+                    &scope,
+                )
+            };
+            assert!(!builder.is_null(), "{}", take_last_error_message());
+            unsafe { lance_index_segment_builder_free(builder) };
+        }
+
+        scope.fragment_ids = fragment_ids.as_ptr();
+        scope.fragment_count = 1;
+        for metric in [LanceMetricType::L2, LanceMetricType::Cosine] {
+            options.metric = metric as i32;
+            let builder = unsafe {
+                lance_index_segment_builder_new_vector_with_options(
+                    dataset,
+                    column.as_ptr(),
+                    ptr::null(),
+                    &options,
+                    &scope,
+                )
+            };
+            assert!(!builder.is_null(), "{}", take_last_error_message());
+            unsafe { lance_index_segment_builder_free(builder) };
+        }
+        assert!(!centroids.is_released());
+        assert!(!codebook.is_released());
+    }
+    unsafe {
+        if let Some(release) = centroids.release {
+            release(&mut centroids);
+        }
+        if let Some(release) = codebook.release {
+            release(&mut codebook);
+        }
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
 fn test_vector_index_segment_allows_full_dataset_precomputed_pq_for_non_dot_metrics() {
     for metric in [LanceMetricType::L2, LanceMetricType::Cosine] {
         let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
