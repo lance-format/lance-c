@@ -172,6 +172,7 @@ class CompactionOptions;
 class CompactionPlan;
 class CompactionTask;
 class RewriteResult;
+struct BasePath;
 class OptimizeIndicesOptions;
 class OptimizeIndicesPlan;
 class OptimizeIndexTask;
@@ -763,6 +764,80 @@ public:
         }
         return value;
     }
+
+    /// Number of fragments in an Append operation.
+    uint64_t append_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_append_fragment_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one Append fragment as an independent detached fragment.
+    Fragment append_fragment_at(size_t index) const;
+
+    /// Target version of a Restore operation.
+    uint64_t restore_version() const {
+        uint64_t version = 0;
+        if (lance_operation_restore_version(handle_.get(), &version) != 0) {
+            check_error();
+        }
+        return version;
+    }
+
+    /// Reserved fragment count of a ReserveFragments operation.
+    uint32_t reserve_fragments_count() const {
+        uint32_t count = 0;
+        if (lance_operation_reserve_fragments_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Number of new base paths in an UpdateBases operation.
+    uint64_t update_bases_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_bases_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Borrowed new base path from an UpdateBases operation. The strings
+    /// remain valid until this operation handle is closed.
+    LanceBasePathView update_bases_at(size_t index) const {
+        LanceBasePathView base{};
+        if (lance_operation_update_bases_at(handle_.get(), index, &base) != 0) {
+            check_error();
+        }
+        return base;
+    }
+
+    /// New base paths cloned from an UpdateBases operation.
+    std::vector<BasePath> update_bases() const;
+
+    /// Construct an owned native Append operation. Fragment handles are
+    /// borrowed and their complete native metadata is copied.
+    static Operation make_append(const std::vector<const Fragment*>& fragments);
+
+    /// Construct an owned native Restore operation.
+    static Operation make_restore(uint64_t version) {
+        auto* operation = lance_operation_restore_new(version);
+        if (!operation) check_error();
+        return Operation(operation);
+    }
+
+    /// Construct an owned native ReserveFragments operation.
+    static Operation make_reserve_fragments(uint32_t num_fragments) {
+        auto* operation = lance_operation_reserve_fragments_new(num_fragments);
+        if (!operation) check_error();
+        return Operation(operation);
+    }
+
+    /// Construct an owned native UpdateBases operation. Native commit
+    /// validation owns conflict detection and zero-ID allocation.
+    static Operation make_update_bases(const std::vector<BasePath>& new_bases);
 
     /// Construct an owned native Delete operation. The fragment handles are
     /// borrowed and their complete native metadata is copied. Deleted IDs and
@@ -2402,6 +2477,37 @@ public:
         return value;
     }
 
+    /// Whether this handle retains a dataset-bound native fragment.
+    bool is_bound() const {
+        bool value = false;
+        if (lance_fragment_is_bound(handle_.get(), &value) != 0) check_error();
+        return value;
+    }
+
+    /// Clone one native base data file from owned fragment metadata.
+    DataFile data_file_at(size_t index) const {
+        LanceDataFile* raw = nullptr;
+        if (lance_fragment_data_file_at(handle_.get(), index, &raw) != 0)
+            check_error();
+        if (!raw) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_fragment_data_file_at returned success with "
+                        "null data file");
+        }
+        return DataFile(raw);
+    }
+
+    /// Find the native base data file that stores a field ID. Missing fields
+    /// return std::nullopt; a negative field ID is an invalid argument.
+    std::optional<DataFile> data_file_for_field(int32_t field_id) const {
+        LanceDataFile* raw = nullptr;
+        if (lance_fragment_data_file_for_field(
+                handle_.get(), field_id, &raw) != 0)
+            check_error();
+        if (!raw) return std::nullopt;
+        return DataFile(raw);
+    }
+
     /// Native `Fragment` metadata serialized as JSON. Includes base data
     /// files, overlays, deletion-file metadata, row-id/version metadata, and
     /// the optional physical_rows value.
@@ -2592,6 +2698,76 @@ inline Operation Operation::make_project(
         check_error();
     }
     return Operation(raw);
+}
+
+inline Fragment Operation::append_fragment_at(size_t index) const {
+    LanceFragment* raw = nullptr;
+    if (lance_operation_append_fragment_at(handle_.get(), index, &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_append_fragment_at returned success "
+                    "with null fragment");
+    }
+    return Fragment(raw);
+}
+
+inline std::vector<BasePath> Operation::update_bases() const {
+    uint64_t count = 0;
+    if (lance_operation_update_bases_count(handle_.get(), &count) != 0)
+        check_error();
+
+    std::vector<BasePath> out;
+    out.reserve(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        LanceBasePathView view{};
+        if (lance_operation_update_bases_at(
+                handle_.get(), static_cast<size_t>(i), &view) != 0)
+            check_error();
+        BasePath base;
+        base.id = view.id;
+        base.path = view.path ? view.path : "";
+        base.name = view.name ? std::optional<std::string>(view.name)
+                              : std::nullopt;
+        base.is_dataset_root = view.is_dataset_root;
+        out.push_back(std::move(base));
+    }
+    return out;
+}
+
+inline Operation Operation::make_append(
+    const std::vector<const Fragment*>& fragments) {
+    std::vector<const LanceFragment*> handles;
+    handles.reserve(fragments.size());
+    for (const auto* fragment : fragments) {
+        if (!fragment) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "append fragment must not be null");
+        }
+        handles.push_back(fragment->c_handle());
+    }
+    auto* operation = lance_operation_append_new(
+        handles.empty() ? nullptr : handles.data(), handles.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline Operation Operation::make_update_bases(
+    const std::vector<BasePath>& new_bases) {
+    std::vector<LanceBasePath> raw;
+    raw.reserve(new_bases.size());
+    for (const auto& base : new_bases) {
+        LanceBasePath entry{};
+        entry.id = base.id;
+        entry.path = base.path.c_str();
+        entry.name = base.name ? base.name->c_str() : nullptr;
+        entry.is_dataset_root = base.is_dataset_root;
+        raw.push_back(entry);
+    }
+    auto* operation = lance_operation_update_bases_new(
+        raw.empty() ? nullptr : raw.data(), raw.size());
+    if (!operation) check_error();
+    return Operation(operation);
 }
 
 inline Operation Operation::make_delete(

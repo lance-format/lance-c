@@ -311,6 +311,22 @@ static int compare_i32(const void *left, const void *right) {
     return (a > b) - (a < b);
 }
 
+static uint64_t dataset_max_fragment_id(LanceDataset *dataset) {
+    uint64_t count = lance_dataset_fragment_count(dataset);
+    CHECK_OK();
+    uint64_t *ids = (uint64_t *)calloc(count, sizeof(uint64_t));
+    ASSERT(ids != NULL, "allocate fragment ids");
+    ASSERT(lance_dataset_fragment_ids(dataset, ids) == 0,
+           "read fragment ids for high-water mark");
+    CHECK_OK();
+    uint64_t max_id = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        if (ids[i] > max_id) max_id = ids[i];
+    }
+    free(ids);
+    return max_id;
+}
+
 static size_t collect_c_ids(const char *uri, int32_t *out, size_t capacity) {
     LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
     ASSERT(dataset != NULL, "open replacement result");
@@ -2176,6 +2192,354 @@ static void test_blob_writer_publication(const char *uri) {
     printf("C blob writer publication OK\n");
 }
 
+static void test_native_operation_construction(const char *src_uri,
+                                               const char *base) {
+    char uri[4096];
+    snprintf(uri, sizeof(uri), "%s/c_native_operations", base);
+
+    LanceDataset *source = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(source != NULL, "open native operation source");
+    CHECK_OK();
+    uint64_t source_rows = lance_dataset_count_rows(source);
+    CHECK_OK();
+    lance_dataset_close(source);
+
+    LanceUncommittedWriteOptions options;
+    memset(&options, 0, sizeof(options));
+    options.write.params.max_rows_per_file = 1;
+
+    LanceTransaction *create = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_CREATE, &options);
+    LanceDataset *dataset = commit_transaction(uri, create, NULL);
+    uint64_t version = lance_dataset_version(dataset);
+    CHECK_OK();
+    ASSERT(version == 1, "native operation seed version");
+    uint64_t seed_fragments = lance_dataset_fragment_count(dataset);
+    CHECK_OK();
+    ASSERT(seed_fragments > 1, "seed must span fragments");
+    lance_transaction_close(create);
+    lance_dataset_close(dataset);
+
+    LanceTransaction *staged = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_APPEND, &options);
+    uint64_t read_version = transaction_read_version(staged);
+    ASSERT(read_version == 1, "staged append read version");
+    ASSERT(transaction_operation_kind(staged) == LANCE_OPERATION_APPEND,
+           "staged append operation kind");
+    uint64_t staged_count = transaction_fragment_count(staged);
+
+    LanceOperation *staged_operation = NULL;
+    ASSERT(lance_transaction_operation(staged, &staged_operation) == 0,
+           "clone staged append operation");
+    CHECK_OK();
+    uint64_t append_count = UINT64_MAX;
+    ASSERT(lance_operation_append_fragment_count(staged_operation,
+                                                 &append_count) == 0,
+           "append fragment count");
+    CHECK_OK();
+    ASSERT(append_count == staged_count && append_count > 0,
+           "generic and typed append counts agree");
+
+    LanceFragment **handles =
+        (LanceFragment **)calloc(append_count, sizeof(LanceFragment *));
+    ASSERT(handles != NULL, "allocate detached fragment handles");
+    for (uint64_t i = 0; i < append_count; i++) {
+        LanceFragment *fragment = NULL;
+        ASSERT(lance_operation_append_fragment_at(staged_operation, i,
+                                                  &fragment) == 0,
+               "typed append fragment");
+        CHECK_OK();
+        ASSERT(fragment != NULL, "typed append fragment output");
+        bool is_bound = true;
+        ASSERT(lance_fragment_is_bound(fragment, &is_bound) == 0,
+               "append fragment bound state");
+        CHECK_OK();
+        ASSERT(!is_bound, "append fragments must be detached");
+        ASSERT(lance_fragment_data_file_count(fragment) > 0,
+               "detached fragment data files");
+        CHECK_OK();
+        LanceDataFile *file = NULL;
+        ASSERT(lance_fragment_data_file_at(fragment, 0, &file) == 0,
+               "detached fragment data file");
+        CHECK_OK();
+        ASSERT(file != NULL, "detached fragment data file output");
+        const char *path = lance_data_file_path(file);
+        ASSERT(path != NULL, "detached data file path");
+        CHECK_OK();
+        lance_data_file_close(file);
+        LanceDataFile *field_file = NULL;
+        ASSERT(lance_fragment_data_file_for_field(fragment, 0, &field_file) == 0,
+               "detached field data file");
+        CHECK_OK();
+        if (field_file != NULL) lance_data_file_close(field_file);
+        const char *metadata = lance_fragment_metadata_json(fragment);
+        ASSERT(metadata != NULL && metadata[0] != '\0',
+               "detached fragment metadata JSON");
+        CHECK_OK();
+        lance_free_string(metadata);
+
+        uint64_t rows = 0xBEEF;
+        ASSERT(lance_fragment_physical_rows(fragment, &rows) == -1,
+               "detached physical rows rejected");
+        ASSERT(lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED,
+               "detached physical rows error code");
+        ASSERT(rows == 0xBEEF, "detached physical rows output untouched");
+        ASSERT(lance_fragment_scan(fragment) == NULL,
+               "detached scan rejected");
+        ASSERT(lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED,
+               "detached scan error code");
+        handles[i] = fragment;
+    }
+
+    lance_operation_close(staged_operation);
+    lance_transaction_close(staged);
+
+    LanceOperation *typed_append = lance_operation_append_new(
+        (const LanceFragment *const *)handles, append_count);
+    ASSERT(typed_append != NULL, "construct typed append operation");
+    CHECK_OK();
+    for (uint64_t i = 0; i < append_count; i++) {
+        const char *metadata = lance_fragment_metadata_json(handles[i]);
+        ASSERT(metadata != NULL,
+               "detached metadata outlives staged transaction");
+        CHECK_OK();
+        lance_free_string(metadata);
+        lance_fragment_close(handles[i]);
+    }
+    free(handles);
+
+    LanceTransaction *append_transaction =
+        lance_transaction_new(read_version, typed_append, NULL);
+    ASSERT(append_transaction != NULL, "typed append transaction");
+    CHECK_OK();
+    dataset = commit_transaction(uri, append_transaction, NULL);
+    ASSERT(lance_dataset_version(dataset) == 2, "typed append version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == source_rows * 2,
+           "typed append rows");
+    CHECK_OK();
+    uint64_t max_after_append = dataset_max_fragment_id(dataset);
+    lance_transaction_close(append_transaction);
+    lance_operation_close(typed_append);
+    lance_dataset_close(dataset);
+
+    LanceOperation *restore = lance_operation_restore_new(1);
+    ASSERT(restore != NULL, "construct restore operation");
+    CHECK_OK();
+    uint64_t restore_version = UINT64_MAX;
+    ASSERT(lance_operation_restore_version(restore, &restore_version) == 0,
+           "restore version getter");
+    CHECK_OK();
+    ASSERT(restore_version == 1, "restore version value");
+    LanceTransaction *restore_transaction =
+        lance_transaction_new(2, restore, NULL);
+    ASSERT(restore_transaction != NULL, "restore transaction");
+    dataset = commit_transaction(uri, restore_transaction, NULL);
+    ASSERT(lance_dataset_version(dataset) == 3, "restore version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == source_rows,
+           "restore restores historical rows");
+    CHECK_OK();
+    lance_transaction_close(restore_transaction);
+    lance_operation_close(restore);
+    lance_dataset_close(dataset);
+
+    LanceOperation *reserve_zero = lance_operation_reserve_fragments_new(0);
+    ASSERT(reserve_zero != NULL, "construct zero reserve");
+    CHECK_OK();
+    uint32_t reserve_count = UINT32_MAX;
+    ASSERT(lance_operation_reserve_fragments_count(reserve_zero,
+                                                   &reserve_count) == 0,
+           "zero reserve getter");
+    CHECK_OK();
+    ASSERT(reserve_count == 0, "zero reserve value");
+    LanceTransaction *zero_transaction =
+        lance_transaction_new(3, reserve_zero, NULL);
+    ASSERT(zero_transaction != NULL, "zero reserve transaction");
+    dataset = commit_transaction(uri, zero_transaction, NULL);
+    ASSERT(lance_dataset_version(dataset) == 4, "zero reserve version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == source_rows,
+           "zero reserve preserves rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(dataset) == seed_fragments,
+           "zero reserve preserves fragments");
+    CHECK_OK();
+    lance_transaction_close(zero_transaction);
+    lance_operation_close(reserve_zero);
+    lance_dataset_close(dataset);
+
+    LanceOperation *reserve_two = lance_operation_reserve_fragments_new(2);
+    ASSERT(reserve_two != NULL, "construct reserve two");
+    CHECK_OK();
+    LanceTransaction *reserve_transaction =
+        lance_transaction_new(4, reserve_two, NULL);
+    ASSERT(reserve_transaction != NULL, "reserve two transaction");
+    dataset = commit_transaction(uri, reserve_transaction, NULL);
+    ASSERT(lance_dataset_version(dataset) == 5, "reserve two version");
+    CHECK_OK();
+    lance_transaction_close(reserve_transaction);
+    lance_operation_close(reserve_two);
+    lance_dataset_close(dataset);
+
+    LanceTransaction *reserved_append = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_APPEND, &options);
+    uint64_t reserved_read_version = transaction_read_version(reserved_append);
+    ASSERT(reserved_read_version == 5, "reserved append read version");
+    LanceOperation *reserved_operation = NULL;
+    ASSERT(lance_transaction_operation(reserved_append, &reserved_operation) == 0,
+           "reserved append operation");
+    CHECK_OK();
+    uint64_t reserved_fragments = UINT64_MAX;
+    ASSERT(lance_operation_append_fragment_count(reserved_operation,
+                                                 &reserved_fragments) == 0,
+           "reserved append fragment count");
+    CHECK_OK();
+    LanceFragment **reserved_handles = (LanceFragment **)calloc(
+        reserved_fragments, sizeof(LanceFragment *));
+    ASSERT(reserved_handles != NULL, "allocate reserved handles");
+    for (uint64_t i = 0; i < reserved_fragments; i++) {
+        ASSERT(lance_operation_append_fragment_at(reserved_operation, i,
+                                                  &reserved_handles[i]) == 0,
+               "reserved append fragment");
+        CHECK_OK();
+    }
+    LanceOperation *reserved_typed = lance_operation_append_new(
+        (const LanceFragment *const *)reserved_handles, reserved_fragments);
+    ASSERT(reserved_typed != NULL, "reserved typed append");
+    CHECK_OK();
+    for (uint64_t i = 0; i < reserved_fragments; i++) {
+        lance_fragment_close(reserved_handles[i]);
+    }
+    free(reserved_handles);
+    lance_operation_close(reserved_operation);
+    lance_transaction_close(reserved_append);
+    LanceTransaction *reserved_transaction =
+        lance_transaction_new(reserved_read_version, reserved_typed, NULL);
+    ASSERT(reserved_transaction != NULL, "reserved append transaction");
+    dataset = commit_transaction(uri, reserved_transaction, NULL);
+    ASSERT(lance_dataset_version(dataset) == 6, "reserved append version");
+    CHECK_OK();
+    lance_transaction_close(reserved_transaction);
+    lance_operation_close(reserved_typed);
+    ASSERT(lance_dataset_fragment_count(dataset) ==
+               seed_fragments + reserved_fragments,
+           "reserved append fragment count");
+    CHECK_OK();
+    uint64_t reserved_ids[64] = {0};
+    ASSERT(lance_dataset_fragment_ids(dataset, reserved_ids) == 0,
+           "reserved append fragment ids");
+    CHECK_OK();
+    uint64_t max_after = 0;
+    for (uint64_t i = 0; i < seed_fragments + reserved_fragments; i++) {
+        if (reserved_ids[i] > max_after) max_after = reserved_ids[i];
+    }
+    ASSERT(max_after == max_after_append + 2 + reserved_fragments,
+           "reserve advances native fragment id allocation");
+    CHECK_OK();
+    lance_dataset_close(dataset);
+
+    char base_a[4096];
+    char base_b[4096];
+    snprintf(base_a, sizeof(base_a), "%s_c_base_a", uri);
+    snprintf(base_b, sizeof(base_b), "%s_c_base_b", uri);
+    LanceBasePath bases[2];
+    memset(bases, 0, sizeof(bases));
+    bases[0].id = 7;
+    bases[0].path = base_a;
+    bases[0].name = NULL;
+    bases[1].id = 0;
+    bases[1].path = base_b;
+    bases[1].name = "";
+    bases[1].is_dataset_root = true;
+    LanceOperation *update_bases =
+        lance_operation_update_bases_new(bases, 2);
+    ASSERT(update_bases != NULL, "construct update bases");
+    CHECK_OK();
+    uint64_t base_count = UINT64_MAX;
+    ASSERT(lance_operation_update_bases_count(update_bases, &base_count) == 0,
+           "update bases count");
+    CHECK_OK();
+    ASSERT(base_count == 2, "update bases count value");
+    LanceBasePathView view;
+    memset(&view, 0, sizeof(view));
+    ASSERT(lance_operation_update_bases_at(update_bases, 0, &view) == 0,
+           "update bases view");
+    CHECK_OK();
+    ASSERT(view.id == 7, "update bases view id");
+    ASSERT(view.name == NULL, "update bases NULL name stays NULL");
+    ASSERT(strcmp(view.path, base_a) == 0, "update bases view path");
+    memset(&view, 0, sizeof(view));
+    ASSERT(lance_operation_update_bases_at(update_bases, 1, &view) == 0,
+           "update bases empty name view");
+    CHECK_OK();
+    ASSERT(view.name != NULL && strcmp(view.name, "") == 0,
+           "update bases empty name stays empty");
+    ASSERT(view.is_dataset_root, "update bases root flag");
+
+    LanceTransaction *bases_transaction =
+        lance_transaction_new(6, update_bases, NULL);
+    ASSERT(bases_transaction != NULL, "update bases transaction");
+    dataset = commit_transaction(uri, bases_transaction, NULL);
+    ASSERT(lance_dataset_version(dataset) == 7, "update bases version");
+    CHECK_OK();
+    const char *bases_json = lance_dataset_base_paths_json(dataset);
+    ASSERT(bases_json != NULL, "base paths JSON");
+    CHECK_OK();
+    ASSERT(strstr(bases_json, base_a) != NULL &&
+               strstr(bases_json, base_b) != NULL,
+           "update bases publishes both paths");
+    lance_free_string(bases_json);
+    lance_transaction_close(bases_transaction);
+    lance_operation_close(update_bases);
+    lance_dataset_close(dataset);
+
+    LanceBasePath conflict;
+    memset(&conflict, 0, sizeof(conflict));
+    conflict.path = base_a;
+    LanceOperation *conflict_operation =
+        lance_operation_update_bases_new(&conflict, 1);
+    ASSERT(conflict_operation != NULL, "construct conflicting update bases");
+    LanceTransaction *conflict_transaction =
+        lance_transaction_new(7, conflict_operation, NULL);
+    ASSERT(conflict_transaction != NULL, "conflicting update bases transaction");
+    LanceDataset *failed = NULL;
+    ASSERT(lance_transaction_commit(uri, conflict_transaction, NULL, NULL, NULL,
+                                    &failed) == -1,
+           "conflicting base path commit rejected");
+    ASSERT(failed == NULL, "conflicting commit has no dataset");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "conflicting base path error code");
+    const char *conflict_message = lance_last_error_message();
+    ASSERT(conflict_message != NULL &&
+               strstr(conflict_message, "Conflict detected") != NULL,
+           "conflicting base path native message");
+    lance_free_string(conflict_message);
+    lance_transaction_close(conflict_transaction);
+    lance_operation_close(conflict_operation);
+
+    LanceOperation *empty_bases =
+        lance_operation_update_bases_new(NULL, 0);
+    ASSERT(empty_bases != NULL, "construct empty update bases");
+    CHECK_OK();
+    lance_operation_close(empty_bases);
+
+    LanceOperation *null_append = lance_operation_append_new(NULL, 1);
+    ASSERT(null_append == NULL, "NULL append fragment array rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL append fragment array error code");
+    LanceOperation *empty_append = lance_operation_append_new(NULL, 0);
+    ASSERT(empty_append != NULL, "empty append operation");
+    CHECK_OK();
+    lance_operation_close(empty_append);
+    LanceOperation *null_bases = lance_operation_update_bases_new(NULL, 1);
+    ASSERT(null_bases == NULL, "NULL update bases array rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL update bases array error code");
+
+    printf("native operation construction OK\n");
+}
+
 int main(int argc, char **argv) {
     if (argc != 5) {
         fprintf(stderr,
@@ -2191,6 +2555,7 @@ int main(int argc, char **argv) {
 
     test_native_schema(argv[3]);
     test_blob_writer_publication(argv[4]);
+    test_native_operation_construction(argv[1], argv[2]);
     printf("All C transaction tests passed!\n");
     return 0;
 }
