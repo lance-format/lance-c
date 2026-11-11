@@ -158,12 +158,15 @@ void test_sql_builder_lifecycle(const std::string& uri) {
 void test_sql_renamed_table(const std::string& uri) {
     auto dataset = lance::Dataset::open(uri);
 
-    // The default table name does not resolve a renamed query, so planning
-    // throws and the builder is already consumed.
-    auto renamed = dataset.sql("SELECT id FROM orders ORDER BY id");
-    renamed.table_name("orders");
-    CHECK(error_code_of([&] { renamed.build(); }) ==
-          LANCE_ERR_INVALID_ARGUMENT);
+    // The default table name is "dataset", so a query that reads "orders"
+    // cannot be planned and the builder is already consumed.
+    {
+        auto plan = dataset.sql("SELECT id FROM orders ORDER BY id");
+        CHECK(error_code_of([&] { plan.build(); }) ==
+              LANCE_ERR_INVALID_ARGUMENT);
+    }
+
+    // Renaming the table makes the same query plan and run.
 
     auto stream = dataset.sql("SELECT id FROM orders ORDER BY id")
                       .table_name("orders")

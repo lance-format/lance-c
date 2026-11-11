@@ -48,12 +48,6 @@ static int compare_i32(const void *left, const void *right) {
     return (a > b) - (a < b);
 }
 
-static int compare_u64(const void *left, const void *right) {
-    uint64_t a = *(const uint64_t *)left;
-    uint64_t b = *(const uint64_t *)right;
-    return (a > b) - (a < b);
-}
-
 /* The number of top-level fields advertised by the stream schema. */
 static int64_t stream_field_count(struct ArrowArrayStream *stream) {
     struct ArrowSchema schema;
