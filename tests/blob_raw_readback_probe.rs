@@ -196,12 +196,14 @@ fn open_c_reader_result(
     options: Option<&LanceFileReaderOptions>,
 ) -> Result<*mut LanceFileReader, (LanceErrorCode, String)> {
     let uri = c_string(uri);
-    let options_ptr = options.map_or(ptr::null(), |options| options as *const _);
+    let options_ptr = options.map_or(ptr::null(), |options| {
+        options as *const LanceFileReaderOptions
+    });
     let reader = unsafe {
         lance_file_reader_open(
             uri.as_ptr(),
-            options_ptr,
             ptr::null(),
+            options_ptr,
             ptr::null(),
             ptr::null(),
         )
