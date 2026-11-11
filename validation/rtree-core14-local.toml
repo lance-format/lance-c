@@ -1,0 +1,23 @@
+[patch."https://github.com/lancedb/lance.git"]
+fsst = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/compression/fsst" }
+lance = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance" }
+lance-arrow = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-arrow" }
+lance-arrow-scalar = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/arrow-scalar" }
+lance-arrow-stats = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/arrow-stats" }
+lance-bitpacking = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/compression/bitpacking" }
+lance-core = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-core" }
+lance-datafusion = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-datafusion" }
+lance-datagen = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-datagen" }
+lance-derive = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-derive" }
+lance-encoding = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-encoding" }
+lance-file = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-file" }
+lance-geo = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-geo" }
+lance-index = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-index" }
+lance-index-core = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-index-core" }
+lance-io = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-io" }
+lance-jsonb = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-jsonb" }
+lance-linalg = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-linalg" }
+lance-namespace = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-namespace" }
+lance-select = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-select" }
+lance-table = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-table" }
+lance-tokenizer = { path = "/home/xuanwo/Code/lance-c-validation/rtree-core14-backport-native/rust/lance-tokenizer" }
