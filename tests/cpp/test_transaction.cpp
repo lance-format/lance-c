@@ -1643,13 +1643,10 @@ static void test_typed_native_operations(const std::string& source_uri,
     CHECK(field_maps.size() == 1);
     CHECK(field_maps.at(seed_id_field).count() == 2);
 
-    // The overwrite publication reuses source fragments for manifest-level
-    // assertions only, so apply the metadata change to the seed dataset whose
-    // data files are reachable for the deletion checks below.
     auto updated = lance::Dataset::commit(
-        seed_uri,
-        lance::Transaction::from_operation(seed.version(), update_config));
-    CHECK(updated.version() == seed.version() + 1);
+        overwrite_uri,
+        lance::Transaction::from_operation(published.version(), update_config));
+    CHECK(updated.version() == 2);
     auto updated_config = updated.config();
     CHECK(updated_config.find("owner") == updated_config.end());
     CHECK(updated_config.find("empty") == updated_config.end());

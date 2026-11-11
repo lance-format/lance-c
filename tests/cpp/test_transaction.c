@@ -3025,15 +3025,12 @@ static void test_native_typed_operations(const char *src_uri,
     lance_update_map_close(typed_field_updates);
     lance_update_map_close(typed_config_updates);
 
-    // UpdateConfig must apply to a dataset whose data files are reachable;
-    // the overwrite publication reuses source fragments for manifest-level
-    // assertions only, so commit the metadata change against the seed.
     LanceTransaction *update_transaction =
         lance_transaction_new(1, update_config, NULL);
     ASSERT(update_transaction != NULL, "typed UpdateConfig transaction");
     CHECK_OK();
     LanceDataset *updated =
-        commit_transaction(seed_uri, update_transaction, NULL);
+        commit_transaction(overwrite_uri, update_transaction, NULL);
     ASSERT(lance_dataset_version(updated) == 2,
            "typed UpdateConfig version");
     CHECK_OK();
