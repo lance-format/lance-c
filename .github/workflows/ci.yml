@@ -130,6 +130,52 @@ jobs:
       - name: Verify CMake package and consumer linkage
         run: bash .github/scripts/verify-cmake-consumer.sh --from-target-dir target/debug
 
+  test-windows:
+    name: Tests (Windows x64)
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          $version = '29.3'
+          $archive = "protoc-$version-win64.zip"
+          Invoke-WebRequest `
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$version/$archive" `
+            -OutFile "$env:RUNNER_TEMP\$archive"
+          Expand-Archive "$env:RUNNER_TEMP\$archive" `
+            -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
+          "$env:RUNNER_TEMP\protoc\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
+      - name: Configure
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Install to staging prefix
+        run: cmake --install build --prefix stage --config Release
+      - name: Verify staged package and installed consumers
+        run: >
+          pwsh -File .github/scripts/verify-windows-staging.ps1
+          -Prefix stage -SourceRoot .
+          -WorkDir "$env:RUNNER_TEMP\lance-c-windows-acceptance"
+      - name: Upload staged package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lance-c-windows-x86_64-pc-windows-msvc
+          path: stage
+          if-no-files-found: error
+          retention-days: 14
+
   rustdoc:
     name: Rustdoc
     runs-on: ubuntu-24.04
