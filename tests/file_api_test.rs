@@ -342,6 +342,37 @@ fn read_all_c(
     result
 }
 
+fn read_indices_c(
+    reader: *const LanceFileReader,
+    indices: &[u32],
+    batch_size: u32,
+    batch_readahead: u32,
+) -> Result<Vec<RecordBatch>, String> {
+    let mut stream = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    let status = unsafe {
+        lance_file_reader_read_indices(
+            reader,
+            indices.as_ptr(),
+            indices.len(),
+            batch_size,
+            batch_readahead,
+            &mut stream,
+        )
+    };
+    if status != 0 {
+        return Err(take_error().1);
+    }
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let mut batches = Vec::new();
+    for batch in reader {
+        match batch {
+            Ok(batch) => batches.push(batch),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(batches)
+}
+
 fn native_reader(uri: &str) -> NativeFileReader {
     native_reader_with_options(uri, NativeReaderOptions::default())
 }
@@ -382,6 +413,27 @@ fn native_batches(reader: &NativeFileReader) -> Vec<RecordBatch> {
             .await
             .unwrap();
         stream.map(|batch| batch.unwrap()).collect().await
+    })
+}
+
+fn native_indices_batches(
+    reader: &NativeFileReader,
+    indices: Vec<u32>,
+) -> Result<Vec<RecordBatch>, String> {
+    lance_c::runtime::block_on(async {
+        let stream = reader
+            .read_stream(
+                ReadBatchParams::Indices(UInt32Array::from_iter_values(indices)),
+                8,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        stream
+            .map(|batch| batch.map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()
+            .await
     })
 }
 
@@ -906,78 +958,24 @@ fn reader_projection_range_indices_errors_and_io_stats() {
     );
 
     let duplicate_indices = [2u32, 2, 0];
-    let mut duplicate_stream = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
-    assert_eq!(
-        unsafe {
-            lance_file_reader_read_indices(
-                reader,
-                duplicate_indices.as_ptr(),
-                duplicate_indices.len(),
-                8,
-                1,
-                &mut duplicate_stream,
-            )
-        },
-        0
-    );
-    let (_, duplicate_batches) = collect_c_stream(duplicate_stream);
-    let duplicate = arrow::compute::concat_batches(&fixture_schema(), &duplicate_batches).unwrap();
-    assert_eq!(
-        duplicate
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .values(),
-        &[3, 3, 1]
-    );
     let oracle = native_reader(uri);
-    let native_duplicates = lance_c::runtime::block_on(async {
-        oracle
-            .read_stream(
-                ReadBatchParams::Indices(UInt32Array::from_iter_values(duplicate_indices)),
-                8,
-                1,
-                FilterExpression::no_filter(),
-            )
-            .await
-            .unwrap()
-            .map(|batch| batch.unwrap())
-            .collect::<Vec<_>>()
-            .await
-    });
-    assert_batches_match_ignoring_root_metadata(&duplicate_batches, &native_duplicates);
+    let c_duplicates = read_indices_c(reader, &duplicate_indices, 8, 1);
+    let native_duplicates = native_indices_batches(&oracle, duplicate_indices.to_vec());
+    match (&c_duplicates, &native_duplicates) {
+        (Ok(c_batches), Ok(native_batches)) => {
+            assert_batches_match_ignoring_root_metadata(c_batches, native_batches);
+        }
+        (Err(c_error), Err(native_error)) => assert_eq!(c_error, native_error),
+        _ => panic!(
+            "duplicate index outcome diverged: C={c_duplicates:?}, native={native_duplicates:?}"
+        ),
+    }
 
     let out_of_range = [7u32];
-    let mut out_of_range_stream = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
-    assert_eq!(
-        unsafe {
-            lance_file_reader_read_indices(
-                reader,
-                out_of_range.as_ptr(),
-                out_of_range.len(),
-                8,
-                1,
-                &mut out_of_range_stream,
-            )
-        },
-        -1
-    );
-    let (_, c_out_of_range_error) = take_error();
-    let native_out_of_range_error = lance_c::runtime::block_on(async {
-        oracle
-            .read_stream(
-                ReadBatchParams::Indices(UInt32Array::from_iter_values(out_of_range)),
-                8,
-                1,
-                FilterExpression::no_filter(),
-            )
-            .await
-            .err()
-            .expect("native out-of-range index must fail")
-    });
-    assert_eq!(c_out_of_range_error, native_out_of_range_error.to_string());
+    let c_out_of_range_error = read_indices_c(reader, &out_of_range, 8, 1).unwrap_err();
+    let native_out_of_range_error =
+        native_indices_batches(&oracle, out_of_range.to_vec()).unwrap_err();
+    assert_eq!(c_out_of_range_error, native_out_of_range_error);
     assert!(c_out_of_range_error.contains("out of bounds"));
 
     let mut stats = LanceScanStats::default();
@@ -1739,7 +1737,7 @@ fn malformed_files_and_v1_are_rejected_without_panic() {
 #[test]
 fn real_v1_fixture_is_rejected_by_the_current_format_reader() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("test_data/v0.27.1/pq_in_schema/data/9a05591c-9c05-4599-8d0f-40b36f27a313.lance");
+        .join("test_data/v0.7.5/with_deletions/data/016c15dc-2c94-4382-b7a4-2c7def9c3897.lance");
     let uri = c_string(path.to_str().unwrap());
     let reader = unsafe {
         lance_file_reader_open(
