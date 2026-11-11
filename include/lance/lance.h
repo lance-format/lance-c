@@ -29,6 +29,10 @@
 extern "C" {
 #endif
 
+/* Opaque native dynamic storage-options handles. The accessor is declared
+   early because dataset open and write options attach it. */
+typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
+
 /* ─── Arrow C Data Interface forward declarations ─── */
 /* These match the canonical Arrow spec structs. If you already include
    arrow/c/abi.h, guard with ARROW_C_DATA_INTERFACE. */
@@ -552,6 +556,42 @@ LanceDataset* lance_dataset_open_with_session(
     const char* uri,
     const char* const* storage_opts,
     uint64_t version,
+    const LanceSession* session
+);
+
+/**
+ * Additive options for lance_dataset_open_with_options.
+ *
+ * Zero-initialize to open the latest version with native storage defaults.
+ * `storage_options_accessor` may be NULL for native defaults or point to a
+ * native dynamic accessor. The native dataset retains the accessor (and its
+ * provider/cache) after this call, so closing the C accessor does not
+ * invalidate later dataset I/O. Static options belong in the accessor's
+ * initial options. `version == 0` opens the latest version.
+ */
+typedef struct LanceDatasetOpenOptions {
+    uint64_t version;
+    const LanceStorageOptionsAccessor* storage_options_accessor;
+} LanceDatasetOpenOptions;
+
+/**
+ * Open a dataset with additive options and an optional shared session.
+ *
+ * `options` may be NULL, which is equivalent to a zero-initialized struct.
+ * `session` may be NULL for the default session. A non-NULL session is
+ * retained through shared ownership, exactly like
+ * lance_dataset_open_with_session.
+ *
+ * The returned dataset retains the native accessor and its provider. Later
+ * dataset I/O uses the native provider refresh, error and cache policy; the
+ * binding adds no second credential cache. Passing NULL for the accessor
+ * preserves the existing native default behavior.
+ *
+ * @return Dataset handle, or NULL on error.
+ */
+LanceDataset* lance_dataset_open_with_options(
+    const char* uri,
+    const LanceDatasetOpenOptions* options,
     const LanceSession* session
 );
 
@@ -6833,6 +6873,55 @@ int32_t lance_dataset_write_with_options(
     LanceDataset** out_dataset
 );
 
+/**
+ * Same as lance_dataset_write but attaches a native dynamic storage-options
+ * accessor instead of static storage_opts. The returned dataset retains the
+ * accessor and provider; later I/O follows native refresh, error and cache
+ * semantics. A NULL accessor uses native defaults. Static options belong in
+ * the accessor's initial options. This entry point keeps the legacy
+ * 20-version / 14-day auto-cleanup policy.
+ */
+int32_t lance_dataset_write_with_accessor(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Same as lance_dataset_write_with_params but attaches a native dynamic
+ * storage-options accessor instead of static storage_opts. The accessor is
+ * retained by the returned dataset. A NULL accessor uses native defaults.
+ * This entry point keeps the legacy 20/14 auto-cleanup policy.
+ */
+int32_t lance_dataset_write_with_params_and_accessor(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceWriteParams* params,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Same as lance_dataset_write_with_options but attaches a native dynamic
+ * storage-options accessor instead of static storage_opts. The accessor is
+ * retained by the returned dataset. A NULL accessor uses native defaults.
+ * `options` may be NULL to select native WriteParams::default().
+ */
+int32_t lance_dataset_write_with_options_and_accessor(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceWriteOptions* options,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    LanceDataset** out_dataset
+);
+
 /* ─── Native data files ─── */
 
 /** Owned native `DataFile` metadata snapshot. */
@@ -7088,6 +7177,26 @@ int32_t lance_dataset_write_uncommitted_stream(
     int32_t mode,
     const LanceUncommittedWriteOptions* options,
     const char* const* storage_opts,
+    const LanceSession* session,
+    LanceTransaction** out_transaction
+);
+
+/**
+ * Same as lance_dataset_write_uncommitted_stream but attaches a native dynamic
+ * storage-options accessor for data-file writes performed by this call. The
+ * returned transaction carries transaction metadata only and does not retain
+ * the accessor; pass the accessor again to the later commit when commit I/O
+ * needs dynamic storage options. A NULL accessor uses native defaults. All
+ * stream, validation and output semantics match the static-options entry
+ * point.
+ */
+int32_t lance_dataset_write_uncommitted_stream_with_accessor(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceUncommittedWriteOptions* options,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
     const LanceSession* session,
     LanceTransaction** out_transaction
 );
@@ -7695,6 +7804,23 @@ int32_t lance_transaction_commit(
 );
 
 /**
+ * Same as lance_transaction_commit but attaches a native dynamic
+ * storage-options accessor instead of static storage_opts. The returned
+ * dataset retains the accessor and provider; later I/O follows native refresh,
+ * error and cache semantics. A NULL accessor uses native defaults. Static
+ * options belong in the accessor's initial options. Transaction ownership and
+ * failure/rollback behavior match lance_transaction_commit.
+ */
+int32_t lance_transaction_commit_with_accessor(
+    const char* uri,
+    const LanceTransaction* transaction,
+    const LanceCommitOptions* options,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    const LanceSession* session,
+    LanceDataset** out_dataset
+);
+
+/**
  * Publish append transactions through CommitBuilder::execute_batch.
  *
  * Each input transaction is borrowed and cloned. Native batch rules determine
@@ -7719,9 +7845,26 @@ int32_t lance_transaction_commit_batch(
     LanceTransaction** out_merged_transaction
 );
 
+/**
+ * Same as lance_transaction_commit_batch but attaches a native dynamic
+ * storage-options accessor instead of static storage_opts. The returned
+ * dataset retains the accessor and provider; the merged transaction carries
+ * transaction metadata only. A NULL accessor uses native defaults. All
+ * eligibility, merge and output rules match lance_transaction_commit_batch.
+ */
+int32_t lance_transaction_commit_batch_with_accessor(
+    const char* uri,
+    const LanceTransaction* const* transactions,
+    size_t transaction_count,
+    const LanceCommitOptions* options,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    const LanceSession* session,
+    LanceDataset** out_dataset,
+    LanceTransaction** out_merged_transaction
+);
+
 /* ─── Storage options ─────────────────────────────────────────────────────── */
 
-typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
 typedef struct LanceStorageOptionsProvider LanceStorageOptionsProvider;
 typedef struct LanceStorageOptionsSnapshot LanceStorageOptionsSnapshot;
 

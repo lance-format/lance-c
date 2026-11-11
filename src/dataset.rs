@@ -21,6 +21,7 @@ use crate::file_session::LanceObjectStoreIoStats;
 use crate::helpers;
 use crate::runtime::block_on;
 use crate::session::LanceSession;
+use crate::storage_options::{LanceStorageOptionsAccessor, storage_options_accessor_from_ffi};
 use crate::stream_guard::guarded_ffi_stream_from_reader;
 
 /// Opaque handle representing an opened Lance dataset.
@@ -110,6 +111,40 @@ fn projection_from_columns(
 // Dataset lifecycle
 // ---------------------------------------------------------------------------
 
+/// Optional settings for `lance_dataset_open_with_options`.
+///
+/// Zero-initialization opens the latest version with native storage defaults.
+/// A NULL `storage_options_accessor` uses native defaults; a non-NULL accessor
+/// is retained by the returned dataset and by later native owners. Static
+/// storage options belong in the accessor's initial options.
+#[repr(C)]
+pub struct LanceDatasetOpenOptions {
+    /// Dataset version to open. Pass 0 for latest.
+    pub version: u64,
+    /// Native dynamic storage-options accessor, or NULL for native defaults.
+    pub storage_options_accessor: *const LanceStorageOptionsAccessor,
+}
+
+/// Open a Lance dataset at the given URI using additive options.
+///
+/// `options` may be NULL for latest version and native storage defaults.
+/// `session` may be NULL for the default session; a non-NULL session is
+/// retained through shared ownership exactly like
+/// `lance_dataset_open_with_session`. A non-NULL accessor is cloned and
+/// retained by the native dataset; closing the C accessor does not invalidate
+/// the dataset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_open_with_options(
+    uri: *const c_char,
+    options: *const LanceDatasetOpenOptions,
+    session: *const LanceSession,
+) -> *mut LanceDataset {
+    ffi_try!(
+        unsafe { open_dataset_with_options_inner(uri, options, session) },
+        null
+    )
+}
+
 /// Open a Lance dataset at the given URI.
 ///
 /// - `uri`: Dataset path (file://, s3://, az://, gs://, memory://)
@@ -125,7 +160,7 @@ pub unsafe extern "C" fn lance_dataset_open(
     version: u64,
 ) -> *mut LanceDataset {
     ffi_try!(
-        unsafe { open_dataset_inner(uri, storage_options, version, None) },
+        unsafe { open_dataset_inner(uri, storage_options, version, None, ptr::null()) },
         null
     )
 }
@@ -159,7 +194,29 @@ unsafe fn open_dataset_with_session_inner(
         ));
     }
     let session = unsafe { &*session };
-    unsafe { open_dataset_inner(uri, storage_options, version, Some(session)) }
+    unsafe { open_dataset_inner(uri, storage_options, version, Some(session), ptr::null()) }
+}
+
+unsafe fn open_dataset_with_options_inner(
+    uri: *const c_char,
+    options: *const LanceDatasetOpenOptions,
+    session: *const LanceSession,
+) -> Result<*mut LanceDataset> {
+    let (version, accessor) = if options.is_null() {
+        (0, ptr::null())
+    } else {
+        // SAFETY: the caller guarantees a non-NULL options pointer is valid
+        // for the duration of this call.
+        let options = unsafe { &*options };
+        (options.version, options.storage_options_accessor)
+    };
+    let session = if session.is_null() {
+        None
+    } else {
+        // SAFETY: non-NULL session points to a live handle for this call.
+        Some(unsafe { &*session })
+    };
+    unsafe { open_dataset_inner(uri, ptr::null(), version, session, accessor) }
 }
 
 unsafe fn open_dataset_inner(
@@ -167,14 +224,23 @@ unsafe fn open_dataset_inner(
     storage_options: *const *const c_char,
     version: u64,
     session: Option<&LanceSession>,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
 ) -> Result<*mut LanceDataset> {
     let uri_str = unsafe { helpers::parse_c_string(uri)? }
         .ok_or_else(|| lance_core::Error::invalid_input_source("uri must not be NULL".into()))?;
 
     let opts = unsafe { helpers::parse_storage_options(storage_options)? };
+    let accessor = unsafe { storage_options_accessor_from_ffi(storage_options_accessor)? };
+    if accessor.is_some() && !opts.is_empty() {
+        return Err(lance_core::Error::invalid_input_source(
+            "storage_options must be NULL when a storage options accessor is provided".into(),
+        ));
+    }
 
     let mut builder = DatasetBuilder::from_uri(uri_str);
-    if !opts.is_empty() {
+    if let Some(accessor) = accessor {
+        builder = builder.with_storage_options_accessor(accessor);
+    } else if !opts.is_empty() {
         builder = builder.with_storage_options(opts);
     }
     if version != 0 {
