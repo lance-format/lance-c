@@ -217,6 +217,7 @@ pub unsafe extern "C" fn lance_dataset_merge_insert(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn merge_insert_inner(
     dataset: *mut LanceDataset,
     on_columns: *const *const c_char,

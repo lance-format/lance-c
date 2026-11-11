@@ -428,6 +428,7 @@ pub unsafe extern "C" fn lance_mem_wal_initialize(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn initialize_inner(
     dataset: *mut LanceDataset,
     mode: i32,
@@ -554,21 +555,21 @@ pub unsafe extern "C" fn lance_mem_wal_index_details_free(details: *mut LanceMem
 pub unsafe extern "C" fn lance_mem_wal_index_details_num_shards(
     details: *const LanceMemWalIndexDetails,
 ) -> u32 {
-    ffi_try!(unsafe { Ok(details_ref(details)?.num_shards) }, 0)
+    ffi_try!(Ok(details_ref(details)?.num_shards), 0)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_mem_wal_index_details_maintain_all_indexes(
     details: *const LanceMemWalIndexDetails,
 ) -> i32 {
-    ffi_try!(unsafe { Ok(details_ref(details)?.maintain_all as i32) }, 0)
+    ffi_try!(Ok(details_ref(details)?.maintain_all as i32), 0)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_mem_wal_index_details_maintained_index_count(
     details: *const LanceMemWalIndexDetails,
 ) -> usize {
-    ffi_try!(unsafe { Ok(details_ref(details)?.maintained.len()) }, 0)
+    ffi_try!(Ok(details_ref(details)?.maintained.len()), 0)
 }
 
 #[unsafe(no_mangle)]
@@ -598,7 +599,7 @@ pub unsafe extern "C" fn lance_mem_wal_index_details_maintained_index_at(
 pub unsafe extern "C" fn lance_mem_wal_index_details_sharding_spec_count(
     details: *const LanceMemWalIndexDetails,
 ) -> usize {
-    ffi_try!(unsafe { Ok(details_ref(details)?.specs.len()) }, 0)
+    ffi_try!(Ok(details_ref(details)?.specs.len()), 0)
 }
 
 #[unsafe(no_mangle)]
@@ -628,7 +629,7 @@ pub unsafe extern "C" fn lance_mem_wal_index_details_sharding_spec_at(
 pub unsafe extern "C" fn lance_mem_wal_index_details_writer_config_default_count(
     details: *const LanceMemWalIndexDetails,
 ) -> usize {
-    ffi_try!(unsafe { Ok(details_ref(details)?.defaults.len()) }, 0)
+    ffi_try!(Ok(details_ref(details)?.defaults.len()), 0)
 }
 
 #[unsafe(no_mangle)]
@@ -838,10 +839,7 @@ pub unsafe extern "C" fn lance_mem_wal_sharding_field_free(field: *mut LanceMemW
 pub unsafe extern "C" fn lance_mem_wal_sharding_field_id(
     field: *const LanceMemWalShardingField,
 ) -> *const c_char {
-    ffi_try!(
-        unsafe { Ok(field_ref(field)?.field_id.as_ptr()) },
-        std::ptr::null()
-    )
+    ffi_try!(Ok(field_ref(field)?.field_id.as_ptr()), std::ptr::null())
 }
 
 #[unsafe(no_mangle)]
@@ -869,12 +867,10 @@ pub unsafe extern "C" fn lance_mem_wal_sharding_field_transform(
     field: *const LanceMemWalShardingField,
 ) -> *const c_char {
     ffi_try!(
-        unsafe {
-            Ok(field_ref(field)?
-                .transform
-                .as_ref()
-                .map_or(std::ptr::null(), |value| value.as_ptr()))
-        },
+        Ok(field_ref(field)?
+            .transform
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.as_ptr())),
         std::ptr::null()
     )
 }
@@ -884,12 +880,10 @@ pub unsafe extern "C" fn lance_mem_wal_sharding_field_expression(
     field: *const LanceMemWalShardingField,
 ) -> *const c_char {
     ffi_try!(
-        unsafe {
-            Ok(field_ref(field)?
-                .expression
-                .as_ref()
-                .map_or(std::ptr::null(), |value| value.as_ptr()))
-        },
+        Ok(field_ref(field)?
+            .expression
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.as_ptr())),
         std::ptr::null()
     )
 }
@@ -898,17 +892,14 @@ pub unsafe extern "C" fn lance_mem_wal_sharding_field_expression(
 pub unsafe extern "C" fn lance_mem_wal_sharding_field_result_type(
     field: *const LanceMemWalShardingField,
 ) -> *const c_char {
-    ffi_try!(
-        unsafe { Ok(field_ref(field)?.result_type.as_ptr()) },
-        std::ptr::null()
-    )
+    ffi_try!(Ok(field_ref(field)?.result_type.as_ptr()), std::ptr::null())
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_mem_wal_sharding_field_parameter_count(
     field: *const LanceMemWalShardingField,
 ) -> usize {
-    ffi_try!(unsafe { Ok(field_ref(field)?.parameters.len()) }, 0)
+    ffi_try!(Ok(field_ref(field)?.parameters.len()), 0)
 }
 
 #[unsafe(no_mangle)]
@@ -1015,14 +1006,14 @@ pub unsafe extern "C" fn lance_mem_wal_sharding_spec_free(spec: *mut LanceMemWal
 pub unsafe extern "C" fn lance_mem_wal_sharding_spec_id(
     spec: *const LanceMemWalShardingSpec,
 ) -> u32 {
-    ffi_try!(unsafe { Ok(spec_ref(spec)?.spec.spec_id) }, 0)
+    ffi_try!(Ok(spec_ref(spec)?.spec.spec_id), 0)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_mem_wal_sharding_spec_field_count(
     spec: *const LanceMemWalShardingSpec,
 ) -> usize {
-    ffi_try!(unsafe { Ok(spec_ref(spec)?.spec.fields.len()) }, 0)
+    ffi_try!(Ok(spec_ref(spec)?.spec.fields.len()), 0)
 }
 
 #[unsafe(no_mangle)]
@@ -1143,8 +1134,8 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_new(
     ffi_try!(
         unsafe {
             require_out(out, "out")?;
-            let shard_id = unsafe { parse_c_string(shard_id)? }
-                .ok_or_else(|| invalid("shard_id must not be NULL"))?;
+            let shard_id =
+                parse_c_string(shard_id)?.ok_or_else(|| invalid("shard_id must not be NULL"))?;
             let uuid = parse_uuid(shard_id, "shard_id")?;
             let handle = LanceMemWalShardSnapshot::new(ShardSnapshot::new(uuid))?;
             *out = Box::into_raw(Box::new(handle));
@@ -1187,7 +1178,7 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_shard_id(
     snapshot: *const LanceMemWalShardSnapshot,
 ) -> *const c_char {
     ffi_try!(
-        unsafe { Ok(snapshot_ref(snapshot)?.shard_id.as_ptr()) },
+        Ok(snapshot_ref(snapshot)?.shard_id.as_ptr()),
         std::ptr::null()
     )
 }
@@ -1196,17 +1187,14 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_shard_id(
 pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_spec_id(
     snapshot: *const LanceMemWalShardSnapshot,
 ) -> u32 {
-    ffi_try!(unsafe { Ok(snapshot_ref(snapshot)?.snapshot.spec_id) }, 0)
+    ffi_try!(Ok(snapshot_ref(snapshot)?.snapshot.spec_id), 0)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_current_generation(
     snapshot: *const LanceMemWalShardSnapshot,
 ) -> u64 {
-    ffi_try!(
-        unsafe { Ok(snapshot_ref(snapshot)?.snapshot.current_generation) },
-        0
-    )
+    ffi_try!(Ok(snapshot_ref(snapshot)?.snapshot.current_generation), 0)
 }
 
 #[unsafe(no_mangle)]
@@ -1215,11 +1203,11 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_with_spec_id(
     spec_id: u32,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let snapshot = required_mut(snapshot, "snapshot")?;
             snapshot.snapshot.spec_id = spec_id;
             Ok(0)
-        },
+        ,
         neg
     )
 }
@@ -1230,11 +1218,11 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_with_current_generation(
     generation: u64,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let snapshot = required_mut(snapshot, "snapshot")?;
             snapshot.snapshot.current_generation = generation;
             Ok(0)
-        },
+        ,
         neg
     )
 }
@@ -1246,7 +1234,7 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_with_sstable(
     path: *const c_char,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let snapshot = required_mut(snapshot, "snapshot")?;
             let path = unsafe { parse_c_string(path)? }
                 .ok_or_else(|| invalid("path must not be NULL"))?
@@ -1257,7 +1245,7 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_with_sstable(
                 .push(SsTable { generation, path });
             snapshot.sync_paths()?;
             Ok(0)
-        },
+        ,
         neg
     )
 }
@@ -1266,10 +1254,7 @@ pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_with_sstable(
 pub unsafe extern "C" fn lance_mem_wal_shard_snapshot_sstable_count(
     snapshot: *const LanceMemWalShardSnapshot,
 ) -> usize {
-    ffi_try!(
-        unsafe { Ok(snapshot_ref(snapshot)?.snapshot.sstables.len()) },
-        0
-    )
+    ffi_try!(Ok(snapshot_ref(snapshot)?.snapshot.sstables.len()), 0)
 }
 
 #[unsafe(no_mangle)]
@@ -1307,8 +1292,8 @@ pub unsafe extern "C" fn lance_mem_wal_compacted_sstable_new(
     ffi_try!(
         unsafe {
             require_out(out, "out")?;
-            let shard_id = unsafe { parse_c_string(shard_id)? }
-                .ok_or_else(|| invalid("shard_id must not be NULL"))?;
+            let shard_id =
+                parse_c_string(shard_id)?.ok_or_else(|| invalid("shard_id must not be NULL"))?;
             let uuid = parse_uuid(shard_id, "shard_id")?;
             *out = LanceCompactedSsTable {
                 shard_id: *uuid.as_bytes(),
@@ -1518,7 +1503,7 @@ pub unsafe extern "C" fn lance_shard_writer_shard_id(
     writer: *const LanceShardWriter,
 ) -> *const c_char {
     ffi_try!(
-        unsafe { Ok(writer_ref(writer)?.shard_id_c.as_ptr()) },
+        Ok(writer_ref(writer)?.shard_id_c.as_ptr()),
         std::ptr::null()
     )
 }
@@ -1718,7 +1703,7 @@ unsafe fn writer_lsm_scanner_inner(
         get_pk_columns(&writer.dataset)?,
     )
     .with_in_memory_memtables(writer.shard_id, refs);
-    *out = Box::into_raw(Box::new(LanceLsmScanner::new(scanner)));
+    unsafe { *out = Box::into_raw(Box::new(LanceLsmScanner::new(scanner))) };
     Ok(0)
 }
 
@@ -1831,7 +1816,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_project(
     num_columns: usize,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let scanner = scanner_mut(scanner)?;
             let columns = unsafe { c_string_array(columns, num_columns, "columns")? };
             let current = scanner.take()?;
@@ -1842,7 +1827,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_project(
                 }
                 Err(error) => Err(error),
             }
-        },
+        ,
         neg
     )
 }
@@ -1854,7 +1839,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_filter(
     filter: *const c_char,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let scanner = scanner_mut(scanner)?;
             let filter = unsafe { parse_c_string(filter)? }
                 .ok_or_else(|| invalid("filter must not be NULL"))?;
@@ -1869,7 +1854,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_filter(
                 }
                 Err(error) => Err(error),
             }
-        },
+        ,
         neg
     )
 }
@@ -1884,7 +1869,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_limit(
     has_offset: i32,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let scanner = scanner_mut(scanner)?;
             let limit = bool_flag(has_limit, "has_limit")?.then_some(limit);
             let offset = bool_flag(has_offset, "has_offset")?.then_some(offset);
@@ -1906,7 +1891,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_limit(
                 }
                 Err(error) => Err(error),
             }
-        },
+        ,
         neg
     )
 }
@@ -1914,12 +1899,12 @@ pub unsafe extern "C" fn lance_lsm_scanner_limit(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_lsm_scanner_with_row_address(scanner: *mut LanceLsmScanner) -> i32 {
     ffi_try!(
-        unsafe {
+
             let scanner = scanner_mut(scanner)?;
             let current = scanner.take()?;
             scanner.scanner = Some(current.with_row_address());
             Ok(0)
-        },
+        ,
         neg
     )
 }
@@ -1927,12 +1912,12 @@ pub unsafe extern "C" fn lance_lsm_scanner_with_row_address(scanner: *mut LanceL
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_lsm_scanner_with_memtable_gen(scanner: *mut LanceLsmScanner) -> i32 {
     ffi_try!(
-        unsafe {
+
             let scanner = scanner_mut(scanner)?;
             let current = scanner.take()?;
             scanner.scanner = Some(current.with_memtable_gen());
             Ok(0)
-        },
+        ,
         neg
     )
 }
@@ -1944,12 +1929,12 @@ pub unsafe extern "C" fn lance_lsm_scanner_schema(
     out: *mut FFI_ArrowSchema,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let scanner = scanner_ref(scanner)?;
             let schema = scanner.current()?.schema();
             write_ffi_schema(out, schema.as_ref())?;
             Ok(0)
-        },
+        ,
         neg
     )
 }
@@ -1979,7 +1964,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_to_arrow_stream(
     out: *mut FFI_ArrowArrayStream,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let scanner = scanner_ref(scanner)?;
             let stream = block_on(scanner.current()?.try_into_stream())?;
             let schema = stream.schema();
@@ -1991,7 +1976,7 @@ pub unsafe extern "C" fn lance_lsm_scanner_to_arrow_stream(
             );
             write_ffi_stream(out, reader)?;
             Ok(0)
-        },
+        ,
         neg
     )
 }
@@ -2055,7 +2040,7 @@ pub unsafe extern "C" fn lance_lsm_point_lookup_planner_new(
             let snapshots = snapshots_from_c(snapshots, num_snapshots)?;
             let native = dataset.snapshot();
             let pk_columns = if bool_flag(has_pk_columns, "has_pk_columns")? {
-                unsafe { c_string_array(pk_columns, num_pk_columns, "pk_columns")? }
+                c_string_array(pk_columns, num_pk_columns, "pk_columns")?
             } else {
                 get_pk_columns(&native)?
             };
@@ -2092,7 +2077,7 @@ pub unsafe extern "C" fn lance_lsm_point_lookup_planner_plan(
             let planner = point_planner_ref(planner)?;
             let pk_value = required(pk_value, "pk_value")?;
             let columns = if bool_flag(has_columns, "has_columns")? {
-                Some(unsafe { c_string_array(columns, num_columns, "columns")? })
+                Some(c_string_array(columns, num_columns, "columns")?)
             } else {
                 None
             };
@@ -2263,7 +2248,7 @@ unsafe fn vector_planner_new_inner(
         .ok_or_else(|| invalid("vector_column must not be NULL"))?
         .to_string();
     let filter = unsafe { parse_c_string(filter)? }.map(str::to_string);
-    let snapshots = snapshots_from_c(snapshots, num_snapshots)?;
+    let snapshots = unsafe { snapshots_from_c(snapshots, num_snapshots)? };
     let native = dataset.snapshot();
     let pk_columns = if bool_flag(has_pk_columns, "has_pk_columns")? {
         unsafe { c_string_array(pk_columns, num_pk_columns, "pk_columns")? }
@@ -2304,11 +2289,13 @@ unsafe fn vector_planner_new_inner(
     .with_identity_schema(identity_schema)
     .with_dataset(native)
     .with_filter(filter_expr);
-    *out = Box::into_raw(Box::new(LanceLsmVectorSearchPlanner {
-        planner,
-        dataset_schema: base_schema,
-        vector_dim,
-    }));
+    unsafe {
+        *out = Box::into_raw(Box::new(LanceLsmVectorSearchPlanner {
+            planner,
+            dataset_schema: base_schema,
+            vector_dim,
+        }))
+    };
     Ok(0)
 }
 
@@ -2405,10 +2392,12 @@ unsafe fn vector_plan_inner(
         refine,
         overfetch_factor,
     ))?;
-    *out_plan = Box::into_raw(Box::new(LanceMemWalPlan {
-        plan,
-        dataset_schema: Arc::clone(&planner.dataset_schema),
-    }));
+    unsafe {
+        *out_plan = Box::into_raw(Box::new(LanceMemWalPlan {
+            plan,
+            dataset_schema: Arc::clone(&planner.dataset_schema),
+        }))
+    };
     Ok(0)
 }
 
@@ -2442,11 +2431,11 @@ pub unsafe extern "C" fn lance_mem_wal_plan_schema(
     out: *mut FFI_ArrowSchema,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let plan = plan_ref(plan)?;
             write_ffi_schema(out, plan.plan.schema().as_ref())?;
             Ok(0)
-        },
+        ,
         neg
     )
 }
@@ -2458,11 +2447,11 @@ pub unsafe extern "C" fn lance_mem_wal_plan_dataset_schema(
     out: *mut FFI_ArrowSchema,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let plan = plan_ref(plan)?;
             write_ffi_schema(out, plan.dataset_schema.as_ref())?;
             Ok(0)
-        },
+        ,
         neg
     )
 }
@@ -2526,14 +2515,14 @@ pub unsafe extern "C" fn lance_mem_wal_plan_to_arrow_stream(
     out: *mut FFI_ArrowArrayStream,
 ) -> i32 {
     ffi_try!(
-        unsafe {
+
             let plan = plan_ref(plan)?;
             let batches = execute_plan_batches(&plan.plan)?;
             let schema = plan.plan.schema();
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
             write_ffi_stream(out, reader)?;
             Ok(0)
-        },
+        ,
         neg
     )
 }
