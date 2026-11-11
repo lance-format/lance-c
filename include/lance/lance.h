@@ -4633,10 +4633,10 @@ int32_t lance_dataset_write_with_options(
 /**
  * Native operation variant. Discriminants are ABI-stable.
  *
- * This first transaction delivery constructs Append and Overwrite through the
- * native writer. The other variants can be read from history and inspected by
- * kind, but manual construction and variant-specific mutation helpers are
- * later issue #112 scope.
+ * Append and Overwrite are constructed by the native writer, and Delete has a
+ * typed operation constructor. The other variants can be read from history and
+ * inspected by kind; their constructors and variant-specific mutation helpers
+ * remain later issue #112 scope.
  */
 typedef enum {
     LANCE_OPERATION_UNKNOWN             = 0,
