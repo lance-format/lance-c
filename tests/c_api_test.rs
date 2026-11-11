@@ -44511,15 +44511,18 @@ fn test_native_operation_typed_four_variants_representation() {
         take_last_error_message()
     );
     assert!(!native_schema.is_null());
-    assert_eq!(native_schema_field_id_for_test(native_schema, "id"), 7);
-    assert_eq!(native_schema_field_id_for_test(native_schema, "payload"), 3);
+    // Native Overwrite assigns fresh field IDs at commit: the Arrow-provided
+    // `lance:field_id` metadata is provisional and the committed dataset uses
+    // the native identity assigned by the writer.
+    assert_eq!(native_schema_field_id_for_test(native_schema, "id"), 0);
+    assert_eq!(native_schema_field_id_for_test(native_schema, "payload"), 1);
     assert_eq!(
         native_schema_field_id_for_test(native_schema, "payload.tag"),
-        11
+        2
     );
     assert_eq!(
         native_schema_field_id_for_test(native_schema, "payload.score"),
-        4
+        3
     );
     let arrow_schema = native_schema_arrow(native_schema);
     assert_eq!(arrow_schema.field(1).metadata()["owner"], "typed-op-tests");
@@ -44532,6 +44535,70 @@ fn test_native_operation_typed_four_variants_representation() {
         DataType::Dictionary(_, _)
     ));
     assert_eq!(payload_arrow[1].metadata()["source"], "score-field");
+
+    // A native transaction decoded from protobuf can carry nonconsecutive and
+    // nested field IDs. Schema cloning and typed operation construction must
+    // retain them verbatim instead of renumbering the fields.
+    let custom_native_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+    let custom_fields = lance_file::datatypes::Fields::from(&custom_native_schema);
+    let custom_message = pb::Transaction {
+        read_version: 0,
+        uuid: "typed-custom-field-ids".to_string(),
+        tag: String::new(),
+        transaction_properties: HashMap::new(),
+        operation: Some(pb::transaction::Operation::Overwrite(
+            pb::transaction::Overwrite {
+                fragments: Vec::new(),
+                schema: custom_fields.0,
+                schema_metadata: HashMap::new(),
+                config_upsert_values: HashMap::new(),
+                initial_bases: Vec::new(),
+            },
+        )),
+    };
+    let custom_transaction = transaction_from_proto_bytes(&custom_message.encode_to_vec());
+    let custom_operation = native_transaction_operation(custom_transaction);
+    let mut custom_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_overwrite_schema_clone(custom_operation, &mut custom_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(native_schema_field_id_for_test(custom_schema, "id"), 7);
+    assert_eq!(native_schema_field_id_for_test(custom_schema, "payload"), 3);
+    assert_eq!(
+        native_schema_field_id_for_test(custom_schema, "payload.tag"),
+        11
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(custom_schema, "payload.score"),
+        4
+    );
+    let custom_merge = unsafe { lance_operation_merge_new(custom_schema, ptr::null(), 0, false) };
+    assert!(!custom_merge.is_null(), "{}", take_last_error_message());
+    let mut custom_merge_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_merge_schema_clone(custom_merge, &mut custom_merge_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(custom_merge_schema, "id"),
+        7
+    );
+    assert_eq!(
+        native_schema_field_id_for_test(custom_merge_schema, "payload.tag"),
+        11
+    );
+    unsafe {
+        lance_schema_close(custom_merge_schema);
+        lance_operation_close(custom_merge);
+        lance_schema_close(custom_schema);
+        lance_operation_close(custom_operation);
+        lance_transaction_close(custom_transaction);
+    }
 
     let fragments = [
         first_fragment as *const LanceFragment,
@@ -45473,7 +45540,25 @@ fn test_native_operation_typed_publication_paths() {
     let merged_snapshot = open_dataset_for_test(&source_uri);
     let merged_version = unsafe { lance_dataset_version(merged_snapshot) };
     unsafe { lance_dataset_close(merged_snapshot) };
-    let stale_transaction = unsafe { lance_transaction_new(merged_version, merge, ptr::null()) };
+    // The operation must cover every fragment of the latest manifest; otherwise
+    // native fragment-coverage validation rejects it before the read-version
+    // conflict is observed.
+    let stale_merge_fragments = [
+        first_fragment as *const LanceFragment,
+        second_fragment as *const LanceFragment,
+        staged_fragment as *const LanceFragment,
+    ];
+    let stale_merge = unsafe {
+        lance_operation_merge_new(
+            merge_schema,
+            stale_merge_fragments.as_ptr(),
+            stale_merge_fragments.len(),
+            true,
+        )
+    };
+    assert!(!stale_merge.is_null(), "{}", take_last_error_message());
+    let stale_transaction =
+        unsafe { lance_transaction_new(merged_version, stale_merge, ptr::null()) };
     let concurrent_map = build_native_update_map(&[("concurrent", Some("1"))], false);
     let concurrent_options = LanceUpdateConfigOperationOptions {
         config_updates: concurrent_map,
@@ -45527,7 +45612,10 @@ fn test_native_operation_typed_publication_paths() {
         conflict_dataset,
         std::ptr::without_provenance_mut(0xDEAD_BEEF)
     );
-    unsafe { lance_transaction_close(stale_transaction) };
+    unsafe {
+        lance_transaction_close(stale_transaction);
+        lance_operation_close(stale_merge);
+    }
 
     // Merge changing a retained field's nullability without rewriting it is a
     // native validation failure, reported verbatim.
