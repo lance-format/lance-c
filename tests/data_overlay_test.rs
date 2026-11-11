@@ -842,6 +842,20 @@ fn data_overlay_validation_errors() {
     );
     assert!(take_error().1.contains("Roaring"));
 
+    let bitmaps = file_bitmaps(overlay);
+    let valid_pointer = bitmaps[0].as_ptr();
+    for oversized_len in [isize::MAX as usize + 1, usize::MAX] {
+        assert!(
+            unsafe {
+                lance_data_overlay_file_new(data_file, 0, &valid_pointer, &oversized_len, 1, 0)
+            }
+            .is_null()
+        );
+        let (code, message) = take_error();
+        assert_eq!(code, LanceErrorCode::InvalidArgument);
+        assert!(message.contains("isize::MAX"), "{message}");
+    }
+
     let mut count = 0u64;
     assert_eq!(
         unsafe { lance_data_overlay_file_bitmap_count(overlay, &mut count) },
