@@ -69,6 +69,7 @@ datafusion-substrait = { version = "=54.1.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
+prost-types = "0.14"
 tempfile = "3"
 # Direct for `libc::SIGABRT` in the panic-guard test's child-process assertions;
 # already in the graph transitively via tokio/lance.
