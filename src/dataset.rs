@@ -5,6 +5,7 @@
 
 use std::ffi::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::ptr;
 use std::sync::{Arc, RwLock};
 
 use arrow::ffi::FFI_ArrowSchema;
@@ -14,6 +15,7 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance_core::Result;
 
+use crate::data_file::LanceDataFile;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::helpers;
 use crate::runtime::block_on;
@@ -454,6 +456,64 @@ unsafe fn dataset_schema_inner(
     let ffi_schema = FFI_ArrowSchema::try_from(&arrow_schema)?;
     unsafe {
         std::ptr::write_unaligned(out, ffi_schema);
+    }
+    Ok(0)
+}
+
+/// Create native data-file metadata from an existing Lance file.
+///
+/// Maps directly to `Dataset::create_data_file(path, base_id)`. `path` is
+/// relative to the selected data directory and must be non-NULL UTF-8.
+/// `base_id == NULL` selects native `None`; a non-NULL pointer selects native
+/// `Some`, including `Some(0)`. Empty paths, missing files, malformed Lance
+/// files, schema mismatches and unregistered base IDs retain native validation
+/// and error timing.
+///
+/// On success `*out_file` receives an independently owned snapshot that
+/// remains valid after the dataset is closed. The output is written only on
+/// success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_create_data_file(
+    dataset: *const LanceDataset,
+    path: *const c_char,
+    base_id: *const u32,
+    out_file: *mut *mut LanceDataFile,
+) -> i32 {
+    ffi_try!(
+        unsafe { dataset_create_data_file_inner(dataset, path, base_id, out_file) },
+        neg
+    )
+}
+
+unsafe fn dataset_create_data_file_inner(
+    dataset: *const LanceDataset,
+    path: *const c_char,
+    base_id: *const u32,
+    out_file: *mut *mut LanceDataFile,
+) -> Result<i32> {
+    if dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
+    }
+    if out_file.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_file must not be NULL".into(),
+        ));
+    }
+    let path = unsafe { helpers::parse_c_string(path)? }
+        .ok_or_else(|| lance_core::Error::invalid_input_source("path must not be NULL".into()))?;
+    let base_id = if base_id.is_null() {
+        None
+    } else {
+        Some(unsafe { ptr::read(base_id) })
+    };
+
+    let snapshot = unsafe { &*dataset }.snapshot();
+    let file = block_on(snapshot.create_data_file(path, base_id))?;
+    let file = Box::new(LanceDataFile::from_native(file)?);
+    unsafe {
+        ptr::write(out_file, Box::into_raw(file));
     }
     Ok(0)
 }

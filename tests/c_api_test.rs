@@ -24202,6 +24202,52 @@ fn write_batch(ids: Vec<i32>, vals: Vec<f32>) -> RecordBatch {
     .unwrap()
 }
 
+fn ffi_record_batch(batch: &RecordBatch) -> (FFI_ArrowArray, FFI_ArrowSchema) {
+    let struct_array: StructArray = batch.clone().into();
+    (
+        FFI_ArrowArray::new(&struct_array.into_data()),
+        FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap(),
+    )
+}
+
+fn write_replacement_data_file(path: &str, batch: &RecordBatch) -> LanceFileWriteSummary {
+    let (mut array, schema) = ffi_record_batch(batch);
+    let mut imported = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut imported) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(array.release.is_none());
+
+    let path = c_str(path);
+    let version = c_str("2.1");
+    let mut options: LanceFileWriterOptions = unsafe { std::mem::zeroed() };
+    options.version = version.as_ptr();
+    let writer = unsafe {
+        lance_file_writer_open(path.as_ptr(), &schema, &options, ptr::null(), ptr::null())
+    };
+    assert!(!writer.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_file_writer_write_batch(writer, imported) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_batch_free(imported) };
+
+    let mut summary = LanceFileWriteSummary::default();
+    assert_eq!(
+        unsafe { lance_file_writer_finish(writer, &mut summary) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_file_writer_close(writer) };
+    summary
+}
+
 #[test]
 fn test_dataset_write_create() {
     let tmp = tempfile::tempdir().unwrap();
@@ -24737,6 +24783,563 @@ fn transaction_from_proto_bytes(bytes: &[u8]) -> *mut LanceTransaction {
     let transaction = unsafe { lance_transaction_from_proto(bytes.as_ptr(), bytes.len()) };
     assert!(!transaction.is_null(), "{}", take_last_error_message());
     transaction
+}
+
+type DataFileSnapshot = (
+    String,
+    Vec<i32>,
+    Vec<i32>,
+    (u32, u32),
+    Option<u64>,
+    Option<u32>,
+);
+
+fn data_file_snapshot(file: *const LanceDataFile) -> DataFileSnapshot {
+    let path = unsafe { lance_data_file_path(file) };
+    assert!(!path.is_null(), "{}", take_last_error_message());
+    let path = unsafe { CStr::from_ptr(path) }
+        .to_string_lossy()
+        .into_owned();
+
+    let field_count = unsafe { lance_data_file_field_count(file) };
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "{}",
+        take_last_error_message()
+    );
+    let mut fields = Vec::with_capacity(field_count);
+    for index in 0..field_count {
+        let mut field_id = i32::MIN;
+        assert_eq!(
+            unsafe { lance_data_file_field_id_at(file, index, &mut field_id) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        fields.push(field_id);
+    }
+
+    let column_count = unsafe { lance_data_file_column_index_count(file) };
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "{}",
+        take_last_error_message()
+    );
+    let mut column_indices = Vec::with_capacity(column_count);
+    for index in 0..column_count {
+        let mut column_index = i32::MIN;
+        assert_eq!(
+            unsafe { lance_data_file_column_index_at(file, index, &mut column_index) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        column_indices.push(column_index);
+    }
+
+    let mut major = u32::MAX;
+    let mut minor = u32::MAX;
+    assert_eq!(
+        unsafe { lance_data_file_file_version(file, &mut major, &mut minor) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut size_present = true;
+    let mut size = 0;
+    assert_eq!(
+        unsafe { lance_data_file_file_size(file, &mut size_present, &mut size) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let file_size = size_present.then_some(size);
+
+    let mut base_present = true;
+    let mut base_id = u32::MAX;
+    assert_eq!(
+        unsafe { lance_data_file_base_id(file, &mut base_present, &mut base_id) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    (
+        path,
+        fields,
+        column_indices,
+        (major, minor),
+        file_size,
+        base_present.then_some(base_id),
+    )
+}
+
+fn data_replacement_group_snapshot(group: *const LanceDataReplacementGroup) -> DataFileSnapshot {
+    let fragment_id = unsafe { lance_data_replacement_group_fragment_id(group) };
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(fragment_id, 7);
+    let mut file = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_data_replacement_group_file(group, &mut file) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!file.is_null());
+    let snapshot = data_file_snapshot(file);
+    unsafe { lance_data_file_close(file) };
+    snapshot
+}
+
+#[test]
+fn test_native_data_file_and_data_replacement_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("native_datafile_replacement")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let storage_version = c_str("2.1");
+    let mut options: LanceUncommittedWriteOptions = unsafe { std::mem::zeroed() };
+    options.write.params.max_rows_per_file = 4;
+    options.write.params.data_storage_version = storage_version.as_ptr();
+    let create = write_uncommitted_for_batch(
+        &uri,
+        write_batch(
+            (1..=20).collect(),
+            (1..=20).map(|value| value as f32).collect(),
+        ),
+        LanceWriteMode::Create,
+        &options,
+    );
+    let created = commit_native_transaction(&uri, create, ptr::null());
+    unsafe {
+        lance_transaction_close(create);
+        lance_dataset_close(created);
+    }
+
+    let filename = "native-data-file.lance";
+    let replacement_path = format!("{uri}/data/{filename}");
+    let summary = write_replacement_data_file(
+        &replacement_path,
+        &write_batch(vec![101, 102, 103, 104], vec![1.1, 2.2, 3.3, 4.4]),
+    );
+    assert_eq!(summary.num_rows, 4);
+    assert!(summary.size_bytes > 0);
+
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_fragment_count(dataset) }, 5);
+
+    let filename_c = c_str(filename);
+    let mut file = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_data_file(dataset, filename_c.as_ptr(), ptr::null(), &mut file)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!file.is_null());
+    let snapshot = data_file_snapshot(file);
+
+    let native_file = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        dataset.create_data_file(filename, None).await.unwrap()
+    });
+    assert_eq!(snapshot.0, native_file.path);
+    assert_eq!(snapshot.1.as_slice(), native_file.fields.as_ref());
+    assert_eq!(snapshot.2.as_slice(), native_file.column_indices.as_ref());
+    assert_eq!(
+        snapshot.3,
+        (
+            native_file.file_major_version,
+            native_file.file_minor_version
+        )
+    );
+    assert_eq!(
+        snapshot.4,
+        native_file.file_size_bytes.get().map(|size| size.get())
+    );
+    assert_eq!(snapshot.5, native_file.base_id);
+    assert!(snapshot.4.is_some());
+
+    let mut sentinel_field = 17;
+    assert_eq!(
+        unsafe { lance_data_file_field_id_at(file, usize::MAX, &mut sentinel_field) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(sentinel_field, 17);
+    assert_eq!(
+        unsafe { lance_data_file_field_id_at(file, 0, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let mut sentinel_major = 17;
+    let sentinel_minor = 19;
+    assert_eq!(
+        unsafe { lance_data_file_file_version(file, &mut sentinel_major, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!((sentinel_major, sentinel_minor), (17, 19));
+    let mut second_minor = 19;
+    assert_eq!(
+        unsafe { lance_data_file_file_version(file, ptr::null_mut(), &mut second_minor) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(second_minor, 19);
+
+    let mut sentinel_present = false;
+    let sentinel_size = 23;
+    assert_eq!(
+        unsafe { lance_data_file_file_size(file, &mut sentinel_present, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(!sentinel_present);
+    assert_eq!(sentinel_size, 23);
+
+    let mut sentinel_base_present = false;
+    let sentinel_base_id = 29;
+    assert_eq!(
+        unsafe { lance_data_file_base_id(file, &mut sentinel_base_present, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(!sentinel_base_present);
+    assert_eq!(sentinel_base_id, 29);
+
+    assert!(unsafe { lance_data_file_path(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_data_file_field_count(ptr::null()) }, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_data_file_column_index_count(ptr::null()) },
+        0
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let file_clone = unsafe { lance_data_file_clone(file) };
+    assert!(!file_clone.is_null(), "{}", take_last_error_message());
+    unsafe { lance_dataset_close(dataset) };
+    assert_eq!(data_file_snapshot(file_clone), snapshot);
+
+    let group = unsafe { lance_data_replacement_group_new(7, file) };
+    assert!(!group.is_null(), "{}", take_last_error_message());
+    unsafe { lance_data_file_close(file) };
+    assert_eq!(data_replacement_group_snapshot(group), snapshot);
+    assert_eq!(
+        unsafe { lance_data_replacement_group_file(group, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let group_clone = unsafe { lance_data_replacement_group_clone(group) };
+    assert!(!group_clone.is_null(), "{}", take_last_error_message());
+    unsafe { lance_data_replacement_group_close(group) };
+    assert_eq!(data_replacement_group_snapshot(group_clone), snapshot);
+
+    let groups = [group_clone as *const LanceDataReplacementGroup];
+    let operation = unsafe { lance_operation_data_replacement_new(groups.as_ptr(), 1) };
+    assert!(!operation.is_null(), "{}", take_last_error_message());
+    let mut count = u64::MAX;
+    assert_eq!(
+        unsafe { lance_operation_data_replacement_count(operation, &mut count) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(count, 1);
+    let mut inspected = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_data_replacement_at(operation, 0, &mut inspected) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(data_replacement_group_snapshot(inspected), snapshot);
+    unsafe {
+        lance_data_file_close(file_clone);
+        lance_data_replacement_group_close(group_clone);
+        lance_data_replacement_group_close(inspected);
+    }
+
+    let transaction = unsafe { lance_transaction_new(7, operation, ptr::null()) };
+    assert!(!transaction.is_null(), "{}", take_last_error_message());
+    let roundtrip = transaction_from_proto_bytes(&transaction_proto_bytes(transaction));
+    let roundtrip_operation = native_transaction_operation(roundtrip);
+    assert_eq!(
+        native_operation_kind(roundtrip_operation),
+        LanceOperationKind::DataReplacement
+    );
+    assert_eq!(
+        unsafe { lance_operation_data_replacement_count(roundtrip_operation, &mut count) },
+        0
+    );
+    assert_eq!(count, 1);
+    let mut roundtrip_group = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_operation_data_replacement_at(roundtrip_operation, 0, &mut roundtrip_group)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(data_replacement_group_snapshot(roundtrip_group), snapshot);
+
+    let empty = unsafe { lance_operation_data_replacement_new(ptr::null(), 0) };
+    assert!(!empty.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_operation_data_replacement_count(empty, &mut count) },
+        0
+    );
+    assert_eq!(count, 0);
+
+    assert!(unsafe { lance_operation_data_replacement_new(ptr::null(), 1) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let null_group: *const LanceDataReplacementGroup = ptr::null();
+    let invalid_groups = [null_group];
+    assert!(
+        unsafe {
+            lance_operation_data_replacement_new(invalid_groups.as_ptr(), invalid_groups.len())
+        }
+        .is_null()
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let sentinel_group = std::ptr::dangling_mut::<LanceDataReplacementGroup>();
+    let mut out_group = sentinel_group;
+    assert_eq!(
+        unsafe { lance_operation_data_replacement_at(operation, 1, &mut out_group) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out_group, sentinel_group);
+
+    let predicate = c_str("");
+    let delete =
+        unsafe { lance_operation_delete_new(ptr::null(), 0, ptr::null(), 0, predicate.as_ptr()) };
+    assert!(!delete.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe { lance_operation_data_replacement_count(delete, &mut count) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    unsafe {
+        lance_operation_close(delete);
+        lance_operation_close(empty);
+        lance_operation_close(operation);
+        lance_operation_close(roundtrip_operation);
+        lance_transaction_close(transaction);
+        lance_transaction_close(roundtrip);
+    }
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let sentinel_file = std::ptr::dangling_mut::<LanceDataFile>();
+    let mut out_file = sentinel_file;
+    assert_eq!(
+        unsafe { lance_dataset_create_data_file(dataset, ptr::null(), ptr::null(), &mut out_file) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out_file, sentinel_file);
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_data_file(
+                ptr::null(),
+                filename_c.as_ptr(),
+                ptr::null(),
+                &mut out_file,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out_file, sentinel_file);
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_data_file(
+                dataset,
+                filename_c.as_ptr(),
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let zero = 0u32;
+    out_file = sentinel_file;
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_data_file(dataset, filename_c.as_ptr(), &zero, &mut out_file)
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(out_file, sentinel_file);
+
+    for bad_path in ["", "missing-data-file.lance"] {
+        let bad_path = c_str(bad_path);
+        out_file = sentinel_file;
+        assert_eq!(
+            unsafe {
+                lance_dataset_create_data_file(
+                    dataset,
+                    bad_path.as_ptr(),
+                    ptr::null(),
+                    &mut out_file,
+                )
+            },
+            -1
+        );
+        assert_eq!(out_file, sentinel_file);
+        let _ = take_last_error_message();
+    }
+
+    std::fs::write(format!("{uri}/data/garbage.lance"), b"not a lance file").unwrap();
+    let garbage = c_str("garbage.lance");
+    out_file = sentinel_file;
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_data_file(dataset, garbage.as_ptr(), ptr::null(), &mut out_file)
+        },
+        -1
+    );
+    assert_eq!(out_file, sentinel_file);
+    let _ = take_last_error_message();
+
+    let invalid_schema = Arc::new(Schema::new(vec![Field::new(
+        "not_in_dataset",
+        DataType::Int32,
+        false,
+    )]));
+    let invalid_batch =
+        RecordBatch::try_new(invalid_schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+    write_replacement_data_file(&format!("{uri}/data/invalid-schema.lance"), &invalid_batch);
+    let invalid_schema_path = c_str("invalid-schema.lance");
+    out_file = sentinel_file;
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_data_file(
+                dataset,
+                invalid_schema_path.as_ptr(),
+                ptr::null(),
+                &mut out_file,
+            )
+        },
+        -1
+    );
+    assert_eq!(out_file, sentinel_file);
+    let _ = take_last_error_message();
+
+    let alternate = tmp.path().join("alternate_base");
+    std::fs::create_dir_all(&alternate).unwrap();
+    let alternate_uri = format!("file://{}", alternate.to_str().unwrap());
+    let alternate_uri_c = c_str(&alternate_uri);
+    let alternate_name = c_str("native-alternate");
+    let base = LanceBasePath {
+        id: 0,
+        path: alternate_uri_c.as_ptr(),
+        name: alternate_name.as_ptr(),
+        is_dataset_root: false,
+    };
+    assert_eq!(
+        unsafe { lance_dataset_add_bases(dataset, &base, 1, ptr::null()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let base_paths_json = unsafe { lance_dataset_base_paths_json(dataset) };
+    assert!(!base_paths_json.is_null(), "{}", take_last_error_message());
+    let base_paths_json = unsafe { CStr::from_ptr(base_paths_json) }
+        .to_string_lossy()
+        .into_owned();
+    let base_paths: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(&base_paths_json).unwrap();
+    assert_eq!(base_paths.len(), 1);
+    let (base_id_text, base_entry) = base_paths.iter().next().unwrap();
+    let alternate_base_id: u32 = base_id_text.parse().unwrap();
+    assert_eq!(base_entry["path"], alternate_uri);
+
+    let alternate_filename = "alternate-data-file.lance";
+    write_replacement_data_file(
+        alternate.join(alternate_filename).to_str().unwrap(),
+        &write_batch(vec![201, 202, 203, 204], vec![2.1, 2.2, 2.3, 2.4]),
+    );
+    let alternate_filename_c = c_str(alternate_filename);
+    out_file = sentinel_file;
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_data_file(
+                dataset,
+                alternate_filename_c.as_ptr(),
+                &alternate_base_id,
+                &mut out_file,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let alternate_snapshot = data_file_snapshot(out_file);
+    let native_alternate = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .create_data_file(alternate_filename, Some(alternate_base_id))
+            .await
+            .unwrap()
+    });
+    assert_eq!(alternate_snapshot.0, native_alternate.path);
+    assert_eq!(
+        alternate_snapshot.1.as_slice(),
+        native_alternate.fields.as_ref()
+    );
+    assert_eq!(
+        alternate_snapshot.2.as_slice(),
+        native_alternate.column_indices.as_ref()
+    );
+    assert_eq!(
+        alternate_snapshot.3,
+        (
+            native_alternate.file_major_version,
+            native_alternate.file_minor_version
+        )
+    );
+    assert_eq!(
+        alternate_snapshot.4,
+        native_alternate
+            .file_size_bytes
+            .get()
+            .map(|size| size.get())
+    );
+    assert_eq!(alternate_snapshot.5, Some(alternate_base_id));
+    assert_eq!(alternate_snapshot.5, native_alternate.base_id);
+
+    unsafe {
+        lance_data_file_close(out_file);
+        lance_dataset_close(dataset);
+    }
 }
 
 #[test]

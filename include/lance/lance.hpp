@@ -553,6 +553,155 @@ struct UncommittedWriteOptions {
 
 // ─── Native transactions ─────────────────────────────────────────────────────
 
+/// Owned native `DataFile` metadata snapshot. Move-only.
+class DataFile {
+    Handle<LanceDataFile, lance_data_file_close> handle_;
+
+public:
+    explicit DataFile(LanceDataFile* file) : handle_(file) {}
+
+    DataFile(DataFile&&) noexcept = default;
+    DataFile& operator=(DataFile&&) noexcept = default;
+    DataFile(const DataFile&) = delete;
+    DataFile& operator=(const DataFile&) = delete;
+
+    /// Native data-file path relative to its selected data directory.
+    std::string path() const {
+        const char* path = lance_data_file_path(handle_.get());
+        if (!path) check_error();
+        return path;
+    }
+
+    /// Native field IDs in stored order.
+    std::vector<int32_t> fields() const {
+        size_t count = lance_data_file_field_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<int32_t> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            int32_t field_id = 0;
+            if (lance_data_file_field_id_at(
+                    handle_.get(), i, &field_id) != 0) {
+                check_error();
+            }
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Native column indices in stored order, including the `-1` marker.
+    std::vector<int32_t> column_indices() const {
+        size_t count = lance_data_file_column_index_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<int32_t> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            int32_t column_index = 0;
+            if (lance_data_file_column_index_at(
+                    handle_.get(), i, &column_index) != 0) {
+                check_error();
+            }
+            out.push_back(column_index);
+        }
+        return out;
+    }
+
+    /// Native major/minor data-file format version.
+    std::pair<uint32_t, uint32_t> file_version() const {
+        uint32_t major = 0;
+        uint32_t minor = 0;
+        if (lance_data_file_file_version(
+                handle_.get(), &major, &minor) != 0) {
+            check_error();
+        }
+        return {major, minor};
+    }
+
+    /// Native optional file size in bytes.
+    std::optional<uint64_t> file_size() const {
+        bool present = false;
+        uint64_t size = 0;
+        if (lance_data_file_file_size(
+                handle_.get(), &present, &size) != 0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return size;
+    }
+
+    /// Native optional base path ID.
+    std::optional<uint32_t> base_id() const {
+        bool present = false;
+        uint32_t base_id = 0;
+        if (lance_data_file_base_id(
+                handle_.get(), &present, &base_id) != 0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return base_id;
+    }
+
+    /// Clone this snapshot into an independently owned handle.
+    DataFile clone() const {
+        auto* raw = lance_data_file_clone(handle_.get());
+        if (!raw) check_error();
+        return DataFile(raw);
+    }
+
+    const LanceDataFile* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native `DataReplacementGroup` snapshot. Move-only.
+class DataReplacementGroup {
+    Handle<LanceDataReplacementGroup, lance_data_replacement_group_close>
+        handle_;
+
+public:
+    explicit DataReplacementGroup(LanceDataReplacementGroup* group)
+        : handle_(group) {}
+
+    /// Construct a group by cloning `file` into native metadata.
+    DataReplacementGroup(uint64_t fragment_id, const DataFile& file)
+        : handle_(nullptr) {
+        auto* raw =
+            lance_data_replacement_group_new(fragment_id, file.c_handle());
+        if (!raw) check_error();
+        handle_ =
+            Handle<LanceDataReplacementGroup, lance_data_replacement_group_close>(
+                raw);
+    }
+
+    DataReplacementGroup(DataReplacementGroup&&) noexcept = default;
+    DataReplacementGroup& operator=(DataReplacementGroup&&) noexcept = default;
+    DataReplacementGroup(const DataReplacementGroup&) = delete;
+    DataReplacementGroup& operator=(const DataReplacementGroup&) = delete;
+
+    uint64_t fragment_id() const {
+        uint64_t id = lance_data_replacement_group_fragment_id(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return id;
+    }
+
+    DataFile file() const {
+        LanceDataFile* file = nullptr;
+        if (lance_data_replacement_group_file(handle_.get(), &file) != 0) {
+            check_error();
+        }
+        return DataFile(file);
+    }
+
+    /// Clone this snapshot into an independently owned handle.
+    DataReplacementGroup clone() const {
+        auto* raw = lance_data_replacement_group_clone(handle_.get());
+        if (!raw) check_error();
+        return DataReplacementGroup(raw);
+    }
+
+    const LanceDataReplacementGroup* c_handle() const {
+        return handle_.get();
+    }
+};
+
 enum class OperationKind : int32_t {
     Unknown             = LANCE_OPERATION_UNKNOWN,
     Append              = LANCE_OPERATION_APPEND,
@@ -617,12 +766,38 @@ public:
         const std::vector<const IndexSegmentMetadata*>& new_indices,
         const std::vector<const IndexSegmentMetadata*>& removed_indices);
 
+    /// Construct an owned native DataReplacement operation. Group handles are
+    /// borrowed and copied in input order. Native commit validation remains
+    /// authoritative.
+    static Operation make_data_replacement(
+        const std::vector<const DataReplacementGroup*>& replacements);
+
     /// New-index metadata cloned from a CreateIndex operation. Each returned
     /// value is independent of this operation handle.
     std::vector<IndexSegmentMetadata> create_index_new() const;
 
     /// Removed-index metadata cloned from a CreateIndex operation.
     std::vector<IndexSegmentMetadata> create_index_removed() const;
+
+    /// Number of data replacement groups.
+    uint64_t data_replacement_count() const {
+        uint64_t count = 0;
+        if (lance_operation_data_replacement_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one data replacement group.
+    DataReplacementGroup data_replacement_at(size_t index) const {
+        LanceDataReplacementGroup* group = nullptr;
+        if (lance_operation_data_replacement_at(
+                handle_.get(), index, &group) != 0) {
+            check_error();
+        }
+        return DataReplacementGroup(group);
+    }
 
     /// Number of updated fragments in a Delete operation.
     uint64_t delete_updated_fragment_count() const {
@@ -2077,6 +2252,23 @@ inline Operation Operation::make_delete(
         handles.empty() ? nullptr : handles.data(), handles.size(),
         deleted_fragment_ids.empty() ? nullptr : deleted_fragment_ids.data(),
         deleted_fragment_ids.size(), predicate.c_str());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline Operation Operation::make_data_replacement(
+    const std::vector<const DataReplacementGroup*>& replacements) {
+    std::vector<const LanceDataReplacementGroup*> handles;
+    handles.reserve(replacements.size());
+    for (const auto* replacement : replacements) {
+        if (!replacement) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "data replacement group must not be null");
+        }
+        handles.push_back(replacement->c_handle());
+    }
+    auto* operation = lance_operation_data_replacement_new(
+        handles.empty() ? nullptr : handles.data(), handles.size());
     if (!operation) check_error();
     return Operation(operation);
 }
@@ -4779,6 +4971,26 @@ public:
         if (lance_dataset_schema(handle_.get(), out) != 0) {
             check_error();
         }
+    }
+
+    /// Create native data-file metadata from an existing Lance file.
+    ///
+    /// `path` is relative to the selected native data directory.
+    /// `base_id == std::nullopt` maps to native `None`; an engaged value maps
+    /// to native `Some`, including zero. Empty paths, missing or malformed
+    /// files, schema mismatches and unregistered base IDs retain native error
+    /// timing. The returned snapshot remains valid after this dataset is
+    /// destroyed.
+    DataFile create_data_file(
+        const std::string& path,
+        std::optional<uint32_t> base_id = std::nullopt) const {
+        LanceDataFile* file = nullptr;
+        const uint32_t* base_id_ptr = base_id ? &*base_id : nullptr;
+        if (lance_dataset_create_data_file(
+                handle_.get(), path.c_str(), base_id_ptr, &file) != 0) {
+            check_error();
+        }
+        return DataFile(file);
     }
 
     /// Take rows by indices. `out` is caller-owned and its non-null `release`
