@@ -158,7 +158,8 @@ static void scan_fragment_value(const LanceFragment *fragment,
 static void release_schema(ArrowSchema *schema) { schema->release = NULL; }
 static void release_array(ArrowArray *array) { array->release = NULL; }
 
-/* Exported schemas and batches can outlive their stream and each other. */
+/* Stream descriptors live with the caller. Exported schemas and batches share
+ * backing storage so each can outlive the stream and the other outputs. */
 typedef struct {
     atomic_size_t references;
 } StreamStorage;
@@ -187,7 +188,6 @@ static void release_owned_array(ArrowArray *array) {
 
 typedef struct {
     StreamStorage storage; /* First member so the last owner frees the allocation. */
-    ArrowArrayStream stream;
     ArrowSchema schema;
     ArrowSchema child_schema[2];
     ArrowSchema *schema_children[2];
@@ -205,7 +205,6 @@ typedef struct {
 
 typedef struct {
     StreamStorage storage;
-    ArrowArrayStream stream;
     ArrowSchema schema;
     ArrowSchema child_schema;
     ArrowSchema *schema_children[1];
@@ -286,7 +285,7 @@ static void one_stream_release(ArrowArrayStream *stream) {
     release_storage(&data->storage);
 }
 
-static TwoColumnStream *two_column_stream(const char *left_name,
+static ArrowArrayStream two_column_stream(const char *left_name,
                                           const char *left_format,
                                           const char *right_name,
                                           const char *right_format,
@@ -342,15 +341,16 @@ static TwoColumnStream *two_column_stream(const char *left_name,
     data->batch.children = data->batch_children;
     data->batch.release = release_owned_array;
     data->batch.private_data = &data->storage;
-    data->stream.get_schema = two_stream_get_schema;
-    data->stream.get_next = two_stream_get_next;
-    data->stream.get_last_error = stream_last_error;
-    data->stream.release = two_stream_release;
-    data->stream.private_data = data;
-    return data;
+    return (ArrowArrayStream){
+        .get_schema = two_stream_get_schema,
+        .get_next = two_stream_get_next,
+        .get_last_error = stream_last_error,
+        .release = two_stream_release,
+        .private_data = data,
+    };
 }
 
-static OneColumnStream *one_column_stream(const char *name, const char *format,
+static ArrowArrayStream one_column_stream(const char *name, const char *format,
                                           const int32_t *values, size_t len) {
     ASSERT(len <= 8, "one-column stream length");
     ASSERT(strcmp(format, "i") == 0, "one-column stream int32");
@@ -388,39 +388,44 @@ static OneColumnStream *one_column_stream(const char *name, const char *format,
     data->batch.children = data->batch_children;
     data->batch.release = release_owned_array;
     data->batch.private_data = &data->storage;
-    data->stream.get_schema = one_stream_get_schema;
-    data->stream.get_next = one_stream_get_next;
-    data->stream.get_last_error = stream_last_error;
-    data->stream.release = one_stream_release;
-    data->stream.private_data = data;
-    return data;
+    return (ArrowArrayStream){
+        .get_schema = one_stream_get_schema,
+        .get_next = one_stream_get_next,
+        .get_last_error = stream_last_error,
+        .release = one_stream_release,
+        .private_data = data,
+    };
 }
 
 static void test_stream_output_lifetimes(void) {
     const int64_t ids[] = {7, 9};
     const int32_t values[] = {70, 90};
-    TwoColumnStream *two =
+    ArrowArrayStream two =
         two_column_stream("id", "l", "value", "i", ids, values, 2);
     ArrowSchema schema = {0};
     ArrowArray batch = {0};
-    ASSERT(two->stream.get_schema(&two->stream, &schema) == 0, "export schema");
-    ASSERT(two->stream.get_next(&two->stream, &batch) == 0, "export batch");
-    two->stream.release(&two->stream);
+    ASSERT(two.get_schema(&two, &schema) == 0, "export schema");
+    ASSERT(two.get_next(&two, &batch) == 0, "export batch");
+    two.release(&two);
     ASSERT(integer_value(batch.children[0], 1, "l") == 9,
            "batch remains readable after stream release");
     batch.release(&batch);
     ASSERT(strcmp(schema.children[1]->name, "value") == 0,
            "schema remains readable after stream and batch release");
     schema.release(&schema);
+    ASSERT(two.release == NULL && two.private_data == NULL,
+           "released stream descriptor remains readable after storage release");
 
-    OneColumnStream *one = one_column_stream("value", "i", values, 2);
-    ASSERT(one->stream.get_schema(&one->stream, &schema) == 0, "export schema");
-    ASSERT(one->stream.get_next(&one->stream, &batch) == 0, "export batch");
+    ArrowArrayStream one = one_column_stream("value", "i", values, 2);
+    ASSERT(one.get_schema(&one, &schema) == 0, "export schema");
+    ASSERT(one.get_next(&one, &batch) == 0, "export batch");
     schema.release(&schema);
-    one->stream.release(&one->stream);
+    one.release(&one);
     ASSERT(integer_value(batch.children[0], 1, "i") == 90,
            "batch remains readable after schema and stream release");
     batch.release(&batch);
+    ASSERT(one.release == NULL && one.private_data == NULL,
+           "released stream descriptor remains readable after final batch release");
 }
 
 static void commit_operation(const char *uri, uint64_t read_version,
@@ -533,15 +538,15 @@ static void test_merge_columns(const char *uri) {
 
     int64_t join_ids[4] = {1, 2, 3, 4};
     int32_t join_values[4] = {11, 22, 33, 44};
-    TwoColumnStream *stream =
+    ArrowArrayStream stream =
         two_column_stream("id", "l", "joined", "i", join_ids, join_values, 4);
     LanceFragment *updated = NULL;
     LanceSchema *schema = NULL;
-    ASSERT(lance_fragment_merge_columns(fragments[0], &stream->stream, "id",
+    ASSERT(lance_fragment_merge_columns(fragments[0], &stream, "id",
                                         "id", &updated, &schema) == 0,
            "fragment hash merge");
     check_ok("fragment hash merge");
-    ASSERT(stream->stream.release == NULL, "merge consumed stream");
+    ASSERT(stream.release == NULL, "merge consumed stream");
 
     const LanceFragment *final_fragments[3] = {updated, fragments[1],
                                                fragments[2]};
@@ -578,15 +583,15 @@ static void test_update_columns(const char *uri) {
 
     int64_t update_ids[2] = {1, 3};
     int32_t update_values[2] = {901, 903};
-    TwoColumnStream *stream =
+    ArrowArrayStream stream =
         two_column_stream("id", "l", "value", "i", update_ids, update_values,
                           2);
     LanceFragmentUpdateColumnsResult *result = NULL;
-    ASSERT(lance_fragment_update_columns(fragments[0], &stream->stream, "id",
+    ASSERT(lance_fragment_update_columns(fragments[0], &stream, "id",
                                          "id", &result) == 0,
            "fragment update_columns");
     check_ok("fragment update_columns");
-    ASSERT(stream->stream.release == NULL, "update consumed stream");
+    ASSERT(stream.release == NULL, "update consumed stream");
 
     LanceFragment *updated = NULL;
     ASSERT(lance_fragment_update_columns_result_fragment(result, &updated) == 0,
@@ -688,13 +693,13 @@ static void test_write_columns(const char *uri) {
     check_ok("project value schema");
 
     int32_t replacement[4] = {111, 222, 333, 444};
-    OneColumnStream *stream = one_column_stream("value", "i", replacement, 4);
+    ArrowArrayStream stream = one_column_stream("value", "i", replacement, 4);
     LanceDataReplacementGroup *group = NULL;
     ASSERT(lance_fragment_write_columns(fragments[0], value_schema,
-                                        &stream->stream, &group) == 0,
+                                        &stream, &group) == 0,
            "fragment write_columns");
     check_ok("fragment write_columns");
-    ASSERT(stream->stream.release == NULL, "write consumed stream");
+    ASSERT(stream.release == NULL, "write consumed stream");
 
     const LanceDataReplacementGroup *groups[1] = {group};
     LanceOperation *operation =
