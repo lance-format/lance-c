@@ -1661,7 +1661,7 @@ static void test_typed_native_operations(const std::string& source_uri,
 
     // The overwrite publication reuses source fragments, so deletion must run
     // against the source dataset, whose data files are reachable.
-    auto deletable = lance::Dataset::open(src_uri);
+    auto deletable = lance::Dataset::open(source_uri);
     CHECK(deletable.delete_rows("id = 1") == 1);
     CHECK(deletable.count_rows() == source_rows - 1);
     std::optional<lance::Fragment> deleted_fragment;
