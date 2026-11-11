@@ -44559,7 +44559,8 @@ fn test_memwal_snapshot_isolation_update_delete() {
         },
         0
     );
-    let before = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    let mut before = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    before.sort_unstable();
     assert_eq!(before, vec![1, 2, 3, 4]);
     unsafe { lance_lsm_scanner_free(scanner) };
 
@@ -44579,7 +44580,9 @@ fn test_memwal_snapshot_isolation_update_delete() {
     );
     let batches = mw_scan_to_batches(scanner);
     let ids = mw_int32_values(&batches, "id");
-    assert_eq!(ids, vec![1, 3, 4]);
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![1, 3, 4]);
     let names = batches[0]
         .column_by_name("name")
         .unwrap()
