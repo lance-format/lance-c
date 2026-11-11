@@ -270,7 +270,7 @@ static int vector_source_get_schema(struct ArrowArrayStream *stream,
     allocation->top.release = release_vector_schema;
     allocation->top.private_data = allocation;
 
-    allocation->id.format = "l";
+    allocation->id.format = "i";
     allocation->id.name = "id";
     allocation->id.flags = ARROW_FLAG_NULLABLE;
     allocation->id.release = release_noop_schema;
