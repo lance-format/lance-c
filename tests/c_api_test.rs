@@ -37604,13 +37604,13 @@ fn c_vector_ids(dataset: *mut LanceDataset, query: &[f32], k: u32, args: ProbeAr
         "{}",
         take_last_error_message()
     );
-    if args.effort_first {
-        if let Some(effort) = args.effort {
-            assert_eq!(
-                unsafe { lance_scanner_set_search_effort(scanner, effort) },
-                0
-            );
-        }
+    if args.effort_first
+        && let Some(effort) = args.effort
+    {
+        assert_eq!(
+            unsafe { lance_scanner_set_search_effort(scanner, effort) },
+            0
+        );
     }
     if let Some(nprobes) = args.nprobes {
         assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, nprobes) }, 0);
@@ -37627,13 +37627,13 @@ fn c_vector_ids(dataset: *mut LanceDataset, query: &[f32], k: u32, args: ProbeAr
             0
         );
     }
-    if !args.effort_first {
-        if let Some(effort) = args.effort {
-            assert_eq!(
-                unsafe { lance_scanner_set_search_effort(scanner, effort) },
-                0
-            );
-        }
+    if !args.effort_first
+        && let Some(effort) = args.effort
+    {
+        assert_eq!(
+            unsafe { lance_scanner_set_search_effort(scanner, effort) },
+            0
+        );
     }
     let mut stream = FFI_ArrowArrayStream::empty();
     assert_eq!(
@@ -38414,7 +38414,7 @@ fn test_prewarm_scalar_train_and_index_merge_lifecycle() {
     let mut prewarm = LanceIndexPrewarmOptions {
         with_position: true,
         has_segment_selection: false,
-        segment_uuids: 1 as *const u8,
+        segment_uuids: std::ptr::NonNull::<u8>::dangling().as_ptr(),
         segment_count: usize::MAX,
     };
     assert_eq!(
