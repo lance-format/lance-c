@@ -347,6 +347,10 @@ typedef struct LanceTags     LanceTags;
 typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceCleanupExplanation LanceCleanupExplanation;
 typedef struct LanceDatasetConfig LanceDatasetConfig;
+typedef struct LanceDatasetDeltaBuilder LanceDatasetDeltaBuilder;
+typedef struct LanceDatasetDelta LanceDatasetDelta;
+typedef struct LanceSqlQueryBuilder LanceSqlQueryBuilder;
+typedef struct LanceSqlQuery LanceSqlQuery;
 typedef struct LanceCompactionOptionsV2 LanceCompactionOptionsV2;
 typedef struct LanceCompactionPlan LanceCompactionPlan;
 typedef struct LanceCompactionTask LanceCompactionTask;
@@ -8969,6 +8973,292 @@ void lance_delimited_list_close(LanceDelimitedList* list);
 const uint8_t* lance_byte_buffer_data(const LanceByteBuffer* buffer);
 size_t lance_byte_buffer_len(const LanceByteBuffer* buffer);
 void lance_byte_buffer_close(LanceByteBuffer* buffer);
+
+/* ─── Native dataset SQL ──────────────────────────────────────────────────── */
+
+/**
+ * Moves `sql` into a native `SqlQueryBuilder` owned by the returned handle.
+ * The SQL text is copied when the builder is created; the builder holds its
+ * own dataset snapshot (native Dataset clone), so it stays valid after the
+ * dataset handle closes.
+ *
+ * Returns NULL on error, including a NULL dataset or NULL SQL pointer.
+ */
+LanceSqlQueryBuilder* lance_dataset_sql_builder_new(
+    const LanceDataset* dataset, const char* sql);
+
+/**
+ * Close a SQL builder handle. NULL-safe. Close exactly once.
+ * `lance_sql_query_builder_build` consumes the allocation, so a consumed
+ * builder must not be closed.
+ */
+void lance_sql_query_builder_close(LanceSqlQueryBuilder* builder);
+
+/**
+ * Close a SQL query handle. NULL-safe. Close exactly once.
+ * `lance_sql_query_into_stream` consumes the allocation, so a consumed
+ * query must not be closed.
+ */
+void lance_sql_query_close(LanceSqlQuery* query);
+
+/**
+ * Name the table in the SELECT statement. The string is copied. An empty
+ * name is passed to native unchanged. The native default is "dataset".
+ *
+ * Returns 0 on success, -1 on error. A NULL name is rejected and the builder
+ * keeps its prior table name.
+ */
+int32_t lance_sql_query_builder_set_table_name(
+    LanceSqlQueryBuilder* builder, const char* table_name);
+
+/**
+ * Ask the native planner to inject the `_rowid` system column into the scan
+ * output where it is safe to do so. Passed to the native builder unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_with_row_id(
+    LanceSqlQueryBuilder* builder, bool enabled);
+
+/**
+ * Ask the native planner to inject the `_row_address` system column into the
+ * scan output where it is safe to do so. Passed to the native builder
+ * unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_with_row_addr(
+    LanceSqlQueryBuilder* builder, bool enabled);
+
+/**
+ * Set how blob columns are materialized, as a LanceBlobHandling value:
+ * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS (0, the native default), ALL_BINARY
+ * (1) or ALL_DESCRIPTIONS (2). Other values are rejected and the builder
+ * keeps its prior handling. Passed to the native builder unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_blob_handling(
+    LanceSqlQueryBuilder* builder, LanceBlobHandling handling);
+
+/**
+ * Set the native target output batch size (rows). The native builder
+ * validates the value's range when the query is built; a value that does not
+ * fit the native usize is rejected here and the builder keeps its prior
+ * value.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_batch_size(
+    LanceSqlQueryBuilder* builder, uint64_t batch_size);
+
+/**
+ * Set the native target output batch size in bytes. Not set (native None)
+ * until called; the native builder owns the value's interpretation and
+ * validation.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_batch_size_bytes(
+    LanceSqlQueryBuilder* builder, uint64_t batch_size_bytes);
+
+/**
+ * Plan the configured query and consume `builder` on every return path,
+ * including foreign-pointer errors and native planning failures. The caller
+ * must not use the builder after this call. On success `*out_query` receives
+ * an independently owned query handle (close it with
+ * `lance_sql_query_close`); on error the slot is left unchanged.
+ *
+ * Native planning classifies malformed SQL as invalid input. Batch-size
+ * validation happens here.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_build(
+    LanceSqlQueryBuilder* builder, LanceSqlQuery** out_query);
+
+/**
+ * Move the query's native stream into `*out_stream`, consuming `query` on
+ * every return path. The caller must not use the query after this call. On
+ * success `*out_stream` is an Arrow C stream owned by the caller (release it
+ * exactly once); it keeps the query's dataset snapshot alive and remains
+ * valid after the query, builder and dataset handles close. On error the
+ * stream slot is left unchanged.
+ *
+ * The stream is not materialized here; batches are produced lazily by the
+ * native execution plan. Malformed queries can also fail at this native
+ * physical-planning stage.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_into_stream(
+    LanceSqlQuery* query, struct ArrowArrayStream* out_stream);
+
+/* ─── Native dataset delta ────────────────────────────────────────────────── */
+
+/**
+ * Timestamp for delta date-mode ranges.
+ *
+ * `unix_seconds` is a signed Unix timestamp in whole seconds and `nanos` the
+ * nanoseconds within that second. The native chrono construction in the
+ * builder owns representability and range validation, so out-of-range or
+ * non-normalized values are rejected when the delta is built. There is no
+ * invented epoch or reset value.
+ */
+typedef struct LanceDeltaTimestamp {
+    int64_t unix_seconds;
+    uint32_t nanos; /* Native-validated 0..=999999999. */
+} LanceDeltaTimestamp;
+
+/**
+ * Moves a dataset snapshot into a native `DatasetDeltaBuilder` owned by the
+ * returned handle. The builder holds its own dataset clone, so it stays
+ * valid after the dataset handle closes.
+ *
+ * Returns NULL on error, including a NULL dataset pointer.
+ */
+LanceDatasetDeltaBuilder* lance_dataset_delta_builder_new(
+    const LanceDataset* dataset);
+
+/**
+ * Close a delta builder handle. NULL-safe. Close exactly once.
+ * `lance_dataset_delta_builder_build` consumes the allocation, so a consumed
+ * builder must not be closed.
+ */
+void lance_dataset_delta_builder_close(LanceDatasetDeltaBuilder* builder);
+
+/**
+ * Close a delta handle. NULL-safe. Close exactly once.
+ */
+void lance_dataset_delta_close(LanceDatasetDelta* delta);
+
+/**
+ * Compare against the named version. Native build rejects combining this
+ * with any explicit begin/end version or date. Not set (native None) until
+ * called; the compared-against mode normalizes its native versions.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_compared_against_version(
+    LanceDatasetDeltaBuilder* builder, uint64_t version);
+
+/**
+ * Set the explicit begin version. Native build requires both begin and end
+ * versions, or a compared-against version. Not set until called.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_begin_version(
+    LanceDatasetDeltaBuilder* builder, uint64_t version);
+
+/**
+ * Set the explicit end version.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_end_version(
+    LanceDatasetDeltaBuilder* builder, uint64_t version);
+
+/**
+ * Set the begin date for date-mode ranges. Native build requires a begin
+ * date when an end date is provided. The timestamp is copied. A NULL
+ * timestamp is rejected and the builder keeps its prior value; a timestamp
+ * the native chrono constructor cannot represent is rejected the same way.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_begin_timestamp(
+    LanceDatasetDeltaBuilder* builder, const LanceDeltaTimestamp* timestamp);
+
+/**
+ * Set the end date for date-mode ranges (requires a begin date in native
+ * build).
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_end_timestamp(
+    LanceDatasetDeltaBuilder* builder, const LanceDeltaTimestamp* timestamp);
+
+/**
+ * Build the delta synchronously and consume `builder` on every return path,
+ * including foreign-pointer errors and native validation failures. The
+ * caller must not use the builder after this call. Native build validates
+ * range combinations (compared-against version conflicts, partial version
+ * and date ranges, missing range) and normalizes the compared-against
+ * mode's versions. On success `*out_delta` receives an independently owned
+ * delta handle (close it with `lance_dataset_delta_close`); on error the
+ * slot is left unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_build(
+    LanceDatasetDeltaBuilder* builder, LanceDatasetDelta** out_delta);
+
+/**
+ * List the transactions committed between the delta's begin and end
+ * versions. Each returned transaction is independently owned; release them
+ * together with `lance_transaction_array_free`. Versions without a
+ * transaction file are skipped natively.
+ *
+ * On success `*out_transactions` receives the array (NULL when the count is
+ * 0) and `*out_count` its length. Both slots are left unchanged on error.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_list_transactions(
+    const LanceDatasetDelta* delta,
+    LanceTransaction*** out_transactions,
+    size_t* out_count);
+
+/**
+ * Free a transaction array produced by `lance_dataset_delta_list_transactions`,
+ * closing each non-NULL transaction handle and the array allocation. NULL
+ * and zero-length arrays are no-ops. Call exactly once with the exact
+ * pointer and count returned by `list_transactions`.
+ */
+void lance_transaction_array_free(
+    LanceTransaction** transactions, size_t count);
+
+/**
+ * Stream the rows inserted across the delta's range. `*out_stream` receives
+ * an Arrow C stream owned by the caller (release it exactly once); it stays
+ * valid after the delta and dataset handles close. On error the stream slot
+ * is left unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_inserted_rows(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
+
+/**
+ * Stream the rows updated across the delta's range.
+ * See `lance_dataset_delta_get_inserted_rows`.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_updated_rows(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
+
+/**
+ * Stream the rows upserted across the delta's range.
+ * See `lance_dataset_delta_get_inserted_rows`.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_upserted_rows(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
+
+/**
+ * Stream the deleted row ids across the delta's range. The stream's single
+ * column is the native stable row-id column; native resolution and id
+ * normalization are authoritative, and native errors (unsupported versions,
+ * reversed ranges, missing stable row ids) surface as returned errors.
+ * See `lance_dataset_delta_get_inserted_rows`.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_deleted_row_ids(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
 
 #ifdef __cplusplus
 } /* extern "C" */

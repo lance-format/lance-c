@@ -182,6 +182,10 @@ class IvfModel;
 class FtsQueryContext;
 class FtsQuery;
 class Namespace;
+class SqlQueryBuilder;
+class SqlQuery;
+class DatasetDeltaBuilder;
+class DatasetDelta;
 
 // ─── Version history ─────────────────────────────────────────────────────────
 
@@ -6027,6 +6031,20 @@ public:
     Scanner scan(std::nullopt_t,
                  const std::optional<std::string>& filter = std::nullopt) const;
 
+    /// Plan a SQL query over this dataset with the native `dataset::sql`
+    /// planner. `sql` is copied; the returned builder owns its own dataset
+    /// snapshot, so this dataset handle may close first. System-column
+    /// injection, batch limits and blob handling are configured on the
+    /// builder; the native planner owns their semantics.
+    SqlQueryBuilder sql(const std::string& sql) const;
+
+    /// Explore row changes between dataset versions with the native
+    /// `dataset::delta` support. The returned builder owns its own dataset
+    /// snapshot. Version and date ranges are validated synchronously on
+    /// build; transaction listing and the four row-change streams are
+    /// native.
+    DatasetDeltaBuilder delta() const;
+
     /// Compatibility wrapper for an OR Match query.
     [[deprecated("Use prepare_fts_match_query() to select the Match operator")]]
     FtsQueryContext prepare_fts_query(
@@ -6417,6 +6435,296 @@ public:
 
 private:
     explicit Dataset(LanceDataset* ptr) : handle_(ptr) {}
+};
+
+// ─── Dataset SQL ─────────────────────────────────────────────────────────────
+
+/// Planned native SQL query result. Created by SqlQueryBuilder::build();
+/// `into_stream` moves the query's native stream into a caller-owned
+/// ArrowStream and consumes this object, so it must not be used afterwards.
+class SqlQuery {
+    Handle<LanceSqlQuery, lance_sql_query_close> handle_;
+
+public:
+    explicit SqlQuery(LanceSqlQuery* query) : handle_(query) {}
+
+    SqlQuery(SqlQuery&&) noexcept = default;
+    SqlQuery& operator=(SqlQuery&&) noexcept = default;
+    SqlQuery(const SqlQuery&) = delete;
+    SqlQuery& operator=(const SqlQuery&) = delete;
+
+    /// Move the query's native stream into a returned `ArrowStream`,
+    /// consuming this query: the C entry point frees the query allocation on
+    /// every return path, including errors, so the handle is released before
+    /// the call and never closed again. The returned stream is owned by the
+    /// caller and released exactly once. On error this object is already
+    /// consumed; do not reuse it.
+    ArrowStream into_stream() {
+        auto* raw = handle_.release();
+        ArrowArrayStream stream{};
+        if (lance_sql_query_into_stream(raw, &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+};
+
+/// Builder mirroring the native `dataset::sql::SqlQueryBuilder`. All setters
+/// return `*this`; a setter that fails (foreign conversion errors) preserves
+/// the builder's prior state. `build` plans the query and consumes this
+/// builder, so it must not be used afterwards.
+class SqlQueryBuilder {
+    Handle<LanceSqlQueryBuilder, lance_sql_query_builder_close> handle_;
+
+public:
+    explicit SqlQueryBuilder(LanceSqlQueryBuilder* builder) : handle_(builder) {}
+
+    SqlQueryBuilder(SqlQueryBuilder&&) noexcept = default;
+    SqlQueryBuilder& operator=(SqlQueryBuilder&&) noexcept = default;
+    SqlQueryBuilder(const SqlQueryBuilder&) = delete;
+    SqlQueryBuilder& operator=(const SqlQueryBuilder&) = delete;
+
+    /// Name the table in the SELECT statement. The string is copied; an
+    /// empty name is passed to native unchanged. The native default is
+    /// "dataset".
+    SqlQueryBuilder& table_name(const std::string& name) {
+        if (lance_sql_query_builder_set_table_name(handle_.get(),
+                                                    name.c_str()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Ask the native planner to inject the `_rowid` system column where
+    /// safe.
+    SqlQueryBuilder& with_row_id(bool enabled = true) {
+        if (lance_sql_query_builder_set_with_row_id(handle_.get(), enabled) !=
+            0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Ask the native planner to inject the `_row_address` system column
+    /// where safe.
+    SqlQueryBuilder& with_row_addr(bool enabled = true) {
+        if (lance_sql_query_builder_set_with_row_addr(handle_.get(), enabled) !=
+            0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set how blob columns are materialized (LanceBlobHandling).
+    SqlQueryBuilder& blob_handling(LanceBlobHandling handling) {
+        if (lance_sql_query_builder_set_blob_handling(handle_.get(),
+                                                       handling) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the native target output batch size (rows). The native builder
+    /// validates the value's range on build.
+    SqlQueryBuilder& batch_size(uint64_t rows) {
+        if (lance_sql_query_builder_set_batch_size(handle_.get(), rows) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the native target output batch size in bytes.
+    SqlQueryBuilder& batch_size_bytes(uint64_t bytes) {
+        if (lance_sql_query_builder_set_batch_size_bytes(handle_.get(),
+                                                         bytes) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Plan the query and consume this builder: the C entry point frees the
+    /// builder on every return path, including errors, so the handle is
+    /// released before the call and never closed again.
+    SqlQuery build() {
+        auto* raw = handle_.release();
+        LanceSqlQuery* query = nullptr;
+        if (lance_sql_query_builder_build(raw, &query) != 0) {
+            check_error();
+        }
+        return SqlQuery(query);
+    }
+};
+
+// ─── Dataset delta ───────────────────────────────────────────────────────────
+
+/// Native version-diff handle. Reusable: `list_transactions` and every
+/// `get_*` stream may be called repeatedly and in any order; each returned
+/// stream owns its state after this (and the dataset) handle closes.
+class DatasetDelta {
+    Handle<LanceDatasetDelta, lance_dataset_delta_close> handle_;
+
+public:
+    explicit DatasetDelta(LanceDatasetDelta* delta) : handle_(delta) {}
+
+    DatasetDelta(DatasetDelta&&) noexcept = default;
+    DatasetDelta& operator=(DatasetDelta&&) noexcept = default;
+    DatasetDelta(const DatasetDelta&) = delete;
+    DatasetDelta& operator=(const DatasetDelta&) = delete;
+
+    /// List the transactions committed between the delta's begin and end
+    /// versions. Each element is an independently owned Transaction. Every
+    /// element is adopted before the shared array guard releases the
+    /// untouched remainder, so a mid-loop exception frees the rest exactly
+    /// once.
+    std::vector<Transaction> list_transactions() const {
+        LanceTransaction** transactions = nullptr;
+        size_t count = 0;
+        if (lance_dataset_delta_list_transactions(handle_.get(), &transactions,
+                                                   &count) != 0) {
+            check_error();
+        }
+        std::unique_ptr<LanceTransaction*,
+                        std::function<void(LanceTransaction**)>>
+            guard(transactions, [count](LanceTransaction** t) {
+                lance_transaction_array_free(t, count);
+            });
+        std::vector<Transaction> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            LanceTransaction* item = transactions[i];
+            transactions[i] = nullptr;
+            out.push_back(Transaction(item));
+        }
+        return out;
+    }
+
+    /// Stream the rows inserted across the delta's range into a returned
+    /// `ArrowStream`. The stream owns the native state it needs, so it stays
+    /// valid after this delta (and its dataset) handle closes. On error
+    /// nothing is returned and this delta remains usable.
+    ArrowStream get_inserted_rows() const {
+        ArrowArrayStream stream{};
+        if (lance_dataset_delta_get_inserted_rows(handle_.get(), &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    /// Stream the rows updated across the delta's range into a returned
+    /// `ArrowStream`. The stream owns its native state and stays valid after
+    /// this delta (and its dataset) handle closes. On error nothing is
+    /// returned and this delta remains usable.
+    ArrowStream get_updated_rows() const {
+        ArrowArrayStream stream{};
+        if (lance_dataset_delta_get_updated_rows(handle_.get(), &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    /// Stream the rows upserted across the delta's range into a returned
+    /// `ArrowStream`. The stream owns its native state and stays valid after
+    /// this delta (and its dataset) handle closes. On error nothing is
+    /// returned and this delta remains usable.
+    ArrowStream get_upserted_rows() const {
+        ArrowArrayStream stream{};
+        if (lance_dataset_delta_get_upserted_rows(handle_.get(), &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    /// Stream the deleted row ids across the delta's range into a returned
+    /// `ArrowStream`. The single column is the native stable row-id; native
+    /// resolution, version-zero behavior and error stages are authoritative.
+    /// The stream stays valid after this delta (and its dataset) handle
+    /// closes. On error nothing is returned and this delta remains usable.
+    ArrowStream get_deleted_row_ids() const {
+        ArrowArrayStream stream{};
+        if (lance_dataset_delta_get_deleted_row_ids(handle_.get(), &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+};
+
+/// Builder mirroring the native `dataset::delta::DatasetDeltaBuilder`. Range
+/// combinations are validated synchronously on build. `build` consumes this
+/// builder, so it must not be used afterwards.
+class DatasetDeltaBuilder {
+    Handle<LanceDatasetDeltaBuilder, lance_dataset_delta_builder_close> handle_;
+
+public:
+    explicit DatasetDeltaBuilder(LanceDatasetDeltaBuilder* builder)
+        : handle_(builder) {}
+
+    DatasetDeltaBuilder(DatasetDeltaBuilder&&) noexcept = default;
+    DatasetDeltaBuilder& operator=(DatasetDeltaBuilder&&) noexcept = default;
+    DatasetDeltaBuilder(const DatasetDeltaBuilder&) = delete;
+    DatasetDeltaBuilder& operator=(const DatasetDeltaBuilder&) = delete;
+
+    /// Compare against the named version. Native build rejects combining
+    /// this with any explicit begin/end version or date.
+    DatasetDeltaBuilder& compared_against_version(uint64_t version) {
+        if (lance_dataset_delta_builder_set_compared_against_version(
+                handle_.get(), version) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the explicit begin version. Native build requires both begin and
+    /// end versions, or a compared-against version.
+    DatasetDeltaBuilder& begin_version(uint64_t version) {
+        if (lance_dataset_delta_builder_set_begin_version(handle_.get(),
+                                                           version) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the explicit end version.
+    DatasetDeltaBuilder& end_version(uint64_t version) {
+        if (lance_dataset_delta_builder_set_end_version(handle_.get(),
+                                                         version) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the begin date for date-mode ranges. Native build requires a
+    /// begin date when an end date is provided. A timestamp the native
+    /// chrono constructor cannot represent is rejected when the delta is
+    /// built.
+    DatasetDeltaBuilder& begin_timestamp(const LanceDeltaTimestamp& timestamp) {
+        if (lance_dataset_delta_builder_set_begin_timestamp(handle_.get(),
+                                                             &timestamp) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the end date for date-mode ranges.
+    DatasetDeltaBuilder& end_timestamp(const LanceDeltaTimestamp& timestamp) {
+        if (lance_dataset_delta_builder_set_end_timestamp(handle_.get(),
+                                                           &timestamp) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Build the delta and consume this builder: the C entry point frees the
+    /// builder on every return path, including errors, so the handle is
+    /// released before the call and never closed again. Native build is
+    /// synchronous and validates the configured range combination.
+    DatasetDelta build() {
+        auto* raw = handle_.release();
+        LanceDatasetDelta* delta = nullptr;
+        if (lance_dataset_delta_builder_build(raw, &delta) != 0) {
+            check_error();
+        }
+        return DatasetDelta(delta);
+    }
 };
 
 inline LanceSchema Dataset::native_schema() const {
@@ -8097,6 +8405,18 @@ inline Scanner Dataset::scan(std::nullopt_t,
                                filter ? filter->c_str() : nullptr);
     if (!s) check_error();
     return Scanner(s);
+}
+
+inline SqlQueryBuilder Dataset::sql(const std::string& sql) const {
+    auto* builder = lance_dataset_sql_builder_new(c_handle(), sql.c_str());
+    if (!builder) check_error();
+    return SqlQueryBuilder(builder);
+}
+
+inline DatasetDeltaBuilder Dataset::delta() const {
+    auto* builder = lance_dataset_delta_builder_new(c_handle());
+    if (!builder) check_error();
+    return DatasetDeltaBuilder(builder);
 }
 
 // ─── Batch ───────────────────────────────────────────────────────────────────
