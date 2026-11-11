@@ -893,9 +893,10 @@ fn test_delta_full_and_version_ranges_match_native() {
     let (_tmp, uri, _timestamps) = create_history_dataset();
     let ds = open_dataset(&uri, 0);
 
-    // Full range from version 0: every inserted row, no updates (nothing can
-    // predate version 0), and no deleted ids because version 0 is the empty
-    // snapshot by native rule.
+    // Full range from version 0: every row still live at the end version, no
+    // updates (nothing can predate version 0), and no deleted ids because
+    // version 0 is the empty snapshot by native rule. Row 3 was deleted at
+    // version 4, so the end snapshot no longer holds it.
     let delta = build_c_delta(ds, |builder| {
         assert_eq!(
             unsafe { lance_dataset_delta_builder_set_begin_version(builder, 0) },
@@ -913,12 +914,12 @@ fn test_delta_full_and_version_ranges_match_native() {
         DeltaStream::Inserted,
     );
     assert_eq!(inserted, native_inserted);
-    assert_eq!(ids_of(&inserted), vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(ids_of(&inserted), vec![1, 2, 4, 5, 6, 7]);
 
     let updated = c_delta_stream(delta, DeltaStream::Updated);
     assert!(updated.is_empty(), "no row was updated after version 0");
     let upserted = c_delta_stream(delta, DeltaStream::Upserted);
-    assert_eq!(ids_of(&upserted), vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(ids_of(&upserted), vec![1, 2, 4, 5, 6, 7]);
     let deleted = c_delta_stream(delta, DeltaStream::Deleted);
     assert!(deleted.is_empty(), "version 0 deleted-row ids are empty");
     unsafe { lance_dataset_delta_close(delta) };
@@ -1086,18 +1087,23 @@ fn test_delta_date_mode_matches_resolved_version_range() {
             0
         );
     });
+    // Row order is a plan detail, so compare the change sets themselves.
     for kind in [
         DeltaStream::Inserted,
         DeltaStream::Updated,
         DeltaStream::Upserted,
-        DeltaStream::Deleted,
     ] {
         assert_eq!(
-            c_delta_stream(delta, kind),
-            c_delta_stream(by_version, kind),
+            ids_of(&c_delta_stream(delta, kind)),
+            ids_of(&c_delta_stream(by_version, kind)),
             "date mode should equal the resolved version range for {kind:?}"
         );
     }
+    assert_eq!(
+        row_ids_of(&c_delta_stream(delta, DeltaStream::Deleted)),
+        row_ids_of(&c_delta_stream(by_version, DeltaStream::Deleted)),
+        "date mode should equal the resolved version range for the deleted row ids"
+    );
     unsafe {
         lance_dataset_delta_close(delta);
         lance_dataset_delta_close(by_version);

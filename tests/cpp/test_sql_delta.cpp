@@ -112,6 +112,11 @@ std::vector<int32_t> sorted(std::vector<int32_t> values) {
     return values;
 }
 
+std::vector<uint64_t> sorted(std::vector<uint64_t> values) {
+    std::sort(values.begin(), values.end());
+    return values;
+}
+
 LanceErrorCode error_code_of(const std::function<void()>& fn) {
     try {
         fn();
@@ -297,7 +302,8 @@ void test_delta_full_range(const std::string& uri) {
 
     CHECK(field_count(inserted) == 6);
     CHECK(field_count(deleted) == 1);
-    const std::vector<int32_t> all{1, 2, 3, 4, 5, 6, 7};
+    // Row 3 was deleted at version 4, so it is absent from the end snapshot.
+    const std::vector<int32_t> all{1, 2, 4, 5, 6, 7};
     CHECK(sorted(read_i32(inserted, 0)) == all);
     CHECK(read_i32(updated, 0).empty());
     CHECK(sorted(read_i32(upserted, 0)) == all);
@@ -356,11 +362,13 @@ void test_delta_date_mode(const std::string& uri, int64_t begin_seconds,
 
     auto date_inserted = by_date.get_inserted_rows();
     auto version_inserted = by_version.get_inserted_rows();
-    CHECK(read_i32(date_inserted, 0) == read_i32(version_inserted, 0));
+    // Row order is a plan detail, so compare the change sets themselves.
+    CHECK(sorted(read_i32(date_inserted, 0)) ==
+          sorted(read_i32(version_inserted, 0)));
 
     auto date_deleted = by_date.get_deleted_row_ids();
     auto version_deleted = by_version.get_deleted_row_ids();
-    CHECK(read_u64(date_deleted, 0) == read_u64(version_deleted, 0));
+    CHECK(sorted(read_u64(date_deleted, 0)) == sorted(read_u64(version_deleted, 0)));
 }
 
 void test_delta_errors(const std::string& history_uri,

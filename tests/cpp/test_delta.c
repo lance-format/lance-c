@@ -227,20 +227,21 @@ static void test_full_and_version_ranges(const char *uri) {
     ASSERT(dataset != NULL, "open history dataset");
     CHECK_OK();
 
-    /* Full range from version 0: every inserted row, no updates, and version
-     * 0 behaves as the empty snapshot for deleted ids. */
+    /* Full range from version 0: every row still live at the end version, no
+     * updates, and version 0 behaves as the empty snapshot for deleted ids.
+     * Row 3 was deleted at version 4, so the end snapshot no longer holds it. */
     LanceDatasetDelta *delta = build_delta_versions(dataset, 0, 5);
     struct ArrowArrayStream stream = inserted_rows(delta);
     ASSERT(stream_field_count(&stream) == 6,
            "row streams carry the row-version metadata columns");
-    int32_t all_ids[] = {1, 2, 3, 4, 5, 6, 7};
-    assert_i32_set("full inserted", &stream, all_ids, 7);
+    int32_t all_ids[] = {1, 2, 4, 5, 6, 7};
+    assert_i32_set("full inserted", &stream, all_ids, 6);
 
     stream = updated_rows(delta);
     assert_i32_set("full updated", &stream, NULL, 0);
 
     stream = upserted_rows(delta);
-    assert_i32_set("full upserted", &stream, all_ids, 7);
+    assert_i32_set("full upserted", &stream, all_ids, 6);
 
     stream = deleted_row_ids(delta);
     ASSERT(stream_field_count(&stream) == 1, "deleted ids have one column");
@@ -318,8 +319,8 @@ static void test_transaction_list(const char *uri) {
 
     /* The delta remains usable after listing. */
     struct ArrowArrayStream stream = inserted_rows(delta);
-    int32_t all_ids[] = {1, 2, 3, 4, 5, 6, 7};
-    assert_i32_set("post-list inserted", &stream, all_ids, 7);
+    int32_t all_ids[] = {1, 2, 4, 5, 6, 7};
+    assert_i32_set("post-list inserted", &stream, all_ids, 6);
     lance_dataset_delta_close(delta);
 
     /* An empty range lists nothing and every stream is empty. */
