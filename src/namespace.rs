@@ -875,6 +875,7 @@ unsafe fn dataset_write_namespace_inner(
             options,
             false,
             ptr::null(),
+            ptr::null(),
             session.as_ref().map(|session| session.inner.clone()),
         )?
     };
@@ -1001,7 +1002,14 @@ unsafe fn transaction_commit_namespace_uri_inner(
     });
     let transaction = unsafe { &*transaction }.inner.clone();
     let builder = unsafe {
-        commit_builder_from_ffi_with_handler(uri, Some(handler), options, storage_opts, session)?
+        commit_builder_from_ffi_with_handler(
+            uri,
+            Some(handler),
+            options,
+            storage_opts,
+            ptr::null(),
+            session,
+        )?
     };
     let dataset = block_on(builder.execute(transaction))?;
     unsafe {
