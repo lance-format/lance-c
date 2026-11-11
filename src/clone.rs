@@ -38,9 +38,9 @@ fn invalid(message: impl Into<String>) -> lance_core::Error {
 ///   `Ref::Version(snapshot.manifest.branch, Some(snapshot.version_id()))`.
 ///   This pins the snapshot; it does not select the latest head of the branch.
 /// - `target_storage_options == NULL` passes native `None`. A non-NULL accessor
-///   is forwarded as `Some` and contributes its native `Arc` to
-///   `ObjectStoreParams`, even when it has no initial options; credentials are
-///   not resolved or copied here.
+///   that holds static options and/or a provider contributes its native `Arc`
+///   to `ObjectStoreParams`; an accessor created with neither contributes
+///   `None`. Credentials are not resolved or copied here.
 ///
 /// The out handle is written only on success. On failure, native copies may
 /// leave partial objects under `target_path`, while the target dataset itself

@@ -4884,9 +4884,10 @@ public:
     /// version id pinned); it does not select the latest head. Pass
     /// `Ref::version(std::nullopt, std::nullopt)` to clone the current head of
     /// the default branch. `storage_options == nullptr` passes native None;
-    /// otherwise the accessor's native Arc is forwarded as-is (including an
-    /// accessor with no initial options) without resolving or copying
-    /// credentials. On failure the target is not published, but
+    /// otherwise the accessor's native Arc is forwarded as-is when it holds
+    /// static options or a provider (an accessor with neither passes None),
+    /// without resolving or copying credentials. On failure the target is not
+    /// published, but
     /// partial objects may remain under `target_path`.
     Dataset deep_clone(
         const std::string& target_path,
