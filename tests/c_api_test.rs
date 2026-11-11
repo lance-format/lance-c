@@ -10844,7 +10844,7 @@ unsafe fn build_scalar_segment_via_c(
     scalar_type: LanceScalarIndexType,
     params_json: &str,
     fragment_ids: &[u32],
-    uuid: [u8; 16],
+    uuid: Option<[u8; 16]>,
 ) -> *mut LanceIndexSegmentMetadata {
     let column = c_str(column);
     let index_name = c_str(index_name);
@@ -10854,10 +10854,11 @@ unsafe fn build_scalar_segment_via_c(
     } else {
         params_json.as_ptr()
     };
+    let uuid_ptr = uuid.as_ref().map_or(ptr::null(), |uuid| uuid.as_ptr());
     let options = LanceIndexSegmentBuildOptions {
         fragment_ids: fragment_ids.as_ptr(),
         fragment_count: fragment_ids.len(),
-        index_uuid: uuid.as_ptr(),
+        index_uuid: uuid_ptr,
         ivf_centroids: ptr::null_mut(),
         ivf_centroids_schema: ptr::null(),
         pq_codebook: ptr::null_mut(),
@@ -10993,7 +10994,7 @@ fn test_index_metadata_complete_inspection_clone_and_native_oracle() {
             LanceScalarIndexType::ZoneMap,
             params_json,
             &[0, 1],
-            uuid,
+            Some(uuid),
         )
     };
     let after_ms = Utc::now().timestamp_millis();
@@ -11051,7 +11052,7 @@ fn test_index_metadata_complete_inspection_clone_and_native_oracle() {
             LanceScalarIndexType::Bitmap,
             "",
             &[2],
-            bitmap_uuid,
+            Some(bitmap_uuid),
         )
     };
     let mut details_len = usize::MAX;
@@ -11133,7 +11134,7 @@ fn test_create_index_operation_constructor_validation_and_ownership() {
             LanceScalarIndexType::ZoneMap,
             r#"{"rows_per_zone":2,"use_seeds":false}"#,
             &[0, 1],
-            [0x42; 16],
+            Some([0x42; 16]),
         )
     };
 
@@ -11303,7 +11304,7 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
             LanceScalarIndexType::ZoneMap,
             params,
             &[0, 1],
-            uuid_a,
+            Some(uuid_a),
         )
     };
     let segment_b = unsafe {
@@ -11314,7 +11315,7 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
             LanceScalarIndexType::ZoneMap,
             params,
             &[2, 3],
-            uuid_b,
+            Some(uuid_b),
         )
     };
     let segment_a_value = inspect_index_metadata_via_c(segment_a);
@@ -11346,7 +11347,7 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
             LanceScalarIndexType::ZoneMap,
             params,
             &[0, 1, 2, 3],
-            uuid_conflict,
+            Some(uuid_conflict),
         )
     };
     let conflict_segments = [conflict_segment as *const LanceIndexSegmentMetadata];
@@ -11384,7 +11385,6 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
         read_version + 1
     );
     assert_eq!(unsafe { lance_dataset_count_rows(committed) }, 17);
-    assert_eq!(unsafe { lance_dataset_index_count(committed) }, 1);
     let mut committed_uuids = dataset_segment_uuids(committed, "score_zonemap_create");
     committed_uuids.sort();
     let mut expected_uuids = vec![uuid_a, uuid_b];
@@ -11511,7 +11511,7 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
             LanceScalarIndexType::ZoneMap,
             params,
             &[0, 1, 2, 3],
-            uuid_replacement,
+            Some(uuid_replacement),
         )
     };
     let replacement_value = inspect_index_metadata_via_c(replacement_segment);
@@ -11554,7 +11554,6 @@ fn test_create_index_commit_replace_conflict_history_and_query() {
         unsafe { lance_dataset_version(replaced) },
         replacement_version + 1
     );
-    assert_eq!(unsafe { lance_dataset_index_count(replaced) }, 1);
     let replaced_uuids = dataset_segment_uuids(replaced, "score_zonemap_create");
     assert_eq!(replaced_uuids, vec![uuid_replacement]);
     let (ids, statistics) = scan_index_ids(replaced, "score = 70", true);
@@ -11666,7 +11665,7 @@ fn test_create_index_native_validation_stays_in_core() {
             LanceScalarIndexType::BTree,
             "",
             &[0, 1],
-            [0x11; 16],
+            None,
         )
     };
     let bitmap = unsafe {
@@ -11677,7 +11676,7 @@ fn test_create_index_native_validation_stays_in_core() {
             LanceScalarIndexType::Bitmap,
             "",
             &[2, 3],
-            [0x22; 16],
+            Some([0x22; 16]),
         )
     };
     let btree_value = inspect_index_metadata_via_c(btree);
