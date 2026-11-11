@@ -165,9 +165,10 @@ for sample in $(seq 1 "$SAMPLES"); do
     done
 done
 
-python3 "$SCRIPT_DIR/summarize_benchmark.py" "$RAW_TMP" "$SUMMARY_TMP" \
-    >"$EVIDENCE_DIR/logs/summary.log" 2>&1
 mv "$RAW_TMP" "$EVIDENCE_DIR/benchmark_raw.csv"
+python3 "$SCRIPT_DIR/summarize_benchmark.py" \
+    "$EVIDENCE_DIR/benchmark_raw.csv" "$SUMMARY_TMP" \
+    >"$EVIDENCE_DIR/logs/summary.log" 2>&1
 mv "$SUMMARY_TMP" "$EVIDENCE_DIR/benchmark_summary.json"
 cat "$EVIDENCE_DIR/benchmark_summary.json"
 
