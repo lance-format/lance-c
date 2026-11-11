@@ -18,11 +18,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
-use arrow_array::builder::ListBuilder;
+use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::types::Int32Type;
 use arrow_array::{
     BinaryArray, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, StructArray, UInt32Array,
+    RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use lance::Dataset;
@@ -576,6 +576,157 @@ fn create_typed_fts_dataset_on_disk() -> (tempfile::TempDir, String) {
     unsafe { lance_c::lance_dataset_close(dataset) };
 
     (tmp, uri)
+}
+
+/// Create a two-fragment dataset whose only indexed column is a nullable list
+/// of text. Each list element is one FTS document.
+fn create_typed_fts_list_dataset_on_disk() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("typed_fts_list_c_test_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+
+    let make_batch = |ids: Vec<i32>, lists: &[Option<Vec<Option<&str>>>]| {
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        for list in lists {
+            match list {
+                Some(items) => {
+                    for item in items {
+                        match item {
+                            Some(value) => tags.values().append_value(*value),
+                            None => tags.values().append_null(),
+                        }
+                    }
+                    tags.append(true);
+                }
+                None => tags.append(false),
+            }
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(tags.finish())],
+        )
+        .unwrap()
+    };
+    let first = make_batch(
+        vec![1, 2, 3, 4, 5],
+        &[
+            Some(vec![
+                Some("alpha beta"),
+                Some("gamma alpha"),
+                None,
+                Some(""),
+                Some("delta"),
+            ]),
+            Some(vec![Some("alpha"), Some("beta alpha")]),
+            None,
+            Some(Vec::new()),
+            Some(vec![None, None]),
+        ],
+    );
+    let second = make_batch(
+        vec![6, 7, 8, 9, 10, 11],
+        &[
+            Some(vec![Some("!!!"), Some("epsilon")]),
+            Some(vec![Some("")]),
+            Some(vec![Some("alpha"), Some("alpha")]),
+            Some(vec![Some("alpha beta gamma")]),
+            Some(vec![Some("zeta"), Some("alpha beta")]),
+            Some(vec![Some("beta"), Some("gamma")]),
+        ],
+    );
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap()
+        .append(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let uri_c = CString::new(uri.clone()).unwrap();
+    let dataset = unsafe { lance_c::lance_dataset_open(uri_c.as_ptr(), std::ptr::null(), 0) };
+    assert!(!dataset.is_null(), "failed to open typed FTS list dataset");
+    let params = CString::new(
+        r#"{"base_tokenizer":"simple","language":"English","with_position":true,"document_granularity":"list_element"}"#,
+    )
+    .unwrap();
+    let column = CString::new("tags").unwrap();
+    let rc = unsafe {
+        lance_c::lance_dataset_create_scalar_index(
+            dataset,
+            column.as_ptr(),
+            std::ptr::null(),
+            lance_c::LanceScalarIndexType::Inverted as i32,
+            params.as_ptr(),
+            false,
+        )
+    };
+    if rc != 0 {
+        let message = lance_c::lance_last_error_message();
+        let message = if message.is_null() {
+            "unknown error".to_string()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        panic!("failed to create list-element inverted index: {message}");
+    }
+    unsafe { lance_c::lance_dataset_close(dataset) };
+
+    (tmp, uri)
+}
+
+/// Return the `_rowid` of one dataset row for row-address allowlist tests.
+fn typed_fts_row_id(uri: &str, target: i32) -> u64 {
+    use futures::TryStreamExt;
+
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.with_row_id();
+        let mut stream = scanner.try_into_stream().await.unwrap();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                if ids.value(row) == target {
+                    return row_ids.value(row);
+                }
+            }
+        }
+        panic!("row id {target} not found in {uri}");
+    })
 }
 
 /// Create a two-fragment dataset for scanner ordering tests.
@@ -1154,6 +1305,8 @@ fn test_cpp_compilation_and_execution() {
 fn test_typed_fts_native_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
     let (_tmp, dataset_uri) = create_typed_fts_dataset_on_disk();
+    let (_list_tmp, list_dataset_uri) = create_typed_fts_list_dataset_on_disk();
+    let list_row_id = typed_fts_row_id(&list_dataset_uri, 1).to_string();
     let build_dir = tempfile::tempdir().unwrap();
     let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -1165,7 +1318,7 @@ fn test_typed_fts_native_compilation_and_execution() {
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C FTS test compilation failed"
     );
-    run_test_binary_with_dataset(&c_binary, &dataset_uri);
+    run_test_binary_with_args(&c_binary, &[&dataset_uri, &list_dataset_uri, &list_row_id]);
 
     let cpp_source = tests_dir.join("test_fts_query.cpp");
     let cpp_binary = build_dir.path().join("test_fts_query_cpp");
@@ -1173,7 +1326,10 @@ fn test_typed_fts_native_compilation_and_execution() {
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ FTS test compilation failed"
     );
-    run_test_binary_with_dataset(&cpp_binary, &dataset_uri);
+    run_test_binary_with_args(
+        &cpp_binary,
+        &[&dataset_uri, &list_dataset_uri, &list_row_id],
+    );
 }
 
 #[test]
