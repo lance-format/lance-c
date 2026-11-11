@@ -42903,24 +42903,23 @@ fn diagnostics_fts_tokenize_matches_native_profiles_and_unicode() {
 
 #[test]
 fn diagnostics_fts_tokenize_max_length_presence() {
-    let text = "short extraordinarilylongword abc";
+    let long_token = "x".repeat(41);
+    let text = format!("short {long_token} abc");
     let omitted = c_query_tokens(text.as_bytes(), None);
-    assert_eq!(omitted, native_query_tokens(text, None));
+    assert_eq!(omitted, native_query_tokens(&text, None));
     assert!(
-        !omitted
-            .iter()
-            .any(|(token, _)| token.contains("extraordinarily"))
+        !omitted.iter().any(|(token, _)| token == &long_token),
+        "omitted max_token_length must use native default 40"
     );
 
     let explicit_null = c_query_tokens(text.as_bytes(), Some(r#"{"max_token_length":null}"#));
     assert_eq!(
         explicit_null,
-        native_query_tokens(text, Some(r#"{"max_token_length":null}"#))
+        native_query_tokens(&text, Some(r#"{"max_token_length":null}"#))
     );
     assert!(
-        explicit_null
-            .iter()
-            .any(|(token, _)| token == "extraordinarilylongword")
+        explicit_null.iter().any(|(token, _)| token == &long_token),
+        "explicit null max_token_length must disable the length limit"
     );
     assert_ne!(omitted, explicit_null);
 
@@ -42928,7 +42927,7 @@ fn diagnostics_fts_tokenize_max_length_presence() {
     assert!(zero.is_empty());
     assert_eq!(
         zero,
-        native_query_tokens(text, Some(r#"{"max_token_length":0}"#))
+        native_query_tokens(&text, Some(r#"{"max_token_length":0}"#))
     );
 }
 
