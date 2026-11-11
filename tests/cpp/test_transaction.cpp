@@ -940,6 +940,13 @@ static void test_blob_writer_data_replacement(const std::string& blob_uri) {
          ReplacementBatch{{4}, &dedicated_b}});
     CHECK(dedicated_a.release == nullptr);
     CHECK(dedicated_b.release == nullptr);
+    if (packed_field.release) packed_field.release(&packed_field);
+    if (dedicated_a_field.release) {
+        dedicated_a_field.release(&dedicated_a_field);
+    }
+    if (dedicated_b_field.release) {
+        dedicated_b_field.release(&dedicated_b_field);
+    }
 
     auto packed_file = dataset.create_data_file(packed_name);
     auto dedicated_file = dataset.create_data_file(dedicated_name);
