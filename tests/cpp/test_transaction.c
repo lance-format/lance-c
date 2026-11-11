@@ -1138,10 +1138,12 @@ static void test_native_schema(const char *uri) {
     int32_t field_sentinel = -11;
     ASSERT(lance_schema_field_id(schema, "nope", &field_sentinel) == -1,
            "unknown field ID");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "unknown field ID code");
     ASSERT(field_sentinel == -11, "unknown field ID leaves output");
 
-    /* Experimental: native Project with an empty selection commits or rejects
-       according to core validation; record the actual behavior. */
+    /* Pinned native core accepts an empty Project schema; assert the observed
+       behavior so a silent policy change is visible. */
     LanceSchema *empty_schema = NULL;
     ASSERT(lance_schema_project(schema, NULL, 0, &empty_schema) == 0,
            "empty native schema projection");
@@ -1168,8 +1170,10 @@ static void test_native_schema(const char *uri) {
     printf("empty-schema Project commit rc=%d code=%d\n", empty_rc,
            (int)lance_last_error_code());
     fflush(stdout);
-    /* Final assertion is tightened after the experimental observation. */
-    (void)empty_committed;
+    ASSERT(empty_rc == 0, "empty-schema Project commit");
+    CHECK_OK();
+    ASSERT(empty_committed != NULL, "empty-schema Project commit output");
+    lance_dataset_close(empty_committed);
     lance_transaction_close(empty_transaction);
     lance_operation_close(empty_operation);
     printf("native schema and Project OK\n");
