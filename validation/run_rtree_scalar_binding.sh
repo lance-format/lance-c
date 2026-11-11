@@ -159,7 +159,31 @@ assert_clean "initial"
 run_step rustc-version rustc --version
 run_step cargo-version cargo --version
 run_step pi-version pi --version
-run_step pi-auth pi auth check --model magpie/group/deepseek --json
+pi_auth_log="$LOGS/pi-auth-observe.log"
+pi_auth_status="$LOGS/pi-auth-observe.status"
+pi_auth_tmp="$pi_auth_status.tmp"
+pi_auth_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+{
+    printf '%s\t' "pi-auth-observe"
+    printf '%q ' pi auth check --model magpie/group/deepseek --json
+    printf '\n'
+} >>"$COMMANDS"
+set +e
+pi auth check --model magpie/group/deepseek --json 2>&1 | tee "$pi_auth_log"
+pi_auth_rc=${PIPESTATUS[0]}
+set -e
+pi_auth_finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+{
+    printf 'name=pi-auth-observe\n'
+    printf 'status=observed\n'
+    printf 'exit_code=%s\n' "$pi_auth_rc"
+    printf 'started_at=%s\n' "$pi_auth_started"
+    printf 'finished_at=%s\n' "$pi_auth_finished"
+    printf 'note=informational; the local Pi model catalog may be empty\n'
+} >"$pi_auth_tmp"
+mv "$pi_auth_tmp" "$pi_auth_status"
+printf 'pi-auth-observe\t%s\t%s\n' "$pi_auth_rc" "$pi_auth_finished" >>"$STATUSES"
+run_step nier-magpie-grant python3 validation/check_nier_magpie_grant.py
 
 run_step fmt cargo fmt --all -- --check
 run_step check cargo check --all-targets --locked
