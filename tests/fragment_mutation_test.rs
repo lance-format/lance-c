@@ -168,8 +168,8 @@ fn open_bound_fragment(uri: &str, fragment_id: u64) -> *mut LanceFragment {
     fragment
 }
 
-fn native_fragment(uri: &str, fragment_id: u64) -> FileFragment {
-    let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
+async fn native_fragment(uri: &str, fragment_id: u64) -> FileFragment {
+    let dataset = Dataset::open(uri).await.unwrap();
     dataset
         .get_fragment(usize::try_from(fragment_id).unwrap())
         .unwrap()
@@ -345,10 +345,8 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
 
     let mut reader_fragment = ptr::null_mut();
     let mut reader_schema = ptr::null_mut();
-    let mut reader_stream = one_column_stream(
-        "reader_value",
-        vec![Some(100), Some(200), Some(300), Some(400)],
-    );
+    let mut reader_stream =
+        one_column_stream("reader_value", vec![Some(100), Some(300), Some(400)]);
     assert_eq!(
         unsafe {
             lance_fragment_add_columns_stream(
@@ -491,7 +489,7 @@ fn test_fragment_merge_and_update_match_native_oracle() {
     let source_version = fragment_read_version(fragment);
 
     let native_merge = lance_c::runtime::block_on(async {
-        let mut native = native_fragment(&oracle_uri, 0);
+        let mut native = native_fragment(&oracle_uri, 0).await;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("merged", DataType::Int32, true),
@@ -562,7 +560,7 @@ fn test_fragment_merge_and_update_match_native_oracle() {
     );
 
     let native_update = lance_c::runtime::block_on(async {
-        let mut native = native_fragment(&oracle_uri, 0);
+        let mut native = native_fragment(&oracle_uri, 0).await;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Int32, true),
@@ -769,7 +767,7 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
     assert_eq!((major, minor), (2, 2));
 
     let native_group = lance_c::runtime::block_on(async {
-        let native = native_fragment(&oracle_uri, 0);
+        let native = native_fragment(&oracle_uri, 0).await;
         let schema = native.dataset().schema().project(&["value"]).unwrap();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
@@ -850,6 +848,7 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
     let second = open_bound_fragment(&uri, 1);
     let native_delete = lance_c::runtime::block_on(async {
         native_fragment(&oracle_uri, 1)
+            .await
             .extend_deletions([0, 0])
             .await
     });
@@ -873,6 +872,7 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
     let third = open_bound_fragment(&uri, 2);
     let native_full = lance_c::runtime::block_on(async {
         native_fragment(&oracle_uri, 2)
+            .await
             .extend_deletions([0, 1, 2, 3])
             .await
     });
@@ -894,6 +894,7 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
 
     let native_out_of_range = lance_c::runtime::block_on(async {
         native_fragment(&oracle_uri, 1)
+            .await
             .extend_deletions([100])
             .await
     });
