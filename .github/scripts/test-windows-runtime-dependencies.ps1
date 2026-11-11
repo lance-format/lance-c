@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+#
+# Deterministic checks for the Windows dependency guard. This does not replace
+# the native consumer run: API-set imports are accepted as loader contracts,
+# and the installed shared consumer proves their resolution on this host.
+
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+. (Join-Path $PSScriptRoot 'windows-runtime-dependencies.ps1')
+
+$fixture = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+$prefixPath = Join-Path $fixture 'stage'
+$system32 = Join-Path $fixture 'Windows\System32'
+try {
+    New-Item -ItemType Directory -Force -Path (Join-Path $prefixPath 'lib'), $system32 |
+        Out-Null
+    Set-Content -LiteralPath (Join-Path $system32 'KERNEL32.dll') -Value 'fixture'
+    Set-Content -LiteralPath (Join-Path $prefixPath 'lib\app-local.dll') -Value 'fixture'
+
+    $cases = @(
+        @{ Dependency = 'KERNEL32.dll'; Expected = 'system32' },
+        @{ Dependency = 'app-local.dll'; Expected = 'staged' },
+        @{ Dependency = 'api-ms-win-core-synch-l1-2-0.dll'; Expected = 'api-set' },
+        @{ Dependency = 'EXT-MS-WIN-NTUSER-Window-l1-1-0.dll'; Expected = 'api-set' }
+    )
+
+    foreach ($case in $cases) {
+        $actual = Resolve-RuntimeDependency `
+            -Dependency $case.Dependency `
+            -PrefixPath $prefixPath `
+            -System32 $system32
+        if ($actual -ne $case.Expected) {
+            throw "dependency $($case.Dependency) classified as $actual, expected $($case.Expected)"
+        }
+        Write-Host "    $($case.Dependency) -> $actual"
+    }
+
+    $missing = 'missing-runtime-174.dll'
+    $rejected = $false
+    try {
+        Resolve-RuntimeDependency `
+            -Dependency $missing `
+            -PrefixPath $prefixPath `
+            -System32 $system32 | Out-Null
+    } catch {
+        $rejected = $true
+        if ($_.Exception.Message -notmatch [regex]::Escape($missing)) {
+            throw
+        }
+    }
+    if (-not $rejected) {
+        throw "ordinary missing dependency $missing was not rejected"
+    }
+
+    Write-Host "==> Windows dependency guard checks passed"
+} finally {
+    Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+}

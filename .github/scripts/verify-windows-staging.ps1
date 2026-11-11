@@ -16,6 +16,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot 'windows-runtime-dependencies.ps1')
+
 function Invoke-Dumpbin {
     param([string[]]$Arguments)
 
@@ -117,17 +119,26 @@ if ($dependencies.Count -eq 0) {
 
 $system32 = Join-Path $env:SystemRoot 'System32'
 foreach ($dependency in $dependencies) {
-    $systemCandidate = Join-Path $system32 $dependency
-    $appLocalCandidate = Join-Path $prefixPath "lib\$dependency"
-    if (Test-Path -LiteralPath $systemCandidate -PathType Leaf) {
-        Write-Host "    $dependency -> System32"
-    } elseif (Test-Path -LiteralPath $appLocalCandidate -PathType Leaf) {
-        Write-Host "    $dependency -> staged lib"
-    } else {
-        throw "runtime dependency $dependency is neither in System32 nor staged beside the DLL"
+    $dependencySource = Resolve-RuntimeDependency `
+        -Dependency $dependency `
+        -PrefixPath $prefixPath `
+        -System32 $system32
+    switch ($dependencySource) {
+        'api-set' {
+            Write-Host "    $dependency -> API-set contract; native loader check follows"
+        }
+        'system32' {
+            Write-Host "    $dependency -> System32"
+        }
+        'staged' {
+            Write-Host "    $dependency -> staged lib"
+        }
+        default {
+            throw "unknown dependency classification for ${dependency}: $dependencySource"
+        }
     }
 }
-Write-Host "==> Verified $($dependencies.Count) runtime DLL dependencies"
+Write-Host "==> Inspected $($dependencies.Count) runtime DLL dependencies"
 
 function Test-InstalledConsumer {
     param(
@@ -162,8 +173,14 @@ function Test-InstalledConsumer {
         throw "acceptance executable was not built: $executable"
     }
 
+    $executableDependents = (Invoke-Dumpbin @('/dependents', $executable)) -join "`n"
     if ($Linkage -eq 'shared') {
         Copy-Item -LiteralPath $dll -Destination (Split-Path -Parent $executable) -Force
+        if ($executableDependents -notmatch '(?im)^\s*lance_c\.dll\s*$') {
+            throw "shared acceptance executable does not import lance_c.dll"
+        }
+    } elseif ($executableDependents -match '(?im)^\s*lance_c\.dll\s*$') {
+        throw "static acceptance executable unexpectedly imports lance_c.dll"
     }
 
     $dataRoot = Join-Path $workPath "dataset-$Linkage"

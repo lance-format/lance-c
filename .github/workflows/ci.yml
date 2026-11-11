@@ -163,6 +163,8 @@ jobs:
           "$env:RUNNER_TEMP\protoc\bin" |
             Out-File -FilePath $env:GITHUB_PATH -Append
           & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
+      - name: Test Windows dependency guard
+        run: pwsh -File .github/scripts/test-windows-runtime-dependencies.ps1
       - name: Configure
         run: >
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
