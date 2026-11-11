@@ -685,6 +685,7 @@ public final class CrossSdkAcceptance {
       throws Exception {
     List<Integer> fixtureFragments = List.of(0, 1);
     List<Integer> fixtureFields = List.of(VECTOR_FIELD_ID);
+    // Java 12 exposes the generic VECTOR type; the concrete IVF_PQ shape is in Any.
     List<Index> produced =
         decodeSegments(
             metadataPath,
@@ -717,7 +718,7 @@ public final class CrossSdkAcceptance {
             fixtureFields,
             beforeVersion,
             1,
-            IndexType.IVF_PQ,
+            IndexType.VECTOR,
             "VectorIndexDetails",
             Map.of(),
             false);
@@ -735,7 +736,7 @@ public final class CrossSdkAcceptance {
             fixtureFields,
             beforeVersion,
             1,
-            IndexType.IVF_PQ,
+            IndexType.VECTOR,
             "VectorIndexDetails",
             producedByUuid,
             true);
@@ -759,7 +760,7 @@ public final class CrossSdkAcceptance {
             fixtureFields,
             beforeVersion,
             1,
-            IndexType.IVF_PQ,
+            IndexType.VECTOR,
             "VectorIndexDetails",
             producedByUuid,
             true);
