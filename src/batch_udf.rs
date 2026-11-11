@@ -7,9 +7,8 @@
 //! cleanup, and commit semantics. This module only translates Arrow C Data
 //! values, callback errors, and the four synchronous checkpoint methods.
 
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::ptr;
 use std::sync::Arc;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
@@ -19,46 +18,14 @@ use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore
 use lance_core::{Error, Result};
 use lance_table::format::Fragment;
 
+use crate::callback::{
+    LanceCallbackError, LanceOwnedString, callback_error, release_message_only,
+    release_owned_string_slot, take_owned_string,
+};
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, panic_payload_message};
 use crate::helpers;
 use crate::runtime::block_on;
-
-/// Owned, optional UTF-8 string produced by a foreign callback.
-#[repr(C)]
-pub struct LanceOwnedString {
-    /// NUL-terminated string data, or NULL when absent.
-    pub data: *mut c_char,
-    /// Releases `data`. Required whenever `data` is non-NULL.
-    pub release: Option<unsafe extern "C" fn(*mut LanceOwnedString)>,
-}
-
-impl LanceOwnedString {
-    fn empty() -> Self {
-        Self {
-            data: ptr::null_mut(),
-            release: None,
-        }
-    }
-}
-
-/// Structured failure returned by a mapper or checkpoint callback.
-#[repr(C)]
-pub struct LanceCallbackError {
-    /// A nonzero `LanceErrorCode` value.
-    pub code: i32,
-    /// Callback-owned message copied before `release` is invoked.
-    pub message: LanceOwnedString,
-}
-
-impl LanceCallbackError {
-    fn empty() -> Self {
-        Self {
-            code: 0,
-            message: LanceOwnedString::empty(),
-        }
-    }
-}
 
 /// Native checkpoint batch identity.
 #[repr(C)]
@@ -179,7 +146,8 @@ unsafe fn add_columns_batch_udf_inner(
     let mapper_callback = udf
         .mapper
         .ok_or_else(|| Error::invalid_input_source("udf.mapper must not be NULL".into()))?;
-    let output_schema = unsafe { import_output_schema(udf.output_schema, "udf.output_schema")? };
+    let output_schema =
+        unsafe { helpers::import_arrow_schema(udf.output_schema, "udf.output_schema")? };
     let read_columns = unsafe { helpers::parse_c_string_array(read_columns)? };
     let batch_size = if batch_size.is_null() {
         None
@@ -232,44 +200,6 @@ unsafe fn add_columns_batch_udf_inner(
     dataset
         .with_mut(|dataset| block_on(dataset.add_columns(transform, read_columns, batch_size)))?;
     Ok(0)
-}
-
-unsafe fn import_output_schema(schema: *const FFI_ArrowSchema, name: &str) -> Result<Arc<Schema>> {
-    if schema.is_null() {
-        return Err(Error::invalid_input_source(
-            format!("{name} must not be NULL").into(),
-        ));
-    }
-    // SAFETY: caller supplies a live ArrowSchema for this call.
-    let schema = unsafe { &*schema };
-    if schema.release.is_none() || schema.format.is_null() {
-        return Err(Error::invalid_input_source(
-            format!("{name} is uninitialised or already released").into(),
-        ));
-    }
-    // SAFETY: `format` is non-NULL and follows the C Data Interface invariant.
-    if unsafe { CStr::from_ptr(schema.format) }.to_str().is_err() {
-        return Err(Error::invalid_input_source(
-            format!("{name} format is not valid UTF-8").into(),
-        ));
-    }
-
-    // Complete Arrow Schema import preserves field order, names, nullability,
-    // field metadata, and schema metadata. Arrow may assert on malformed child
-    // pointers, so contain that deterministic validation failure.
-    match catch_unwind(AssertUnwindSafe(|| Schema::try_from(schema))) {
-        Ok(Ok(schema)) => Ok(Arc::new(schema)),
-        Ok(Err(error)) => Err(Error::invalid_input_source(
-            format!("{name} is not a valid Arrow schema: {error}").into(),
-        )),
-        Err(payload) => Err(Error::invalid_input_source(
-            format!(
-                "{name} triggered an Arrow validation panic: {}",
-                panic_payload_message(&*payload)
-            )
-            .into(),
-        )),
-    }
 }
 
 struct FfiBatchUdfMapper {
@@ -608,73 +538,6 @@ unsafe fn import_output_batch(
             .into(),
         )),
     }
-}
-
-unsafe fn callback_error(error: &mut LanceCallbackError, status: i32, context: &str) -> Error {
-    let code = error.code;
-    let message = unsafe { take_owned_string(&mut error.message) }.into_display_string(&format!(
-        "{context} callback returned error status {status} without a message"
-    ));
-
-    match code {
-        1 => Error::invalid_input(message),
-        2 => Error::io(message),
-        3 => Error::not_found(message),
-        6 => Error::internal(message),
-        7 => Error::not_supported(message),
-        other => Error::internal(format!(
-            "{context} callback returned unsupported error code {other} (status {status}): {message}"
-        )),
-    }
-}
-
-struct CallbackString {
-    text: Option<String>,
-    invalid_utf8: bool,
-}
-
-impl CallbackString {
-    fn into_display_string(self, fallback: &str) -> String {
-        if self.invalid_utf8 {
-            return format!("{fallback}: callback message is not valid UTF-8");
-        }
-        self.text.unwrap_or_else(|| fallback.to_owned())
-    }
-
-    fn into_string(self, fallback: &str) -> Result<String> {
-        if self.invalid_utf8 {
-            return Err(Error::invalid_input(format!(
-                "{fallback}: message is not valid UTF-8"
-            )));
-        }
-        Ok(self.text.unwrap_or_else(|| fallback.to_owned()))
-    }
-}
-
-unsafe fn take_owned_string(value: &mut LanceOwnedString) -> CallbackString {
-    let mut text = None;
-    let mut invalid_utf8 = false;
-    if !value.data.is_null() {
-        // SAFETY: a callback-provided string must be NUL-terminated while its
-        // release callback is still live.
-        match unsafe { CStr::from_ptr(value.data) }.to_str() {
-            Ok(value) => text = Some(value.to_owned()),
-            Err(_) => invalid_utf8 = true,
-        }
-    }
-    unsafe { release_owned_string_slot(value) };
-    CallbackString { text, invalid_utf8 }
-}
-
-unsafe fn release_message_only(error: &mut LanceCallbackError) {
-    unsafe { release_owned_string_slot(&mut error.message) };
-}
-
-unsafe fn release_owned_string_slot(value: &mut LanceOwnedString) {
-    if let Some(release) = value.release.take() {
-        unsafe { release(value) };
-    }
-    value.data = ptr::null_mut();
 }
 
 unsafe fn release_array_slot(array: &mut FFI_ArrowArray) {
