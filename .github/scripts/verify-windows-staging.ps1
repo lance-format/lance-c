@@ -12,7 +12,8 @@ param(
     [Parameter(Mandatory = $true)][string]$SourceRoot,
     [Parameter(Mandatory = $true)][string]$WorkDir,
     [ValidateSet('x64', 'ARM64')][string]$Architecture = 'x64',
-    [string]$CMakeGenerator = 'Visual Studio 17 2022'
+    [string]$CMakeGenerator = 'Visual Studio 17 2022',
+    [string]$CMakeToolset = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -191,6 +192,9 @@ function Test-InstalledConsumer {
         "-DLanceC_LINK=$Linkage",
         '-DCMAKE_BUILD_TYPE=Release'
     )
+    if (-not [string]::IsNullOrWhiteSpace($CMakeToolset)) {
+        $configureArguments += @('-T', $CMakeToolset)
+    }
     & cmake @configureArguments
     if ($LASTEXITCODE -ne 0) {
         throw "cmake configure failed for $Linkage consumer with exit code $LASTEXITCODE"

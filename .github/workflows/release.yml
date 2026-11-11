@@ -184,10 +184,12 @@ jobs:
             runner: windows-2022
             generator: Visual Studio 17 2022
             architecture: x64
+            toolset: ""
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             generator: Visual Studio 18 2026
             architecture: ARM64
+            toolset: ClangCL
     env:
       RUST_BACKTRACE: "1"
     steps:
@@ -226,6 +228,7 @@ jobs:
         run: >
           cmake -S . -B build -G "${{ matrix.generator }}"
           -A ${{ matrix.architecture }}
+          ${{ matrix.toolset != '' && format('-T {0}', matrix.toolset) || '' }}
           -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release --parallel 4
@@ -238,6 +241,7 @@ jobs:
           -WorkDir "$env:RUNNER_TEMP\lance-c-windows-${{ matrix.architecture }}-acceptance"
           -Architecture ${{ matrix.architecture }}
           -CMakeGenerator "${{ matrix.generator }}"
+          -CMakeToolset "${{ matrix.toolset }}"
       - name: Resolve version
         id: ver
         shell: pwsh

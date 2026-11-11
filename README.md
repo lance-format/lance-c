@@ -639,11 +639,14 @@ cmake --install build --prefix C:\path\to\prefix --config Release
 For a native ARM64 build, select the Visual Studio 2026 ARM64 platform:
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 `
+cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL `
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 cmake --install build --prefix C:\path\to\prefix --config Release
 ```
+
+AWS-LC requires clang-cl for its Windows ARM64 assembly sources, so this path
+uses the Visual Studio ClangCL toolset.
 
 The install prefix contains `lib/lance_c.dll`, its import library
 `lib/lance_c.dll.lib`, the static library `lib/lance_c.lib`, and the public
@@ -657,10 +660,11 @@ Windows CI builds this layout with Rust 1.94.0. The x64 job uses
 runner, PowerShell process, and Rust host are native ARM64. Each job verifies
 the PE32+ machine, public `lance_*` exports, and resolved runtime DLL
 dependencies, then runs static and shared C++17 consumers with `PATH`
-restricted to the Windows system directories. The ARM64 job also verifies the
-PE machine of both installed acceptance executables before running them. The
-hosted Windows 11 ARM64 baseline does not establish Windows 10 ARM64 or
-Windows Server ARM64 support.
+restricted to the Windows system directories. The ARM64 job builds both the
+package and installed consumers with the ClangCL toolset and verifies the PE
+machine of both acceptance executables before running them. The hosted Windows
+11 ARM64 baseline does not establish Windows 10 ARM64 or Windows Server ARM64
+support.
 
 See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
 for a reproducible native-14 C segment to Java-12 commit/query PoC.

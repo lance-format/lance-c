@@ -233,9 +233,9 @@ jobs:
         run: pwsh -File .github/scripts/test-windows-runtime-dependencies.ps1
       - name: Configure
         run: >
-          cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64
+          cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL
           -DCMAKE_BUILD_TYPE=Release
-      - name: Assert ARM64 CMake configuration
+      - name: Assert ARM64 ClangCL configuration
         shell: pwsh
         run: |
           $cache = Get-Content -LiteralPath build\CMakeCache.txt
@@ -244,6 +244,12 @@ jobs:
           }
           if ($cache -notcontains 'CMAKE_GENERATOR_PLATFORM:INTERNAL=ARM64') {
             throw 'CMake did not select the ARM64 platform'
+          }
+          if (-not ($cache -match '^CMAKE_GENERATOR_TOOLSET(?::[^=]+)?=ClangCL$')) {
+            throw 'CMake did not select the ClangCL toolset'
+          }
+          if (-not ($cache -match '^CMAKE_C_COMPILER(?::[^=]+)?=.*clang-cl\.exe$')) {
+            throw 'CMake did not select clang-cl as the C compiler'
           }
       - name: Build
         run: cmake --build build --config Release --parallel 4
@@ -255,6 +261,7 @@ jobs:
           -Prefix stage -SourceRoot .
           -WorkDir "$env:RUNNER_TEMP\lance-c-windows-arm64-acceptance"
           -Architecture ARM64 -CMakeGenerator "Visual Studio 18 2026"
+          -CMakeToolset ClangCL
       - name: Upload staged package
         uses: actions/upload-artifact@v4
         with:
