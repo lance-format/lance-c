@@ -467,8 +467,7 @@ static LanceDataset *commit_overlay(const char *uri, uint64_t read_version,
     return committed;
 }
 
-static void check_history(const LanceDataset *dataset, uint64_t version,
-                          uint64_t expected_committed_version) {
+static void check_history(const LanceDataset *dataset, uint64_t version) {
     LanceTransaction *transaction = NULL;
     ASSERT(lance_dataset_read_transaction_by_version(dataset, version,
                                                      &transaction) == 0,
@@ -508,8 +507,8 @@ static void check_history(const LanceDataset *dataset, uint64_t version,
         ASSERT(lance_data_overlay_file_committed_version(overlay,
                                                          &committed_version) == 0,
                "history committed version");
-        ASSERT(committed_version == expected_committed_version,
-               "history committed version stamped");
+        ASSERT(committed_version == 0,
+               "history preserves submitted placeholder version");
         lance_data_overlay_file_close(overlay);
         lance_data_overlay_group_close(group);
     }
@@ -695,7 +694,7 @@ int main(int argc, char **argv) {
     assert_row(committed, 19, 0, 190, 2001, before[19].rowid);
     assert_row(committed, 20, 0, 200, 2000, before[20].rowid);
 
-    check_history(committed, base_version + 1, base_version + 1);
+    check_history(committed, base_version + 1);
 
     uint64_t committed_fragment_ids[2] = {0, 0};
     ASSERT(lance_dataset_fragment_ids(committed, committed_fragment_ids) == 0,
@@ -726,8 +725,8 @@ int main(int argc, char **argv) {
     assert_row(committed2, 1, 0, 9999, 211, before[1].rowid);
     assert_row(committed2, 2, 0, 20, 200, before[2].rowid);
     assert_row(committed2, 3, 1, 0, 212, before[3].rowid);
-    check_history(committed2, base_version + 2, base_version + 2);
-    check_history(committed2, base_version + 1, base_version + 1);
+    check_history(committed2, base_version + 2);
+    check_history(committed2, base_version + 1);
     lance_schema_close(a_schema0);
     lance_fragment_close(committed_fragment0);
 

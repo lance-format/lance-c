@@ -266,8 +266,7 @@ lance::DataOverlayGroup rebuild_group(const lance::DataOverlayGroup& source,
     return lance::DataOverlayGroup(source.fragment_id(), {&rebuilt});
 }
 
-void check_history(const lance::Dataset& dataset, uint64_t version,
-                   uint64_t expected_committed_version) {
+void check_history(const lance::Dataset& dataset, uint64_t version) {
     auto transaction = dataset.read_transaction_by_version(version);
     CHECK(transaction.has_value());
     auto operation = transaction->operation();
@@ -277,7 +276,7 @@ void check_history(const lance::Dataset& dataset, uint64_t version,
         auto group = operation.data_overlay_group_at(i);
         CHECK(group.overlay_count() == 1);
         auto file = group.overlay_at(0);
-        CHECK(file.committed_version() == expected_committed_version);
+        CHECK(file.committed_version() == 0);
     }
 }
 
@@ -402,7 +401,7 @@ int main(int argc, char** argv) {
         assert_row(committed, 19, false, 190, 2001, before[19].rowid);
         assert_row(committed, 20, false, 200, 2000, before[20].rowid);
 
-        check_history(committed, 3, 3);
+        check_history(committed, 3);
 
         auto committed_fragment0 =
             committed.open_fragment(committed.fragment_ids()[0]);
@@ -426,8 +425,8 @@ int main(int argc, char** argv) {
         assert_row(committed2, 1, false, 9999, 211, before[1].rowid);
         assert_row(committed2, 2, false, 20, 200, before[2].rowid);
         assert_row(committed2, 3, true, 0, 212, before[3].rowid);
-        check_history(committed2, 4, 4);
-        check_history(committed2, 3, 3);
+        check_history(committed2, 4);
+        check_history(committed2, 3);
 
         auto old = lance::Dataset::open(uri, 1);
         CHECK(old.version() == 1);
