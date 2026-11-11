@@ -1123,7 +1123,6 @@ static void test_native_operation_construction(const char *src_uri,
         const char *path = lance_data_file_path(file);
         ASSERT(path != NULL, "detached data file path");
         CHECK_OK();
-        lance_free_string(path);
         lance_data_file_close(file);
         LanceDataFile *field_file = NULL;
         ASSERT(lance_fragment_data_file_for_field(fragment, 0, &field_file) == 0,

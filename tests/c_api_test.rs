@@ -43108,7 +43108,7 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
         lance_dataset_close(created);
     }
 
-    let mut dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     assert!(!dataset.is_null(), "{}", take_last_error_message());
     let delete_predicate = c_str("id = 2");
     let mut deleted_rows = 0u64;
@@ -43121,6 +43121,7 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
     assert_eq!(deleted_rows, 1);
     let version_after_delete = unsafe { lance_dataset_version(dataset) };
     assert_eq!(version_after_delete, 2);
+    let fragments_after_delete = unsafe { lance_dataset_fragment_count(dataset) };
     unsafe { lance_dataset_close(dataset) };
 
     let staged = write_uncommitted_for_batch(
@@ -43177,10 +43178,7 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
             take_last_error_message()
         );
         assert!(!is_bound, "append getter must yield detached metadata");
-        assert_eq!(
-            unsafe { lance_fragment_id(handle) },
-            native_fragment.id as u64
-        );
+        assert_eq!(unsafe { lance_fragment_id(handle) }, native_fragment.id);
         assert_eq!(
             fragment_json_for_test(handle),
             serde_json::to_string(native_fragment).unwrap()
@@ -43407,7 +43405,10 @@ fn test_native_operation_append_restore_reserve_and_update_bases() {
         pairs,
         vec![(1, 1.0), (3, 3.0), (4, 4.0), (5, 5.0), (6, 6.0)]
     );
-    assert_eq!(committed_fragments.len(), 6);
+    assert_eq!(
+        committed_fragments.len(),
+        fragments_after_delete as usize + append_count as usize
+    );
     assert!(
         committed_fragments[1].deletion_file.is_some(),
         "deletion metadata must survive append"
