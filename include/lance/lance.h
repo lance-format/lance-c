@@ -553,6 +553,24 @@ LanceDataset* lance_dataset_open_with_session(
 /** Close and free a dataset handle. Safe to call with NULL. */
 void lance_dataset_close(LanceDataset* dataset);
 
+/**
+ * Clone a dataset handle as an independent in-memory snapshot.
+ *
+ * The returned handle shares the source's native Dataset snapshot and its
+ * Arc-backed state (session, object-store registry, caches, commit handler),
+ * but has its own lock. Cloning performs no storage I/O. Mutating either
+ * handle does not change the other handle's version, schema, or rows, and
+ * does not hold the other handle's lock. Close the returned handle with
+ * `lance_dataset_close`; source and clone may be closed in either order.
+ *
+ * This duplicates an in-memory handle; it is not Lance's on-disk shallow or
+ * deep clone operation.
+ *
+ * @param dataset Source handle; must not be NULL
+ * @return New independent handle, or NULL on error
+ */
+LanceDataset* lance_dataset_clone_handle(const LanceDataset* dataset);
+
 /* ─── Dataset metadata (sync, in-memory) ─── */
 
 /**

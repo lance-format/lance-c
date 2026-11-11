@@ -3987,6 +3987,23 @@ public:
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
         const Session* session = nullptr);
 
+    /// Clone this handle as an independent in-memory snapshot.
+    ///
+    /// The returned handle shares this dataset's native snapshot and
+    /// Arc-backed session, object-store registry, caches, and commit handler,
+    /// but has its own lock. Cloning performs no storage I/O. Mutating either
+    /// handle does not change the other's version, schema, or rows, and does
+    /// not hold the other's lock. Source and clone may be destroyed in either
+    /// order.
+    ///
+    /// This duplicates an in-memory handle; it is not Lance's on-disk shallow
+    /// or deep clone operation. Throws lance::Error on failure.
+    Dataset clone_handle() const {
+        auto* ds = lance_dataset_clone_handle(handle_.get());
+        if (!ds) check_error();
+        return Dataset(ds);
+    }
+
     /// Number of rows in the dataset.
     uint64_t count_rows() const {
         uint64_t n = lance_dataset_count_rows(handle_.get());

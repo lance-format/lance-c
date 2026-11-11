@@ -4504,6 +4504,201 @@ static void test_fragment_read_operations(const std::string& uri) {
     PASS();
 }
 
+static void test_clone_handle(const std::string& uri) {
+    TEST(test_clone_handle);
+
+    assert(lance_dataset_clone_handle(nullptr) == nullptr);
+    assert(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT);
+    const char* null_message = lance_last_error_message();
+    assert(null_message != nullptr);
+    assert(std::string(null_message).find("dataset is NULL") !=
+           std::string::npos);
+    lance_free_string(null_message);
+
+    std::optional<lance::Dataset> source;
+    source.emplace(lance::Dataset::open(uri));
+    const uint64_t source_version = source->version();
+    assert(source_version == 3);
+    assert(source->count_rows() == 6);
+
+    auto clone = source->clone_handle();
+    assert(clone.version() == source_version);
+    assert(clone.count_rows() == 6);
+
+    ArrowSchema source_schema{};
+    ArrowSchema clone_schema{};
+    source->schema(&source_schema);
+    clone.schema(&clone_schema);
+    assert(source_schema.n_children == 3);
+    assert(clone_schema.n_children == 3);
+    source_schema.release(&source_schema);
+    clone_schema.release(&clone_schema);
+
+    assert(clone.delete_rows("id = 2") == 1);
+    const uint64_t clone_version = source_version + 1;
+    assert(clone.version() == clone_version);
+    assert(clone.count_rows() == 5);
+    assert(source->version() == source_version);
+    assert(source->count_rows() == 6);
+
+    std::vector<uint64_t> source_indices{0, 1, 2, 3, 4, 5};
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    source->take(source_indices.data(), source_indices.size(), &stream);
+    assert((read_fragment_take_ids(stream, false) ==
+            std::vector<int32_t>{0, 2, 3, 10, 11, 13}));
+
+    ArrowSchema source_schema_after{};
+    source->schema(&source_schema_after);
+    assert(source_schema_after.n_children == 3);
+    source_schema_after.release(&source_schema_after);
+
+    std::vector<uint64_t> clone_indices{0, 1, 2, 3, 4};
+    memset(&stream, 0, sizeof(stream));
+    clone.take(clone_indices.data(), clone_indices.size(), &stream);
+    assert((read_fragment_take_ids(stream, false) ==
+            std::vector<int32_t>{0, 3, 10, 11, 13}));
+
+    /* The source can be destroyed before the clone. */
+    source.reset();
+    assert(clone.version() == clone_version);
+    assert(clone.count_rows() == 5);
+    memset(&stream, 0, sizeof(stream));
+    clone.take(clone_indices.data(), clone_indices.size(), &stream);
+    assert((read_fragment_take_ids(stream, false) ==
+            std::vector<int32_t>{0, 3, 10, 11, 13}));
+    clone = lance::Dataset::open(uri).clone_handle();
+    assert(clone.version() == clone_version);
+
+    /* A clone can be destroyed before the source. */
+    source.emplace(lance::Dataset::open(uri));
+    assert(source->version() == clone_version);
+    assert(source->count_rows() == 5);
+    {
+        auto short_lived = source->clone_handle();
+        assert(short_lived.version() == clone_version);
+    }
+    assert(source->version() == clone_version);
+    assert(source->count_rows() == 5);
+
+    /* A cloned handle can be mutating under its write lock while the source
+     * handle is read. The mapper blocks deterministically inside the clone's
+     * exclusive section; a timeout watchdog fails the test rather than
+     * hanging if the source ever waits for the clone's lock. */
+    struct MutationGate {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool mapper_entered = false;
+        bool allow_mapper = false;
+        bool failed = false;
+        std::exception_ptr error;
+    } gate;
+
+    ArrowSchema udf_column{};
+    ArrowSchema* udf_children[1] = {&udf_column};
+    udf_column.format = "l";
+    udf_column.name = "clone_gate";
+    udf_column.flags = ARROW_FLAG_NULLABLE;
+    udf_column.release = test_noop_schema_release;
+    ArrowSchema udf_schema{};
+    udf_schema.format = "+s";
+    udf_schema.n_children = 1;
+    udf_schema.children = udf_children;
+    udf_schema.release = test_noop_schema_release;
+
+    lance::BatchUDF udf;
+    udf.output_schema = &udf_schema;
+    udf.mapper = [&gate](const ArrowArray& input, const ArrowSchema&,
+                         ArrowArray& output) {
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        gate.mapper_entered = true;
+        gate.changed.notify_all();
+        gate.changed.wait(lock, [&gate] { return gate.allow_mapper; });
+        lock.unlock();
+        auto* batch = new CppInt64Batch(input.length, 12000);
+        output = batch->top;
+    };
+
+    auto concurrent_clone = source->clone_handle();
+    const uint64_t concurrent_source_version = source->version();
+    std::thread mutation([&] {
+        try {
+            concurrent_clone.add_columns_batch_udf(udf);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(gate.mutex);
+            gate.failed = true;
+            gate.error = std::current_exception();
+            gate.changed.notify_all();
+        }
+    });
+
+    bool mapper_started = false;
+    {
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        mapper_started = gate.changed.wait_for(
+            lock, std::chrono::seconds(30), [&gate] {
+                return gate.mapper_entered || gate.failed;
+            });
+    }
+    if (!mapper_started) {
+        {
+            std::lock_guard<std::mutex> lock(gate.mutex);
+            gate.allow_mapper = true;
+        }
+        gate.changed.notify_all();
+        mutation.join();
+        if (gate.error) std::rethrow_exception(gate.error);
+        assert(mapper_started && "clone mutation never reached the mapper");
+    }
+
+    auto source_read = std::async(std::launch::async, [&source] {
+        const uint64_t rows = source->count_rows();
+        std::vector<uint64_t> indices{0, 1, 2, 3, 4};
+        ArrowArrayStream read_stream;
+        memset(&read_stream, 0, sizeof(read_stream));
+        source->take(indices.data(), indices.size(), &read_stream);
+        return std::make_pair(rows, read_fragment_take_ids(read_stream, false));
+    });
+    const bool source_read_completed =
+        source_read.wait_for(std::chrono::seconds(30)) ==
+        std::future_status::ready;
+
+    {
+        std::lock_guard<std::mutex> lock(gate.mutex);
+        gate.allow_mapper = true;
+    }
+    gate.changed.notify_all();
+    mutation.join();
+    if (gate.error) std::rethrow_exception(gate.error);
+
+    std::pair<uint64_t, std::vector<int32_t>> source_result;
+    if (source_read_completed) {
+        source_result = source_read.get();
+    } else {
+        source_read.wait();
+        (void)source_read.get();
+    }
+    assert(source_read_completed &&
+           "source reads must not wait for a cloned handle mutation");
+    assert(source_result.first == 5);
+    assert((source_result.second ==
+            std::vector<int32_t>{0, 3, 10, 11, 13}));
+
+    assert(concurrent_clone.version() == concurrent_source_version + 1);
+    assert(source->version() == concurrent_source_version);
+    assert(source->count_rows() == 5);
+    ArrowSchema source_schema_concurrent{};
+    source->schema(&source_schema_concurrent);
+    assert(source_schema_concurrent.n_children == 3);
+    source_schema_concurrent.release(&source_schema_concurrent);
+    ArrowSchema clone_schema_concurrent{};
+    concurrent_clone.schema(&clone_schema_concurrent);
+    assert(clone_schema_concurrent.n_children == 4);
+    clone_schema_concurrent.release(&clone_schema_concurrent);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 12) {
         fprintf(stderr,
@@ -4539,6 +4734,7 @@ int main(int argc, char** argv) {
     test_scanner_introspection(uri);
     test_fragment_snapshots(fragment_uri);
     test_fragment_read_operations(fragment_read_uri);
+    test_clone_handle(fragment_read_uri);
     test_scanner_row_addr_lists(uri);
     test_distance_range(uri);
     test_scanner_async_stream_ownership(uri);
