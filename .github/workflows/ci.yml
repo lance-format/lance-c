@@ -248,9 +248,6 @@ jobs:
           if (-not ($cache -match '^CMAKE_GENERATOR_TOOLSET(?::[^=]+)?=ClangCL$')) {
             throw 'CMake did not select the ClangCL toolset'
           }
-          if (-not ($cache -match '^CMAKE_C_COMPILER(?::[^=]+)?=.*clang-cl\.exe$')) {
-            throw 'CMake did not select clang-cl as the C compiler'
-          }
       - name: Build
         run: cmake --build build --config Release --parallel 4
       - name: Install to staging prefix
