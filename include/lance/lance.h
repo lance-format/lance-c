@@ -368,6 +368,7 @@ typedef struct LanceFtsTokenList LanceFtsTokenList;
 typedef struct LanceBlobFile LanceBlobFile;
 typedef struct LanceBlobDescriptorArrayBuilder LanceBlobDescriptorArrayBuilder;
 typedef struct LanceDataFile LanceDataFile;
+typedef struct LanceDataReplacementGroup LanceDataReplacementGroup;
 typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
