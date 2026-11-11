@@ -747,6 +747,7 @@ static void test_distributed_metadata_publication(LanceDataset *dataset,
     for (size_t i = 0; i < fragment_count; ++i) {
         lance_free_bytes(staged[i]);
     }
+    printf("Distributed inverted metadata publication C path passed\n");
 }
 
 int main(int argc, char **argv) {

@@ -226,6 +226,7 @@ static void test_distributed_metadata_publication(const std::string& uri,
     for (size_t i = 0; i < ids.size(); ++i) {
         assert(ids[i] == static_cast<int32_t>(i * 4));
     }
+    std::printf("Distributed inverted metadata publication C++ path passed\n");
 }
 
 int main(int argc, char** argv) {
