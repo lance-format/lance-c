@@ -6221,6 +6221,111 @@ int32_t lance_dataset_write_with_options(
     LanceDataset** out_dataset
 );
 
+/* ─── Native data files ─── */
+
+/** Owned native `DataFile` metadata snapshot. */
+typedef struct LanceDataFile LanceDataFile;
+
+/**
+ * Create native data-file metadata from an existing Lance file.
+ *
+ * Maps directly to `Dataset::create_data_file`. `path` is relative to the
+ * selected native data directory and must be non-NULL UTF-8. `base_id == NULL`
+ * maps to native `None`; a non-NULL pointer maps to native `Some`, including
+ * zero. Empty paths, missing files, malformed Lance files, schema mismatches
+ * and unregistered base IDs retain native validation and error timing.
+ *
+ * On success `*out_file` receives an independently owned snapshot that remains
+ * valid after the dataset is closed. The output is written only on success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_data_file(
+    const LanceDataset* dataset,
+    const char* path,
+    const uint32_t* base_id,
+    LanceDataFile** out_file
+);
+
+/** Close a data-file handle. NULL-safe. Close exactly once. */
+void lance_data_file_close(LanceDataFile* file);
+
+/**
+ * Clone a data-file handle into an independent snapshot.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceDataFile* lance_data_file_clone(const LanceDataFile* file);
+
+/**
+ * Return the native data-file path. The pointer is borrowed from `file` and
+ * remains valid until the handle is closed. Returns NULL on error.
+ */
+const char* lance_data_file_path(const LanceDataFile* file);
+
+/**
+ * Read the number of native field IDs. Returns 0 on error; check
+ * `lance_last_error_code()` to distinguish failure from an empty list.
+ */
+size_t lance_data_file_field_count(const LanceDataFile* file);
+
+/**
+ * Read one native field ID. Returns 0 on success, -1 on error.
+ * `out_field_id` is written only on success.
+ */
+int32_t lance_data_file_field_id_at(
+    const LanceDataFile* file,
+    size_t index,
+    int32_t* out_field_id
+);
+
+/**
+ * Read the number of native column indices. Returns 0 on error; check
+ * `lance_last_error_code()` to distinguish failure from an empty list.
+ */
+size_t lance_data_file_column_index_count(const LanceDataFile* file);
+
+/**
+ * Read one native column index, including the native `-1` marker.
+ * Returns 0 on success, -1 on error. The output is written only on success.
+ */
+int32_t lance_data_file_column_index_at(
+    const LanceDataFile* file,
+    size_t index,
+    int32_t* out_column_index
+);
+
+/**
+ * Read the native data-file format version. Both outputs are required and
+ * written only on success. Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_file_file_version(
+    const LanceDataFile* file,
+    uint32_t* out_major,
+    uint32_t* out_minor
+);
+
+/**
+ * Read the optional native data-file size. On success `*out_is_set` reports
+ * native `Some`/`None`; `out_size` is written only when present.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_file_file_size(
+    const LanceDataFile* file,
+    bool* out_is_set,
+    uint64_t* out_size
+);
+
+/**
+ * Read the optional native base ID. On success `*out_is_set` reports native
+ * `Some`/`None`; `out_base_id` is written only when present.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_file_base_id(
+    const LanceDataFile* file,
+    bool* out_is_set,
+    uint32_t* out_base_id
+);
+
 /* ─── Native transactions ─── */
 
 /**
@@ -6378,6 +6483,63 @@ void lance_transaction_close(LanceTransaction* transaction);
 
 /** Close an operation handle. NULL-safe. Close exactly once. */
 void lance_operation_close(LanceOperation* operation);
+
+/** Owned native `DataReplacementGroup` snapshot. */
+typedef struct LanceDataReplacementGroup LanceDataReplacementGroup;
+
+/** Close a data replacement group. NULL-safe. Close exactly once. */
+void lance_data_replacement_group_close(LanceDataReplacementGroup* group);
+
+/**
+ * Construct a native data replacement group.
+ *
+ * `new_file` is borrowed and its complete native metadata is cloned. The
+ * fragment ID is copied unchanged. No binding-side ordering, uniqueness or
+ * coverage policy is added. Returns NULL on error.
+ */
+LanceDataReplacementGroup* lance_data_replacement_group_new(
+    uint64_t fragment_id,
+    const LanceDataFile* new_file
+);
+
+/**
+ * Clone a data replacement group into an independent snapshot.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceDataReplacementGroup* lance_data_replacement_group_clone(
+    const LanceDataReplacementGroup* group
+);
+
+/**
+ * Read the native fragment ID. Returns 0 on error; check
+ * `lance_last_error_code()`. Fragment ID 0 is a valid native value.
+ */
+uint64_t lance_data_replacement_group_fragment_id(
+    const LanceDataReplacementGroup* group
+);
+
+/**
+ * Clone the data file owned by a data replacement group. The output is written
+ * only on success and must be closed independently.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_replacement_group_file(
+    const LanceDataReplacementGroup* group,
+    LanceDataFile** out_file
+);
+
+/**
+ * Construct an owned native DataReplacement operation.
+ *
+ * Group handles are borrowed and copied in input order. A NULL array is
+ * accepted only with a zero count. Empty replacement lists are retained
+ * because the native operation permits them. No sorting, deduplication,
+ * non-empty, field-ID or coverage policy is added. Returns NULL on error.
+ */
+LanceOperation* lance_operation_data_replacement_new(
+    const LanceDataReplacementGroup* const* replacements,
+    size_t replacement_count
+);
 
 /**
  * Read the native transaction read version.
@@ -6556,6 +6718,27 @@ int32_t lance_operation_delete_deleted_fragment_id_at(
  */
 const char* lance_operation_delete_predicate(
     const LanceOperation* operation
+);
+
+/**
+ * Read the number of data replacement groups. A non-DataReplacement operation
+ * returns LANCE_ERR_NOT_SUPPORTED. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_data_replacement_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one data replacement group. A wrong operation variant returns
+ * LANCE_ERR_NOT_SUPPORTED; an out-of-range index returns
+ * LANCE_ERR_INVALID_ARGUMENT. The output is written only on success and must
+ * be closed independently. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_data_replacement_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceDataReplacementGroup** out_group
 );
 
 /**
