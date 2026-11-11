@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -243,6 +244,115 @@ static void test_detached_conflict_and_errors(const std::string& source_uri,
     std::printf("C++ detached/conflict/errors OK\n");
 }
 
+static void test_fragment_delete(const std::string& source_uri,
+                                 const std::string& base) {
+    const std::string uri = base + "/cpp_fragment_delete";
+
+    lance::UncommittedWriteOptions write_options;
+    write_options.write.params.max_rows_per_file = 4;
+    write_options.write.params.enable_stable_row_ids = true;
+    auto create =
+        write_uncommitted(source_uri, uri, lance::WriteMode::Create, write_options);
+    auto dataset = lance::Dataset::commit(uri, create);
+    CHECK(dataset.version() == 1);
+    CHECK(dataset.count_rows() == 20);
+    CHECK(dataset.fragment_count() == 5);
+    CHECK(dataset.delete_rows("id IN (2, 6)") == 2);
+    const uint64_t version = dataset.version();
+    const auto ids = dataset.fragment_ids();
+    CHECK(ids.size() == 5);
+
+    std::optional<lance::Fragment> first =
+        dataset.open_fragment(ids[0]);
+    std::optional<lance::Fragment> second =
+        dataset.open_fragment(ids[1]);
+    auto no_delete = first->delete_if("false");
+    CHECK(no_delete.has_value());
+    CHECK(no_delete->id() == ids[0]);
+    no_delete.reset();
+
+    auto all_deleted = second->delete_if("true");
+    CHECK(!all_deleted.has_value());
+    CHECK(second->logical_rows() == 3);
+
+    auto staged = first->delete_if("id = 3");
+    CHECK(staged.has_value());
+    CHECK(staged->deleted_rows() == 2);
+    CHECK(staged->logical_rows() == 2);
+    CHECK(staged->metadata_json().find("\"deletion_file\":{") !=
+          std::string::npos);
+    {
+        auto scanner = staged->scan();
+        CHECK(scanner.count_rows() == 2);
+    }
+
+    auto operation = lance::Operation::make_delete(
+        {&*staged}, {ids[1]}, "id = 3 OR true");
+    CHECK(operation.kind() == lance::OperationKind::Delete);
+    CHECK(operation.delete_updated_fragment_count() == 1);
+    CHECK(operation.delete_updated_fragment_metadata_json(0) ==
+          staged->metadata_json());
+    CHECK(operation.delete_deleted_fragment_count() == 1);
+    CHECK(operation.delete_deleted_fragment_id(0) == ids[1]);
+    CHECK(operation.delete_predicate() == "id = 3 OR true");
+
+    lance::TransactionOptions options;
+    options.tag = "cpp-fragment-delete";
+    options.transaction_properties =
+        std::vector<std::pair<std::string, std::string>>{
+            {"owner=cpp", "用户"},
+            {"empty", ""},
+        };
+    auto transaction =
+        lance::Transaction::from_operation(version, operation, options);
+    CHECK(transaction.read_version() == version);
+    CHECK(transaction.uuid().size() == 36);
+    CHECK(transaction.tag() == std::optional<std::string>{"cpp-fragment-delete"});
+    CHECK(transaction.has_properties());
+    CHECK((transaction.properties() ==
+           std::map<std::string, std::string>{
+               {"owner=cpp", "用户"},
+               {"empty", ""},
+           }));
+
+    auto bytes = transaction.to_proto();
+    auto parsed = lance::Transaction::from_proto(bytes);
+    CHECK(parsed.operation().kind() == lance::OperationKind::Delete);
+    CHECK(parsed.operation().delete_predicate() == "id = 3 OR true");
+
+    auto omitted = lance::Transaction::from_operation(version, operation);
+    CHECK(omitted.uuid().size() == 36);
+    CHECK(!omitted.tag().has_value());
+    CHECK(!omitted.has_properties());
+
+    staged.reset();
+    first.reset();
+    second.reset();
+
+    lance::CommitOptions commit_options;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = lance::CommitTimeoutMode::Disabled;
+    auto committed = lance::Dataset::commit(uri, parsed, commit_options);
+    CHECK(committed.version() == version + 1);
+    CHECK(committed.count_rows() == 14);
+    CHECK(committed.fragment_count() == 4);
+    auto read_shaped = committed.read_transaction();
+    CHECK(read_shaped.has_value());
+    CHECK(read_shaped->read_version() == version);
+    CHECK(read_shaped->tag() ==
+          std::optional<std::string>{"cpp-fragment-delete"});
+    CHECK(read_shaped->properties().at("owner=cpp") == "用户");
+    CHECK(read_shaped->properties().at("empty").empty());
+    CHECK(read_shaped->operation().kind() == lance::OperationKind::Delete);
+
+    auto reopened = lance::Dataset::open(uri);
+    CHECK(reopened.version() == version + 1);
+    CHECK(reopened.count_rows() == 14);
+    CHECK(reopened.fragment_count() == 4);
+
+    std::printf("C++ fragment delete OK\n");
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) {
         std::fprintf(stderr,
@@ -252,6 +362,7 @@ int main(int argc, char** argv) {
     try {
         test_create_append_overwrite_and_batch(argv[1], argv[2]);
         test_detached_conflict_and_errors(argv[1], argv[2]);
+        test_fragment_delete(argv[1], argv[2]);
     } catch (const lance::Error& error) {
         std::fprintf(stderr, "lance::Error(%d): %s\n",
                      static_cast<int>(error.code), error.what());

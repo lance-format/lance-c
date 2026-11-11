@@ -7,18 +7,22 @@
 //! remain usable after the dataset or writer that produced them is closed.
 //! Dataset reads and transaction publication are implemented in `commit.rs`.
 
+use std::collections::HashMap;
 use std::ffi::{CString, c_char};
 use std::ptr;
+use std::sync::Arc;
 
 use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::Schema as ArrowSchema;
-use lance::dataset::transaction::{Operation, Transaction};
+use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::Result;
-use lance_table::format::pb;
+use lance_table::format::{Fragment, pb};
 use prost::Message;
 
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
+use crate::fragment::{LanceFragment, fragment_metadata_json};
+use crate::helpers;
 use crate::runtime::block_on;
 
 /// Owned native transaction value.
@@ -29,6 +33,27 @@ pub struct LanceTransaction {
 /// Owned native operation value cloned from a transaction.
 pub struct LanceOperation {
     pub(crate) inner: Operation,
+}
+
+/// Options for constructing one native transaction.
+///
+/// `uuid == NULL` lets Lance generate a v4 UUID. A non-NULL pointer, including
+/// an empty string, is passed through unchanged. `tag == NULL` maps to native
+/// `None`; an empty non-NULL string maps to `Some("")`.
+///
+/// `has_transaction_properties == false` maps to native `None`.
+/// `has_transaction_properties == true` maps to `Some(map)`, including an
+/// explicitly empty map when `property_count == 0`. When the count is non-zero,
+/// `property_keys` and `property_values` must both contain that many non-NULL
+/// UTF-8 strings. Duplicate keys follow native `HashMap` behavior.
+#[repr(C)]
+pub struct LanceTransactionOptions {
+    pub uuid: *const c_char,
+    pub tag: *const c_char,
+    pub has_transaction_properties: bool,
+    pub property_keys: *const *const c_char,
+    pub property_values: *const *const c_char,
+    pub property_count: usize,
 }
 
 /// Native operation variant.
@@ -96,9 +121,32 @@ fn operation_at<'a>(operation: *const LanceOperation) -> Result<&'a LanceOperati
     Ok(unsafe { &*operation })
 }
 
+fn delete_operation_parts(operation: &LanceOperation) -> Result<(&[Fragment], &[u64], &str)> {
+    match &operation.inner {
+        Operation::Delete {
+            updated_fragments,
+            deleted_fragment_ids,
+            predicate,
+        } => Ok((updated_fragments, deleted_fragment_ids, predicate)),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "Delete inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
 fn owned_c_string(value: &str, label: &str) -> Result<CString> {
     CString::new(value)
         .map_err(|_| lance_core::Error::internal(format!("{label} contains an embedded NUL byte")))
+}
+
+fn required_c_string<'a>(ptr: *const c_char, label: &str) -> Result<&'a str> {
+    unsafe { helpers::parse_c_string(ptr) }?.ok_or_else(|| {
+        lance_core::Error::invalid_input_source(format!("{label} must not be NULL").into())
+    })
 }
 
 /// Close a transaction handle. NULL-safe. A non-NULL handle must be closed
@@ -121,6 +169,167 @@ pub unsafe extern "C" fn lance_operation_close(operation: *mut LanceOperation) {
             let _ = Box::from_raw(operation);
         });
     }
+}
+
+/// Construct an owned native Delete operation.
+///
+/// Updated fragment handles are borrowed; their complete native metadata is
+/// copied before this function returns. Deleted IDs and the predicate are also
+/// copied. NULL arrays are accepted only with a zero count. The predicate must
+/// be non-NULL UTF-8; an empty predicate is passed through.
+///
+/// Native validation owns fragment existence, uniqueness, overlap and predicate
+/// semantics. This constructor does not add binding-side policies. Returns NULL
+/// on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_delete_new(
+    updated_fragments: *const *const LanceFragment,
+    updated_fragment_count: usize,
+    deleted_fragment_ids: *const u64,
+    deleted_fragment_count: usize,
+    predicate: *const c_char,
+) -> *mut LanceOperation {
+    ffi_try!(
+        unsafe {
+            operation_delete_new_inner(
+                updated_fragments,
+                updated_fragment_count,
+                deleted_fragment_ids,
+                deleted_fragment_count,
+                predicate,
+            )
+        },
+        null
+    )
+}
+
+unsafe fn operation_delete_new_inner(
+    updated_fragments: *const *const LanceFragment,
+    updated_fragment_count: usize,
+    deleted_fragment_ids: *const u64,
+    deleted_fragment_count: usize,
+    predicate: *const c_char,
+) -> Result<*mut LanceOperation> {
+    if updated_fragments.is_null() && updated_fragment_count > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "updated_fragments must not be NULL when updated_fragment_count = {updated_fragment_count}"
+            )
+            .into(),
+        ));
+    }
+    if deleted_fragment_ids.is_null() && deleted_fragment_count > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "deleted_fragment_ids must not be NULL when deleted_fragment_count = {deleted_fragment_count}"
+            )
+            .into(),
+        ));
+    }
+    let predicate = required_c_string(predicate, "predicate")?;
+
+    let updated_fragments = if updated_fragment_count == 0 {
+        Vec::new()
+    } else {
+        let fragments =
+            unsafe { std::slice::from_raw_parts(updated_fragments, updated_fragment_count) };
+        fragments
+            .iter()
+            .enumerate()
+            .map(|(index, fragment)| {
+                if fragment.is_null() {
+                    return Err(lance_core::Error::invalid_input_source(
+                        format!(
+                            "updated_fragments[{index}] must not be NULL when updated_fragment_count = {updated_fragment_count}"
+                        )
+                        .into(),
+                    ));
+                }
+                Ok(unsafe { &**fragment }.metadata().clone())
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let deleted_fragment_ids = if deleted_fragment_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(deleted_fragment_ids, deleted_fragment_count) }.to_vec()
+    };
+
+    Ok(Box::into_raw(Box::new(LanceOperation {
+        inner: Operation::Delete {
+            updated_fragments,
+            deleted_fragment_ids,
+            predicate: predicate.to_string(),
+        },
+    })))
+}
+
+/// Construct an owned native transaction from an operation.
+///
+/// The operation is cloned and remains usable. `options == NULL` selects native
+/// defaults: a generated UUID, no tag and no transaction properties. Native
+/// `TransactionBuilder` construction and later commit validation remain
+/// authoritative. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_transaction_new(
+    read_version: u64,
+    operation: *const LanceOperation,
+    options: *const LanceTransactionOptions,
+) -> *mut LanceTransaction {
+    ffi_try!(
+        unsafe { transaction_new_inner(read_version, operation, options) },
+        null
+    )
+}
+
+unsafe fn transaction_new_inner(
+    read_version: u64,
+    operation: *const LanceOperation,
+    options: *const LanceTransactionOptions,
+) -> Result<*mut LanceTransaction> {
+    let operation = operation_at(operation)?.inner.clone();
+    let mut builder = TransactionBuilder::new(read_version, operation);
+    if !options.is_null() {
+        let options = unsafe { &*options };
+        if !options.uuid.is_null() {
+            builder = builder.uuid(required_c_string(options.uuid, "uuid")?.to_string());
+        }
+        let tag = unsafe { helpers::parse_c_string(options.tag) }?.map(str::to_string);
+        builder = builder.tag(tag);
+        if options.has_transaction_properties {
+            if options.property_count > 0
+                && (options.property_keys.is_null() || options.property_values.is_null())
+            {
+                return Err(lance_core::Error::invalid_input_source(
+                    format!(
+                        "property_keys and property_values must not be NULL when property_count = {}",
+                        options.property_count
+                    )
+                    .into(),
+                ));
+            }
+            let mut properties = HashMap::with_capacity(options.property_count);
+            for index in 0..options.property_count {
+                let key = unsafe { *options.property_keys.add(index) };
+                let value = unsafe { *options.property_values.add(index) };
+                if key.is_null() || value.is_null() {
+                    return Err(lance_core::Error::invalid_input_source(
+                        format!(
+                            "transaction property {index} must have non-NULL key and value pointers"
+                        )
+                        .into(),
+                    ));
+                }
+                let key = required_c_string(key, "transaction property key")?;
+                let value = required_c_string(value, "transaction property value")?;
+                properties.insert(key.to_string(), value.to_string());
+            }
+            builder = builder.transaction_properties(Some(Arc::new(properties)));
+        }
+    }
+    Ok(Box::into_raw(Box::new(LanceTransaction {
+        inner: builder.build(),
+    })))
 }
 
 /// Read the transaction's native read version into `out_read_version`.
@@ -469,6 +678,160 @@ unsafe fn operation_fragment_count_inner(
         ptr::write(out_count, count);
     }
     Ok(0)
+}
+
+/// Read the number of updated fragments in a Delete operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_delete_updated_fragment_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_delete_updated_fragment_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_delete_updated_fragment_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let (updated, _, _) = delete_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_count, updated.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Serialize one updated Delete fragment's native metadata as JSON.
+///
+/// This uses the same native `Fragment` serialization as
+/// `lance_fragment_metadata_json`. Caller frees with `lance_free_string()`.
+/// Returns NULL on error, including a wrong operation kind or bad index.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_delete_updated_fragment_metadata_json_at(
+    operation: *const LanceOperation,
+    index: usize,
+) -> *const c_char {
+    ffi_try!(
+        unsafe { operation_delete_updated_fragment_metadata_json_at_inner(operation, index) },
+        null
+    )
+}
+
+unsafe fn operation_delete_updated_fragment_metadata_json_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+) -> Result<*const c_char> {
+    let operation = operation_at(operation)?;
+    let (updated, _, _) = delete_operation_parts(operation)?;
+    let fragment = updated.get(index).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "updated fragment index {index} is out of range for {} fragments",
+                updated.len()
+            )
+            .into(),
+        )
+    })?;
+    fragment_metadata_json(fragment)
+}
+
+/// Read the number of fully deleted fragment IDs in a Delete operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_delete_deleted_fragment_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_delete_deleted_fragment_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_delete_deleted_fragment_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let (_, deleted, _) = delete_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_count, deleted.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Read one fully deleted fragment ID from a Delete operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_delete_deleted_fragment_id_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_id: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_delete_deleted_fragment_id_at_inner(operation, index, out_id) },
+        neg
+    )
+}
+
+unsafe fn operation_delete_deleted_fragment_id_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_id: *mut u64,
+) -> Result<i32> {
+    if out_id.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_id must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let (_, deleted, _) = delete_operation_parts(operation)?;
+    let id = deleted.get(index).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "deleted fragment index {index} is out of range for {} fragments",
+                deleted.len()
+            )
+            .into(),
+        )
+    })?;
+    unsafe {
+        ptr::write(out_id, *id);
+    }
+    Ok(0)
+}
+
+/// Return a newly allocated copy of a Delete operation's predicate.
+///
+/// Caller frees with `lance_free_string()`. Returns NULL on error, including a
+/// wrong operation kind.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_delete_predicate(
+    operation: *const LanceOperation,
+) -> *const c_char {
+    ffi_try!(
+        unsafe { operation_delete_predicate_inner(operation) },
+        std::ptr::null()
+    )
+}
+
+unsafe fn operation_delete_predicate_inner(
+    operation: *const LanceOperation,
+) -> Result<*const c_char> {
+    let operation = operation_at(operation)?;
+    let (_, _, predicate) = delete_operation_parts(operation)?;
+    Ok(owned_c_string(predicate, "Delete predicate")?.into_raw())
 }
 
 /// Export an Overwrite operation's schema as Arrow C Data Interface.

@@ -695,6 +695,37 @@ auto committed = dataset.read_transaction();
 auto version_one = dataset.read_transaction_by_version(1);
 ```
 
+Fragment deletion writes native deletion files before publication. The returned
+fragment metadata is used by its scanner, so staged reads, takes and counts see
+the deletion immediately:
+
+```cpp
+auto fragment = dataset.open_fragment(dataset.fragment_ids()[0]);
+auto updated = fragment.delete_if("id = 3");  // nullopt if every row is deleted
+if (updated) {
+    auto operation = lance::Operation::make_delete(
+        {&*updated}, {}, "id = 3");
+    lance::TransactionOptions options;
+    options.tag = "fragment-delete";
+    options.transaction_properties =
+        std::vector<std::pair<std::string, std::string>>{
+            {"owner=team", "analytics"},
+            {"empty", ""},
+        };
+    auto transaction = lance::Transaction::from_operation(
+        dataset.version(), operation, options);
+    dataset = lance::Dataset::commit("data.lance", transaction);
+}
+```
+
+Deleting every row returns `std::nullopt`; put that fragment ID in
+`Operation::make_delete`'s deleted-ID list instead. An explicit
+`Scanner::fragment_ids()` replaces the staged metadata selection; a zero-length
+selection selects no fragments. The C entry points are
+`lance_fragment_delete`, `lance_operation_delete_new` and
+`lance_transaction_new`. Native commit validation and conflict handling remain
+authoritative.
+
 Append batches use native `CommitBuilder::execute_batch` and return both the
 actual merged transaction and a new dataset:
 
@@ -711,9 +742,10 @@ The C entry points are `lance_dataset_write_uncommitted_stream`,
 `LanceCommitOptions`; explicit zero retries, zero retry budget, disabled timeout
 and explicit timeout values are forwarded without reinterpretation.
 
-This first delivery exposes writer-generated Append and Overwrite operations.
-Typed Delete/Update/Merge/Restore/Clone/Rewrite/index/schema operation
-constructors and callback-based commit locks remain later issue #112 scope.
+This delivery exposes writer-generated Append and Overwrite operations plus a
+typed Delete constructor for the native fragment-delete workflow. Other typed
+Update/Merge/Restore/Clone/Rewrite/index/schema operation constructors and
+callback-based commit locks remain later issue #112 scope.
 Transaction values are independent snapshots: closing their source dataset,
 stream, or derived operation handle does not invalidate them.
 
