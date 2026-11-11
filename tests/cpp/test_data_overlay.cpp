@@ -176,10 +176,14 @@ Row find_row(const lance::Dataset& dataset, int32_t wanted) {
     lance::ArrowStream stream(raw);
 
     Row result;
+    ArrowSchema schema{};
+    if (stream->get_schema(stream.get(), &schema) != 0) {
+        CHECK(lance_last_error_code() == LANCE_OK);
+        return result;
+    }
     while (true) {
         ArrowArray array{};
-        ArrowSchema schema{};
-        if (stream->get_next(stream.get(), &array, &schema) != 0) {
+        if (stream->get_next(stream.get(), &array) != 0) {
             CHECK(lance_last_error_code() == LANCE_OK);
             break;
         }
@@ -227,9 +231,9 @@ Row find_row(const lance::Dataset& dataset, int32_t wanted) {
             break;
         }
         if (array.release) array.release(&array);
-        if (schema.release) schema.release(&schema);
         if (result.found) break;
     }
+    if (schema.release) schema.release(&schema);
     return result;
 }
 
@@ -313,8 +317,10 @@ int main(int argc, char** argv) {
 
         auto fragment0 = dataset.open_fragment(fragment_ids[0]);
         auto fragment1 = dataset.open_fragment(fragment_ids[1]);
-        auto schema0 = fragment0.native_schema().project({"a", "b"});
-        auto schema1 = fragment1.native_schema().project({"a", "b"});
+        auto schema0 = lance::LanceSchema::project(
+            fragment0.native_schema(), {"a", "b"});
+        auto schema1 = lance::LanceSchema::project(
+            fragment1.native_schema(), {"a", "b"});
 
         auto writer0 = fragment0.write_overlay(schema0);
         OverlayBatch batch0(5, true, true);
@@ -368,14 +374,17 @@ int main(int argc, char** argv) {
         auto group1 = rebuild_group(*finished1,
                                     lance::OverlayCoverageKind::PerField);
 
-        auto empty_schema = fragment1.native_schema().project({"a"});
+        auto empty_schema = lance::LanceSchema::project(
+            fragment1.native_schema(), {"a"});
         auto empty_writer = fragment1.write_overlay(empty_schema);
         auto empty_group = empty_writer.finish();
         CHECK(!empty_group.has_value());
 
-        auto operation = lance::Operation::make_data_overlay({&group0, &group1});
+        const std::vector<const lance::DataOverlayGroup*> groups = {
+            &group0, &group1};
+        auto operation = lance::Operation::make_data_overlay(groups);
         CHECK(operation.kind() == lance::OperationKind::DataOverlay);
-        CHECK(operation.data_overlay_group_count() == expected_group_count);
+        CHECK(operation.data_overlay_group_count() == groups.size());
         {
             auto inspected = operation.data_overlay_group_at(1);
             CHECK(inspected.fragment_id() == fragment_ids[1]);
@@ -414,7 +423,8 @@ int main(int argc, char** argv) {
 
         auto committed_fragment0 =
             committed.open_fragment(committed.fragment_ids()[0]);
-        auto second_schema = committed_fragment0.native_schema().project({"a"});
+        auto second_schema = lance::LanceSchema::project(
+            committed_fragment0.native_schema(), {"a"});
         auto second_writer =
             committed_fragment0.write_overlay(second_schema);
         OverlayBatch batch3(1, true, false);
@@ -425,8 +435,10 @@ int main(int argc, char** argv) {
         CHECK(finished2.has_value());
         check_group(*finished2, committed.fragment_ids()[0],
                     lance::OverlayCoverageKind::Shared, 1);
+        const std::vector<const lance::DataOverlayGroup*> second_groups = {
+            &*finished2};
         auto second_operation =
-            lance::Operation::make_data_overlay({&*finished2});
+            lance::Operation::make_data_overlay(second_groups);
         auto second_transaction =
             lance::Transaction::from_operation(3, second_operation);
         auto committed2 = lance::Dataset::commit(uri, second_transaction);
