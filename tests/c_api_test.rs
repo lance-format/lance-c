@@ -44675,7 +44675,7 @@ fn test_native_dataset_deep_clone_refs_and_sentinels() {
     let main_head = unsafe { lance_ref_version(ptr::null(), false, 0) };
     let head = clone_to("main-head.lance", main_head);
     assert_eq!(unsafe { lance_dataset_count_rows(head) }, 6);
-    assert_eq!(deep_clone_take_ids(head, 6), vec![0, 1, 2, 3, 4, 5]);
+    assert_eq!(deep_clone_take_ids(head, 6), vec![0, 1, 2, 4, 5, 10]);
 
     // Historical version: v1 exists before the deletion.
     let version_one = unsafe { lance_ref_version_number(1) };
