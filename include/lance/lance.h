@@ -10521,12 +10521,27 @@ int32_t lance_file_reader_read_global_buffer(
     uint32_t index,
     LanceByteBuffer** out_bytes
 );
+/**
+ * Stream all rows as Arrow C Data.
+ *
+ * `batch_size` and `batch_readahead` must both be greater than zero. A zero
+ * value is rejected with LANCE_ERR_INVALID_ARGUMENT and does not select a
+ * default. On error, `out` is unchanged.
+ */
 int32_t lance_file_reader_read_all(
     const LanceFileReader* reader,
     uint32_t batch_size,
     uint32_t batch_readahead,
     struct ArrowArrayStream* out
 );
+/**
+ * Stream a checked native row range.
+ *
+ * `batch_size` and `batch_readahead` must both be greater than zero. A zero
+ * value is rejected with LANCE_ERR_INVALID_ARGUMENT and does not select a
+ * default. The range is validated before the stream options. On error, `out`
+ * is unchanged.
+ */
 int32_t lance_file_reader_read_range(
     const LanceFileReader* reader,
     uint64_t offset,
@@ -10535,6 +10550,14 @@ int32_t lance_file_reader_read_range(
     uint32_t batch_readahead,
     struct ArrowArrayStream* out
 );
+/**
+ * Stream native u32 row indices in the supplied order.
+ *
+ * `indices` may be NULL only when `count` is zero. `batch_size` and
+ * `batch_readahead` must both be greater than zero. A zero value is rejected
+ * with LANCE_ERR_INVALID_ARGUMENT and does not select a default. On error,
+ * `out` is unchanged.
+ */
 int32_t lance_file_reader_read_indices(
     const LanceFileReader* reader,
     const uint32_t* indices,

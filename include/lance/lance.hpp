@@ -11958,6 +11958,8 @@ public:
         return ByteBuffer(buffer);
     }
 
+    /// `batch_size` and `batch_readahead` must be greater than zero. A zero
+    /// value throws `lance::Error` with LANCE_ERR_INVALID_ARGUMENT.
     ArrowStream read_all(
         uint32_t batch_size = 1024,
         uint32_t batch_readahead = 4) const {
@@ -11969,6 +11971,8 @@ public:
         return ArrowStream(stream);
     }
 
+    /// `batch_size` and `batch_readahead` must be greater than zero. A zero
+    /// value throws `lance::Error` with LANCE_ERR_INVALID_ARGUMENT.
     ArrowStream read_range(
         uint64_t offset,
         uint64_t num_rows,
@@ -11987,6 +11991,8 @@ public:
         return ArrowStream(stream);
     }
 
+    /// `batch_size` and `batch_readahead` must be greater than zero. A zero
+    /// value throws `lance::Error` with LANCE_ERR_INVALID_ARGUMENT.
     ArrowStream read_indices(
         const std::vector<uint32_t>& indices,
         uint32_t batch_size = 1024,

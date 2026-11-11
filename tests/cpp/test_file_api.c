@@ -208,6 +208,39 @@ static int verify_stream(
     return rows == expected_rows;
 }
 
+static ArrowArrayStream invalid_stream_sentinel(void) {
+    ArrowArrayStream stream;
+    memset(&stream, 0xA5, sizeof(stream));
+    return stream;
+}
+
+static int expect_stream_option_error(
+    int status,
+    const char *option,
+    const char *context) {
+    if (status != -1) {
+        fprintf(stderr, "FAIL %s: status=%d, expected -1\n", context, status);
+        return 0;
+    }
+    LanceErrorCode code = lance_last_error_code();
+    const char *message = lance_last_error_message();
+    int matches = code == LANCE_ERR_INVALID_ARGUMENT && message != NULL &&
+                  strstr(message, option) != NULL &&
+                  strstr(message, "greater than 0") != NULL;
+    if (!matches) {
+        fprintf(stderr, "FAIL %s: code=%d message=%s\n", context, (int)code,
+                message ? message : "no error");
+    }
+    if (message) lance_free_string(message);
+    return matches;
+}
+
+static int stream_output_unchanged(
+    const ArrowArrayStream *before,
+    const ArrowArrayStream *after) {
+    return memcmp(before, after, sizeof(*before)) == 0;
+}
+
 static int provider_fetch(
     void *provider_ctx,
     LanceStorageOptionsFetchResult *out,
@@ -330,6 +363,90 @@ int main(int argc, char **argv) {
           "read range");
     CHECK(verify_stream(&range_stream, 1, 2), "range rows");
     if (range_stream.release) range_stream.release(&range_stream);
+
+    const uint32_t selected_indices[] = {1u, 2u};
+    const int32_t option_cases[][2] = {{0, 2}, {2, 0}, {0, 0}};
+    const char *option_names[] = {"batch_size", "batch_readahead", "batch_size"};
+    for (size_t i = 0; i < sizeof(option_cases) / sizeof(option_cases[0]); i++) {
+        ArrowArrayStream out = invalid_stream_sentinel();
+        ArrowArrayStream before = out;
+        int status = lance_file_reader_read_all(
+            reader, (uint32_t)option_cases[i][0], (uint32_t)option_cases[i][1],
+            &out);
+        CHECK(status == -1, "read_all rejects zero stream option");
+        CHECK(expect_stream_option_error(status, option_names[i], "read_all"),
+              "read_all option error");
+        CHECK(stream_output_unchanged(&before, &out),
+              "read_all modified out on error");
+
+        out = invalid_stream_sentinel();
+        before = out;
+        status = lance_file_reader_read_range(
+            reader, 1, 1, (uint32_t)option_cases[i][0],
+            (uint32_t)option_cases[i][1], &out);
+        CHECK(status == -1, "read_range rejects zero stream option");
+        CHECK(expect_stream_option_error(status, option_names[i], "read_range"),
+              "read_range option error");
+        CHECK(stream_output_unchanged(&before, &out),
+              "read_range modified out on error");
+
+        out = invalid_stream_sentinel();
+        before = out;
+        status = lance_file_reader_read_indices(
+            reader, selected_indices,
+            sizeof(selected_indices) / sizeof(selected_indices[0]),
+            (uint32_t)option_cases[i][0], (uint32_t)option_cases[i][1], &out);
+        CHECK(status == -1, "read_indices rejects zero stream option");
+        CHECK(expect_stream_option_error(status, option_names[i], "read_indices"),
+              "read_indices option error");
+        CHECK(stream_output_unchanged(&before, &out),
+              "read_indices modified out on error");
+    }
+
+    ArrowArrayStream indices_stream = {0};
+    CHECK(lance_file_reader_read_indices(
+              reader, selected_indices,
+              sizeof(selected_indices) / sizeof(selected_indices[0]), 2, 1,
+              &indices_stream) == 0,
+          "read indices");
+    CHECK(verify_stream(&indices_stream, 2, 2), "index rows");
+    if (indices_stream.release) indices_stream.release(&indices_stream);
+
+    ArrowArrayStream empty_range = {0};
+    CHECK(lance_file_reader_read_range(reader, 0, 0, 2, 1, &empty_range) == 0,
+          "empty range read");
+    CHECK(verify_stream(&empty_range, 0, 1), "empty range stream");
+    if (empty_range.release) empty_range.release(&empty_range);
+
+    ArrowArrayStream empty_indices = {0};
+    CHECK(lance_file_reader_read_indices(reader, NULL, 0, 2, 1,
+                                         &empty_indices) == 0,
+          "empty indices read");
+    CHECK(verify_stream(&empty_indices, 0, 1), "empty indices stream");
+    if (empty_indices.release) empty_indices.release(&empty_indices);
+
+    ArrowArrayStream empty_range_zero = invalid_stream_sentinel();
+    ArrowArrayStream empty_range_zero_before = empty_range_zero;
+    int empty_status = lance_file_reader_read_range(
+        reader, 0, 0, 1, 0, &empty_range_zero);
+    CHECK(empty_status == -1, "empty read_range rejects zero readahead");
+    CHECK(expect_stream_option_error(empty_status, "batch_readahead",
+                                     "empty read_range"),
+          "empty read_range option error");
+    CHECK(stream_output_unchanged(&empty_range_zero_before, &empty_range_zero),
+          "empty read_range modified out on error");
+
+    ArrowArrayStream empty_indices_zero = invalid_stream_sentinel();
+    ArrowArrayStream empty_indices_zero_before = empty_indices_zero;
+    empty_status = lance_file_reader_read_indices(
+        reader, NULL, 0, 0, 1, &empty_indices_zero);
+    CHECK(empty_status == -1, "empty read_indices rejects zero batch_size");
+    CHECK(expect_stream_option_error(empty_status, "batch_size",
+                                     "empty read_indices"),
+          "empty read_indices option error");
+    CHECK(stream_output_unchanged(&empty_indices_zero_before,
+                                  &empty_indices_zero),
+          "empty read_indices modified out on error");
 
     lance_file_metadata_close(metadata);
     lance_file_reader_close(reader);
