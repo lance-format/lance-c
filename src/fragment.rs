@@ -132,6 +132,98 @@ pub unsafe extern "C" fn lance_fragment_close(fragment: *mut LanceFragment) {
     }
 }
 
+/// Construct detached native fragment metadata.
+///
+/// This starts from native `Fragment::new(fragment_id)`, clones the borrowed
+/// data files in input order, and optionally sets `physical_rows`. Native
+/// defaults are retained for deletion files, overlays, row IDs and row
+/// version metadata. This constructor does not infer schema coverage or the
+/// physical row count and adds no binding-specific consistency checks.
+///
+/// `data_files` may be NULL only when `data_file_count` is zero. Every element
+/// of a non-NULL array must be non-NULL. `physical_rows` is optional; a
+/// non-NULL value must fit the platform `usize`. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_fragment_new(
+    fragment_id: u64,
+    data_files: *const *const LanceDataFile,
+    data_file_count: usize,
+    physical_rows: *const u64,
+) -> *mut LanceFragment {
+    ffi_try!(
+        unsafe { fragment_new_inner(fragment_id, data_files, data_file_count, physical_rows) },
+        null
+    )
+}
+
+unsafe fn fragment_new_inner(
+    fragment_id: u64,
+    data_files: *const *const LanceDataFile,
+    data_file_count: usize,
+    physical_rows: *const u64,
+) -> Result<*mut LanceFragment> {
+    let files = if data_files.is_null() {
+        if data_file_count != 0 {
+            return Err(Error::invalid_input_source(
+                format!("data_files must not be NULL when data_file_count = {data_file_count}")
+                    .into(),
+            ));
+        }
+        Vec::new()
+    } else {
+        if data_file_count > isize::MAX as usize / std::mem::size_of::<*const LanceDataFile>() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "data_file_count {data_file_count} exceeds the maximum addressable pointer slice length"
+                )
+                .into(),
+            ));
+        }
+        if data_file_count
+            > isize::MAX as usize / std::mem::size_of::<lance_table::format::DataFile>()
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "data_file_count {data_file_count} exceeds the maximum cloneable data-file count"
+                )
+                .into(),
+            ));
+        }
+        let data_files = unsafe { std::slice::from_raw_parts(data_files, data_file_count) };
+        let mut files = Vec::with_capacity(data_file_count);
+        for (index, data_file) in data_files.iter().enumerate() {
+            if data_file.is_null() {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "data_files[{index}] must not be NULL when data_file_count = {data_file_count}"
+                    )
+                    .into(),
+                ));
+            }
+            files.push(unsafe { &**data_file }.native().clone());
+        }
+        files
+    };
+
+    let physical_rows = if physical_rows.is_null() {
+        None
+    } else {
+        let value = unsafe { ptr::read_unaligned(physical_rows) };
+        Some(usize::try_from(value).map_err(|_| {
+            Error::invalid_input(format!(
+                "physical_rows {value} exceeds the platform usize range"
+            ))
+        })?)
+    };
+
+    let mut fragment = Fragment::new(fragment_id);
+    fragment.files = files;
+    fragment.physical_rows = physical_rows;
+    Ok(Box::into_raw(Box::new(LanceFragment::from_metadata(
+        fragment,
+    ))))
+}
+
 /// Return the fragment ID. Returns 0 and sets an error for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_fragment_id(fragment: *const LanceFragment) -> u64 {

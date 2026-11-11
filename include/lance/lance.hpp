@@ -3767,12 +3767,13 @@ public:
     }
 };
 
-// ─── Read-only fragment snapshot ─────────────────────────────────────────────
+// ─── Fragment handles ────────────────────────────────────────────────────────
 
-/// RAII handle over one fragment from a dataset snapshot. Native
-/// `FileFragment` owns an `Arc<Dataset>`, so this handle remains valid and
-/// keeps reading the same dataset version after the source Dataset is closed
-/// or mutated. Methods expose only read-only metadata and row counts.
+/// RAII handle over a dataset-bound or independently constructed fragment.
+/// Native `FileFragment` owns an `Arc<Dataset>`, so bound handles remain valid
+/// and keep reading the same dataset version after the source Dataset is closed
+/// or mutated. Detached handles own copied native metadata and support
+/// operation construction without dataset access.
 class Fragment {
     Handle<LanceFragment, lance_fragment_close> handle_;
 
@@ -3784,6 +3785,18 @@ public:
     Fragment& operator=(Fragment&&) noexcept = default;
     Fragment(const Fragment&) = delete;
     Fragment& operator=(const Fragment&) = delete;
+
+    /// Construct detached native Fragment metadata from borrowed data files.
+    ///
+    /// The data files are cloned in input order. `physical_rows ==
+    /// std::nullopt` maps to native `None`; all other metadata retains native
+    /// `Fragment::new` defaults. A fragment ID of zero requests native
+    /// commit-time allocation. Schema coverage and `physical_rows` are caller
+    /// metadata; this constructor does not infer or revalidate them.
+    static Fragment from_data_files(
+        uint64_t fragment_id,
+        const std::vector<const DataFile*>& data_files,
+        std::optional<uint64_t> physical_rows = std::nullopt);
 
     /// Native fragment ID.
     uint64_t id() const {
@@ -3916,6 +3929,25 @@ public:
 
     const LanceFragment* c_handle() const { return handle_.get(); }
 };
+
+inline Fragment Fragment::from_data_files(
+    uint64_t fragment_id,
+    const std::vector<const DataFile*>& data_files,
+    std::optional<uint64_t> physical_rows) {
+    std::vector<const LanceDataFile*> handles;
+    handles.reserve(data_files.size());
+    for (const auto* file : data_files) {
+        handles.push_back(file ? file->c_handle() : nullptr);
+    }
+    uint64_t rows = physical_rows.value_or(0);
+    auto* fragment = lance_fragment_new(
+        fragment_id,
+        handles.empty() ? nullptr : handles.data(),
+        handles.size(),
+        physical_rows ? &rows : nullptr);
+    if (!fragment) check_error();
+    return Fragment(fragment);
+}
 
 inline std::optional<Fragment> Fragment::delete_if(
     const std::string& predicate) const {
