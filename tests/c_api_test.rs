@@ -31677,6 +31677,13 @@ fn expected_blob(row: usize) -> Option<Vec<u8>> {
     BLOB_ROW_SIZES[row % BLOB_ROW_SIZES.len()].map(|len| blob_payload(len, seed))
 }
 
+/// Physical row address of a logical row in the two-fragment blob fixture.
+fn blob_row_address(row: usize) -> u64 {
+    let fragment = row / BLOB_ROW_SIZES.len();
+    let offset = row % BLOB_ROW_SIZES.len();
+    ((fragment as u64) << 32) | offset as u64
+}
+
 /// Row ids of every row in `id` order, read through the scanner.
 fn scan_blob_row_ids(dataset: *const LanceDataset) -> Vec<u64> {
     let id_column = c_str("id");
@@ -31865,6 +31872,366 @@ fn assert_blob_take_by_indices_matches_row_ids(enable_stable_row_ids: bool) {
 
     close_blob_handles(&by_row_id);
     close_blob_handles(&by_index);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_take_by_addresses_matches_native_and_expected_payloads() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let rows = [7, 2, 3, 4, 2, 9, 0];
+    let addresses = rows.map(blob_row_address);
+
+    // Read through the native Rust entry point as a separate oracle.
+    let native = lance_c::runtime::block_on(async {
+        let dataset = Arc::new(Dataset::open(&uri).await.unwrap());
+        let blobs = dataset
+            .take_blobs_by_addresses(&addresses, "blob")
+            .await
+            .unwrap();
+        let mut results = Vec::with_capacity(blobs.len());
+        for blob in blobs {
+            results.push(match blob {
+                Some(blob) => Some((blob.size(), blob.read().await.unwrap().to_vec())),
+                None => None,
+            });
+        }
+        results
+    });
+
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let column = c_str("blob");
+    let mut handles = vec![ptr::null_mut::<LanceBlobFile>(); rows.len()];
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ds,
+                addresses.as_ptr(),
+                addresses.len(),
+                column.as_ptr(),
+                handles.as_mut_ptr(),
+            )
+        },
+        0,
+        "take_blobs_by_addresses failed: {}",
+        take_last_error_message()
+    );
+
+    // The result must own its readers before the dataset is released.
+    unsafe { lance_dataset_close(ds) };
+
+    for (slot, row) in rows.into_iter().enumerate() {
+        let expected = expected_blob(row);
+        let native = native[slot]
+            .as_ref()
+            .map(|(size, bytes)| (*size, bytes.as_slice()));
+        match expected {
+            None => {
+                assert!(
+                    handles[slot].is_null(),
+                    "row {row}: a null blob must yield a NULL slot"
+                );
+                assert!(native.is_none(), "row {row}: native oracle disagrees");
+            }
+            Some(expected) => {
+                let handle = handles[slot];
+                assert!(!handle.is_null(), "row {row}: expected a handle");
+                assert_eq!(
+                    unsafe { lance_blob_file_size(handle) },
+                    expected.len() as u64,
+                    "row {row}: size"
+                );
+                assert_eq!(
+                    native,
+                    Some((expected.len() as u64, expected.as_slice())),
+                    "row {row}: direct native result"
+                );
+
+                if slot == 4 {
+                    let mut duplicate_cursor = u64::MAX;
+                    assert_eq!(
+                        unsafe { lance_blob_file_tell(handles[4], &mut duplicate_cursor) },
+                        0
+                    );
+                    assert_eq!(
+                        duplicate_cursor, 0,
+                        "duplicate addresses must not share a cursor"
+                    );
+                }
+                assert_eq!(read_blob_to_end(handle), expected, "row {row}: bytes");
+            }
+        }
+    }
+
+    close_blob_handles(&handles);
+}
+
+#[test]
+fn test_blob_take_by_addresses_differs_from_stable_row_ids() {
+    let (_tmp, uri) = create_blob_v2_dataset(true);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let row_ids = scan_blob_row_ids(ds);
+    let addresses = (0..2 * BLOB_ROW_SIZES.len())
+        .map(blob_row_address)
+        .collect::<Vec<_>>();
+    assert_eq!(row_ids.len(), addresses.len());
+    for (row, (row_id, address)) in row_ids.iter().zip(&addresses).enumerate() {
+        assert_ne!(
+            row_id, address,
+            "row {row}: stable row ID {row_id} must not be treated as physical address {address}"
+        );
+    }
+
+    let column = c_str("blob");
+    let mut by_id = vec![ptr::null_mut::<LanceBlobFile>(); row_ids.len()];
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                column.as_ptr(),
+                by_id.as_mut_ptr(),
+            )
+        },
+        0,
+        "stable-row-ID take failed: {}",
+        take_last_error_message()
+    );
+    let mut by_address = vec![ptr::null_mut::<LanceBlobFile>(); addresses.len()];
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ds,
+                addresses.as_ptr(),
+                addresses.len(),
+                column.as_ptr(),
+                by_address.as_mut_ptr(),
+            )
+        },
+        0,
+        "row-address take failed: {}",
+        take_last_error_message()
+    );
+
+    for (row, expected) in (0..2 * BLOB_ROW_SIZES.len())
+        .map(|row| (row, expected_blob(row)))
+        .collect::<Vec<_>>()
+    {
+        match expected {
+            None => {
+                assert!(by_id[row].is_null(), "stable row id row {row}");
+                assert!(by_address[row].is_null(), "row address {row}");
+            }
+            Some(expected) => {
+                assert!(!by_id[row].is_null(), "stable row id row {row}");
+                assert!(!by_address[row].is_null(), "row address {row}");
+                assert_eq!(
+                    read_blob_to_end(by_id[row]),
+                    expected,
+                    "stable row id row {row}: bytes"
+                );
+                assert_eq!(
+                    read_blob_to_end(by_address[row]),
+                    expected,
+                    "row address {row}: bytes"
+                );
+            }
+        }
+    }
+
+    close_blob_handles(&by_id);
+    close_blob_handles(&by_address);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_take_by_addresses_rejects_invalid_without_writing_out() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let column = c_str("blob");
+    let sentinel = ptr::without_provenance_mut::<LanceBlobFile>(0xDEAD_BEEF);
+    let mut out = [sentinel; 2];
+    let assert_out_untouched = |out: &[*mut LanceBlobFile], case: &str| {
+        for (slot, handle) in out.iter().enumerate() {
+            assert_eq!(*handle, sentinel, "{case}: slot {slot} was written");
+        }
+    };
+
+    // Empty selections still validate the column through native. The old
+    // entry points retain their early-empty behavior.
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ds,
+                ptr::null(),
+                0,
+                column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        0,
+        "empty by-address take failed: {}",
+        take_last_error_message()
+    );
+    assert_out_untouched(&out, "empty valid column");
+
+    let missing = c_str("does_not_exist");
+    assert_eq!(
+        unsafe { lance_dataset_take_blobs(ds, ptr::null(), 0, missing.as_ptr(), out.as_mut_ptr()) },
+        0,
+        "legacy take must preserve its early-empty behavior"
+    );
+    assert_out_untouched(&out, "legacy empty unknown column");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ds,
+                ptr::null(),
+                0,
+                missing.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::NotFound,
+        "the new entry point must keep native unknown-column classification"
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("does_not_exist"), "{message}");
+    assert_out_untouched(&out, "new empty unknown column");
+
+    let not_a_blob = c_str("raw");
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ds,
+                ptr::null(),
+                0,
+                not_a_blob.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("not a blob column"), "{message}");
+    assert_out_untouched(&out, "new empty non-blob column");
+
+    // A valid address followed by a nonexistent fragment rejects the complete
+    // request without filling even the valid slot.
+    let addresses = [blob_row_address(0), u64::MAX - 1];
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ds,
+                addresses.as_ptr(),
+                addresses.len(),
+                column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains(&(u64::MAX - 1).to_string()), "{message}");
+    assert_out_untouched(&out, "partially invalid addresses");
+
+    let valid = [blob_row_address(0)];
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ds,
+                ptr::null(),
+                1,
+                column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("row_addresses must not be NULL when num_row_addresses = 1"),
+        "{message}"
+    );
+    assert_out_untouched(&out, "NULL row_addresses");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ptr::null(),
+                valid.as_ptr(),
+                valid.len(),
+                column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dataset must not be NULL"), "{message}");
+    assert_out_untouched(&out, "NULL dataset");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ds,
+                valid.as_ptr(),
+                valid.len(),
+                ptr::null(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("column must not be NULL"), "{message}");
+    assert_out_untouched(&out, "NULL column");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ds,
+                valid.as_ptr(),
+                valid.len(),
+                column.as_ptr(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("out must not be NULL"), "{message}");
+
+    let invalid_utf8 = CString::new(vec![b'b', b'l', 0xFF, b'o', b'b']).unwrap();
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_addresses(
+                ds,
+                valid.as_ptr(),
+                valid.len(),
+                invalid_utf8.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_out_untouched(&out, "invalid UTF-8 column");
+
     unsafe { lance_dataset_close(ds) };
 }
 
@@ -32079,6 +32446,434 @@ fn test_blob_cursor_advances_only_on_sequential_reads() {
     assert_eq!(window, payload[40..56]);
     assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
     assert_eq!(cursor, 5, "read_range must not move the cursor");
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_file_read_ranges_orders_overlaps_and_preserves_cursor() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let payload = expected_blob(PACKED_BLOB_ROW).unwrap();
+    let ranges = [
+        LanceBlobRange {
+            offset: 100,
+            length: 20,
+        },
+        LanceBlobRange {
+            offset: 128,
+            length: 0,
+        },
+        LanceBlobRange {
+            offset: 40,
+            length: 16,
+        },
+        LanceBlobRange {
+            offset: 100,
+            length: 8,
+        },
+        LanceBlobRange {
+            offset: 127,
+            length: 1,
+        },
+        LanceBlobRange {
+            offset: 0,
+            length: 128,
+        },
+    ];
+    let capacities = [25usize, 0, 20, 8, 2, 130];
+    let mut buffers = capacities
+        .iter()
+        .map(|capacity| vec![0xEEu8; *capacity])
+        .collect::<Vec<_>>();
+    let destinations = buffers
+        .iter_mut()
+        .map(|buffer| {
+            if buffer.is_empty() {
+                ptr::null_mut()
+            } else {
+                buffer.as_mut_ptr()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(unsafe { lance_blob_file_seek(blob, 5) }, 0);
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_ranges(
+                blob,
+                ranges.as_ptr(),
+                ranges.len(),
+                destinations.as_ptr(),
+                capacities.as_ptr(),
+            )
+        },
+        0,
+        "read_ranges failed: {}",
+        take_last_error_message()
+    );
+
+    for (index, (range, buffer)) in ranges.iter().zip(&buffers).enumerate() {
+        let length = range.length as usize;
+        assert_eq!(
+            &buffer[..length],
+            &payload[range.offset as usize..range.offset as usize + length],
+            "range {index}: bytes"
+        );
+        assert!(
+            buffer[length..].iter().all(|byte| *byte == 0xEE),
+            "range {index}: bytes beyond the requested length were modified"
+        );
+    }
+
+    let mut cursor = u64::MAX;
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 5, "read_ranges must not move the cursor");
+
+    // An empty request with NULL arrays is valid on an open handle.
+    assert_eq!(
+        unsafe { lance_blob_file_read_ranges(blob, ptr::null(), 0, ptr::null(), ptr::null(),) },
+        0,
+        "empty read_ranges failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 5);
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_file_read_ranges_rejects_invalid_without_writing_buffers() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let size = unsafe { lance_blob_file_size(blob) };
+    assert_eq!(unsafe { lance_blob_file_seek(blob, 7) }, 0);
+
+    let mut first = [0xAAu8; 4];
+    let mut second = [0xBBu8; 8];
+    let destinations = [first.as_mut_ptr(), second.as_mut_ptr()];
+    let destination_lens = [first.len(), second.len()];
+    let valid_ranges = [
+        LanceBlobRange {
+            offset: 0,
+            length: 4,
+        },
+        LanceBlobRange {
+            offset: 8,
+            length: 8,
+        },
+    ];
+    let assert_untouched = |first: &[u8], second: &[u8], case: &str| {
+        assert!(
+            first.iter().all(|byte| *byte == 0xAA),
+            "{case}: first destination was modified"
+        );
+        assert!(
+            second.iter().all(|byte| *byte == 0xBB),
+            "{case}: second destination was modified"
+        );
+    };
+
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_ranges(
+                blob,
+                ptr::null(),
+                2,
+                destinations.as_ptr(),
+                destination_lens.as_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("ranges must not be NULL when num_ranges = 2"),
+        "{message}"
+    );
+    assert_untouched(&first, &second, "NULL ranges");
+
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_ranges(
+                blob,
+                valid_ranges.as_ptr(),
+                valid_ranges.len(),
+                ptr::null(),
+                destination_lens.as_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("destinations must not be NULL when num_ranges = 2"),
+        "{message}"
+    );
+    assert_untouched(&first, &second, "NULL destinations");
+
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_ranges(
+                blob,
+                valid_ranges.as_ptr(),
+                valid_ranges.len(),
+                destinations.as_ptr(),
+                ptr::null(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("destination_lens must not be NULL when num_ranges = 2"),
+        "{message}"
+    );
+    assert_untouched(&first, &second, "NULL destination_lens");
+
+    let null_destinations = [ptr::null_mut(), second.as_mut_ptr()];
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_ranges(
+                blob,
+                valid_ranges.as_ptr(),
+                valid_ranges.len(),
+                null_destinations.as_ptr(),
+                destination_lens.as_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("destinations[0] must not be NULL"),
+        "{message}"
+    );
+    assert_untouched(&first, &second, "NULL non-empty destination");
+
+    let short_lens = [3usize, second.len()];
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_ranges(
+                blob,
+                valid_ranges.as_ptr(),
+                valid_ranges.len(),
+                destinations.as_ptr(),
+                short_lens.as_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("destination_lens[0] = 3 is smaller"),
+        "{message}"
+    );
+    assert_untouched(&first, &second, "short destination");
+
+    let overflow = [LanceBlobRange {
+        offset: u64::MAX,
+        length: 2,
+    }];
+    let overflow_destinations = [first.as_mut_ptr()];
+    let overflow_lens = [second.len()];
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_ranges(
+                blob,
+                overflow.as_ptr(),
+                overflow.len(),
+                overflow_destinations.as_ptr(),
+                overflow_lens.as_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("ranges[0].offset 18446744073709551615"),
+        "{message}"
+    );
+    assert_untouched(&first, &second, "overflowing range");
+
+    let out_of_bounds = [LanceBlobRange {
+        offset: size - 1,
+        length: 2,
+    }];
+    let bounds_destinations = [first.as_mut_ptr()];
+    let bounds_lens = [second.len()];
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_ranges(
+                blob,
+                out_of_bounds.as_ptr(),
+                out_of_bounds.len(),
+                bounds_destinations.as_ptr(),
+                bounds_lens.as_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("exceeds blob size"), "{message}");
+    assert_untouched(&first, &second, "out-of-bounds range");
+
+    let mixed_ranges = [
+        LanceBlobRange {
+            offset: 0,
+            length: 4,
+        },
+        LanceBlobRange {
+            offset: size - 1,
+            length: 2,
+        },
+    ];
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_ranges(
+                blob,
+                mixed_ranges.as_ptr(),
+                mixed_ranges.len(),
+                destinations.as_ptr(),
+                destination_lens.as_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("exceeds blob size"), "{message}");
+    assert_untouched(&first, &second, "valid range followed by invalid range");
+
+    let mut cursor = u64::MAX;
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 7, "rejected range reads must not move the cursor");
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_file_native_close_state_and_buffer_control() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let size = unsafe { lance_blob_file_size(blob) };
+    let mut closed = true;
+    assert_eq!(unsafe { lance_blob_file_is_closed(blob, &mut closed) }, 0);
+    assert!(!closed, "a fresh handle starts open");
+
+    assert_eq!(unsafe { lance_blob_file_set_buffer_size(blob, 0) }, 0);
+    assert_eq!(unsafe { lance_blob_file_set_buffer_size(blob, 64) }, 0);
+    assert_eq!(
+        unsafe { lance_blob_file_set_buffer_size(blob, 1024 * 1024) },
+        0
+    );
+
+    assert_eq!(unsafe { lance_blob_file_mark_closed(blob) }, 0);
+    assert_eq!(unsafe { lance_blob_file_is_closed(blob, &mut closed) }, 0);
+    assert!(closed);
+    assert_eq!(
+        unsafe { lance_blob_file_size(blob) },
+        size,
+        "size must remain available after marking closed"
+    );
+
+    // Native close is idempotent.
+    assert_eq!(unsafe { lance_blob_file_mark_closed(blob) }, 0);
+    assert_eq!(unsafe { lance_blob_file_is_closed(blob, &mut closed) }, 0);
+    assert!(closed);
+
+    assert_eq!(unsafe { lance_blob_file_set_buffer_size(blob, 32) }, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("already closed"), "{message}");
+
+    // Empty multi-range requests still reach native closed-state validation.
+    assert_eq!(
+        unsafe { lance_blob_file_read_ranges(blob, ptr::null(), 0, ptr::null(), ptr::null(),) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("already closed"), "{message}");
+
+    let range = [LanceBlobRange {
+        offset: 0,
+        length: 1,
+    }];
+    let mut byte = [0xF1u8];
+    let destinations = [byte.as_mut_ptr()];
+    let destination_lens = [1usize];
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_ranges(
+                blob,
+                range.as_ptr(),
+                range.len(),
+                destinations.as_ptr(),
+                destination_lens.as_ptr(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("already closed"), "{message}");
+    assert_eq!(byte, [0xF1u8], "a rejected read must not write output");
+
+    let mut cursor = 0u64;
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+
+    // Preserve the old zero-length single-range compatibility. Non-empty
+    // positional reads follow native closed-state errors.
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, 0, ptr::null_mut(), 0) },
+        0,
+        "the existing zero-length read_range must keep succeeding"
+    );
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, 0, byte.as_mut_ptr(), byte.len()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("already closed"), "{message}");
+    assert_eq!(byte, [0xF1u8]);
+
+    assert_eq!(
+        unsafe { lance_blob_file_is_closed(blob, ptr::null_mut()) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("out_closed must not be NULL"), "{message}");
+    assert_eq!(
+        unsafe { lance_blob_file_is_closed(ptr::null(), &mut closed) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("blob must not be NULL"), "{message}");
+    assert_eq!(unsafe { lance_blob_file_mark_closed(ptr::null_mut()) }, -1);
+    let message = take_last_error_message();
+    assert!(message.contains("blob must not be NULL"), "{message}");
 
     close_blob_handles(&handles);
     unsafe { lance_dataset_close(ds) };

@@ -2406,15 +2406,29 @@ int32_t lance_dataset_take_rows(
 
 /*
  * A LanceBlobFile is a file-like handle over one value of a Blob v2 column,
- * returned by lance_dataset_take_blobs() / lance_dataset_take_blobs_by_indices()
- * and released with lance_blob_file_close(). It owns what it needs to read,
- * so it stays valid after the dataset is closed. Not thread-safe per handle;
- * distinct handles are independent.
+ * returned by lance_dataset_take_blobs(), lance_dataset_take_blobs_by_indices()
+ * or lance_dataset_take_blobs_by_addresses(), and released with
+ * lance_blob_file_close(). It owns what it needs to read, so it stays valid
+ * after the dataset is closed. Not thread-safe per handle; distinct handles
+ * are independent.
  *
  * Reads are cursor-based: the cursor starts at 0, lance_blob_file_read() and
  * lance_blob_file_read_up_to() advance it, lance_blob_file_read_range() does
- * not, lance_blob_file_seek() sets it.
+ * not, lance_blob_file_read_ranges() does not, lance_blob_file_seek() sets it.
+ * lance_blob_file_mark_closed() changes the native file state without freeing
+ * the opaque allocation; lance_blob_file_close() releases the allocation.
  */
+
+/**
+ * One blob-relative byte range for lance_blob_file_read_ranges().
+ *
+ * `offset` and `length` are interpreted against the start of the blob. Empty
+ * ranges are valid.
+ */
+typedef struct LanceBlobRange {
+    uint64_t offset;
+    uint64_t length;
+} LanceBlobRange;
 
 /**
  * Take blob handles by dataset row ID.
@@ -2468,6 +2482,41 @@ int32_t lance_dataset_take_blobs_by_indices(
     const LanceDataset* dataset,
     const uint64_t* indices,
     size_t num_indices,
+    const char* column,
+    LanceBlobFile** out
+);
+
+/**
+ * Take blob handles by physical row address.
+ *
+ * A row address encodes `(fragment_id << 32) | row_offset`. These are
+ * physical row addresses, such as those produced by a scan with row addresses
+ * enabled; they are not stable row IDs from `_rowid`.
+ *
+ * On success `out[i]` holds the handle for `row_addresses[i]`, or NULL when
+ * that blob value is null. A valid empty blob yields a non-NULL handle of size
+ * zero. Handles preserve input order and duplicates, have independent cursors,
+ * and remain usable after the dataset closes. On failure `out` is left
+ * untouched.
+ *
+ * Unlike the older take entry points, an empty selection still validates
+ * `column` through the native API. This includes rejecting a missing or
+ * non-blob column.
+ *
+ * @param dataset            Open dataset snapshot.
+ * @param row_addresses      Array of physical row addresses. May be NULL only
+ *                           when `num_row_addresses` is zero.
+ * @param num_row_addresses  Length of `row_addresses`.
+ * @param column             Blob column to read. Must not be NULL.
+ * @param out                Caller-allocated array of at least
+ *                           `num_row_addresses` handle pointers. Must not be
+ *                           NULL.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_take_blobs_by_addresses(
+    const LanceDataset* dataset,
+    const uint64_t* row_addresses,
+    size_t num_row_addresses,
     const char* column,
     LanceBlobFile** out
 );
@@ -2545,6 +2594,41 @@ int32_t lance_blob_file_read_range(
 );
 
 /**
+ * Read multiple blob-relative ranges without moving the cursor.
+ *
+ * The result for `ranges[i]` is copied to `destinations[i]`. Input order,
+ * duplicate ranges, overlaps and empty ranges are preserved. Each
+ * `destination_lens[i]` is a capacity, not an exact length: it must be at
+ * least `ranges[i].length`, and any excess capacity is left untouched.
+ *
+ * Every offset-plus-length is checked for 64-bit overflow. Blob bounds and the
+ * closed state are validated by the native implementation for the complete
+ * request before any destination is written. A request with `num_ranges == 0`
+ * still reaches native closed-state validation, so it succeeds on an open
+ * handle and fails on one marked closed.
+ *
+ * When `num_ranges` is zero, `ranges`, `destinations` and `destination_lens`
+ * may be NULL. For a zero-length range, its destination may be NULL. For a
+ * non-empty range, its destination must not be NULL. On any error no
+ * destination is modified.
+ *
+ * @param blob              Blob handle. NULL is an error.
+ * @param ranges            Array of ranges. May be NULL only when
+ *                          `num_ranges` is zero.
+ * @param num_ranges        Number of entries in each range/buffer array.
+ * @param destinations      Parallel array of destination pointers.
+ * @param destination_lens  Parallel array of destination capacities in bytes.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_read_ranges(
+    const LanceBlobFile* blob,
+    const LanceBlobRange* ranges,
+    size_t num_ranges,
+    uint8_t* const* destinations,
+    const size_t* destination_lens
+);
+
+/**
  * Move the cursor to `pos`.
  *
  * Seeking past the end of the blob is allowed, mirroring the underlying Lance
@@ -2567,10 +2651,60 @@ int32_t lance_blob_file_seek(LanceBlobFile* blob, uint64_t pos);
 int32_t lance_blob_file_tell(const LanceBlobFile* blob, uint64_t* pos);
 
 /**
- * Close a blob handle and free it.
+ * Set the sequential read-ahead size used by future reads.
  *
- * Call exactly once per non-NULL handle; the handle is invalid afterwards.
- * NULL is a no-op. Never fails and leaves the pending error untouched.
+ * Zero disables read-ahead. A changed value drops any unused prefetched bytes,
+ * matching the native BlobFile behavior. The size is a hint and does not
+ * change the visible blob bytes or cursor.
+ *
+ * @param blob         Blob handle. NULL is an error.
+ * @param buffer_size  Read-ahead size in bytes; zero disables it.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_set_buffer_size(
+    LanceBlobFile* blob,
+    size_t buffer_size
+);
+
+/**
+ * Mark the native blob file closed.
+ *
+ * This maps to the native BlobFile close operation. It is idempotent and does
+ * not free the opaque allocation. After this succeeds, size() remains
+ * available but cursor and range reads, tell() and set_buffer_size() follow
+ * native closed-handle errors. Releasing the allocation still requires
+ * lance_blob_file_close().
+ *
+ * The existing single-range zero-length compatibility is unchanged: a
+ * zero-length lance_blob_file_read_range() request succeeds without reaching
+ * the closed-state check.
+ *
+ * @param blob  Blob handle. NULL is an error.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_mark_closed(LanceBlobFile* blob);
+
+/**
+ * Report whether the native blob file is closed.
+ *
+ * @param blob        Blob handle. NULL is an error.
+ * @param out_closed  Receives the native closed state. Must not be NULL.
+ *                    Written only on success.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_is_closed(
+    const LanceBlobFile* blob,
+    bool* out_closed
+);
+
+/**
+ * Free a blob handle's opaque allocation.
+ *
+ * This does not perform the native close operation; use
+ * lance_blob_file_mark_closed() for that. Call exactly once per non-NULL
+ * handle; the handle is invalid afterwards. Dropping the allocation also drops
+ * the underlying native BlobFile. NULL is a no-op. Never fails and leaves the
+ * pending error untouched.
  *
  * @param blob  Blob handle, or NULL.
  */

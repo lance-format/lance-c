@@ -966,6 +966,14 @@ static void assert_blob_payload(const uint8_t *bytes, size_t len, size_t offset)
     }
 }
 
+static void assert_blob_payload_seeded(
+    const uint8_t *bytes, size_t len, size_t offset, uint8_t seed) {
+    for (size_t i = 0; i < len; i++) {
+        ASSERT(bytes[i] == (uint8_t)(blob_byte(offset + i) + seed),
+               "seeded blob payload mismatch");
+    }
+}
+
 static void test_take_blobs(const char *blob_uri) {
     printf("  test_take_blobs... ");
 
@@ -1044,6 +1052,262 @@ static void test_take_blobs(const char *blob_uri) {
     printf("OK\n");
 }
 
+static void test_blob_native_read_slice(const char *blob_uri) {
+    printf("  test_blob_native_read_slice... ");
+
+    LanceDataset *ds = lance_dataset_open(blob_uri, NULL, 0);
+    ASSERT(ds != NULL, "blob dataset open failed");
+
+    const uint64_t addresses[] = {
+        0,
+        (((uint64_t)1) << 32) | 2,
+        (((uint64_t)1) << 32) | 1,
+        3,
+        4,
+        0,
+    };
+    LanceBlobFile *addressed[6] = {0};
+    int32_t rc = lance_dataset_take_blobs_by_addresses(
+        ds, addresses, 6, "blob", addressed);
+    ASSERT(rc == 0, "take_blobs_by_addresses failed");
+
+    /* Empty selections reach native column validation, unlike the old
+     * entry points. Failures leave `out` untouched. */
+    LanceBlobFile *untouched[2] = {addressed[0], addressed[0]};
+    rc = lance_dataset_take_blobs_by_addresses(
+        ds, NULL, 0, "does_not_exist", untouched);
+    ASSERT(rc == -1, "empty unknown column should fail");
+    expect_error_contains(
+        LANCE_ERR_NOT_FOUND, "does_not_exist", "empty unknown column");
+    ASSERT(untouched[0] == addressed[0] && untouched[1] == addressed[0],
+           "failed by-address take must leave out untouched");
+
+    rc = lance_dataset_take_blobs(
+        ds, NULL, 0, "does_not_exist", untouched);
+    ASSERT(rc == 0, "legacy take must keep its early-empty behavior");
+    ASSERT(untouched[0] == addressed[0] && untouched[1] == addressed[0],
+           "legacy empty take must leave out untouched");
+
+    rc = lance_dataset_take_blobs_by_addresses(
+        ds, NULL, 0, "raw", untouched);
+    ASSERT(rc == -1, "empty non-blob column should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "not a blob column", "non-blob column");
+
+    const uint64_t invalid_addresses[] = {0, UINT64_MAX - 1};
+    rc = lance_dataset_take_blobs_by_addresses(
+        ds, invalid_addresses, 2, "blob", untouched);
+    ASSERT(rc == -1, "partially invalid addresses should fail");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "invalid row address");
+    ASSERT(untouched[0] == addressed[0] && untouched[1] == addressed[0],
+           "a partially valid request must not fill out");
+
+    rc = lance_dataset_take_blobs_by_addresses(
+        ds, NULL, 1, "blob", untouched);
+    ASSERT(rc == -1, "NULL row_addresses with count 1 should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "row_addresses must not be NULL",
+        "NULL row_addresses");
+
+    /* Handles own their readers; the dataset can be released first. */
+    lance_dataset_close(ds);
+
+    const uint64_t sizes[] = {8, 1024, 128, 0, 0, 8};
+    uint8_t buffer[1024];
+    for (size_t i = 0; i < 6; i++) {
+        if (i == 4) {
+            ASSERT(addressed[i] == NULL, "the null blob must yield a NULL slot");
+            continue;
+        }
+        ASSERT(addressed[i] != NULL, "a non-null blob must yield a handle");
+        ASSERT(lance_blob_file_size(addressed[i]) == sizes[i],
+               "by-address size mismatch");
+        if (i == 5) {
+            uint64_t duplicate_cursor = UINT64_MAX;
+            rc = lance_blob_file_tell(addressed[i], &duplicate_cursor);
+            ASSERT(rc == 0 && duplicate_cursor == 0,
+                   "duplicate addresses must have independent cursors");
+        }
+        rc = lance_blob_file_read(
+            addressed[i], buffer, (size_t)sizes[i]);
+        ASSERT(rc == 0, "by-address read after dataset close failed");
+        assert_blob_payload_seeded(
+            buffer, (size_t)sizes[i], 0, (i == 1 || i == 2) ? 100 : 0);
+    }
+
+    /* Ordered, overlapping, duplicate and empty ranges. Capacities are larger
+     * than requested lengths and their tails must stay untouched. */
+    LanceBlobFile *packed = addressed[2];
+    rc = lance_blob_file_seek(packed, 5);
+    ASSERT(rc == 0, "seek failed");
+
+    const LanceBlobRange ranges[] = {
+        {100, 20},
+        {128, 0},
+        {40, 16},
+        {100, 8},
+        {127, 1},
+        {0, 128},
+    };
+    uint8_t range0[32];
+    uint8_t range2[24];
+    uint8_t range3[8];
+    uint8_t range4[2];
+    uint8_t range5[130];
+    memset(range0, 0xEE, sizeof(range0));
+    memset(range2, 0xEE, sizeof(range2));
+    memset(range3, 0xEE, sizeof(range3));
+    memset(range4, 0xEE, sizeof(range4));
+    memset(range5, 0xEE, sizeof(range5));
+    uint8_t *destinations[] = {
+        range0, NULL, range2, range3, range4, range5,
+    };
+    const size_t destination_lens[] = {
+        sizeof(range0), 0, sizeof(range2), sizeof(range3),
+        sizeof(range4), sizeof(range5),
+    };
+    rc = lance_blob_file_read_ranges(
+        packed, ranges, 6, destinations, destination_lens);
+    ASSERT(rc == 0, "read_ranges failed");
+    assert_blob_payload(range0, 20, 100);
+    assert_blob_payload(range2, 16, 40);
+    assert_blob_payload(range3, 8, 100);
+    assert_blob_payload(range4, 1, 127);
+    assert_blob_payload(range5, 128, 0);
+    for (size_t i = 20; i < sizeof(range0); i++) {
+        ASSERT(range0[i] == 0xEE, "range0 tail was modified");
+    }
+    for (size_t i = 16; i < sizeof(range2); i++) {
+        ASSERT(range2[i] == 0xEE, "range2 tail was modified");
+    }
+    for (size_t i = 1; i < sizeof(range4); i++) {
+        ASSERT(range4[i] == 0xEE, "range4 tail was modified");
+    }
+    for (size_t i = 128; i < sizeof(range5); i++) {
+        ASSERT(range5[i] == 0xEE, "range5 tail was modified");
+    }
+    uint64_t cursor = UINT64_MAX;
+    rc = lance_blob_file_tell(packed, &cursor);
+    ASSERT(rc == 0 && cursor == 5, "read_ranges moved the cursor");
+
+    /* Representative invalid requests must not write any destination. */
+    const LanceBlobRange small_range[] = {{0, 4}};
+    uint8_t small_destination[4] = {0xAA, 0xAA, 0xAA, 0xAA};
+    uint8_t *small_destinations[] = {small_destination};
+    const size_t short_lens[] = {3};
+    rc = lance_blob_file_read_ranges(
+        packed, small_range, 1, small_destinations, short_lens);
+    ASSERT(rc == -1, "short destination should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "smaller than", "short destination");
+    for (size_t i = 0; i < sizeof(small_destination); i++) {
+        ASSERT(small_destination[i] == 0xAA,
+               "short destination was modified");
+    }
+
+    const LanceBlobRange overflow_range[] = {{UINT64_MAX, 2}};
+    uint8_t overflow_destination[2] = {0xAA, 0xAA};
+    uint8_t *overflow_destinations[] = {overflow_destination};
+    const size_t overflow_lens[] = {sizeof(overflow_destination)};
+    rc = lance_blob_file_read_ranges(
+        packed, overflow_range, 1, overflow_destinations, overflow_lens);
+    ASSERT(rc == -1, "overflowing range should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "overflows", "overflowing range");
+    ASSERT(overflow_destination[0] == 0xAA &&
+           overflow_destination[1] == 0xAA,
+           "overflow destination was modified");
+
+    const LanceBlobRange mixed_ranges[] = {{0, 4}, {127, 2}};
+    uint8_t mixed0[8];
+    uint8_t mixed1[8];
+    memset(mixed0, 0xBB, sizeof(mixed0));
+    memset(mixed1, 0xCC, sizeof(mixed1));
+    uint8_t *mixed_destinations[] = {mixed0, mixed1};
+    const size_t mixed_lens[] = {sizeof(mixed0), sizeof(mixed1)};
+    rc = lance_blob_file_read_ranges(
+        packed, mixed_ranges, 2, mixed_destinations, mixed_lens);
+    ASSERT(rc == -1, "out-of-bounds range should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "exceeds blob size", "out-of-bounds range");
+    for (size_t i = 0; i < sizeof(mixed0); i++) {
+        ASSERT(mixed0[i] == 0xBB, "mixed valid destination was modified");
+    }
+    for (size_t i = 0; i < sizeof(mixed1); i++) {
+        ASSERT(mixed1[i] == 0xCC, "mixed invalid destination was modified");
+    }
+
+    rc = lance_blob_file_read_ranges(
+        packed, NULL, 1, destinations, destination_lens);
+    ASSERT(rc == -1, "NULL ranges with count 1 should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "ranges must not be NULL", "NULL ranges");
+    rc = lance_blob_file_read_ranges(
+        packed, ranges, 1, NULL, destination_lens);
+    ASSERT(rc == -1, "NULL destinations with count 1 should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "destinations must not be NULL",
+        "NULL destinations");
+    rc = lance_blob_file_read_ranges(
+        packed, ranges, 1, destinations, NULL);
+    ASSERT(rc == -1, "NULL destination lengths with count 1 should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "destination_lens must not be NULL",
+        "NULL destination_lens");
+
+    rc = lance_blob_file_read_ranges(
+        packed, NULL, 0, NULL, NULL);
+    ASSERT(rc == 0, "empty read_ranges on an open handle should succeed");
+
+    rc = lance_blob_file_set_buffer_size(packed, 0);
+    ASSERT(rc == 0, "set_buffer_size(0) failed");
+    rc = lance_blob_file_set_buffer_size(packed, 64);
+    ASSERT(rc == 0, "set_buffer_size(64) failed");
+    rc = lance_blob_file_set_buffer_size(packed, 1024 * 1024);
+    ASSERT(rc == 0, "set_buffer_size(large) failed");
+
+    bool closed = true;
+    rc = lance_blob_file_is_closed(packed, &closed);
+    ASSERT(rc == 0 && !closed, "a fresh handle should be open");
+    rc = lance_blob_file_mark_closed(packed);
+    ASSERT(rc == 0, "mark_closed failed");
+    rc = lance_blob_file_is_closed(packed, &closed);
+    ASSERT(rc == 0 && closed, "mark_closed did not update native state");
+    ASSERT(lance_blob_file_size(packed) == 128,
+           "size should remain available after native close");
+    rc = lance_blob_file_mark_closed(packed);
+    ASSERT(rc == 0, "mark_closed should be idempotent");
+
+    rc = lance_blob_file_read_ranges(
+        packed, NULL, 0, NULL, NULL);
+    ASSERT(rc == -1, "empty read_ranges on a closed handle should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "already closed", "closed read_ranges");
+
+    rc = lance_blob_file_set_buffer_size(packed, 32);
+    ASSERT(rc == -1, "set_buffer_size on a closed handle should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "already closed", "closed set_buffer_size");
+
+    /* Preserve the old zero-length single-range behavior. */
+    memset(range0, 0xEE, sizeof(range0));
+    rc = lance_blob_file_read_range(packed, 0, NULL, 0);
+    ASSERT(rc == 0, "zero-length read_range must keep succeeding");
+    rc = lance_blob_file_read_range(packed, 0, range0, 1);
+    ASSERT(rc == -1, "non-empty read_range on a closed handle should fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "already closed", "closed read_range");
+    ASSERT(range0[0] == 0xEE, "closed read_range modified its destination");
+
+    for (size_t i = 0; i < 6; i++) {
+        lance_blob_file_close(addressed[i]);
+    }
+    printf("OK\n");
+}
+
 static void test_versions(const char *uri) {
     printf("  test_versions... ");
 
@@ -1111,6 +1375,24 @@ static void expect_error(LanceErrorCode expected, const char *operation) {
     }
     const char *msg = lance_last_error_message();
     if (msg) lance_free_string(msg);
+}
+
+static void expect_error_contains(
+    LanceErrorCode expected,
+    const char *needle,
+    const char *operation) {
+    if (lance_last_error_code() != expected) {
+        const char *msg = lance_last_error_message();
+        fprintf(stderr, "FAIL: %s returned error code %d, expected %d: %s\n",
+                operation, (int)lance_last_error_code(), (int)expected,
+                msg ? msg : "unknown");
+        if (msg) lance_free_string(msg);
+        exit(1);
+    }
+    const char *msg = lance_last_error_message();
+    ASSERT(msg != NULL, "an error message is expected");
+    ASSERT(strstr(msg, needle) != NULL, "error message did not contain expected text");
+    lance_free_string(msg);
 }
 
 static void test_native_refs_and_tags(const char *uri) {
@@ -4795,6 +5077,7 @@ int main(int argc, char **argv) {
     test_fragment_read_operations(fragment_read_uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
+    test_blob_native_read_slice(blob_uri);
     test_versions(uri);
     test_native_refs_and_tags(uri);
     test_branch_lifecycle(uri);
