@@ -4007,7 +4007,9 @@ int32_t lance_fragment_update_columns_result_matched_offset_count(
 /**
  * Read one matched physical row offset in stable bitmap order.
  *
- * Values remain in their native u32 domain.
+ * Values remain in their native u32 domain. For all offsets, prefer
+ * lance_fragment_update_columns_result_matched_offsets() to avoid restarting
+ * the bitmap traversal for each index.
  *
  * @return 0 on success, -1 on error. The output is unchanged on error.
  */
@@ -4037,7 +4039,8 @@ int32_t lance_fragment_update_columns_result_matched_offsets_serialize(
  * Copy all matched physical row offsets in one native bitmap traversal.
  *
  * The caller owns out_offsets, with count writable uint32_t elements. count
- * must equal lance_fragment_update_columns_result_matched_offset_count().
+ * must equal the value written by
+ * lance_fragment_update_columns_result_matched_offset_count().
  * NULL out_offsets is valid for an empty result with count == 0. Values retain
  * native bitmap order and remain valid after the result handle is closed.
  *
