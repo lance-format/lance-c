@@ -7680,6 +7680,40 @@ public:
         return Dataset(out);
     }
 
+    /// Deep clone this handle's snapshot into `target_path`.
+    ///
+    /// `reference == nullptr` clones the handle's current snapshot (branch and
+    /// version id pinned); it does not select the latest head. Pass
+    /// `Ref::version(std::nullopt, std::nullopt)` to clone the current head of
+    /// the default branch. `storage_options == nullptr` passes native None;
+    /// otherwise the accessor's native Arc is forwarded as-is when it holds
+    /// static options or a provider (an accessor with neither passes None),
+    /// without resolving or copying credentials. The returned dataset keeps
+    /// the cloned snapshot's version id (native clone commit semantics), so
+    /// `version()` is not necessarily 1. Copy or commit errors can leave the
+    /// target's publication state uncertain; reopen it to check its state.
+    /// Partial objects may remain under `target_path` and are not rolled back.
+    /// The target URI must use a scheme known to the default object-store
+    /// registry, because native clone commits resolve it there.
+    /// For datasets with additional base paths, native deep clone reads them
+    /// through the source dataset's object store; per-base distinct source
+    /// credentials are not supported.
+    Dataset deep_clone(
+        const std::string& target_path,
+        const Ref* reference = nullptr,
+        const StorageOptionsAccessor* storage_options = nullptr) const {
+        LanceDataset* out = nullptr;
+        if (lance_dataset_deep_clone(
+                handle_.get(),
+                target_path.c_str(),
+                reference ? reference->c_handle() : nullptr,
+                storage_options ? storage_options->c_handle() : nullptr,
+                &out) != 0) {
+            check_error();
+        }
+        return Dataset(out);
+    }
+
     /// Create a native branch from `reference`.
     ///
     /// `storage_opts == std::nullopt` uses the source dataset's native store

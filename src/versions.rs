@@ -229,7 +229,7 @@ unsafe fn tag_metadata_at<'a>(tag: *const LanceTag, index: usize) -> Result<&'a 
     })
 }
 
-unsafe fn reference_at<'a>(reference: *const LanceRef) -> Result<&'a Ref> {
+pub(crate) unsafe fn reference_at<'a>(reference: *const LanceRef) -> Result<&'a Ref> {
     if reference.is_null() {
         return Err(invalid("reference must not be NULL"));
     }
