@@ -106,6 +106,37 @@ static void init_batch_arrays(
     array->release = release_array;
 }
 
+static int read_object_bytes(
+    const char *object_path,
+    char *output,
+    size_t capacity,
+    long *output_len) {
+    char local_path[4096];
+    if (object_path[0] == '/') {
+        snprintf(local_path, sizeof(local_path), "%s", object_path);
+    } else {
+        snprintf(local_path, sizeof(local_path), "/%s", object_path);
+    }
+    FILE *file = fopen(local_path, "rb");
+    if (!file) return 0;
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return 0;
+    }
+    long length = ftell(file);
+    if (length < 0 || (size_t)length >= capacity ||
+        fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return 0;
+    }
+    size_t read = fread(output, 1, (size_t)length, file);
+    fclose(file);
+    if (read != (size_t)length) return 0;
+    output[length] = '\0';
+    *output_len = length;
+    return 1;
+}
+
 static const char *label_at(const ArrowArray *array, int64_t index) {
     static char output[16];
     const uint8_t *validity = (const uint8_t *)array->buffers[0];
@@ -303,6 +334,107 @@ int main(int argc, char **argv) {
     lance_file_metadata_close(metadata);
     lance_file_reader_close(reader);
 
+    ArrowSchema payload_schema;
+    init_schema(&payload_schema, "z", "payload", ARROW_FLAG_NULLABLE, NULL, 0);
+    const char payload_bytes[] = "skipbeta";
+    const int32_t payload_offsets[] = {0, 4, 4, 8};
+    const uint8_t payload_validity[] = {0x05};
+    const void *payload_buffers[3] = {
+        payload_validity, payload_offsets, payload_bytes};
+    ArrowArray payload_array = {0};
+    payload_array.length = 2;
+    payload_array.offset = 1;
+    payload_array.n_buffers = 3;
+    payload_array.buffers = payload_buffers;
+    payload_array.release = release_array;
+
+    LancePackedBlobWriter *packed = lance_file_session_open_packed_blob_writer(
+        session, "c/packed-blob.lance", 31);
+    CHECK(packed != NULL, "packed blob writer");
+    if (packed) {
+        CHECK(lance_packed_blob_writer_blob_id(packed) == 31,
+              "packed blob id");
+        const char *packed_path = lance_packed_blob_writer_path(packed);
+        CHECK(packed_path != NULL, "packed blob path");
+        char packed_path_copy[4096] = {0};
+        if (packed_path) {
+            snprintf(packed_path_copy, sizeof(packed_path_copy), "%s",
+                     packed_path);
+            lance_free_string(packed_path);
+        }
+        CHECK(lance_packed_blob_writer_write_blobs(
+                  packed, &payload_array, &payload_schema) == 0,
+              "packed bulk write");
+        CHECK(payload_array.release == NULL, "packed input array consumed");
+        CHECK(payload_schema.release != NULL, "packed input schema borrowed");
+        CHECK(lance_packed_blob_writer_write_blob(packed, NULL, 0) == 0,
+              "packed NULL empty payload");
+        ArrowArray prepared_array = {0};
+        ArrowSchema prepared_schema = {0};
+        CHECK(lance_packed_blob_writer_finish_array(
+                  packed, "blob", &prepared_array, &prepared_schema) == 0,
+              "packed finish");
+        CHECK(prepared_array.release != NULL, "packed prepared array");
+        CHECK(prepared_schema.release != NULL, "packed prepared field");
+        CHECK(prepared_array.length == 3, "packed prepared rows");
+        CHECK(prepared_schema.name &&
+                  strcmp(prepared_schema.name, "blob") == 0,
+              "packed prepared field name");
+        char sidecar[64] = {0};
+        long sidecar_len = 0;
+        CHECK(read_object_bytes(
+                  packed_path_copy, sidecar, sizeof(sidecar), &sidecar_len),
+              "packed sidecar read");
+        CHECK(sidecar_len == 4 && strcmp(sidecar, "beta") == 0,
+              "packed sidecar bytes");
+        if (prepared_array.release) prepared_array.release(&prepared_array);
+        if (prepared_schema.release) prepared_schema.release(&prepared_schema);
+        lance_packed_blob_writer_close(packed);
+    }
+
+    LanceDedicatedBlobWriter *dedicated =
+        lance_file_session_open_dedicated_blob_writer(
+            session, "c/dedicated-blob.lance", 32);
+    CHECK(dedicated != NULL, "dedicated blob writer");
+    if (dedicated) {
+        CHECK(lance_dedicated_blob_writer_blob_id(dedicated) == 32,
+              "dedicated blob id");
+        const char *dedicated_path = lance_dedicated_blob_writer_path(dedicated);
+        CHECK(dedicated_path != NULL, "dedicated blob path");
+        char dedicated_path_copy[4096] = {0};
+        if (dedicated_path) {
+            snprintf(dedicated_path_copy, sizeof(dedicated_path_copy), "%s",
+                     dedicated_path);
+            lance_free_string(dedicated_path);
+        }
+        CHECK(lance_dedicated_blob_writer_write(
+                  dedicated, (const uint8_t *)"alpha", 5) == 0,
+              "dedicated write alpha");
+        CHECK(lance_dedicated_blob_writer_write(dedicated, NULL, 0) == 0,
+              "dedicated NULL empty write");
+        CHECK(lance_dedicated_blob_writer_write(
+                  dedicated, (const uint8_t *)"omega", 5) == 0,
+              "dedicated write omega");
+        ArrowArray prepared_array = {0};
+        ArrowSchema prepared_schema = {0};
+        CHECK(lance_dedicated_blob_writer_finish_array(
+                  dedicated, "blob", &prepared_array, &prepared_schema) == 0,
+              "dedicated finish");
+        CHECK(prepared_array.release != NULL, "dedicated prepared array");
+        CHECK(prepared_schema.release != NULL, "dedicated prepared field");
+        CHECK(prepared_array.length == 1, "dedicated prepared rows");
+        char sidecar[64] = {0};
+        long sidecar_len = 0;
+        CHECK(read_object_bytes(
+                  dedicated_path_copy, sidecar, sizeof(sidecar), &sidecar_len),
+              "dedicated sidecar read");
+        CHECK(sidecar_len == 10 && strcmp(sidecar, "alphaomega") == 0,
+              "dedicated sidecar bytes");
+        if (prepared_array.release) prepared_array.release(&prepared_array);
+        if (prepared_schema.release) prepared_schema.release(&prepared_schema);
+        lance_dedicated_blob_writer_close(dedicated);
+    }
+
     char local_path[4096];
     snprintf(local_path, sizeof(local_path), "%s/source.bin", argv[1]);
     FILE *local = fopen(local_path, "wb");
@@ -380,8 +512,38 @@ int main(int argc, char **argv) {
         CHECK(value && strcmp(value, "8192") == 0, "snapshot value");
         lance_storage_options_snapshot_close(snapshot);
     }
+
+    LanceFileSession *dynamic_session =
+        lance_file_session_new(base_uri, dynamic, NULL, NULL);
+    CHECK(dynamic_session != NULL, "dynamic file session");
+    LancePackedBlobWriter *dynamic_writer = NULL;
+    if (dynamic_session) {
+        dynamic_writer = lance_file_session_open_packed_blob_writer(
+            dynamic_session, "c/dynamic-writer.lance", 33);
+        CHECK(dynamic_writer != NULL, "dynamic packed writer");
+    }
+    if (dynamic_session) lance_file_session_close(dynamic_session);
     lance_storage_options_accessor_close(dynamic);
     lance_storage_options_provider_close(provider);
+    if (dynamic_writer) {
+        CHECK(lance_packed_blob_writer_write_blob(
+                  dynamic_writer, (const uint8_t *)"alpha", 5) == 0,
+              "dynamic writer after accessor close");
+        CHECK(lance_packed_blob_writer_write_blob(
+                  dynamic_writer, (const uint8_t *)"beta", 4) == 0,
+              "dynamic writer second write");
+        ArrowArray prepared_array = {0};
+        ArrowSchema prepared_schema = {0};
+        CHECK(lance_packed_blob_writer_finish_array(
+                  dynamic_writer, "blob", &prepared_array,
+                  &prepared_schema) == 0,
+              "dynamic writer finish after owner close");
+        CHECK(prepared_array.length == 2,
+              "dynamic writer descriptor rows");
+        if (prepared_array.release) prepared_array.release(&prepared_array);
+        if (prepared_schema.release) prepared_schema.release(&prepared_schema);
+        lance_packed_blob_writer_close(dynamic_writer);
+    }
 
     lance_file_session_close(session);
     lance_storage_options_accessor_close(storage);
