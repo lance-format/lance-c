@@ -455,6 +455,19 @@ void test_update_columns(const std::string& uri) {
     auto dataset = lance::Dataset::open(uri);
     auto fragment0 = dataset.open_fragment(dataset.fragment_ids()[0]);
     const uint64_t read_version = fragment0.read_version();
+    // Dense live rows, sparse matches, and no matches use the same native update.
+    const std::vector<std::vector<int64_t>> keys{{1, 3, 4}, {1, 4}, {99}};
+    const std::vector<std::vector<uint32_t>> expected{{0, 2, 3}, {0, 3}, {}};
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        std::vector<uint32_t> copied;
+        {
+            TwoColumnStream input("id", "l", "value", "i", keys[i],
+                                  std::vector<int32_t>(keys[i].size(), 123));
+            auto temporary = fragment0.update_columns(input.get(), "id", "id");
+            copied = temporary.matched_offsets();
+        }
+        CHECK(copied == expected[i]);
+    }
     TwoColumnStream stream("id", "l", "value", "i", {1, 3}, {901, 903});
     auto result = fragment0.update_columns(stream.get(), "id", "id");
     CHECK(stream.get()->release == nullptr);

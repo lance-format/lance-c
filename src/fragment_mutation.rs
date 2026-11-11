@@ -646,6 +646,39 @@ pub unsafe extern "C" fn lance_fragment_update_columns_result_matched_offset_at(
     )
 }
 
+/// Copy all matched physical row offsets in one native bitmap traversal.
+/// The caller owns the output buffer; its element count must match the result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_fragment_update_columns_result_matched_offsets(
+    result: *const LanceFragmentUpdateColumnsResult,
+    out_offsets: *mut u32,
+    count: usize,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            let result = result_ref(result)?;
+            if count as u64 != result.inner.matched_offsets.len() {
+                return Err(lance_core::Error::invalid_input_source(
+                    format!(
+                        "matched offset output count {count} must equal {}",
+                        result.inner.matched_offsets.len()
+                    )
+                    .into(),
+                ));
+            }
+            helpers::validate_slice_length::<u32>(count, "out_offsets")?;
+            if count != 0 {
+                require_output(out_offsets, "out_offsets")?;
+                for (index, offset) in result.inner.matched_offsets.iter().enumerate() {
+                    unsafe { ptr::write(out_offsets.add(index), offset) };
+                }
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
 /// Serialize the matched offsets with the portable Roaring format.
 ///
 /// This is an interoperability export only; typed Update construction consumes
@@ -695,4 +728,77 @@ pub unsafe extern "C" fn lance_fragment_update_columns_result_matched_offsets_se
         })(),
         neg
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matched_offsets_copy_preserves_values_and_error_outputs() {
+        for expected in [
+            vec![],
+            vec![0, 65_535, 65_536, u32::MAX],
+            (0..65_537).collect(),
+        ] {
+            let result = LanceFragmentUpdateColumnsResult {
+                inner: FragmentUpdateColumnsResult {
+                    fragment: Fragment::new(0),
+                    fields_modified: vec![],
+                    matched_offsets: expected.iter().copied().collect(),
+                },
+            };
+            let mut copied = vec![u32::MAX; expected.len()];
+            assert_eq!(
+                unsafe {
+                    lance_fragment_update_columns_result_matched_offsets(
+                        &result,
+                        copied.as_mut_ptr(),
+                        copied.len(),
+                    )
+                },
+                0
+            );
+            assert_eq!(copied, expected);
+            let mut sentinel = [41, 42];
+            for count in [0, expected.len() + 1, usize::MAX]
+                .into_iter()
+                .filter(|&count| count != expected.len())
+            {
+                assert_eq!(
+                    unsafe {
+                        lance_fragment_update_columns_result_matched_offsets(
+                            &result,
+                            sentinel.as_mut_ptr(),
+                            count,
+                        )
+                    },
+                    -1
+                );
+                assert_eq!(sentinel, [41, 42]);
+                assert_eq!(
+                    crate::lance_last_error_code(),
+                    crate::LanceErrorCode::LANCE_ERR_INVALID_ARGUMENT
+                );
+            }
+            assert_eq!(
+                unsafe {
+                    lance_fragment_update_columns_result_matched_offsets(
+                        &result,
+                        ptr::null_mut(),
+                        expected.len(),
+                    )
+                },
+                if expected.is_empty() { 0 } else { -1 }
+            );
+        }
+        let mut sentinel = 43;
+        assert_eq!(
+            unsafe {
+                lance_fragment_update_columns_result_matched_offsets(ptr::null(), &mut sentinel, 1)
+            },
+            -1
+        );
+        assert_eq!(sentinel, 43);
+    }
 }

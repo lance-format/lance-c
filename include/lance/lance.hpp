@@ -4667,7 +4667,7 @@ public:
         return out;
     }
 
-    /// Matched physical row offsets in their native u32 domain.
+    /// Matched physical row offsets in their native u32 domain, copied in one pass.
     std::vector<uint32_t> matched_offsets() const {
         uint64_t count = 0;
         if (lance_fragment_update_columns_result_matched_offset_count(
@@ -4675,14 +4675,13 @@ public:
             check_error();
         }
         std::vector<uint32_t> out;
-        out.reserve(static_cast<std::size_t>(count));
-        for (uint64_t i = 0; i < count; ++i) {
-            uint32_t offset = 0;
-            if (lance_fragment_update_columns_result_matched_offset_at(
-                    handle_.get(), static_cast<std::size_t>(i), &offset) != 0) {
-                check_error();
-            }
-            out.push_back(offset);
+        if (count > out.max_size()) {
+            throw std::length_error("matched offset count exceeds vector max_size");
+        }
+        out.resize(static_cast<std::size_t>(count));
+        if (lance_fragment_update_columns_result_matched_offsets(
+                handle_.get(), out.data(), out.size()) != 0) {
+            check_error();
         }
         return out;
     }

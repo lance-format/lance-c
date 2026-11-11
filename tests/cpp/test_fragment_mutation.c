@@ -623,8 +623,15 @@ static void test_update_columns(const char *uri) {
         check_ok("matched offset");
     }
     ASSERT(offsets[0] == 0 && offsets[1] == 2, "matched physical offsets");
+    uint32_t copied_offsets[2] = {UINT32_MAX, UINT32_MAX};
+    ASSERT(lance_fragment_update_columns_result_matched_offsets(
+               result, copied_offsets, 2) == 0,
+           "copy matched offsets");
+    check_ok("copy matched offsets");
+    ASSERT(memcmp(offsets, copied_offsets, sizeof(offsets)) == 0,
+           "bulk offsets match indexed offsets");
 
-    LanceFragmentOffsetsView entry = {0, offsets, 2};
+    LanceFragmentOffsetsView entry = {0, copied_offsets, 2};
     LanceUpdatedFragmentOffsets *offset_owner =
         lance_updated_fragment_offsets_new(&entry, 1);
     ASSERT(offset_owner != NULL, "construct UpdatedFragmentOffsets");

@@ -4033,6 +4033,22 @@ int32_t lance_fragment_update_columns_result_matched_offsets_serialize(
     size_t* out_len
 );
 
+/**
+ * Copy all matched physical row offsets in one native bitmap traversal.
+ *
+ * The caller owns out_offsets, with count writable uint32_t elements. count
+ * must equal lance_fragment_update_columns_result_matched_offset_count().
+ * NULL out_offsets is valid for an empty result with count == 0. Values retain
+ * native bitmap order and remain valid after the result handle is closed.
+ *
+ * @return 0 on success, -1 on error. The output buffer is unchanged on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offsets(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint32_t* out_offsets,
+    size_t count
+);
+
 /* ─── Random access ─── */
 
 /**
