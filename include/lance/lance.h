@@ -347,6 +347,10 @@ typedef struct LanceTags     LanceTags;
 typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceCleanupExplanation LanceCleanupExplanation;
 typedef struct LanceDatasetConfig LanceDatasetConfig;
+typedef struct LanceDatasetDeltaBuilder LanceDatasetDeltaBuilder;
+typedef struct LanceDatasetDelta LanceDatasetDelta;
+typedef struct LanceSqlQueryBuilder LanceSqlQueryBuilder;
+typedef struct LanceSqlQuery LanceSqlQuery;
 typedef struct LanceCompactionOptionsV2 LanceCompactionOptionsV2;
 typedef struct LanceCompactionPlan LanceCompactionPlan;
 typedef struct LanceCompactionTask LanceCompactionTask;
@@ -368,6 +372,9 @@ typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
 typedef struct LanceUpdateMap LanceUpdateMap;
+typedef struct LanceDataOverlayFile LanceDataOverlayFile;
+typedef struct LanceDataOverlayGroup LanceDataOverlayGroup;
+typedef struct LanceFragmentOverlayWriter LanceFragmentOverlayWriter;
 typedef struct LanceIvfModel LanceIvfModel;
 typedef struct LanceSchema LanceSchema;
 typedef struct LanceNamespace LanceNamespace;
@@ -3389,6 +3396,83 @@ int32_t lance_fragment_take(
     size_t num_indices,
     const char* const* columns,
     struct ArrowArrayStream* out
+);
+
+/**
+ * Open an overlay writer for a bound fragment.
+ *
+ * The fragment must belong to a dataset (a detached fragment returns
+ * LANCE_ERR_NOT_SUPPORTED). The writer captures the fragment's current native
+ * snapshot and the supplied schema. The schema may be a subset of the dataset
+ * schema; native code owns field compatibility, row layout, type, nullability
+ * and range checks. Commit the resulting overlay with the dataset read version
+ * used to open this writer.
+ *
+ * Native overlays are experimental. For release builds, set
+ * `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads or
+ * modifies an overlay dataset. Enable it before publication so all readers
+ * recognize the manifest feature.
+ *
+ * @param fragment    Bound fragment snapshot. Must not be NULL.
+ * @param schema      Native fragment schema, or a compatible subset.
+ * @param out_writer  Receives the writer on success; unchanged on failure.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_overlay_writer_new(
+    const LanceFragment* fragment,
+    const LanceSchema* schema,
+    LanceFragmentOverlayWriter** out_writer
+);
+
+/**
+ * Write one batch of overlay values to a writer.
+ *
+ * The batch is borrowed for the duration of the call and may be closed
+ * afterwards. Rows are keyed by `_rowaddr`; each covered cell supplies a dense
+ * value in ascending fragment-offset order. Native validation owns missing or
+ * nullable `_rowaddr`, repeated or descending offsets, wrong fragment, wrong
+ * types and out-of-range offsets.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_fragment_overlay_writer_write_batch(
+    LanceFragmentOverlayWriter* writer,
+    const LanceBatch* batch
+);
+
+/**
+ * Finish an overlay writer.
+ *
+ * Consumes the writer allocation on every return, including errors. On success
+ * `out_group` receives an owned group, or NULL when the staged coverage was
+ * empty (native `None`). `out_group` is written only on success and a non-NULL
+ * result must be closed with `lance_data_overlay_group_close`. Returns 0 on
+ * success, -1 on error.
+ */
+int32_t lance_fragment_overlay_writer_finish(
+    LanceFragmentOverlayWriter* writer,
+    LanceDataOverlayGroup** out_group
+);
+
+/**
+ * Abort an overlay writer.
+ *
+ * Consumes the writer allocation and discards staged data best-effort. This is
+ * the native abort path, not a finish or publication. NULL-safe. No error is
+ * reported.
+ */
+void lance_fragment_overlay_writer_abort(
+    LanceFragmentOverlayWriter* writer
+);
+
+/**
+ * Close an overlay writer without finishing or publishing it.
+ *
+ * Consumes the writer allocation and drops the native writer, matching ordinary
+ * Rust drop. NULL-safe.
+ */
+void lance_fragment_overlay_writer_close(
+    LanceFragmentOverlayWriter* writer
 );
 
 /**
@@ -7397,6 +7481,174 @@ LanceOperation* lance_operation_data_replacement_new(
 );
 
 /**
+ * Coverage layout for a data overlay.
+ *
+ * `LANCE_DATA_OVERLAY_COVERAGE_SHARED` stores one bitmap covering every field
+ * in the overlay data file. `LANCE_DATA_OVERLAY_COVERAGE_PER_FIELD` stores one
+ * bitmap per field in `data_file.fields` order. The FFI takes the integer value
+ * so unknown kinds are rejected with a descriptive error.
+ */
+typedef enum LanceDataOverlayCoverageKind {
+    LANCE_DATA_OVERLAY_COVERAGE_SHARED = 0,
+    LANCE_DATA_OVERLAY_COVERAGE_PER_FIELD = 1,
+} LanceDataOverlayCoverageKind;
+
+/**
+ * Create an owned native data overlay value.
+ *
+ * `data_file` is borrowed and its complete native metadata is copied.
+ * `coverage_kind` is 0 (shared, exactly one bitmap) or 1 (per-field, bitmaps in
+ * `data_file.fields` order). Each bitmap is portable 32-bit Roaring
+ * serialization and is borrowed for the duration of the call; empty per-field
+ * coverage is retained. `committed_version` is copied unchanged. Native code
+ * owns field compatibility, coverage validity, row layout and publication
+ * checks; this constructor adds no policy.
+ *
+ * Returns an owned overlay, or NULL on error. Close it exactly once with
+ * `lance_data_overlay_file_close`.
+ */
+LanceDataOverlayFile* lance_data_overlay_file_new(
+    const LanceDataFile* data_file,
+    int32_t coverage_kind,
+    const uint8_t* const* bitmaps,
+    const size_t* bitmap_lens,
+    size_t bitmap_count,
+    uint64_t committed_version
+);
+
+/** Close a data overlay value. NULL-safe. */
+void lance_data_overlay_file_close(LanceDataOverlayFile* file);
+
+/**
+ * Clone a data overlay value into an independent snapshot.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceDataOverlayFile* lance_data_overlay_file_clone(
+    const LanceDataOverlayFile* file
+);
+
+/**
+ * Clone the complete data file metadata owned by the overlay. The output is
+ * written only on success and must be closed independently.
+ * Returns an owned data file, or NULL on error.
+ */
+LanceDataFile* lance_data_overlay_file_data_file(
+    const LanceDataOverlayFile* file
+);
+
+/**
+ * Read the coverage kind (0 shared, 1 per-field). Returns 0 on success, -1 on
+ * error; `out_kind` is unchanged on failure.
+ */
+int32_t lance_data_overlay_file_coverage_kind(
+    const LanceDataOverlayFile* file,
+    int32_t* out_kind
+);
+
+/**
+ * Read the number of coverage bitmaps (1 for shared, field count for
+ * per-field). Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_file_bitmap_count(
+    const LanceDataOverlayFile* file,
+    uint64_t* out_count
+);
+
+/**
+ * Serialize one coverage bitmap to a caller-owned buffer.
+ *
+ * `index` is 0 for shared coverage and the field position for per-field
+ * coverage. On success `out_bytes` receives a `libc::malloc` allocation of
+ * `out_len` bytes; release it exactly once with `lance_free_bytes`. Outputs are
+ * written only on success. Parity is bitmap semantics: the native writer may
+ * re-serialize with a different optimized container layout.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_file_bitmap_at(
+    const LanceDataOverlayFile* file,
+    size_t index,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Read the overlay's committed-version stamp. Returns 0 on success, -1 on
+ * error; zero is a valid pre-commit placeholder.
+ */
+int32_t lance_data_overlay_file_committed_version(
+    const LanceDataOverlayFile* file,
+    uint64_t* out_version
+);
+
+/**
+ * Construct an owned native data overlay group.
+ *
+ * Overlay handles are borrowed and cloned in input order. A NULL array is
+ * accepted only with a zero count. Empty groups are retained because the
+ * native operation permits them. Returns NULL on error.
+ */
+LanceDataOverlayGroup* lance_data_overlay_group_new(
+    uint64_t fragment_id,
+    const LanceDataOverlayFile* const* overlays,
+    size_t overlay_count
+);
+
+/** Close a data overlay group. NULL-safe. */
+void lance_data_overlay_group_close(LanceDataOverlayGroup* group);
+
+/**
+ * Clone a data overlay group into an independent snapshot.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceDataOverlayGroup* lance_data_overlay_group_clone(
+    const LanceDataOverlayGroup* group
+);
+
+/**
+ * Read the target fragment ID. Returns 0 on success, -1 on error; fragment ID
+ * 0 is valid.
+ */
+int32_t lance_data_overlay_group_fragment_id(
+    const LanceDataOverlayGroup* group,
+    uint64_t* out_fragment_id
+);
+
+/**
+ * Read the number of overlays in the group. Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_group_overlay_count(
+    const LanceDataOverlayGroup* group,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one overlay from the group. The output is written only on success and
+ * must be closed independently. Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_group_overlay_at(
+    const LanceDataOverlayGroup* group,
+    size_t index,
+    LanceDataOverlayFile** out_overlay
+);
+
+/**
+ * Construct an owned native DataOverlay operation.
+ *
+ * Group handles are borrowed and cloned in input order. A NULL array is
+ * accepted only with a zero count. Empty group lists are retained because the
+ * native operation permits them. Native commit owns fragment existence,
+ * coverage validity, layout and ordering checks. Returns NULL on error.
+ *
+ * Native overlays are experimental. For release builds, set
+ * `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads or
+ * modifies an overlay dataset, including before publication.
+ */
+LanceOperation* lance_operation_data_overlay_new(
+    const LanceDataOverlayGroup* const* groups,
+    size_t group_count
+);
+
+/**
  * Read the native transaction read version.
  * Returns 0 on success, -1 on error. Zero is valid for an uncommitted create.
  */
@@ -8055,6 +8307,27 @@ int32_t lance_operation_data_replacement_at(
     const LanceOperation* operation,
     size_t index,
     LanceDataReplacementGroup** out_group
+);
+
+/**
+ * Read the number of data overlay groups. A non-DataOverlay operation returns
+ * LANCE_ERR_NOT_SUPPORTED. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_data_overlay_group_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one data overlay group. A wrong operation variant returns
+ * LANCE_ERR_NOT_SUPPORTED; an out-of-range index returns
+ * LANCE_ERR_INVALID_ARGUMENT. The output is written only on success and must
+ * be closed independently. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_data_overlay_group_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceDataOverlayGroup** out_group
 );
 
 /**
@@ -9379,6 +9652,290 @@ const uint8_t* lance_byte_buffer_data(const LanceByteBuffer* buffer);
 size_t lance_byte_buffer_len(const LanceByteBuffer* buffer);
 void lance_byte_buffer_close(LanceByteBuffer* buffer);
 
+/* ─── Native dataset SQL ──────────────────────────────────────────────────── */
+
+/**
+ * Moves `sql` into a native `SqlQueryBuilder` owned by the returned handle.
+ * The SQL text is copied when the builder is created; the builder holds its
+ * own dataset snapshot (native Dataset clone), so it stays valid after the
+ * dataset handle closes.
+ *
+ * Returns NULL on error, including a NULL dataset or NULL SQL pointer.
+ */
+LanceSqlQueryBuilder* lance_dataset_sql_builder_new(
+    const LanceDataset* dataset, const char* sql);
+
+/**
+ * Close a SQL builder handle. NULL-safe. Close exactly once.
+ * `lance_sql_query_builder_build` consumes the allocation, so a consumed
+ * builder must not be closed.
+ */
+void lance_sql_query_builder_close(LanceSqlQueryBuilder* builder);
+
+/**
+ * Close a SQL query handle. NULL-safe. Close exactly once.
+ * `lance_sql_query_into_stream` consumes the allocation, so a consumed
+ * query must not be closed.
+ */
+void lance_sql_query_close(LanceSqlQuery* query);
+
+/**
+ * Name the table in the SELECT statement. The string is copied. An empty
+ * name is passed to native unchanged. The native default is "dataset".
+ *
+ * Returns 0 on success, -1 on error. A NULL name is rejected and the builder
+ * keeps its prior table name.
+ */
+int32_t lance_sql_query_builder_set_table_name(
+    LanceSqlQueryBuilder* builder, const char* table_name);
+
+/**
+ * Ask the native planner to inject the `_rowid` system column into the scan
+ * output where it is safe to do so. Passed to the native builder unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_with_row_id(
+    LanceSqlQueryBuilder* builder, bool enabled);
+
+/**
+ * Ask the native planner to inject the `_rowaddr` system column into the
+ * scan output where it is safe to do so. Passed to the native builder
+ * unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_with_row_addr(
+    LanceSqlQueryBuilder* builder, bool enabled);
+
+/**
+ * Set how blob columns are materialized, as a LanceBlobHandling value:
+ * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS (0, the native default), ALL_BINARY
+ * (1) or ALL_DESCRIPTIONS (2). Other values are rejected and the builder
+ * keeps its prior handling. Passed to the native builder unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_blob_handling(
+    LanceSqlQueryBuilder* builder, LanceBlobHandling handling);
+
+/**
+ * Set the native target output batch size (rows). The native builder
+ * validates the value's range when the query is built; a value that does not
+ * fit the native usize is rejected here and the builder keeps its prior
+ * value.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_batch_size(
+    LanceSqlQueryBuilder* builder, uint64_t batch_size);
+
+/**
+ * Set the native target output batch size in bytes. Not set (native None)
+ * until called; the native builder owns the value's interpretation and
+ * validation.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_batch_size_bytes(
+    LanceSqlQueryBuilder* builder, uint64_t batch_size_bytes);
+
+/**
+ * Plan the configured query and consume `builder` on every return path,
+ * including foreign-pointer errors and native planning failures. The caller
+ * must not use the builder after this call. On success `*out_query` receives
+ * an independently owned query handle (close it with
+ * `lance_sql_query_close`); on error the slot is left unchanged.
+ *
+ * Native planning classifies malformed SQL as invalid input. Batch-size
+ * validation happens here.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_build(
+    LanceSqlQueryBuilder* builder, LanceSqlQuery** out_query);
+
+/**
+ * Move the query's native stream into `*out_stream`, consuming `query` on
+ * every return path. The caller must not use the query after this call. On
+ * success `*out_stream` is an Arrow C stream owned by the caller (release it
+ * exactly once); it keeps the query's dataset snapshot alive and remains
+ * valid after the query, builder and dataset handles close. On error the
+ * stream slot is left unchanged.
+ *
+ * The stream is not materialized here; batches are produced lazily by the
+ * native execution plan. Malformed queries can also fail at this native
+ * physical-planning stage.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_into_stream(
+    LanceSqlQuery* query, struct ArrowArrayStream* out_stream);
+
+/* ─── Native dataset delta ────────────────────────────────────────────────── */
+
+/**
+ * Timestamp for delta date-mode ranges.
+ *
+ * `unix_seconds` is a signed Unix timestamp in whole seconds and `nanos` the
+ * nanosecond component. Native chrono timestamp construction defines
+ * representability, including leap seconds. An unrepresentable value is
+ * rejected by the timestamp setter.
+ */
+typedef struct LanceDeltaTimestamp {
+    int64_t unix_seconds;
+    uint32_t nanos; /* Validated by the native timestamp constructor. */
+} LanceDeltaTimestamp;
+
+/**
+ * Moves a dataset snapshot into a native `DatasetDeltaBuilder` owned by the
+ * returned handle. The builder holds its own dataset clone, so it stays
+ * valid after the dataset handle closes.
+ *
+ * Returns NULL on error, including a NULL dataset pointer.
+ */
+LanceDatasetDeltaBuilder* lance_dataset_delta_builder_new(
+    const LanceDataset* dataset);
+
+/**
+ * Close a delta builder handle. NULL-safe. Close exactly once.
+ * `lance_dataset_delta_builder_build` consumes the allocation, so a consumed
+ * builder must not be closed.
+ */
+void lance_dataset_delta_builder_close(LanceDatasetDeltaBuilder* builder);
+
+/**
+ * Close a delta handle. NULL-safe. Close exactly once.
+ */
+void lance_dataset_delta_close(LanceDatasetDelta* delta);
+
+/**
+ * Compare against the named version. Native build rejects combining this
+ * with any explicit begin/end version or date. Not set (native None) until
+ * called; the compared-against mode normalizes its native versions.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_compared_against_version(
+    LanceDatasetDeltaBuilder* builder, uint64_t version);
+
+/**
+ * Set the explicit begin version. Native build requires both begin and end
+ * versions, or a compared-against version. Not set until called.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_begin_version(
+    LanceDatasetDeltaBuilder* builder, uint64_t version);
+
+/**
+ * Set the explicit end version.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_end_version(
+    LanceDatasetDeltaBuilder* builder, uint64_t version);
+
+/**
+ * Set the begin date for date-mode ranges. Native build requires a begin
+ * date when an end date is provided. The timestamp is copied. A NULL
+ * timestamp is rejected and the builder keeps its prior value; a timestamp
+ * the native chrono constructor cannot represent is rejected the same way.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_begin_timestamp(
+    LanceDatasetDeltaBuilder* builder, const LanceDeltaTimestamp* timestamp);
+
+/**
+ * Set the end date for date-mode ranges (requires a begin date in native
+ * build).
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_end_timestamp(
+    LanceDatasetDeltaBuilder* builder, const LanceDeltaTimestamp* timestamp);
+
+/**
+ * Build the delta synchronously and consume `builder` on every return path,
+ * including foreign-pointer errors and native validation failures. The
+ * caller must not use the builder after this call. Native build validates
+ * range combinations (compared-against version conflicts, partial version
+ * and date ranges, missing range) and normalizes the compared-against
+ * mode's versions. On success `*out_delta` receives an independently owned
+ * delta handle (close it with `lance_dataset_delta_close`); on error the
+ * slot is left unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_build(
+    LanceDatasetDeltaBuilder* builder, LanceDatasetDelta** out_delta);
+
+/**
+ * List the transactions committed between the delta's begin and end
+ * versions. Each returned transaction is independently owned; release them
+ * together with `lance_transaction_array_free`. Versions without a
+ * transaction file are skipped natively.
+ *
+ * On success `*out_transactions` receives the array (NULL when the count is
+ * 0) and `*out_count` its length. Both slots are left unchanged on error.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_list_transactions(
+    const LanceDatasetDelta* delta,
+    LanceTransaction*** out_transactions,
+    size_t* out_count);
+
+/**
+ * Free a transaction array produced by `lance_dataset_delta_list_transactions`,
+ * closing each non-NULL transaction handle and the array allocation. NULL
+ * and zero-length arrays are no-ops. Call exactly once with the exact
+ * pointer and count returned by `list_transactions`.
+ */
+void lance_transaction_array_free(
+    LanceTransaction** transactions, size_t count);
+
+/**
+ * Stream the rows inserted across the delta's range. `*out_stream` receives
+ * an Arrow C stream owned by the caller (release it exactly once); it stays
+ * valid after the delta and dataset handles close. On error the stream slot
+ * is left unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_inserted_rows(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
+
+/**
+ * Stream the rows updated across the delta's range.
+ * See `lance_dataset_delta_get_inserted_rows`.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_updated_rows(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
+
+/**
+ * Stream the rows upserted across the delta's range.
+ * See `lance_dataset_delta_get_inserted_rows`.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_upserted_rows(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
+
+/**
+ * Stream the deleted row ids across the delta's range. The stream's single
+ * column is the native stable row-id column; native resolution and id
+ * normalization are authoritative, and native errors (unsupported versions,
+ * reversed ranges, missing stable row ids) surface as returned errors.
+ * See `lance_dataset_delta_get_inserted_rows`.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_deleted_row_ids(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
 
 /* ─── MemWAL / LSM public workflow ────────────────────────────────────────── */
 
