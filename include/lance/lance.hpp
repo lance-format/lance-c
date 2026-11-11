@@ -1799,6 +1799,116 @@ public:
     const LanceFtsQuery* c_handle() const { return handle_.get(); }
 };
 
+// ─── Native tokenization and process diagnostics ────────────────────────────
+
+/// One token produced by the native Lance analyzer chain.
+struct FtsToken {
+    std::string text;
+    uint32_t position = 0;
+};
+
+/// Owned token list produced by `FtsTokenList::tokenize`.
+///
+/// The list owns every token string. `at()` copies one token into a value, so
+/// the value remains usable after the list is destroyed.
+class FtsTokenList {
+    Handle<LanceFtsTokenList, lance_fts_token_list_close> handle_;
+
+    explicit FtsTokenList(LanceFtsTokenList* tokens) : handle_(tokens) {}
+
+public:
+    FtsTokenList(FtsTokenList&&) noexcept = default;
+    FtsTokenList& operator=(FtsTokenList&&) noexcept = default;
+    FtsTokenList(const FtsTokenList&) = delete;
+    FtsTokenList& operator=(const FtsTokenList&) = delete;
+
+    /// Tokenize an explicit UTF-8 byte range with native defaults or native
+    /// `InvertedIndexParams` JSON. Embedded NUL bytes are preserved. A null
+    /// `params_json` selects native defaults.
+    static FtsTokenList tokenize(
+        std::string_view text,
+        std::optional<std::string> params_json = std::nullopt) {
+        auto* tokens = lance_fts_tokenize(
+            text.data(), text.size(),
+            params_json ? params_json->c_str() : nullptr);
+        if (!tokens) check_error();
+        return FtsTokenList(tokens);
+    }
+
+    /// Number of tokens. Throws on a NULL handle.
+    size_t size() const {
+        uint64_t count = lance_fts_token_list_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return static_cast<size_t>(count);
+    }
+
+    bool empty() const { return size() == 0; }
+
+    /// Copy token `index`. Throws on an out-of-range index.
+    FtsToken at(size_t index) const {
+        LanceFtsTokenView view{};
+        if (lance_fts_token_list_get(handle_.get(), index, &view) != 0)
+            check_error();
+        if (view.text == nullptr && view.text_len != 0)
+            throw std::runtime_error(
+                "native token view has NULL text with a nonzero length");
+        return FtsToken{
+            std::string(view.text_len == 0 ? "" : view.text, view.text_len),
+            view.position};
+    }
+
+    /// Copy all tokens in native order.
+    std::vector<FtsToken> tokens() const {
+        std::vector<FtsToken> out;
+        size_t count = size();
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) out.push_back(at(i));
+        return out;
+    }
+
+    const LanceFtsTokenList* c_handle() const { return handle_.get(); }
+};
+
+/// Native process-wide object-store IOPS counter, with no reset semantics.
+inline uint64_t process_iops_counter() {
+    uint64_t value = lance_process_iops_counter();
+    if (lance_last_error_code() != LANCE_OK) check_error();
+    return value;
+}
+
+/// Native process-wide object-store bytes-read counter, with no reset
+/// semantics.
+inline uint64_t process_bytes_read_counter() {
+    uint64_t value = lance_process_bytes_read_counter();
+    if (lance_last_error_code() != LANCE_OK) check_error();
+    return value;
+}
+
+/// One read of both native process counters.
+struct ProcessIoCounters {
+    uint64_t iops = 0;
+    uint64_t bytes_read = 0;
+};
+
+inline ProcessIoCounters process_io_counters() {
+    ProcessIoCounters counters;
+    counters.iops = lance_process_iops_counter();
+    if (lance_last_error_code() != LANCE_OK) check_error();
+    counters.bytes_read = lance_process_bytes_read_counter();
+    if (lance_last_error_code() != LANCE_OK) check_error();
+    return counters;
+}
+
+/// Native SIMD report as the exact JSON object produced by
+/// `lance_simd_info_json()`: `tier`, `target_arch`, and `host_features`.
+inline std::string simd_info_json() {
+    const char* raw = lance_simd_info_json();
+    if (!raw) check_error();
+    std::unique_ptr<const char, void (*)(const char*)> guard(
+        raw, lance_free_string);
+    return std::string(raw);
+}
+
 // ─── Blob file ───────────────────────────────────────────────────────────────
 
 /// One blob-relative byte range for `BlobFile::read_ranges()`.
@@ -4143,6 +4253,27 @@ public:
             out.push_back(info);
         }
         return out;
+    }
+
+    /// Snapshot the dataset's native object-store I/O counters without
+    /// resetting them. The counters are the current native accumulator for the
+    /// store returned by `Dataset::object_store(None)`; a preceding incremental
+    /// call resets that accumulator.
+    LanceObjectStoreIoStats io_stats_snapshot() const {
+        LanceObjectStoreIoStats stats{};
+        if (lance_dataset_io_stats_snapshot(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+
+    /// Return dataset object-store counters accumulated since the previous
+    /// incremental call and reset the native accumulator. No binding-side
+    /// baseline is kept.
+    LanceObjectStoreIoStats io_stats_incremental() const {
+        LanceObjectStoreIoStats stats{};
+        if (lance_dataset_io_stats_incremental(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
     }
 
     /// Snapshot the dataset's manifest config map.

@@ -29,6 +29,33 @@ pub unsafe fn parse_c_string<'a>(ptr: *const c_char) -> Result<Option<&'a str>> 
     Ok(Some(s))
 }
 
+/// Parse an explicit-length UTF-8 byte range.
+///
+/// A NULL pointer is only valid when `len == 0`, in which case it denotes the
+/// empty string. Embedded NUL bytes are preserved; this is not a C string.
+pub unsafe fn parse_utf8_text<'a>(ptr: *const c_char, len: usize, label: &str) -> Result<&'a str> {
+    if ptr.is_null() {
+        if len == 0 {
+            return Ok("");
+        }
+        return Err(lance_core::Error::invalid_input(format!(
+            "{label} is NULL but length is {len}"
+        )));
+    }
+    if len == 0 {
+        return Ok("");
+    }
+    if len > isize::MAX as usize {
+        return Err(lance_core::Error::invalid_input(format!(
+            "{label} length {len} exceeds isize::MAX"
+        )));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    std::str::from_utf8(bytes).map_err(|error| {
+        lance_core::Error::invalid_input(format!("{label} is not valid UTF-8: {error}"))
+    })
+}
+
 /// Parse a NULL-terminated array of C strings into `Option<Vec<String>>`.
 /// If `ptr` is NULL, returns `None` (meaning "all columns" / "no filter").
 /// The array must end with a NULL pointer sentinel.

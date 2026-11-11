@@ -4504,6 +4504,81 @@ static void test_fragment_read_operations(const std::string& uri) {
     PASS();
 }
 
+static void test_diagnostics(const std::string& uri) {
+    TEST(test_diagnostics);
+
+    auto tokens = lance::FtsTokenList::tokenize("the Cats and Dogs");
+    assert(tokens.size() == 2);
+    auto cat = tokens.at(0);
+    auto dog = tokens.at(1);
+    assert(cat.text == "cat" && cat.position == 0);
+    assert(dog.text == "dog" && dog.position == 2);
+    assert(tokens.tokens().size() == 2);
+    bool range_rejected = false;
+    try {
+        (void)tokens.at(2);
+    } catch (const lance::Error&) {
+        range_rejected = true;
+    }
+    assert(range_rejected && "out-of-range token must throw");
+
+    auto empty = lance::FtsTokenList::tokenize(
+        std::string_view("", 0));
+    assert(empty.empty());
+
+    const std::string raw_text("a\0b", 3);
+    auto raw = lance::FtsTokenList::tokenize(
+        raw_text, std::string(R"({"base_tokenizer":"raw"})"));
+    assert(raw.size() == 1);
+    assert(raw.at(0).text == raw_text && raw.at(0).position == 0);
+
+    const std::string invalid_utf8(1, static_cast<char>(0xff));
+    bool utf8_rejected = false;
+    try {
+        (void)lance::FtsTokenList::tokenize(invalid_utf8);
+    } catch (const lance::Error&) {
+        utf8_rejected = true;
+    }
+    assert(utf8_rejected && "invalid UTF-8 must throw");
+
+    bool params_rejected = false;
+    try {
+        (void)lance::FtsTokenList::tokenize(
+            "code",
+            std::string(
+                R"({"base_tokenizer":"code","analyzer":"text"})"));
+    } catch (const lance::Error&) {
+        params_rejected = true;
+    }
+    assert(params_rejected && "invalid tokenizer params must throw");
+
+    auto simd = lance::simd_info_json();
+    assert(simd.find("\"tier\"") != std::string::npos);
+    assert(simd.find("\"target_arch\"") != std::string::npos);
+    assert(simd.find("\"host_features\"") != std::string::npos);
+
+    auto iops_before = lance::process_iops_counter();
+    auto bytes_before = lance::process_bytes_read_counter();
+    auto counters_before = lance::process_io_counters();
+    assert(counters_before.iops >= iops_before);
+    assert(counters_before.bytes_read >= bytes_before);
+
+    auto ds = lance::Dataset::open(uri);
+    auto snapshot_before = ds.io_stats_snapshot();
+    auto incremental_before = ds.io_stats_incremental();
+    assert(incremental_before.read_iops == snapshot_before.read_iops);
+    assert(incremental_before.read_bytes == snapshot_before.read_bytes);
+    assert(ds.count_rows() > 0);
+    auto snapshot_after = ds.io_stats_snapshot();
+    auto incremental_after = ds.io_stats_incremental();
+    assert(snapshot_after.read_iops == incremental_after.read_iops);
+    assert(snapshot_after.read_bytes == incremental_after.read_bytes);
+    assert(lance::process_iops_counter() >= iops_before);
+    assert(lance::process_bytes_read_counter() >= bytes_before);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 12) {
         fprintf(stderr,
@@ -4572,6 +4647,7 @@ int main(int argc, char** argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
+    test_diagnostics(uri);
     test_config_replacement(config_base_uri);
     test_base_paths_and_add(config_base_uri, alternate_base_uri);
     test_file_stream_ownership(config_base_uri, alternate_base_uri);

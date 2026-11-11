@@ -42,12 +42,14 @@ use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance::io::RecordBatchStream;
 use lance::session::{CacheSpec as NativeCacheSpec, Session as NativeSession};
 use lance_c::*;
+use lance_core::utils::cpu::simd_info;
 use lance_core::utils::path::LancePathExt;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::DocumentGranularity;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur,
-    Operator, PhraseQuery,
+    Operator, PhraseQuery, collect_query_tokens,
 };
 use lance_index::scalar::minhash_lsh::MinHashQuery as NativeMinHashQuery;
 use lance_select::{RowAddrMask as NativeRowAddrMask, RowAddrTreeMap as NativeRowAddrTreeMap};
@@ -42804,4 +42806,336 @@ fn test_prewarm_scalar_train_and_index_merge_lifecycle() {
         lance_fts_query_close(phrase);
         lance_dataset_close(reopened);
     }
+}
+
+fn native_query_tokens(text: &str, params_json: Option<&str>) -> Vec<(String, u32)> {
+    let params = match params_json {
+        Some(json) => serde_json::from_str::<InvertedIndexParams>(json).unwrap(),
+        None => InvertedIndexParams::default(),
+    };
+    let mut tokenizer = params.build().unwrap();
+    let tokens = collect_query_tokens(text, &mut tokenizer);
+    (0..tokens.len())
+        .map(|index| (tokens.get_token(index).to_owned(), tokens.position(index)))
+        .collect()
+}
+
+fn c_query_tokens(text: &[u8], params_json: Option<&str>) -> Vec<(String, u32)> {
+    let params = params_json.map(|json| CString::new(json).unwrap());
+    let list = unsafe {
+        lance_fts_tokenize(
+            text.as_ptr().cast(),
+            text.len(),
+            params.as_ref().map_or(ptr::null(), |json| json.as_ptr()),
+        )
+    };
+    assert!(!list.is_null(), "{}", take_last_error_message());
+    let count = unsafe { lance_fts_token_list_count(list) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let mut tokens = Vec::new();
+    for index in 0..usize::try_from(count).unwrap() {
+        let mut view = LanceFtsTokenView {
+            text: ptr::null(),
+            text_len: 0,
+            position: 0,
+        };
+        assert_eq!(
+            unsafe { lance_fts_token_list_get(list, index, &mut view) },
+            0
+        );
+        let bytes = unsafe { std::slice::from_raw_parts(view.text.cast::<u8>(), view.text_len) };
+        tokens.push((String::from_utf8(bytes.to_vec()).unwrap(), view.position));
+    }
+    unsafe { lance_fts_token_list_close(list) };
+    tokens
+}
+
+fn assert_tokenize_error(text: &[u8], params_json: Option<&str>) {
+    let params = params_json.map(|json| CString::new(json).unwrap());
+    let list = unsafe {
+        lance_fts_tokenize(
+            text.as_ptr().cast(),
+            text.len(),
+            params.as_ref().map_or(ptr::null(), |json| json.as_ptr()),
+        )
+    };
+    assert!(list.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(!take_last_error_message().is_empty());
+}
+
+#[test]
+fn diagnostics_fts_tokenize_matches_native_text_profile() {
+    let text = "the Cats and Dogs";
+    let expected = vec![("cat".to_string(), 0), ("dog".to_string(), 2)];
+    assert_eq!(c_query_tokens(text.as_bytes(), None), expected);
+    assert_eq!(
+        c_query_tokens(text.as_bytes(), None),
+        native_query_tokens(text, None)
+    );
+}
+
+#[test]
+fn diagnostics_fts_tokenize_matches_native_profiles_and_unicode() {
+    let cases = [
+        ("fooBar::baz(quux)", r#"{"base_tokenizer":"code"}"#),
+        (
+            "hello",
+            r#"{"base_tokenizer":"ngram","min_ngram_length":2,"max_ngram_length":3}"#,
+        ),
+        ("a b", r#"{"base_tokenizer":"raw"}"#),
+        ("你好 世界 Café", None),
+        (
+            "The Cats Café",
+            r#"{"lower_case":false,"stem":false,"remove_stop_words":false,"ascii_folding":false}"#,
+        ),
+    ];
+    for (text, params) in cases {
+        assert_eq!(
+            c_query_tokens(text.as_bytes(), params),
+            native_query_tokens(text, params),
+            "tokenizer parity failed for text={text:?} params={params:?}"
+        );
+    }
+}
+
+#[test]
+fn diagnostics_fts_tokenize_max_length_presence() {
+    let text = "short extraordinarilylongword abc";
+    let omitted = c_query_tokens(text.as_bytes(), None);
+    assert_eq!(omitted, native_query_tokens(text, None));
+    assert!(
+        !omitted
+            .iter()
+            .any(|(token, _)| token.contains("extraordinarily"))
+    );
+
+    let explicit_null = c_query_tokens(text.as_bytes(), Some(r#"{"max_token_length":null}"#));
+    assert_eq!(
+        explicit_null,
+        native_query_tokens(text, Some(r#"{"max_token_length":null}"#))
+    );
+    assert!(
+        explicit_null
+            .iter()
+            .any(|(token, _)| token == "extraordinarilylongword")
+    );
+    assert_ne!(omitted, explicit_null);
+
+    let zero = c_query_tokens(text.as_bytes(), Some(r#"{"max_token_length":0}"#));
+    assert!(zero.is_empty());
+    assert_eq!(
+        zero,
+        native_query_tokens(text, Some(r#"{"max_token_length":0}"#))
+    );
+}
+
+#[test]
+fn diagnostics_fts_tokenize_custom_stop_words_presence() {
+    let text = "the cat and dog";
+    let absent = c_query_tokens(text.as_bytes(), None);
+    assert_eq!(absent, native_query_tokens(text, None));
+    assert_eq!(absent, vec![("cat".to_string(), 0), ("dog".to_string(), 2)]);
+
+    let empty = c_query_tokens(text.as_bytes(), Some(r#"{"custom_stop_words":[]}"#));
+    assert_eq!(
+        empty,
+        native_query_tokens(text, Some(r#"{"custom_stop_words":[]}"#))
+    );
+    assert_eq!(
+        empty,
+        vec![
+            ("the".to_string(), 0),
+            ("cat".to_string(), 1),
+            ("and".to_string(), 2),
+            ("dog".to_string(), 3),
+        ]
+    );
+
+    let custom = c_query_tokens(text.as_bytes(), Some(r#"{"custom_stop_words":["cat"]}"#));
+    assert_eq!(
+        custom,
+        native_query_tokens(text, Some(r#"{"custom_stop_words":["cat"]}"#))
+    );
+    assert!(!custom.iter().any(|(token, _)| token == "cat"));
+}
+
+#[test]
+fn diagnostics_fts_tokenize_preserves_embedded_nul_for_raw() {
+    let text = b"a\0b";
+    let params = Some(r#"{"base_tokenizer":"raw"}"#);
+    let tokens = c_query_tokens(text, params);
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].0.as_bytes(), text);
+    assert_eq!(tokens[0].1, 0);
+    assert_eq!(tokens, native_query_tokens("a\0b", params));
+}
+
+#[test]
+fn diagnostics_fts_tokenize_validates_text_and_params() {
+    assert_tokenize_error(&[0xff], None);
+    assert_tokenize_error(b"x", Some("{"));
+    assert_tokenize_error(
+        b"code",
+        Some(r#"{"base_tokenizer":"code","analyzer":"text"}"#),
+    );
+
+    let oversized = unsafe { lance_fts_tokenize(c_str("x").as_ptr(), usize::MAX, ptr::null()) };
+    assert!(oversized.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+
+    let null_text = unsafe { lance_fts_tokenize(ptr::null(), 1, ptr::null()) };
+    assert!(null_text.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+
+    let empty = unsafe { lance_fts_tokenize(ptr::null(), 0, ptr::null()) };
+    assert!(!empty.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_fts_token_list_count(empty) }, 0);
+    unsafe { lance_fts_token_list_close(empty) };
+}
+
+#[test]
+fn diagnostics_fts_token_list_rejects_bad_access_without_writing_out() {
+    let text = c_str("the Cats and Dogs");
+    let list = unsafe { lance_fts_tokenize(text.as_ptr(), 15, ptr::null()) };
+    assert!(!list.is_null(), "{}", take_last_error_message());
+
+    assert_eq!(
+        unsafe { lance_fts_token_list_get(list, 0, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+
+    let mut untouched = LanceFtsTokenView {
+        text: ptr::null(),
+        text_len: 7,
+        position: 9,
+    };
+    assert_eq!(
+        unsafe { lance_fts_token_list_get(list, 2, &mut untouched) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(untouched.text.is_null());
+    assert_eq!(untouched.text_len, 7);
+    assert_eq!(untouched.position, 9);
+    let _ = take_last_error_message();
+
+    assert_eq!(unsafe { lance_fts_token_list_count(ptr::null()) }, 0);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+    unsafe { lance_fts_token_list_close(list) };
+    unsafe { lance_fts_token_list_close(ptr::null_mut()) };
+}
+
+#[test]
+fn diagnostics_simd_info_matches_native_snapshot() {
+    let raw = lance_simd_info_json();
+    assert!(!raw.is_null(), "{}", take_last_error_message());
+    let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+    unsafe { lance_free_string(raw) };
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let native = simd_info();
+    let object = value.as_object().unwrap();
+    assert_eq!(object.len(), 3);
+    assert_eq!(value["tier"], native.tier.to_string());
+    assert_eq!(value["target_arch"], native.target_arch);
+    assert_eq!(
+        value["host_features"],
+        serde_json::json!(native.host_features)
+    );
+}
+
+#[test]
+fn diagnostics_process_counters_and_dataset_io_stats_match_native() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+
+    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let native_store = lance_c::runtime::block_on(native.object_store(None)).unwrap();
+    let native_snapshot = native_store.io_stats_snapshot();
+
+    let mut snapshot_before = LanceObjectStoreIoStats::default();
+    assert_eq!(
+        unsafe { lance_dataset_io_stats_snapshot(ds, &mut snapshot_before) },
+        0
+    );
+    assert_eq!(snapshot_before.read_iops, native_snapshot.read_iops);
+    assert_eq!(snapshot_before.read_bytes, native_snapshot.read_bytes);
+    assert_eq!(snapshot_before.write_iops, native_snapshot.write_iops);
+    assert_eq!(snapshot_before.written_bytes, native_snapshot.written_bytes);
+
+    let mut incremental_before = LanceObjectStoreIoStats::default();
+    assert_eq!(
+        unsafe { lance_dataset_io_stats_incremental(ds, &mut incremental_before) },
+        0
+    );
+    assert_eq!(incremental_before, snapshot_before);
+
+    let iops_before = lance_process_iops_counter();
+    let bytes_before = lance_process_bytes_read_counter();
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+    let batches = scan_all_rows(ds);
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        10
+    );
+    let iops_after = lance_process_iops_counter();
+    let bytes_after = lance_process_bytes_read_counter();
+    assert!(iops_after >= iops_before);
+    assert!(
+        bytes_after > bytes_before,
+        "scan must read bytes through the native object store"
+    );
+
+    let mut snapshot_after = LanceObjectStoreIoStats::default();
+    assert_eq!(
+        unsafe { lance_dataset_io_stats_snapshot(ds, &mut snapshot_after) },
+        0
+    );
+    let mut incremental_after = LanceObjectStoreIoStats::default();
+    assert_eq!(
+        unsafe { lance_dataset_io_stats_incremental(ds, &mut incremental_after) },
+        0
+    );
+    assert_eq!(snapshot_after, incremental_after);
+    assert!(
+        snapshot_after.read_bytes > 0,
+        "fragment scan must produce native read bytes after incremental reset"
+    );
+
+    let mut untouched = LanceObjectStoreIoStats {
+        read_iops: 11,
+        read_bytes: 12,
+        write_iops: 13,
+        written_bytes: 14,
+    };
+    assert_eq!(
+        unsafe { lance_dataset_io_stats_snapshot(ptr::null(), &mut untouched) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        untouched,
+        LanceObjectStoreIoStats {
+            read_iops: 11,
+            read_bytes: 12,
+            write_iops: 13,
+            written_bytes: 14,
+        }
+    );
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_io_stats_incremental(ds, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let _ = take_last_error_message();
+
+    unsafe { lance_dataset_close(ds) };
 }

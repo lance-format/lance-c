@@ -6475,6 +6475,130 @@ static void test_fragment_read_operations(const char *uri) {
     printf("OK\n");
 }
 
+static void test_diagnostics(const char *uri) {
+    printf("test_diagnostics... ");
+
+    const char *text = "the Cats and Dogs";
+    LanceFtsTokenList *tokens =
+        lance_fts_tokenize(text, strlen(text), NULL);
+    ASSERT(tokens != NULL, "default tokenize should succeed");
+    ASSERT(lance_fts_token_list_count(tokens) == 2,
+           "default tokenizer should keep cat and dog");
+    LanceFtsTokenView view = {NULL, 0, 0};
+    ASSERT(lance_fts_token_list_get(tokens, 0, &view) == 0,
+           "first token should exist");
+    ASSERT(view.text_len == 3 && memcmp(view.text, "cat", 3) == 0,
+           "first token should be cat");
+    ASSERT(view.position == 0, "cat position should be 0");
+    ASSERT(lance_fts_token_list_get(tokens, 1, &view) == 0,
+           "second token should exist");
+    ASSERT(view.text_len == 3 && memcmp(view.text, "dog", 3) == 0,
+           "second token should be dog");
+    ASSERT(view.position == 2, "dog position should be 2");
+    view.text = (const char *)0x1;
+    view.text_len = 99;
+    view.position = 99;
+    ASSERT(lance_fts_token_list_get(tokens, 2, &view) != 0,
+           "out-of-range token should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "out-of-range token should be invalid argument");
+    ASSERT(view.text == (const char *)0x1 && view.text_len == 99 &&
+               view.position == 99,
+           "failed token get must not write the out slot");
+    lance_fts_token_list_close(tokens);
+
+    /* Empty text with a NULL pointer is valid and yields no tokens. */
+    tokens = lance_fts_tokenize(NULL, 0, NULL);
+    ASSERT(tokens != NULL, "NULL/0 text should tokenize as empty");
+    ASSERT(lance_fts_token_list_count(tokens) == 0,
+           "empty text should have no tokens");
+    lance_fts_token_list_close(tokens);
+
+    /* NULL text with a nonzero length and invalid UTF-8 are rejected. */
+    ASSERT(lance_fts_tokenize(NULL, 1, NULL) == NULL,
+           "NULL text with length should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL text with length should be invalid argument");
+    const char invalid_utf8[] = {(char)0xff};
+    ASSERT(lance_fts_tokenize(invalid_utf8, sizeof(invalid_utf8), NULL) ==
+               NULL,
+           "invalid UTF-8 should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid UTF-8 should be invalid argument");
+
+    /* Raw tokenization preserves embedded NUL bytes. */
+    const char raw_text[] = {'a', '\0', 'b'};
+    const char *raw_params = "{\"base_tokenizer\":\"raw\"}";
+    tokens = lance_fts_tokenize(raw_text, sizeof(raw_text), raw_params);
+    ASSERT(tokens != NULL, "raw tokenize should succeed");
+    ASSERT(lance_fts_token_list_count(tokens) == 1,
+           "raw tokenizer should emit one token");
+    memset(&view, 0, sizeof(view));
+    ASSERT(lance_fts_token_list_get(tokens, 0, &view) == 0,
+           "raw token should exist");
+    ASSERT(view.text_len == sizeof(raw_text) &&
+               memcmp(view.text, raw_text, sizeof(raw_text)) == 0,
+           "raw token must preserve embedded NUL");
+    ASSERT(view.position == 0, "raw token position should be 0");
+    lance_fts_token_list_close(tokens);
+
+    /* Native deserialization errors are surfaced, not silently defaulted. */
+    const char *bad_params = "{\"base_tokenizer\":\"code\",\"analyzer\":\"text\"}";
+    ASSERT(lance_fts_tokenize("code", 4, bad_params) == NULL,
+           "invalid tokenizer params should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid tokenizer params should be invalid argument");
+
+    const char *simd = lance_simd_info_json();
+    ASSERT(simd != NULL, "SIMD report should succeed");
+    ASSERT(strstr(simd, "\"tier\"") != NULL, "SIMD report needs tier");
+    ASSERT(strstr(simd, "\"target_arch\"") != NULL,
+           "SIMD report needs target_arch");
+    ASSERT(strstr(simd, "\"host_features\"") != NULL,
+           "SIMD report needs host_features");
+    lance_free_string(simd);
+
+    /* Opening and counting rows performs real object-store reads. */
+    uint64_t iops_before = lance_process_iops_counter();
+    uint64_t bytes_before = lance_process_bytes_read_counter();
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "dataset should open for diagnostics");
+    ASSERT(lance_dataset_count_rows(ds) > 0,
+           "diagnostic dataset should have rows");
+    uint64_t iops_after = lance_process_iops_counter();
+    uint64_t bytes_after = lance_process_bytes_read_counter();
+    ASSERT(iops_after >= iops_before, "process IOPS counter is monotonic");
+    ASSERT(bytes_after >= bytes_before,
+           "process bytes counter is monotonic");
+
+    LanceObjectStoreIoStats snapshot_before = {0, 0, 0, 0};
+    ASSERT(lance_dataset_io_stats_snapshot(ds, &snapshot_before) == 0,
+           "dataset snapshot stats should succeed");
+    LanceObjectStoreIoStats incremental_before = {0, 0, 0, 0};
+    ASSERT(lance_dataset_io_stats_incremental(ds, &incremental_before) == 0,
+           "dataset incremental stats should succeed");
+    ASSERT(incremental_before.read_iops == snapshot_before.read_iops,
+           "first incremental read returns the pre-reset snapshot");
+    ASSERT(incremental_before.read_bytes == snapshot_before.read_bytes,
+           "first incremental bytes return the pre-reset snapshot");
+
+    ASSERT(lance_dataset_count_rows(ds) > 0,
+           "repeat dataset read should succeed");
+    LanceObjectStoreIoStats snapshot_after = {0, 0, 0, 0};
+    ASSERT(lance_dataset_io_stats_snapshot(ds, &snapshot_after) == 0,
+           "dataset snapshot stats after read should succeed");
+    LanceObjectStoreIoStats incremental_after = {0, 0, 0, 0};
+    ASSERT(lance_dataset_io_stats_incremental(ds, &incremental_after) == 0,
+           "dataset incremental stats after read should succeed");
+    ASSERT(snapshot_after.read_iops == incremental_after.read_iops,
+           "snapshot and first incremental read must agree after reset");
+    ASSERT(snapshot_after.read_bytes == incremental_after.read_bytes,
+           "snapshot bytes and first incremental read must agree after reset");
+    lance_dataset_close(ds);
+
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -6537,6 +6661,7 @@ int main(int argc, char **argv) {
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
+    test_diagnostics(uri);
     test_config_replacement(config_base_uri);
     test_base_paths_and_add(config_base_uri, alternate_base_uri);
     test_file_enumeration(config_base_uri, alternate_base_uri);
