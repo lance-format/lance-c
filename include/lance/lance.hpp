@@ -4887,8 +4887,7 @@ public:
     /// otherwise the accessor's native Arc is forwarded as-is when it holds
     /// static options or a provider (an accessor with neither passes None),
     /// without resolving or copying credentials. On failure the target is not
-    /// published, but
-    /// partial objects may remain under `target_path`.
+    /// published, but partial objects may remain under `target_path`.
     Dataset deep_clone(
         const std::string& target_path,
         const Ref* reference = nullptr,

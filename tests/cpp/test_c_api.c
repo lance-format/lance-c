@@ -6743,58 +6743,195 @@ static void test_diagnostics(const char *uri) {
 }
 
 
-static void test_dataset_deep_clone(const char *src_uri) {
+/* Read the sorted `id` column of a dataset through the C stream API. */
+static size_t scan_sorted_ids(const LanceDataset *dataset, int32_t *out,
+                              size_t capacity) {
+    LanceScanner *scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "deep clone scan create failed");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "deep clone scan stream failed");
+    size_t count = collect_ordering_ids(&stream, out, capacity);
+    lance_scanner_close(scanner);
+    return count;
+}
+
+static void expect_sorted_ids(const char *label, const LanceDataset *dataset,
+                              const int32_t *expected, size_t expected_count) {
+    int32_t actual[16];
+    size_t count = scan_sorted_ids(dataset, actual, 16);
+    ASSERT(count == expected_count, label);
+    qsort(actual, count, sizeof(int32_t), compare_int32);
+    ASSERT(memcmp(actual, expected, count * sizeof(int32_t)) == 0, label);
+}
+
+/* Build a native clone source from the nested fragment fixture: nullable
+ * struct fields, stable row ids, several fragments, a deletion, config and a
+ * scalar index. Clones then exercise NULL/version/tag/branch references. */
+static void test_dataset_deep_clone(const char *feature_uri) {
     printf("  test_dataset_deep_clone... ");
 
-    LanceDataset *source = lance_dataset_open(src_uri, NULL, 0);
-    ASSERT(source != NULL, "deep clone source open failed");
-    const uint64_t source_version = lance_dataset_version(source);
-    const uint64_t source_rows = lance_dataset_count_rows(source);
-    CHECK_OK();
-    ASSERT(source_rows > 0, "deep clone source must not be empty");
-
+    char fixture_uri[2048];
     char target_a[2048];
     char target_b[2048];
     char target_c[2048];
-    ASSERT(strlen(src_uri) + 32 < sizeof(target_a),
+    char target_d[2048];
+    ASSERT(strlen(feature_uri) + 48 < sizeof(fixture_uri),
            "deep clone fixture uri is too long");
-    snprintf(target_a, sizeof(target_a), "%s.deep-clone-a", src_uri);
-    snprintf(target_b, sizeof(target_b), "%s.deep-clone-b", src_uri);
-    snprintf(target_c, sizeof(target_c), "%s.deep-clone-c", src_uri);
+    snprintf(fixture_uri, sizeof(fixture_uri), "%s.deep-clone-fixture",
+             feature_uri);
+    snprintf(target_a, sizeof(target_a), "%s.deep-clone-a", feature_uri);
+    snprintf(target_b, sizeof(target_b), "%s.deep-clone-b", feature_uri);
+    snprintf(target_c, sizeof(target_c), "%s.deep-clone-c", feature_uri);
+    snprintf(target_d, sizeof(target_d), "%s.deep-clone-d", feature_uri);
+
+    LanceDataset *origin = lance_dataset_open(feature_uri, NULL, 0);
+    ASSERT(origin != NULL, "deep clone fixture source open failed");
+    CHECK_OK();
+    struct ArrowSchema origin_schema;
+    memset(&origin_schema, 0, sizeof(origin_schema));
+    ASSERT(lance_dataset_schema(origin, &origin_schema) == 0,
+           "deep clone fixture schema export failed");
+    CHECK_OK();
+    LanceScanner *origin_scanner = lance_scanner_new(origin, NULL, NULL);
+    ASSERT(origin_scanner != NULL, "deep clone fixture scan create failed");
+    struct ArrowArrayStream origin_stream;
+    memset(&origin_stream, 0, sizeof(origin_stream));
+    ASSERT(lance_scanner_to_arrow_stream(origin_scanner, &origin_stream) == 0,
+           "deep clone fixture scan stream failed");
+    lance_scanner_close(origin_scanner);
+
+    LanceWriteParams params = {0};
+    params.max_rows_per_file = 2;
+    params.max_rows_per_group = 2;
+    params.enable_stable_row_ids = true;
+    LanceDataset *fixture = NULL;
+    CHECK_OK();
+    ASSERT(lance_dataset_write_with_params(
+               fixture_uri, &origin_schema, &origin_stream, LANCE_WRITE_CREATE,
+               &params, NULL, &fixture) == 0,
+           "deep clone fixture write failed");
+    if (origin_schema.release) origin_schema.release(&origin_schema);
+    CHECK_OK();
+    lance_dataset_close(origin);
+    ASSERT(lance_dataset_count_rows(fixture) == 6,
+           "deep clone fixture row count mismatch");
+
+    uint64_t deleted = 0;
+    ASSERT(lance_dataset_delete(fixture, "id = 0", &deleted) == 0,
+           "deep clone fixture delete failed");
+    CHECK_OK();
+    ASSERT(deleted == 1 && lance_dataset_count_rows(fixture) == 5,
+           "deep clone fixture deletion count mismatch");
+
+    const char *config_keys[1] = {"clone.owner"};
+    const char *config_values[1] = {"native-c"};
+    ASSERT(lance_dataset_update_config(fixture, config_keys, config_values, 1) == 0,
+           "deep clone fixture config update failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_create_scalar_index(fixture, "id", "deep_clone_c_id",
+                                             LANCE_SCALAR_BTREE, NULL,
+                                             false) == 0,
+           "deep clone fixture index creation failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(fixture) == 4,
+           "deep clone fixture version mismatch");
+
+    LanceRef *v1 = lance_ref_version_number(1);
+    ASSERT(v1 != NULL, "deep clone version ref create failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_tag_create(fixture, "deep-clone-c-v1", v1) == 0,
+           "deep clone fixture tag create failed");
+    CHECK_OK();
+    LanceRef *tag = lance_ref_tag("deep-clone-c-v1");
+    ASSERT(tag != NULL, "deep clone tag ref create failed");
+    CHECK_OK();
+    LanceDataset *branch =
+        lance_dataset_branch_create(fixture, "deep-clone-c-branch", v1, NULL);
+    ASSERT(branch != NULL, "deep clone fixture branch create failed");
+    CHECK_OK();
+    lance_dataset_close(branch);
+    LanceRef *branch_ref = lance_ref_version("deep-clone-c-branch", false, 0);
+    ASSERT(branch_ref != NULL, "deep clone branch ref create failed");
+    CHECK_OK();
+
+    const int32_t expected_snapshot[] = {2, 3, 10, 11, 13};
+    const int32_t expected_v1[] = {0, 2, 3, 10, 11, 13};
 
     LanceStorageOptionsAccessor *accessor =
         lance_storage_options_accessor_new(NULL, NULL);
     ASSERT(accessor != NULL, "deep clone accessor create failed");
     CHECK_OK();
-
-    LanceDataset *cloned = NULL;
-    ASSERT(lance_dataset_deep_clone(source, target_a, NULL, accessor, &cloned) == 0,
+    LanceDataset *snapshot = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_a, NULL, accessor,
+                                    &snapshot) == 0,
            "deep clone with NULL ref failed");
-    CHECK_OK();
     lance_storage_options_accessor_close(accessor);
-    ASSERT(cloned != NULL, "deep clone did not write the out handle");
-    ASSERT(lance_dataset_version(cloned) == 1,
+    CHECK_OK();
+    ASSERT(snapshot != NULL, "deep clone did not write the out handle");
+    ASSERT(lance_dataset_version(snapshot) == 1,
            "deep clone target must start at version 1");
-    ASSERT(lance_dataset_count_rows(cloned) == source_rows,
-           "deep clone row count mismatch");
-    CHECK_OK();
-    lance_dataset_close(cloned);
+    ASSERT(lance_dataset_count_rows(snapshot) == 5,
+           "deep clone snapshot row count mismatch");
+    expect_sorted_ids("deep clone snapshot ids changed", snapshot,
+                      expected_snapshot, 5);
 
-    LanceRef *version_ref = lance_ref_version_number(source_version);
-    ASSERT(version_ref != NULL, "deep clone version ref create failed");
-    CHECK_OK();
-    cloned = NULL;
-    ASSERT(lance_dataset_deep_clone(source, target_b, version_ref, NULL, &cloned) == 0,
+    LanceDatasetConfig *config = lance_dataset_config(snapshot);
+    ASSERT(config != NULL, "deep clone target config read failed");
+    ASSERT(lance_dataset_config_count(config) == 1,
+           "deep clone target config count mismatch");
+    ASSERT(strcmp(lance_dataset_config_key_at(config, 0), "clone.owner") == 0,
+           "deep clone target config key mismatch");
+    ASSERT(strcmp(lance_dataset_config_value_at(config, 0), "native-c") == 0,
+           "deep clone target config value mismatch");
+    lance_dataset_config_close(config);
+    ASSERT(lance_dataset_index_count(snapshot) >= 1,
+           "deep clone target lost the scalar index");
+
+    LanceDataset *from_version = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_b, v1, NULL,
+                                    &from_version) == 0,
            "deep clone with explicit version ref failed");
     CHECK_OK();
-    ASSERT(lance_dataset_count_rows(cloned) == source_rows,
+    ASSERT(lance_dataset_version(from_version) == 1,
+           "deep clone version ref target version mismatch");
+    ASSERT(lance_dataset_count_rows(from_version) == 6,
            "deep clone version ref row count mismatch");
+    expect_sorted_ids("deep clone version ref ids changed", from_version,
+                      expected_v1, 6);
+
+    LanceDataset *from_tag = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_c, tag, NULL, &from_tag) == 0,
+           "deep clone with tag ref failed");
     CHECK_OK();
-    lance_dataset_close(cloned);
-    lance_ref_close(version_ref);
+    ASSERT(lance_dataset_count_rows(from_tag) == 6,
+           "deep clone tag ref row count mismatch");
+    expect_sorted_ids("deep clone tag ref ids changed", from_tag, expected_v1,
+                      6);
+
+    LanceDataset *from_branch = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_d, branch_ref, NULL,
+                                    &from_branch) == 0,
+           "deep clone with branch ref failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(from_branch) == 6,
+           "deep clone branch ref row count mismatch");
+    expect_sorted_ids("deep clone branch ref ids changed", from_branch,
+                      expected_v1, 6);
+
+    /* The source handle keeps its pinned snapshot when the fixture advances. */
+    deleted = 0;
+    ASSERT(lance_dataset_delete(fixture, "id = 13", &deleted) == 0,
+           "deep clone fixture second delete failed");
+    CHECK_OK();
+    ASSERT(deleted == 1 && lance_dataset_count_rows(fixture) == 4,
+           "deep clone fixture second delete count mismatch");
+    ASSERT(lance_dataset_count_rows(snapshot) == 5,
+           "deep clone snapshot changed with the source");
 
     LanceDataset *sentinel = NULL;
-    ASSERT(lance_dataset_deep_clone(source, target_a, NULL, NULL, &sentinel) == -1,
+    ASSERT(lance_dataset_deep_clone(fixture, target_a, NULL, NULL, &sentinel) == -1,
            "deep clone over an existing target must fail");
     ASSERT(sentinel == NULL, "failed deep clone must not write the out handle");
     expect_error(LANCE_ERR_DATASET_ALREADY_EXISTS, "deep clone existing target");
@@ -6803,32 +6940,59 @@ static void test_dataset_deep_clone(const char *src_uri) {
     ASSERT(missing != NULL, "deep clone missing tag ref create failed");
     CHECK_OK();
     sentinel = NULL;
-    ASSERT(lance_dataset_deep_clone(source, target_c, missing, NULL, &sentinel) == -1,
+    ASSERT(lance_dataset_deep_clone(fixture, target_b, missing, NULL, &sentinel) == -1,
            "deep clone with a missing tag must fail");
     ASSERT(sentinel == NULL, "missing tag must not write the out handle");
     expect_error(LANCE_ERR_NOT_FOUND, "deep clone missing tag");
     lance_ref_close(missing);
 
-    ASSERT(lance_dataset_deep_clone(NULL, target_c, NULL, NULL, &sentinel) == -1,
+    LanceRef *bad_branch =
+        lance_ref_version("deep-clone-no-branch", false, 0);
+    ASSERT(bad_branch != NULL, "deep clone bad branch ref create failed");
+    CHECK_OK();
+    sentinel = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_b, bad_branch, NULL,
+                                    &sentinel) == -1,
+           "deep clone with an unknown branch must fail");
+    ASSERT(sentinel == NULL, "unknown branch must not write the out handle");
+    expect_error(LANCE_ERR_NOT_FOUND, "deep clone unknown branch");
+    lance_ref_close(bad_branch);
+
+    ASSERT(lance_dataset_deep_clone(NULL, target_b, NULL, NULL, &sentinel) == -1,
            "deep clone with a NULL dataset must fail");
     expect_error(LANCE_ERR_INVALID_ARGUMENT, "deep clone NULL dataset");
-    ASSERT(lance_dataset_deep_clone(source, NULL, NULL, NULL, &sentinel) == -1,
+    ASSERT(lance_dataset_deep_clone(fixture, NULL, NULL, NULL, &sentinel) == -1,
            "deep clone with a NULL target path must fail");
     expect_error(LANCE_ERR_INVALID_ARGUMENT, "deep clone NULL target path");
-    ASSERT(lance_dataset_deep_clone(source, target_c, NULL, NULL, NULL) == -1,
+    ASSERT(lance_dataset_deep_clone(fixture, target_b, NULL, NULL, NULL) == -1,
            "deep clone with a NULL out slot must fail");
     expect_error(LANCE_ERR_INVALID_ARGUMENT, "deep clone NULL out slot");
 
-    lance_dataset_close(source);
+    lance_dataset_close(snapshot);
+    lance_dataset_close(from_version);
+    lance_dataset_close(from_tag);
+    lance_dataset_close(from_branch);
+    lance_dataset_close(fixture);
+    lance_ref_close(v1);
+    lance_ref_close(tag);
+    lance_ref_close(branch_ref);
 
-    cloned = lance_dataset_open(target_a, NULL, 0);
-    ASSERT(cloned != NULL, "deep clone target reopen failed");
-    ASSERT(lance_dataset_version(cloned) == 1,
-           "reopened deep clone target version mismatch");
-    ASSERT(lance_dataset_count_rows(cloned) == source_rows,
-           "reopened deep clone target row count mismatch");
+    /* Reopen the independent target with a fresh session. */
+    LanceSession *session = lance_session_new(0, 0);
+    ASSERT(session != NULL, "deep clone reopen session create failed");
     CHECK_OK();
-    lance_dataset_close(cloned);
+    LanceDataset *reopened =
+        lance_dataset_open_with_session(target_a, NULL, 0, session);
+    ASSERT(reopened != NULL, "deep clone target reopen failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(reopened) == 1,
+           "reopened deep clone target version mismatch");
+    ASSERT(lance_dataset_count_rows(reopened) == 5,
+           "reopened deep clone target row count mismatch");
+    expect_sorted_ids("reopened deep clone target ids changed", reopened,
+                      expected_snapshot, 5);
+    lance_dataset_close(reopened);
+    lance_session_close(session);
 
     printf("OK\n");
 }
@@ -6894,7 +7058,7 @@ int main(int argc, char **argv) {
     test_native_scalar_indexes(uri);
     test_minhash_lsh(uri);
     test_dataset_write_roundtrip(uri, write_uri);
-    test_dataset_deep_clone(write_uri);
+    test_dataset_deep_clone(fragment_read_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
     test_diagnostics(uri);
