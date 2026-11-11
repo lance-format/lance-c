@@ -3535,7 +3535,15 @@ static void test_native_write_data_options(
         LANCE_WRITE_CREATE,
         blob_options,
         &dataset);
-    ASSERT(rc == 0, "blob option create failed");
+    if (rc != 0) {
+        const char *message = lance_last_error_message();
+        fprintf(
+            stderr,
+            "FAIL: blob option create failed: %s\n",
+            message != NULL ? message : "unknown error");
+        if (message) lance_free_string(message);
+        exit(1);
+    }
     CHECK_OK();
     ASSERT(lance_dataset_count_rows(dataset) == blob_rows,
            "blob option create row count mismatch");

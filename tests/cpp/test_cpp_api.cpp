@@ -2564,6 +2564,7 @@ static void test_native_write_base_and_presence(
 }
 
 static void test_native_write_data_option_errors(
+    const std::string& src_uri,
     const std::string& blob_uri,
     const std::string& dst_uri) {
     TEST(test_native_write_data_option_errors);
@@ -2580,13 +2581,19 @@ static void test_native_write_data_option_errors(
         lance::NativeWriteOptions options(spec);
         bool caught = false;
         try {
-            auto stream = native_write_source_stream(blob_uri);
+            auto stream = native_write_source_stream(src_uri);
             auto rejected = lance::Dataset::write_with_native_options(
                 file_uri, &stream, lance::WriteMode::Create, options);
             (void)rejected;
         } catch (const lance::Error& error) {
             caught = true;
             assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            if (std::strstr(error.what(), "max_page_bytes") == nullptr) {
+                std::fprintf(
+                    stderr,
+                    "unexpected file-writer error: %s\n",
+                    error.what());
+            }
             assert(std::strstr(error.what(), "max_page_bytes") != nullptr);
         }
         assert(caught);
@@ -5449,7 +5456,7 @@ int main(int argc, char** argv) {
     test_write_options_and_config(uri, write_uri);
     test_native_write_options(uri, write_uri);
     test_native_write_base_and_presence(uri, write_uri);
-    test_native_write_data_option_errors(blob_uri, write_uri);
+    test_native_write_data_option_errors(uri, blob_uri, write_uri);
     test_native_write_progress_errors(uri, write_uri);
     test_native_write_owner_lifetime_and_commit_error(uri, write_uri);
     test_data_statistics(write_uri);
