@@ -3029,6 +3029,24 @@ void lance_schema_close(LanceSchema* schema);
 LanceSchema* lance_schema_clone(const LanceSchema* schema);
 
 /**
+ * Create a native schema from an Arrow C Data Interface schema.
+ *
+ * The input schema is borrowed and not consumed. Native conversion preserves
+ * `lance:field_id` metadata when present and assigns fresh consecutive field
+ * IDs to fields without one, starting at one greater than the highest existing
+ * field ID (0 when none), following native `Schema::try_from`. The resulting
+ * schema is validated for duplicate and unknown field IDs, encodings, and
+ * primary-key metadata.
+ *
+ * On success writes an independently owned handle to `*out_schema` and
+ * returns 0. On error the output slot is untouched.
+ */
+int32_t lance_schema_from_arrow(
+    const struct ArrowSchema* schema,
+    LanceSchema** out_schema
+);
+
+/**
  * Export a native schema as an Arrow C Data Interface view.
  *
  * This is an interoperability view only: Arrow does not represent every native
@@ -8826,6 +8844,866 @@ void lance_delimited_list_close(LanceDelimitedList* list);
 const uint8_t* lance_byte_buffer_data(const LanceByteBuffer* buffer);
 size_t lance_byte_buffer_len(const LanceByteBuffer* buffer);
 void lance_byte_buffer_close(LanceByteBuffer* buffer);
+
+
+/* ─── MemWAL / LSM public workflow ────────────────────────────────────────── */
+
+/**
+ * How initialize_mem_wal() partitions rows into shards.
+ *
+ * These values are this ABI's stable mapping, not native enum discriminants.
+ * New modes append; existing values never change.
+ */
+typedef enum {
+    LANCE_MEM_WAL_SHARDING_MANUAL    = 0,
+    LANCE_MEM_WAL_SHARDING_UNSHARDED = 1,
+    LANCE_MEM_WAL_SHARDING_BUCKET    = 2,
+    LANCE_MEM_WAL_SHARDING_IDENTITY  = 3,
+} LanceMemWalShardingMode;
+
+/**
+ * Distance metric for a MemWAL vector search plan.
+ *
+ * These values are this ABI's stable mapping, not native enum discriminants.
+ * New metrics append; existing values never change.
+ */
+typedef enum {
+    LANCE_MEM_WAL_DISTANCE_L2      = 0,
+    LANCE_MEM_WAL_DISTANCE_COSINE  = 1,
+    LANCE_MEM_WAL_DISTANCE_DOT     = 2,
+    LANCE_MEM_WAL_DISTANCE_HAMMING = 3,
+} LanceMemWalDistanceType;
+
+/**
+ * A compacted SSTable generation, as a native value type.
+ *
+ * Shared with the write and transaction contract; do not redeclare it
+ * elsewhere. `shard_id` holds the 16 canonical UUID bytes in textual
+ * 8-4-4-4-12 order. The value is passed by pointer to
+ * lance_dataset_merge_insert_with_compaction() and copied by native code.
+ */
+typedef struct {
+    uint8_t  shard_id[16];
+    uint64_t generation;
+} LanceCompactedSsTable;
+
+/**
+ * Per-index HNSW build parameters for a shard writer.
+ *
+ * Each `has_*` flag is 0 or 1. A zero flag leaves the native default for that
+ * parameter. `index_name` is required and non-empty. `max_level` must fit in
+ * 16 bits; larger values are rejected instead of truncated. Duplicate
+ * `index_name` entries follow map last-write-wins.
+ */
+typedef struct {
+    const char* index_name;
+    int32_t     has_num_edges;
+    uint32_t    num_edges;
+    int32_t     has_ef_construction;
+    uint32_t    ef_construction;
+    int32_t     has_max_level;
+    uint32_t    max_level;
+} LanceMemWalHnswParams;
+
+/**
+ * Optional overrides for a native ShardWriterConfig.
+ *
+ * A NULL config on lance_shard_writer_open() selects the native default. On
+ * lance_mem_wal_initialize(), a NULL config records no writer-configuration
+ * defaults, while a non-NULL config starts from the native default and records
+ * every resulting default in the MemWAL index. A present field with value 0 is
+ * forwarded to native code except `stats_log_interval_ms`, where 0 disables
+ * periodic logging (native None) and is omitted from the recorded defaults.
+ *
+ * `hnsw_params` is required to be non-NULL when `num_hnsw_params > 0`.
+ */
+typedef struct {
+    int32_t has_durable_write;
+    int32_t durable_write;
+
+    int32_t  has_max_wal_buffer_size;
+    uint64_t max_wal_buffer_size;
+
+    int32_t  has_max_wal_flush_interval_ms;
+    uint64_t max_wal_flush_interval_ms;
+
+    int32_t  has_max_memtable_size;
+    uint64_t max_memtable_size;
+
+    int32_t  has_max_memtable_rows;
+    uint64_t max_memtable_rows;
+
+    int32_t  has_max_memtable_batches;
+    uint64_t max_memtable_batches;
+
+    int32_t  has_max_unflushed_memtable_bytes;
+    uint64_t max_unflushed_memtable_bytes;
+
+    int32_t  has_manifest_scan_batch_size;
+    uint64_t manifest_scan_batch_size;
+
+    int32_t  has_backpressure_log_interval_ms;
+    uint64_t backpressure_log_interval_ms;
+
+    int32_t  has_stats_log_interval_ms;
+    uint64_t stats_log_interval_ms;
+
+    const LanceMemWalHnswParams* hnsw_params;
+    size_t                       num_hnsw_params;
+} LanceShardWriterConfig;
+
+/**
+ * Native write counters captured at the time of the call.
+ *
+ * Durations are nanoseconds and saturate at UINT64_MAX. The counters come from
+ * the native SharedWriteStats owner retained by the writer, so they remain
+ * available after a successful close.
+ */
+typedef struct {
+    uint64_t put_count;
+    uint64_t put_time_nanos;
+    uint64_t wal_flush_count;
+    uint64_t wal_flush_time_nanos;
+    uint64_t wal_flush_bytes;
+    uint64_t wal_io_time_nanos;
+    uint64_t wal_io_count;
+    uint64_t index_update_time_nanos;
+    uint64_t index_update_count;
+    uint64_t index_update_rows;
+    uint64_t memtable_flush_count;
+    uint64_t memtable_flush_time_nanos;
+    uint64_t memtable_flush_rows;
+    uint64_t memtable_flush_failures;
+} LanceShardWriterStats;
+
+/**
+ * Live MemTable and memory statistics for a shard writer.
+ *
+ * Byte totals mirror the Python-public dictionary: `estimated_size_bytes` is
+ * active row data, `index_bytes` is the active in-memory index footprint, and
+ * `retained_bytes` is the whole resident footprint. This call requires a live
+ * native writer; after close it fails with LANCE_ERR_INVALID_ARGUMENT.
+ */
+typedef struct {
+    int32_t  is_live;
+    uint64_t row_count;
+    uint64_t batch_count;
+    uint64_t estimated_size_bytes;
+    uint64_t index_bytes;
+    uint64_t frozen_bytes;
+    uint64_t grace_bytes;
+    uint64_t retained_bytes;
+    uint64_t generation;
+
+    int32_t  has_max_buffered_batch_position;
+    uint64_t max_buffered_batch_position;
+
+    uint64_t durable_batch_count;
+    uint64_t global_offset;
+
+    int32_t  has_pending_wal_start_batch_position;
+    uint64_t pending_wal_start_batch_position;
+    int32_t  has_pending_wal_end_batch_position;
+    uint64_t pending_wal_end_batch_position;
+    uint64_t pending_wal_batch_count;
+    uint64_t pending_wal_row_count;
+    uint64_t pending_wal_estimated_bytes;
+    uint64_t frozen_count;
+} LanceShardMemTableStats;
+
+/**
+ * Writer-global batch positions covered by one put or delete call.
+ *
+ * The range is half-open: `batch_position_begin` is the first covered batch
+ * position and `batch_position_end` is one past the last.
+ */
+typedef struct {
+    uint64_t batch_position_begin;
+    uint64_t batch_position_end;
+} LanceShardWriteResult;
+
+typedef struct LanceMemWalIndexDetails LanceMemWalIndexDetails;
+typedef struct LanceMemWalShardingSpec LanceMemWalShardingSpec;
+typedef struct LanceMemWalShardingField LanceMemWalShardingField;
+typedef struct LanceMemWalShardSnapshot LanceMemWalShardSnapshot;
+typedef struct LanceShardWriter LanceShardWriter;
+typedef struct LanceLsmScanner LanceLsmScanner;
+typedef struct LanceLsmPointLookupPlanner LanceLsmPointLookupPlanner;
+typedef struct LanceLsmVectorSearchPlanner LanceLsmVectorSearchPlanner;
+typedef struct LanceMemWalPlan LanceMemWalPlan;
+
+/**
+ * Initialize MemWAL on a dataset.
+ *
+ * Commits the native MemWAL system index. `mode` selects manual, unsharded,
+ * bucket or identity sharding; bucket ranges and column suitability are
+ * validated by native code. `column` is required for bucket and identity
+ * modes, and must be NULL for manual and unsharded modes. `num_buckets` is
+ * used only for bucket mode and must be 0 otherwise.
+ *
+ * A non-NULL `config` records the resulting native writer defaults in the
+ * MemWAL index; NULL records none. `maintained_indexes` is read only when
+ * `has_maintained_indexes != 0`; zero entries then means "maintain none",
+ * while a zero flag means "maintain every index".
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_mem_wal_initialize(
+    LanceDataset* dataset,
+    LanceMemWalShardingMode mode,
+    const char* column,
+    uint32_t num_buckets,
+    int32_t has_maintained_indexes,
+    const char* const* maintained_indexes,
+    size_t num_maintained_indexes,
+    const LanceShardWriterConfig* config
+);
+
+/**
+ * Read the native MemWAL index details.
+ *
+ * Returns 0 with `*out == NULL` when MemWAL is not initialized on the dataset.
+ * On success with a value, the caller owns `*out` and frees it with
+ * lance_mem_wal_index_details_free().
+ */
+int32_t lance_mem_wal_index_details(
+    LanceDataset* dataset,
+    LanceMemWalIndexDetails** out
+);
+
+/** Free an index-details handle. Safe to call with NULL. */
+void lance_mem_wal_index_details_free(LanceMemWalIndexDetails* details);
+
+/** Number of shards recorded for the MemWAL index. */
+uint32_t lance_mem_wal_index_details_num_shards(
+    const LanceMemWalIndexDetails* details
+);
+
+/** Whether the index maintains every dataset index: 1 or 0. */
+int32_t lance_mem_wal_index_details_maintain_all_indexes(
+    const LanceMemWalIndexDetails* details
+);
+
+/** Count of explicitly maintained index names. */
+size_t lance_mem_wal_index_details_maintained_index_count(
+    const LanceMemWalIndexDetails* details
+);
+
+/**
+ * Borrow one explicitly maintained index name.
+ *
+ * The name remains valid until the details handle is freed. Returns -1 on a
+ * NULL handle or an out-of-range index.
+ */
+int32_t lance_mem_wal_index_details_maintained_index_at(
+    const LanceMemWalIndexDetails* details,
+    size_t index,
+    const char** out_name
+);
+
+/** Count of sharding specs recorded for the index. */
+size_t lance_mem_wal_index_details_sharding_spec_count(
+    const LanceMemWalIndexDetails* details
+);
+
+/**
+ * Clone one sharding spec. The caller owns `*out_spec` and frees it with
+ * lance_mem_wal_sharding_spec_free().
+ */
+int32_t lance_mem_wal_index_details_sharding_spec_at(
+    const LanceMemWalIndexDetails* details,
+    size_t index,
+    LanceMemWalShardingSpec** out_spec
+);
+
+/** Count of recorded writer-configuration defaults. */
+size_t lance_mem_wal_index_details_writer_config_default_count(
+    const LanceMemWalIndexDetails* details
+);
+
+/**
+ * Borrow one recorded writer-configuration default.
+ *
+ * Entries iterate in lexicographic key order. Both strings remain valid until
+ * the details handle is freed.
+ */
+int32_t lance_mem_wal_index_details_writer_config_default_at(
+    const LanceMemWalIndexDetails* details,
+    size_t index,
+    const char** out_key,
+    const char** out_value
+);
+
+/**
+ * Create a sharding field value.
+ *
+ * `field_id`, `result_type` (when non-NULL), parameter keys and parameter
+ * values must be UTF-8. `transform` and `expression` are NULL for native None;
+ * a non-NULL `result_type` is copied, and NULL means the empty string.
+ * Parameters follow map last-write-wins. `source_ids` is required to be
+ * non-NULL when `num_source_ids > 0`.
+ */
+int32_t lance_mem_wal_sharding_field_new(
+    const char* field_id,
+    const int32_t* source_ids,
+    size_t num_source_ids,
+    const char* transform,
+    const char* expression,
+    const char* result_type,
+    const char* const* parameter_keys,
+    const char* const* parameter_values,
+    size_t num_parameters,
+    LanceMemWalShardingField** out
+);
+
+/** Clone a sharding field. The caller owns the result. */
+int32_t lance_mem_wal_sharding_field_clone(
+    const LanceMemWalShardingField* field,
+    LanceMemWalShardingField** out
+);
+
+/** Free a sharding field handle. Safe to call with NULL. */
+void lance_mem_wal_sharding_field_free(LanceMemWalShardingField* field);
+
+/** Borrow the field id. */
+const char* lance_mem_wal_sharding_field_id(
+    const LanceMemWalShardingField* field
+);
+
+/**
+ * Borrow the source field ids. Writes the count to `out_count` and returns
+ * NULL when the count is zero. The pointer remains valid until the handle is
+ * freed.
+ */
+const int32_t* lance_mem_wal_sharding_field_source_ids(
+    const LanceMemWalShardingField* field,
+    size_t* out_count
+);
+
+/** Borrow the transform name, or NULL when native holds None. */
+const char* lance_mem_wal_sharding_field_transform(
+    const LanceMemWalShardingField* field
+);
+
+/** Borrow the transform expression, or NULL when native holds None. */
+const char* lance_mem_wal_sharding_field_expression(
+    const LanceMemWalShardingField* field
+);
+
+/** Borrow the result type; never NULL for a valid handle (may be ""). */
+const char* lance_mem_wal_sharding_field_result_type(
+    const LanceMemWalShardingField* field
+);
+
+/** Count of transform parameters. */
+size_t lance_mem_wal_sharding_field_parameter_count(
+    const LanceMemWalShardingField* field
+);
+
+/**
+ * Borrow one transform parameter in lexicographic key order. Both strings
+ * remain valid until the field handle is freed.
+ */
+int32_t lance_mem_wal_sharding_field_parameter_at(
+    const LanceMemWalShardingField* field,
+    size_t index,
+    const char** out_key,
+    const char** out_value
+);
+
+/**
+ * Create a sharding spec from field handles. Fields are cloned; the caller
+ * keeps ownership of each input handle. `fields` is required to be non-NULL
+ * when `num_fields > 0`.
+ */
+int32_t lance_mem_wal_sharding_spec_new(
+    uint32_t spec_id,
+    const LanceMemWalShardingField* const* fields,
+    size_t num_fields,
+    LanceMemWalShardingSpec** out
+);
+
+/** Clone a sharding spec. The caller owns the result. */
+int32_t lance_mem_wal_sharding_spec_clone(
+    const LanceMemWalShardingSpec* spec,
+    LanceMemWalShardingSpec** out
+);
+
+/** Free a sharding spec handle. Safe to call with NULL. */
+void lance_mem_wal_sharding_spec_free(LanceMemWalShardingSpec* spec);
+
+/** Native spec id. */
+uint32_t lance_mem_wal_sharding_spec_id(
+    const LanceMemWalShardingSpec* spec
+);
+
+/** Count of fields in the spec. */
+size_t lance_mem_wal_sharding_spec_field_count(
+    const LanceMemWalShardingSpec* spec
+);
+
+/**
+ * Clone one field from the spec. The caller owns `*out_field` and frees it
+ * with lance_mem_wal_sharding_field_free().
+ */
+int32_t lance_mem_wal_sharding_spec_field_at(
+    const LanceMemWalShardingSpec* spec,
+    size_t index,
+    LanceMemWalShardingField** out_field
+);
+
+/**
+ * Evaluate a sharding spec against the dataset schema.
+ *
+ * Adds a column named after the spec's `field_id` holding the native shard
+ * value. The caller owns `*out_batch` and closes it with lance_batch_close().
+ */
+int32_t lance_mem_wal_evaluate_sharding_spec(
+    LanceDataset* dataset,
+    const LanceBatch* batch,
+    const LanceMemWalShardingSpec* spec,
+    LanceBatch** out_batch
+);
+
+/**
+ * Evaluate a sharding spec against an explicit native schema.
+ *
+ * Uses the native schema value for field ids and source resolution instead of
+ * the dataset schema. The caller owns `*out_batch`. A NULL schema is invalid.
+ */
+int32_t lance_mem_wal_evaluate_sharding_spec_with_schema(
+    const LanceBatch* batch,
+    const LanceMemWalShardingSpec* spec,
+    const LanceSchema* schema,
+    LanceBatch** out_batch
+);
+
+/**
+ * Create a shard snapshot value.
+ *
+ * `shard_id` is a canonical UUID string. Native starts with spec id 0 and
+ * current generation 1, matching ShardSnapshot::new().
+ */
+int32_t lance_mem_wal_shard_snapshot_new(
+    const char* shard_id,
+    LanceMemWalShardSnapshot** out
+);
+
+/** Clone a shard snapshot. The clone is independently owned. */
+int32_t lance_mem_wal_shard_snapshot_clone(
+    const LanceMemWalShardSnapshot* snapshot,
+    LanceMemWalShardSnapshot** out
+);
+
+/** Free a shard snapshot. Safe to call with NULL. */
+void lance_mem_wal_shard_snapshot_free(LanceMemWalShardSnapshot* snapshot);
+
+/** Borrow the shard UUID string in canonical form. */
+const char* lance_mem_wal_shard_snapshot_shard_id(
+    const LanceMemWalShardSnapshot* snapshot
+);
+
+/** Native spec id. */
+uint32_t lance_mem_wal_shard_snapshot_spec_id(
+    const LanceMemWalShardSnapshot* snapshot
+);
+
+/** Native current generation. */
+uint64_t lance_mem_wal_shard_snapshot_current_generation(
+    const LanceMemWalShardSnapshot* snapshot
+);
+
+/** Set the native spec id. */
+int32_t lance_mem_wal_shard_snapshot_with_spec_id(
+    LanceMemWalShardSnapshot* snapshot,
+    uint32_t spec_id
+);
+
+/** Set the native current generation. */
+int32_t lance_mem_wal_shard_snapshot_with_current_generation(
+    LanceMemWalShardSnapshot* snapshot,
+    uint64_t generation
+);
+
+/**
+ * Append an SSTable reference.
+ *
+ * `path` is copied and is relative to the shard directory. The native optional
+ * measurements are left unmeasured, matching a snapshot built from an external
+ * path. The caller owns the string for the duration of the call.
+ */
+int32_t lance_mem_wal_shard_snapshot_with_sstable(
+    LanceMemWalShardSnapshot* snapshot,
+    uint64_t generation,
+    const char* path
+);
+
+/** Count of referenced SSTables. */
+size_t lance_mem_wal_shard_snapshot_sstable_count(
+    const LanceMemWalShardSnapshot* snapshot
+);
+
+/**
+ * Borrow one SSTable reference: writes its generation and a borrowed path that
+ * remains valid until the snapshot is freed or mutated.
+ */
+int32_t lance_mem_wal_shard_snapshot_sstable_at(
+    const LanceMemWalShardSnapshot* snapshot,
+    size_t index,
+    uint64_t* out_generation,
+    const char** out_path
+);
+
+/**
+ * Create a compacted SSTable value from a UUID string and generation.
+ *
+ * The resulting value is the shared 16-byte UUID plus generation value type.
+ */
+int32_t lance_mem_wal_compacted_sstable_new(
+    const char* shard_id,
+    uint64_t generation,
+    LanceCompactedSsTable* out
+);
+
+/**
+ * Open a native shard writer for one shard.
+ *
+ * Resolves the MemWAL index, sharding spec, maintained index set, store
+ * parameters and session from the dataset. A NULL `config` selects native
+ * ShardWriterConfig::default(). `out` is written only on success; the caller
+ * owns the writer and frees it with lance_shard_writer_free().
+ */
+int32_t lance_shard_writer_open(
+    LanceDataset* dataset,
+    const char* shard_id,
+    const LanceShardWriterConfig* config,
+    LanceShardWriter** out
+);
+
+/** Borrow the writer's canonical shard UUID string. */
+const char* lance_shard_writer_shard_id(
+    const LanceShardWriter* writer
+);
+
+/**
+ * Write batches from an Arrow stream.
+ *
+ * The stream is consumed on every return once `writer` is non-NULL, including
+ * error paths. An empty stream is rejected by native code. `out_result` is
+ * optional; when non-NULL it is written only on success.
+ */
+int32_t lance_shard_writer_put(
+    LanceShardWriter* writer,
+    struct ArrowArrayStream* stream,
+    LanceShardWriteResult* out_result
+);
+
+/**
+ * Delete rows by primary key from an Arrow stream.
+ *
+ * Same stream ownership and result rules as lance_shard_writer_put().
+ */
+int32_t lance_shard_writer_delete(
+    LanceShardWriter* writer,
+    struct ArrowArrayStream* stream,
+    LanceShardWriteResult* out_result
+);
+
+/**
+ * Snapshot native write counters.
+ *
+ * Available after a successful close because the native SharedWriteStats
+ * owner is retained by the handle.
+ */
+int32_t lance_shard_writer_stats(
+    const LanceShardWriter* writer,
+    LanceShardWriterStats* out
+);
+
+/**
+ * Snapshot live MemTable and memory statistics.
+ *
+ * Requires a live native writer; after close this returns
+ * LANCE_ERR_INVALID_ARGUMENT "ShardWriter is already closed". Unsupported in
+ * WAL-only writers, where native returns its own error.
+ */
+int32_t lance_shard_writer_memtable_stats(
+    const LanceShardWriter* writer,
+    LanceShardMemTableStats* out
+);
+
+/**
+ * Build a snapshot from the writer's latest manifest.
+ *
+ * Returns 0 with `*out == NULL` when the shard has no manifest yet. On success
+ * with a value, the caller owns `*out`.
+ */
+int32_t lance_shard_writer_snapshot(
+    const LanceShardWriter* writer,
+    LanceMemWalShardSnapshot** out
+);
+
+/**
+ * Create an LSM scanner over the supplied snapshots plus this writer's latest
+ * manifest, and attach the writer's active plus frozen-awaiting-flush
+ * MemTables. A snapshot with the same shard id is replaced by the writer's
+ * latest state. The scanner retains the captured native owners after the
+ * writer closes.
+ */
+int32_t lance_shard_writer_lsm_scanner(
+    LanceShardWriter* writer,
+    const LanceMemWalShardSnapshot* const* snapshots,
+    size_t num_snapshots,
+    LanceLsmScanner** out
+);
+
+/**
+ * Flush and close the native writer.
+ *
+ * The native writer is consumed on every result. A later close succeeds, even
+ * after an earlier failure; the first call reports its own native error.
+ * Pending WAL and MemTable failures surface from this call. `stats` remains
+ * available afterwards; MemTable-only operations do not.
+ */
+int32_t lance_shard_writer_close(LanceShardWriter* writer);
+
+/** Free a shard writer. Does not flush; close it first for durability. */
+void lance_shard_writer_free(LanceShardWriter* writer);
+
+/**
+ * Create an LSM scanner over a dataset and snapshots, without an active
+ * MemTable. Primary-key columns come from the dataset schema.
+ */
+int32_t lance_lsm_scanner_from_snapshots(
+    LanceDataset* dataset,
+    const LanceMemWalShardSnapshot* const* snapshots,
+    size_t num_snapshots,
+    LanceLsmScanner** out
+);
+
+/**
+ * Project the scan onto ordered column names. An empty list is passed to
+ * native code as an empty projection; `columns` may be NULL only when
+ * `num_columns == 0`. The scanner is updated only on success.
+ */
+int32_t lance_lsm_scanner_project(
+    LanceLsmScanner* scanner,
+    const char* const* columns,
+    size_t num_columns
+);
+
+/** Set a native SQL filter expression. The scanner is updated only on success. */
+int32_t lance_lsm_scanner_filter(
+    LanceLsmScanner* scanner,
+    const char* filter
+);
+
+/**
+ * Limit the scan, optionally with an offset. Each `has_*` flag is 0 or 1 and
+ * a present negative value is rejected. The scanner is updated only on
+ * success.
+ */
+int32_t lance_lsm_scanner_limit(
+    LanceLsmScanner* scanner,
+    int64_t limit,
+    int32_t has_limit,
+    int64_t offset,
+    int32_t has_offset
+);
+
+/** Include the `_rowaddr` internal column. */
+int32_t lance_lsm_scanner_with_row_address(LanceLsmScanner* scanner);
+
+/** Include the `_memtable_gen` internal column. */
+int32_t lance_lsm_scanner_with_memtable_gen(LanceLsmScanner* scanner);
+
+/** Schema produced by the scanner's native composition. */
+int32_t lance_lsm_scanner_schema(
+    const LanceLsmScanner* scanner,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Execute the scan and return one batch. The caller owns `*out` and closes it
+ * with lance_batch_close().
+ */
+int32_t lance_lsm_scanner_to_batch(
+    const LanceLsmScanner* scanner,
+    LanceBatch** out
+);
+
+/**
+ * Execute the scan and export an Arrow stream. The scanner is not consumed and
+ * its native owners remain alive independently of the scan result.
+ */
+int32_t lance_lsm_scanner_to_arrow_stream(
+    const LanceLsmScanner* scanner,
+    struct ArrowArrayStream* out
+);
+
+/** Count matching rows without materializing them. */
+int32_t lance_lsm_scanner_count_rows(
+    const LanceLsmScanner* scanner,
+    uint64_t* out_count
+);
+
+/** Free an LSM scanner. Safe to call with NULL. */
+void lance_lsm_scanner_free(LanceLsmScanner* scanner);
+
+/**
+ * Create a point-lookup planner.
+ *
+ * `pk_columns` is read only when `has_pk_columns != 0`; otherwise the native
+ * dataset primary key is used and an absent primary key is an error. The
+ * planner captures the snapshots and dataset schema. `out` is written only on
+ * success.
+ */
+int32_t lance_lsm_point_lookup_planner_new(
+    LanceDataset* dataset,
+    const LanceMemWalShardSnapshot* const* snapshots,
+    size_t num_snapshots,
+    int32_t has_pk_columns,
+    const char* const* pk_columns,
+    size_t num_pk_columns,
+    LanceLsmPointLookupPlanner** out
+);
+
+/**
+ * Plan a point lookup for exactly one key row.
+ *
+ * `pk_value` must contain exactly one row. For a single-column primary key it
+ * must have exactly one non-Struct column; for a composite key it must have
+ * exactly one Struct column carrying one field per primary-key column.
+ * `columns` is read only when `has_columns != 0`. The caller owns `*out_plan`.
+ */
+int32_t lance_lsm_point_lookup_planner_plan(
+    LanceLsmPointLookupPlanner* planner,
+    const LanceBatch* pk_value,
+    int32_t has_columns,
+    const char* const* columns,
+    size_t num_columns,
+    LanceMemWalPlan** out
+);
+
+/** Free a point-lookup planner. Safe to call with NULL. */
+void lance_lsm_point_lookup_planner_free(
+    LanceLsmPointLookupPlanner* planner
+);
+
+/**
+ * Create a vector-search planner.
+ *
+ * The vector column must be a native FixedSizeList column. `filter` is an
+ * optional native SQL filter expression. `pk_columns` follows the same rule as
+ * the point-lookup planner. Distance values are this ABI's stable mapping.
+ */
+int32_t lance_lsm_vector_search_planner_new(
+    LanceDataset* dataset,
+    const LanceMemWalShardSnapshot* const* snapshots,
+    size_t num_snapshots,
+    const char* vector_column,
+    int32_t has_pk_columns,
+    const char* const* pk_columns,
+    size_t num_pk_columns,
+    LanceMemWalDistanceType distance_type,
+    const char* filter,
+    LanceLsmVectorSearchPlanner** out
+);
+
+/**
+ * Plan a KNN search over the captured LSM tiers.
+ *
+ * `query` holds exactly `query_len == vector_dimension` float32 values and is
+ * required to be non-NULL when `query_len > 0`. `k`, `nprobes` and
+ * `overfetch_factor` are validated by native code. `columns` is read only when
+ * `has_columns != 0`. The caller owns `*out_plan`.
+ */
+int32_t lance_lsm_vector_search_planner_plan(
+    LanceLsmVectorSearchPlanner* planner,
+    const float* query,
+    size_t query_len,
+    uint64_t k,
+    uint64_t nprobes,
+    int32_t has_columns,
+    const char* const* columns,
+    size_t num_columns,
+    int32_t refine_base_table,
+    double overfetch_factor,
+    LanceMemWalPlan** out
+);
+
+/** Free a vector-search planner. Safe to call with NULL. */
+void lance_lsm_vector_search_planner_free(
+    LanceLsmVectorSearchPlanner* planner
+);
+
+/**
+ * Export the plan's output schema as Arrow. `out` is caller-owned and its
+ * non-NULL release callback must be invoked exactly once.
+ */
+int32_t lance_mem_wal_plan_schema(
+    const LanceMemWalPlan* plan,
+    struct ArrowSchema* out
+);
+
+/**
+ * Export the dataset schema captured by the planner as Arrow. `out` is
+ * caller-owned.
+ */
+int32_t lance_mem_wal_plan_dataset_schema(
+    const LanceMemWalPlan* plan,
+    struct ArrowSchema* out
+);
+
+/**
+ * Format the native DataFusion plan tree without executing it. The returned
+ * string is NUL-terminated, owned by the caller, and must be freed with
+ * lance_free_string(). Returns -1 on error.
+ */
+int32_t lance_mem_wal_plan_explain(
+    const LanceMemWalPlan* plan,
+    char** out
+);
+
+/**
+ * Execute the plan and concatenate its batches into one. The caller owns
+ * `*out` and closes it with lance_batch_close().
+ */
+int32_t lance_mem_wal_plan_to_batch(
+    const LanceMemWalPlan* plan,
+    LanceBatch** out
+);
+
+/**
+ * Execute the plan and export an Arrow stream. Execution errors are reported
+ * with the prefix "Plan execution failed: ". The plan remains valid.
+ */
+int32_t lance_mem_wal_plan_to_arrow_stream(
+    const LanceMemWalPlan* plan,
+    struct ArrowArrayStream* out
+);
+
+/** Free an execution plan. Safe to call with NULL. */
+void lance_mem_wal_plan_free(LanceMemWalPlan* plan);
+
+/**
+ * Merge-insert with atomic MemWAL SSTable compaction progress.
+ *
+ * Behaves like lance_dataset_merge_insert(), then marks `compacted_sstables`
+ * as compacted in the same commit. Call this only on the final data-changing
+ * pass of a multi-pass compaction. `compacted_sstables` is required to be
+ * non-NULL when `num_compacted_sstables > 0`.
+ */
+int32_t lance_dataset_merge_insert_with_compaction(
+    LanceDataset* dataset,
+    const char* const* on_columns,
+    size_t num_on_columns,
+    struct ArrowArrayStream* source,
+    const LanceMergeInsertParams* params,
+    const LanceCompactedSsTable* compacted_sstables,
+    size_t num_compacted_sstables,
+    LanceMergeInsertResult* out_result
+);
 
 #ifdef __cplusplus
 } /* extern "C" */

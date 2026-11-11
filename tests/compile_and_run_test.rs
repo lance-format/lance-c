@@ -1486,3 +1486,76 @@ fn test_native_namespace_compilation_and_execution() {
     );
     run_test_binary_with_dataset(&cpp_binary, root);
 }
+
+fn create_mem_wal_dataset_on_disk() -> (tempfile::TempDir, String) {
+    use std::collections::HashMap;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("mem_wal_cpp_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut pk = HashMap::new();
+    pk.insert(
+        "lance-schema:unenforced-primary-key".to_string(),
+        "true".to_string(),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(pk),
+        Field::new("name", DataType::Utf8, true),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+            true,
+        ),
+    ]));
+    let ids = vec![1_i32, 2, 3];
+    let names = vec!["a", "b", "c"];
+    let flat: Vec<f32> = (0..3).flat_map(|i| vec![i as f32, 0.0, 0.0, 0.0]).collect();
+    let vector = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        4,
+        Arc::new(Float32Array::from(flat)),
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(vector),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+    (tmp, uri)
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test --test compile_and_run_test -- --ignored test_mem_wal_cpp_compilation_and_execution"]
+fn test_mem_wal_cpp_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (_tmp, uri) = create_mem_wal_dataset_on_disk();
+    let build_dir = tempfile::tempdir().unwrap();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp")
+        .join("mem_wal_test.cpp");
+    let binary = build_dir.path().join("mem_wal_test_cpp");
+    assert!(
+        compile_cpp_test(&[&source], &binary, &include_dir, &lib_path),
+        "C++ MemWAL test compilation failed"
+    );
+    run_test_binary_with_dataset(&binary, &uri);
+}
