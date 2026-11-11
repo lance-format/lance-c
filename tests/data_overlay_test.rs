@@ -74,7 +74,8 @@ async fn create_fixture(uri: &str) -> Dataset {
     )
     .await
     .unwrap();
-    dataset.delete("id = 10").await.unwrap()
+    dataset.delete("id = 10").await.unwrap();
+    dataset
 }
 
 struct Fixture {
@@ -309,12 +310,7 @@ fn commit(
 
 fn read_native_batch(dataset: &Dataset) -> RecordBatch {
     lance_c::runtime::block_on(async {
-        dataset
-            .scan()
-            .with_row_id(true)
-            .try_into_batch()
-            .await
-            .unwrap()
+        dataset.scan().with_row_id().try_into_batch().await.unwrap()
     })
 }
 
@@ -385,11 +381,7 @@ fn assert_values(dataset: &Dataset, expected: &[(i32, Option<i32>, Option<i32>)]
 #[test]
 fn data_overlay_value_and_operation_lifetimes() {
     let fixture = lance_c::runtime::block_on(Fixture::new());
-    let mut fragment_count = 0usize;
-    assert_eq!(
-        unsafe { lance_dataset_fragment_count(fixture.dataset, &mut fragment_count) },
-        0
-    );
+    let fragment_count = unsafe { lance_dataset_fragment_count(fixture.dataset) };
     assert_eq!(fragment_count, 2);
     let mut ids = vec![0u64; fragment_count];
     assert_eq!(
@@ -683,7 +675,7 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
 
     let (second, _) = {
         let mut second_writer_schema = ptr::null_mut();
-        let mut second_fragment = ptr::null_mut();
+        let second_fragment;
         let c_uri = c_string(&fixture.uri);
         let reopened = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
         assert!(!reopened.is_null());
@@ -730,7 +722,7 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
 
     let old = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
     let c_uri = c_string(&fixture.uri);
-    let mut old_handle = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 1) };
+    let old_handle = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 1) };
     assert!(!old_handle.is_null());
     let old_fragment = unsafe { lance_dataset_open_fragment(old_handle, ids[0]) };
     assert!(!old_fragment.is_null());
