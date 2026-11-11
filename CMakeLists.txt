@@ -42,6 +42,14 @@ if(NOT LANCE_C_USE_PREBUILT)
         CRATE_TYPES staticlib cdylib
         PROFILE release
     )
+    if(Rust_CARGO_TARGET MATCHES "apple-darwin$")
+        # Corrosion selects its own linker, overriding Cargo's environment.
+        # Keep the dylib export policy on the actual imported build target.
+        corrosion_set_linker(lance_c
+            "${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-macos-exports.sh")
+        corrosion_set_env_vars(lance_c
+            "LANCE_C_MACOS_LINKER=${CMAKE_C_COMPILER}")
+    endif()
 endif()
 
 # Imported targets and install rules are added in subsequent tasks.
