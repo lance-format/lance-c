@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow::record_batch::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -862,7 +863,7 @@ unsafe fn dataset_write_namespace_inner(
     let table_id = unsafe { table_id_from_json(table_id_json)? };
     let expected_schema = ArrowSchema::try_from(unsafe { &*schema })
         .map_err(|error| Error::invalid_input_source(format!("invalid schema: {error}").into()))?;
-    let stream_schema = reader.arrow_schema();
+    let stream_schema = reader.schema();
     if stream_schema.fields() != expected_schema.fields() {
         return Err(Error::invalid_input_source(
             format!(

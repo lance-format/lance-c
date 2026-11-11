@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use lance_c::*;
@@ -153,6 +154,30 @@ fn assert_native_unsupported(namespace: *const LanceNamespace, operation: &str, 
         .expect("native error must be preserved");
     assert_eq!(code, 0, "{operation} native Unsupported code");
     assert!(!message.is_empty(), "{operation} native error message");
+}
+
+fn make_vector_batch() -> (Schema, RecordBatch) {
+    const DIM: i32 = 2;
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+            false,
+        ),
+    ]);
+    let ids = Int32Array::from(vec![0, 1, 2]);
+    let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), DIM);
+    for id in 0..3 {
+        vectors.values().append_slice(&[id as f32, 0.0]);
+        vectors.append(true);
+    }
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(ids), Arc::new(vectors.finish())],
+    )
+    .unwrap();
+    (schema, batch)
 }
 
 fn make_batch() -> (Arc<Schema>, RecordBatch) {
@@ -641,6 +666,21 @@ fn rest_adapter_client_context_headers_metrics_and_native_errors() {
     let table_id = r#"["workspace","rest-table"]"#;
     let dataset = write_namespace(client, table_id, 0, &schema, batch);
     unsafe { lance_dataset_close(dataset) };
+    let (vector_schema, vector_batch) = make_vector_batch();
+    let vector_table = r#"["workspace","rest-vectors"]"#;
+    let dataset = write_namespace(client, vector_table, 0, &vector_schema, vector_batch);
+    unsafe { lance_dataset_close(dataset) };
+    let (rc, query) = call(
+        client,
+        "query_table",
+        r#"{"id":["workspace","rest-vectors"],"k":2,"vector":{"single_vector":[0.0,0.0]},"vector_column":"vector"}"#,
+        None,
+    );
+    assert_eq!(rc, 0, "REST query failed: {}", last_error());
+    assert!(
+        query.bytes().windows(6).any(|window| window == b"ARROW1"),
+        "query_table must return a native Arrow IPC stream"
+    );
     let count = assert_call_ok(
         client,
         "count_table_rows",
