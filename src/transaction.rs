@@ -2209,7 +2209,7 @@ unsafe fn operation_overwrite_new_inner(
     initial_bases: *const LanceBasePathList,
 ) -> Result<*mut LanceOperation> {
     let schema = unsafe { schema_ref(schema) }?.inner.clone();
-    let fragments = unsafe { clone_fragment_array(fragments, fragment_count) }?;
+    let fragments = unsafe { clone_fragment_array(fragments, fragment_count, "fragments") }?;
     let config_upsert_values =
         unsafe { parse_string_map(config_upsert_values, "config_upsert_values") }?;
     let initial_bases = unsafe { parse_base_path_list(initial_bases) }?;
@@ -2254,7 +2254,7 @@ unsafe fn operation_merge_new_inner(
     preserves_nullability: bool,
 ) -> Result<*mut LanceOperation> {
     let schema = unsafe { schema_ref(schema) }?.inner.clone();
-    let fragments = unsafe { clone_fragment_array(fragments, fragment_count) }?;
+    let fragments = unsafe { clone_fragment_array(fragments, fragment_count, "fragments") }?;
     Ok(Box::into_raw(Box::new(LanceOperation::from_native(
         Operation::Merge {
             fragments,
