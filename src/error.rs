@@ -72,7 +72,10 @@ pub fn error_code_from_lance(err: &lance_core::Error) -> LanceErrorCode {
     match err {
         Error::InvalidInput { .. } | Error::InvalidRef { .. } => LanceErrorCode::InvalidArgument,
         Error::DatasetAlreadyExists { .. } => LanceErrorCode::DatasetAlreadyExists,
-        Error::CommitConflict { .. } | Error::RefConflict { .. } => LanceErrorCode::CommitConflict,
+        Error::CommitConflict { .. }
+        | Error::RetryableCommitConflict { .. }
+        | Error::IncompatibleTransaction { .. }
+        | Error::RefConflict { .. } => LanceErrorCode::CommitConflict,
         Error::DatasetNotFound { .. }
         | Error::NotFound { .. }
         | Error::IndexNotFound { .. }

@@ -17,6 +17,7 @@ use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
+use lance_table::format::Fragment;
 
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
@@ -127,10 +128,14 @@ pub unsafe extern "C" fn lance_fragment_metadata_json(
 
 unsafe fn metadata_json_inner(fragment: *const LanceFragment) -> Result<*const c_char> {
     let fragment = unsafe { fragment_ref(fragment) }?;
-    let json = serde_json::to_string(fragment.inner.metadata()).map_err(|error| {
+    fragment_metadata_json(fragment.inner.metadata())
+}
+
+pub(crate) fn fragment_metadata_json(fragment: &Fragment) -> Result<*const c_char> {
+    let json = serde_json::to_string(fragment).map_err(|error| {
         Error::internal(format!(
             "failed to serialize metadata for fragment {}: {error}",
-            fragment.inner.id()
+            fragment.id
         ))
     })?;
     CString::new(json)
@@ -138,7 +143,7 @@ unsafe fn metadata_json_inner(fragment: *const LanceFragment) -> Result<*const c
         .map_err(|error| {
             Error::internal(format!(
                 "fragment {} metadata JSON contains an embedded NUL: {error}",
-                fragment.inner.id()
+                fragment.id
             ))
         })
 }
@@ -285,6 +290,50 @@ unsafe fn fragment_scan_inner(fragment: *const LanceFragment) -> Result<*mut Lan
     Ok(Box::into_raw(Box::new(LanceScanner::from_fragment(
         &fragment.inner,
     ))))
+}
+
+/// Delete rows from this fragment without publishing a transaction.
+///
+/// The input fragment is borrowed and cloned before Lance's consuming
+/// `FileFragment::delete` runs, so the input handle remains usable. A partial
+/// deletion returns an independently owned fragment whose metadata carries the
+/// staged deletion file. Deleting every row succeeds with NULL output. On any
+/// error, `out_fragment` is unchanged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_fragment_delete(
+    fragment: *const LanceFragment,
+    predicate: *const c_char,
+    out_fragment: *mut *mut LanceFragment,
+) -> i32 {
+    ffi_try!(
+        unsafe { fragment_delete_inner(fragment, predicate, out_fragment) },
+        neg
+    )
+}
+
+unsafe fn fragment_delete_inner(
+    fragment: *const LanceFragment,
+    predicate: *const c_char,
+    out_fragment: *mut *mut LanceFragment,
+) -> Result<i32> {
+    let fragment = unsafe { fragment_ref(fragment) }?;
+    if out_fragment.is_null() {
+        return Err(Error::invalid_input_source(
+            "out_fragment must not be NULL".into(),
+        ));
+    }
+    let predicate = unsafe { helpers::parse_c_string(predicate)? }
+        .ok_or_else(|| Error::invalid_input_source("predicate must not be NULL".into()))?;
+
+    let updated = block_on(fragment.inner.clone().delete(predicate))?;
+    let updated = match updated {
+        Some(updated) => Box::into_raw(Box::new(LanceFragment { inner: updated })),
+        None => ptr::null_mut(),
+    };
+    unsafe {
+        ptr::write(out_fragment, updated);
+    }
+    Ok(0)
 }
 
 fn fragment_take_projection(

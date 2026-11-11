@@ -162,6 +162,46 @@ static void check_properties(const LanceTransaction *transaction,
     }
 }
 
+static void check_property_value(const LanceTransaction *transaction,
+                                 const char *expected_key,
+                                 const char *expected_value) {
+    uint64_t count = 0;
+    ASSERT(lance_transaction_property_count(transaction, &count) == 0,
+           "read transaction property count");
+    CHECK_OK();
+    for (uint64_t i = 0; i < count; ++i) {
+        const char *key = lance_transaction_property_key_at(transaction, i);
+        const char *value = lance_transaction_property_value_at(transaction, i);
+        ASSERT(key != NULL && value != NULL, "transaction property entry");
+        int matches = strcmp(key, expected_key) == 0 &&
+                      strcmp(value, expected_value) == 0;
+        lance_free_string(key);
+        lance_free_string(value);
+        if (matches) return;
+    }
+    fprintf(stderr, "missing transaction property: %s=%s\n", expected_key,
+            expected_value);
+    exit(1);
+}
+
+static uint64_t scanner_row_count(LanceScanner *scanner) {
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "export scanner stream");
+    CHECK_OK();
+    uint64_t rows = 0;
+    while (1) {
+        struct ArrowArray array = {0};
+        ASSERT(stream.get_next(&stream, &array) == 0,
+               "read scanner stream");
+        if (!array.release) break;
+        rows += (uint64_t)array.length;
+        array.release(&array);
+    }
+    stream.release(&stream);
+    return rows;
+}
+
 static LanceDataset *commit_transaction(
     const char *uri,
     const LanceTransaction *transaction,
@@ -400,6 +440,256 @@ static void test_validation(const char *base) {
     printf("validation OK\n");
 }
 
+static void test_fragment_delete(const char *src_uri, const char *base) {
+    char uri[4096];
+    snprintf(uri, sizeof(uri), "%s/c_fragment_delete", base);
+
+    LanceUncommittedWriteOptions options;
+    memset(&options, 0, sizeof(options));
+    options.write.params.max_rows_per_file = 4;
+    options.write.params.enable_stable_row_ids = true;
+    LanceTransaction *create = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_CREATE, &options);
+    LanceDataset *dataset = commit_transaction(uri, create, NULL);
+    lance_transaction_close(create);
+    ASSERT(lance_dataset_version(dataset) == 1, "delete fixture version 1");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == 20,
+           "delete fixture rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(dataset) == 5,
+           "delete fixture fragments");
+    CHECK_OK();
+    uint64_t num_deleted = 0;
+    ASSERT(lance_dataset_delete(dataset, "id IN (2, 6)", &num_deleted) == 0,
+           "seed existing deletion files");
+    CHECK_OK();
+    ASSERT(num_deleted == 2, "seed deletion count");
+
+    uint64_t version = lance_dataset_version(dataset);
+    CHECK_OK();
+    uint64_t ids[5] = {0};
+    ASSERT(lance_dataset_fragment_ids(dataset, ids) == 0,
+           "delete fixture fragment IDs");
+    CHECK_OK();
+    LanceFragment *first = lance_dataset_open_fragment(dataset, ids[0]);
+    LanceFragment *second = lance_dataset_open_fragment(dataset, ids[1]);
+    ASSERT(first != NULL && second != NULL, "open delete fixture fragments");
+    CHECK_OK();
+    lance_dataset_close(dataset);
+
+    LanceFragment *no_delete = (LanceFragment *)(uintptr_t)0x1;
+    ASSERT(lance_fragment_delete(first, "false", &no_delete) == 0,
+           "no-op fragment delete");
+    CHECK_OK();
+    ASSERT(no_delete != NULL, "no-op delete returns fragment metadata");
+    ASSERT(lance_fragment_id(no_delete) == ids[0],
+           "no-op delete preserves fragment ID");
+    lance_fragment_close(no_delete);
+
+    LanceFragment *all_deleted = (LanceFragment *)(uintptr_t)0x1;
+    ASSERT(lance_fragment_delete(second, "true", &all_deleted) == 0,
+           "full fragment delete");
+    CHECK_OK();
+    ASSERT(all_deleted == NULL, "full fragment delete writes NULL");
+
+    LanceFragment *sentinel = (LanceFragment *)(uintptr_t)0x2;
+    LanceFragment *staged = sentinel;
+    ASSERT(lance_fragment_delete(second, NULL, &staged) == -1,
+           "NULL delete predicate must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL predicate error code");
+    ASSERT(staged == sentinel, "failed delete must leave output unchanged");
+    const char *message = lance_last_error_message();
+    if (message) lance_free_string(message);
+
+    ASSERT(lance_fragment_delete(first, "id = 3", &staged) == 0,
+           "partial fragment delete");
+    CHECK_OK();
+    ASSERT(staged != NULL, "partial delete returns updated metadata");
+    uint64_t logical_rows = 0;
+    ASSERT(lance_fragment_logical_rows(staged, &logical_rows) == 0,
+           "staged logical row count");
+    CHECK_OK();
+    ASSERT(logical_rows == 2, "staged logical row count mismatch");
+    LanceScanner *scanner = lance_fragment_scan(staged);
+    ASSERT(scanner != NULL, "staged fragment scanner");
+    CHECK_OK();
+    ASSERT(scanner_row_count(scanner) == 2,
+           "staged scanner must read the new deletion file");
+    lance_scanner_close(scanner);
+
+    const LanceFragment *updated[] = {staged};
+    const uint64_t deleted[] = {ids[1]};
+    LanceOperation *operation =
+        lance_operation_delete_new(updated, 1, deleted, 1,
+                                   "id = 3 OR true");
+    ASSERT(operation != NULL, "construct Delete operation");
+    CHECK_OK();
+    LanceOperationKind kind = LANCE_OPERATION_UNKNOWN;
+    ASSERT(lance_operation_kind(operation, &kind) == 0 &&
+               kind == LANCE_OPERATION_DELETE,
+           "Delete operation kind");
+    CHECK_OK();
+    uint64_t updated_count = 0;
+    ASSERT(lance_operation_delete_updated_fragment_count(
+               operation, &updated_count) == 0 &&
+               updated_count == 1,
+           "updated Delete fragment count");
+    CHECK_OK();
+    const char *updated_json =
+        lance_operation_delete_updated_fragment_metadata_json_at(operation, 0);
+    ASSERT(updated_json != NULL, "updated Delete metadata JSON");
+    CHECK_OK();
+    ASSERT(strstr(updated_json, "\"deletion_file\":{") != NULL,
+           "updated metadata carries staged deletion file");
+    lance_free_string(updated_json);
+    uint64_t deleted_id = UINT64_MAX;
+    ASSERT(lance_operation_delete_deleted_fragment_id_at(
+               operation, 0, &deleted_id) == 0 &&
+               deleted_id == ids[1],
+           "deleted fragment ID");
+    CHECK_OK();
+    const char *operation_predicate =
+        lance_operation_delete_predicate(operation);
+    ASSERT(operation_predicate != NULL &&
+               strcmp(operation_predicate, "id = 3 OR true") == 0,
+           "Delete predicate inspection");
+    lance_free_string(operation_predicate);
+
+    const char *property_keys[] = {"engine=c11", "empty"};
+    const char *property_values[] = {"用户", ""};
+    LanceTransactionOptions transaction_options;
+    memset(&transaction_options, 0, sizeof(transaction_options));
+    transaction_options.tag = "c11-fragment-delete";
+    transaction_options.has_transaction_properties = true;
+    transaction_options.property_keys = property_keys;
+    transaction_options.property_values = property_values;
+    transaction_options.property_count = 2;
+    LanceTransaction *transaction =
+        lance_transaction_new(version, operation, &transaction_options);
+    ASSERT(transaction != NULL, "construct Delete transaction");
+    CHECK_OK();
+    ASSERT(transaction_read_version(transaction) == version,
+           "Delete transaction read version");
+    const char *tag = NULL;
+    ASSERT(lance_transaction_tag(transaction, &tag) == 1,
+           "Delete transaction tag");
+    CHECK_OK();
+    ASSERT(tag != NULL && strcmp(tag, "c11-fragment-delete") == 0,
+           "Delete transaction tag value");
+    lance_free_string(tag);
+    check_property_value(transaction, "engine=c11", "用户");
+    check_property_value(transaction, "empty", "");
+
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    ASSERT(lance_transaction_to_proto(transaction, &bytes, &len) == 0,
+           "serialize Delete transaction");
+    CHECK_OK();
+    LanceTransaction *parsed = lance_transaction_from_proto(bytes, len);
+    lance_free_bytes(bytes);
+    ASSERT(parsed != NULL, "parse Delete transaction protobuf");
+    CHECK_OK();
+    ASSERT(transaction_operation_kind(parsed) == LANCE_OPERATION_DELETE,
+           "parsed Delete operation kind");
+
+    lance_fragment_close(staged);
+    lance_fragment_close(first);
+    lance_fragment_close(second);
+    lance_operation_close(operation);
+
+    LanceCommitOptions commit_options;
+    memset(&commit_options, 0, sizeof(commit_options));
+    commit_options.has_max_retries = true;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = LANCE_COMMIT_TIMEOUT_DISABLED;
+    dataset = commit_transaction(uri, parsed, &commit_options);
+    lance_transaction_close(parsed);
+    lance_transaction_close(transaction);
+    ASSERT(lance_dataset_version(dataset) == version + 1,
+           "Delete publishes one version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == 14,
+           "Delete publication row count");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(dataset) == 4,
+           "Delete publication fragment count");
+    CHECK_OK();
+    lance_dataset_close(dataset);
+
+    dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "reopen Delete publication");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == version + 1 &&
+               lance_dataset_count_rows(dataset) == 14,
+           "Delete publication persisted");
+    CHECK_OK();
+
+    uint64_t current_ids[4] = {0};
+    ASSERT(lance_dataset_fragment_ids(dataset, current_ids) == 0,
+           "reopened fragment IDs");
+    CHECK_OK();
+    LanceFragment *left = lance_dataset_open_fragment(dataset, current_ids[0]);
+    LanceFragment *right = lance_dataset_open_fragment(dataset, current_ids[0]);
+    ASSERT(left != NULL && right != NULL, "open conflict fragments");
+    CHECK_OK();
+    uint64_t current_version = lance_dataset_version(dataset);
+    CHECK_OK();
+    lance_dataset_close(dataset);
+
+    LanceFragment *left_update = NULL;
+    LanceFragment *right_update = NULL;
+    ASSERT(lance_fragment_delete(left, "id = 1", &left_update) == 0,
+           "stage left conflict deletion");
+    CHECK_OK();
+    ASSERT(lance_fragment_delete(right, "id = 4", &right_update) == 0,
+           "stage right conflict deletion");
+    CHECK_OK();
+    const LanceFragment *left_updates[] = {left_update};
+    const LanceFragment *right_updates[] = {right_update};
+    LanceOperation *left_operation = lance_operation_delete_new(
+        left_updates, 1, NULL, 0, "id = 1");
+    LanceOperation *right_operation = lance_operation_delete_new(
+        right_updates, 1, NULL, 0, "id = 4");
+    ASSERT(left_operation != NULL && right_operation != NULL,
+           "construct conflict operations");
+    CHECK_OK();
+    LanceTransaction *left_transaction =
+        lance_transaction_new(current_version, left_operation, NULL);
+    LanceTransaction *right_transaction =
+        lance_transaction_new(current_version, right_operation, NULL);
+    ASSERT(left_transaction != NULL && right_transaction != NULL,
+           "construct conflict transactions");
+    CHECK_OK();
+    dataset = commit_transaction(uri, left_transaction, &commit_options);
+    ASSERT(lance_dataset_version(dataset) == current_version + 1,
+           "conflict winner version");
+    CHECK_OK();
+    lance_dataset_close(dataset);
+
+    LanceDataset *sentinel_dataset = (LanceDataset *)(uintptr_t)0x1;
+    LanceDataset *failed_output = sentinel_dataset;
+    ASSERT(lance_transaction_commit(uri, right_transaction, &commit_options,
+                                    NULL, NULL, &failed_output) == -1,
+           "same-fragment delete conflict");
+    ASSERT(lance_last_error_code() == LANCE_ERR_COMMIT_CONFLICT,
+           "same-fragment delete conflict code");
+    ASSERT(failed_output == sentinel_dataset,
+           "failed conflict must leave output unchanged");
+    check_dataset(uri, current_version + 1, 13, 4);
+
+    lance_fragment_close(left_update);
+    lance_fragment_close(right_update);
+    lance_fragment_close(left);
+    lance_fragment_close(right);
+    lance_operation_close(left_operation);
+    lance_operation_close(right_operation);
+    lance_transaction_close(left_transaction);
+    lance_transaction_close(right_transaction);
+    printf("fragment delete OK\n");
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s <source-dataset-uri> <base-path>\n",
@@ -408,6 +698,7 @@ int main(int argc, char **argv) {
     }
     test_create_append_overwrite(argv[1], argv[2]);
     test_validation(argv[2]);
+    test_fragment_delete(argv[1], argv[2]);
     printf("All C transaction tests passed!\n");
     return 0;
 }

@@ -197,6 +197,34 @@ impl ProjectionSelection {
     }
 }
 
+/// Fragment scope carried by a scanner.
+///
+/// `All` uses the dataset snapshot's default fragment set. `Ids` resolves
+/// native metadata from that snapshot. `Metadata` carries the exact native
+/// fragment values supplied by a staged fragment operation.
+#[derive(Clone, Debug)]
+enum FragmentSelection {
+    All,
+    Ids(Vec<u64>),
+    Metadata(Vec<Fragment>),
+}
+
+impl FragmentSelection {
+    fn is_restricted(&self) -> bool {
+        !matches!(self, Self::All)
+    }
+
+    fn scalar_segment_ids(&self) -> Option<Vec<u64>> {
+        match self {
+            Self::Ids(ids) if !ids.is_empty() => Some(ids.clone()),
+            Self::Metadata(fragments) if !fragments.is_empty() => {
+                Some(fragments.iter().map(|fragment| fragment.id).collect())
+            }
+            Self::All | Self::Ids(_) | Self::Metadata(_) => None,
+        }
+    }
+}
+
 /// Opaque scanner handle. Stores configuration until stream materialization.
 pub struct LanceScanner {
     dataset: Arc<Dataset>,
@@ -221,7 +249,7 @@ pub struct LanceScanner {
     with_row_id: bool,
     with_row_address: bool,
     include_deleted_rows: bool,
-    fragment_ids: Option<Vec<u64>>,
+    fragment_selection: FragmentSelection,
     // External row prefilter keyed in the dataset's `_rowid` space; combined into
     // a single `RowAddrMask` (allowed AND NOT blocked) when the scanner is built.
     row_addr_allowlist: Option<RowAddrTreeMap>,
@@ -429,7 +457,7 @@ impl LanceScanner {
             with_row_id: false,
             with_row_address: false,
             include_deleted_rows: false,
-            fragment_ids: None,
+            fragment_selection: FragmentSelection::All,
             row_addr_allowlist: None,
             row_addr_blocklist: None,
             index_segments: None,
@@ -466,7 +494,7 @@ impl LanceScanner {
     /// and selects that fragment's metadata over the ordinary scanner path.
     pub(crate) fn from_fragment(fragment: &FileFragment) -> Self {
         let mut scanner = Self::new(Arc::new(fragment.dataset().clone()));
-        scanner.fragment_ids = Some(vec![fragment.id() as u64]);
+        scanner.fragment_selection = FragmentSelection::Metadata(vec![fragment.metadata().clone()]);
         scanner
     }
 
@@ -575,19 +603,25 @@ impl LanceScanner {
         Ok(())
     }
 
-    /// Restrict the scan/search domain to fragment_ids when they are set.
+    /// Apply the scanner's fragment selection.
     /// For nearest queries this limits candidates before Top-K regardless of prefilter;
     /// it is not a predicate applied to the ranked results.
     fn apply_fragment_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
-        if let Some(ids) = &self.fragment_ids {
-            let all_fragments = self.dataset.get_fragments();
-            let id_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
-            let selected: Vec<_> = all_fragments
-                .into_iter()
-                .filter(|f| id_set.contains(&(f.id() as u64)))
-                .map(|f| f.metadata().clone())
-                .collect();
-            scanner.with_fragments(selected);
+        match &self.fragment_selection {
+            FragmentSelection::All => {}
+            FragmentSelection::Ids(ids) => {
+                let all_fragments = self.dataset.get_fragments();
+                let id_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
+                let selected: Vec<_> = all_fragments
+                    .into_iter()
+                    .filter(|f| id_set.contains(&(f.id() as u64)))
+                    .map(|f| f.metadata().clone())
+                    .collect();
+                scanner.with_fragments(selected);
+            }
+            FragmentSelection::Metadata(fragments) => {
+                scanner.with_fragments(fragments.clone());
+            }
         }
         Ok(())
     }
@@ -761,7 +795,7 @@ impl LanceScanner {
                 "fts_index_segments requires an FTS query context".into(),
             ));
         }
-        if self.fts_context.is_some() && self.fragment_ids.is_some() {
+        if self.fts_context.is_some() && self.fragment_selection.is_restricted() {
             return Err(lance_core::Error::invalid_input_source(
                 "fragment_ids cannot be combined with an FTS query context; split the query by FTS index segment UUID instead".into(),
             ));
@@ -884,7 +918,7 @@ impl LanceScanner {
                     "scalar_index_segment requires an ordinary scan of live rows; vector/MinHash/FTS queries and include_deleted_rows=true are unsupported".into(),
                 ));
             }
-            let fragment_ids = self.fragment_ids.as_ref().filter(|ids| !ids.is_empty())
+            let fragment_ids = self.fragment_selection.scalar_segment_ids()
                 .ok_or_else(|| lance_core::Error::invalid_input_source(
                     "scalar_index_segment requires explicit nonempty fragment_ids for its read and fallback domain".into(),
                 ))?;
@@ -892,7 +926,7 @@ impl LanceScanner {
                 dataset: Arc::clone(&self.dataset),
                 segment_uuid,
                 auto_selection: self.scalar_index_auto_selection,
-                fragment_ids: fragment_ids.clone(),
+                fragment_ids,
                 use_scalar_index: self.use_scalar_index.unwrap_or(true),
                 callback: self.scan_statistics_callback.clone(),
             })
@@ -2483,7 +2517,7 @@ unsafe fn scanner_set_fragment_ids_inner(
     } else {
         &[]
     };
-    s.fragment_ids = Some(id_slice.to_vec());
+    s.fragment_selection = FragmentSelection::Ids(id_slice.to_vec());
     Ok(0)
 }
 

@@ -2148,6 +2148,39 @@ int32_t lance_fragment_count_rows(
     uint64_t* out_rows
 );
 
+/**
+ * Delete rows from this fragment snapshot without publishing a transaction.
+ *
+ * This calls native `FileFragment::delete`. The input fragment is borrowed and
+ * internally cloned, so it remains usable on every return path. The deletion
+ * file is written immediately, but the dataset manifest is unchanged until the
+ * caller publishes the returned metadata in a Delete transaction.
+ *
+ * On success, `out_fragment` receives:
+ * - a new independently owned fragment with the updated deletion-file
+ *   metadata when some rows remain;
+ * - NULL when every row was deleted.
+ *
+ * `out_fragment` is written only on success; it is unchanged on error. The
+ * returned fragment owns its dataset snapshot and can be scanned, taken,
+ * counted, closed, or used to build a Delete operation independently of the
+ * source dataset. A staged scanner reads the new deletion file before
+ * publication. A no-op predicate returns the original fragment metadata.
+ *
+ * `predicate` must be non-NULL UTF-8 SQL. An empty string and all predicate
+ * semantics are passed to native Lance without binding-side pruning.
+ *
+ * @param fragment      Fragment snapshot. Must not be NULL.
+ * @param predicate     SQL predicate. Must not be NULL.
+ * @param out_fragment  Success-only optional output. Must not be NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_delete(
+    const LanceFragment* fragment,
+    const char* predicate,
+    LanceFragment** out_fragment
+);
+
 /* ─── Random access ─── */
 
 /**
@@ -2735,6 +2768,11 @@ int32_t lance_scanner_set_materialization_style(
  * Restrict the scan/search domain to the given fragment IDs. For nearest-neighbor
  * queries, this limits the candidates searched before Top-K regardless of the
  * prefilter setting; it is not a predicate applied to ranked results.
+ *
+ * Calling this replaces any initial metadata selection from
+ * `lance_fragment_scan()`, including staged deletion metadata. A zero-length
+ * selection selects zero fragments. To select every fragment in the scanner's
+ * dataset snapshot, supply all of its native fragment IDs explicitly.
  * Must be called before iteration.
  * @param ids  Array of fragment IDs
  * @param len  Number of fragment IDs
@@ -4688,6 +4726,30 @@ typedef struct LanceCommitOptions {
 } LanceCommitOptions;
 
 /**
+ * Options for one-shot native transaction construction.
+ *
+ * `uuid == NULL` lets Lance generate a v4 UUID. A non-NULL value, including an
+ * empty string, is passed through unchanged. `tag == NULL` maps to native
+ * `None`; a non-NULL empty string maps to `Some("")`.
+ *
+ * `has_transaction_properties == false` maps to native `None`.
+ * `has_transaction_properties == true` maps to `Some(map)`, including
+ * `Some(empty)` when `property_count == 0`. If `property_count > 0`,
+ * `property_keys` and `property_values` must contain that many non-NULL UTF-8
+ * strings. Keys and values are separate parallel arrays, so keys may contain
+ * any character, including `=`. Duplicate keys follow native last-write-wins
+ * map behavior.
+ */
+typedef struct LanceTransactionOptions {
+    const char* uuid;
+    const char* tag;
+    bool has_transaction_properties;
+    const char* const* property_keys;
+    const char* const* property_values;
+    size_t property_count;
+} LanceTransactionOptions;
+
+/**
  * Write an Arrow stream as uncommitted Lance data files and return the owned
  * native transaction that would publish it.
  *
@@ -4731,6 +4793,41 @@ void lance_operation_close(LanceOperation* operation);
 int32_t lance_transaction_read_version(
     const LanceTransaction* transaction,
     uint64_t* out_read_version
+);
+
+/**
+ * Construct an owned native Delete operation.
+ *
+ * `updated_fragments` is an array of borrowed fragment handles whose complete
+ * native metadata is copied. Each pointer must be non-NULL when the count is
+ * non-zero. `deleted_fragment_ids` is copied. `predicate` must be non-NULL
+ * UTF-8 and is copied; an empty predicate is accepted.
+ *
+ * Native constructors and commit own fragment existence, uniqueness, overlap
+ * and predicate validation. This function adds no binding-side policy.
+ * Returns an owned operation, or NULL on error.
+ */
+LanceOperation* lance_operation_delete_new(
+    const LanceFragment* const* updated_fragments,
+    size_t updated_fragment_count,
+    const uint64_t* deleted_fragment_ids,
+    size_t deleted_fragment_count,
+    const char* predicate
+);
+
+/**
+ * Construct an owned native transaction from an operation.
+ *
+ * The operation is cloned and remains usable. `options == NULL` selects a
+ * generated UUID, no tag and no transaction properties. A non-NULL options
+ * value applies its documented UUID/tag/property mapping. Native
+ * `TransactionBuilder` construction and later commit validation remain
+ * authoritative. Returns an owned transaction, or NULL on error.
+ */
+LanceTransaction* lance_transaction_new(
+    uint64_t read_version,
+    const LanceOperation* operation,
+    const LanceTransactionOptions* options
 );
 
 /**
@@ -4818,6 +4915,54 @@ int32_t lance_operation_kind(
 int32_t lance_operation_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
+);
+
+/**
+ * Read the number of updated fragments in a Delete operation.
+ * Returns 0 on success, -1 on error (including wrong operation kind).
+ */
+int32_t lance_operation_delete_updated_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Serialize one updated Delete fragment's native metadata as JSON.
+ *
+ * The JSON is the same native `Fragment` serialization returned by
+ * `lance_fragment_metadata_json()`. Caller frees with `lance_free_string()`.
+ * Returns NULL on error, including a wrong operation kind or bad index.
+ */
+const char* lance_operation_delete_updated_fragment_metadata_json_at(
+    const LanceOperation* operation,
+    size_t index
+);
+
+/**
+ * Read the number of fully deleted fragment IDs in a Delete operation.
+ * Returns 0 on success, -1 on error (including wrong operation kind).
+ */
+int32_t lance_operation_delete_deleted_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one fully deleted fragment ID from a Delete operation.
+ * Returns 0 on success, -1 on error. `out_id` is unchanged on error.
+ */
+int32_t lance_operation_delete_deleted_fragment_id_at(
+    const LanceOperation* operation,
+    size_t index,
+    uint64_t* out_id
+);
+
+/**
+ * Return a newly allocated copy of a Delete operation's predicate.
+ * Caller frees with `lance_free_string()`. Returns NULL on error.
+ */
+const char* lance_operation_delete_predicate(
+    const LanceOperation* operation
 );
 
 /**

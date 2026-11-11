@@ -97,6 +97,7 @@ public:
 // ─── Forward Declarations ────────────────────────────────────────────────────
 
 class Scanner;
+class Fragment;
 class IndexModel;
 class IndexSegmentBuilder;
 class IndexSegmentMetadata;
@@ -525,7 +526,77 @@ public:
         return count;
     }
 
+    /// Construct an owned native Delete operation. The fragment handles are
+    /// borrowed and their complete native metadata is copied. Deleted IDs and
+    /// the predicate are copied. Native commit validation remains authoritative.
+    static Operation make_delete(
+        const std::vector<const Fragment*>& updated_fragments,
+        const std::vector<uint64_t>& deleted_fragment_ids,
+        const std::string& predicate);
+
+    /// Number of updated fragments in a Delete operation.
+    uint64_t delete_updated_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_delete_updated_fragment_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Native `Fragment` metadata JSON for one updated Delete fragment.
+    std::string delete_updated_fragment_metadata_json(size_t index) const {
+        const char* raw = lance_operation_delete_updated_fragment_metadata_json_at(
+            handle_.get(), index);
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    /// Number of fully deleted fragment IDs in a Delete operation.
+    uint64_t delete_deleted_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_delete_deleted_fragment_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// One fully deleted fragment ID from a Delete operation.
+    uint64_t delete_deleted_fragment_id(size_t index) const {
+        uint64_t id = 0;
+        if (lance_operation_delete_deleted_fragment_id_at(
+                handle_.get(), index, &id) != 0) {
+            check_error();
+        }
+        return id;
+    }
+
+    /// Delete predicate captured by the native operation.
+    std::string delete_predicate() const {
+        const char* raw = lance_operation_delete_predicate(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
     const LanceOperation* c_handle() const { return handle_.get(); }
+};
+
+/// Options for Transaction::from_operation.
+///
+/// `uuid == std::nullopt` requests native UUID generation; an engaged empty
+/// string is passed through. `tag == std::nullopt` maps to native None; an
+/// engaged empty string maps to Some(""). An engaged empty properties vector
+/// maps to native Some(empty), while nullopt maps to None.
+struct TransactionOptions {
+    std::optional<std::string> uuid;
+    std::optional<std::string> tag;
+    std::optional<std::vector<std::pair<std::string, std::string>>>
+        transaction_properties;
 };
 
 /// Owned native Transaction snapshot. Move-only and independent of the dataset
@@ -620,6 +691,38 @@ public:
                         "lance_transaction_operation returned success with null output");
         }
         return Operation(raw);
+    }
+
+    /// Construct a native transaction from a copied operation.
+    static Transaction from_operation(
+        uint64_t read_version,
+        const Operation& operation,
+        const TransactionOptions& options = {}) {
+        std::vector<const char*> property_keys;
+        std::vector<const char*> property_values;
+        LanceTransactionOptions raw{};
+        if (options.uuid) raw.uuid = options.uuid->c_str();
+        if (options.tag) raw.tag = options.tag->c_str();
+        if (options.transaction_properties) {
+            const auto& entries = *options.transaction_properties;
+            property_keys.reserve(entries.size());
+            property_values.reserve(entries.size());
+            for (const auto& [key, value] : entries) {
+                property_keys.push_back(key.c_str());
+                property_values.push_back(value.c_str());
+            }
+            raw.has_transaction_properties = true;
+            raw.property_keys =
+                property_keys.empty() ? nullptr : property_keys.data();
+            raw.property_values =
+                property_values.empty() ? nullptr : property_values.data();
+            raw.property_count = entries.size();
+        }
+
+        auto* transaction = lance_transaction_new(
+            read_version, operation.c_handle(), &raw);
+        if (!transaction) check_error();
+        return Transaction(transaction);
     }
 
     /// Serialize with the selected core's native protobuf conversion.
@@ -1152,8 +1255,47 @@ public:
         return value;
     }
 
+    /// Delete rows from this fragment without publishing a transaction.
+    ///
+    /// The source handle remains usable. The returned fragment owns the new
+    /// deletion-file metadata and can be scanned before publication. A full
+    /// deletion returns `std::nullopt`.
+    std::optional<Fragment> delete_if(const std::string& predicate) const;
+
     const LanceFragment* c_handle() const { return handle_.get(); }
 };
+
+inline std::optional<Fragment> Fragment::delete_if(
+    const std::string& predicate) const {
+    LanceFragment* raw = nullptr;
+    if (lance_fragment_delete(
+            handle_.get(), predicate.c_str(), &raw) != 0) {
+        check_error();
+    }
+    if (!raw) return std::nullopt;
+    return Fragment(raw);
+}
+
+inline Operation Operation::make_delete(
+    const std::vector<const Fragment*>& updated_fragments,
+    const std::vector<uint64_t>& deleted_fragment_ids,
+    const std::string& predicate) {
+    std::vector<const LanceFragment*> handles;
+    handles.reserve(updated_fragments.size());
+    for (const auto* fragment : updated_fragments) {
+        if (!fragment) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "updated fragment must not be null");
+        }
+        handles.push_back(fragment->c_handle());
+    }
+    auto* operation = lance_operation_delete_new(
+        handles.empty() ? nullptr : handles.data(), handles.size(),
+        deleted_fragment_ids.empty() ? nullptr : deleted_fragment_ids.data(),
+        deleted_fragment_ids.size(), predicate.c_str());
+    if (!operation) check_error();
+    return Operation(operation);
+}
 
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
