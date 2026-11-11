@@ -17,8 +17,10 @@ use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::Result;
 use lance_table::format::{Fragment, IndexMetadata, pb};
+use lance_table::transaction::DataReplacementGroup;
 use prost::Message;
 
+use crate::data_file::LanceDataFile;
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::fragment::{LanceFragment, fragment_metadata_json};
@@ -34,6 +36,11 @@ pub struct LanceTransaction {
 /// Owned native operation value cloned from a transaction.
 pub struct LanceOperation {
     pub(crate) inner: Operation,
+}
+
+/// Owned native `DataReplacementGroup` snapshot.
+pub struct LanceDataReplacementGroup {
+    pub(crate) inner: DataReplacementGroup,
 }
 
 /// Options for constructing one native transaction.
@@ -122,6 +129,17 @@ fn operation_at<'a>(operation: *const LanceOperation) -> Result<&'a LanceOperati
     Ok(unsafe { &*operation })
 }
 
+fn data_replacement_group_at<'a>(
+    group: *const LanceDataReplacementGroup,
+) -> Result<&'a LanceDataReplacementGroup> {
+    if group.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "data replacement group must not be NULL".into(),
+        ));
+    }
+    Ok(unsafe { &*group })
+}
+
 fn delete_operation_parts(operation: &LanceOperation) -> Result<(&[Fragment], &[u64], &str)> {
     match &operation.inner {
         Operation::Delete {
@@ -150,6 +168,19 @@ fn create_index_operation_parts(
         other => Err(lance_core::Error::not_supported_source(
             format!(
                 "CreateIndex inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+fn data_replacement_groups(operation: &LanceOperation) -> Result<&[DataReplacementGroup]> {
+    match &operation.inner {
+        Operation::DataReplacement { replacements } => Ok(replacements),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "DataReplacement inspection is not supported for {} operations",
                 other.name()
             )
             .into(),
@@ -188,6 +219,175 @@ pub unsafe extern "C" fn lance_operation_close(operation: *mut LanceOperation) {
             let _ = Box::from_raw(operation);
         });
     }
+}
+
+/// Close a data replacement group handle. NULL-safe. A non-NULL handle must be
+/// closed exactly once and must not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_data_replacement_group_close(group: *mut LanceDataReplacementGroup) {
+    if !group.is_null() {
+        swallow_unwind("lance_data_replacement_group_close", || unsafe {
+            let _ = Box::from_raw(group);
+        });
+    }
+}
+
+/// Construct a native data replacement group.
+///
+/// `new_file` is borrowed and its complete native metadata is cloned before
+/// this function returns. The native fragment ID is copied unchanged; no
+/// binding-side ordering, uniqueness or coverage policy is added. Returns NULL
+/// on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_data_replacement_group_new(
+    fragment_id: u64,
+    new_file: *const LanceDataFile,
+) -> *mut LanceDataReplacementGroup {
+    ffi_try!(
+        unsafe { data_replacement_group_new_inner(fragment_id, new_file) },
+        null
+    )
+}
+
+unsafe fn data_replacement_group_new_inner(
+    fragment_id: u64,
+    new_file: *const LanceDataFile,
+) -> Result<*mut LanceDataReplacementGroup> {
+    if new_file.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "new_file must not be NULL".into(),
+        ));
+    }
+    let new_file = unsafe { &*new_file }.native().clone();
+    Ok(Box::into_raw(Box::new(LanceDataReplacementGroup {
+        inner: DataReplacementGroup(fragment_id, new_file),
+    })))
+}
+
+/// Clone a data replacement group into an independent snapshot.
+///
+/// Returns NULL on error. The caller closes the returned handle exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_data_replacement_group_clone(
+    group: *const LanceDataReplacementGroup,
+) -> *mut LanceDataReplacementGroup {
+    ffi_try!(unsafe { data_replacement_group_clone_inner(group) }, null)
+}
+
+unsafe fn data_replacement_group_clone_inner(
+    group: *const LanceDataReplacementGroup,
+) -> Result<*mut LanceDataReplacementGroup> {
+    let group = data_replacement_group_at(group)?;
+    Ok(Box::into_raw(Box::new(LanceDataReplacementGroup {
+        inner: group.inner.clone(),
+    })))
+}
+
+/// Read the native fragment ID from a data replacement group.
+///
+/// Returns 0 on error; check `lance_last_error_code()`. Fragment ID 0 is a
+/// valid native value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_data_replacement_group_fragment_id(
+    group: *const LanceDataReplacementGroup,
+) -> u64 {
+    ffi_try!(Ok(data_replacement_group_at(group)?.inner.0), 0)
+}
+
+/// Clone the data file owned by a data replacement group.
+///
+/// Returns 0 on success, -1 on error. `out_file` is written only on success
+/// and must be closed independently.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_data_replacement_group_file(
+    group: *const LanceDataReplacementGroup,
+    out_file: *mut *mut LanceDataFile,
+) -> i32 {
+    ffi_try!(
+        unsafe { data_replacement_group_file_inner(group, out_file) },
+        neg
+    )
+}
+
+unsafe fn data_replacement_group_file_inner(
+    group: *const LanceDataReplacementGroup,
+    out_file: *mut *mut LanceDataFile,
+) -> Result<i32> {
+    if out_file.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_file must not be NULL".into(),
+        ));
+    }
+    let group = data_replacement_group_at(group)?;
+    let file = Box::new(LanceDataFile::from_native(group.inner.1.clone())?);
+    unsafe {
+        ptr::write(out_file, Box::into_raw(file));
+    }
+    Ok(0)
+}
+
+/// Construct an owned native DataReplacement operation.
+///
+/// Group handles are borrowed and their native fragment IDs and data files are
+/// copied in input order. A NULL array is accepted only with a zero count.
+/// Empty replacement lists are retained because the native operation permits
+/// them. No sorting, deduplication, non-empty, field-ID or coverage policy is
+/// added. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_data_replacement_new(
+    replacements: *const *const LanceDataReplacementGroup,
+    replacement_count: usize,
+) -> *mut LanceOperation {
+    ffi_try!(
+        unsafe { operation_data_replacement_new_inner(replacements, replacement_count) },
+        null
+    )
+}
+
+unsafe fn operation_data_replacement_new_inner(
+    replacements: *const *const LanceDataReplacementGroup,
+    replacement_count: usize,
+) -> Result<*mut LanceOperation> {
+    if replacements.is_null() && replacement_count > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("replacements must not be NULL when replacement_count = {replacement_count}")
+                .into(),
+        ));
+    }
+    let max_groups = isize::MAX as usize / std::mem::size_of::<*const LanceDataReplacementGroup>();
+    if replacement_count > max_groups {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "replacement_count {replacement_count} exceeds the maximum addressable pointer slice length"
+            )
+            .into(),
+        ));
+    }
+
+    let replacements = if replacement_count == 0 {
+        Vec::new()
+    } else {
+        let groups = unsafe { std::slice::from_raw_parts(replacements, replacement_count) };
+        groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                if group.is_null() {
+                    return Err(lance_core::Error::invalid_input_source(
+                        format!(
+                            "replacements[{index}] must not be NULL when replacement_count = {replacement_count}"
+                        )
+                        .into(),
+                    ));
+                }
+                Ok(unsafe { &**group }.inner.clone())
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    Ok(Box::into_raw(Box::new(LanceOperation {
+        inner: Operation::DataReplacement { replacements },
+    })))
 }
 
 /// Construct an owned native Delete operation.
@@ -737,9 +937,8 @@ unsafe fn operation_kind_inner(
 
 /// Read the fragment count for an Append or Overwrite operation.
 ///
-/// Returns 0 on success, -1 on error. Other operation variants, including
-/// manually constructed operation groups added by later issues, return
-/// LANCE_ERR_NOT_SUPPORTED here.
+/// Returns 0 on success, -1 on error. Other operation variants return
+/// `LANCE_ERR_NOT_SUPPORTED`; use their typed getters.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_operation_fragment_count(
     operation: *const LanceOperation,
@@ -1082,6 +1281,86 @@ unsafe fn operation_delete_predicate_inner(
     let operation = operation_at(operation)?;
     let (_, _, predicate) = delete_operation_parts(operation)?;
     Ok(owned_c_string(predicate, "Delete predicate")?.into_raw())
+}
+
+/// Read the number of data replacement groups.
+///
+/// Returns 0 on success, -1 on error. A non-DataReplacement operation returns
+/// `LANCE_ERR_NOT_SUPPORTED`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_data_replacement_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_data_replacement_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_data_replacement_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let replacements = data_replacement_groups(operation)?;
+    unsafe {
+        ptr::write(out_count, replacements.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Clone one data replacement group from a DataReplacement operation.
+///
+/// Returns 0 on success, -1 on error. The output is written only on success and
+/// must be closed independently. A wrong operation variant returns
+/// `LANCE_ERR_NOT_SUPPORTED`; an out-of-range index returns
+/// `LANCE_ERR_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_data_replacement_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_group: *mut *mut LanceDataReplacementGroup,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_data_replacement_at_inner(operation, index, out_group) },
+        neg
+    )
+}
+
+unsafe fn operation_data_replacement_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_group: *mut *mut LanceDataReplacementGroup,
+) -> Result<i32> {
+    if out_group.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_group must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let replacements = data_replacement_groups(operation)?;
+    let group = replacements.get(index).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "data replacement index {index} is out of range for {} replacements",
+                replacements.len()
+            )
+            .into(),
+        )
+    })?;
+    let group = Box::new(LanceDataReplacementGroup {
+        inner: group.clone(),
+    });
+    unsafe {
+        ptr::write(out_group, Box::into_raw(group));
+    }
+    Ok(0)
 }
 
 /// Export an Overwrite operation's schema as Arrow C Data Interface.

@@ -234,6 +234,119 @@ static void check_dataset(const char *uri,
     lance_dataset_close(dataset);
 }
 
+static void write_c_replacement_file(const char *uri,
+                                     const LanceFragment *fragment,
+                                     const char *filename) {
+    LanceScanner *scanner = lance_fragment_scan(fragment);
+    ASSERT(scanner != NULL, "replacement fragment scanner");
+    CHECK_OK();
+
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "export replacement stream");
+    CHECK_OK();
+    lance_scanner_close(scanner);
+
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0,
+           "read replacement schema");
+    CHECK_OK();
+
+    char data_uri[4096];
+    snprintf(data_uri, sizeof(data_uri), "file://%s/data", uri);
+    LanceFileSession *session =
+        lance_file_session_new(data_uri, NULL, NULL, NULL);
+    ASSERT(session != NULL, "replacement file session");
+    CHECK_OK();
+    LanceFileWriterOptions options;
+    memset(&options, 0, sizeof(options));
+    options.version = "2.1";
+    LanceFileWriter *writer = lance_file_session_open_writer(
+        session, filename, &schema, &options);
+    ASSERT(writer != NULL, "replacement file writer");
+    CHECK_OK();
+
+    uint64_t rows = 0;
+    while (1) {
+        struct ArrowArray batch;
+        memset(&batch, 0, sizeof(batch));
+        ASSERT(stream.get_next(&stream, &batch) == 0,
+               "read replacement batch");
+        if (!batch.release) break;
+        ASSERT(batch.n_children > 0, "replacement batch id column");
+        int32_t *ids = (int32_t *)batch.children[0]->buffers[1];
+        for (int64_t row = 0; row < batch.length; row++) {
+            ids[row] += 999;
+        }
+        rows += (uint64_t)batch.length;
+        LanceBatch *imported = NULL;
+        ASSERT(lance_batch_from_arrow(&batch, &schema, &imported) == 0,
+               "import replacement batch");
+        CHECK_OK();
+        ASSERT(lance_file_writer_write_batch(writer, imported) == 0,
+               "write replacement batch");
+        CHECK_OK();
+        lance_batch_free(imported);
+    }
+    if (schema.release) schema.release(&schema);
+    if (stream.release) stream.release(&stream);
+
+    LanceFileWriteSummary summary;
+    memset(&summary, 0, sizeof(summary));
+    ASSERT(lance_file_writer_finish(writer, &summary) == 0,
+           "finish replacement file");
+    CHECK_OK();
+    ASSERT(rows == 4 && summary.num_rows == 4,
+           "replacement file must preserve four rows");
+    ASSERT(summary.size_bytes > 0, "replacement file must be non-empty");
+    lance_file_writer_close(writer);
+    lance_file_session_close(session);
+}
+
+static int compare_i32(const void *left, const void *right) {
+    int32_t a = *(const int32_t *)left;
+    int32_t b = *(const int32_t *)right;
+    return (a > b) - (a < b);
+}
+
+static size_t collect_c_ids(const char *uri, int32_t *out, size_t capacity) {
+    LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "open replacement result");
+    CHECK_OK();
+    LanceScanner *scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "replacement result scanner");
+    CHECK_OK();
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "export replacement result");
+    CHECK_OK();
+    lance_scanner_close(scanner);
+    lance_dataset_close(dataset);
+
+    size_t count = 0;
+    while (1) {
+        struct ArrowArray batch;
+        memset(&batch, 0, sizeof(batch));
+        ASSERT(stream.get_next(&stream, &batch) == 0,
+               "read replacement result batch");
+        if (!batch.release) break;
+        ASSERT(batch.n_children > 0, "replacement result id column");
+        const int32_t *ids = (const int32_t *)batch.children[0]->buffers[1];
+        ASSERT(count + (size_t)batch.length <= capacity,
+               "replacement result capacity");
+        for (int64_t row = 0; row < batch.length; row++) {
+            out[count++] = ids[row];
+        }
+        batch.release(&batch);
+    }
+    if (stream.release) stream.release(&stream);
+    qsort(out, count, sizeof(int32_t), compare_i32);
+    return count;
+}
+
 static void test_create_append_overwrite(const char *src_uri,
                                          const char *base) {
     char create_uri[4096];
@@ -690,6 +803,251 @@ static void test_fragment_delete(const char *src_uri, const char *base) {
     printf("fragment delete OK\n");
 }
 
+static void test_data_replacement(const char *src_uri, const char *base) {
+    char uri[4096];
+    snprintf(uri, sizeof(uri), "%s/c_data_replacement", base);
+
+    LanceUncommittedWriteOptions options;
+    memset(&options, 0, sizeof(options));
+    options.write.params.max_rows_per_file = 4;
+    options.write.params.data_storage_version = "2.1";
+    LanceTransaction *create = write_uncommitted_from_source(
+        src_uri, uri, LANCE_WRITE_CREATE, &options);
+    LanceDataset *dataset = commit_transaction(uri, create, NULL);
+    lance_transaction_close(create);
+    ASSERT(lance_dataset_version(dataset) == 1,
+           "data replacement fixture version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == 20,
+           "data replacement fixture rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(dataset) == 5,
+           "data replacement fixture fragments");
+    CHECK_OK();
+
+    uint64_t ids[5] = {0};
+    ASSERT(lance_dataset_fragment_ids(dataset, ids) == 0,
+           "data replacement fragment IDs");
+    CHECK_OK();
+    LanceFragment *fragment = lance_dataset_open_fragment(dataset, ids[0]);
+    ASSERT(fragment != NULL, "open data replacement fragment");
+    CHECK_OK();
+    const char *filename = "c-data-replacement.lance";
+    write_c_replacement_file(uri, fragment, filename);
+    lance_fragment_close(fragment);
+
+    LanceDataFile *file = NULL;
+    ASSERT(lance_dataset_create_data_file(
+               dataset, filename, NULL, &file) == 0,
+           "create replacement data file");
+    CHECK_OK();
+    ASSERT(file != NULL, "replacement data file output");
+    const char *path = lance_data_file_path(file);
+    ASSERT(path != NULL && strcmp(path, filename) == 0,
+           "replacement data file path");
+    CHECK_OK();
+    size_t field_count = lance_data_file_field_count(file);
+    ASSERT(lance_last_error_code() == LANCE_OK && field_count > 0,
+           "replacement data file fields");
+    int32_t field_id = INT32_MIN;
+    ASSERT(lance_data_file_field_id_at(file, 0, &field_id) == 0,
+           "replacement data file field ID");
+    CHECK_OK();
+    size_t column_count = lance_data_file_column_index_count(file);
+    ASSERT(lance_last_error_code() == LANCE_OK && column_count > 0,
+           "replacement data file column indices");
+    int32_t column_index = INT32_MIN;
+    ASSERT(lance_data_file_column_index_at(file, 0, &column_index) == 0,
+           "replacement data file column index");
+    CHECK_OK();
+    uint32_t major = UINT32_MAX;
+    uint32_t minor = UINT32_MAX;
+    ASSERT(lance_data_file_file_version(file, &major, &minor) == 0 &&
+               major == 2 && minor == 1,
+           "replacement data file version");
+    CHECK_OK();
+    bool present = true;
+    uint64_t size = 0;
+    ASSERT(lance_data_file_file_size(file, &present, &size) == 0 &&
+               present && size > 0,
+           "replacement data file size");
+    CHECK_OK();
+    present = true;
+    uint32_t base_id = UINT32_MAX;
+    ASSERT(lance_data_file_base_id(file, &present, &base_id) == 0 &&
+               !present,
+           "replacement data file base ID is absent");
+    CHECK_OK();
+
+    LanceDataFile *file_clone = lance_data_file_clone(file);
+    ASSERT(file_clone != NULL, "clone replacement data file");
+    CHECK_OK();
+    const char *clone_path = lance_data_file_path(file_clone);
+    ASSERT(clone_path != NULL && strcmp(clone_path, filename) == 0,
+           "cloned replacement data file path");
+    CHECK_OK();
+    lance_data_file_close(file_clone);
+
+    LanceDataReplacementGroup *group =
+        lance_data_replacement_group_new(ids[0], file);
+    ASSERT(group != NULL, "construct replacement group");
+    CHECK_OK();
+    lance_data_file_close(file);
+    ASSERT(lance_data_replacement_group_fragment_id(group) == ids[0],
+           "replacement group fragment ID");
+    CHECK_OK();
+
+    LanceDataFile *group_file = NULL;
+    ASSERT(lance_data_replacement_group_file(group, &group_file) == 0,
+           "replacement group file");
+    CHECK_OK();
+    ASSERT(group_file != NULL, "replacement group file output");
+    const char *group_path = lance_data_file_path(group_file);
+    ASSERT(group_path != NULL && strcmp(group_path, filename) == 0,
+           "replacement group file path");
+    CHECK_OK();
+    lance_data_file_close(group_file);
+
+    const LanceDataReplacementGroup *groups[] = {group};
+    LanceOperation *operation =
+        lance_operation_data_replacement_new(groups, 1);
+    ASSERT(operation != NULL, "construct DataReplacement operation");
+    CHECK_OK();
+    LanceOperationKind kind = LANCE_OPERATION_UNKNOWN;
+    ASSERT(lance_operation_kind(operation, &kind) == 0 &&
+               kind == LANCE_OPERATION_DATA_REPLACEMENT,
+           "DataReplacement operation kind");
+    CHECK_OK();
+    uint64_t replacement_count = UINT64_MAX;
+    ASSERT(lance_operation_data_replacement_count(
+               operation, &replacement_count) == 0 &&
+               replacement_count == 1,
+           "DataReplacement operation count");
+    CHECK_OK();
+    LanceDataReplacementGroup *inspected = NULL;
+    ASSERT(lance_operation_data_replacement_at(
+               operation, 0, &inspected) == 0,
+           "inspect DataReplacement group");
+    CHECK_OK();
+    ASSERT(inspected != NULL &&
+               lance_data_replacement_group_fragment_id(inspected) == ids[0],
+           "inspected DataReplacement fragment ID");
+    CHECK_OK();
+    lance_data_replacement_group_close(inspected);
+    lance_data_replacement_group_close(group);
+
+    LanceOperation *empty =
+        lance_operation_data_replacement_new(NULL, 0);
+    ASSERT(empty != NULL, "empty DataReplacement operation");
+    CHECK_OK();
+    ASSERT(lance_operation_data_replacement_count(
+               empty, &replacement_count) == 0 &&
+               replacement_count == 0,
+           "empty DataReplacement operation count");
+    CHECK_OK();
+    lance_operation_close(empty);
+
+    LanceOperation *invalid =
+        lance_operation_data_replacement_new(NULL, 1);
+    ASSERT(invalid == NULL, "NULL replacement array must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL replacement array error code");
+    LanceDataReplacementGroup *null_group = NULL;
+    const LanceDataReplacementGroup *invalid_groups[] = {null_group};
+    invalid = lance_operation_data_replacement_new(invalid_groups, 1);
+    ASSERT(invalid == NULL, "NULL replacement group must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL replacement group error code");
+    LanceDataReplacementGroup *sentinel_group =
+        (LanceDataReplacementGroup *)(uintptr_t)0x1;
+    ASSERT(lance_operation_data_replacement_at(
+               operation, 1, &sentinel_group) == -1,
+           "out-of-range DataReplacement inspection");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "out-of-range DataReplacement error code");
+    ASSERT(sentinel_group == (LanceDataReplacementGroup *)(uintptr_t)0x1,
+           "failed DataReplacement inspection preserves output");
+
+    LanceOperation *delete_operation =
+        lance_operation_delete_new(NULL, 0, NULL, 0, "");
+    ASSERT(delete_operation != NULL, "Delete validation operation");
+    CHECK_OK();
+    ASSERT(lance_operation_data_replacement_count(
+               delete_operation, &replacement_count) == -1,
+           "wrong variant DataReplacement inspection");
+    ASSERT(lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED,
+           "wrong variant DataReplacement error code");
+    lance_operation_close(delete_operation);
+
+    uint64_t deleted = 0;
+    ASSERT(lance_dataset_delete(dataset, "id = 2", &deleted) == 0 &&
+               deleted == 1,
+           "delete replacement fixture row");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == 2,
+           "replacement fixture deletion version");
+    CHECK_OK();
+    LanceTransaction *transaction =
+        lance_transaction_new(2, operation, NULL);
+    ASSERT(transaction != NULL, "construct DataReplacement transaction");
+    CHECK_OK();
+    lance_operation_close(operation);
+
+    LanceCommitOptions commit_options;
+    memset(&commit_options, 0, sizeof(commit_options));
+    commit_options.has_max_retries = true;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = LANCE_COMMIT_TIMEOUT_DISABLED;
+    LanceDataset *committed =
+        commit_transaction(uri, transaction, &commit_options);
+    lance_transaction_close(transaction);
+    ASSERT(lance_dataset_version(committed) == 3,
+           "DataReplacement publishes one version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(committed) == 19,
+           "DataReplacement row count");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(committed) == 5,
+           "DataReplacement fragment count");
+    CHECK_OK();
+
+    LanceTransaction *history = NULL;
+    ASSERT(lance_dataset_read_transaction(committed, &history) == 0,
+           "read DataReplacement history");
+    CHECK_OK();
+    ASSERT(history != NULL, "DataReplacement history exists");
+    LanceOperation *history_operation = NULL;
+    ASSERT(lance_transaction_operation(history, &history_operation) == 0,
+           "clone DataReplacement history operation");
+    CHECK_OK();
+    ASSERT(lance_operation_kind(history_operation, &kind) == 0 &&
+               kind == LANCE_OPERATION_DATA_REPLACEMENT,
+           "history DataReplacement kind");
+    CHECK_OK();
+    ASSERT(lance_operation_data_replacement_count(
+               history_operation, &replacement_count) == 0 &&
+               replacement_count == 1,
+           "history DataReplacement count");
+    CHECK_OK();
+    lance_operation_close(history_operation);
+    lance_transaction_close(history);
+    lance_dataset_close(committed);
+    lance_dataset_close(dataset);
+
+    int32_t actual[19] = {0};
+    ASSERT(collect_c_ids(uri, actual, 19) == 19,
+           "reopened DataReplacement row count");
+    const int32_t expected[19] = {5,    6,    7,    8,    9,    10,   11,
+                                  12,   13,   14,   15,   16,   17,   18,
+                                  19,   20,   1000, 1002, 1003};
+    for (size_t i = 0; i < 19; i++) {
+        ASSERT(actual[i] == expected[i],
+               "reopened DataReplacement fixed row value");
+    }
+
+    printf("data replacement OK\n");
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s <source-dataset-uri> <base-path>\n",
@@ -699,6 +1057,7 @@ int main(int argc, char **argv) {
     test_create_append_overwrite(argv[1], argv[2]);
     test_validation(argv[2]);
     test_fragment_delete(argv[1], argv[2]);
+    test_data_replacement(argv[1], argv[2]);
     printf("All C transaction tests passed!\n");
     return 0;
 }
