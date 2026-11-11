@@ -591,6 +591,14 @@ unsafe fn file_session_upload_file_inner(
                     remote_path.as_ref()
                 ))
             })?;
+        // The pinned LocalWriter can ignore buffered errors in shutdown.
+        // A checked flush must succeed before it publishes the destination.
+        writer.flush().await.map_err(|error| {
+            Error::io(format!(
+                "failed to flush upload {local_path:?} to {:?}: {error}",
+                remote_path.as_ref()
+            ))
+        })?;
         Writer::shutdown(writer.as_mut()).await?;
         Ok::<(), Error>(())
     })?;
@@ -646,6 +654,11 @@ unsafe fn file_session_download_file_inner(
                 ))
             })?;
         }
+        file.flush().await.map_err(|error| {
+            Error::io(format!(
+                "failed to flush local file {local_path:?}: {error}"
+            ))
+        })?;
         Writer::shutdown(file.as_mut()).await.map_err(|error| {
             Error::io(format!(
                 "failed to publish local file {local_path:?}: {error}"
