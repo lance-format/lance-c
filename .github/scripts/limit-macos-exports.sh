@@ -7,9 +7,11 @@
 # any additional list, so the only way to keep a dependency export out of the
 # final dylib is to replace rustc's list before invoking the linker.
 #
-# This wrapper is installed as CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER for
-# macOS release and CI builds. It only changes the `liblance_c.dylib` link and
-# leaves build scripts, procedural macros, tests, and executables untouched.
+# Direct Cargo CI builds select this wrapper through
+# CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER. CMake builds use corrosion_set_linker
+# so Corrosion preserves the selection; LANCE_C_MACOS_LINKER names the underlying
+# compiler driver. Only the `liblance_c.dylib` link is changed. Build scripts,
+# procedural macros, tests, and executables are left untouched.
 
 set -euo pipefail
 
