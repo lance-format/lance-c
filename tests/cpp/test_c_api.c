@@ -2876,6 +2876,186 @@ static void test_write_options_and_config(const char *src_uri,
     printf("OK\n");
 }
 
+typedef struct NativeWriteProgressCapture {
+    uint64_t begins;
+    uint64_t completes;
+    uint64_t stats;
+    uint64_t releases;
+    uint64_t rows;
+    uint64_t bytes;
+    uint32_t files;
+} NativeWriteProgressCapture;
+
+static int32_t native_write_begin(void *callback_ctx,
+                                  const LanceWriteFragmentProgressInfo *info,
+                                  LanceCallbackError *error) {
+    NativeWriteProgressCapture *capture =
+        (NativeWriteProgressCapture *)callback_ctx;
+    (void)info;
+    (void)error;
+    capture->begins++;
+    return 0;
+}
+
+static int32_t native_write_complete(void *callback_ctx,
+                                     const LanceWriteFragmentProgressInfo *info,
+                                     LanceCallbackError *error) {
+    NativeWriteProgressCapture *capture =
+        (NativeWriteProgressCapture *)callback_ctx;
+    (void)info;
+    (void)error;
+    capture->completes++;
+    return 0;
+}
+
+static void native_write_stats(void *callback_ctx,
+                               const LanceWriteStats *stats) {
+    NativeWriteProgressCapture *capture =
+        (NativeWriteProgressCapture *)callback_ctx;
+    capture->stats++;
+    capture->rows = stats->rows_written;
+    capture->bytes = stats->bytes_written;
+    capture->files = stats->files_written;
+}
+
+static void native_write_release(void *callback_ctx) {
+    NativeWriteProgressCapture *capture =
+        (NativeWriteProgressCapture *)callback_ctx;
+    capture->releases++;
+}
+
+/* Exercises the owned native-write options representation through a real C
+ * caller: source-owner retention, transaction properties, progress callbacks
+ * and staged publication. */
+static void test_native_write_options(const char *src_uri,
+                                      const char *write_uri) {
+    printf("  test_native_write_options... ");
+    char uri[4096];
+    char staged_uri[4096];
+    snprintf(uri, sizeof(uri), "%s_native_api", write_uri);
+    snprintf(staged_uri, sizeof(staged_uri), "%s_native_staged", write_uri);
+
+    NativeWriteProgressCapture progress = {0};
+    LanceNativeWriteProgress progress_desc = {0};
+    progress_desc.begin_fragment = native_write_begin;
+    progress_desc.complete_fragment = native_write_complete;
+    progress_desc.write_stats = native_write_stats;
+    progress_desc.release = native_write_release;
+    progress_desc.callback_ctx = &progress;
+
+    const char *property_keys[] = {"engine"};
+    const char *property_values[] = {"c-native-options"};
+    LanceTransactionProperties properties = {
+        property_keys, property_values, 1};
+
+    LanceWriteOptions write_options = {0};
+    write_options.params.max_rows_per_file = 2;
+    LanceNativeWriteOptionsSpec spec = {0};
+    spec.write_options = &write_options;
+    spec.transaction_properties = &properties;
+    spec.progress = &progress_desc;
+    spec.has_enable_v2_manifest_paths = 1;
+    spec.enable_v2_manifest_paths = false;
+
+    LanceSession *session = lance_session_new(4 * 1024 * 1024, 1 * 1024 * 1024);
+    LanceStorageOptionsAccessor *accessor =
+        lance_storage_options_accessor_new(NULL, NULL);
+    ASSERT(session != NULL && accessor != NULL, "native owners must be created");
+    spec.session = session;
+    spec.storage_options_accessor = accessor;
+
+    LanceNativeWriteOptions *options = lance_native_write_options_new(&spec);
+    ASSERT(options != NULL, "native write options must be created");
+    /* The handle clones these owners. */
+    lance_session_close(session);
+    lance_storage_options_accessor_close(accessor);
+
+    LanceDataset *src = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(src != NULL, "open source failed");
+    LanceScanner *scanner = lance_scanner_new(src, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "to_arrow_stream failed");
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "schema read failed");
+
+    LanceDataset *ds = NULL;
+    int32_t rc = lance_dataset_write_with_native_options(
+        uri, &schema, &stream, LANCE_WRITE_CREATE, options, &ds);
+    if (schema.release) schema.release(&schema);
+    ASSERT(rc == 0, "native options create failed");
+    CHECK_OK();
+    ASSERT(ds != NULL, "out_dataset must be populated");
+    ASSERT(lance_dataset_count_rows(ds) > 0, "create must write rows");
+    ASSERT(progress.begins > 0 && progress.completes > 0,
+           "fragment progress callbacks must run");
+    ASSERT(progress.stats > 0 && progress.rows > 0 && progress.bytes > 0,
+           "native stats callbacks must carry cumulative values");
+    ASSERT(progress.releases == 0,
+           "callback context remains owned while the options handle is open");
+    lance_dataset_close(ds);
+    lance_scanner_close(scanner);
+
+    scanner = lance_scanner_new(src, NULL, NULL);
+    ASSERT(scanner != NULL, "staged scanner creation failed");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "staged to_arrow_stream failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0,
+           "staged schema read failed");
+
+    LanceTransaction *transaction = NULL;
+    rc = lance_dataset_write_uncommitted_stream_with_native_options(
+        staged_uri, &schema, &stream, LANCE_WRITE_CREATE, options,
+        &transaction);
+    if (schema.release) schema.release(&schema);
+    ASSERT(rc == 0, "native options staged write failed");
+    CHECK_OK();
+    ASSERT(transaction != NULL, "out_transaction must be populated");
+    bool has_properties = false;
+    ASSERT(lance_transaction_has_properties(transaction, &has_properties) == 0,
+           "transaction property presence failed");
+    CHECK_OK();
+    ASSERT(has_properties, "transaction properties must be Some");
+    uint64_t property_count = 0;
+    ASSERT(lance_transaction_property_count(transaction, &property_count) == 0,
+           "transaction property count failed");
+    CHECK_OK();
+    ASSERT(property_count == 1, "one transaction property expected");
+    const char *property_key = lance_transaction_property_key_at(transaction, 0);
+    const char *property_value =
+        lance_transaction_property_value_at(transaction, 0);
+    ASSERT(property_key != NULL && property_value != NULL,
+           "property key/value must be present");
+    ASSERT(strcmp(property_key, "engine") == 0, "property key mismatch");
+    ASSERT(strcmp(property_value, "c-native-options") == 0,
+           "property value mismatch");
+    lance_free_string(property_key);
+    lance_free_string(property_value);
+
+    LanceDataset *committed = NULL;
+    rc = lance_transaction_commit(
+        staged_uri, transaction, NULL, NULL, NULL, &committed);
+    ASSERT(rc == 0, "staged commit failed");
+    CHECK_OK();
+    ASSERT(committed != NULL, "commit must return a dataset");
+    ASSERT(lance_dataset_count_rows(committed) > 0,
+           "staged commit must write rows");
+    lance_dataset_close(committed);
+    lance_transaction_close(transaction);
+    lance_scanner_close(scanner);
+    lance_dataset_close(src);
+
+    lance_native_write_options_close(options);
+    ASSERT(progress.releases == 1,
+           "progress context must be released exactly once");
+    printf("OK\n");
+}
+
 /* Exercises `lance_dataset_calculate_data_stats` on the freshly-written
  * (modern, v2+) dataset, where per-field on-disk sizes are populated. Runs
  * before the mutation tests reshape or empty the dataset. */
@@ -6851,6 +7031,7 @@ int main(int argc, char **argv) {
     test_minhash_lsh(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
+    test_native_write_options(uri, write_uri);
     test_data_statistics(write_uri);
     test_diagnostics(uri);
     test_config_replacement(config_base_uri);

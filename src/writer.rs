@@ -29,6 +29,7 @@ use crate::commit_lock::{LanceCommitLock, commit_handler_from_ffi};
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
+use crate::native_write_options::LanceNativeWriteOptions;
 use crate::runtime::block_on;
 use crate::session::LanceSession;
 use crate::storage_options::{LanceStorageOptionsAccessor, storage_options_accessor_from_ffi};
@@ -206,6 +207,7 @@ pub unsafe extern "C" fn lance_dataset_write(
                     storage_options_accessor: std::ptr::null(),
                     session: None,
                     commit_handler: None,
+                    native_options: std::ptr::null(),
                 },
                 storage_opts,
                 out_dataset,
@@ -245,6 +247,7 @@ pub unsafe extern "C" fn lance_dataset_write_with_params(
                     storage_options_accessor: std::ptr::null(),
                     session: None,
                     commit_handler: None,
+                    native_options: std::ptr::null(),
                 },
                 storage_opts,
                 out_dataset,
@@ -291,6 +294,7 @@ pub unsafe extern "C" fn lance_dataset_write_with_options(
                     storage_options_accessor: std::ptr::null(),
                     session: None,
                     commit_handler: None,
+                    native_options: std::ptr::null(),
                 },
                 storage_opts,
                 out_dataset,
@@ -329,6 +333,7 @@ pub unsafe extern "C" fn lance_dataset_write_with_accessor(
                     storage_options_accessor,
                     session: None,
                     commit_handler: None,
+                    native_options: std::ptr::null(),
                 },
                 std::ptr::null(),
                 out_dataset,
@@ -368,6 +373,7 @@ pub unsafe extern "C" fn lance_dataset_write_with_params_and_accessor(
                     storage_options_accessor,
                     session: None,
                     commit_handler: None,
+                    native_options: std::ptr::null(),
                 },
                 std::ptr::null(),
                 out_dataset,
@@ -407,6 +413,7 @@ pub unsafe extern "C" fn lance_dataset_write_with_options_and_accessor(
                     storage_options_accessor,
                     session: None,
                     commit_handler: None,
+                    native_options: std::ptr::null(),
                 },
                 std::ptr::null(),
                 out_dataset,
@@ -458,6 +465,47 @@ pub unsafe extern "C" fn lance_dataset_write_with_options_with_commit_lock(
                     storage_options_accessor: storage_accessor,
                     session,
                     commit_handler: commit_handler_from_ffi(commit_lock),
+                    native_options: std::ptr::null(),
+                },
+                std::ptr::null(),
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Write with an owned native-backed options handle.
+///
+/// A NULL `options` selects native `WriteParams::default()`. The handle
+/// supplies every native write option, including the session, storage
+/// accessor, commit lock, base placement, blob policy, file-writer options and
+/// progress callbacks. The stream is consumed on every return path except a
+/// NULL `stream`. Output semantics match `lance_dataset_write`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_write_with_native_options(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    options: *const LanceNativeWriteOptions,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options: std::ptr::null(),
+                    legacy_auto_cleanup: false,
+                    storage_options_accessor: std::ptr::null(),
+                    session: None,
+                    commit_handler: None,
+                    native_options: options,
                 },
                 std::ptr::null(),
                 out_dataset,
@@ -476,6 +524,7 @@ struct WriteSettings {
     storage_options_accessor: *const LanceStorageOptionsAccessor,
     session: Option<Arc<Session>>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
+    native_options: *const LanceNativeWriteOptions,
 }
 
 /// Build native `WriteParams` from the writer option representations.
@@ -522,17 +571,7 @@ pub(crate) unsafe fn write_params_from_ffi(
     };
 
     if !options.is_null() {
-        // SAFETY: a non-NULL `options` points to a valid `LanceWriteOptions`
-        // for the duration of this call. The borrow ends before any await.
-        let options = unsafe { &*options };
-        unsafe { apply_write_params(&mut write_params, &options.params)? };
-        if !options.auto_cleanup.is_null() {
-            // SAFETY: the caller guarantees a non-NULL `auto_cleanup` points
-            // to a valid `LanceAutoCleanupParams` for this call.
-            write_params.auto_cleanup =
-                Some(unsafe { auto_cleanup_from_ffi(&*options.auto_cleanup)? });
-        }
-        write_params.skip_auto_cleanup = options.skip_auto_cleanup;
+        unsafe { apply_write_options(&mut write_params, options)? };
     } else if !params.is_null() {
         // SAFETY: a non-NULL `params` points to a valid `LanceWriteParams` for
         // the duration of this call.
@@ -550,6 +589,31 @@ pub(crate) unsafe fn write_params_from_ffi(
     }
 
     Ok(write_params)
+}
+
+/// Apply the shared `LanceWriteOptions` representation onto native params.
+///
+/// The C pointers are borrowed only for this synchronous conversion. The same
+/// mapping is used by the legacy entry points and by the owned native options
+/// handle.
+pub(crate) unsafe fn apply_write_options(
+    target: &mut WriteParams,
+    options: *const LanceWriteOptions,
+) -> Result<()> {
+    if options.is_null() {
+        return Ok(());
+    }
+    // SAFETY: a non-NULL `options` points to a valid `LanceWriteOptions` for
+    // the duration of this call. The borrow ends before any await.
+    let options = unsafe { &*options };
+    unsafe { apply_write_params(target, &options.params)? };
+    if !options.auto_cleanup.is_null() {
+        // SAFETY: the caller guarantees a non-NULL `auto_cleanup` points to a
+        // valid `LanceAutoCleanupParams` for this call.
+        target.auto_cleanup = Some(unsafe { auto_cleanup_from_ffi(&*options.auto_cleanup)? });
+    }
+    target.skip_auto_cleanup = options.skip_auto_cleanup;
+    Ok(())
 }
 
 unsafe fn write_dataset_inner(
@@ -613,19 +677,27 @@ unsafe fn write_dataset_inner(
         lance_core::Error::invalid_input_source(format!("invalid schema: {e}").into())
     })?;
 
-    let mut write_params = unsafe {
-        write_params_from_ffi(
-            mode,
-            settings.params,
-            settings.options,
-            settings.legacy_auto_cleanup,
-            storage_opts,
-            settings.storage_options_accessor,
-            settings.session,
-        )?
+    let mut write_params = if settings.native_options.is_null() {
+        let mut params = unsafe {
+            write_params_from_ffi(
+                mode,
+                settings.params,
+                settings.options,
+                settings.legacy_auto_cleanup,
+                storage_opts,
+                settings.storage_options_accessor,
+                settings.session,
+            )?
+        };
+        params.commit_handler = settings.commit_handler;
+        params
+    } else {
+        // SAFETY: the caller guarantees a non-NULL native-options pointer is
+        // valid for this synchronous call. `params_clone` copies every native
+        // owner the write needs.
+        unsafe { &*settings.native_options }.params_clone()
     };
-
-    write_params.commit_handler = settings.commit_handler;
+    write_params.mode = mode.into();
 
     // Fail fast: compare the stream schema against the caller-provided schema.
     let stream_schema = reader.schema();

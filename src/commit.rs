@@ -26,6 +26,7 @@ use crate::commit_lock::{LanceCommitLock, commit_handler_from_ffi};
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
+use crate::native_write_options::LanceNativeWriteOptions;
 use crate::runtime::block_on;
 use crate::session::LanceSession;
 use crate::storage_options::{LanceStorageOptionsAccessor, storage_options_accessor_from_ffi};
@@ -289,6 +290,7 @@ pub unsafe extern "C" fn lance_dataset_write_uncommitted_stream(
                 std::ptr::null(),
                 session,
                 None,
+                std::ptr::null(),
                 out_transaction,
             )
         },
@@ -329,6 +331,7 @@ pub unsafe extern "C" fn lance_dataset_write_uncommitted_stream_with_accessor(
                 storage_options_accessor,
                 session,
                 None,
+                std::ptr::null(),
                 out_transaction,
             )
         },
@@ -367,6 +370,50 @@ pub unsafe extern "C" fn lance_dataset_write_uncommitted_stream_with_commit_lock
                 storage_accessor,
                 session,
                 commit_handler_from_ffi(commit_lock),
+                std::ptr::null(),
+                out_transaction,
+            )
+        },
+        neg
+    )
+}
+
+/// Stage an Arrow stream with an owned native-backed options handle.
+///
+/// A NULL `options` selects native `WriteParams::default()`. The handle
+/// supplies the session, storage accessor, commit lock, base placement, blob
+/// policy, file-writer options and progress callbacks. `mode` is supplied
+/// here, not by the handle. The stream is consumed on every return path
+/// except a NULL `stream`.
+///
+/// The returned transaction owns metadata and uncommitted data-file
+/// references. It does not retain the options handle or its session/accessor;
+/// pass those to the later commit entry point when commit I/O needs them.
+/// `enable_v2_manifest_paths` and the commit lock affect the native staging
+/// context; publication naming remains controlled by the commit entry point's
+/// `LanceCommitOptions`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_write_uncommitted_stream_with_native_options(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    options: *const LanceNativeWriteOptions,
+    out_transaction: *mut *mut LanceTransaction,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_uncommitted_stream_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                None,
+                options,
                 out_transaction,
             )
         },
@@ -385,6 +432,7 @@ unsafe fn write_uncommitted_stream_inner(
     storage_options_accessor: *const LanceStorageOptionsAccessor,
     session: *const LanceSession,
     commit_handler: Option<Arc<dyn CommitHandler>>,
+    native_options: *const LanceNativeWriteOptions,
     out_transaction: *mut *mut LanceTransaction,
 ) -> Result<i32> {
     if stream.is_null() {
@@ -420,15 +468,22 @@ unsafe fn write_uncommitted_stream_inner(
     let expected_schema = ArrowSchema::try_from(unsafe { &*schema }).map_err(|error| {
         lance_core::Error::invalid_input_source(format!("invalid schema: {error}").into())
     })?;
-    let mut params = writer_params_from_ffi(
-        mode,
-        options,
-        storage_opts,
-        storage_options_accessor,
-        session,
-    )?;
-
-    params.commit_handler = commit_handler;
+    let mut params = if native_options.is_null() {
+        let mut params = writer_params_from_ffi(
+            mode,
+            options,
+            storage_opts,
+            storage_options_accessor,
+            session,
+        )?;
+        params.commit_handler = commit_handler;
+        params
+    } else {
+        // SAFETY: the caller guarantees a non-NULL native-options pointer is
+        // valid for this synchronous call.
+        unsafe { &*native_options }.params_clone()
+    };
+    params.mode = mode.into();
 
     let stream_schema = reader.schema();
     if stream_schema.fields() != expected_schema.fields() {

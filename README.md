@@ -669,6 +669,67 @@ ds.scan()
 // consume stream...
 ```
 
+### Owned native write options
+
+`lance_native_write_options_new` copies one `LanceNativeWriteOptionsSpec` into
+an opaque `LanceNativeWriteOptions` owner. The handle maps the full representable
+native `WriteParams` surface: output shape, auto-cleanup, stable row IDs,
+`data_storage_version`, `enable_v2_manifest_paths`, session, transaction
+properties, base registration and placement, per-base storage params, external
+blob policy, blob pack-file threshold, current-format file-writer options, and
+fragment/cumulative progress callbacks. `lance_dataset_write_with_native_options`
+uses it for a committing write;
+`lance_dataset_write_uncommitted_stream_with_native_options` uses it for a
+staged write that is published through the existing transaction commit APIs.
+
+```c
+LanceWriteOptions write = {0};
+write.params.max_rows_per_file = 1;
+
+LanceNativeWriteOptionsSpec spec = {0};
+spec.write_options = &write;
+spec.has_enable_v2_manifest_paths = 1;
+spec.enable_v2_manifest_paths = false;
+spec.has_target_all_bases = 1;
+spec.target_all_bases = true;
+
+LanceNativeWriteOptions* options = lance_native_write_options_new(&spec);
+LanceDataset* out = NULL;
+if (lance_dataset_write_with_native_options(
+        "data.lance", &schema, &stream, LANCE_WRITE_CREATE, options, &out) != 0) {
+    /* read lance_last_error_* */
+}
+lance_native_write_options_close(options);
+```
+
+The C++ RAII wrapper is `lance::NativeWriteOptions` with
+`lance::NativeWriteOptionsSpec`; use `Dataset::write_with_native_options` and
+`Dataset::write_uncommitted_with_native_options`.
+
+Option presence is preserved. A NULL list pointer maps to native `None`; a
+non-NULL list pointer with count zero maps to `Some(empty)`. An explicit empty
+target list and all native target-base conflicts are reported by Lance core,
+not reconstructed here. `target_all_bases` resolves primary storage as ID 0
+and registered bases by ascending ID, with primary first when included.
+
+Progress callbacks receive actual native events. Fragment begin/complete
+callbacks receive a borrowed `LanceWriteFragmentProgressInfo`; the write-stats
+callback receives cumulative native `WriteStats`. Fragment callbacks may report
+an error and may run concurrently on native worker threads. Write-stats has no
+native error channel. Ownership of the progress context transfers only when
+`lance_native_write_options_new` succeeds, and the release callback runs
+exactly once when the final native owner drops. Closing the options handle does
+not invalidate already-committed datasets or returned transactions.
+
+Native trait-object hooks that cannot be represented in C remain explicit gaps:
+custom Rust object stores and store wrappers, custom commit handlers other than
+`LanceCommitLock`, and feature-gated AWS credential providers. Global
+`ObjectStoreParams` scalar fields beyond the storage accessor are also not
+exposed; per-base `ObjectStoreParams` supports the accessor, block size, S3
+credential refresh offset, constant-size upload parts, and lexical ordering.
+Native object-store resolution, validation, defaults and errors remain
+authoritative.
+
 ### Native transactions
 
 `Dataset::write_uncommitted` maps to `InsertBuilder::execute_uncommitted_stream`

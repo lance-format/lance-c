@@ -2317,6 +2317,75 @@ static void test_write_options_and_config(const std::string& src_uri,
     PASS();
 }
 
+static void test_native_write_options(const std::string& src_uri,
+                                      const std::string& dst_uri) {
+    TEST(test_native_write_options);
+
+    const std::string uri = dst_uri + "_cpp_native_options";
+    const std::string staged_uri = dst_uri + "_cpp_native_staged";
+    auto src = lance::Dataset::open(src_uri);
+    auto fragment_events = std::make_shared<std::size_t>(0);
+    auto stats_events = std::make_shared<std::size_t>(0);
+
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.max_rows_per_file = 2;
+        spec.enable_v2_manifest_paths = false;
+        spec.transaction_properties =
+            std::vector<std::pair<std::string, std::string>>{
+                {"engine", "cpp-native-options"}};
+        spec.progress.begin_fragment =
+            [fragment_events](const lance::FragmentWriteProgressInfo&) {
+                ++*fragment_events;
+            };
+        spec.progress.complete_fragment =
+            [fragment_events](const lance::FragmentWriteProgressInfo&) {
+                ++*fragment_events;
+            };
+        spec.progress.write_stats =
+            [stats_events](const lance::NativeWriteStats& stats) {
+                ++*stats_events;
+                assert(stats.rows_written > 0);
+            };
+
+        lance::NativeWriteOptions options(spec);
+        {
+            auto scanner = src.scan();
+            ArrowArrayStream stream;
+            memset(&stream, 0, sizeof(stream));
+            scanner.to_arrow_stream(&stream);
+            auto ds = lance::Dataset::write_with_native_options(
+                uri, &stream, lance::WriteMode::Create, options);
+            assert(ds.count_rows() > 0);
+        }
+        assert(*fragment_events > 0);
+        assert(*stats_events > 0);
+
+        {
+            auto scanner = src.scan();
+            ArrowArrayStream stream;
+            memset(&stream, 0, sizeof(stream));
+            scanner.to_arrow_stream(&stream);
+            auto transaction = lance::Dataset::write_uncommitted_with_native_options(
+                staged_uri, &stream, lance::WriteMode::Create, options);
+            assert(transaction.has_properties());
+            assert(transaction.properties().at("engine") == "cpp-native-options");
+            auto committed = lance::Dataset::commit(staged_uri, transaction);
+            assert(committed.count_rows() > 0);
+        }
+    }
+
+    assert(fragment_events.use_count() == 1);
+    assert(stats_events.use_count() == 1);
+
+    auto reopened = lance::Dataset::open(uri);
+    assert(reopened.count_rows() == src.count_rows());
+    auto staged = lance::Dataset::open(staged_uri);
+    assert(staged.count_rows() == src.count_rows());
+
+    PASS();
+}
+
 // Exercises `Dataset::calculate_data_stats` on the freshly-written (modern,
 // v2+) dataset, where per-field on-disk sizes are populated. Runs before the
 // mutation tests reshape or empty the dataset.
@@ -4878,6 +4947,7 @@ int main(int argc, char** argv) {
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);
+    test_native_write_options(uri, write_uri);
     test_data_statistics(write_uri);
     test_diagnostics(uri);
     test_config_replacement(config_base_uri);
