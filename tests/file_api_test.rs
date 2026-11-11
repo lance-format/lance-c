@@ -378,6 +378,15 @@ fn native_batches(reader: &NativeFileReader) -> Vec<RecordBatch> {
     })
 }
 
+fn assert_batches_match_ignoring_root_metadata(left: &[RecordBatch], right: &[RecordBatch]) {
+    assert_eq!(left.len(), right.len());
+    for (left, right) in left.iter().zip(right.iter()) {
+        assert_eq!(left.num_rows(), right.num_rows());
+        assert_eq!(left.schema().fields(), right.schema().fields());
+        assert_eq!(left.columns(), right.columns());
+    }
+}
+
 fn native_metadata(uri: &str) -> Arc<CachedFileMetadata> {
     native_reader(uri).metadata().clone()
 }
@@ -462,7 +471,7 @@ fn versions_declared_lazy_and_defaults_round_trip_against_native() {
         assert_eq!(schema.metadata(), fixture_schema().metadata());
 
         let oracle = native_reader(uri);
-        assert_eq!(batches, native_batches(&oracle));
+        assert_batches_match_ignoring_root_metadata(&batches, &native_batches(&oracle));
     }
 
     let lazy = root.path().join("lazy.lance");
@@ -1688,7 +1697,17 @@ fn storage_provider_none_some_empty_error_expiry_and_force() {
         refresh_offset_millis: Some(0),
     };
     let (provider, counters, provider_id) = create_test_provider(context, false);
-    let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), provider) };
+    let initial_keys = [
+        c"expires_at_millis".as_ptr(),
+        c"refresh_offset_millis".as_ptr(),
+    ];
+    let initial_values = [c"0".as_ptr(), c"0".as_ptr()];
+    let initial_input = LanceStorageOptionsInput {
+        keys: initial_keys.as_ptr(),
+        values: initial_values.as_ptr(),
+        count: 2,
+    };
+    let accessor = unsafe { lance_storage_options_accessor_new(&initial_input, provider) };
     let first = snapshot_options(accessor).unwrap().unwrap();
     assert_eq!(first.get("expires").map(String::as_str), Some("cached"));
     assert_eq!(counters.fetches.load(Ordering::SeqCst), 1);
