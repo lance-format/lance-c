@@ -3046,9 +3046,11 @@ static void test_native_typed_operations(const char *src_uri,
            "typed deletion seed");
     CHECK_OK();
     ASSERT(deleted == 1, "typed deletion count");
-    uint64_t updated_ids[8];
     uint64_t updated_fragment_count = lance_dataset_fragment_count(updated);
     CHECK_OK();
+    uint64_t *updated_ids =
+        (uint64_t *)calloc(updated_fragment_count, sizeof(uint64_t));
+    ASSERT(updated_ids != NULL, "allocate typed deletion fragment ids");
     ASSERT(lance_dataset_fragment_ids(updated, updated_ids) == 0,
            "typed deletion fragment ids");
     CHECK_OK();
@@ -3096,6 +3098,7 @@ static void test_native_typed_operations(const char *src_uri,
     lance_free_string(deletion_message);
     ASSERT(rejection_dataset == NULL, "deletion Overwrite has no dataset");
     lance_fragment_close(deleted_fragment);
+    free(updated_ids);
     lance_schema_close(updated_schema);
     lance_operation_close(deletion_overwrite);
     lance_transaction_close(deletion_transaction);
