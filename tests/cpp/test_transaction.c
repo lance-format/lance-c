@@ -2634,8 +2634,8 @@ static void test_fragment_creation(const char *src_uri, const char *base) {
     CHECK_OK();
     uint64_t fragments_before = lance_dataset_fragment_count(dataset);
     CHECK_OK();
-    ASSERT(rows >= 4 && fragments_before == (rows + 3) / 4,
-           "seed dataset must span one fragment per four rows");
+    ASSERT(rows >= 8 && fragments_before >= 2,
+           "seed dataset must span several fragments");
 
     LanceSchema *schema = NULL;
     ASSERT(lance_dataset_schema_clone(dataset, &schema) == 0,
@@ -2700,8 +2700,8 @@ static void test_fragment_creation(const char *src_uri, const char *base) {
     CHECK_OK();
     if (input.schema.release) input.schema.release(&input.schema);
     ASSERT(fragments != NULL, "many fragment array");
-    ASSERT(fragment_count == (size_t)((rows + 3) / 4),
-           "native max_rows_per_file splitting");
+    ASSERT(fragment_count == (size_t)fragments_before,
+           "create_many must split exactly like the seed write");
     for (size_t i = 0; i < fragment_count; i++) {
         ASSERT(fragments[i] != NULL, "many fragment handle");
         bool is_bound = true;

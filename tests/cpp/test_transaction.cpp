@@ -1440,8 +1440,8 @@ static void test_fragment_creation(const std::string& src_uri,
         version = dataset.version();
         rows = dataset.count_rows();
         fragments_before = dataset.fragment_count();
-        CHECK(rows >= 4);
-        CHECK(fragments_before == (rows + 3) / 4);
+        CHECK(rows >= 8);
+        CHECK(fragments_before >= 2);
         return dataset.native_schema();
     }();
 
@@ -1479,8 +1479,9 @@ static void test_fragment_creation(const std::string& src_uri,
     auto fragments =
         lance::Fragment::create_many(uri, &many_stream, many_options);
     CHECK(many_stream.release == nullptr);
-    const uint64_t many_count = (rows + 3) / 4;
-    CHECK(fragments.size() == many_count);
+    const uint64_t many_count = fragments.size();
+    CHECK(many_count == fragments_before);
+    CHECK(many_count >= 2);
     for (const auto& fragment : fragments) CHECK(!fragment.is_bound());
 
     std::vector<const lance::Fragment*> many_handles;

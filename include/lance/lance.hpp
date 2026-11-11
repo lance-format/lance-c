@@ -7938,10 +7938,12 @@ inline std::vector<Fragment> Fragment::create_many(
 
     std::vector<Fragment> fragments;
     try {
+        // Reserve before adopting: `Fragment` only moves a pointer, so once
+        // the capacity exists `emplace_back` cannot reallocate. Each slot is
+        // cleared right after adoption, which leaves `raw` holding exactly the
+        // handles this vector does not own.
         fragments.reserve(count);
         for (size_t i = 0; i < count; ++i) {
-            // Adopt before clearing so an exception still leaves the handle in
-            // the array for `lance_fragment_array_free`.
             fragments.emplace_back(raw[i]);
             raw[i] = nullptr;
         }
