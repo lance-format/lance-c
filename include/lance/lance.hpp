@@ -1262,18 +1262,18 @@ public:
         return static_cast<size_t>(count);
     }
 
-    /// Offsets of one entry in ascending native bitmap order.
+    /// Offsets of one entry in ascending native bitmap order, copied in one pass.
     std::vector<uint32_t> offsets_at(size_t index) const {
         std::vector<uint32_t> out;
-        size_t count = offset_count_at(index);
-        out.reserve(count);
-        for (size_t position = 0; position < count; ++position) {
-            uint32_t offset = 0;
-            if (lance_updated_fragment_offsets_offset_at(
-                    handle_.get(), index, position, &offset) != 0) {
-                check_error();
-            }
-            out.push_back(offset);
+        const size_t count = offset_count_at(index);
+        if (count > out.max_size()) {
+            throw std::length_error(
+                "updated fragment offset count exceeds vector max_size");
+        }
+        out.resize(count);
+        if (lance_updated_fragment_offsets_copy_at(
+                handle_.get(), index, out.data(), out.size()) != 0) {
+            check_error();
         }
         return out;
     }

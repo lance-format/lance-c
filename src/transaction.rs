@@ -3881,6 +3881,62 @@ pub unsafe extern "C" fn lance_updated_fragment_offsets_offset_count_at(
     )
 }
 
+/// Copy all offsets for one entry in ascending native bitmap order.
+///
+/// The caller owns `out_offsets` and supplies its exact writable element count.
+/// A NULL output is accepted only for a valid empty entry with `count == 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_updated_fragment_offsets_copy_at(
+    offsets: *const LanceUpdatedFragmentOffsets,
+    index: usize,
+    out_offsets: *mut u32,
+    count: usize,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if offsets.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "offsets must not be NULL".into(),
+                ));
+            }
+            let offsets = unsafe { &*offsets };
+            let bitmap = offsets.inner.0.values().nth(index).ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "fragment entry index {index} is out of range for {} entries",
+                        offsets.inner.0.len()
+                    )
+                    .into(),
+                )
+            })?;
+            let expected_count = usize::try_from(bitmap.len()).unwrap_or(usize::MAX);
+            if count != expected_count {
+                return Err(lance_core::Error::invalid_input_source(
+                    format!(
+                        "offset output count {count} must equal {expected_count} for fragment entry index {index}"
+                    )
+                    .into(),
+                ));
+            }
+            helpers::validate_slice_length::<u32>(count, "out_offsets")?;
+            if count != 0 {
+                if out_offsets.is_null() {
+                    return Err(lance_core::Error::invalid_input_source(
+                        format!("out_offsets must not be NULL when count = {count}").into(),
+                    ));
+                }
+                for (position, offset) in bitmap.iter().enumerate() {
+                    unsafe {
+                        ptr::write(out_offsets.add(position), offset);
+                    }
+                }
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
 /// Read one offset by entry index and ascending offset position.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_updated_fragment_offsets_offset_at(
