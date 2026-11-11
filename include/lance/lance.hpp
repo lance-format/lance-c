@@ -3645,6 +3645,20 @@ public:
         return substrait_filter(bytes.data(), bytes.size());
     }
 
+    /// Set a Substrait aggregate Plan (serialized bytes).
+    /// The plan is validated immediately; a failed replacement keeps the
+    /// previous aggregate. Count and analyze-count replace it with COUNT(*).
+    Scanner& substrait_aggregate(const uint8_t* bytes, size_t len) {
+        if (lance_scanner_set_substrait_aggregate(handle_.get(), bytes, len) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Set a Substrait aggregate Plan (vector overload).
+    Scanner& substrait_aggregate(const std::vector<uint8_t>& bytes) {
+        return substrait_aggregate(bytes.data(), bytes.size());
+    }
+
     /// Add an SQL filter that is combined with the selected primary filter using AND.
     Scanner& additional_sql_filter(const std::string& filter) {
         if (lance_scanner_additional_sql_filter(handle_.get(), filter.c_str()) != 0)

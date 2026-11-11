@@ -26,7 +26,10 @@ use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::refs::BranchContents;
-use lance::dataset::scanner::ColumnOrdering as NativeColumnOrdering;
+use lance::dataset::scanner::{
+    AggregateExpr as NativeAggregateExpr, ColumnOrdering as NativeColumnOrdering, RowAddrMask,
+    RowAddrTreeMap,
+};
 use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance::io::RecordBatchStream;
 use lance::session::{CacheSpec as NativeCacheSpec, Session as NativeSession};
@@ -39,6 +42,13 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::minhash_lsh::MinHashQuery as NativeMinHashQuery;
 use lance_select::{RowAddrMask as NativeRowAddrMask, RowAddrTreeMap as NativeRowAddrTreeMap};
+
+#[path = "support/substrait_aggregate.rs"]
+mod substrait_aggregate;
+
+use substrait_aggregate::{
+    AggregateKind, Cell, aggregate_plan, cells, empty_plan, malformed_plan, non_aggregate_plan,
+};
 
 /// Helper: create a test dataset in a temp directory and return its path.
 fn create_test_dataset() -> (tempfile::TempDir, String) {
@@ -22665,6 +22675,769 @@ fn test_scanner_set_substrait_filter_invalid_inputs() {
 
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
+}
+
+fn sorted_cells(batches: &[RecordBatch]) -> Vec<Vec<Cell>> {
+    let mut rows = cells(batches);
+    rows.sort_by_key(|row| format!("{row:?}"));
+    rows
+}
+
+fn native_aggregate_batches_with_filter(
+    uri: &str,
+    bytes: &[u8],
+    filter: Option<&str>,
+) -> Vec<RecordBatch> {
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        if let Some(filter) = filter {
+            scanner.filter(filter).unwrap();
+        }
+        scanner
+            .aggregate(NativeAggregateExpr::substrait(bytes.to_vec()))
+            .unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        stream.try_collect::<Vec<_>>().await.unwrap()
+    })
+}
+
+fn native_aggregate_error(uri: &str, bytes: &[u8]) -> String {
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        match scanner.aggregate(NativeAggregateExpr::substrait(bytes.to_vec())) {
+            Ok(_) => panic!("invalid Substrait aggregate unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        }
+    })
+}
+
+fn ordering_substrait_id_at_least(threshold: i32) -> Vec<u8> {
+    use datafusion::logical_expr::{col, lit};
+    use datafusion::prelude::SessionContext;
+    use lance_datafusion::substrait::encode_substrait;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, true),
+        Field::new("rank", DataType::Int32, true),
+    ]));
+    encode_substrait(
+        col("id").gt_eq(lit(threshold)),
+        schema,
+        &SessionContext::new().state(),
+    )
+    .unwrap()
+}
+
+fn schema_names(schema: &Schema) -> Vec<&str> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect()
+}
+
+#[test]
+fn test_scanner_substrait_aggregate_grouped_matches_native() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let bytes = aggregate_plan(
+        &[1],
+        &[
+            AggregateKind::CountStar,
+            AggregateKind::Count(2),
+            AggregateKind::Sum(0),
+            AggregateKind::Sum(2),
+            AggregateKind::Min(0),
+            AggregateKind::Max(0),
+        ],
+        &[
+            "group",
+            "rows",
+            "ranks",
+            "ids",
+            "rank_total",
+            "min_id",
+            "max_id",
+        ],
+    );
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let (schema, batches) = collect_scanner(scanner);
+    assert_eq!(
+        schema_names(&schema),
+        vec![
+            "group",
+            "rows",
+            "ranks",
+            "ids",
+            "rank_total",
+            "min_id",
+            "max_id"
+        ]
+    );
+    let actual = sorted_cells(&batches);
+    let mut expected = vec![
+        vec![
+            Cell::Null,
+            Cell::Int(2),
+            Cell::Int(2),
+            Cell::Int(19),
+            Cell::Int(5),
+            Cell::Int(8),
+            Cell::Int(11),
+        ],
+        vec![
+            Cell::Text("a".into()),
+            Cell::Int(5),
+            Cell::Int(4),
+            Cell::Int(27),
+            Cell::Int(4),
+            Cell::Int(2),
+            Cell::Int(10),
+        ],
+        vec![
+            Cell::Text("b".into()),
+            Cell::Int(5),
+            Cell::Int(3),
+            Cell::Int(20),
+            Cell::Int(6),
+            Cell::Int(0),
+            Cell::Int(9),
+        ],
+    ];
+    expected.sort_by_key(|row| format!("{row:?}"));
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual,
+        sorted_cells(&native_aggregate_batches_with_filter(&uri, &bytes, None))
+    );
+
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_scanner_substrait_aggregate_ungrouped_nulls_and_empty_input() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let ungrouped = aggregate_plan(
+        &[],
+        &[
+            AggregateKind::CountStar,
+            AggregateKind::Count(2),
+            AggregateKind::Sum(0),
+            AggregateKind::Sum(2),
+            AggregateKind::Min(0),
+            AggregateKind::Max(0),
+        ],
+        &[
+            "rows",
+            "rank_rows",
+            "id_sum",
+            "rank_sum",
+            "min_id",
+            "max_id",
+        ],
+    );
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_substrait_aggregate(scanner, ungrouped.as_ptr(), ungrouped.len())
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let (_, batches) = collect_scanner(scanner);
+    assert_eq!(
+        cells(&batches),
+        vec![vec![
+            Cell::Int(12),
+            Cell::Int(9),
+            Cell::Int(66),
+            Cell::Int(15),
+            Cell::Int(0),
+            Cell::Int(11),
+        ]]
+    );
+    assert_eq!(
+        cells(&batches),
+        cells(&native_aggregate_batches_with_filter(
+            &uri, &ungrouped, None
+        ))
+    );
+
+    let empty_filter = c_str("id < 0");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), empty_filter.as_ptr()) };
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_substrait_aggregate(scanner, ungrouped.as_ptr(), ungrouped.len())
+        },
+        0
+    );
+    let (_, batches) = collect_scanner(scanner);
+    assert_eq!(
+        cells(&batches),
+        vec![vec![
+            Cell::Int(0),
+            Cell::Int(0),
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+        ]]
+    );
+    assert_eq!(
+        cells(&batches),
+        cells(&native_aggregate_batches_with_filter(
+            &uri,
+            &ungrouped,
+            Some("id < 0"),
+        ))
+    );
+
+    let grouped_empty = aggregate_plan(
+        &[1],
+        &[AggregateKind::CountStar, AggregateKind::Sum(0)],
+        &["group", "id_sum"],
+    );
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), empty_filter.as_ptr()) };
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_substrait_aggregate(
+                scanner,
+                grouped_empty.as_ptr(),
+                grouped_empty.len(),
+            )
+        },
+        0
+    );
+    let (_, batches) = collect_scanner(scanner);
+    assert!(batches.is_empty());
+    assert!(native_aggregate_batches_with_filter(&uri, &grouped_empty, Some("id < 0")).is_empty());
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_substrait_aggregate_filter_fragments_and_masks_match_native() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let row_ids = ordering_row_ids(ds);
+
+    let bytes = aggregate_plan(
+        &[1],
+        &[AggregateKind::CountStar, AggregateKind::Sum(0)],
+        &["group", "rows", "id_sum"],
+    );
+    let substrait_filter = ordering_substrait_id_at_least(6);
+    let fragments = [1_u64];
+    let allow_ids = [6, 8, 10, 11]
+        .into_iter()
+        .map(|id| row_ids[&id])
+        .collect::<Vec<_>>();
+    let block_ids = [row_ids[&11]];
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_substrait_filter(
+                scanner,
+                substrait_filter.as_ptr(),
+                substrait_filter.len(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, fragments.as_ptr(), fragments.len()) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_row_addr_allowlist(scanner, allow_ids.as_ptr(), allow_ids.len())
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_row_addr_blocklist(scanner, block_ids.as_ptr(), block_ids.len())
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let (schema, batches) = collect_scanner(scanner);
+    assert_eq!(schema_names(&schema), vec!["group", "rows", "id_sum"]);
+    let actual = sorted_cells(&batches);
+    let mut expected = vec![
+        vec![Cell::Null, Cell::Int(1), Cell::Int(8)],
+        vec![Cell::Text("a".into()), Cell::Int(1), Cell::Int(10)],
+        vec![Cell::Text("b".into()), Cell::Int(1), Cell::Int(6)],
+    ];
+    expected.sort_by_key(|row| format!("{row:?}"));
+    assert_eq!(actual, expected);
+
+    let native = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.filter_substrait(&substrait_filter).unwrap();
+        scanner.with_fragments(
+            dataset
+                .get_fragments()
+                .into_iter()
+                .filter(|fragment| fragment.id() == 1)
+                .map(|fragment| fragment.metadata().clone())
+                .collect(),
+        );
+        let allowed: RowAddrTreeMap = allow_ids.iter().copied().collect();
+        let blocked: RowAddrTreeMap = block_ids.iter().copied().collect();
+        scanner.with_row_id_prefilter(RowAddrMask::from_allowed(allowed).also_block(blocked));
+        scanner
+            .aggregate(NativeAggregateExpr::substrait(bytes.clone()))
+            .unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        stream.try_collect::<Vec<_>>().await.unwrap()
+    });
+    assert_eq!(actual, sorted_cells(&native));
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_substrait_aggregate_copy_and_failed_replacement() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let mut plan_a = aggregate_plan(
+        &[1],
+        &[AggregateKind::CountStar, AggregateKind::Sum(0)],
+        &["group", "rows", "id_sum"],
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, plan_a.as_ptr(), plan_a.len(),) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    plan_a.fill(0);
+    drop(plan_a);
+    assert_eq!(
+        schema_names(&scanner_introspection_schema(scanner)),
+        vec!["group", "rows", "id_sum"]
+    );
+
+    let malformed = malformed_plan();
+    let native_error = native_aggregate_error(&uri, &malformed);
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_substrait_aggregate(scanner, malformed.as_ptr(), malformed.len())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::IoError);
+    assert_eq!(take_last_error_message(), native_error);
+    assert_eq!(
+        schema_names(&scanner_introspection_schema(scanner)),
+        vec!["group", "rows", "id_sum"],
+        "a failed replacement must retain the previous aggregate"
+    );
+
+    let replacement = aggregate_plan(&[], &[AggregateKind::CountStar], &["total"]);
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_substrait_aggregate(scanner, replacement.as_ptr(), replacement.len())
+        },
+        0
+    );
+    let (schema, batches) = collect_scanner(scanner);
+    assert_eq!(schema_names(&schema), vec!["total"]);
+    assert_eq!(cells(&batches), vec![vec![Cell::Int(12)]]);
+
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_substrait_aggregate(scanner, replacement.as_ptr(), replacement.len())
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("substrait_aggregate must be set before"));
+
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_scanner_substrait_aggregate_native_validation_errors() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    for (bytes, code) in [
+        (empty_plan(), LanceErrorCode::InvalidArgument),
+        (non_aggregate_plan(), LanceErrorCode::InvalidArgument),
+        (malformed_plan(), LanceErrorCode::IoError),
+    ] {
+        let native_error = native_aggregate_error(&uri, &bytes);
+        assert_eq!(
+            unsafe { lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()) },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), code);
+        assert_eq!(take_last_error_message(), native_error);
+    }
+
+    let empty_native_error = native_aggregate_error(&uri, &empty_plan());
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, ptr::null(), 0) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(take_last_error_message(), empty_native_error);
+
+    let empty_storage = [0_u8];
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, empty_storage.as_ptr(), 0) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(take_last_error_message(), empty_native_error);
+
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, ptr::null(), 1) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("bytes is NULL but len > 0"));
+
+    let byte = [0_u8];
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, byte.as_ptr(), usize::MAX) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("exceeds isize::MAX"));
+
+    let valid = aggregate_plan(&[], &[AggregateKind::CountStar], &["total"]);
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, valid.as_ptr(), valid.len()) },
+        0,
+        "ordinary validation failures must leave the scanner usable"
+    );
+    let (_, batches) = collect_scanner(scanner);
+    assert_eq!(cells(&batches), vec![vec![Cell::Int(12)]]);
+
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_scanner_substrait_aggregate_out_of_bounds_field_panics_safely() {
+    // Pinned datafusion-substrait indexes DFSchema::qualified_field without a
+    // bounds check, so an out-of-range Substrait field reference unwinds inside
+    // native aggregate parsing. The FFI boundary must turn that into the shared
+    // panic/poison contract instead of unwinding into the C caller.
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let invalid_column = aggregate_plan(&[], &[AggregateKind::Sum(99)], &["bad"]);
+
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_substrait_aggregate(
+                scanner,
+                invalid_column.as_ptr(),
+                invalid_column.len(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+    let message = take_last_error_message();
+    assert!(message.contains("panic in FFI call"), "{message}");
+    assert!(message.contains("index out of bounds"), "{message}");
+
+    assert_eq!(unsafe { lance_scanner_set_limit(scanner, 1) }, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+    assert!(take_last_error_message().contains("scanner is poisoned"));
+
+    let fresh = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!fresh.is_null());
+    let valid = aggregate_plan(&[], &[AggregateKind::CountStar], &["total"]);
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(fresh, valid.as_ptr(), valid.len()) },
+        0,
+        "a panic on one scanner must not affect dataset-backed fresh scanners"
+    );
+    let (_, batches) = collect_scanner(fresh);
+    assert_eq!(cells(&batches), vec![vec![Cell::Int(12)]]);
+
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_scanner_close(fresh);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_scanner_substrait_aggregate_native_limit_offset_and_order_validation() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let bytes = aggregate_plan(&[], &[AggregateKind::CountStar], &["total"]);
+
+    for zero_limit in [true, false] {
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+        assert_eq!(
+            unsafe { lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()) },
+            0
+        );
+        if zero_limit {
+            assert_eq!(unsafe { lance_scanner_set_limit(scanner, 0) }, 0);
+        } else {
+            assert_eq!(unsafe { lance_scanner_set_offset(scanner, 0) }, 0);
+        }
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(
+            unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert!(take_last_error_message().contains("Cannot use limit/offset with aggregate"));
+        unsafe { lance_scanner_close(scanner) };
+    }
+
+    let ordering = LanceColumnOrdering {
+        column_name: c"id".as_ptr(),
+        direction: LanceOrderDirection::Ascending as i32,
+        null_order: LanceNullOrder::NullsLast as i32,
+    };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_order_by(scanner, &ordering, 1) },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("Cannot use order_by with aggregate"));
+    unsafe { lance_scanner_close(scanner) };
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_order_by(
+                scanner,
+                std::ptr::NonNull::<LanceColumnOrdering>::dangling().as_ptr(),
+                0,
+            )
+        },
+        0
+    );
+    let (_, batches) = collect_scanner(scanner);
+    assert_eq!(
+        cells(&batches),
+        vec![vec![Cell::Int(12)]],
+        "a non-NULL empty ordering normalizes to None in native"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_substrait_aggregate_inspection_stream_and_statistics_lifecycle() {
+    let (_tmp, uri) = create_ordering_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let bytes = aggregate_plan(
+        &[1],
+        &[AggregateKind::CountStar, AggregateKind::Sum(0)],
+        &["group", "rows", "id_sum"],
+    );
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()) },
+        0
+    );
+
+    assert_eq!(
+        schema_names(&scanner_introspection_schema(scanner)),
+        vec!["group", "rows", "id_sum"]
+    );
+    assert!(
+        take_scanner_string(unsafe { lance_scanner_explain_plan(scanner, false) })
+            .contains("AggregateExec")
+    );
+    assert!(
+        take_scanner_string(unsafe { lance_scanner_analyze_plan(scanner) })
+            .contains("AggregateExec")
+    );
+    assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 12);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    assert!(
+        take_scanner_string(unsafe { lance_scanner_analyze_count_plan(scanner) })
+            .contains("AggregateExec")
+    );
+    assert_eq!(captured.calls, 0, "inspection/count must not invoke stats");
+
+    let (_, batches) = collect_scanner(scanner);
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    assert_eq!(
+        captured.calls, 1,
+        "aggregate stream EOF must invoke stats once"
+    );
+
+    assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 12);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    let _ = take_scanner_string(unsafe { lance_scanner_analyze_count_plan(scanner) });
+    assert_eq!(
+        captured.calls, 1,
+        "count/analyze-count must not invoke stats"
+    );
+
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("substrait_aggregate must be set before"));
+
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_scanner_substrait_aggregate_scalar_segment_composition() {
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let filter = c_str("key >= 0");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), filter.as_ptr()) };
+    assert!(!scanner.is_null());
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+    let fragments = [0_u64];
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, fragments.as_ptr(), fragments.len()) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_scalar_index_segment(scanner, uuids[0].as_ptr()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let bytes = aggregate_plan(
+        &[],
+        &[
+            AggregateKind::CountStar,
+            AggregateKind::Sum(0),
+            AggregateKind::Min(0),
+            AggregateKind::Max(0),
+        ],
+        &["rows", "id_sum", "min_id", "max_id"],
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_substrait_aggregate(scanner, bytes.as_ptr(), bytes.len()) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 3);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    assert_eq!(captured.calls, 0);
+    let (schema, batches) = collect_scanner(scanner);
+    assert_eq!(
+        schema_names(&schema),
+        vec!["rows", "id_sum", "min_id", "max_id"]
+    );
+    assert_eq!(
+        cells(&batches),
+        vec![vec![Cell::Int(3), Cell::Int(6), Cell::Int(1), Cell::Int(3),]]
+    );
+    assert_eq!(captured.calls, 1);
+
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_dataset_close(ds);
+    }
 }
 
 // ===========================================================================

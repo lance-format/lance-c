@@ -16,6 +16,11 @@ use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance_c::*;
 
+#[path = "support/substrait_aggregate.rs"]
+mod substrait_aggregate;
+
+use substrait_aggregate::{AggregateKind, Cell, aggregate_plan, cells};
+
 const TEXTS: [&str; 10] = [
     "apple banana",
     "apple",
@@ -103,7 +108,7 @@ fn fixture() -> (tempfile::TempDir, *mut LanceDataset) {
     let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
     assert!(!dataset.is_null(), "{}", last_error());
     let column = c("text");
-    let params = c(r#"{"base_tokenizer":"simple","language":"English"}"#);
+    let params = c(r#"{"base_tokenizer":"simple","language":"English","with_position":true}"#);
     ok(unsafe {
         lance_dataset_create_scalar_index(
             dataset,
@@ -176,6 +181,16 @@ impl Scan {
             }
         }
         out
+    }
+
+    fn collect_aggregate(self) -> Vec<Vec<Cell>> {
+        let mut stream = FFI_ArrowArrayStream::empty();
+        ok(unsafe { lance_scanner_to_arrow_stream(self.0, &mut stream) });
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream).unwrap() };
+        let batches = reader
+            .map(|batch| batch.unwrap())
+            .collect::<Vec<RecordBatch>>();
+        cells(&batches)
     }
 }
 
@@ -347,6 +362,66 @@ fn test_row_addr_allowlist_prepared_fts_scores_allowed_rows_only() {
         );
         unsafe { lance_fts_query_context_close(context) };
     }
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_row_addr_allowlist_prepared_fts_aggregate_composition() {
+    let (_dir, dataset) = fixture();
+    let column = c("text");
+    let bytes = aggregate_plan(
+        &[],
+        &[AggregateKind::CountStar, AggregateKind::Sum(0)],
+        &["rows", "id_sum"],
+    );
+
+    let match_context = unsafe {
+        lance_dataset_prepare_fts_match_query(
+            dataset,
+            column.as_ptr(),
+            c("apple").as_ptr(),
+            LanceFtsMatchOperator::Or as i32,
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!match_context.is_null(), "{}", last_error());
+    let run_match = |allowed: Option<&[u64]>| {
+        let scan = Scan::new(dataset, None);
+        let scan = match allowed {
+            Some(allowed) => scan.allow(allowed),
+            None => scan,
+        };
+        ok(unsafe { lance_scanner_set_fts_query_context(scan.0, match_context) });
+        ok(unsafe { lance_scanner_set_substrait_aggregate(scan.0, bytes.as_ptr(), bytes.len()) });
+        scan.collect_aggregate()
+    };
+    assert_eq!(run_match(None), vec![vec![Cell::Int(6), Cell::Int(26)]]);
+    assert_eq!(
+        run_match(Some(&[0, 1, 5, 9])),
+        vec![vec![Cell::Int(4), Cell::Int(15)]]
+    );
+    unsafe { lance_fts_query_context_close(match_context) };
+
+    let phrase_context = unsafe {
+        lance_dataset_prepare_fts_phrase_query(
+            dataset,
+            column.as_ptr(),
+            c("apple banana").as_ptr(),
+            0,
+            LanceFtsCoverageMode::Strict as i32,
+        )
+    };
+    assert!(!phrase_context.is_null(), "{}", last_error());
+    let scan = Scan::new(dataset, None);
+    ok(unsafe { lance_scanner_set_fts_query_context(scan.0, phrase_context) });
+    ok(unsafe { lance_scanner_set_substrait_aggregate(scan.0, bytes.as_ptr(), bytes.len()) });
+    assert_eq!(
+        scan.collect_aggregate(),
+        vec![vec![Cell::Int(2), Cell::Int(5)]]
+    );
+    unsafe { lance_fts_query_context_close(phrase_context) };
 
     unsafe { lance_dataset_close(dataset) };
 }
