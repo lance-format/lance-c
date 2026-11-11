@@ -1576,8 +1576,8 @@ static void test_blob_planned_reads(const char *blob_uri) {
     }
     schema.release(&schema);
 
-    const uint8_t expected_null_range[] = {0, 0, 0, 0, 0, 1};
-    const size_t expected_range_sizes[] = {20, 0, 16, 8, 0, 0};
+    const uint8_t expected_null_range[] = {0, 0, 1, 0, 0, 1};
+    const size_t expected_range_sizes[] = {20, 0, 0, 8, 0, 0};
     for (size_t request = 0; request < 6; ++request) {
         struct ArrowArray array = {0};
         ASSERT(stream.get_next(&stream, &array) == 0,

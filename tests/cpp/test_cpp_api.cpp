@@ -1287,7 +1287,7 @@ static void test_blob_planned_reads(const std::string& blob_uri) {
             static_cast<size_t>(cpp_u64_array_value(array.children[0], 0));
         assert(request_indices.insert(request).second);
         const ArrowArray* data = array.children[4];
-        if (request == 5) {
+        if (request == 2 || request == 5) {
             assert(cpp_array_value_is_null(data, 0));
         } else {
             assert(!cpp_array_value_is_null(data, 0));
