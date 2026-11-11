@@ -43484,13 +43484,18 @@ fn mw_open(uri: &str) -> *mut lance_c::LanceDataset {
     ds
 }
 
-fn mw_initialize(ds: *mut lance_c::LanceDataset, mode: i32, column: &str, buckets: u32) -> i32 {
-    let column = c_str(column);
+fn mw_initialize(
+    ds: *mut lance_c::LanceDataset,
+    mode: i32,
+    column: Option<&str>,
+    buckets: u32,
+) -> i32 {
+    let column = column.map(c_str);
     unsafe {
         lance_mem_wal_initialize(
             ds,
             mode,
-            column.as_ptr(),
+            column.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
             buckets,
             0,
             ptr::null(),
@@ -43550,7 +43555,7 @@ fn test_memwal_initialize_and_details() {
     assert!(missing.is_null());
 
     assert_eq!(
-        mw_initialize(ds, MW_SHARDING_UNSHARDED, "id", 0),
+        mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0),
         0,
         "{}",
         take_last_error_message()
@@ -43637,7 +43642,7 @@ fn test_memwal_initialize_and_details() {
 
     // A second initialization is rejected and does not clobber the output.
     let mut untouched: *mut LanceMemWalIndexDetails = ptr::dangling_mut();
-    assert_eq!(mw_initialize(ds, MW_SHARDING_MANUAL, "", 0), -1);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_MANUAL, None, 0), -1);
     assert!(take_last_error_message().contains("already initialized"));
     unsafe {
         lance_mem_wal_index_details(ds, &mut untouched);
@@ -43651,7 +43656,7 @@ fn test_memwal_sharding_values_match_native() {
     let (_tmp, uri) = mw_create_dataset();
     let ds = mw_open(&uri);
     assert_eq!(
-        mw_initialize(ds, MW_SHARDING_BUCKET, "id", 8),
+        mw_initialize(ds, MW_SHARDING_BUCKET, Some("id"), 8),
         0,
         "{}",
         take_last_error_message()
@@ -43768,7 +43773,7 @@ fn test_memwal_writer_scan_mutation_and_durable_reopen() {
     let (_tmp, uri) = mw_create_dataset();
     let ds = mw_open(&uri);
     assert_eq!(
-        mw_initialize(ds, MW_SHARDING_UNSHARDED, "id", 0),
+        mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0),
         0,
         "{}",
         take_last_error_message()
@@ -43921,7 +43926,7 @@ fn test_memwal_writer_scan_mutation_and_durable_reopen() {
 fn test_memwal_point_lookup_planner_on_base() {
     let (_tmp, uri) = mw_create_dataset();
     let ds = mw_open(&uri);
-    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, "id", 0), 0);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
     let mut planner = ptr::null_mut();
     assert_eq!(
         unsafe {
@@ -44034,7 +44039,7 @@ fn test_memwal_point_lookup_planner_on_base() {
 fn test_memwal_vector_search_planner_on_base() {
     let (_tmp, uri) = mw_create_dataset();
     let ds = mw_open(&uri);
-    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, "id", 0), 0);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
     let column = c_str("vector");
     let mut planner = ptr::null_mut();
     assert_eq!(
@@ -44125,7 +44130,7 @@ fn test_memwal_vector_search_planner_on_base() {
 fn test_memwal_merge_insert_with_compaction() {
     let (_tmp, uri) = mw_create_dataset();
     let ds = mw_open(&uri);
-    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, "id", 0), 0);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
 
     let on = c_str("id");
     let on_columns = [on.as_ptr()];
@@ -44218,7 +44223,7 @@ fn test_memwal_null_and_error_edges() {
     // Invalid UUID is rejected with the offending text.
     let (_tmp, uri) = mw_create_dataset();
     let ds = mw_open(&uri);
-    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, "id", 0), 0);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
     let bad = c_str("not-a-uuid");
     let mut writer = ptr::dangling_mut();
     assert_eq!(
@@ -44232,7 +44237,7 @@ fn test_memwal_null_and_error_edges() {
     // Bucket range is native policy.
     let (_tmp2, uri2) = mw_create_dataset();
     let ds2 = mw_open(&uri2);
-    assert_eq!(mw_initialize(ds2, MW_SHARDING_BUCKET, "id", 0), -1);
+    assert_eq!(mw_initialize(ds2, MW_SHARDING_BUCKET, Some("id"), 0), -1);
     let message = take_last_error_message();
     assert!(!message.is_empty(), "native bucket error must be reported");
     unsafe {

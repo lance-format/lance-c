@@ -27,20 +27,19 @@ int main(int argc, char** argv) {
     // Initialization and index details through the C++ owners.
     lance::MemWalInitOptions options;
     options.mode = LANCE_MEM_WAL_SHARDING_UNSHARDED;
-    options.column = std::string("id");
     dataset.initialize_mem_wal(options);
 
     auto details = dataset.mem_wal_index_details();
     CHECK(details.has_value());
-    CHECK(details->num_shards == 1);
-    CHECK(details->maintain_all_indexes);
-    CHECK(details->sharding_specs.size() == 1);
-    CHECK(details->sharding_specs[0].id() == 1);
-    CHECK(details->sharding_specs[0].field_count() == 1);
-    CHECK(details->sharding_specs[0].field_at(0).id() == "bucket");
-    CHECK(details->sharding_specs[0].field_at(0).transform() ==
+    CHECK(details->num_shards() == 1);
+    CHECK(details->maintain_all_indexes());
+    CHECK(details->sharding_specs().size() == 1);
+    CHECK(details->sharding_specs()[0].id() == 1);
+    CHECK(details->sharding_specs()[0].field_count() == 1);
+    CHECK(details->sharding_specs()[0].field_at(0).id() == "bucket");
+    CHECK(details->sharding_specs()[0].field_at(0).transform() ==
           std::optional<std::string>("unsharded"));
-    CHECK(!details->writer_config_defaults.empty());
+    CHECK(!details->writer_config_defaults().empty());
 
     // Writer mutation, live scanner visibility, stats, and idempotent close.
     lance::ShardWriterConfig config;
