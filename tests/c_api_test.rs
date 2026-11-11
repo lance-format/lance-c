@@ -22631,7 +22631,7 @@ fn collect_typed_element_hits(
                 ids.value(row),
                 (0..coordinates.len())
                     .map(|index| coordinates.value(index))
-                    .collect(),
+                    .collect::<Vec<u32>>(),
                 scores.value(row),
             ));
         }
@@ -22684,7 +22684,7 @@ fn collect_native_fts_element_hits(
                     ids.value(row),
                     (0..coordinates.len())
                         .map(|index| coordinates.value(index))
-                        .collect(),
+                        .collect::<Vec<u32>>(),
                     scores.value(row),
                 ));
             }
