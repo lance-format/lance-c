@@ -1128,7 +1128,8 @@ pub struct LanceNamespaceCustomClientSpec {
     pub list_table_versions: Option<NamespaceOperationCallback>,
     pub release: Option<unsafe extern "C" fn(*mut c_void)>,
     pub client_ctx: *mut c_void,
-    /// Optional copied identifier. NULL or empty means `custom`.
+    /// Optional copied identity used in native storage-provider cache keys.
+    /// NULL or empty assigns a unique identity for this client's lifetime.
     pub namespace_id: *const c_char,
 }
 
@@ -1160,8 +1161,8 @@ unsafe fn custom_new_inner(
     })?;
     let id = unsafe { parse_c_string(spec.namespace_id)? }
         .filter(|id| !id.is_empty())
-        .unwrap_or("custom")
-        .to_owned();
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let namespace = CustomNamespace {
         id,
         context,

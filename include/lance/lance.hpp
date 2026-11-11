@@ -8771,7 +8771,8 @@ public:
         std::function<std::string(const std::string&)> describe_table_version;
         std::function<std::string(const std::string&)> create_table_version;
         std::function<std::string(const std::string&)> list_table_versions;
-        std::string namespace_id = "custom";
+        /// Empty assigns a unique identity stable for this client's lifetime.
+        std::string namespace_id;
     };
 
     Namespace(Namespace&&) noexcept = default;

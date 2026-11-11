@@ -7939,6 +7939,10 @@ typedef struct LanceNamespaceCustomClientSpec {
     LanceNamespaceOperationFn list_table_versions;
     void (*release)(void* client_ctx);
     void* client_ctx;
+    /** Copied identity used in native storage-provider cache keys. NULL or
+     * empty assigns a unique identity stable for this client's lifetime.
+     * Clients with the same explicit identity share native provider cache keys
+     * for matching table IDs. */
     const char* namespace_id;
 } LanceNamespaceCustomClientSpec;
 
