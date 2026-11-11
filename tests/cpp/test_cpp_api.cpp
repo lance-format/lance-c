@@ -2597,6 +2597,7 @@ static void test_native_write_data_option_errors(
     {
         lance::NativeWriteOptionsSpec spec;
         spec.write.params.data_storage_version = "2.2";
+        spec.external_blob_mode = lance::ExternalBlobMode::Ingest;
         spec.blob_pack_file_size_threshold = 1;
         lance::NativeWriteOptions options(spec);
         auto stream = native_write_source_stream(blob_uri);

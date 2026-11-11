@@ -3515,6 +3515,7 @@ static void test_native_write_data_options(
 
     LanceNativeWriteOptionsSpec blob_spec = {0};
     blob_spec.write_options = &write_options;
+    blob_spec.external_blob_mode = LANCE_EXTERNAL_BLOB_INGEST;
     blob_spec.has_blob_pack_file_size_threshold = 1;
     blob_spec.blob_pack_file_size_threshold = 1;
     LanceNativeWriteOptions *blob_options =
