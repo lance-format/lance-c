@@ -50,7 +50,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Delete operations | Predicate-based deletion via `lance_dataset_delete()` |
 | [x] | Update operations | Expression-based row updates via `lance_dataset_update()` |
 | [x] | Merge-insert | Upsert via configurable when-matched / when-not-matched policies with `lance_dataset_merge_insert()` |
-| [x] | Schema evolution | Add columns via SQL / all-null / `ArrowArrayStream` with `lance_dataset_add_columns_*()`, drop via `lance_dataset_drop_columns()`, rename / retype / set nullability via `lance_dataset_alter_columns()` |
+| [x] | Schema evolution | Add columns via SQL / all-null / `ArrowArrayStream` / callback `BatchUDF` with native checkpointing, left-join native `Dataset::merge`, drop via `lance_dataset_drop_columns()`, and rename / retype / set nullability via `lance_dataset_alter_columns()` |
 | [x] | Version management | Version details/metadata, lightweight refs, native ref checkout, tag and branch lifecycle, rollback, and numeric-version open |
 
 ### Phase 4: Advanced Features

@@ -9,7 +9,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::record_batch::RecordBatchReader;
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
@@ -20,10 +20,6 @@ use lance_c::*;
 
 fn c_string(value: &str) -> CString {
     CString::new(value).unwrap()
-}
-
-fn schema_to_ffi(schema: &Schema) -> FFI_ArrowSchema {
-    FFI_ArrowSchema::try_from(schema).unwrap()
 }
 
 fn stream_from(batches: Vec<RecordBatch>, schema: Arc<Schema>) -> FFI_ArrowArrayStream {
@@ -377,7 +373,7 @@ fn test_merge_matches_native_oracle_and_preserves_snapshots() {
 
 fn collect_row_keys(uri: &str, with_row_id: bool) -> (Vec<(i32, u64)>, u64, u64) {
     let dataset = open(uri);
-    let mut scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
     assert!(!scanner.is_null());
     if with_row_id {
         assert_eq!(unsafe { lance_scanner_with_row_id(scanner, true) }, 0);

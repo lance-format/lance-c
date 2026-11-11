@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow::record_batch::RecordBatchReader;
 use arrow_array::{
     Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray, StructArray,
 };
@@ -80,10 +79,10 @@ fn fixture_uri(root: &tempfile::TempDir, name: &str) -> String {
 }
 
 fn create_batch_udf_dataset(uri: &str, stable: bool) {
-    let metadata = BTreeMap::from([("dataset-key".to_owned(), "dataset-value".to_owned())]);
+    let metadata = HashMap::from([("dataset-key".to_owned(), "dataset-value".to_owned())]);
     let schema = Arc::new(Schema::new_with_metadata(
         vec![
-            Field::new("id", DataType::Int32, false).with_metadata(BTreeMap::from([(
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
                 "field-key".to_owned(),
                 "field-value".to_owned(),
             )])),
@@ -122,9 +121,9 @@ fn output_schema() -> Arc<Schema> {
     Arc::new(Schema::new_with_metadata(
         vec![
             Field::new("derived", DataType::Int64, true)
-                .with_metadata(BTreeMap::from([("unit".to_owned(), "native".to_owned())])),
+                .with_metadata(HashMap::from([("unit".to_owned(), "native".to_owned())])),
         ],
-        BTreeMap::from([("producer".to_owned(), "callback-test".to_owned())]),
+        HashMap::from([("producer".to_owned(), "callback-test".to_owned())]),
     ))
 }
 
@@ -148,7 +147,7 @@ enum MapperMode {
 #[derive(Clone, Debug)]
 struct MapperEvent {
     input_fields: Vec<String>,
-    input_metadata: BTreeMap<String, String>,
+    input_metadata: HashMap<String, String>,
     rows: usize,
 }
 
@@ -573,7 +572,7 @@ fn run_batch_udf(
         ptr::null()
     };
 
-    let mut raw_store = checkpoint_store(context);
+    let raw_store = checkpoint_store(context);
     let mut raw = LanceBatchUDF {
         mapper: Some(mapper_callback),
         mapper_ctx: (context as *const CallbackContext).cast_mut().cast(),
@@ -1098,7 +1097,11 @@ fn test_batch_udf_checkpoint_hits_skip_mapper_and_batches() {
             .iter()
             .any(|event| event.starts_with("get_fragment:"))
     );
-    assert!(events.iter().any(|event| event == "get_batch:1:0"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event == &format!("get_batch:{fragment_b_id}:0"))
+    );
     assert_eq!(events.iter().filter(|event| *event == "mapper").count(), 0);
     unsafe { lance_dataset_close(dataset) };
 }
