@@ -297,7 +297,10 @@ impl FfiBatchUdfMapper {
         let mut error = LanceCallbackError::empty();
         // SAFETY: all pointers are valid for the callback. Input values are
         // borrowed and the output/error slots are initialized and writable.
-        let status = unsafe {
+        // Leave the async execution context while foreign code runs so it can
+        // make synchronous FFI reads through independent handles. The enclosing
+        // dataset mutation lock and all callback borrows remain held.
+        let status = tokio::task::block_in_place(|| unsafe {
             (self.callback)(
                 self.callback_ctx,
                 &input_array,
@@ -305,7 +308,7 @@ impl FfiBatchUdfMapper {
                 &mut output,
                 &mut error,
             )
-        };
+        });
         drop(input_array);
         drop(input_schema);
 
@@ -343,7 +346,9 @@ impl UDFCheckpointStore for FfiCheckpointStore {
             .get_batch
             .expect("validated checkpoint get_batch callback");
         // SAFETY: the callback table and context are valid for this call.
-        let status = unsafe { callback(self.store.callback_ctx, &info, &mut output, &mut error) };
+        let status = tokio::task::block_in_place(|| unsafe {
+            callback(self.store.callback_ctx, &info, &mut output, &mut error)
+        });
         match status {
             0 => {
                 unsafe { release_array_slot(&mut output) };
@@ -380,7 +385,7 @@ impl UDFCheckpointStore for FfiCheckpointStore {
         // callback may move them and clear the source release callbacks. Any
         // ownership left in the slots belongs to the library and is released
         // after the callback returns on every path.
-        let status = unsafe {
+        let status = tokio::task::block_in_place(|| unsafe {
             callback(
                 self.store.callback_ctx,
                 &info,
@@ -388,7 +393,7 @@ impl UDFCheckpointStore for FfiCheckpointStore {
                 &mut schema,
                 &mut error,
             )
-        };
+        });
         unsafe { release_array_slot(&mut array) };
         unsafe { release_schema_slot(&mut schema) };
 
@@ -408,14 +413,14 @@ impl UDFCheckpointStore for FfiCheckpointStore {
             .get_fragment
             .expect("validated checkpoint get_fragment callback");
         // SAFETY: the callback table and context are valid for this call.
-        let status = unsafe {
+        let status = tokio::task::block_in_place(|| unsafe {
             callback(
                 self.store.callback_ctx,
                 fragment_id,
                 &mut out_json,
                 &mut error,
             )
-        };
+        });
         match status {
             0 => {
                 unsafe { release_owned_string_slot(&mut out_json) };
@@ -461,14 +466,14 @@ impl UDFCheckpointStore for FfiCheckpointStore {
             .insert_fragment
             .expect("validated checkpoint insert_fragment callback");
         // SAFETY: `json` remains alive and is borrowed for the callback only.
-        let status = unsafe {
+        let status = tokio::task::block_in_place(|| unsafe {
             callback(
                 self.store.callback_ctx,
                 fragment_id,
                 json.as_ptr(),
                 &mut error,
             )
-        };
+        });
         if status == 0 {
             unsafe { release_message_only(&mut error) };
             Ok(())
