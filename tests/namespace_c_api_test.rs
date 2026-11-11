@@ -1121,7 +1121,17 @@ fn rest_adapter_client_context_headers_metrics_and_native_errors() {
 
     let metrics = unsafe { lance_namespace_retrieve_ops_metrics(client) };
     assert!(!metrics.is_null());
-    let _ = take_and_free(metrics);
+    let metrics: serde_json::Value = serde_json::from_str(&take_and_free(metrics)).unwrap();
+    assert!(
+        metrics
+            .as_object()
+            .is_some_and(|metrics| !metrics.is_empty()),
+        "REST client metrics missing: {metrics}"
+    );
+    assert_eq!(unsafe { lance_namespace_reset_ops_metrics(client) }, 0);
+    let metrics = unsafe { lance_namespace_retrieve_ops_metrics(client) };
+    let metrics: serde_json::Value = serde_json::from_str(&take_and_free(metrics)).unwrap();
+    assert_eq!(metrics, serde_json::json!({}), "REST metrics reset");
     unsafe { lance_rest_adapter_shutdown(adapter) };
     unsafe { lance_rest_adapter_close(adapter) };
     close_namespace(client);
