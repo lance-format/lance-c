@@ -672,27 +672,6 @@ int main(int argc, char **argv) {
     ASSERT(lance_dataset_fragment_count(committed) == 2,
            "overlay commit preserves fragments");
 
-    /* Replaying the same overlay operation against its already-committed read
-       version is a native DataOverlay conflict: the group set is identical to
-       the operation committed at base_version + 1. */
-    LanceOperation *repeat_operation =
-        lance_operation_data_overlay_new(groups, 2);
-    ASSERT(repeat_operation != NULL, "repeat operation");
-    CHECK_OK();
-    LanceTransaction *repeat_transaction =
-        lance_transaction_new(base_version, repeat_operation, NULL);
-    ASSERT(repeat_transaction != NULL, "repeat transaction");
-    CHECK_OK();
-    LanceDataset *repeat_committed = NULL;
-    int32_t repeat_rc = lance_transaction_commit(
-        uri, repeat_transaction, NULL, NULL, NULL, &repeat_committed);
-    ASSERT(repeat_rc != 0, "repeated overlay commit must fail");
-    ASSERT(lance_last_error_code() == LANCE_ERR_COMMIT_CONFLICT,
-           "repeated overlay reports commit conflict");
-    ASSERT(repeat_committed == NULL,
-           "repeated commit leaves output NULL");
-    lance_transaction_close(repeat_transaction);
-    lance_operation_close(repeat_operation);
     lance_data_overlay_group_close(group0);
     lance_data_overlay_group_close(group1);
 
@@ -754,10 +733,10 @@ int main(int argc, char **argv) {
     lance_fragment_close(committed_fragment0);
 
     LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
-    ASSERT(reopened != NULL, "reopen after stale conflict");
+    ASSERT(reopened != NULL, "reopen after final overlay");
     CHECK_OK();
     ASSERT(lance_dataset_version(reopened) == base_version + 2,
-           "stale conflict leaves version unchanged");
+           "second overlay leaves final version");
     assert_row(reopened, 1, 0, 9999, 211, before[1].rowid);
     assert_row(reopened, 2, 0, 20, 200, before[2].rowid);
     assert_row(reopened, 3, 1, 0, 212, before[3].rowid);

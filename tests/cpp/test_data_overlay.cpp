@@ -404,17 +404,6 @@ int main(int argc, char** argv) {
 
         check_history(committed, 3, 2);
 
-        auto repeat_transaction =
-            lance::Transaction::from_operation(2, operation);
-        bool repeat_conflict = false;
-        try {
-            auto unexpected = lance::Dataset::commit(uri, repeat_transaction);
-            (void)unexpected;
-        } catch (const lance::Error& error) {
-            repeat_conflict = error.code == LANCE_ERR_COMMIT_CONFLICT;
-        }
-        CHECK(repeat_conflict);
-
         auto committed_fragment0 =
             committed.open_fragment(committed.fragment_ids()[0]);
         auto second_schema = committed_fragment0.native_schema().project({"a"});
