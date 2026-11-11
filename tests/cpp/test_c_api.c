@@ -2877,14 +2877,35 @@ static void test_write_options_and_config(const char *src_uri,
 }
 
 typedef struct NativeWriteProgressCapture {
-    uint64_t begins;
-    uint64_t completes;
-    uint64_t stats;
-    uint64_t releases;
-    uint64_t rows;
-    uint64_t bytes;
-    uint32_t files;
+    atomic_uint_fast64_t begins;
+    atomic_uint_fast64_t completes;
+    atomic_uint_fast64_t stats;
+    atomic_uint_fast64_t releases;
+    atomic_uint_fast64_t rows;
+    atomic_uint_fast64_t bytes;
+    atomic_uint_fast64_t files;
+    atomic_int fail_begin;
+    atomic_int bad_complete_info;
 } NativeWriteProgressCapture;
+
+static uint64_t native_write_load(const atomic_uint_fast64_t *value) {
+    return atomic_load_explicit(value, memory_order_seq_cst);
+}
+
+static void native_write_release_error_string(LanceOwnedString *self) {
+    free(self->data);
+    self->data = NULL;
+    self->release = NULL;
+}
+
+static void native_write_fill_error(LanceCallbackError *error) {
+    const char *message = "native write progress rejected the fragment";
+    error->code = LANCE_ERR_INVALID_ARGUMENT;
+    error->message.data = (char *)malloc(strlen(message) + 1);
+    ASSERT(error->message.data != NULL, "allocate progress callback error");
+    strcpy(error->message.data, message);
+    error->message.release = native_write_release_error_string;
+}
 
 static int32_t native_write_begin(void *callback_ctx,
                                   const LanceWriteFragmentProgressInfo *info,
@@ -2892,8 +2913,12 @@ static int32_t native_write_begin(void *callback_ctx,
     NativeWriteProgressCapture *capture =
         (NativeWriteProgressCapture *)callback_ctx;
     (void)info;
-    (void)error;
-    capture->begins++;
+    atomic_fetch_add_explicit(
+        &capture->begins, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&capture->fail_begin, memory_order_seq_cst)) {
+        native_write_fill_error(error);
+        return -1;
+    }
     return 0;
 }
 
@@ -2902,9 +2927,14 @@ static int32_t native_write_complete(void *callback_ctx,
                                      LanceCallbackError *error) {
     NativeWriteProgressCapture *capture =
         (NativeWriteProgressCapture *)callback_ctx;
-    (void)info;
     (void)error;
-    capture->completes++;
+    if (info == NULL || info->has_physical_rows == 0 ||
+        info->physical_rows == 0 || info->file_count == 0) {
+        atomic_store_explicit(
+            &capture->bad_complete_info, 1, memory_order_seq_cst);
+    }
+    atomic_fetch_add_explicit(
+        &capture->completes, 1, memory_order_seq_cst);
     return 0;
 }
 
@@ -2912,16 +2942,159 @@ static void native_write_stats(void *callback_ctx,
                                const LanceWriteStats *stats) {
     NativeWriteProgressCapture *capture =
         (NativeWriteProgressCapture *)callback_ctx;
-    capture->stats++;
-    capture->rows = stats->rows_written;
-    capture->bytes = stats->bytes_written;
-    capture->files = stats->files_written;
+    if (stats == NULL) {
+        atomic_store_explicit(
+            &capture->bad_complete_info, 1, memory_order_seq_cst);
+        return;
+    }
+    atomic_fetch_add_explicit(
+        &capture->stats, 1, memory_order_seq_cst);
+    atomic_store_explicit(
+        &capture->rows, stats->rows_written, memory_order_seq_cst);
+    atomic_store_explicit(
+        &capture->bytes, stats->bytes_written, memory_order_seq_cst);
+    atomic_store_explicit(
+        &capture->files, stats->files_written, memory_order_seq_cst);
 }
 
 static void native_write_release(void *callback_ctx) {
     NativeWriteProgressCapture *capture =
         (NativeWriteProgressCapture *)callback_ctx;
-    capture->releases++;
+    atomic_fetch_add_explicit(
+        &capture->releases, 1, memory_order_seq_cst);
+}
+
+static void native_write_wait_release(NativeWriteProgressCapture *capture) {
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        if (native_write_load(&capture->releases) == 1) return;
+        struct timespec delay = {0, 1000000};
+        nanosleep(&delay, NULL);
+    }
+    ASSERT(native_write_load(&capture->releases) == 1,
+           "progress context must be released exactly once");
+}
+
+typedef struct NativeWriteInput {
+    struct ArrowArrayStream stream;
+    struct ArrowSchema schema;
+} NativeWriteInput;
+
+static NativeWriteInput native_write_input(const char *uri) {
+    NativeWriteInput input;
+    memset(&input, 0, sizeof(input));
+    LanceDataset *source = lance_dataset_open(uri, NULL, 0);
+    ASSERT(source != NULL, "open native-write source");
+    CHECK_OK();
+    LanceScanner *scanner = lance_scanner_new(source, NULL, NULL);
+    ASSERT(scanner != NULL, "create native-write source scanner");
+    CHECK_OK();
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &input.stream) == 0,
+           "export native-write source stream");
+    CHECK_OK();
+    ASSERT(input.stream.get_schema(&input.stream, &input.schema) == 0,
+           "read native-write source schema");
+    CHECK_OK();
+    lance_scanner_close(scanner);
+    lance_dataset_close(source);
+    return input;
+}
+
+static void native_write_input_release_schema(NativeWriteInput *input) {
+    if (input->schema.release) input->schema.release(&input->schema);
+    input->schema.release = NULL;
+}
+
+static int32_t native_write_ordinary(
+    const char *uri,
+    NativeWriteInput *input,
+    int32_t mode,
+    const LanceNativeWriteOptions *options,
+    LanceDataset **out_dataset) {
+    int32_t rc = lance_dataset_write_with_native_options(
+        uri, &input->schema, &input->stream, mode, options, out_dataset);
+    native_write_input_release_schema(input);
+    return rc;
+}
+
+static int32_t native_write_staged(
+    const char *uri,
+    NativeWriteInput *input,
+    int32_t mode,
+    const LanceNativeWriteOptions *options,
+    LanceTransaction **out_transaction) {
+    int32_t rc = lance_dataset_write_uncommitted_stream_with_native_options(
+        uri, &input->schema, &input->stream, mode, options, out_transaction);
+    native_write_input_release_schema(input);
+    return rc;
+}
+
+static size_t native_write_fragment_ids(
+    LanceDataset *dataset,
+    uint64_t *ids,
+    size_t capacity) {
+    uint64_t count = lance_dataset_fragment_count(dataset);
+    CHECK_OK();
+    ASSERT((size_t)count <= capacity, "fragment ID capacity exceeded");
+    if (count > 0) {
+        ASSERT(lance_dataset_fragment_ids(dataset, ids) == 0,
+               "read fragment IDs");
+        CHECK_OK();
+    }
+    return (size_t)count;
+}
+
+static int native_write_id_in(
+    const uint64_t *ids,
+    size_t count,
+    uint64_t candidate) {
+    for (size_t index = 0; index < count; ++index) {
+        if (ids[index] == candidate) return 1;
+    }
+    return 0;
+}
+
+static void native_write_assert_new_file_bases(
+    LanceDataset *dataset,
+    const uint64_t *old_ids,
+    size_t old_count,
+    int expect_present,
+    uint32_t expected_base_id) {
+    uint64_t ids[128];
+    size_t count = native_write_fragment_ids(dataset, ids, 128);
+    int saw_new_fragment = 0;
+    for (size_t index = 0; index < count; ++index) {
+        if (native_write_id_in(old_ids, old_count, ids[index])) continue;
+        saw_new_fragment = 1;
+        LanceFragment *fragment =
+            lance_dataset_open_fragment(dataset, ids[index]);
+        ASSERT(fragment != NULL, "open written fragment");
+        CHECK_OK();
+        uint64_t file_count = lance_fragment_data_file_count(fragment);
+        CHECK_OK();
+        ASSERT(file_count > 0, "written fragment must contain a data file");
+        for (uint64_t file_index = 0; file_index < file_count; ++file_index) {
+            LanceDataFile *file = NULL;
+            ASSERT(lance_fragment_data_file_at(
+                       fragment, (size_t)file_index, &file) == 0,
+                   "read written data file");
+            CHECK_OK();
+            ASSERT(file != NULL, "data file handle must be non-NULL");
+            bool present = false;
+            uint32_t base_id = 0;
+            ASSERT(lance_data_file_base_id(file, &present, &base_id) == 0,
+                   "read written data-file base ID");
+            CHECK_OK();
+            ASSERT(present == (expect_present != 0),
+                   "unexpected data-file base presence");
+            if (present) {
+                ASSERT(base_id == expected_base_id,
+                       "unexpected registered data-file base ID");
+            }
+            lance_data_file_close(file);
+        }
+        lance_fragment_close(fragment);
+    }
+    ASSERT(saw_new_fragment, "write must add at least one fragment");
 }
 
 /* Exercises the owned native-write options representation through a real C
@@ -2989,15 +3162,62 @@ static void test_native_write_options(const char *src_uri,
     ASSERT(rc == 0, "native options create failed");
     CHECK_OK();
     ASSERT(ds != NULL, "out_dataset must be populated");
-    ASSERT(lance_dataset_count_rows(ds) > 0, "create must write rows");
-    ASSERT(progress.begins > 0 && progress.completes > 0,
+    uint64_t source_rows = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(source_rows > 0, "create must write rows");
+    ASSERT(native_write_load(&progress.begins) > 0 &&
+               native_write_load(&progress.completes) > 0,
            "fragment progress callbacks must run");
-    ASSERT(progress.stats > 0 && progress.rows > 0 && progress.bytes > 0,
+    ASSERT(native_write_load(&progress.stats) > 0 &&
+               native_write_load(&progress.rows) == source_rows &&
+               native_write_load(&progress.bytes) > 0 &&
+               native_write_load(&progress.files) > 0,
            "native stats callbacks must carry cumulative values");
-    ASSERT(progress.releases == 0,
+    ASSERT(atomic_load_explicit(
+               &progress.bad_complete_info, memory_order_seq_cst) == 0,
+           "complete progress must carry physical rows and native files");
+    ASSERT(native_write_load(&progress.releases) == 0,
            "callback context remains owned while the options handle is open");
     lance_dataset_close(ds);
     lance_scanner_close(scanner);
+
+    NativeWriteInput append_input = native_write_input(src_uri);
+    rc = native_write_ordinary(
+        uri, &append_input, LANCE_WRITE_APPEND, options, &ds);
+    ASSERT(rc == 0, "native options append failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(ds) == source_rows * 2,
+           "append must preserve and add rows");
+    lance_dataset_close(ds);
+
+    NativeWriteInput overwrite_input = native_write_input(src_uri);
+    rc = native_write_ordinary(
+        uri, &overwrite_input, LANCE_WRITE_OVERWRITE, options, &ds);
+    ASSERT(rc == 0, "native options overwrite failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(ds) == source_rows,
+           "overwrite must replace rows");
+    lance_dataset_close(ds);
+
+    LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen overwritten dataset failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(reopened) == source_rows,
+           "reopened overwrite row count mismatch");
+    LanceTransaction *read_transaction = NULL;
+    ASSERT(lance_dataset_read_transaction(reopened, &read_transaction) == 0,
+           "read ordinary native transaction failed");
+    CHECK_OK();
+    ASSERT(read_transaction != NULL,
+           "ordinary native write must retain its transaction");
+    bool has_properties = false;
+    ASSERT(lance_transaction_has_properties(read_transaction, &has_properties) ==
+               0,
+           "ordinary transaction property presence failed");
+    CHECK_OK();
+    ASSERT(has_properties, "ordinary transaction properties must be Some");
+    lance_transaction_close(read_transaction);
+    lance_dataset_close(reopened);
 
     scanner = lance_scanner_new(src, NULL, NULL);
     ASSERT(scanner != NULL, "staged scanner creation failed");
@@ -3016,7 +3236,6 @@ static void test_native_write_options(const char *src_uri,
     ASSERT(rc == 0, "native options staged write failed");
     CHECK_OK();
     ASSERT(transaction != NULL, "out_transaction must be populated");
-    bool has_properties = false;
     ASSERT(lance_transaction_has_properties(transaction, &has_properties) == 0,
            "transaction property presence failed");
     CHECK_OK();
@@ -3043,7 +3262,7 @@ static void test_native_write_options(const char *src_uri,
     ASSERT(rc == 0, "staged commit failed");
     CHECK_OK();
     ASSERT(committed != NULL, "commit must return a dataset");
-    ASSERT(lance_dataset_count_rows(committed) > 0,
+    ASSERT(lance_dataset_count_rows(committed) == source_rows,
            "staged commit must write rows");
     lance_dataset_close(committed);
     lance_transaction_close(transaction);
@@ -3051,8 +3270,441 @@ static void test_native_write_options(const char *src_uri,
     lance_dataset_close(src);
 
     lance_native_write_options_close(options);
-    ASSERT(progress.releases == 1,
-           "progress context must be released exactly once");
+    native_write_wait_release(&progress);
+
+    reopened = lance_dataset_open(staged_uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen staged dataset failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(reopened) == source_rows,
+           "reopened staged row count mismatch");
+    read_transaction = NULL;
+    ASSERT(lance_dataset_read_transaction(reopened, &read_transaction) == 0,
+           "read staged transaction after reopen failed");
+    CHECK_OK();
+    ASSERT(read_transaction != NULL,
+           "staged commit must retain its transaction");
+    ASSERT(lance_transaction_has_properties(read_transaction, &has_properties) ==
+               0,
+           "reopened transaction property presence failed");
+    CHECK_OK();
+    ASSERT(has_properties, "reopened transaction properties must be Some");
+    lance_transaction_close(read_transaction);
+    lance_dataset_close(reopened);
+    printf("OK\n");
+}
+
+typedef struct NativeWriteLockCapture {
+    atomic_int acquires;
+    atomic_int releases;
+    atomic_int destroys;
+    atomic_int context_releases;
+} NativeWriteLockCapture;
+
+static int32_t native_write_lock_acquire(
+    void *callback_ctx,
+    uint64_t version,
+    void **out_lease,
+    LanceCallbackError *error) {
+    (void)version;
+    (void)error;
+    NativeWriteLockCapture *capture =
+        (NativeWriteLockCapture *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &capture->acquires, 1, memory_order_seq_cst);
+    ASSERT(out_lease != NULL, "native write lock out_lease must be non-NULL");
+    *out_lease = NULL;
+    return 0;
+}
+
+static int32_t native_write_lock_release(
+    void *callback_ctx,
+    void *lease,
+    bool success,
+    LanceCallbackError *error) {
+    (void)lease;
+    (void)success;
+    (void)error;
+    NativeWriteLockCapture *capture =
+        (NativeWriteLockCapture *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &capture->releases, 1, memory_order_seq_cst);
+    return 0;
+}
+
+static void native_write_lock_destroy(void *callback_ctx, void *lease) {
+    (void)lease;
+    NativeWriteLockCapture *capture =
+        (NativeWriteLockCapture *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &capture->destroys, 1, memory_order_seq_cst);
+}
+
+static void native_write_lock_context_release(void *callback_ctx) {
+    NativeWriteLockCapture *capture =
+        (NativeWriteLockCapture *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &capture->context_releases, 1, memory_order_seq_cst);
+}
+
+/* C11 presence rules and base placement: NULL target lists select native None,
+ * while a non-NULL zero-length list selects Some(empty) and must be rejected by
+ * Lance. Registered and primary data-file base IDs are read from the resulting
+ * fragment metadata. */
+static void test_native_write_base_placement(
+    const char *src_uri,
+    const char *write_uri) {
+    printf("  test_native_write_base_placement... ");
+    char uri[4096];
+    char base_uri[4096];
+    snprintf(uri, sizeof(uri), "%s_native_bases", write_uri);
+    snprintf(base_uri, sizeof(base_uri), "%s_native_registered_base", write_uri);
+
+    LanceBasePath initial = {0};
+    initial.id = 7;
+    initial.path = base_uri;
+    initial.name = "c-registered";
+    initial.is_dataset_root = false;
+    LanceBasePathList initial_list = {&initial, 1};
+
+    const uint32_t registered_base = 7;
+    LanceUInt32List target_list = {&registered_base, 1};
+    LanceBaseStoreParams base_store = {0};
+    base_store.base_path = base_uri;
+    base_store.has_block_size = 1;
+    base_store.block_size = 4096;
+    LanceBaseStoreParamsList base_store_list = {&base_store, 1};
+
+    LanceWriteOptions write_options = {0};
+    write_options.params.max_rows_per_file = 5;
+    LanceNativeWriteOptionsSpec spec = {0};
+    spec.write_options = &write_options;
+    spec.initial_bases = &initial_list;
+    spec.target_bases = &target_list;
+    spec.base_store_params = &base_store_list;
+    LanceNativeWriteOptions *options = lance_native_write_options_new(&spec);
+    ASSERT(options != NULL, "registered-base write options must be created");
+    CHECK_OK();
+
+    NativeWriteInput create_input = native_write_input(src_uri);
+    LanceDataset *dataset = NULL;
+    int32_t rc = native_write_ordinary(
+        uri, &create_input, LANCE_WRITE_CREATE, options, &dataset);
+    ASSERT(rc == 0, "registered-base create failed");
+    CHECK_OK();
+    ASSERT(dataset != NULL, "registered-base create output missing");
+    uint64_t source_rows = lance_dataset_count_rows(dataset);
+    CHECK_OK();
+    ASSERT(source_rows > 0, "registered-base create wrote no rows");
+    native_write_assert_new_file_bases(dataset, NULL, 0, 1, 7);
+    const char *base_paths = lance_dataset_base_paths_json(dataset);
+    ASSERT(base_paths != NULL, "registered-base registry snapshot failed");
+    ASSERT(strstr(base_paths, "\"7\"") != NULL,
+           "registered base ID must be present in the manifest");
+    lance_free_string(base_paths);
+
+    uint64_t old_ids[128];
+    size_t old_id_count =
+        native_write_fragment_ids(dataset, old_ids, 128);
+    lance_dataset_close(dataset);
+    lance_native_write_options_close(options);
+
+    LanceNativeWriteOptionsSpec append_spec = {0};
+    append_spec.write_options = &write_options;
+    LanceNativeWriteOptions *append_options =
+        lance_native_write_options_new(&append_spec);
+    ASSERT(append_options != NULL, "primary append options must be created");
+    CHECK_OK();
+    NativeWriteInput append_input = native_write_input(src_uri);
+    rc = native_write_ordinary(
+        uri, &append_input, LANCE_WRITE_APPEND, append_options, &dataset);
+    ASSERT(rc == 0, "absent target append failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == source_rows * 2,
+           "absent target append row count mismatch");
+    native_write_assert_new_file_bases(
+        dataset, old_ids, old_id_count, 0, 0);
+    lance_dataset_close(dataset);
+    lance_native_write_options_close(append_options);
+
+    const LanceUInt32List empty_targets = {NULL, 0};
+    LanceNativeWriteOptionsSpec empty_spec = {0};
+    empty_spec.target_bases = &empty_targets;
+    LanceNativeWriteOptions *empty_options =
+        lance_native_write_options_new(&empty_spec);
+    ASSERT(empty_options != NULL, "explicit-empty target options must be created");
+    CHECK_OK();
+    NativeWriteInput failed_input = native_write_input(src_uri);
+    dataset = NULL;
+    rc = native_write_ordinary(
+        uri, &failed_input, LANCE_WRITE_APPEND, empty_options, &dataset);
+    ASSERT(rc == -1, "explicit-empty target append must fail");
+    ASSERT(dataset == NULL, "failed append must not return a dataset");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "target_bases cannot be empty",
+        "explicit-empty native target selection");
+    lance_native_write_options_close(empty_options);
+
+    dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "reopen base-placement dataset failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == source_rows * 2,
+           "rejected empty target must not publish rows");
+    lance_dataset_close(dataset);
+    printf("OK\n");
+}
+
+/* C11 forwarding for file-writer and blob options. The valid paths write and
+ * reopen; the invalid paths assert constructor or native validation errors, and
+ * the native blob error is applied to an existing dataset so its unchanged row
+ * count is directly observable. */
+static void test_native_write_data_options(
+    const char *src_uri,
+    const char *blob_uri,
+    const char *write_uri) {
+    printf("  test_native_write_data_options... ");
+    char file_uri[4096];
+    char blob_output_uri[4096];
+    snprintf(file_uri, sizeof(file_uri), "%s_native_file_writer", write_uri);
+    snprintf(
+        blob_output_uri,
+        sizeof(blob_output_uri),
+        "%s_native_blob_options",
+        write_uri);
+
+    LanceWriteOptions write_options = {0};
+    write_options.params.data_storage_version = "2.2";
+    write_options.params.max_rows_per_file = 5;
+    LanceFileWriterOptions file_options = {0};
+    file_options.has_data_cache_bytes = 1;
+    file_options.data_cache_bytes = 1024 * 1024;
+    file_options.has_max_page_bytes = 1;
+    file_options.max_page_bytes = 4096;
+    file_options.has_keep_original_array = 1;
+    file_options.keep_original_array = 0;
+
+    LanceNativeWriteOptionsSpec file_spec = {0};
+    file_spec.write_options = &write_options;
+    file_spec.file_writer_options = &file_options;
+    LanceNativeWriteOptions *file_native =
+        lance_native_write_options_new(&file_spec);
+    ASSERT(file_native != NULL, "file-writer options must be created");
+    CHECK_OK();
+    NativeWriteInput file_input = native_write_input(src_uri);
+    LanceDataset *dataset = NULL;
+    int32_t rc = native_write_ordinary(
+        file_uri, &file_input, LANCE_WRITE_CREATE, file_native, &dataset);
+    ASSERT(rc == 0, "file-writer create failed");
+    CHECK_OK();
+    uint64_t source_rows = lance_dataset_count_rows(dataset);
+    CHECK_OK();
+    ASSERT(source_rows > 0, "file-writer create wrote no rows");
+    lance_dataset_close(dataset);
+    lance_native_write_options_close(file_native);
+
+    file_options.version = "2.1";
+    LanceNativeWriteOptionsSpec raw_version_spec = {0};
+    raw_version_spec.file_writer_options = &file_options;
+    ASSERT(lance_native_write_options_new(&raw_version_spec) == NULL,
+           "raw file-writer version must be rejected");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "file_writer_options.version",
+        "raw file-writer version validation");
+    file_options.version = NULL;
+
+    LanceNativeWriteOptionsSpec blob_spec = {0};
+    blob_spec.write_options = &write_options;
+    blob_spec.has_blob_pack_file_size_threshold = 1;
+    blob_spec.blob_pack_file_size_threshold = 1;
+    LanceNativeWriteOptions *blob_options =
+        lance_native_write_options_new(&blob_spec);
+    ASSERT(blob_options != NULL, "blob write options must be created");
+    CHECK_OK();
+    LanceDataset *blob_source = lance_dataset_open(blob_uri, NULL, 0);
+    ASSERT(blob_source != NULL, "open blob source failed");
+    CHECK_OK();
+    uint64_t blob_rows = lance_dataset_count_rows(blob_source);
+    CHECK_OK();
+    lance_dataset_close(blob_source);
+    NativeWriteInput blob_input = native_write_input(blob_uri);
+    rc = native_write_ordinary(
+        blob_output_uri,
+        &blob_input,
+        LANCE_WRITE_CREATE,
+        blob_options,
+        &dataset);
+    ASSERT(rc == 0, "blob option create failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == blob_rows,
+           "blob option create row count mismatch");
+    lance_dataset_close(dataset);
+    lance_native_write_options_close(blob_options);
+
+    LanceNativeWriteOptionsSpec bad_mode_spec = {0};
+    bad_mode_spec.external_blob_mode = 2;
+    ASSERT(lance_native_write_options_new(&bad_mode_spec) == NULL,
+           "invalid external blob mode must be rejected");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "external_blob_mode=2",
+        "invalid external blob mode validation");
+
+    LanceNativeWriteOptionsSpec conflict_spec = {0};
+    conflict_spec.write_options = &write_options;
+    conflict_spec.allow_external_blob_outside_bases = true;
+    conflict_spec.external_blob_mode = LANCE_EXTERNAL_BLOB_INGEST;
+    LanceNativeWriteOptions *conflict_options =
+        lance_native_write_options_new(&conflict_spec);
+    ASSERT(conflict_options != NULL,
+           "native blob-conflict options must be constructed");
+    CHECK_OK();
+    NativeWriteInput conflict_input = native_write_input(blob_uri);
+    dataset = NULL;
+    rc = native_write_ordinary(
+        blob_output_uri,
+        &conflict_input,
+        LANCE_WRITE_APPEND,
+        conflict_options,
+        &dataset);
+    ASSERT(rc == -1, "ingest plus allow-outside must fail natively");
+    ASSERT(dataset == NULL, "failed blob append must not return a dataset");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "allow_external_blob_outside_bases",
+        "native blob mode conflict");
+    lance_native_write_options_close(conflict_options);
+
+    dataset = lance_dataset_open(blob_output_uri, NULL, 0);
+    ASSERT(dataset != NULL, "reopen blob-option dataset failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == blob_rows,
+           "native blob validation error must not publish the append");
+    lance_dataset_close(dataset);
+    printf("OK\n");
+}
+
+/* C11 callback teardown and source-owner retention. Session, accessor and lock
+ * source handles close before the write; the options handle retains native
+ * owners. Fragment progress failure is checked on both ordinary and staged
+ * appends, and the reopened dataset proves neither failure published rows. */
+static void test_native_write_progress_and_owners(
+    const char *src_uri,
+    const char *write_uri) {
+    printf("  test_native_write_progress_and_owners... ");
+    char uri[4096];
+    snprintf(uri, sizeof(uri), "%s_native_owners", write_uri);
+
+    NativeWriteProgressCapture progress = {0};
+    LanceNativeWriteProgress progress_desc = {0};
+    progress_desc.begin_fragment = native_write_begin;
+    progress_desc.complete_fragment = native_write_complete;
+    progress_desc.write_stats = native_write_stats;
+    progress_desc.release = native_write_release;
+    progress_desc.callback_ctx = &progress;
+
+    NativeWriteLockCapture lock = {0};
+    LanceCommitLockCallbacks lock_callbacks = {0};
+    lock_callbacks.lock = native_write_lock_acquire;
+    lock_callbacks.release = native_write_lock_release;
+    lock_callbacks.destroy_lease = native_write_lock_destroy;
+    lock_callbacks.callback_ctx = &lock;
+    lock_callbacks.release_context = native_write_lock_context_release;
+    LanceCommitLock *commit_lock = lance_commit_lock_new(&lock_callbacks);
+    ASSERT(commit_lock != NULL, "native write commit lock must be created");
+    CHECK_OK();
+
+    LanceSession *session = lance_session_new(4 * 1024 * 1024, 1024 * 1024);
+    LanceStorageOptionsInput empty_accessor_options = {0};
+    LanceStorageOptionsAccessor *accessor =
+        lance_storage_options_accessor_new(&empty_accessor_options, NULL);
+    ASSERT(session != NULL && accessor != NULL,
+           "native write source owners must be created");
+    CHECK_OK();
+
+    LanceWriteOptions write_options = {0};
+    write_options.params.max_rows_per_file = 4;
+    LanceNativeWriteOptionsSpec spec = {0};
+    spec.write_options = &write_options;
+    spec.session = session;
+    spec.storage_options_accessor = accessor;
+    spec.commit_lock = commit_lock;
+    spec.progress = &progress_desc;
+    LanceNativeWriteOptions *options = lance_native_write_options_new(&spec);
+    ASSERT(options != NULL, "owner-retaining write options must be created");
+    CHECK_OK();
+    lance_session_close(session);
+    lance_storage_options_accessor_close(accessor);
+    lance_commit_lock_close(commit_lock);
+
+    NativeWriteInput create_input = native_write_input(src_uri);
+    LanceDataset *dataset = NULL;
+    int32_t rc = native_write_ordinary(
+        uri, &create_input, LANCE_WRITE_CREATE, options, &dataset);
+    ASSERT(rc == 0, "owner-retaining create failed");
+    CHECK_OK();
+    uint64_t source_rows = lance_dataset_count_rows(dataset);
+    CHECK_OK();
+    ASSERT(source_rows > 0, "owner-retaining create wrote no rows");
+    ASSERT(atomic_load_explicit(
+               &lock.acquires, memory_order_seq_cst) > 0,
+           "retained commit lock must participate in the write");
+    ASSERT(atomic_load_explicit(
+               &lock.releases, memory_order_seq_cst) > 0,
+           "retained commit lock must release its lease");
+    ASSERT(atomic_load_explicit(
+               &lock.destroys, memory_order_seq_cst) > 0,
+           "retained commit lock must destroy the stateless lease token");
+    ASSERT(atomic_load_explicit(
+               &lock.context_releases, memory_order_seq_cst) == 0,
+           "source lock close must not release the retained native context");
+    ASSERT(native_write_load(&progress.begins) > 0 &&
+               native_write_load(&progress.completes) > 0 &&
+               native_write_load(&progress.stats) > 0,
+           "retained progress callbacks must receive native events");
+    ASSERT(atomic_load_explicit(
+               &progress.bad_complete_info, memory_order_seq_cst) == 0,
+           "retained fragment callbacks must receive complete native metadata");
+    lance_dataset_close(dataset);
+
+    atomic_store_explicit(
+        &progress.fail_begin, 1, memory_order_seq_cst);
+    NativeWriteInput failed_append = native_write_input(src_uri);
+    dataset = NULL;
+    rc = native_write_ordinary(
+        uri, &failed_append, LANCE_WRITE_APPEND, options, &dataset);
+    ASSERT(rc == -1, "rejected progress ordinary append must fail");
+    ASSERT(dataset == NULL, "rejected progress append output must be NULL");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "native write progress rejected",
+        "ordinary progress callback error");
+
+    NativeWriteInput failed_stage = native_write_input(src_uri);
+    LanceTransaction *transaction = NULL;
+    rc = native_write_staged(
+        uri, &failed_stage, LANCE_WRITE_APPEND, options, &transaction);
+    ASSERT(rc == -1, "rejected progress staged append must fail");
+    ASSERT(transaction == NULL, "failed stage output must be NULL");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "native write progress rejected",
+        "staged progress callback error");
+
+    dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "reopen progress dataset failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == source_rows,
+           "progress callback failures must not publish rows");
+    lance_dataset_close(dataset);
+    ASSERT(native_write_load(&progress.releases) == 0,
+           "progress context must remain owned until the options handle closes");
+
+    lance_native_write_options_close(options);
+    native_write_wait_release(&progress);
+    ASSERT(atomic_load_explicit(
+               &lock.context_releases, memory_order_seq_cst) == 1,
+           "commit-lock context must be released exactly once");
     printf("OK\n");
 }
 
@@ -7331,6 +7983,9 @@ int main(int argc, char **argv) {
     test_dataset_deep_clone(fragment_uri);
     test_write_options_and_config(uri, write_uri);
     test_native_write_options(uri, write_uri);
+    test_native_write_base_placement(uri, write_uri);
+    test_native_write_data_options(uri, blob_uri, write_uri);
+    test_native_write_progress_and_owners(uri, write_uri);
     test_data_statistics(write_uri);
     test_diagnostics(uri);
     test_config_replacement(config_base_uri);
