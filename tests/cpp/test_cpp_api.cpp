@@ -4062,6 +4062,38 @@ static void test_native_scalar_indexes(const std::string& uri) {
     PASS();
 }
 
+// Index names are JSON strings; the C++ wrapper must return complete escaping
+// and own the underlying C string until it has copied it.
+static void test_index_list_json_escaping(const std::string& uri) {
+    TEST(test_index_list_json_escaping);
+
+    auto ds = lance::Dataset::open(uri);
+    const std::vector<std::string> names = {
+        "cpp_index\\q",
+        "cpp_index\\n",
+        "cpp_index\"quote",
+        "cpp_index\nline\ttab",
+        "cpp_索引列",
+    };
+    for (const auto& name : names) {
+        ds.create_scalar_index("id", LANCE_SCALAR_BTREE, name);
+    }
+
+    auto json = ds.list_indices_json();
+    assert(json.find("\"name\":\"cpp_index\\\\q\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_index\\\\n\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_index\\\"quote\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_index\\nline\\ttab\"") !=
+           std::string::npos);
+    assert(json.find("\"name\":\"cpp_索引列\"") != std::string::npos);
+
+    for (const auto& name : names) {
+        ds.drop_index(name);
+    }
+
+    PASS();
+}
+
 static int collect_minhash_alice(ArrowArrayStream& stream) {
     ArrowSchema schema{};
     assert(stream.get_schema(&stream, &schema) == 0);
@@ -4831,6 +4863,7 @@ int main(int argc, char** argv) {
     test_error_exception(uri);
     test_index_lifecycle(uri);
     test_native_scalar_indexes(uri);
+    test_index_list_json_escaping(uri);
     test_minhash_lsh(uri);
     test_batch_nearest(uri);
     test_scanner_materialization_fast_search(uri);

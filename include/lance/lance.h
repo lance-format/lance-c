@@ -3305,7 +3305,7 @@ uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
  */
 int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_ids);
 
-/* ─── Read-only fragment snapshots ─── */
+/* ─── Fragment handles ─── */
 
 /**
  * Resolve a fragment by ID from this dataset snapshot.
@@ -3323,6 +3323,34 @@ int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_id
 LanceFragment* lance_dataset_open_fragment(
     const LanceDataset* dataset,
     uint64_t fragment_id
+);
+
+/**
+ * Construct detached native Fragment metadata.
+ *
+ * Starts from native `Fragment::new(fragment_id)`, clones each borrowed
+ * `LanceDataFile` in input order, and optionally sets the native
+ * `physical_rows` value. Deletion-file, overlay, row-ID and row-version
+ * metadata retain their native `Fragment::new` defaults. The binding does not
+ * infer or independently validate schema coverage or row counts; native
+ * commit remains authoritative for publication.
+ *
+ * `data_files` may be NULL only when `data_file_count == 0`. A non-NULL array
+ * must contain only non-NULL handles. `physical_rows` is optional: NULL maps
+ * to native `None`, while a non-NULL value must fit the platform `usize`.
+ * A fragment_id of zero requests native commit-time allocation, matching the
+ * native Append contract.
+ *
+ * The returned detached handle retains independent copies of the data-file
+ * metadata and may outlive those handles. It supports metadata inspection and
+ * operation construction but rejects dataset-bound reads. On success the
+ * caller closes it with `lance_fragment_close()`. Returns NULL on error.
+ */
+LanceFragment* lance_fragment_new(
+    uint64_t fragment_id,
+    const LanceDataFile* const* data_files,
+    size_t data_file_count,
+    const uint64_t* physical_rows
 );
 
 /** Close and free a fragment handle. Safe to call with NULL. */

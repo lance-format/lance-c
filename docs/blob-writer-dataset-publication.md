@@ -6,9 +6,11 @@ itself. To make the blobs visible to readers, write a replacement data file
 that contains the prepared descriptors and publish it with the normal
 transaction APIs.
 
-This is a replacement path for existing fragments. It does not append new rows;
-new-row append requires fragment creation and `Append`, which is outside this
-workflow.
+The same finished files support two native publication paths:
+
+- Existing fragments use `DataReplacement`, which is described first below.
+- New rows use `Fragment::from_data_files` and `Append`, described under
+  [Publishing new rows](#publishing-new-rows).
 
 ## Prerequisites
 
@@ -100,6 +102,49 @@ assemble a multi-row dedicated replacement, finish one writer per row and
 append the one-row batches through the same raw file writer. Multiple
 dedicated writers may use the same data-file name with different blob IDs;
 their sidecar paths must remain distinct.
+
+## Publishing new rows
+
+New rows use the same writer and raw-file sequence, but publish a new fragment
+instead of replacing an existing one:
+
+1. Open the dataset and record its current version.
+2. Write the Packed/Dedicated sidecars and the matching raw data file as
+   described above. Every new fragment has its own data-file name.
+3. Call `Dataset::create_data_file(name)` for each finished raw file.
+4. Construct a detached fragment from the returned `DataFile` metadata:
+   - C++: `Fragment::from_data_files(fragment_id, {&file}, physical_rows)`
+   - C: `lance_fragment_new(fragment_id, files, count, physical_rows)`
+
+   The constructor starts from native `Fragment::new`, clones each borrowed
+   `DataFile`, and sets only the optional `physical_rows` value. Deletion
+   files, overlays, row-ID metadata and row-version metadata keep their native
+   defaults. Use fragment ID `0` to request native commit-time ID allocation.
+   `physical_rows` is `std::nullopt` or `NULL` for native `None`; otherwise it
+   must be the actual physical row count of the data file. The constructor
+   does not infer that count or revalidate schema coverage.
+5. Build one `Operation::Append` from one or more detached fragments and commit
+   it through the normal `Transaction` path at the recorded version.
+6. Close the `DataFile` handles after fragment construction and the fragment
+   handles after operation construction; both constructors clone their inputs.
+7. Reopen the dataset URI and verify the new rows, the increased row/fragment
+   counts, preservation of old rows and row IDs, and the old snapshot.
+
+`Fragment::from_data_files` and `lance_fragment_new` are metadata constructors,
+not manifest writers. Native commit owns fragment-ID assignment, schema
+coverage, conflict handling and manifest publication. The C11 example is
+`test_blob_writer_append` in the
+[native transaction consumer](../tests/cpp/test_transaction.c); the
+[C++17 consumer](../tests/cpp/test_transaction.cpp) implements the same flow.
+
+### Standalone raw-reader limitation
+
+Dataset publication and dataset reads are supported. The selected Lance
+14.0.2 core cannot reliably reconstruct a standalone raw v2.2 Blob footer:
+default projection fails validation and explicit Blob projection fails
+decoding. This affects raw `FileReader` consumers of the same file and is
+tracked separately in #167; it does not change the dataset Append workflow
+above.
 
 ## Lifecycle and failure boundaries
 

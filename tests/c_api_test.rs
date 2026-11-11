@@ -6079,6 +6079,177 @@ fn test_fragment_snapshot_metadata_schema_and_counts() {
 }
 
 #[test]
+fn test_fragment_new_clones_data_files_and_keeps_native_defaults() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+    let source = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    assert!(!source.is_null());
+    let mut file = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_fragment_data_file_at(source, 0, &mut file) },
+        0
+    );
+    assert!(!file.is_null());
+    let path = unsafe { CStr::from_ptr(lance_data_file_path(file)) }
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let files = [file as *const LanceDataFile];
+    let mut physical_rows = 4_u64;
+    let fragment = unsafe { lance_fragment_new(41, files.as_ptr(), files.len(), &physical_rows) };
+    assert!(!fragment.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_fragment_id(fragment) }, 41);
+    assert_eq!(unsafe { lance_fragment_data_file_count(fragment) }, 1);
+    let mut is_bound = true;
+    assert_eq!(
+        unsafe { lance_fragment_is_bound(fragment, &mut is_bound) },
+        0
+    );
+    assert!(!is_bound);
+
+    let metadata = take_json_value(unsafe { lance_fragment_metadata_json(fragment) });
+    assert_eq!(metadata["id"].as_u64(), Some(41));
+    assert_eq!(metadata["physical_rows"].as_u64(), Some(4));
+    assert_eq!(metadata["files"].as_array().unwrap().len(), 1);
+    assert_eq!(metadata["files"][0]["path"].as_str(), Some(path.as_str()));
+    assert!(metadata.get("deletion_file").is_none());
+    assert!(metadata.get("overlays").is_none());
+    assert!(metadata.get("row_id_meta").is_none());
+    assert!(metadata.get("last_updated_at_version_meta").is_none());
+    assert!(metadata.get("created_at_version_meta").is_none());
+
+    let no_physical_rows =
+        unsafe { lance_fragment_new(42, files.as_ptr(), files.len(), ptr::null()) };
+    assert!(!no_physical_rows.is_null());
+    assert_eq!(unsafe { lance_fragment_id(no_physical_rows) }, 42);
+    let metadata = take_json_value(unsafe { lance_fragment_metadata_json(no_physical_rows) });
+    assert!(metadata["physical_rows"].is_null());
+
+    // The data-file handle may close immediately after fragment construction;
+    // the detached fragment owns an independent native DataFile clone.
+    unsafe { lance_data_file_close(file) };
+    let mut cloned_file = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_fragment_data_file_at(fragment, 0, &mut cloned_file) },
+        0
+    );
+    assert!(!cloned_file.is_null());
+    assert_eq!(
+        unsafe { CStr::from_ptr(lance_data_file_path(cloned_file)) }
+            .to_str()
+            .unwrap(),
+        path
+    );
+    unsafe { lance_data_file_close(cloned_file) };
+
+    physical_rows = u64::MAX;
+    assert_eq!(
+        unsafe { lance_fragment_physical_rows(fragment, &mut physical_rows) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert!(take_last_error_message().contains("fragment is detached"));
+
+    let empty = unsafe { lance_fragment_new(0, ptr::null(), 0, ptr::null()) };
+    assert!(!empty.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_fragment_id(empty) }, 0);
+    assert_eq!(unsafe { lance_fragment_data_file_count(empty) }, 0);
+    let metadata = take_json_value(unsafe { lance_fragment_metadata_json(empty) });
+    assert_eq!(metadata["files"].as_array().unwrap().len(), 0);
+    assert!(metadata["physical_rows"].is_null());
+
+    unsafe { lance_fragment_close(empty) };
+    unsafe { lance_fragment_close(no_physical_rows) };
+    unsafe { lance_fragment_close(fragment) };
+    unsafe { lance_fragment_close(source) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_fragment_new_validates_inputs_and_append_owns_a_clone() {
+    let (_tmp, uri) = create_fragment_snapshot_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let mut ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, ids.as_mut_ptr()) },
+        0
+    );
+    let source = unsafe { lance_dataset_open_fragment(ds, ids[0]) };
+    assert!(!source.is_null());
+    let mut file = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_fragment_data_file_at(source, 0, &mut file) },
+        0
+    );
+
+    assert!(
+        unsafe { lance_fragment_new(1, ptr::null(), 1, ptr::null()) }.is_null(),
+        "NULL data-file array with a nonzero count must fail"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("data_files must not be NULL"));
+    assert!(message.contains("data_file_count = 1"));
+
+    let null_files = [ptr::null::<LanceDataFile>()];
+    assert!(
+        unsafe { lance_fragment_new(1, null_files.as_ptr(), 1, ptr::null()) }.is_null(),
+        "NULL data-file element must fail"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("data_files[0] must not be NULL"));
+
+    let files = [file as *const LanceDataFile];
+    let oversized_count = isize::MAX as usize / std::mem::size_of::<*const LanceDataFile>() + 1;
+    assert!(
+        unsafe { lance_fragment_new(1, files.as_ptr(), oversized_count, ptr::null()) }.is_null(),
+        "pointer-slice length overflow must fail"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("maximum addressable pointer slice length"));
+
+    let physical_rows = 4_u64;
+    let fragment = unsafe { lance_fragment_new(0, files.as_ptr(), files.len(), &physical_rows) };
+    assert!(!fragment.is_null(), "{}", take_last_error_message());
+    let append_fragments = [fragment as *const LanceFragment];
+    let operation =
+        unsafe { lance_operation_append_new(append_fragments.as_ptr(), append_fragments.len()) };
+    assert!(!operation.is_null(), "{}", take_last_error_message());
+    unsafe { lance_data_file_close(file) };
+    unsafe { lance_fragment_close(fragment) };
+
+    let mut appended = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_operation_append_fragment_at(operation, 0, &mut appended) },
+        0
+    );
+    assert!(!appended.is_null());
+    assert_eq!(unsafe { lance_fragment_id(appended) }, 0);
+    assert_eq!(unsafe { lance_fragment_data_file_count(appended) }, 1);
+    let metadata = take_json_value(unsafe { lance_fragment_metadata_json(appended) });
+    assert_eq!(metadata["physical_rows"].as_u64(), Some(4));
+    assert_eq!(metadata["files"].as_array().unwrap().len(), 1);
+
+    unsafe { lance_fragment_close(appended) };
+    unsafe { lance_operation_close(operation) };
+    unsafe { lance_fragment_close(source) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_fragment_snapshot_survives_close_and_later_update() {
     let (_tmp, uri) = create_fragment_snapshot_dataset(false);
     let c_uri = c_str(&uri);
@@ -12104,6 +12275,47 @@ fn create_native_scalar_index_dataset() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a dataset whose real field names require every JSON string escape:
+/// backslash-q, backslash-n, quote, newline, tab and non-ASCII.
+fn create_escaped_index_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("escaped_index_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let column_names = [
+        "backslash\\q",
+        "backslash\\n",
+        "quote\"\n\tcolumn",
+        "非ASCII列",
+    ];
+    let schema = Arc::new(Schema::new(
+        std::iter::once(Field::new("id", DataType::Int32, false))
+            .chain(
+                column_names
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Int32, false)),
+            )
+            .collect::<Vec<_>>(),
+    ));
+    let values: arrow_array::ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![values; column_names.len() + 1]).unwrap();
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    (tmp, uri)
+}
+
 const MINHASH_BASE: &str = "the quick brown fox jumps over the lazy dog and runs away very fast";
 const MINHASH_NEAR: &str = "the quick brown fox jumps over the lazy dog and runs away very quickly";
 const MINHASH_UNRELATED: &str =
@@ -13785,6 +13997,109 @@ fn test_list_indices_json() {
     assert!(json.contains("\"columns\":[\"id\"]"), "json was: {}", json);
     assert!(json.contains("\"type\""), "json was: {}", json);
 
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_list_indices_json_escapes_special_names_and_columns() {
+    use lance::index::DatasetIndexExt;
+
+    let cases = [
+        ("backslash\\q", "index\\q"),
+        ("backslash\\n", "index\\n"),
+        ("quote\"\n\tcolumn", "quote\"\n\tname"),
+        ("非ASCII列", "非ASCII名"),
+    ];
+    let (_tmp, uri) = create_escaped_index_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    for (column, name) in cases {
+        assert_eq!(
+            unsafe {
+                lance_dataset_create_scalar_index(
+                    ds,
+                    c_str(column).as_ptr(),
+                    c_str(name).as_ptr(),
+                    LanceScalarIndexType::BTree as i32,
+                    ptr::null(),
+                    false,
+                )
+            },
+            0,
+            "create index {name:?} on column {column:?}: {}",
+            take_last_error_message()
+        );
+    }
+
+    let json = c_string_value(unsafe { lance_dataset_index_list_json(ds) });
+    unsafe { lance_dataset_close(ds) };
+    let entries: serde_json::Value = serde_json::from_str(&json)
+        .unwrap_or_else(|error| panic!("index list must be valid JSON ({error}): {json:?}"));
+
+    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let indices = lance_c::runtime::block_on(native.load_indices()).unwrap();
+    let schema = native.schema();
+    let expected = indices
+        .iter()
+        .filter(|index| !lance_index::is_system_index(index))
+        .map(|index| {
+            serde_json::json!({
+                "name": index.name,
+                "uuid": index.uuid.to_string(),
+                "columns": index
+                    .fields
+                    .iter()
+                    .filter_map(|field_id| {
+                        schema
+                            .field_by_id(*field_id)
+                            .map(|field| field.name.clone())
+                    })
+                    .collect::<Vec<_>>(),
+                "type": "BTree",
+                "dataset_version": index.dataset_version,
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        serde_json::Value::Array(expected),
+        "raw JSON: {json}"
+    );
+
+    let by_name = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| (entry["name"].as_str().unwrap(), entry))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(by_name.len(), cases.len(), "{json}");
+    for (column, name) in cases {
+        let entry = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing index {name:?}: {json}"));
+        assert_eq!(entry["name"], name, "{json}");
+        assert_eq!(entry["columns"], serde_json::json!([column]), "{json}");
+        assert!(entry["uuid"].is_string(), "{json}");
+        assert!(entry["dataset_version"].is_u64(), "{json}");
+    }
+}
+
+#[test]
+fn test_list_indices_json_empty_and_null() {
+    assert!(unsafe { lance_dataset_index_list_json(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("dataset is NULL"), "{message}");
+
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_index_list_json(ds) }),
+        serde_json::json!([])
+    );
     unsafe { lance_dataset_close(ds) };
 }
 
