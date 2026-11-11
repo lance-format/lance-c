@@ -42877,17 +42877,19 @@ fn diagnostics_fts_tokenize_matches_native_text_profile() {
 
 #[test]
 fn diagnostics_fts_tokenize_matches_native_profiles_and_unicode() {
-    let cases = [
-        ("fooBar::baz(quux)", r#"{"base_tokenizer":"code"}"#),
+    let cases: [(&str, Option<&str>); 5] = [
+        ("fooBar::baz(quux)", Some(r#"{"base_tokenizer":"code"}"#)),
         (
             "hello",
-            r#"{"base_tokenizer":"ngram","min_ngram_length":2,"max_ngram_length":3}"#,
+            Some(r#"{"base_tokenizer":"ngram","min_ngram_length":2,"max_ngram_length":3}"#),
         ),
-        ("a b", r#"{"base_tokenizer":"raw"}"#),
+        ("a b", Some(r#"{"base_tokenizer":"raw"}"#)),
         ("你好 世界 Café", None),
         (
             "The Cats Café",
-            r#"{"lower_case":false,"stem":false,"remove_stop_words":false,"ascii_folding":false}"#,
+            Some(
+                r#"{"lower_case":false,"stem":false,"remove_stop_words":false,"ascii_folding":false}"#,
+            ),
         ),
     ];
     for (text, params) in cases {
