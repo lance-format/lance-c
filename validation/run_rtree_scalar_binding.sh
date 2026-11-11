@@ -131,8 +131,10 @@ printf 'started_at=%s\n' "$started_at" >"$META"
     printf 'rust_test_threads=%s\n' "$RUST_TEST_THREADS"
     printf 'cargo_path=%s\n' "$(command -v cargo)"
     printf 'mbx_path=%s\n' "$(command -v mbx || true)"
+    printf 'pi_path=%s\n' "$(command -v pi || true)"
     printf 'rustc=%s\n' "$(rustc --version)"
     printf 'cargo=%s\n' "$(cargo --version)"
+    printf 'git_remote=%s\n' "$(git remote get-url origin)"
     printf 'tmux_sessions_before:\n'
     tmux list-sessions 2>&1 || true
 } >>"$META"
@@ -156,6 +158,8 @@ assert_clean "initial"
 
 run_step rustc-version rustc --version
 run_step cargo-version cargo --version
+run_step pi-version pi --version
+run_step pi-auth pi auth check --model magpie/group/deepseek --json
 
 run_step fmt cargo fmt --all -- --check
 run_step check cargo check --all-targets --locked
