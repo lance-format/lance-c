@@ -727,6 +727,17 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
     assert_eq!(values.1, Some(211));
 
     let old = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
+    let mut latest = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
+    let metrics = lance_c::runtime::block_on(lance::dataset::optimize::compact_files(
+        &mut latest,
+        lance::dataset::optimize::CompactionOptions::default(),
+        None,
+    ))
+    .unwrap();
+    assert!(metrics.fragments_removed >= 1);
+    let compacted_version = latest.version().version;
+    assert!(compacted_version > 4);
+
     let c_uri = c_string(&fixture.uri);
     let old_handle = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 1) };
     assert!(!old_handle.is_null());
@@ -752,9 +763,12 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
     let stale_group = finish(stale_writer);
     let (stale_committed, stale_code) = commit(&fixture.uri, 1, &[stale_group]);
     assert!(stale_committed.is_null());
+    // DataOverlay commits are additive and do not conflict with other
+    // operations, but a real row-moving compaction removes the old fragment.
+    // Native manifest build then rejects the stale target.
     assert_eq!(
         stale_code,
-        LanceErrorCode::CommitConflict,
+        LanceErrorCode::InvalidArgument,
         "{:?}",
         take_error()
     );
@@ -767,11 +781,11 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
         lance_dataset_close(second);
     }
     let final_native = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
-    assert_eq!(final_native.version().version, 4);
+    assert_eq!(final_native.version().version, compacted_version);
     let final_values = row_values(&read_native_batch(&final_native), 1).unwrap();
     assert_eq!(final_values.0, Some(9999));
     assert_eq!(final_values.1, Some(211));
-    assert_eq!(old.version().version, 3);
+    assert_eq!(old.version().version, 4);
 }
 
 #[test]
