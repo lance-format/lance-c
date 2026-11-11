@@ -9,7 +9,7 @@
 //! core rather than the binding. A plain v2.2 dataset without a Blob column
 //! acts as the control.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::ptr;
 use std::sync::Arc;
 
@@ -90,20 +90,30 @@ fn report_native(uri: &str, file: &str) {
     lance_c::runtime::block_on(async {
         let dataset = Dataset::open(uri).await.unwrap();
         match FileFragment::create_from_file(file, &dataset, 9_001, None).await {
-            Ok(fragment) => println!(
-                "native create_from_file OK file={file} id={} physical_rows={:?} files={:?}",
-                fragment.id(),
-                fragment.physical_rows,
-                fragment
-                    .metadata()
-                    .files
-                    .iter()
-                    .map(|f| f.path.clone())
-                    .collect::<Vec<_>>()
-            ),
+            Ok(fragment) => {
+                let metadata = fragment.metadata();
+                println!(
+                    "native create_from_file OK file={file} id={} physical_rows={:?} files={:?}",
+                    fragment.id(),
+                    metadata.physical_rows,
+                    metadata
+                        .files
+                        .iter()
+                        .map(|f| f.path.clone())
+                        .collect::<Vec<_>>()
+                );
+            }
             Err(error) => println!("native create_from_file ERR file={file}: {error}"),
         }
     });
+}
+
+unsafe fn last_error() -> String {
+    let message = lance_c::lance_last_error_message();
+    if message.is_null() {
+        return String::new();
+    }
+    CStr::from_ptr(message).to_string_lossy().into_owned()
 }
 
 fn report_c(uri: &str, file: &str) {
@@ -112,10 +122,7 @@ fn report_c(uri: &str, file: &str) {
     unsafe {
         let dataset = lance_c::lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0);
         if dataset.is_null() {
-            println!(
-                "C dataset open FAILED: {}",
-                lance_c::lance_last_error_message()
-            );
+            println!("C dataset open FAILED: {}", last_error());
             return;
         }
         let mut out: *mut lance_c::LanceFragment = ptr::null_mut();
@@ -128,13 +135,16 @@ fn report_c(uri: &str, file: &str) {
         );
         if code == 0 && !out.is_null() {
             let json = lance_c::lance_fragment_metadata_json(out);
-            println!("C create_from_file OK file={file} code={code} metadata={json}");
+            println!(
+                "C create_from_file OK file={file} code={code} metadata={}",
+                CStr::from_ptr(json).to_string_lossy()
+            );
             lance_c::lance_free_string(json);
             lance_c::lance_fragment_close(out);
         } else {
             println!(
                 "C create_from_file ERR file={file} code={code} message={}",
-                lance_c::lance_last_error_message()
+                last_error()
             );
         }
         lance_c::lance_dataset_close(dataset);
