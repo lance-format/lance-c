@@ -289,6 +289,7 @@ static Row find_row(const LanceDataset *dataset, int32_t wanted) {
 
 static void assert_row(const LanceDataset *dataset, int32_t id, int a_null,
                        int32_t a, int32_t b, uint64_t rowid) {
+    fprintf(stderr, "assert_row id=%d\n", id);
     Row row = find_row(dataset, id);
     ASSERT(row.found, "row must exist");
     ASSERT(row.a_null == a_null, "row a NULL state");
