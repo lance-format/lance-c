@@ -14696,6 +14696,15 @@ fn nearest_ids_and_statistics(
     )
 }
 
+#[derive(Clone, Copy)]
+struct NearestScanOptions {
+    metric: Option<LanceMetricType>,
+    use_index: bool,
+    k: u32,
+    nprobes: u32,
+    refine_factor: u32,
+}
+
 fn nearest_ids_and_statistics_typed(
     dataset: *mut LanceDataset,
     column: &str,
@@ -14705,21 +14714,87 @@ fn nearest_ids_and_statistics_typed(
     use_index: bool,
     k: u32,
 ) -> (Vec<i32>, CapturedScanStatistics) {
+    let (ids, _, statistics) = nearest_ids_distances_and_statistics_typed(
+        dataset,
+        column,
+        query,
+        query_len,
+        dtype,
+        NearestScanOptions {
+            metric: None,
+            use_index,
+            k,
+            nprobes: 2,
+            refine_factor: 8,
+        },
+    );
+    (ids, statistics)
+}
+
+fn nearest_ids_distances_and_statistics(
+    dataset: *mut LanceDataset,
+    column: &str,
+    query: &[f32],
+    options: NearestScanOptions,
+) -> (Vec<i32>, Vec<f32>, CapturedScanStatistics) {
+    nearest_ids_distances_and_statistics_typed(
+        dataset,
+        column,
+        query.as_ptr().cast(),
+        query.len(),
+        LanceDataType::Float32,
+        options,
+    )
+}
+
+fn nearest_ids_distances_and_statistics_typed(
+    dataset: *mut LanceDataset,
+    column: &str,
+    query: *const c_void,
+    query_len: usize,
+    dtype: LanceDataType,
+    options: NearestScanOptions,
+) -> (Vec<i32>, Vec<f32>, CapturedScanStatistics) {
     let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
     assert!(!scanner.is_null(), "{}", take_last_error_message());
     let column = c_str(column);
     assert_eq!(
         unsafe {
-            lance_scanner_nearest(scanner, column.as_ptr(), query, query_len, dtype as i32, k)
+            lance_scanner_nearest(
+                scanner,
+                column.as_ptr(),
+                query,
+                query_len,
+                dtype as i32,
+                options.k,
+            )
         },
         0,
         "{}",
         take_last_error_message()
     );
-    assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 2) }, 0);
-    assert_eq!(unsafe { lance_scanner_set_refine_factor(scanner, 8) }, 0);
+    if let Some(metric) = options.metric {
+        assert_eq!(
+            unsafe { lance_scanner_set_metric(scanner, metric as i32) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+    }
     assert_eq!(
-        unsafe { lance_scanner_set_use_index(scanner, use_index) },
+        unsafe { lance_scanner_set_nprobes(scanner, options.nprobes) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_refine_factor(scanner, options.refine_factor) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_use_index(scanner, options.use_index) },
         0
     );
     let mut captured = CapturedScanStatistics::default();
@@ -14741,21 +14816,32 @@ fn nearest_ids_and_statistics_typed(
         take_last_error_message()
     );
     let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
-    let ids = reader
+    let rows = reader
         .flat_map(|batch| {
             let batch = batch.unwrap();
-            batch
+            let ids = batch
                 .column_by_name("id")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .unwrap()
                 .values()
-                .to_vec()
+                .to_vec();
+            let distances = batch
+                .column_by_name("_distance")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .values()
+                .to_vec();
+            assert_eq!(ids.len(), distances.len());
+            ids.into_iter().zip(distances)
         })
-        .collect();
+        .collect::<Vec<_>>();
     unsafe { lance_scanner_close(scanner) };
-    (ids, captured)
+    let (ids, distances) = rows.into_iter().unzip();
+    (ids, distances, captured)
 }
 
 fn take_last_error_message() -> String {
@@ -19728,6 +19814,151 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
         }
     }
     unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_vector_index_ivf_rq_dot_query_reopen_and_native_oracle() {
+    let dim = 8_usize;
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(1, 64, dim as i32, false);
+    let uri_c = c_str(&uri);
+    let column = c_str("embedding");
+    let index_name = c_str("rq_dot_idx");
+    // Row 63 is (63 + component / 8). Lance's DOT distance is 1 - dot.
+    let query: Vec<f32> = (0..dim)
+        .map(|component| 63.0 + component as f32 / dim as f32)
+        .collect();
+    let expected_ids = vec![63, 62, 61];
+    let expected_distances = expected_ids
+        .iter()
+        .map(|&id| {
+            1.0 - (0..dim)
+                .map(|component| query[component] * (id as f32 + component as f32 / dim as f32))
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
+
+    let mut options = vector_index_options(LanceVectorIndexType::IvfRq, LanceMetricType::Dot);
+    options.num_partitions = set_option(2);
+    options.max_iters = set_option(10);
+    options.sample_rate = set_option(128);
+
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index_with_options(
+                dataset,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                &options,
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let scan_options = NearestScanOptions {
+        metric: Some(LanceMetricType::Dot),
+        use_index: true,
+        k: 3,
+        nprobes: 2,
+        // Re-rank every indexed row so the fixed expectations do not depend
+        // on RQ training or approximate heap ordering.
+        refine_factor: 64,
+    };
+    let (first_ids, first_distances, first_statistics) =
+        nearest_ids_distances_and_statistics(dataset, "embedding", &query, scan_options);
+    assert_eq!(first_ids, expected_ids);
+    assert_eq!(first_distances, expected_distances);
+    assert!(
+        first_statistics.index_partitions_loaded > 0,
+        "DOT query must execute the persisted IVF_RQ index"
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let reopened = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null(), "{}", take_last_error_message());
+    let (reopened_ids, reopened_distances, reopened_statistics) =
+        nearest_ids_distances_and_statistics(reopened, "embedding", &query, scan_options);
+    assert_eq!(reopened_ids, first_ids);
+    assert_eq!(reopened_distances, first_distances);
+    assert!(
+        reopened_statistics.index_partitions_loaded > 0,
+        "reopened DOT query must execute the persisted IVF_RQ index"
+    );
+
+    let segments_json = unsafe { lance_dataset_index_segments_json(reopened) };
+    assert!(!segments_json.is_null(), "{}", take_last_error_message());
+    let segments: serde_json::Value =
+        serde_json::from_str(unsafe { CStr::from_ptr(segments_json) }.to_str().unwrap()).unwrap();
+    unsafe { lance_free_string(segments_json) };
+    let entry = segments
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "rq_dot_idx")
+        .expect("IVF_RQ DOT segment metadata missing");
+    assert_eq!(entry["type"], "IVF_RQ");
+    assert_eq!(entry["index_version"], 2);
+    unsafe { lance_dataset_close(reopened) };
+
+    let (native_ids, native_distances) = lance_c::runtime::block_on(async {
+        use futures::TryStreamExt;
+
+        let native = Dataset::open(&uri).await.unwrap();
+        let mut scanner = native.scan();
+        let query = arrow_array::Float32Array::from(query.clone());
+        scanner.nearest("embedding", &query, 3).unwrap();
+        scanner
+            .nprobes(2)
+            .refine(64)
+            .use_index(true)
+            .distance_metric(lance_linalg::distance::MetricType::Dot);
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        let mut distances = Vec::new();
+        for batch in batches {
+            ids.extend(
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+            distances.extend(
+                batch
+                    .column_by_name("_distance")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+        }
+        (ids, distances)
+    });
+    assert_eq!(
+        native_ids, first_ids,
+        "native scanner on the same persisted index must return the C API IDs"
+    );
+    assert_eq!(
+        native_distances, first_distances,
+        "native scanner on the same persisted index must return the C API DOT distances"
+    );
 }
 
 fn issue110_rq_version() -> u32 {
