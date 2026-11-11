@@ -6148,6 +6148,48 @@ public:
         return IndexSegmentMetadata(raw);
     }
 
+    /// Clone with caller-supplied coverage. `std::nullopt` copies the source
+    /// fragment-coverage option unchanged; an empty vector selects
+    /// present-empty coverage. Every other native field is copied.
+    IndexSegmentMetadata clone_with_fragment_ids(
+        std::optional<std::vector<uint32_t>> fragment_ids) const {
+        LanceIndexSegmentMetadata* raw = nullptr;
+        if (fragment_ids.has_value()) {
+            raw = lance_index_segment_metadata_clone_with_fragment_ids(
+                handle_.get(), true, fragment_ids->data(),
+                fragment_ids->size());
+        } else {
+            raw = lance_index_segment_metadata_clone_with_fragment_ids(
+                handle_.get(), false, nullptr, 0);
+        }
+        if (!raw) check_error();
+        return IndexSegmentMetadata(raw);
+    }
+
+    /// Encode the complete in-memory metadata as protobuf-encoded
+    /// IndexMetadata bytes. The returned vector owns its storage.
+    std::vector<uint8_t> encode() const {
+        struct BytesGuard {
+            uint8_t* bytes = nullptr;
+            ~BytesGuard() noexcept { lance_free_bytes(bytes); }
+
+            BytesGuard() = default;
+            BytesGuard(const BytesGuard&) = delete;
+            BytesGuard& operator=(const BytesGuard&) = delete;
+        } guard;
+
+        size_t len = 0;
+        if (lance_index_segment_metadata_encode(handle_.get(), &guard.bytes,
+                                                &len) != 0)
+            check_error();
+        if (!guard.bytes || len == 0) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_index_segment_metadata_encode returned empty metadata");
+        }
+        return std::vector<uint8_t>(guard.bytes, guard.bytes + len);
+    }
+
     std::vector<int32_t> covering_field_ids() const {
         size_t count =
             lance_index_segment_metadata_covering_field_count(handle_.get());

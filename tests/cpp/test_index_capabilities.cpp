@@ -3,6 +3,7 @@
 
 #include "lance/lance.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -43,6 +44,76 @@ static int64_t count_stream(ArrowArrayStream* stream) {
     return rows;
 }
 
+static std::vector<int32_t> collect_scanner_ids(lance::Scanner& scanner) {
+    ArrowArrayStream stream{};
+    scanner.to_arrow_stream(&stream);
+
+    ArrowSchema schema{};
+    if (stream.get_schema(&stream, &schema) != 0) {
+        const char* message =
+            stream.get_last_error ? stream.get_last_error(&stream) : nullptr;
+        std::string text = message ? message : "get_schema failed";
+        if (stream.release) stream.release(&stream);
+        throw lance::Error(LANCE_ERR_INTERNAL, text);
+    }
+    int64_t id_index = -1;
+    for (int64_t child = 0; child < schema.n_children; ++child) {
+        const char* name = schema.children[child]->name;
+        if (name && std::strcmp(name, "id") == 0) {
+            id_index = child;
+            break;
+        }
+    }
+    assert(id_index >= 0 && "id column missing from scanner output");
+    if (schema.release) schema.release(&schema);
+
+    std::vector<int32_t> ids;
+    for (;;) {
+        ArrowArray array{};
+        if (stream.get_next(&stream, &array) != 0) {
+            const char* message =
+                stream.get_last_error ? stream.get_last_error(&stream) : nullptr;
+            std::string text = message ? message : "get_next failed";
+            if (stream.release) stream.release(&stream);
+            throw lance::Error(LANCE_ERR_INTERNAL, text);
+        }
+        if (!array.release) break;
+        const auto* values = static_cast<const int32_t*>(
+            array.children[id_index]->buffers[1]);
+        const int64_t offset = array.children[id_index]->offset;
+        for (int64_t row = 0; row < array.length; ++row) {
+            ids.push_back(values[offset + row]);
+        }
+        array.release(&array);
+    }
+    if (stream.release) stream.release(&stream);
+    return ids;
+}
+
+static void assert_metadata_equal_except_fragments(
+    const lance::IndexSegmentMetadata& expected,
+    const lance::IndexSegmentMetadata& actual) {
+    assert(expected.uuid() == actual.uuid());
+    assert(expected.name() == actual.name());
+    assert(expected.field_ids() == actual.field_ids());
+    assert(expected.covering_field_ids() == actual.covering_field_ids());
+    assert(expected.dataset_version() == actual.dataset_version());
+    assert(expected.index_version() == actual.index_version());
+    assert(expected.index_type() == actual.index_type());
+    assert(expected.index_details_type_url() ==
+           actual.index_details_type_url());
+    assert(expected.index_details_value() == actual.index_details_value());
+    assert(expected.files() == actual.files());
+    assert(expected.base_id() == actual.base_id());
+    const auto expected_created = expected.created_at();
+    const auto actual_created = actual.created_at();
+    assert(expected_created.has_value() == actual_created.has_value());
+    if (expected_created) {
+        assert(expected_created->unix_seconds == actual_created->unix_seconds);
+        assert(expected_created->nanos == actual_created->nanos);
+    }
+}
+
 static lance::VectorIndexOptions vector_options(uint32_t partitions) {
     lance::VectorIndexOptions options;
     options.index_type = LANCE_INDEX_IVF_FLAT;
@@ -68,6 +139,99 @@ static int64_t query_rows(lance::Dataset& dataset,
     scanner.to_arrow_stream(&stream);
     lance::ArrowStream owned(stream);
     return count_stream(owned.get());
+}
+
+static void test_distributed_metadata_publication(const std::string& uri,
+                                                  lance::Dataset& dataset) {
+    const std::string fts_params =
+        R"({"base_tokenizer":"simple","language":"English","with_position":true})";
+    const std::array<uint8_t, 16> index_uuid = {
+        0x50, 0x55, 0x42, 0x4c, 0x49, 0x53, 0x48, 0x45,
+        0x44, 0x02, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde,
+    };
+    const auto fragments = dataset.fragment_ids();
+    assert(fragments.size() >= 2 && fragments.size() <= 8);
+    std::vector<uint32_t> coverage;
+    coverage.reserve(fragments.size());
+    for (uint64_t fragment : fragments) {
+        coverage.push_back(static_cast<uint32_t>(fragment));
+    }
+
+    lance::ScalarIndexOptions train;
+    train.train = true;
+    std::vector<std::vector<uint8_t>> staged;
+    staged.reserve(coverage.size());
+    for (uint32_t fragment_id : coverage) {
+        LanceIndexSegmentBuildOptions build{};
+        build.fragment_ids = &fragment_id;
+        build.fragment_count = 1;
+        build.index_uuid = index_uuid.data();
+        build.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+        auto builder = dataset.new_scalar_index_segment_builder_with_options(
+            "dist_text", LANCE_SCALAR_INVERTED, train,
+            "c_dist_text_publish_cpp", fts_params, &build);
+        staged.push_back(builder.execute_uncommitted());
+    }
+
+    const uint64_t version_before = dataset.version();
+    std::atomic<uint64_t> merge_events{0};
+    dataset.merge_index_metadata(index_uuid, "Inverted", std::nullopt,
+                                 capture_progress, &merge_events);
+    assert(merge_events.load(std::memory_order_relaxed) > 0);
+    assert(dataset.version() == version_before);
+
+    auto partial = lance::IndexSegmentMetadata::parse(staged[0]);
+    assert(partial.fragment_ids().size() == 1);
+    auto combined = partial.clone_with_fragment_ids(coverage);
+    assert(combined.fragment_ids() == coverage);
+    assert_metadata_equal_except_fragments(partial, combined);
+    assert(partial.fragment_ids().size() == 1);
+
+    auto unchanged = partial.clone_with_fragment_ids(std::nullopt);
+    assert(unchanged.fragment_ids() == partial.fragment_ids());
+    assert_metadata_equal_except_fragments(partial, unchanged);
+
+    auto encoded = combined.encode();
+    assert(!encoded.empty());
+    assert(dataset.version() == version_before);
+
+    dataset.commit_index_segments(
+        "c_dist_text_published_cpp", "dist_text",
+        std::vector<std::vector<uint8_t>>{encoded});
+    assert(dataset.version() == version_before + 1);
+
+    const auto description = dataset.describe_indices_json();
+    assert(description.find("\"name\":\"c_dist_text_published_cpp\"") !=
+           std::string::npos);
+    std::string expected_coverage = "\"fragment_ids\":[";
+    for (size_t i = 0; i < coverage.size(); ++i) {
+        if (i > 0) expected_coverage += ",";
+        expected_coverage += std::to_string(coverage[i]);
+    }
+    expected_coverage += "]";
+    assert(description.find(expected_coverage) != std::string::npos);
+
+    auto reopened = lance::Dataset::open(uri);
+    auto scanner = reopened.scan();
+    {
+        auto query =
+            lance::FtsQuery::phrase("alpha beta", std::string("dist_text"));
+        scanner.full_text_search(query);
+    }
+    const auto explain = scanner.explain_plan();
+    if (explain.find("PhraseQuery:") == std::string::npos) {
+        std::fprintf(stderr,
+                     "C++ phrase plan did not contain PhraseQuery:\n%s\n",
+                     explain.c_str());
+    }
+    assert(explain.find("PhraseQuery:") != std::string::npos);
+    auto ids = collect_scanner_ids(scanner);
+    assert(ids.size() == 48);
+    std::sort(ids.begin(), ids.end());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        assert(ids[i] == static_cast<int32_t>(i * 4));
+    }
+    std::printf("Distributed inverted metadata publication C++ path passed\n");
 }
 
 int main(int argc, char** argv) {
@@ -202,6 +366,8 @@ int main(int argc, char** argv) {
     dataset.commit_index_segments("c_fts_merged_cpp", "text",
                                   std::vector<std::vector<uint8_t>>{merged});
     assert(dataset.version() == version_before + 1);
+
+    test_distributed_metadata_publication(uri, dataset);
 
     const float query[8] = {20.0f, 20.1f, 20.2f, 20.3f,
                             20.4f, 20.5f, 20.6f, 20.7f};
