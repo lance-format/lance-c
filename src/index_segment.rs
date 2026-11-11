@@ -1198,7 +1198,9 @@ unsafe fn new_vector_builder_with_options_inner(
     let prepared = unsafe { prepare_vector_build(options)? };
     let (fragment_ids, index_uuid) = unsafe { parse_vector_segment_scope(scope)? };
     let dataset = unsafe { &*dataset }.snapshot().as_ref().clone();
-    validate_precomputed_pq_fragment_scope(&dataset, &prepared.params, fragment_ids.as_deref())?;
+    if prepared.train {
+        validate_precomputed_pq_fragment_scope(&dataset, &prepared.params, fragment_ids.as_deref())?;
+    }
 
     Ok(Box::into_raw(Box::new(LanceIndexSegmentBuilder {
         dataset,

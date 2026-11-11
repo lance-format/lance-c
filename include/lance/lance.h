@@ -4486,9 +4486,10 @@ LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector(
  *
  * `scope` may be NULL for whole-dataset/no-UUID semantics. `train` follows
  * the native builder default unless `options->has_train` is true.
- * Supplied PQ codebooks with DOT require full dataset coverage on the selected
- * core. A strict fragment subset returns LANCE_ERR_INVALID_ARGUMENT, preserving
- * the legacy builder's protection against incompatible PQ assignment.
+ * Training with supplied PQ codebooks and DOT requires full dataset coverage
+ * on the selected core. A strict subset returns LANCE_ERR_INVALID_ARGUMENT,
+ * preserving the legacy protection against incompatible PQ assignment.
+ * Definition-only builds with `train` set to false accept fragment subsets.
  */
 LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector_with_options(
     const LanceDataset* dataset,
