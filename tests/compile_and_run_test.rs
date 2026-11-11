@@ -1259,7 +1259,7 @@ fn create_mem_wal_dataset_on_disk() -> (tempfile::TempDir, String) {
         ],
     )
     .unwrap();
-    lance::runtime::block_on(async {
+    lance_c::runtime::block_on(async {
         Dataset::write(
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
             &uri,

@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
     // Initialization and index details through the C++ owners.
     lance::MemWalInitOptions options;
     options.mode = LANCE_MEM_WAL_SHARDING_UNSHARDED;
+    options.writer_config = lance::ShardWriterConfig{};
     dataset.initialize_mem_wal(options);
 
     auto details = dataset.mem_wal_index_details();

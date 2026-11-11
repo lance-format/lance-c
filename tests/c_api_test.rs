@@ -43490,6 +43490,16 @@ fn mw_initialize(
     column: Option<&str>,
     buckets: u32,
 ) -> i32 {
+    mw_initialize_with_config(ds, mode, column, buckets, ptr::null())
+}
+
+fn mw_initialize_with_config(
+    ds: *mut lance_c::LanceDataset,
+    mode: i32,
+    column: Option<&str>,
+    buckets: u32,
+    config: *const LanceShardWriterConfig,
+) -> i32 {
     let column = column.map(c_str);
     unsafe {
         lance_mem_wal_initialize(
@@ -43500,7 +43510,7 @@ fn mw_initialize(
             0,
             ptr::null(),
             0,
-            ptr::null(),
+            config,
         )
     }
 }
@@ -43555,7 +43565,13 @@ fn test_memwal_initialize_and_details() {
     assert!(missing.is_null());
 
     assert_eq!(
-        mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0),
+        mw_initialize_with_config(
+            ds,
+            MW_SHARDING_UNSHARDED,
+            None,
+            0,
+            &LanceShardWriterConfig::default()
+        ),
         0,
         "{}",
         take_last_error_message()
@@ -43938,7 +43954,7 @@ fn test_memwal_point_lookup_planner_on_base() {
     );
     assert!(!planner.is_null());
 
-    let key = mw_batch(&[2], &[None], &[[0.0; 4]]);
+    let key = mw_batch(&[2], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
     let (mut array, schema) = ffi_record_batch(&key);
     let mut key_batch = ptr::null_mut();
     assert_eq!(

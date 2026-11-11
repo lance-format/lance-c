@@ -85,7 +85,7 @@ pub struct LanceMemWalHnswParams {
 
 /// Optional overrides for a native `ShardWriterConfig`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct LanceShardWriterConfig {
     pub has_durable_write: i32,
     pub durable_write: i32,
@@ -302,11 +302,6 @@ where
 {
     if out.is_null() {
         return Err(invalid("out must not be NULL"));
-    }
-    if unsafe { &*out }.release.is_some() {
-        return Err(invalid(
-            "out must be an empty ArrowArrayStream (release callback must be NULL)",
-        ));
     }
     let ffi_stream = FFI_ArrowArrayStream::new(Box::new(stream));
     unsafe {
