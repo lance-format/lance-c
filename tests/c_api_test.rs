@@ -16999,7 +16999,7 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
             let mut scanner = native.scan();
             let query = arrow_array::Float32Array::from(query.clone());
             scanner.nearest("embedding", &query, 3).unwrap();
-            scanner.nprobs(2).refine(8).use_index(true);
+            scanner.nprobes(2).refine(8).use_index(true);
             let batches = scanner
                 .try_into_stream()
                 .await
