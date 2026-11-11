@@ -710,7 +710,7 @@ fn create_blob_publication_dataset_on_disk() -> (tempfile::TempDir, String) {
             for (id, value) in rows {
                 ids.push(*id);
                 match value {
-                    BlobValue::Bytes(bytes) => blobs.push_bytes(bytes.to_vec()).unwrap(),
+                    BlobValue::Bytes(bytes) => blobs.push_bytes(*bytes).unwrap(),
                     BlobValue::Empty => blobs.push_empty().unwrap(),
                     BlobValue::Null => blobs.push_null().unwrap(),
                 }
