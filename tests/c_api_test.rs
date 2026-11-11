@@ -44435,6 +44435,8 @@ fn update_map_from_operation(
 
 #[test]
 fn test_native_operation_typed_four_variants_representation() {
+    use lance_table::format::pb;
+
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp
         .path()
