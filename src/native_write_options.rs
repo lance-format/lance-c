@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::fmt;
-use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -282,7 +281,7 @@ impl OwnedNativeWriteProgress {
             callback(self.callback_ctx, &info, &mut error)
         });
         if status != 0 {
-            return Err(callback_error(&mut error, status, context));
+            return Err(unsafe { callback_error(&mut error, status, context) });
         }
         unsafe { release_message_only(&mut error) };
         Ok(())
