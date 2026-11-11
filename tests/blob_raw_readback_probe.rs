@@ -6,7 +6,7 @@
 //!
 //! This is a temporary investigation artifact, not a regression test.
 
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString};
 use std::ptr;
 use std::sync::Arc;
 
@@ -309,14 +309,13 @@ fn describe_schema(metadata: &CachedFileMetadata) {
             );
         }
     }
-    match versions::reader_projection_from_whole_schema(&metadata.file_schema, metadata.version) {
-        Ok(projection) => println!(
-            "whole-schema projection: indices={:?} fields={}",
-            projection.column_indices,
-            projection.schema.fields.len()
-        ),
-        Err(error) => println!("whole-schema projection error: {error}"),
-    }
+    let projection =
+        versions::reader_projection_from_whole_schema(&metadata.file_schema, metadata.version);
+    println!(
+        "whole-schema projection: indices={:?} fields={}",
+        projection.column_indices,
+        projection.schema.fields.len()
+    );
 }
 
 fn native_read_all(uri: &str) -> Result<usize, String> {
