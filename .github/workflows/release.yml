@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
 name: Release
 on:
   push:
@@ -64,14 +67,15 @@ jobs:
     env:
       CC: clang
       CXX: clang++
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       # Runs before checkout so git is present for the clone and for the
       # Corrosion FetchContent. The image has no sudo and runs as root.
-      # xz-utils backs `tar -cJf` and perl provides `shasum`; neither is in
-      # the base image. libprotobuf-dev supplies the well-known .proto files
-      # under /usr/include/google/protobuf/, which lance-encoding's build
-      # script imports; protobuf-compiler only Recommends it, so
-      # --no-install-recommends drops it and protoc fails to resolve
+      # xz-utils backs `tar -cJf`, zstd backs `rust-cache`, and perl provides
+      # `shasum`; none is in the base image. libprotobuf-dev supplies the
+      # well-known .proto files under /usr/include/google/protobuf/, which
+      # lance-encoding's build script imports; protobuf-compiler only Recommends
+      # it, so --no-install-recommends drops it and protoc fails to resolve
       # google/protobuf/empty.proto.
       - name: Install build dependencies (container)
         if: matrix.container != ''
@@ -89,16 +93,18 @@ jobs:
             perl \
             pkg-config \
             protobuf-compiler \
-            xz-utils
+            xz-utils \
+            zstd
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git (container)
         if: matrix.container != ''
         run: git config --global --add safe.directory '*'
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: ". -> build/cargo/build"
           # Suffix keeps the container and host builds of the same triple from
           # sharing a cache — they link against different glibc versions.
           key: ${{ matrix.target }}${{ matrix.artifact_suffix }}
@@ -125,8 +131,12 @@ jobs:
       - name: Verify macOS staged libraries
         if: matrix.os_label == 'macos'
         run: bash .github/scripts/verify-macos-staging.sh stage arm64
+      - name: Smoke-test staged package with CMake consumer
+        run: bash .github/scripts/verify-cmake-consumer.sh --from-install-prefix stage
       - name: Tar
         id: pack
+        env:
+          XZ_OPT: -T0
         run: |
           VERSION=${{ steps.ver.outputs.version }}
           TARGET=${{ matrix.target }}

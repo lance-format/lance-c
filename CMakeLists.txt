@@ -114,6 +114,13 @@ if(NOT LANCE_C_USE_PREBUILT)
         DESTINATION ${CMAKE_INSTALL_LIBDIR})
     install(FILES $<TARGET_FILE:lance_c-shared>
         DESTINATION ${CMAKE_INSTALL_LIBDIR})
+else()
+    install(FILES "${_lance_c_static_real}"
+        OPTIONAL
+        DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(FILES "${_lance_c_shared_real}"
+        OPTIONAL
+        DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
 # License.

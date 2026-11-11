@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
 name: CI
 on:
   push:
@@ -7,26 +10,49 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  # Skip DWARF debug info in dev/test profiles (previously set implicitly by
+  # actions-rust-lang/setup-rust-toolchain) to cut compile/link I/O in half and
+  # keep target/debug/liblance_c.a (~2 GiB) under macOS lipo's 4 GiB limit.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  format:
-    name: Rustfmt
+  lint:
+    name: Format & License
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt -- --check
+      - name: Check SPDX license headers
+        run: |
+          MISSING=""
+          for f in $(find src tests include cmake examples .github/scripts -type f \( \
+            -name '*.rs' -o -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \
+            -o -name '*.cmake' -o -name 'CMakeLists.txt' -o -name '*.py' -o -name '*.sh' \
+          \)) build.rs CMakeLists.txt Cargo.toml; do
+            if ! head -5 "$f" | grep -q 'SPDX-License-Identifier'; then
+              MISSING="$MISSING $f"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "Missing SPDX license header in:$MISSING"
+            exit 1
+          fi
 
   clippy:
     name: Clippy
@@ -34,10 +60,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Clippy
@@ -50,32 +78,49 @@ jobs:
     env:
       CC: clang
       CXX: clang++
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler lld
+      - name: Build library artifacts
+        run: cargo build --lib
       - name: Run tests
         run: cargo test
       - name: Run C/C++ compilation tests
         run: cargo test --test compile_and_run_test -- --ignored
+      - name: Verify CMake package and consumer linkage
+        run: bash .github/scripts/verify-cmake-consumer.sh --from-target-dir target/debug
 
   test-macos:
     name: Tests (macOS)
-    runs-on: macos-15-intel
-    # Allow cold Lance builds to finish both Rust tests and native consumers.
-    timeout-minutes: 60
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CC: clang
+      CXX: clang++
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: brew install protobuf
+      - name: Build library artifacts
+        run: cargo build --lib
       - name: Run tests
         run: cargo test
       - name: Run C/C++ compilation tests
         run: cargo test --test compile_and_run_test -- --ignored
+      - name: Verify CMake package and consumer linkage
+        run: bash .github/scripts/verify-cmake-consumer.sh --from-target-dir target/debug
 
   rustdoc:
     name: Rustdoc
@@ -83,8 +128,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Check documentation
@@ -96,30 +143,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: "1.94.0"
+      - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Check MSRV
         run: cargo check --all-targets
-
-  license-headers:
-    name: License headers
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check Rust files for SPDX headers
-        run: |
-          MISSING=""
-          for f in $(find src tests -name '*.rs'); do
-            if ! head -2 "$f" | grep -q 'SPDX-License-Identifier'; then
-              MISSING="$MISSING $f"
-            fi
-          done
-          if [ -n "$MISSING" ]; then
-            echo "Missing SPDX license header in:$MISSING"
-            exit 1
-          fi
