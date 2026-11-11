@@ -1861,7 +1861,11 @@ fn storage_provider_none_some_empty_error_expiry_and_force() {
         lance_storage_options_accessor_close(accessor);
         lance_storage_options_provider_close(provider);
     }
-    assert_eq!(counters.provider_releases.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        counters.provider_releases.load(Ordering::SeqCst),
+        0,
+        "the native S3 object store retains the fetch-only provider after C handles close"
+    );
     drop(provider_id);
 
     let releases = Arc::new(AtomicUsize::new(0));
