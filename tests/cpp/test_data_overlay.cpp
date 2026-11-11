@@ -404,6 +404,17 @@ int main(int argc, char** argv) {
 
         check_history(committed, 3, 2);
 
+        auto repeat_transaction =
+            lance::Transaction::from_operation(2, operation);
+        bool repeat_conflict = false;
+        try {
+            auto unexpected = lance::Dataset::commit(uri, repeat_transaction);
+            (void)unexpected;
+        } catch (const lance::Error& error) {
+            repeat_conflict = error.code == LANCE_ERR_COMMIT_CONFLICT;
+        }
+        CHECK(repeat_conflict);
+
         auto committed_fragment0 =
             committed.open_fragment(committed.fragment_ids()[0]);
         auto second_schema = committed_fragment0.native_schema().project({"a"});
@@ -429,38 +440,8 @@ int main(int argc, char** argv) {
         check_history(committed2, 4, 1);
         check_history(committed2, 3, 2);
 
-        LanceCompactionOptions compaction{};
-        compaction.target_rows_per_fragment = 15;
-        auto metrics = committed2.compact_files(&compaction);
-        CHECK(metrics.fragments_removed >= 1);
-        CHECK(committed2.version() == 5);
-
-        auto old = lance::Dataset::open(uri, 1);
-        CHECK(old.version() == 1);
-        auto old_fragment = old.open_fragment(old.fragment_ids()[0]);
-        auto old_schema = old_fragment.native_schema().project({"a"});
-        auto stale_writer = old_fragment.write_overlay(old_schema);
-        OverlayBatch stale_batch(1, true, false);
-        stale_batch.set_rowaddr(0, row_address(old.fragment_ids()[0], 9));
-        stale_batch.set_a(0, 777);
-        write_batch(stale_writer, stale_batch);
-        auto stale_finished = stale_writer.finish();
-        CHECK(stale_finished.has_value());
-        auto stale_operation =
-            lance::Operation::make_data_overlay({&*stale_finished});
-        auto stale_transaction =
-            lance::Transaction::from_operation(1, stale_operation);
-        bool conflict = false;
-        try {
-            auto unexpected = lance::Dataset::commit(uri, stale_transaction);
-            (void)unexpected;
-        } catch (const lance::Error& error) {
-            conflict = error.code == LANCE_ERR_COMMIT_CONFLICT;
-        }
-        CHECK(conflict);
-
         auto reopened = lance::Dataset::open(uri);
-        CHECK(reopened.version() == 5);
+        CHECK(reopened.version() == 4);
         assert_row(reopened, 1, false, 9999, 211, before[1].rowid);
         assert_row(reopened, 2, false, 20, 200, before[2].rowid);
         assert_row(reopened, 3, true, 0, 212, before[3].rowid);

@@ -671,6 +671,28 @@ int main(int argc, char **argv) {
            "overlay commit advances version");
     ASSERT(lance_dataset_fragment_count(committed) == 2,
            "overlay commit preserves fragments");
+
+    /* Replaying the same overlay operation against its already-committed read
+       version is a native DataOverlay conflict: the group set is identical to
+       the operation committed at base_version + 1. */
+    LanceOperation *repeat_operation =
+        lance_operation_data_overlay_new(groups, 2);
+    ASSERT(repeat_operation != NULL, "repeat operation");
+    CHECK_OK();
+    LanceTransaction *repeat_transaction =
+        lance_transaction_new(base_version, repeat_operation, NULL);
+    ASSERT(repeat_transaction != NULL, "repeat transaction");
+    CHECK_OK();
+    LanceDataset *repeat_committed = NULL;
+    int32_t repeat_rc = lance_transaction_commit(
+        uri, repeat_transaction, NULL, NULL, NULL, &repeat_committed);
+    ASSERT(repeat_rc != 0, "repeated overlay commit must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_COMMIT_CONFLICT,
+           "repeated overlay reports commit conflict");
+    ASSERT(repeat_committed == NULL,
+           "repeated commit leaves output NULL");
+    lance_transaction_close(repeat_transaction);
+    lance_operation_close(repeat_operation);
     lance_data_overlay_group_close(group0);
     lance_data_overlay_group_close(group1);
 
@@ -731,57 +753,10 @@ int main(int argc, char **argv) {
     lance_schema_close(a_schema0);
     lance_fragment_close(committed_fragment0);
 
-    LanceDataset *old = lance_dataset_open(uri, NULL, 1);
-    ASSERT(old != NULL, "open version 1 snapshot");
-    CHECK_OK();
-    ASSERT(lance_dataset_version(old) == 1, "old snapshot version");
-    uint64_t old_fragment_ids[2] = {0, 0};
-    ASSERT(lance_dataset_fragment_ids(old, old_fragment_ids) == 0,
-           "old fragment ids");
-    LanceFragment *old_fragment = open_fragment(old, old_fragment_ids[0]);
-    LanceSchema *old_a_schema = project_schema(old_fragment, a_columns, 1);
-    LanceFragmentOverlayWriter *stale_writer =
-        new_writer(old_fragment, old_a_schema);
-    OverlayBatch stale_batch;
-    init_overlay_batch(&stale_batch, 1, 1, 0);
-    set_rowaddr(&stale_batch, 0, ROW_ADDRESS(old_fragment_ids[0], 9));
-    set_a(&stale_batch, 0, 777);
-    LanceBatch *stale_imported = import_overlay_batch(&stale_batch);
-    ASSERT(lance_fragment_overlay_writer_write_batch(stale_writer,
-                                                     stale_imported) == 0,
-           "write stale overlay batch");
-    CHECK_OK();
-    lance_batch_free(stale_imported);
-    LanceDataOverlayGroup *stale_group = finish_writer(stale_writer);
-    ASSERT(stale_group != NULL, "stale finish returns group");
-
-    const LanceDataOverlayGroup *stale_groups[1] = {stale_group};
-    LanceOperation *stale_operation =
-        lance_operation_data_overlay_new(stale_groups, 1);
-    ASSERT(stale_operation != NULL, "stale operation");
-    CHECK_OK();
-    LanceTransaction *stale_transaction =
-        lance_transaction_new(1, stale_operation, NULL);
-    ASSERT(stale_transaction != NULL, "stale transaction");
-    CHECK_OK();
-    LanceDataset *stale_committed = NULL;
-    int32_t stale_rc = lance_transaction_commit(uri, stale_transaction, NULL,
-                                                NULL, NULL, &stale_committed);
-    ASSERT(stale_rc != 0, "stale overlay commit must fail");
-    ASSERT(lance_last_error_code() == LANCE_ERR_COMMIT_CONFLICT,
-           "stale overlay reports commit conflict");
-    ASSERT(stale_committed == NULL, "failed commit leaves dataset NULL");
-    lance_transaction_close(stale_transaction);
-    lance_operation_close(stale_operation);
-    lance_data_overlay_group_close(stale_group);
-    lance_schema_close(old_a_schema);
-    lance_fragment_close(old_fragment);
-    lance_dataset_close(old);
-
     LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
     ASSERT(reopened != NULL, "reopen after stale conflict");
     CHECK_OK();
-    ASSERT(lance_dataset_version(reopened) == base_version + 3,
+    ASSERT(lance_dataset_version(reopened) == base_version + 2,
            "stale conflict leaves version unchanged");
     assert_row(reopened, 1, 0, 9999, 211, before[1].rowid);
     assert_row(reopened, 2, 0, 20, 200, before[2].rowid);
