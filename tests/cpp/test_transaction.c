@@ -3057,8 +3057,13 @@ static void test_native_typed_operations(const char *src_uri,
     check_field_schema_metadata(updated, 0, "field-old", NULL);
 
     // The overwrite publication reuses source fragments, so deletion must run
-    // against the source dataset, whose data files are reachable.
-    LanceDataset *deletable = lance_dataset_open(src_uri, NULL, 0);
+    // against a private copy whose data files are reachable from its own URI.
+    char deletable_uri[4096];
+    snprintf(deletable_uri, sizeof(deletable_uri), "%s/c_typed_deletable", base);
+    LanceTransaction *deletable_transaction = write_uncommitted_from_source(
+        src_uri, deletable_uri, LANCE_WRITE_CREATE, &write_options);
+    LanceDataset *deletable =
+        commit_transaction(deletable_uri, deletable_transaction, NULL);
     ASSERT(deletable != NULL, "open typed deletion dataset");
     CHECK_OK();
     uint64_t deleted = 0;

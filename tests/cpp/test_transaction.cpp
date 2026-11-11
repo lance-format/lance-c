@@ -1463,6 +1463,7 @@ static void test_typed_native_operations(const std::string& source_uri,
     const std::string clone_uri = base + "/cpp_typed_clone";
     const std::string deep_uri = base + "/cpp_typed_clone_deep";
     const std::string rejection_uri = base + "/cpp_typed_rejection";
+    const std::string deletable_uri = base + "/cpp_typed_deletable";
 
     auto source = lance::Dataset::open(source_uri);
     const uint64_t source_rows = source.count_rows();
@@ -1660,8 +1661,11 @@ static void test_typed_native_operations(const std::string& source_uri,
     check_typed_field_metadata(updated, 0, "field-old", std::nullopt);
 
     // The overwrite publication reuses source fragments, so deletion must run
-    // against the source dataset, whose data files are reachable.
-    auto deletable = lance::Dataset::open(source_uri);
+    // against a private copy whose data files are reachable from its own URI.
+    auto deletable = lance::Dataset::commit(
+        deletable_uri,
+        write_uncommitted(source_uri, deletable_uri, lance::WriteMode::Create));
+    CHECK(deletable.count_rows() == source_rows);
     CHECK(deletable.delete_rows("id = 1") == 1);
     CHECK(deletable.count_rows() == source_rows - 1);
     std::optional<lance::Fragment> deleted_fragment;
