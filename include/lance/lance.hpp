@@ -18,6 +18,8 @@
 #include "lance/lance.h"
 
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -859,6 +861,227 @@ struct SqlColumn {
     std::string name;
     std::string expression;
 };
+
+// ─── Schema-evolution callbacks ─────────────────────────────────────────────
+
+/// Native checkpoint batch identity. Mapper and checkpoint callbacks receive a
+/// borrowed value.
+struct BatchUDFInfo {
+    uint32_t fragment_id = 0;
+    std::size_t batch_index = 0;
+};
+
+/// Mapper callback. The input Arrow values are borrowed; `output` is an
+/// uninitialized ArrowArray that the callback must initialize with owned data
+/// under the declared BatchUDF output schema. Throw to fail.
+using BatchUDFMapper = std::function<void(
+    const ArrowArray& input,
+    const ArrowSchema& input_schema,
+    ArrowArray& output)>;
+
+/// Optional native UDF checkpoint store.
+///
+/// `get_batch` returns true on a hit, false on a miss, and throws on error.
+/// `insert_batch` receives mutable owned Arrow values: it may move both structs
+/// into its storage and clear the source release callbacks. The library
+/// releases any ownership left in those arguments after the callback returns.
+/// `get_fragment` returns opaque native Fragment JSON or std::nullopt on a
+/// miss. `insert_fragment` receives the native u64 Fragment ID and borrowed
+/// JSON. All four callbacks are required when the store is engaged.
+struct UDFCheckpointStore {
+    std::function<bool(
+        const BatchUDFInfo&,
+        ArrowArray&)> get_batch;
+
+    std::function<void(
+        const BatchUDFInfo&,
+        ArrowArray&,
+        ArrowSchema&)> insert_batch;
+
+    std::function<std::optional<std::string>(uint32_t)> get_fragment;
+
+    std::function<void(uint64_t, const std::string&)> insert_fragment;
+};
+
+/// Native BatchUDF declaration. `output_schema` is the complete schema of every
+/// returned batch and remains borrowed for the enclosing add-columns call.
+struct BatchUDF {
+    BatchUDFMapper mapper;
+    const ArrowSchema* output_schema = nullptr;
+    std::optional<UDFCheckpointStore> checkpoint_store;
+};
+
+namespace callback_detail {
+
+inline void release_owned_string(LanceOwnedString* value) noexcept {
+    if (value == nullptr) return;
+    std::free(value->data);
+    value->data = nullptr;
+    value->release = nullptr;
+}
+
+inline void set_callback_error(
+    LanceCallbackError* target,
+    int32_t code,
+    const char* message) noexcept {
+    if (target == nullptr) return;
+    target->code = code;
+    target->message.data = nullptr;
+    target->message.release = nullptr;
+    if (message == nullptr) return;
+
+    const std::size_t len = std::strlen(message);
+    char* copy = static_cast<char*>(std::malloc(len + 1));
+    if (copy == nullptr) {
+        return;
+    }
+    std::memcpy(copy, message, len + 1);
+    target->message.data = copy;
+    target->message.release = &release_owned_string;
+}
+
+inline void release_array_after_exception(ArrowArray* value) noexcept {
+    if (value != nullptr && value->release != nullptr) {
+        value->release(value);
+    }
+}
+
+struct MapperContext {
+    const BatchUDF* udf;
+};
+
+struct CheckpointContext {
+    const UDFCheckpointStore* store;
+};
+
+inline int32_t mapper_trampoline(
+    void* callback_ctx,
+    const ArrowArray* input,
+    const ArrowSchema* input_schema,
+    ArrowArray* output,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<MapperContext*>(callback_ctx);
+        context->udf->mapper(*input, *input_schema, *output);
+        return 0;
+    } catch (const lance::Error& exception) {
+        release_array_after_exception(output);
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        release_array_after_exception(output);
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        release_array_after_exception(output);
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+inline int32_t get_batch_trampoline(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* raw_info,
+    ArrowArray* output,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        BatchUDFInfo info{raw_info->fragment_id, raw_info->batch_index};
+        return context->store->get_batch(info, *output) ? 1 : 0;
+    } catch (const lance::Error& exception) {
+        release_array_after_exception(output);
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        release_array_after_exception(output);
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        release_array_after_exception(output);
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+inline int32_t insert_batch_trampoline(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* raw_info,
+    ArrowArray* batch,
+    ArrowSchema* batch_schema,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        BatchUDFInfo info{raw_info->fragment_id, raw_info->batch_index};
+        context->store->insert_batch(info, *batch, *batch_schema);
+        return 0;
+    } catch (const lance::Error& exception) {
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+inline int32_t get_fragment_trampoline(
+    void* callback_ctx,
+    uint32_t fragment_id,
+    LanceOwnedString* out_json,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        auto json = context->store->get_fragment(fragment_id);
+        if (!json) return 0;
+
+        char* copy = static_cast<char*>(std::malloc(json->size() + 1));
+        if (copy == nullptr) {
+            set_callback_error(
+                error, LANCE_ERR_INTERNAL, "failed to allocate callback JSON");
+            return -1;
+        }
+        std::memcpy(copy, json->data(), json->size());
+        copy[json->size()] = '\0';
+        out_json->data = copy;
+        out_json->release = &release_owned_string;
+        return 1;
+    } catch (const lance::Error& exception) {
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+inline int32_t insert_fragment_trampoline(
+    void* callback_ctx,
+    uint64_t fragment_id,
+    const char* fragment_json,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        context->store->insert_fragment(
+            fragment_id, std::string(fragment_json == nullptr ? "" : fragment_json));
+        return 0;
+    } catch (const lance::Error& exception) {
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+}  // namespace callback_detail
 
 // ─── Shared Session ──────────────────────────────────────────────────────────
 
@@ -2898,6 +3121,31 @@ public:
         return num_updated;
     }
 
+    /// One-shot native `Dataset::merge` left join. The two-argument overload
+    /// maps an omitted `right_on` to `left_on`.
+    ///
+    /// A non-null `source` is consumed on return or throw; a null source is
+    /// rejected without consumption. Native owns matching, schema union, and
+    /// commit behavior. Existing scanners and independently opened handles
+    /// retain their previous snapshots. Throws lance::Error on failure.
+    void merge(ArrowArrayStream* source, const std::string& left_on) {
+        merge(source, left_on, left_on);
+    }
+
+    /// One-shot native `Dataset::merge` left join with distinct keys.
+    ///
+    /// Empty key strings are forwarded to native validation. Throws
+    /// lance::Error on failure.
+    void merge(
+        ArrowArrayStream* source,
+        const std::string& left_on,
+        const std::string& right_on) {
+        if (lance_dataset_merge(
+                handle_.get(), left_on.c_str(), right_on.c_str(), source) != 0) {
+            check_error();
+        }
+    }
+
     /// Merge `source` into this dataset keyed on `on_columns`, committing a
     /// new manifest. Defaults to find-or-create semantics (insert rows that
     /// do not match an existing key). Returns the per-call insert / update /
@@ -3040,6 +3288,79 @@ public:
         // Rust layer rejects before it indexes the pointer.
         if (lance_dataset_add_columns_sql(
                 handle_.get(), raw.data(), raw.size(), batch_size) != 0) {
+            check_error();
+        }
+    }
+
+    /// Add columns through native `NewColumnTransform::BatchUDF`.
+    ///
+    /// `udf.output_schema` is the complete schema of every returned batch and
+    /// must remain valid for the call. An engaged checkpoint store requires all
+    /// four callbacks. `std::nullopt` read columns maps to native `None`; an
+    /// engaged empty vector maps to `Some(empty)`. `std::nullopt` batch size
+    /// maps to `None`; `std::optional<uint32_t>(0)` is forwarded as explicit
+    /// zero, leaving validation to native.
+    ///
+    /// Callbacks execute synchronously under this handle's exclusive mutation
+    /// lock. They must not re-enter the same handle; use an independent handle
+    /// or an existing fragment/scanner snapshot for callback reads. C++
+    /// exceptions are contained and converted to native callback errors.
+    /// Throws lance::Error on failure.
+    void add_columns_batch_udf(
+        const BatchUDF& udf,
+        std::optional<std::vector<std::string>> read_columns = std::nullopt,
+        std::optional<uint32_t> batch_size = std::nullopt) {
+        if (!udf.mapper) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT, "BatchUDF mapper must not be empty");
+        }
+        if (udf.output_schema == nullptr) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "BatchUDF output_schema must not be null");
+        }
+
+        callback_detail::MapperContext mapper_context{&udf};
+        callback_detail::CheckpointContext checkpoint_context{nullptr};
+        LanceUDFCheckpointStore raw_store{};
+        const UDFCheckpointStore* store = nullptr;
+        if (udf.checkpoint_store) {
+            store = &*udf.checkpoint_store;
+            if (!store->get_batch || !store->insert_batch ||
+                !store->get_fragment || !store->insert_fragment) {
+                throw Error(
+                    LANCE_ERR_INVALID_ARGUMENT,
+                    "UDFCheckpointStore must provide all four callbacks");
+            }
+            checkpoint_context.store = store;
+            raw_store.get_batch = &callback_detail::get_batch_trampoline;
+            raw_store.insert_batch = &callback_detail::insert_batch_trampoline;
+            raw_store.get_fragment = &callback_detail::get_fragment_trampoline;
+            raw_store.insert_fragment = &callback_detail::insert_fragment_trampoline;
+            raw_store.callback_ctx = &checkpoint_context;
+        }
+
+        LanceBatchUDF raw{};
+        raw.mapper = &callback_detail::mapper_trampoline;
+        raw.mapper_ctx = &mapper_context;
+        raw.output_schema = udf.output_schema;
+        raw.checkpoint_store = store == nullptr ? nullptr : &raw_store;
+
+        std::vector<const char*> read_column_ptrs;
+        if (read_columns) {
+            read_column_ptrs.reserve(read_columns->size() + 1);
+            for (const auto& column : *read_columns) {
+                read_column_ptrs.push_back(column.c_str());
+            }
+            read_column_ptrs.push_back(nullptr);
+        }
+        const uint32_t batch_size_value = batch_size.value_or(0);
+        const char* const* read_columns_ptr =
+            read_columns ? read_column_ptrs.data() : nullptr;
+        const uint32_t* batch_size_ptr = batch_size ? &batch_size_value : nullptr;
+
+        if (lance_dataset_add_columns_batch_udf(
+                handle_.get(), &raw, read_columns_ptr, batch_size_ptr) != 0) {
             check_error();
         }
     }

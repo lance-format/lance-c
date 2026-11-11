@@ -213,6 +213,247 @@ static void capture_build_progress(
     captured->events += 1;
 }
 
+static void test_noop_schema_release(struct ArrowSchema *schema) {
+    if (schema != NULL) schema->release = NULL;
+}
+
+static void test_noop_array_release(struct ArrowArray *array) {
+    if (array != NULL) array->release = NULL;
+}
+
+typedef struct {
+    struct ArrowSchema top;
+    struct ArrowSchema key;
+    struct ArrowSchema value;
+    struct ArrowSchema *schema_children[2];
+    struct ArrowArray top_array;
+    struct ArrowArray key_array;
+    struct ArrowArray value_array;
+    struct ArrowArray *array_children[2];
+    const void *top_buffers[1];
+    const void *key_buffers[2];
+    const void *value_buffers[2];
+    int32_t ids[4];
+    int64_t values[4];
+    int emitted;
+    struct ArrowArrayStream stream;
+} MergeStreamFixture;
+
+static int merge_stream_get_schema(
+    struct ArrowArrayStream *stream,
+    struct ArrowSchema *out
+) {
+    MergeStreamFixture *fixture = (MergeStreamFixture *)stream->private_data;
+    *out = fixture->top;
+    out->release = test_noop_schema_release;
+    return 0;
+}
+
+static int merge_stream_get_next(
+    struct ArrowArrayStream *stream,
+    struct ArrowArray *out
+) {
+    MergeStreamFixture *fixture = (MergeStreamFixture *)stream->private_data;
+    if (fixture->emitted) {
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
+    fixture->emitted = 1;
+    *out = fixture->top_array;
+    out->release = test_noop_array_release;
+    return 0;
+}
+
+static const char *merge_stream_last_error(struct ArrowArrayStream *stream) {
+    (void)stream;
+    return NULL;
+}
+
+static void merge_stream_release(struct ArrowArrayStream *stream) {
+    if (stream != NULL) stream->release = NULL;
+}
+
+static void init_merge_stream(MergeStreamFixture *fixture) {
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->ids[0] = 1;
+    fixture->ids[1] = 2;
+    fixture->ids[2] = 3;
+    fixture->ids[3] = 4;
+    fixture->values[0] = 1001;
+    fixture->values[1] = 1002;
+    fixture->values[2] = 1003;
+    fixture->values[3] = 1004;
+
+    fixture->schema_children[0] = &fixture->key;
+    fixture->schema_children[1] = &fixture->value;
+    fixture->top.format = "+s";
+    fixture->top.n_children = 2;
+    fixture->top.children = fixture->schema_children;
+    fixture->top.release = test_noop_schema_release;
+    fixture->key.format = "i";
+    fixture->key.name = "id";
+    fixture->key.release = test_noop_schema_release;
+    fixture->value.format = "l";
+    fixture->value.name = "c_merged";
+    fixture->value.flags = ARROW_FLAG_NULLABLE;
+    fixture->value.release = test_noop_schema_release;
+
+    fixture->top_buffers[0] = NULL;
+    fixture->key_buffers[0] = NULL;
+    fixture->key_buffers[1] = fixture->ids;
+    fixture->value_buffers[0] = NULL;
+    fixture->value_buffers[1] = fixture->values;
+
+    fixture->array_children[0] = &fixture->key_array;
+    fixture->array_children[1] = &fixture->value_array;
+    fixture->key_array.length = 4;
+    fixture->key_array.n_buffers = 2;
+    fixture->key_array.buffers = fixture->key_buffers;
+    fixture->key_array.release = test_noop_array_release;
+    fixture->value_array.length = 4;
+    fixture->value_array.n_buffers = 2;
+    fixture->value_array.buffers = fixture->value_buffers;
+    fixture->value_array.release = test_noop_array_release;
+    fixture->top_array.length = 4;
+    fixture->top_array.n_buffers = 1;
+    fixture->top_array.buffers = fixture->top_buffers;
+    fixture->top_array.n_children = 2;
+    fixture->top_array.children = fixture->array_children;
+    fixture->top_array.release = test_noop_array_release;
+
+    fixture->stream.get_schema = merge_stream_get_schema;
+    fixture->stream.get_next = merge_stream_get_next;
+    fixture->stream.get_last_error = merge_stream_last_error;
+    fixture->stream.release = merge_stream_release;
+    fixture->stream.private_data = fixture;
+}
+
+typedef struct {
+    struct ArrowArray top;
+    struct ArrowArray child;
+    struct ArrowArray *children[1];
+    const void *top_buffers[1];
+    const void *child_buffers[2];
+    int64_t *values;
+} Int64BatchAllocation;
+
+static void release_int64_batch(struct ArrowArray *array) {
+    if (array == NULL) return;
+    Int64BatchAllocation *allocation =
+        (Int64BatchAllocation *)array->private_data;
+    if (allocation != NULL) {
+        free(allocation->values);
+        free(allocation);
+    }
+    array->release = NULL;
+    array->private_data = NULL;
+}
+
+static int32_t test_batch_udf_mapper(
+    void *callback_ctx,
+    const struct ArrowArray *input,
+    const struct ArrowSchema *input_schema,
+    struct ArrowArray *out,
+    LanceCallbackError *error
+) {
+    (void)callback_ctx;
+    (void)input_schema;
+    (void)error;
+    size_t rows = (size_t)input->length;
+    Int64BatchAllocation *allocation =
+        (Int64BatchAllocation *)calloc(1, sizeof(*allocation));
+    if (allocation == NULL) return -1;
+    allocation->values = (int64_t *)malloc(rows * sizeof(int64_t));
+    if (allocation->values == NULL && rows > 0) {
+        free(allocation);
+        return -1;
+    }
+    for (size_t i = 0; i < rows; ++i) allocation->values[i] = 7000 + (int64_t)i;
+
+    allocation->top_buffers[0] = NULL;
+    allocation->child_buffers[0] = NULL;
+    allocation->child_buffers[1] = allocation->values;
+    allocation->children[0] = &allocation->child;
+    allocation->child.length = (int64_t)rows;
+    allocation->child.n_buffers = 2;
+    allocation->child.buffers = allocation->child_buffers;
+    allocation->child.release = test_noop_array_release;
+    allocation->top.length = (int64_t)rows;
+    allocation->top.n_buffers = 1;
+    allocation->top.buffers = allocation->top_buffers;
+    allocation->top.n_children = 1;
+    allocation->top.children = allocation->children;
+    allocation->top.release = release_int64_batch;
+    allocation->top.private_data = allocation;
+    *out = allocation->top;
+    return 0;
+}
+
+typedef struct {
+    uint64_t get_batch;
+    uint64_t insert_batch;
+    uint64_t get_fragment;
+    uint64_t insert_fragment;
+} CheckpointCalls;
+
+static int32_t checkpoint_get_batch(
+    void *callback_ctx,
+    const LanceUDFBatchInfo *info,
+    struct ArrowArray *out,
+    LanceCallbackError *error
+) {
+    (void)info;
+    (void)out;
+    (void)error;
+    CheckpointCalls *calls = (CheckpointCalls *)callback_ctx;
+    calls->get_batch += 1;
+    return 0;
+}
+
+static int32_t checkpoint_insert_batch(
+    void *callback_ctx,
+    const LanceUDFBatchInfo *info,
+    struct ArrowArray *batch,
+    struct ArrowSchema *batch_schema,
+    LanceCallbackError *error
+) {
+    (void)info;
+    (void)batch;
+    (void)batch_schema;
+    (void)error;
+    CheckpointCalls *calls = (CheckpointCalls *)callback_ctx;
+    calls->insert_batch += 1;
+    return 0;
+}
+
+static int32_t checkpoint_get_fragment(
+    void *callback_ctx,
+    uint32_t fragment_id,
+    LanceOwnedString *out_json,
+    LanceCallbackError *error
+) {
+    (void)fragment_id;
+    (void)out_json;
+    (void)error;
+    CheckpointCalls *calls = (CheckpointCalls *)callback_ctx;
+    calls->get_fragment += 1;
+    return 0;
+}
+
+static int32_t checkpoint_insert_fragment(
+    void *callback_ctx,
+    uint64_t fragment_id,
+    const char *fragment_json,
+    LanceCallbackError *error
+) {
+    (void)fragment_id;
+    (void)fragment_json;
+    (void)error;
+    CheckpointCalls *calls = (CheckpointCalls *)callback_ctx;
+    calls->insert_fragment += 1;
+    return 0;
+}
+
 static void test_open_and_metadata(const char *uri) {
     printf("  test_open_and_metadata... ");
 
@@ -3453,6 +3694,101 @@ static void test_add_columns(const char *write_uri) {
     printf("OK\n");
 }
 
+/* Re-opens the dataset reduced by test_drop_columns and exercises native
+ * Dataset::merge plus BatchUDF with all four checkpoint callbacks. */
+static void test_merge_and_batch_udf(const char *write_uri) {
+    printf("  test_merge_and_batch_udf... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    CHECK_OK();
+    uint64_t fields_before = 0;
+    struct ArrowSchema schema_before;
+    memset(&schema_before, 0, sizeof(schema_before));
+    ASSERT(lance_dataset_schema(ds, &schema_before) == 0, "schema export failed");
+    fields_before = (uint64_t)schema_before.n_children;
+    if (schema_before.release) schema_before.release(&schema_before);
+    uint64_t version_before = lance_dataset_version(ds);
+
+    MergeStreamFixture merge = {0};
+    init_merge_stream(&merge);
+    int32_t rc = lance_dataset_merge(ds, "id", "id", &merge.stream);
+    ASSERT(rc == 0, "lance_dataset_merge failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(ds) > version_before,
+           "merge must commit a new version");
+
+    uint64_t fields_after_merge = 0;
+    struct ArrowSchema schema_after_merge;
+    memset(&schema_after_merge, 0, sizeof(schema_after_merge));
+    ASSERT(lance_dataset_schema(ds, &schema_after_merge) == 0,
+           "schema export after merge failed");
+    fields_after_merge = (uint64_t)schema_after_merge.n_children;
+    if (schema_after_merge.release) schema_after_merge.release(&schema_after_merge);
+    ASSERT(fields_after_merge == fields_before + 1,
+           "merge must add exactly one column");
+
+    struct ArrowSchema udf_column;
+    struct ArrowSchema *udf_children[1];
+    memset(&udf_column, 0, sizeof(udf_column));
+    udf_children[0] = &udf_column;
+    udf_column.format = "l";
+    udf_column.name = "c_udf_c";
+    udf_column.flags = ARROW_FLAG_NULLABLE;
+    udf_column.release = test_noop_schema_release;
+    struct ArrowSchema udf_schema;
+    memset(&udf_schema, 0, sizeof(udf_schema));
+    udf_schema.format = "+s";
+    udf_schema.n_children = 1;
+    udf_schema.children = udf_children;
+    udf_schema.release = test_noop_schema_release;
+
+    CheckpointCalls calls = {0};
+    LanceUDFCheckpointStore store = {0};
+    store.get_batch = checkpoint_get_batch;
+    store.insert_batch = checkpoint_insert_batch;
+    store.get_fragment = checkpoint_get_fragment;
+    store.insert_fragment = checkpoint_insert_fragment;
+    store.callback_ctx = &calls;
+    LanceBatchUDF udf = {0};
+    udf.mapper = test_batch_udf_mapper;
+    udf.mapper_ctx = NULL;
+    udf.output_schema = &udf_schema;
+    udf.checkpoint_store = &store;
+
+    uint64_t version_before_udf = lance_dataset_version(ds);
+    rc = lance_dataset_add_columns_batch_udf(ds, &udf, NULL, NULL);
+    ASSERT(rc == 0, "lance_dataset_add_columns_batch_udf failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(ds) > version_before_udf,
+           "BatchUDF must commit a new version");
+    ASSERT(calls.get_fragment > 0 && calls.get_batch > 0 &&
+           calls.insert_batch > 0 && calls.insert_fragment > 0,
+           "all four checkpoint callbacks must be exercised");
+
+    uint64_t fields_after_udf = 0;
+    struct ArrowSchema schema_after_udf;
+    memset(&schema_after_udf, 0, sizeof(schema_after_udf));
+    ASSERT(lance_dataset_schema(ds, &schema_after_udf) == 0,
+           "schema export after BatchUDF failed");
+    fields_after_udf = (uint64_t)schema_after_udf.n_children;
+    if (schema_after_udf.release) schema_after_udf.release(&schema_after_udf);
+    ASSERT(fields_after_udf == fields_after_merge + 1,
+           "BatchUDF must add exactly one column");
+
+    rc = lance_dataset_merge(ds, "id", "id", NULL);
+    ASSERT(rc == -1, "NULL merge stream must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT for NULL merge stream");
+    rc = lance_dataset_add_columns_batch_udf(ds, NULL, NULL, NULL);
+    ASSERT(rc == -1, "NULL BatchUDF must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT for NULL BatchUDF");
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 /* Builds one uncommitted scalar index segment and exercises the byte-buffer
  * and parsed-metadata ownership APIs from a real C caller. */
 static void test_index_segment_builder(const char *uri) {
@@ -5100,6 +5436,7 @@ int main(int argc, char **argv) {
     test_alter_columns(write_uri);
     test_drop_columns(write_uri);
     test_add_columns(write_uri);
+    test_merge_and_batch_udf(write_uri);
     test_compact_files(write_uri);
     test_delete(write_uri);
 
