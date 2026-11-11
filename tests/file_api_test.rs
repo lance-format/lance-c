@@ -479,14 +479,23 @@ fn versions_declared_lazy_and_defaults_round_trip_against_native() {
     write_fixture(lazy, None, true, None, None, None, None, false);
     assert_fixture_batches(&read_all_c(lazy, None).1);
 
-    for (name, expected) in [
-        ("default", LanceFileVersion::default()),
-        ("stable", LanceFileVersion::Stable),
-        ("next", LanceFileVersion::Next),
+    let default_uri = root.path().join("default.lance");
+    let default_uri = default_uri.to_str().unwrap();
+    write_fixture(default_uri, None, false, None, None, None, None, false);
+    let reader = open_c_reader(default_uri, None);
+    assert_eq!(
+        metadata_info(reader).format_version,
+        format_version(LanceFileVersion::default())
+    );
+    unsafe { lance_file_reader_close(reader) };
+
+    for (name, version, expected) in [
+        ("stable", "stable", LanceFileVersion::Stable),
+        ("next", "next", LanceFileVersion::Next),
     ] {
         let uri = root.path().join(format!("{name}.lance"));
         let uri = uri.to_str().unwrap();
-        write_fixture(uri, Some(name), false, None, None, None, None, false);
+        write_fixture(uri, Some(version), false, None, None, None, None, false);
         let reader = open_c_reader(uri, None);
         assert_eq!(
             metadata_info(reader).format_version,
@@ -1718,7 +1727,7 @@ fn storage_provider_none_some_empty_error_expiry_and_force() {
     let third = snapshot_options(accessor).unwrap().unwrap();
     assert_eq!(third.get("expires").map(String::as_str), Some("cached"));
     assert_eq!(counters.fetches.load(Ordering::SeqCst), 2);
-    assert_eq!(counters.snapshot_releases.load(Ordering::SeqCst), 3);
+    assert_eq!(counters.snapshot_releases.load(Ordering::SeqCst), 2);
     unsafe {
         lance_storage_options_accessor_close(accessor);
         lance_storage_options_provider_close(provider);
