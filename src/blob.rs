@@ -643,7 +643,11 @@ mod tests {
         ]));
         let mut blobs = BlobArrayBuilder::new(1);
         blobs
-            .push_bytes((0..128).map(|index| (index * 7 + 3) as u8).collect())
+            .push_bytes(
+                (0..128)
+                    .map(|index| (index * 7 + 3) as u8)
+                    .collect::<Vec<u8>>(),
+            )
             .unwrap();
         let batch = RecordBatch::try_new(
             schema.clone(),

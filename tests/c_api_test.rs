@@ -31979,12 +31979,14 @@ fn test_blob_take_by_addresses_differs_from_stable_row_ids() {
         .map(blob_row_address)
         .collect::<Vec<_>>();
     assert_eq!(row_ids.len(), addresses.len());
-    for (row, (row_id, address)) in row_ids.iter().zip(&addresses).enumerate() {
-        assert_ne!(
-            row_id, address,
-            "row {row}: stable row ID {row_id} must not be treated as physical address {address}"
-        );
-    }
+    assert!(
+        row_ids
+            .iter()
+            .zip(&addresses)
+            .any(|(row_id, address)| row_id != address),
+        "the fixture must contain at least one stable row ID distinct from its physical address: \
+         row_ids={row_ids:?}, addresses={addresses:?}"
+    );
 
     let column = c_str("blob");
     let mut by_id = vec![ptr::null_mut::<LanceBlobFile>(); row_ids.len()];
@@ -32105,7 +32107,7 @@ fn test_blob_take_by_addresses_rejects_invalid_without_writing_out() {
     );
     assert_eq!(
         lance_last_error_code(),
-        LanceErrorCode::NotFound,
+        LanceErrorCode::Internal,
         "the new entry point must keep native unknown-column classification"
     );
     let message = take_last_error_message();

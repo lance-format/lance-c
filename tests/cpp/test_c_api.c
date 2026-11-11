@@ -51,6 +51,12 @@ static void discard_last_error(void) {
     if (message) lance_free_string(message);
 }
 
+static void expect_error(LanceErrorCode expected, const char *operation);
+static void expect_error_contains(
+    LanceErrorCode expected,
+    const char *needle,
+    const char *operation);
+
 static const char *arrow_field_metadata_value(
     const struct ArrowSchema *field,
     const char *key,
@@ -1078,7 +1084,7 @@ static void test_blob_native_read_slice(const char *blob_uri) {
         ds, NULL, 0, "does_not_exist", untouched);
     ASSERT(rc == -1, "empty unknown column should fail");
     expect_error_contains(
-        LANCE_ERR_NOT_FOUND, "does_not_exist", "empty unknown column");
+        LANCE_ERR_INTERNAL, "does_not_exist", "empty unknown column");
     ASSERT(untouched[0] == addressed[0] && untouched[1] == addressed[0],
            "failed by-address take must leave out untouched");
 

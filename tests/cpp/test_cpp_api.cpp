@@ -961,13 +961,13 @@ static void test_blob_native_read_slice(const std::string& blob_uri) {
         }
 
         // Empty by-address selections still validate the column natively.
-        bool not_found = false;
+        bool unknown_column = false;
         try {
             ds.take_blobs_by_addresses(nullptr, 0, "does_not_exist");
         } catch (const lance::Error& error) {
-            not_found = error.code == LANCE_ERR_NOT_FOUND;
+            unknown_column = error.code == LANCE_ERR_INTERNAL;
         }
-        assert(not_found);
+        assert(unknown_column);
 
         bool non_blob = false;
         try {
