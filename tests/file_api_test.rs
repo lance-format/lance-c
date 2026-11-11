@@ -905,8 +905,10 @@ fn reader_projection_range_indices_errors_and_io_stats() {
     };
     let (_, sized_batches) = read_all_c(uri, Some(&explicit_zero_false));
     assert_eq!(sized_batches.len(), 7);
-    let mut native_options = NativeReaderOptions::default();
-    native_options.batch_size_bytes = Some(0);
+    let mut native_options = NativeReaderOptions {
+        batch_size_bytes: Some(0),
+        ..Default::default()
+    };
     native_options.decoder_config.cache_repetition_index = false;
     native_options.decoder_config.validate_on_decode = false;
     native_options.decoder_config.inline_scheduling = Some(false);
