@@ -14,6 +14,7 @@
 
 #include "lance/lance.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -116,6 +117,130 @@ static void assert_field_metadata_absent(
     }
     assert(arrow_field_metadata_value(field, key) == nullptr);
 }
+
+static void test_noop_schema_release(ArrowSchema* schema) {
+    if (schema) schema->release = nullptr;
+}
+
+static void test_noop_array_release(ArrowArray* array) {
+    if (array) array->release = nullptr;
+}
+
+struct MergeStreamFixture {
+    ArrowSchema top{};
+    ArrowSchema key{};
+    ArrowSchema value{};
+    ArrowSchema* schema_children[2]{};
+    ArrowArray top_array{};
+    ArrowArray key_array{};
+    ArrowArray value_array{};
+    ArrowArray* array_children[2]{};
+    const void* top_buffers[1]{};
+    const void* key_buffers[2]{};
+    const void* value_buffers[2]{};
+    std::array<int32_t, 4> ids{{1, 2, 3, 4}};
+    std::array<int64_t, 4> values{{9001, 9002, 9003, 9004}};
+    std::string value_name;
+    int emitted = 0;
+    ArrowArrayStream stream{};
+
+    explicit MergeStreamFixture(std::string name) : value_name(std::move(name)) {
+        schema_children[0] = &key;
+        schema_children[1] = &value;
+        top.format = "+s";
+        top.n_children = 2;
+        top.children = schema_children;
+        top.release = test_noop_schema_release;
+        key.format = "i";
+        key.name = "id";
+        key.release = test_noop_schema_release;
+        value.format = "l";
+        value.name = value_name.c_str();
+        value.flags = ARROW_FLAG_NULLABLE;
+        value.release = test_noop_schema_release;
+
+        top_buffers[0] = nullptr;
+        key_buffers[0] = nullptr;
+        key_buffers[1] = ids.data();
+        value_buffers[0] = nullptr;
+        value_buffers[1] = values.data();
+        array_children[0] = &key_array;
+        array_children[1] = &value_array;
+        key_array.length = static_cast<int64_t>(ids.size());
+        key_array.n_buffers = 2;
+        key_array.buffers = key_buffers;
+        key_array.release = test_noop_array_release;
+        value_array.length = static_cast<int64_t>(values.size());
+        value_array.n_buffers = 2;
+        value_array.buffers = value_buffers;
+        value_array.release = test_noop_array_release;
+        top_array.length = static_cast<int64_t>(ids.size());
+        top_array.n_buffers = 1;
+        top_array.buffers = top_buffers;
+        top_array.n_children = 2;
+        top_array.children = array_children;
+        top_array.release = test_noop_array_release;
+
+        stream.get_schema = [](ArrowArrayStream* raw, ArrowSchema* out) {
+            auto* self = static_cast<MergeStreamFixture*>(raw->private_data);
+            *out = self->top;
+            out->release = test_noop_schema_release;
+            return 0;
+        };
+        stream.get_next = [](ArrowArrayStream* raw, ArrowArray* out) {
+            auto* self = static_cast<MergeStreamFixture*>(raw->private_data);
+            if (self->emitted) {
+                *out = {};
+                return 0;
+            }
+            self->emitted = 1;
+            *out = self->top_array;
+            out->release = test_noop_array_release;
+            return 0;
+        };
+        stream.get_last_error = [](ArrowArrayStream*) -> const char* {
+            return nullptr;
+        };
+        stream.release = [](ArrowArrayStream* raw) {
+            if (raw) raw->release = nullptr;
+        };
+        stream.private_data = this;
+    }
+};
+
+struct CppInt64Batch {
+    ArrowArray top{};
+    ArrowArray child{};
+    ArrowArray* children[1]{};
+    const void* top_buffers[1]{};
+    const void* child_buffers[2]{};
+    std::vector<int64_t> values;
+
+    CppInt64Batch(int64_t rows, int64_t base) : values(static_cast<size_t>(rows)) {
+        for (int64_t row = 0; row < rows; ++row) {
+            values[static_cast<size_t>(row)] = base + row;
+        }
+        top_buffers[0] = nullptr;
+        child_buffers[0] = nullptr;
+        child_buffers[1] = values.data();
+        children[0] = &child;
+        child.length = rows;
+        child.n_buffers = 2;
+        child.buffers = child_buffers;
+        child.release = test_noop_array_release;
+        top.length = rows;
+        top.n_buffers = 1;
+        top.buffers = top_buffers;
+        top.n_children = 1;
+        top.children = children;
+        top.release = [](ArrowArray* array) {
+            delete static_cast<CppInt64Batch*>(array->private_data);
+            array->release = nullptr;
+            array->private_data = nullptr;
+        };
+        top.private_data = this;
+    }
+};
 
 struct ScanStatisticsCapture {
     uint64_t calls = 0;
@@ -2880,6 +3005,120 @@ static void test_add_columns(const std::string& dst_uri) {
     PASS();
 }
 
+// Exercises native Dataset::merge plus BatchUDF callbacks, checkpoint methods,
+// and C++ exception containment through the header-only wrappers.
+static void test_merge_and_batch_udf(const std::string& dst_uri) {
+    TEST(test_merge_and_batch_udf);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t version = ds.version();
+    ArrowSchema schema_before{};
+    ds.schema(&schema_before);
+    const int64_t fields_before = schema_before.n_children;
+    schema_before.release(&schema_before);
+
+    MergeStreamFixture merge{"c_merged_cpp"};
+    ds.merge(&merge.stream, "id", "id");
+    assert(ds.version() > version);
+    version = ds.version();
+
+    MergeStreamFixture merge_default{"c_merged_default"};
+    ds.merge(&merge_default.stream, "id");
+    assert(ds.version() > version);
+
+    ArrowSchema schema_after_merge{};
+    ds.schema(&schema_after_merge);
+    assert(schema_after_merge.n_children == fields_before + 2);
+    schema_after_merge.release(&schema_after_merge);
+
+    ArrowSchema udf_column{};
+    ArrowSchema* udf_children[1] = {&udf_column};
+    udf_column.format = "l";
+    udf_column.name = "c_udf_cpp";
+    udf_column.flags = ARROW_FLAG_NULLABLE;
+    udf_column.release = test_noop_schema_release;
+    ArrowSchema udf_schema{};
+    udf_schema.format = "+s";
+    udf_schema.n_children = 1;
+    udf_schema.children = udf_children;
+    udf_schema.release = test_noop_schema_release;
+
+    auto expect_error = [&](lance::BatchUDF udf, LanceErrorCode expected) {
+        bool caught = false;
+        try {
+            ds.add_columns_batch_udf(udf);
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == expected);
+        }
+        assert(caught);
+    };
+
+    lance::BatchUDF lance_error;
+    lance_error.output_schema = &udf_schema;
+    lance_error.mapper = [](const ArrowArray&, const ArrowSchema&, ArrowArray&) {
+        throw lance::Error(LANCE_ERR_NOT_SUPPORTED, "mapper lance error");
+    };
+    expect_error(lance_error, LANCE_ERR_NOT_SUPPORTED);
+
+    lance::BatchUDF std_error;
+    std_error.output_schema = &udf_schema;
+    std_error.mapper = [](const ArrowArray&, const ArrowSchema&, ArrowArray&) {
+        throw std::runtime_error("mapper std error");
+    };
+    expect_error(std_error, LANCE_ERR_INTERNAL);
+
+    lance::BatchUDF unknown_error;
+    unknown_error.output_schema = &udf_schema;
+    unknown_error.mapper = [](const ArrowArray&, const ArrowSchema&, ArrowArray&) {
+        throw 17;
+    };
+    expect_error(unknown_error, LANCE_ERR_INTERNAL);
+
+    std::atomic<int> get_batch_calls{0};
+    std::atomic<int> insert_batch_calls{0};
+    std::atomic<int> get_fragment_calls{0};
+    std::atomic<int> insert_fragment_calls{0};
+    lance::BatchUDF udf;
+    udf.output_schema = &udf_schema;
+    udf.mapper = [](const ArrowArray& input, const ArrowSchema&, ArrowArray& out) {
+        auto* batch = new CppInt64Batch(input.length, 12000);
+        out = batch->top;
+    };
+    lance::UDFCheckpointStore checkpoint;
+    checkpoint.get_batch = [&](const lance::BatchUDFInfo&, ArrowArray&) {
+        get_batch_calls.fetch_add(1);
+        return false;
+    };
+    checkpoint.insert_batch = [&](const lance::BatchUDFInfo&, ArrowArray&, ArrowSchema&) {
+        insert_batch_calls.fetch_add(1);
+    };
+    checkpoint.get_fragment = [&](uint32_t) -> std::optional<std::string> {
+        get_fragment_calls.fetch_add(1);
+        return std::nullopt;
+    };
+    checkpoint.insert_fragment = [&](uint64_t, const std::string&) {
+        insert_fragment_calls.fetch_add(1);
+    };
+    udf.checkpoint_store = std::move(checkpoint);
+
+    uint64_t udf_version = ds.version();
+    ds.add_columns_batch_udf(
+        udf, std::vector<std::string>{}, std::optional<uint32_t>{1});
+    assert(ds.version() > udf_version);
+    assert(get_batch_calls.load() > 0);
+    assert(insert_batch_calls.load() > 0);
+    assert(get_fragment_calls.load() > 0);
+    assert(insert_fragment_calls.load() > 0);
+
+    ArrowSchema schema_after_udf{};
+    ds.schema(&schema_after_udf);
+    assert(schema_after_udf.n_children == fields_before + 3);
+    schema_after_udf.release(&schema_after_udf);
+
+    PASS();
+}
+
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::compact_files`. The smoke fixture is a single fragment
 // so the default planner has nothing to compact — we expect a no-op (zero
@@ -4011,6 +4250,7 @@ int main(int argc, char** argv) {
     test_alter_columns(write_uri);
     test_drop_columns(write_uri);
     test_add_columns(write_uri);
+    test_merge_and_batch_udf(write_uri);
     test_compact_files(write_uri);
     test_delete_rows(write_uri);
 

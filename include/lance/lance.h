@@ -1967,6 +1967,216 @@ int32_t lance_dataset_merge_insert(
     LanceMergeInsertResult* out_result
 );
 
+/* ─── lance_dataset_merge ─────────────────────────────────────────────────── */
+
+/**
+ * Left-join precomputed columns from `source` into `dataset` and commit one
+ * native `Dataset::merge` operation.
+ *
+ * `left_on` may name an existing dataset column, `_rowid`, or `_rowaddr`.
+ * `right_on` names a field in the source schema. Field lookup is exact and
+ * case-sensitive. Empty key strings are forwarded to native validation.
+ *
+ * The source field named by `right_on` is the join key and is not appended.
+ * Every other top-level RHS field must be new to the dataset. Native owns key
+ * matching, duplicate and NULL semantics, schema compatibility, field IDs,
+ * physical writes, and commit conflicts.
+ *
+ * The non-NULL `source` stream is consumed on every return path, including
+ * invalid dataset/key arguments and native failures. After this call the
+ * caller must not read, move, or release the stream again. A NULL `source` is
+ * rejected without consuming anything.
+ *
+ * On success the same dataset handle points at the newly committed version.
+ * Existing scanners, fragment snapshots, and independently opened handles
+ * retain their previous snapshot. On error the handle keeps its prior
+ * in-memory snapshot unless the native commit outcome is uncertain; reopen
+ * the URI to establish the actual committed state in that case.
+ *
+ * Native may leave uncommitted data files after a failed merge. The binding
+ * does not delete or roll them back; dataset cleanup/GC owns their
+ * disposition.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_merge(
+    LanceDataset* dataset,
+    const char* left_on,
+    const char* right_on,
+    struct ArrowArrayStream* source
+);
+
+/* ─── BatchUDF callbacks ─────────────────────────────────────────────────── */
+
+/**
+ * Owned, optional NUL-terminated UTF-8 string returned by a foreign callback.
+ *
+ * When `data` is non-NULL, `release` must be non-NULL. The library copies the
+ * string before invoking `release`, then calls `release` exactly once. The
+ * release callback must free the storage behind `data` and return normally.
+ */
+typedef struct LanceOwnedString {
+    char* data;
+    void (*release)(struct LanceOwnedString* self);
+} LanceOwnedString;
+
+/**
+ * Error returned by a BatchUDF mapper or checkpoint callback.
+ *
+ * The library zero-initializes this structure before every invocation. On
+ * success the callback leaves it zeroed. On failure `code` is nonzero:
+ * INVALID_ARGUMENT, IO, NOT_FOUND, NOT_SUPPORTED, and INTERNAL map to their
+ * native variants; other values are treated as INTERNAL.
+ *
+ * `message` is copied into a Rust-owned error before `message.release` is
+ * called exactly once. A callback must not report failure through
+ * lance_last_error_*: callbacks may run on a different thread.
+ */
+typedef struct LanceCallbackError {
+    int32_t code;
+    LanceOwnedString message;
+} LanceCallbackError;
+
+/**
+ * Native BatchInfo passed to checkpoint callbacks. The pointer is borrowed for
+ * the callback only. `batch_index` is size_t to match native usize.
+ */
+typedef struct LanceUDFBatchInfo {
+    uint32_t fragment_id;
+    size_t batch_index;
+} LanceUDFBatchInfo;
+
+/**
+ * Map one input RecordBatch to an owned output ArrowArray.
+ *
+ * Input values are borrowed for the callback only. The input ArrowArray is the
+ * top-level struct array and `input_schema` is its complete schema. On success
+ * initialize `output` with an owned ArrowArray whose struct children match the
+ * declared `LanceBatchUDF.output_schema`, then return 0. Native owns the output
+ * and its release callback after a successful return. Zero-column batches
+ * retain their row count through the top-level array length.
+ *
+ * On failure return nonzero, fill `error`, and leave any initialized output
+ * for the library to release. The callback may run on a native runtime thread
+ * and must be thread-safe and non-unwinding.
+ */
+typedef int32_t (*LanceBatchUDFMapper)(
+    void* callback_ctx,
+    const struct ArrowArray* input,
+    const struct ArrowSchema* input_schema,
+    struct ArrowArray* output,
+    LanceCallbackError* error
+);
+
+/**
+ * Retrieve a checkpointed output batch.
+ *
+ * Return 1 with `output` initialized to an owned ArrowArray, 0 with `output`
+ * left zero-initialized, or -1 with `error` initialized.
+ */
+typedef int32_t (*LanceUDFCheckpointGetBatch)(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* info,
+    struct ArrowArray* output,
+    LanceCallbackError* error
+);
+
+/**
+ * Retain a checkpoint batch.
+ *
+ * `batch` and `batch_schema` are owned, movable Arrow C Data Interface values.
+ * The callback may move both structs into its storage and clear the source
+ * `release` fields. The library releases any ownership left in these argument
+ * slots after the callback returns, so a retained value can outlive the call
+ * and dataset close. Return 0 on success or -1 with `error`.
+ */
+typedef int32_t (*LanceUDFCheckpointInsertBatch)(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* info,
+    struct ArrowArray* batch,
+    struct ArrowSchema* batch_schema,
+    LanceCallbackError* error
+);
+
+/**
+ * Retrieve native Fragment JSON for a fragment checkpoint hit.
+ *
+ * Return 1 with `out_json` initialized, 0 for a miss, or -1 with `error`.
+ * The library copies the JSON before calling `out_json->release` exactly once.
+ */
+typedef int32_t (*LanceUDFCheckpointGetFragment)(
+    void* callback_ctx,
+    uint32_t fragment_id,
+    LanceOwnedString* out_json,
+    LanceCallbackError* error
+);
+
+/**
+ * Persist native Fragment JSON and its native u64 Fragment ID.
+ *
+ * `fragment_json` is borrowed for the callback only. Return 0 on success or
+ * -1 with `error`.
+ */
+typedef int32_t (*LanceUDFCheckpointInsertFragment)(
+    void* callback_ctx,
+    uint64_t fragment_id,
+    const char* fragment_json,
+    LanceCallbackError* error
+);
+
+/**
+ * Foreign UDFCheckpointStore adapter.
+ *
+ * All four callbacks are required. `callback_ctx` is a call-scoped borrow and
+ * may be NULL for stateless callbacks. The library neither retains nor
+ * releases it.
+ */
+typedef struct LanceUDFCheckpointStore {
+    LanceUDFCheckpointGetBatch get_batch;
+    LanceUDFCheckpointInsertBatch insert_batch;
+    LanceUDFCheckpointGetFragment get_fragment;
+    LanceUDFCheckpointInsertFragment insert_fragment;
+    void* callback_ctx;
+} LanceUDFCheckpointStore;
+
+/**
+ * Foreign BatchUDF declaration.
+ *
+ * `output_schema` is the complete schema of every mapper and get-batch output
+ * batch and is borrowed for this call. `checkpoint_store` may be NULL.
+ * Mapper and checkpoint contexts are call-scoped and must remain valid until
+ * the enclosing function returns.
+ */
+typedef struct LanceBatchUDF {
+    LanceBatchUDFMapper mapper;
+    void* mapper_ctx;
+    const struct ArrowSchema* output_schema;
+    const LanceUDFCheckpointStore* checkpoint_store;
+} LanceBatchUDF;
+
+/**
+ * Add columns through native `NewColumnTransform::BatchUDF`.
+ *
+ * `read_columns` NULL maps to native None. A non-NULL NULL-terminated array
+ * maps to native Some; an immediately terminated array maps to Some(empty).
+ * `batch_size` NULL maps to None. A non-NULL pointer maps to Some(*batch_size),
+ * including explicit zero; native owns validation of zero.
+ *
+ * Native owns output schema compatibility, row alignment, checkpoint ordering,
+ * file cleanup, publication, and commit conflicts. Mapper and store callbacks
+ * execute synchronously under the dataset handle's exclusive mutation lock.
+ * They must not re-enter the same handle; use an independent handle or an
+ * existing fragment/scanner snapshot for reads.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_add_columns_batch_udf(
+    LanceDataset* dataset,
+    const LanceBatchUDF* udf,
+    const char* const* read_columns,
+    const uint32_t* batch_size
+);
+
 /* ─── lance_dataset_compact_files ─────────────────────────────────────────── */
 
 /**
