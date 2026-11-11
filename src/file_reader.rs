@@ -423,7 +423,9 @@ pub(crate) unsafe fn open_reader_at(
                 )
             })?
             .file_metadata_cache()
-            .clone(),
+            // Native file keys identify a path, without its backing store or
+            // content version. Share capacity while isolating each reader.
+            .with_key_prefix(&uuid::Uuid::new_v4().to_string()),
     };
 
     let (file_scheduler, metadata) = block_on(async {

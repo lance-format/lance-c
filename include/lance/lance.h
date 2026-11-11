@@ -6377,10 +6377,11 @@ typedef enum {
  * an explicit empty projection and is rejected by native validation. A NULL
  * options pointer uses native defaults and no projection.
  *
- * SESSION cache requires a shared LanceSession. NONE uses native
- * LanceCache::no_cache and is the safe default. Native cache keys include the
- * file path prefix but not the file version, etag, or content hash. Files read
- * with a shared cache must remain immutable for the cache lifetime.
+ * SESSION cache requires a shared LanceSession and shares its capacity through
+ * a reader-local namespace. Entries can be reused within that reader. Native
+ * file cache keys lack backing-store identity and content versions. Files must
+ * remain immutable while their reader or streams are active. NONE uses native
+ * LanceCache::no_cache and is the default.
  *
  * `has_*` fields distinguish None from explicit zero/false. Boolean payloads
  * must be 0 or 1 when set.
@@ -6526,6 +6527,10 @@ int32_t lance_file_session_upload_file(
     const char* local_path,
     const char* relative_remote_path
 );
+/**
+ * Download through the native local writer. It publishes the destination only
+ * after the source stream completes, including when both paths alias one file.
+ */
 int32_t lance_file_session_download_file(
     const LanceFileSession* session,
     const char* relative_remote_path,

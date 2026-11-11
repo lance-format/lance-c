@@ -599,8 +599,8 @@ unsafe fn file_session_upload_file_inner(
 
 /// Download a session-relative object to a local path.
 ///
-/// The remote object is opened before the local file is created or truncated.
-/// A mid-stream failure may leave a partial local file.
+/// The native local writer stages bytes and publishes them at shutdown, after
+/// the source stream completes. Source/destination aliases are safe to copy.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_file_session_download_file(
     session: *const LanceFileSession,
@@ -629,11 +629,15 @@ unsafe fn file_session_download_file_inner(
     block_on(async {
         let reader = session.inner.store.open(&remote_path).await?;
         let mut stream = reader.get_stream().await?;
-        let mut file = tokio::fs::File::create(local_path).await.map_err(|error| {
-            Error::io(format!(
-                "failed to create local file {local_path:?}: {error}"
-            ))
-        })?;
+        let destination = Path::from_absolute_path(std::path::absolute(local_path)?)?;
+        let mut file = ObjectStore::local()
+            .create(&destination)
+            .await
+            .map_err(|error| {
+                Error::io(format!(
+                    "failed to create local file {local_path:?}: {error}"
+                ))
+            })?;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             file.write_all(&chunk).await.map_err(|error| {
@@ -642,9 +646,9 @@ unsafe fn file_session_download_file_inner(
                 ))
             })?;
         }
-        file.flush().await.map_err(|error| {
+        Writer::shutdown(file.as_mut()).await.map_err(|error| {
             Error::io(format!(
-                "failed to flush local file {local_path:?}: {error}"
+                "failed to publish local file {local_path:?}: {error}"
             ))
         })?;
         Ok::<(), Error>(())

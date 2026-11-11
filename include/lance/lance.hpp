@@ -1195,7 +1195,7 @@ inline void provider_release(void* callback_ctx) noexcept {
     delete static_cast<ProviderContext*>(callback_ctx);
 }
 
-LanceStorageOptionsProvider* create_provider(
+inline LanceStorageOptionsProvider* create_provider(
     const std::string& provider_id,
     StorageOptionsProvider::Fetch fetch,
     StorageOptionsProvider::Fetch force_fetch) {
