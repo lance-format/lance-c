@@ -44515,3 +44515,343 @@ fn test_memwal_vector_search_indexed() {
         lance_dataset_close(ds);
     }
 }
+
+fn mw_writer_config(rows: Option<u64>) -> LanceShardWriterConfig {
+    let mut config = LanceShardWriterConfig::default();
+    if let Some(rows) = rows {
+        config.has_max_memtable_rows = 1;
+        config.max_memtable_rows = rows;
+    }
+    config
+}
+
+#[test]
+fn test_memwal_snapshot_isolation_update_delete() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let shard = "00000000-0000-0000-0000-000000000000";
+
+    // Commit an initial generation so the writer has a native manifest.
+    let writer = mw_writer_open(ds, shard);
+    mw_put(writer, mw_batch(&[4], &[Some("d")], &[[0.0; 4]]));
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    unsafe { lance_shard_writer_free(writer) };
+
+    let writer = mw_writer_open(ds, shard);
+    let mut snapshot = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_snapshot(writer, &mut snapshot) },
+        0
+    );
+    assert!(!snapshot.is_null(), "a committed writer has a manifest");
+    let mut snapshots = [snapshot as *const LanceMemWalShardSnapshot];
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_scanner_from_snapshots(
+                ds,
+                snapshots.as_mut_ptr(),
+                snapshots.len(),
+                &mut scanner,
+            )
+        },
+        0
+    );
+    let before = mw_int32_values(&mw_scan_to_batches(scanner), "id");
+    assert_eq!(before, vec![1, 2, 3, 4]);
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    // Uncommitted mutations are visible to the live writer scanner but not to
+    // the snapshot scanner above.
+    mw_put(writer, mw_batch(&[1], &[Some("updated")], &[[0.0; 4]]));
+    let key = mw_batch(&[2], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let mut result = LanceShardWriteResult::default();
+    assert_eq!(
+        unsafe { lance_shard_writer_delete(writer, &mut batch_to_ffi_stream(key), &mut result) },
+        0
+    );
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(writer, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    let batches = mw_scan_to_batches(scanner);
+    let ids = mw_int32_values(&batches, "id");
+    assert_eq!(ids, vec![1, 3, 4]);
+    let names = batches[0]
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    let position = ids.iter().position(|id| *id == 1).unwrap();
+    assert_eq!(names.value(position), "updated");
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    // Point lookups on the live writer apply the same newest-wins rules.
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_new(ds, ptr::null(), 0, 0, ptr::null(), 0, &mut planner)
+        },
+        0
+    );
+    let mut plan = ptr::null_mut();
+    let key = mw_batch(&[2], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let (mut array, schema) = ffi_record_batch(&key);
+    let mut key_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut key_batch) },
+        0
+    );
+    // The planner above has no snapshot: it must still execute against the
+    // base table after the writer's updates are committed below.
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key_batch, 0, ptr::null(), 0, &mut plan)
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_mem_wal_plan_free(plan) };
+    let mut plan = ptr::null_mut();
+    let key = mw_batch(&[1], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let (mut array, schema) = ffi_record_batch(&key);
+    let mut key_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut key_batch) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key_batch, 0, ptr::null(), 0, &mut plan)
+        },
+        0
+    );
+    let batches = c_stream_batches({
+        let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+        assert_eq!(
+            unsafe { lance_mem_wal_plan_to_arrow_stream(plan, stream.as_mut_ptr()) },
+            0
+        );
+        unsafe { stream.assume_init() }
+    })
+    .1;
+    let ids = mw_int32_values(&batches, "id");
+    assert_eq!(
+        ids,
+        vec![1],
+        "base lookup does not see uncommitted writer state"
+    );
+
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    unsafe {
+        lance_shard_writer_free(writer);
+        lance_mem_wal_shard_snapshot_free(snapshot);
+        lance_mem_wal_plan_free(plan);
+        lance_lsm_point_lookup_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_memwal_manual_identity_and_config_validation() {
+    for (mode, num_shards, field_transform) in [
+        (MW_SHARDING_MANUAL, 0_u32, None),
+        (MW_SHARDING_IDENTITY, 0_u32, Some("identity")),
+    ] {
+        let (_tmp, uri) = mw_create_dataset();
+        let ds = mw_open(&uri);
+        let column = (mode == MW_SHARDING_IDENTITY).then_some("id");
+        let mut config = mw_writer_config(Some(1));
+        config.has_durable_write = 1;
+        config.durable_write = 0;
+        assert_eq!(
+            mw_initialize_with_config(ds, mode, column, 0, &config),
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let mut details = ptr::null_mut();
+        assert_eq!(unsafe { lance_mem_wal_index_details(ds, &mut details) }, 0);
+        assert!(!details.is_null());
+        assert_eq!(
+            unsafe { lance_mem_wal_index_details_num_shards(details) },
+            num_shards
+        );
+        let specs = unsafe { lance_mem_wal_index_details_sharding_spec_count(details) };
+        assert_eq!(specs, usize::from(field_transform.is_some()));
+        if let Some(transform) = field_transform {
+            let mut spec = ptr::null_mut();
+            assert_eq!(
+                unsafe { lance_mem_wal_index_details_sharding_spec_at(details, 0, &mut spec) },
+                0
+            );
+            let mut field = ptr::null_mut();
+            assert_eq!(
+                unsafe { lance_mem_wal_sharding_spec_field_at(spec, 0, &mut field) },
+                0
+            );
+            let actual = unsafe { CStr::from_ptr(lance_mem_wal_sharding_field_transform(field)) }
+                .to_str()
+                .unwrap();
+            assert_eq!(actual, transform);
+            unsafe {
+                lance_mem_wal_sharding_field_free(field);
+                lance_mem_wal_sharding_spec_free(spec);
+            }
+        }
+        // Writer config defaults reflect the explicit override.
+        let mut key = ptr::null();
+        let mut value = ptr::null();
+        let count = unsafe { lance_mem_wal_index_details_writer_config_default_count(details) };
+        let mut durable = None;
+        for index in 0..count {
+            assert_eq!(
+                unsafe {
+                    lance_mem_wal_index_details_writer_config_default_at(
+                        details, index, &mut key, &mut value,
+                    )
+                },
+                0
+            );
+            if unsafe { CStr::from_ptr(key) }.to_str().unwrap() == "durable_write" {
+                durable = Some(
+                    unsafe { CStr::from_ptr(value) }
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(durable.as_deref(), Some("false"));
+        unsafe { lance_mem_wal_index_details_free(details) };
+
+        // Invalid flags and NULL columns are rejected before native work.
+        assert_eq!(mw_initialize(ds, 9, None, 0), -1);
+        assert_eq!(mw_initialize(ds, mode, None, 0), -1);
+        unsafe { lance_dataset_close(ds) };
+    }
+}
+
+#[test]
+fn test_memwal_frozen_visibility_and_handle_lifetimes() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    let config = mw_writer_config(Some(1));
+    assert_eq!(
+        mw_initialize_with_config(ds, MW_SHARDING_UNSHARDED, None, 0, &config),
+        0
+    );
+    let writer = mw_writer_open(ds, "00000000-0000-0000-0000-000000000000");
+    for id in 10..15 {
+        mw_put(writer, mw_batch(&[id], &[Some("f")], &[[0.0; 4]]));
+    }
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_shard_writer_lsm_scanner(writer, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    // Active plus frozen-awaiting-flush generations must all be visible.
+    assert_eq!(mw_int32_values(&mw_scan_to_batches(scanner), "id").len(), 8);
+    unsafe { lance_lsm_scanner_free(scanner) };
+
+    // Scanner and planner owners keep the dataset alive after the C handle is
+    // closed. Plan execution happens after both planner and dataset are freed.
+    let mut scanner = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_lsm_scanner_from_snapshots(ds, ptr::null(), 0, &mut scanner) },
+        0
+    );
+    let mut planner = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_new(ds, ptr::null(), 0, 0, ptr::null(), 0, &mut planner)
+        },
+        0
+    );
+    let key = mw_batch(&[1], &[None], &[[0.0; 4]]).project(&[0]).unwrap();
+    let (mut array, schema) = ffi_record_batch(&key);
+    let mut key_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &schema, &mut key_batch) },
+        0
+    );
+    let mut plan = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_lsm_point_lookup_planner_plan(planner, key_batch, 0, ptr::null(), 0, &mut plan)
+        },
+        0
+    );
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    unsafe {
+        lance_shard_writer_free(writer);
+        lance_lsm_point_lookup_planner_free(planner);
+        lance_dataset_close(ds);
+    }
+    let batches = mw_scan_to_batches(scanner);
+    assert!(batches.iter().any(|batch| {
+        batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .contains(&1)
+    }));
+    let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+    assert_eq!(
+        unsafe { lance_mem_wal_plan_to_arrow_stream(plan, stream.as_mut_ptr()) },
+        0
+    );
+    let (_, batches) = c_stream_batches(unsafe { stream.assume_init() });
+    assert_eq!(mw_int32_values(&batches, "id"), vec![1]);
+    unsafe {
+        lance_mem_wal_plan_free(plan);
+        lance_lsm_scanner_free(scanner);
+    }
+}
+
+#[test]
+fn test_memwal_closed_writer_consumes_streams() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let writer = mw_writer_open(ds, "00000000-0000-0000-0000-000000000000");
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+
+    let mut stream = batch_to_ffi_stream(mw_batch(&[9], &[Some("x")], &[[0.0; 4]]));
+    let mut result = LanceShardWriteResult::default();
+    assert_eq!(
+        unsafe { lance_shard_writer_put(writer, &mut stream, &mut result) },
+        -1
+    );
+    assert!(take_last_error_message().contains("already closed"));
+    assert!(
+        stream.release.is_none(),
+        "a rejected put still consumes its stream"
+    );
+
+    // Repeated close succeeds without replaying the first close result.
+    assert_eq!(unsafe { lance_shard_writer_close(writer) }, 0);
+    // Stats stay available from the retained native owner.
+    let mut stats = std::mem::MaybeUninit::<LanceShardWriterStats>::uninit();
+    assert_eq!(
+        unsafe { lance_shard_writer_stats(writer, stats.as_mut_ptr()) },
+        0
+    );
+    // Memtable statistics require the live native writer.
+    let mut mem = std::mem::MaybeUninit::<LanceShardMemTableStats>::uninit();
+    assert_eq!(
+        unsafe { lance_shard_writer_memtable_stats(writer, mem.as_mut_ptr()) },
+        -1
+    );
+    unsafe {
+        lance_shard_writer_free(writer);
+        lance_dataset_close(ds);
+    }
+}
