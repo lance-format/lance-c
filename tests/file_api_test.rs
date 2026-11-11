@@ -2582,20 +2582,24 @@ fn storage_provider_none_some_empty_error_expiry_and_force() {
     drop(malformed_provider_id);
 }
 
-fn write_fixture_with_session(
+fn write_batch_with_session(
     session: *const LanceFileSession,
     relative_path: &str,
+    batch: &RecordBatch,
 ) -> LanceFileWriteSummary {
-    let batch = fixture_batch();
     let schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
     let relative_path = c_string(relative_path);
+    let options = LanceFileWriterOptions {
+        version: c"2.2".as_ptr(),
+        ..Default::default()
+    };
     let writer = unsafe {
-        lance_file_session_open_writer(session, relative_path.as_ptr(), &schema, ptr::null())
+        lance_file_session_open_writer(session, relative_path.as_ptr(), &schema, &options)
     };
     if writer.is_null() {
         panic_on_error();
     }
-    let raw_batch = import_batch(&batch);
+    let raw_batch = import_batch(batch);
     assert_eq!(
         unsafe { lance_file_writer_write_batch(writer, raw_batch) },
         0
@@ -2658,7 +2662,7 @@ fn file_session_operations_diagnostics_and_static_options() {
     assert_eq!(info.is_local, 1);
     assert_eq!(info.is_cloud, 0);
 
-    let summary = write_fixture_with_session(session, "data.lance");
+    let summary = write_batch_with_session(session, "data.lance", &fixture_batch());
     assert_eq!(summary.num_rows, 7);
     let batches = read_fixture_with_session(session, "data.lance");
     assert_fixture_batches(&batches);
@@ -2796,6 +2800,135 @@ fn session_cache_stats(session: *const LanceSession) -> LanceSessionCacheStats {
 }
 
 #[test]
+fn shared_session_cache_isolated_between_backing_stores() {
+    let shared = lance_session_new(8 * 1024 * 1024, 8 * 1024 * 1024);
+    assert!(!shared.is_null());
+    let namespace = uuid::Uuid::new_v4();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+    for value in [1, 9] {
+        let uri = c_string(&format!("shared-memory://cache-{namespace}-{value}/"));
+        let files =
+            unsafe { lance_file_session_new(uri.as_ptr(), ptr::null(), shared, ptr::null()) };
+        if files.is_null() {
+            panic_on_error();
+        }
+        let expected = vec![value; 7];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(expected.clone()))],
+        )
+        .unwrap();
+        write_batch_with_session(files, "data.lance", &batch);
+
+        for cache_mode in [LanceFileCacheMode::None, LanceFileCacheMode::Session] {
+            let options = LanceFileReaderOptions {
+                cache_mode: cache_mode as i32,
+                ..Default::default()
+            };
+            let reader =
+                unsafe { lance_file_session_open_reader(files, c"data.lance".as_ptr(), &options) };
+            if reader.is_null() {
+                panic_on_error();
+            }
+            // A reader may reuse its own decoded values across scans.
+            for _ in 0..2 {
+                let mut stream = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+                assert_eq!(
+                    unsafe { lance_file_reader_read_all(reader, 7, 1, &mut stream) },
+                    0
+                );
+                let batches = collect_c_stream(stream).1;
+                let actual = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual, expected,
+                    "store value={value}, cache mode={cache_mode:?}"
+                );
+            }
+            unsafe { lance_file_reader_close(reader) };
+        }
+        unsafe { lance_file_session_close(files) };
+    }
+    assert!(session_cache_stats(shared).metadata_cache_entries > 0);
+    unsafe { lance_session_close(shared) };
+}
+
+#[test]
+fn file_session_download_preserves_local_source_and_aliases() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.bin");
+    let hard_link = root.path().join("hard-link.bin");
+    let expected = b"keep the original source bytes";
+    std::fs::write(&source, expected).unwrap();
+    std::fs::hard_link(&source, &hard_link).unwrap();
+    let uri = c_string(&format!("file://{}", root.path().display()));
+    let files =
+        unsafe { lance_file_session_new(uri.as_ptr(), ptr::null(), ptr::null(), ptr::null()) };
+    if files.is_null() {
+        panic_on_error();
+    }
+    let destinations = [hard_link, source.clone(), root.path().join("./source.bin")];
+    for destination in destinations {
+        let destination = c_string(destination.to_str().unwrap());
+        let status = unsafe {
+            lance_file_session_download_file(files, c"source.bin".as_ptr(), destination.as_ptr())
+        };
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            expected,
+            "download must preserve its source"
+        );
+        assert_eq!(status, 0, "{}", take_error().1);
+        assert_eq!(
+            std::fs::read(destination.to_str().unwrap()).unwrap(),
+            expected
+        );
+    }
+    #[cfg(unix)]
+    {
+        let symlink = root.path().join("symlink.bin");
+        std::os::unix::fs::symlink(&source, &symlink).unwrap();
+        let destination = c_string(symlink.to_str().unwrap());
+        assert_eq!(
+            unsafe {
+                lance_file_session_download_file(
+                    files,
+                    c"source.bin".as_ptr(),
+                    destination.as_ptr(),
+                )
+            },
+            0
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), expected);
+        assert_eq!(std::fs::read(symlink).unwrap(), expected);
+    }
+    let directory = root.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let destination = c_string(directory.to_str().unwrap());
+    assert_ne!(
+        unsafe {
+            lance_file_session_download_file(files, c"source.bin".as_ptr(), destination.as_ptr())
+        },
+        0
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), expected);
+    assert!(directory.is_dir());
+    unsafe { lance_file_session_close(files) };
+}
+
+#[test]
 fn shared_session_cache_is_explicit_and_streams_outlive_parents() {
     let root = tempfile::tempdir().unwrap();
     let base_uri = format!("file://{}", root.path().display());
@@ -2806,7 +2939,7 @@ fn shared_session_cache_is_explicit_and_streams_outlive_parents() {
         lance_file_session_new(base_uri_c.as_ptr(), ptr::null(), cache_session, ptr::null())
     };
     assert!(!file_session.is_null());
-    write_fixture_with_session(file_session, "cached.lance");
+    write_batch_with_session(file_session, "cached.lance", &fixture_batch());
 
     let none_options = LanceFileReaderOptions::default();
     let before_none = session_cache_stats(cache_session);

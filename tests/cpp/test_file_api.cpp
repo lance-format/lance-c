@@ -10,6 +10,10 @@
 #include <string>
 #include <vector>
 
+lance::FileSession open_file_test_session(
+    const std::string& base_uri,
+    const lance::StorageOptionsAccessor& storage);
+
 namespace {
 
 int failures = 0;
@@ -153,7 +157,7 @@ int main(int argc, char **argv) {
     lance::StorageOptions static_options;
     static_options["block_size"] = "4096";
     lance::StorageOptionsAccessor storage(static_options);
-    lance::FileSession files(base_uri, &storage);
+    auto files = open_file_test_session(base_uri, storage);
 
     const auto store_info = files.store_info();
     CHECK(store_info.block_size == 4096, "configured block size");
