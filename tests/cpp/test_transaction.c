@@ -1048,9 +1048,632 @@ static void test_data_replacement(const char *src_uri, const char *base) {
     printf("data replacement OK\n");
 }
 
+typedef struct PublicationRow {
+    uint32_t id;
+    uint64_t row_id;
+} PublicationRow;
+
+typedef struct PublicationBlob {
+    const char *data;
+    size_t len;
+    int is_null;
+} PublicationBlob;
+
+static void release_publication_schema_leaf(struct ArrowSchema *schema) {
+    if (schema) schema->release = NULL;
+}
+
+static void release_publication_array_leaf(struct ArrowArray *array) {
+    if (array) array->release = NULL;
+}
+
+static void release_publication_schema(struct ArrowSchema *schema) {
+    if (!schema || !schema->release) return;
+    for (int64_t i = 0; i < schema->n_children; i++) {
+        struct ArrowSchema *child = schema->children[i];
+        if (child && child->release) child->release(child);
+    }
+    free(schema->children);
+    schema->children = NULL;
+    schema->n_children = 0;
+    schema->release = NULL;
+}
+
+static void release_publication_array(struct ArrowArray *array) {
+    if (!array || !array->release) return;
+    for (int64_t i = 0; i < array->n_children; i++) {
+        struct ArrowArray *child = array->children[i];
+        if (child && child->release) child->release(child);
+    }
+    free(array->children);
+    array->children = NULL;
+    array->n_children = 0;
+    array->release = NULL;
+}
+
+static void init_publication_root_schema(
+    struct ArrowSchema *root,
+    struct ArrowSchema *id_schema,
+    struct ArrowSchema *blob_schema) {
+    struct ArrowSchema **children =
+        (struct ArrowSchema **)calloc(2, sizeof(*children));
+    ASSERT(children != NULL, "allocate replacement schema children");
+    children[0] = id_schema;
+    children[1] = blob_schema;
+    memset(root, 0, sizeof(*root));
+    root->format = "+s";
+    root->name = "";
+    root->n_children = 2;
+    root->children = children;
+    root->release = release_publication_schema;
+}
+
+static void write_publication_batch(
+    LanceFileWriter *writer,
+    const uint32_t *ids,
+    int64_t row_count,
+    struct ArrowArray *blob_array,
+    const struct ArrowSchema *schema) {
+    ASSERT(blob_array->length == row_count,
+           "descriptor row count must match replacement rows");
+    static const void *id_buffers[2];
+    id_buffers[0] = NULL;
+    id_buffers[1] = ids;
+    struct ArrowArray id_array;
+    memset(&id_array, 0, sizeof(id_array));
+    id_array.length = row_count;
+    id_array.n_buffers = 2;
+    id_array.buffers = id_buffers;
+    id_array.release = release_publication_array_leaf;
+
+    struct ArrowArray **children =
+        (struct ArrowArray **)calloc(2, sizeof(*children));
+    ASSERT(children != NULL, "allocate replacement array children");
+    children[0] = &id_array;
+    children[1] = blob_array;
+    static const void *root_buffers[1];
+    root_buffers[0] = NULL;
+    struct ArrowArray root;
+    memset(&root, 0, sizeof(root));
+    root.length = row_count;
+    root.n_buffers = 1;
+    root.buffers = root_buffers;
+    root.n_children = 2;
+    root.children = children;
+    root.release = release_publication_array;
+
+    LanceBatch *batch = NULL;
+    ASSERT(lance_batch_from_arrow(&root, schema, &batch) == 0,
+           "import replacement batch");
+    CHECK_OK();
+    ASSERT(lance_file_writer_write_batch(writer, batch) == 0,
+           "write replacement batch");
+    CHECK_OK();
+    lance_batch_free(batch);
+}
+
+static LanceFileWriter *open_publication_writer(
+    const LanceFileSession *session,
+    const char *filename,
+    const struct ArrowSchema *schema) {
+    LanceFileWriterOptions options;
+    memset(&options, 0, sizeof(options));
+    options.version = "2.2";
+    LanceFileWriter *writer =
+        lance_file_session_open_writer(session, filename, schema, &options);
+    ASSERT(writer != NULL, "open publication raw writer");
+    CHECK_OK();
+    return writer;
+}
+
+static void check_publication_blob(
+    const LanceDataset *dataset,
+    uint64_t index,
+    const PublicationBlob *expected) {
+    LanceBlobFile *blob = NULL;
+    ASSERT(lance_dataset_take_blobs_by_indices(
+               dataset, &index, 1, "blob", &blob) == 0,
+           "take publication blob by index");
+    CHECK_OK();
+    if (expected->is_null) {
+        ASSERT(blob == NULL, "expected a null blob handle");
+        return;
+    }
+    ASSERT(blob != NULL, "expected a non-null blob handle");
+    ASSERT(lance_blob_file_size(blob) == (uint64_t)expected->len,
+           "publication blob size mismatch");
+    if (expected->len > 0) {
+        uint8_t buffer[128];
+        ASSERT(expected->len <= sizeof(buffer), "publication payload too large");
+        ASSERT(lance_blob_file_read(blob, buffer, expected->len) == 0,
+               "read publication blob");
+        CHECK_OK();
+        ASSERT(memcmp(buffer, expected->data, expected->len) == 0,
+               "publication blob payload mismatch");
+    }
+    lance_blob_file_close(blob);
+}
+
+static void check_publication_payloads(
+    const char *uri,
+    uint64_t version,
+    const PublicationBlob *expected,
+    size_t count) {
+    LanceDataset *dataset = lance_dataset_open(uri, NULL, version);
+    ASSERT(dataset != NULL, "open publication snapshot");
+    CHECK_OK();
+    for (size_t i = 0; i < count; i++) {
+        check_publication_blob(dataset, (uint64_t)i, &expected[i]);
+    }
+    lance_dataset_close(dataset);
+}
+
+static int publication_child_index(
+    const struct ArrowSchema *schema,
+    const char *name) {
+    for (int64_t i = 0; i < schema->n_children; i++) {
+        if (schema->children[i]->name != NULL &&
+            strcmp(schema->children[i]->name, name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static uint64_t collect_publication_rows(
+    const char *uri,
+    uint64_t version,
+    PublicationRow *rows,
+    uint64_t capacity) {
+    LanceDataset *dataset = lance_dataset_open(uri, NULL, version);
+    ASSERT(dataset != NULL, "open dataset for row IDs");
+    CHECK_OK();
+    LanceScanner *scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "create row ID scanner");
+    CHECK_OK();
+    ASSERT(lance_scanner_with_row_id(scanner, true) == 0,
+           "enable scan row IDs");
+    CHECK_OK();
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "export row ID stream");
+    CHECK_OK();
+    struct ArrowSchema schema = {0};
+    ASSERT(stream.get_schema(&stream, &schema) == 0,
+           "read row ID schema");
+    CHECK_OK();
+    int id_index = publication_child_index(&schema, "id");
+    int row_id_index = publication_child_index(&schema, "_rowid");
+    ASSERT(id_index >= 0 && row_id_index >= 0,
+           "row ID schema must contain id and _rowid");
+    uint64_t count = 0;
+    while (1) {
+        struct ArrowArray batch = {0};
+        ASSERT(stream.get_next(&stream, &batch) == 0,
+               "read row ID batch");
+        if (!batch.release) break;
+        ASSERT(batch.n_children > id_index &&
+                   batch.n_children > row_id_index,
+               "row ID batch child count");
+        const struct ArrowArray *id_array = batch.children[id_index];
+        const struct ArrowArray *row_id_array =
+            batch.children[row_id_index];
+        ASSERT(id_array->buffers[1] != NULL &&
+                   row_id_array->buffers[1] != NULL,
+               "row ID arrays must carry values");
+        const uint32_t *ids =
+            (const uint32_t *)id_array->buffers[1];
+        const uint64_t *row_ids =
+            (const uint64_t *)row_id_array->buffers[1];
+        for (int64_t i = 0; i < batch.length; i++) {
+            ASSERT(count < capacity, "row ID capacity");
+            rows[count].id = ids[id_array->offset + i];
+            rows[count].row_id = row_ids[row_id_array->offset + i];
+            count++;
+        }
+        batch.release(&batch);
+    }
+    schema.release(&schema);
+    if (stream.release) stream.release(&stream);
+    lance_scanner_close(scanner);
+    lance_dataset_close(dataset);
+    for (uint64_t i = 1; i < count; i++) {
+        PublicationRow key = rows[i];
+        uint64_t j = i;
+        while (j > 0 && rows[j - 1].id > key.id) {
+            rows[j] = rows[j - 1];
+            j--;
+        }
+        rows[j] = key;
+    }
+    return count;
+}
+
+static void check_row_ids_preserved(
+    const PublicationRow *before,
+    uint64_t before_count,
+    const PublicationRow *after,
+    uint64_t after_count) {
+    for (uint64_t i = 0; i < after_count; i++) {
+        int found = 0;
+        for (uint64_t j = 0; j < before_count; j++) {
+            if (before[j].id == after[i].id) {
+                ASSERT(before[j].row_id == after[i].row_id,
+                       "stable row ID changed across replacement");
+                found = 1;
+                break;
+            }
+        }
+        ASSERT(found, "replacement row must have existed before");
+    }
+}
+
+static void check_fragment_shape(
+    const LanceDataset *dataset,
+    uint64_t fragment_id,
+    uint64_t physical_rows,
+    uint64_t deleted_rows) {
+    LanceFragment *fragment =
+        lance_dataset_open_fragment(dataset, fragment_id);
+    ASSERT(fragment != NULL, "open publication fragment");
+    CHECK_OK();
+    uint64_t actual_physical = UINT64_MAX;
+    ASSERT(lance_fragment_physical_rows(fragment, &actual_physical) == 0 &&
+               actual_physical == physical_rows,
+           "publication fragment physical rows");
+    CHECK_OK();
+    uint64_t actual_deleted = UINT64_MAX;
+    ASSERT(lance_fragment_deleted_rows(fragment, &actual_deleted) == 0 &&
+               actual_deleted == deleted_rows,
+           "publication fragment deleted rows");
+    CHECK_OK();
+    lance_fragment_close(fragment);
+}
+
+static void test_blob_writer_publication(const char *uri) {
+    printf("  test_blob_writer_publication... ");
+    const PublicationBlob pristine[] = {
+        {"old-packed-0", 12, 0},
+        {NULL, 0, 1},
+        {"", 0, 0},
+        {"old-dedicated-3", 15, 0},
+        {"old-dedicated-4", 15, 0},
+        {"keep-c5", 7, 0},
+        {"keep-c6", 7, 0},
+    };
+    const PublicationBlob after_delete[] = {
+        {"old-packed-0", 12, 0},
+        {"", 0, 0},
+        {"old-dedicated-3", 15, 0},
+        {"old-dedicated-4", 15, 0},
+        {"keep-c5", 7, 0},
+        {"keep-c6", 7, 0},
+    };
+    const PublicationBlob replaced[] = {
+        {"new-packed-0", 12, 0},
+        {"", 0, 0},
+        {"new-dedicated-3", 15, 0},
+        {"new-dedicated-4", 15, 0},
+        {"keep-c5", 7, 0},
+        {"keep-c6", 7, 0},
+    };
+
+    LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "open publication dataset");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == 3,
+           "publication fixture version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == 7,
+           "publication fixture rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(dataset) == 3,
+           "publication fixture fragments");
+    CHECK_OK();
+
+    uint64_t fragments[3] = {0};
+    ASSERT(lance_dataset_fragment_ids(dataset, fragments) == 0,
+           "publication fragment IDs");
+    CHECK_OK();
+
+    PublicationRow before[7];
+    ASSERT(collect_publication_rows(uri, 3, before, 7) == 7,
+           "publication row IDs before deletion");
+    check_publication_payloads(uri, 3, pristine, 7);
+
+    uint64_t deleted = 0;
+    ASSERT(lance_dataset_delete(dataset, "id = 1", &deleted) == 0 &&
+               deleted == 1,
+           "delete publication row");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == 4,
+           "publication deletion version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == 6,
+           "publication deletion rows");
+    CHECK_OK();
+    check_publication_payloads(uri, 4, after_delete, 6);
+
+    char data_uri[4096];
+    snprintf(data_uri, sizeof(data_uri), "file://%s/data", uri);
+    LanceFileSession *session =
+        lance_file_session_new(data_uri, NULL, NULL, NULL);
+    ASSERT(session != NULL, "open publication session");
+    CHECK_OK();
+
+    const char *packed_name = "c11-packed-publication.lance";
+    const char *dedicated_name = "c11-dedicated-publication.lance";
+    LancePackedBlobWriter *packed =
+        lance_file_session_open_packed_blob_writer(session, packed_name, 8101);
+    ASSERT(packed != NULL, "open packed publication writer");
+    CHECK_OK();
+    ASSERT(lance_packed_blob_writer_blob_id(packed) == 8101,
+           "packed publication blob ID");
+    CHECK_OK();
+    static const uint8_t packed_validity[] = {0x05};
+    static const int32_t packed_offsets[] = {0, 12, 12, 12};
+    static const char packed_payloads[] = "new-packed-0";
+    static const void *packed_buffers[3];
+    packed_buffers[0] = packed_validity;
+    packed_buffers[1] = packed_offsets;
+    packed_buffers[2] = packed_payloads;
+    struct ArrowArray packed_payload_array;
+    memset(&packed_payload_array, 0, sizeof(packed_payload_array));
+    packed_payload_array.length = 3;
+    packed_payload_array.null_count = 1;
+    packed_payload_array.n_buffers = 3;
+    packed_payload_array.buffers = packed_buffers;
+    packed_payload_array.release = release_publication_array_leaf;
+    struct ArrowSchema packed_payload_schema;
+    memset(&packed_payload_schema, 0, sizeof(packed_payload_schema));
+    packed_payload_schema.format = "z";
+    packed_payload_schema.name = "payload";
+    packed_payload_schema.flags = 2;
+    packed_payload_schema.release = release_publication_schema_leaf;
+    ASSERT(lance_packed_blob_writer_write_blobs(
+               packed, &packed_payload_array, &packed_payload_schema) == 0,
+           "write packed publication blobs");
+    CHECK_OK();
+    ASSERT(packed_payload_array.release == NULL,
+           "packed publication payload array consumed");
+    packed_payload_schema.release(&packed_payload_schema);
+    struct ArrowArray packed_array = {0};
+    struct ArrowSchema packed_schema = {0};
+    ASSERT(lance_packed_blob_writer_finish_array(
+               packed, "blob", &packed_array, &packed_schema) == 0,
+           "finish packed publication writer");
+    CHECK_OK();
+    ASSERT(packed_array.length == 3,
+           "packed publication descriptor rows");
+    ASSERT(packed_schema.release != NULL,
+           "packed publication schema ownership");
+    lance_packed_blob_writer_close(packed);
+
+    LanceDedicatedBlobWriter *dedicated_a =
+        lance_file_session_open_dedicated_blob_writer(
+            session, dedicated_name, 8102);
+    ASSERT(dedicated_a != NULL, "open first dedicated publication writer");
+    CHECK_OK();
+    ASSERT(lance_dedicated_blob_writer_write(
+               dedicated_a, (const uint8_t *)"new-dedicated-3", 15) == 0,
+           "write first dedicated publication blob");
+    CHECK_OK();
+    struct ArrowArray dedicated_a_array = {0};
+    struct ArrowSchema dedicated_a_schema = {0};
+    ASSERT(lance_dedicated_blob_writer_finish_array(
+               dedicated_a, "blob", &dedicated_a_array,
+               &dedicated_a_schema) == 0,
+           "finish first dedicated publication writer");
+    CHECK_OK();
+    ASSERT(dedicated_a_array.length == 1,
+           "first dedicated publication descriptor rows");
+    lance_dedicated_blob_writer_close(dedicated_a);
+
+    LanceDedicatedBlobWriter *dedicated_b =
+        lance_file_session_open_dedicated_blob_writer(
+            session, dedicated_name, 8103);
+    ASSERT(dedicated_b != NULL, "open second dedicated publication writer");
+    CHECK_OK();
+    ASSERT(lance_dedicated_blob_writer_write(
+               dedicated_b, (const uint8_t *)"new-dedicated-4", 15) == 0,
+           "write second dedicated publication blob");
+    CHECK_OK();
+    struct ArrowArray dedicated_b_array = {0};
+    struct ArrowSchema dedicated_b_schema = {0};
+    ASSERT(lance_dedicated_blob_writer_finish_array(
+               dedicated_b, "blob", &dedicated_b_array,
+               &dedicated_b_schema) == 0,
+           "finish second dedicated publication writer");
+    CHECK_OK();
+    ASSERT(dedicated_b_array.length == 1,
+           "second dedicated publication descriptor rows");
+    lance_dedicated_blob_writer_close(dedicated_b);
+
+    struct ArrowSchema id_schema;
+    memset(&id_schema, 0, sizeof(id_schema));
+    id_schema.format = "I";
+    id_schema.name = "id";
+    id_schema.release = release_publication_schema_leaf;
+    struct ArrowSchema root_schema;
+    init_publication_root_schema(&root_schema, &id_schema, &packed_schema);
+
+    LanceFileWriter *packed_writer =
+        open_publication_writer(session, packed_name, &root_schema);
+    const uint32_t packed_ids[3] = {0, 1, 2};
+    write_publication_batch(
+        packed_writer, packed_ids, 3, &packed_array, &root_schema);
+    LanceFileWriteSummary packed_summary = {0};
+    ASSERT(lance_file_writer_finish(packed_writer, &packed_summary) == 0,
+           "finish packed publication data file");
+    CHECK_OK();
+    ASSERT(packed_summary.num_rows == 3,
+           "packed publication data file rows");
+    ASSERT(packed_summary.size_bytes > 0,
+           "packed publication data file size");
+    lance_file_writer_close(packed_writer);
+
+    LanceFileWriter *dedicated_writer =
+        open_publication_writer(session, dedicated_name, &root_schema);
+    const uint32_t dedicated_id_a = 3;
+    write_publication_batch(
+        dedicated_writer, &dedicated_id_a, 1, &dedicated_a_array,
+        &root_schema);
+    const uint32_t dedicated_id_b = 4;
+    write_publication_batch(
+        dedicated_writer, &dedicated_id_b, 1, &dedicated_b_array,
+        &root_schema);
+    LanceFileWriteSummary dedicated_summary = {0};
+    ASSERT(lance_file_writer_finish(dedicated_writer, &dedicated_summary) == 0,
+           "finish dedicated publication data file");
+    CHECK_OK();
+    ASSERT(dedicated_summary.num_rows == 2,
+           "dedicated publication data file rows");
+    ASSERT(dedicated_summary.size_bytes > 0,
+           "dedicated publication data file size");
+    lance_file_writer_close(dedicated_writer);
+    lance_file_session_close(session);
+    root_schema.release(&root_schema);
+    if (dedicated_a_schema.release) dedicated_a_schema.release(&dedicated_a_schema);
+    if (dedicated_b_schema.release) dedicated_b_schema.release(&dedicated_b_schema);
+
+    LanceDataFile *packed_file = NULL;
+    ASSERT(lance_dataset_create_data_file(
+               dataset, packed_name, NULL, &packed_file) == 0,
+           "create packed publication data file");
+    CHECK_OK();
+    ASSERT(packed_file != NULL, "packed publication data file output");
+    ASSERT(strcmp(lance_data_file_path(packed_file), packed_name) == 0,
+           "packed publication data file path");
+    CHECK_OK();
+    uint32_t major = UINT32_MAX;
+    uint32_t minor = UINT32_MAX;
+    ASSERT(lance_data_file_file_version(packed_file, &major, &minor) == 0 &&
+               major == 2 && minor == 2,
+           "packed publication data file version");
+    CHECK_OK();
+    bool present = true;
+    uint64_t file_size = 0;
+    ASSERT(lance_data_file_file_size(packed_file, &present, &file_size) == 0 &&
+               present && file_size > 0,
+           "packed publication data file size metadata");
+    CHECK_OK();
+    present = true;
+    uint32_t base_id = UINT32_MAX;
+    ASSERT(lance_data_file_base_id(packed_file, &present, &base_id) == 0 &&
+               !present,
+           "packed publication data file base ID");
+    CHECK_OK();
+
+    LanceDataFile *dedicated_file = NULL;
+    ASSERT(lance_dataset_create_data_file(
+               dataset, dedicated_name, NULL, &dedicated_file) == 0,
+           "create dedicated publication data file");
+    CHECK_OK();
+    ASSERT(dedicated_file != NULL, "dedicated publication data file output");
+    ASSERT(strcmp(lance_data_file_path(dedicated_file), dedicated_name) == 0,
+           "dedicated publication data file path");
+    CHECK_OK();
+    ASSERT(lance_data_file_file_version(dedicated_file, &major, &minor) == 0 &&
+               major == 2 && minor == 2,
+           "dedicated publication data file version");
+    CHECK_OK();
+
+    LanceDataReplacementGroup *packed_group =
+        lance_data_replacement_group_new(fragments[0], packed_file);
+    ASSERT(packed_group != NULL, "construct packed replacement group");
+    CHECK_OK();
+    LanceDataReplacementGroup *dedicated_group =
+        lance_data_replacement_group_new(fragments[1], dedicated_file);
+    ASSERT(dedicated_group != NULL, "construct dedicated replacement group");
+    CHECK_OK();
+    lance_data_file_close(packed_file);
+    lance_data_file_close(dedicated_file);
+
+    const LanceDataReplacementGroup *groups[] = {
+        packed_group, dedicated_group};
+    LanceOperation *operation =
+        lance_operation_data_replacement_new(groups, 2);
+    ASSERT(operation != NULL, "construct publication operation");
+    CHECK_OK();
+    uint64_t replacement_count = UINT64_MAX;
+    ASSERT(lance_operation_data_replacement_count(
+               operation, &replacement_count) == 0 &&
+               replacement_count == 2,
+           "publication operation replacement count");
+    CHECK_OK();
+    LanceTransaction *transaction =
+        lance_transaction_new(lance_dataset_version(dataset), operation, NULL);
+    ASSERT(transaction != NULL, "construct publication transaction");
+    CHECK_OK();
+    lance_operation_close(operation);
+    lance_data_replacement_group_close(packed_group);
+    lance_data_replacement_group_close(dedicated_group);
+
+    LanceCommitOptions commit_options;
+    memset(&commit_options, 0, sizeof(commit_options));
+    commit_options.has_max_retries = true;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = LANCE_COMMIT_TIMEOUT_DISABLED;
+    LanceDataset *committed =
+        commit_transaction(uri, transaction, &commit_options);
+    lance_transaction_close(transaction);
+    ASSERT(lance_dataset_version(committed) == 5,
+           "publication commit version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(committed) == 6,
+           "publication commit rows");
+    CHECK_OK();
+    ASSERT(lance_dataset_fragment_count(committed) == 3,
+           "publication commit fragments");
+    CHECK_OK();
+
+    LanceTransaction *history = NULL;
+    ASSERT(lance_dataset_read_transaction(committed, &history) == 0,
+           "read publication history");
+    CHECK_OK();
+    LanceOperation *history_operation = NULL;
+    ASSERT(lance_transaction_operation(history, &history_operation) == 0,
+           "clone publication history operation");
+    CHECK_OK();
+    ASSERT(lance_operation_data_replacement_count(
+               history_operation, &replacement_count) == 0 &&
+               replacement_count == 2,
+           "publication history replacement count");
+    CHECK_OK();
+    lance_operation_close(history_operation);
+    lance_transaction_close(history);
+
+    uint64_t committed_fragments[3] = {0};
+    ASSERT(lance_dataset_fragment_ids(committed, committed_fragments) == 0,
+           "publication committed fragment IDs");
+    CHECK_OK();
+    for (size_t i = 0; i < 3; i++) {
+        ASSERT(committed_fragments[i] == fragments[i],
+               "replacement must preserve fragment IDs");
+    }
+    check_fragment_shape(committed, fragments[0], 3, 1);
+    check_fragment_shape(committed, fragments[1], 2, 0);
+    check_fragment_shape(committed, fragments[2], 2, 0);
+
+    PublicationRow after[6];
+    ASSERT(collect_publication_rows(uri, 5, after, 6) == 6,
+           "publication row IDs after commit");
+    check_row_ids_preserved(before, 7, after, 6);
+    check_publication_payloads(uri, 5, replaced, 6);
+    check_publication_payloads(uri, 4, after_delete, 6);
+    check_publication_payloads(uri, 3, pristine, 7);
+
+    lance_dataset_close(committed);
+    lance_dataset_close(dataset);
+    printf("OK\n");
+    printf("C blob writer publication OK\n");
+}
+
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <source-dataset-uri> <base-path>\n",
+    if (argc != 4) {
+        fprintf(stderr,
+                "usage: %s <source-dataset-uri> <base-path> "
+                "<blob-publication-uri>\n",
                 argv[0]);
         return 2;
     }
@@ -1058,6 +1681,7 @@ int main(int argc, char **argv) {
     test_validation(argv[2]);
     test_fragment_delete(argv[1], argv[2]);
     test_data_replacement(argv[1], argv[2]);
+    test_blob_writer_publication(argv[3]);
     printf("All C transaction tests passed!\n");
     return 0;
 }

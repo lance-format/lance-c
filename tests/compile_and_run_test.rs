@@ -656,8 +656,8 @@ fn create_blob_dataset_on_disk() -> (tempfile::TempDir, String) {
 /// The first fragment has three rows (`old-packed-0`, a null and an empty
 /// blob), the second has two rows that are later replaced by dedicated
 /// sidecars, and the third has two rows that stay untouched. Stable row IDs
-/// and V2.2 make the C++ caller replace base data files in place and verify
-/// that row IDs survive the replacement.
+/// and V2.2 make the C and C++ callers replace base data files in place and
+/// verify that row IDs survive the replacement.
 fn create_blob_publication_dataset_on_disk() -> (tempfile::TempDir, String) {
     use lance::BlobArrayBuilder;
 
@@ -1063,7 +1063,10 @@ fn test_native_index_capabilities_consumers() {
 fn test_native_transaction_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
     let (tmp, dataset_uri) = create_test_dataset_on_disk();
-    let (_blob_publication_tmp, blob_publication_uri) = create_blob_publication_dataset_on_disk();
+    let (_c_blob_publication_tmp, c_blob_publication_uri) =
+        create_blob_publication_dataset_on_disk();
+    let (_cpp_blob_publication_tmp, cpp_blob_publication_uri) =
+        create_blob_publication_dataset_on_disk();
     let base = tmp.path().join("native_transactions");
     std::fs::create_dir_all(&base).unwrap();
     let base = base.to_str().unwrap();
@@ -1078,7 +1081,7 @@ fn test_native_transaction_compilation_and_execution() {
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C transaction test compilation failed"
     );
-    run_test_binary_with_two_args(&c_binary, &dataset_uri, base);
+    run_test_binary_with_args(&c_binary, &[&dataset_uri, base, &c_blob_publication_uri]);
 
     let cpp_source = tests_dir.join("test_transaction.cpp");
     let cpp_binary = build_dir.path().join("test_transaction_cpp");
@@ -1086,7 +1089,10 @@ fn test_native_transaction_compilation_and_execution() {
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ transaction test compilation failed"
     );
-    run_test_binary_with_args(&cpp_binary, &[&dataset_uri, base, &blob_publication_uri]);
+    run_test_binary_with_args(
+        &cpp_binary,
+        &[&dataset_uri, base, &cpp_blob_publication_uri],
+    );
 }
 
 #[test]

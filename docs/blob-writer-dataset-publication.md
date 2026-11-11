@@ -51,6 +51,40 @@ The C API follows the same sequence with `lance_file_session_open_*`,
 `lance_*_finish_array`, `lance_file_writer_*`,
 `lance_dataset_create_data_file`, and the existing transaction calls.
 
+### C11 caller notes
+
+A C11 caller performs the publication explicitly:
+
+```c
+LanceFileSession *session = lance_file_session_new(data_uri, NULL, NULL, NULL);
+LancePackedBlobWriter *writer =
+    lance_file_session_open_packed_blob_writer(session, data_file_name, blob_id);
+lance_packed_blob_writer_write_blobs(writer, &payload_array, &payload_schema);
+lance_packed_blob_writer_finish_array(
+    writer, "blob", &descriptor_array, &descriptor_schema);
+lance_packed_blob_writer_close(writer);
+
+/* Build id + descriptor_array as one top-level struct batch. */
+lance_batch_from_arrow(&top_array, &top_schema, &batch);
+lance_file_writer_write_batch(raw_writer, batch);
+
+lance_dataset_create_data_file(dataset, data_file_name, NULL, &data_file);
+lance_data_replacement_group_new(fragment_id, data_file);
+lance_operation_data_replacement_new(groups, group_count);
+lance_transaction_new(dataset_version, operation, NULL);
+lance_transaction_commit(dataset_uri, transaction, commit_options, NULL, NULL,
+                         &committed);
+```
+
+`lance_batch_from_arrow` consumes the top-level array, including the prepared
+descriptor child; do not close or release that child again. The top-level
+schema borrows the prepared descriptor field. `lance_*_finish_array` writes
+the sidecar before it returns, so the raw data file must use the same relative
+name and a compatible file version. `lance_dataset_create_data_file` and the
+subsequent transaction calls are the only publication step. A C and a C++
+consumer should publish against separate dataset snapshots rather than reuse
+one language's replacement output as the other's expected fixture.
+
 ## File layout and replacement rules
 
 The raw file and the blob writer must use the same relative name:
