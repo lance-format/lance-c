@@ -66,7 +66,7 @@ expect_failure "ssl" "forbidden TLS/crypto DT_NEEDED.*libssl.so.3" \
     bash "$repo_root/.github/scripts/verify-linux-staging.sh" "$work/ssl" x86_64-unknown-linux-gnu
 expect_failure "malformed" "not a readable ELF file" \
     bash "$repo_root/.github/scripts/verify-linux-staging.sh" "$work/malformed" x86_64-unknown-linux-gnu
-expect_failure "truncated" "not a readable ELF file" \
+expect_failure "truncated" "no dynamic section" \
     bash "$repo_root/.github/scripts/verify-linux-staging.sh" "$work/truncated" x86_64-unknown-linux-gnu
 expect_failure "missing" "staged shared library is missing" \
     bash "$repo_root/.github/scripts/verify-linux-staging.sh" "$work/missing" x86_64-unknown-linux-gnu
