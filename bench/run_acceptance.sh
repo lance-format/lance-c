@@ -21,6 +21,7 @@ export RUSTUP_TOOLCHAIN=1.94.0
 mkdir -p "$EVIDENCE_DIR/logs" "$EVIDENCE_DIR/status"
 STATUS_TMP="$EVIDENCE_DIR/status/overall.tmp"
 printf '1\n' >"$STATUS_TMP"
+overall_status=0
 
 {
     printf 'product_root=%s\n' "$PRODUCT_ROOT"
@@ -70,9 +71,12 @@ run_step() {
     if ((rc != 0)); then
         printf 'failed step=%s exit=%s\n' "$name" "$rc" | tee -a \
             "$EVIDENCE_DIR/logs/$name.log"
-        printf '%s\n' "$rc" >"$STATUS_TMP"
-        mv "$STATUS_TMP" "$EVIDENCE_DIR/status/overall"
-        exit "$rc"
+        overall_status=$rc
+        if [[ ${CONTINUE_ON_FAILURE:-0} != 1 ]]; then
+            printf '%s\n' "$overall_status" >"$STATUS_TMP"
+            mv "$STATUS_TMP" "$EVIDENCE_DIR/status/overall"
+            exit "$overall_status"
+        fi
     fi
 }
 
@@ -89,6 +93,10 @@ run_step c_cpp_consumers cargo test --locked --test compile_and_run_test \
     test_native_fragment_mutation_consumers -j 8 -- --ignored --nocapture \
     --test-threads=1
 
-printf '0\n' >"$STATUS_TMP"
+printf '%s\n' "$overall_status" >"$STATUS_TMP"
 mv "$STATUS_TMP" "$EVIDENCE_DIR/status/overall"
+if ((overall_status != 0)); then
+    printf 'acceptance completed with failures: %s\n' "$overall_status"
+    exit "$overall_status"
+fi
 printf 'acceptance passed\n'
