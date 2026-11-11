@@ -14081,19 +14081,15 @@ fn test_index_segment_options_reject_invalid_fragment_and_train_combinations() {
             &options,
         )
     };
-    assert!(!builder.is_null());
-    let mut bytes = ptr::null_mut();
-    let mut len = 0;
-    assert_eq!(
-        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
-        -1
+    assert!(
+        builder.is_null(),
+        "legacy model injection still requires trainer provenance"
     );
-    assert!(take_last_error_message().contains("Unknown fragment id"));
+    assert!(take_last_error_message().contains("metadata"));
     assert!(
         !centroid_array.is_released(),
-        "model arrays remain caller-owned after builder execution"
+        "model arrays remain caller-owned on legacy validation errors"
     );
-    unsafe { lance_index_segment_builder_free(builder) };
 
     options.ivf_centroids = ptr::null_mut();
     options.ivf_centroids_schema = ptr::null();
