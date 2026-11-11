@@ -54,6 +54,16 @@ inline void check_error() {
     }
 }
 
+/// Build a portable IVF_RQ fast-rotation model as native JSON. `num_bits == 0`
+/// selects the native RQ default of 5.
+inline std::string build_rq_model(uint32_t dimension, uint32_t num_bits = 5) {
+    const char* json = lance_index_build_rq_model(dimension, num_bits);
+    if (!json) check_error();
+    std::unique_ptr<const char, void (*)(const char*)> guard(json,
+                                                             lance_free_string);
+    return std::string(json);
+}
+
 /// Release and free a library-allocated ArrowArrayStream returned by
 /// Scanner::scan_async. NULL-safe; do not use for caller-allocated streams.
 inline void scanner_async_stream_free(ArrowArrayStream* stream) noexcept {
@@ -1232,6 +1242,54 @@ public:
     }
 
     const LanceFragment* c_handle() const { return handle_.get(); }
+};
+
+/// Additive native vector-build options.
+///
+/// A default-constructed value leaves every optional native field absent.
+/// `train == std::nullopt` retains the native train=true default. Arrow models
+/// are borrowed for the call; `IndexModel` values must outlive the call or
+/// builder-creation call that receives them.
+struct VectorIndexOptions {
+    LanceVectorIndexType index_type = LANCE_INDEX_IVF_FLAT;
+    LanceMetricType metric = LANCE_METRIC_L2;
+
+    std::optional<uint64_t> num_partitions;
+    std::optional<uint64_t> target_partition_size;
+    std::optional<uint64_t> max_iters;
+    std::optional<uint64_t> sample_rate;
+    std::optional<uint64_t> streaming_sample_rate;
+    std::optional<uint64_t> streaming_coreset_rate;
+    uint64_t streaming_refine_passes = 0;
+
+    std::optional<std::string> precomputed_partitions_file;
+    std::optional<std::pair<std::string, std::vector<std::string>>>
+        precomputed_shuffle_buffers;
+    std::optional<uint64_t> shuffle_partition_batches;
+    std::optional<uint64_t> shuffle_partition_concurrency;
+    std::optional<std::map<std::string, std::string>> storage_options;
+
+    std::optional<uint64_t> num_sub_vectors;
+    std::optional<uint64_t> num_bits;
+    IndexModel* ivf_centroids = nullptr;
+    IndexModel* pq_codebook = nullptr;
+    std::optional<std::string> rabitq_model_json;
+
+    std::optional<uint64_t> hnsw_max_level;
+    std::optional<uint64_t> hnsw_m;
+    std::optional<uint64_t> hnsw_ef_construction;
+
+    LanceIndexFileVersion index_file_version = LANCE_INDEX_FILE_VERSION_V3;
+    bool skip_transpose = false;
+    std::map<std::string, std::string> runtime_hints;
+    std::optional<bool> train;
+
+    /// Record a caller-provided accelerator hint. This does not enable C-side
+    /// accelerator execution.
+    VectorIndexOptions& accelerator(std::string device) {
+        runtime_hints["lancedb.accelerator"] = std::move(device);
+        return *this;
+    }
 };
 
 // ─── Dataset ─────────────────────────────────────────────────────────────────
@@ -3061,6 +3119,17 @@ public:
             check_error();
     }
 
+    /// Create a vector index from additive native options.
+    ///
+    /// Native Lance performs the commit before reloading index metadata. An
+    /// exception can therefore be thrown after the dataset version was
+    /// published; reopen the dataset to determine its current version.
+    void create_vector_index_with_options(
+        const std::string& column,
+        const VectorIndexOptions& options,
+        const std::string& name = "",
+        bool replace = false);
+
     /// Create a scalar index on a column.
     void create_scalar_index(const std::string& column,
                              LanceScalarIndexType index_type,
@@ -3091,6 +3160,17 @@ public:
         const LanceVectorIndexParams& params,
         const std::string& index_name = "",
         const LanceIndexSegmentBuildOptions* options = nullptr) const;
+
+    /// Create a single-use vector segment builder from additive native options.
+    /// `fragment_ids == std::nullopt` preserves native None; an engaged empty
+    /// vector preserves Some(empty). Native validation decides duplicate and
+    /// missing-ID behavior and timing.
+    IndexSegmentBuilder new_vector_index_segment_builder_with_options(
+        const std::string& column,
+        const VectorIndexOptions& options,
+        const std::string& index_name = "",
+        std::optional<std::vector<uint32_t>> fragment_ids = std::nullopt,
+        const std::array<uint8_t, 16>* index_uuid = nullptr) const;
 
     /// Train shared IVF centroids as an Arrow C Data Interface array/schema.
     IndexModel train_ivf_model(
@@ -3290,10 +3370,34 @@ class IndexModel {
 
     friend class Dataset;
 
+    IndexModel() noexcept = default;
+
     IndexModel(ArrowArray array, ArrowSchema schema) noexcept
         : array_(array), schema_(schema) {}
 
 public:
+    /// Adopt caller-produced native Arrow model structs, transferring their
+    /// release responsibility to this object. Both inputs are required and are
+    /// cleared to an empty state only after a complete transfer. This allows
+    /// arbitrary native model dtypes and shapes to be passed to
+    /// VectorIndexOptions.
+    static IndexModel adopt(ArrowArray* array, ArrowSchema* schema) {
+        if (!array || !schema) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "IndexModel::adopt requires non-null ArrowArray and ArrowSchema");
+        }
+        if (!array->release || !schema->release) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "IndexModel::adopt requires initialized Arrow structures");
+        }
+        IndexModel model;
+        model.array_ = *array;
+        model.schema_ = *schema;
+        *array = {};
+        *schema = {};
+        return model;
+    }
+
     ~IndexModel() { reset(); }
 
     IndexModel(IndexModel&& other) noexcept
@@ -3317,6 +3421,116 @@ public:
     ArrowArray* array() noexcept { return &array_; }
     const ArrowSchema* schema() const noexcept { return &schema_; }
 };
+
+namespace detail {
+
+/// Stable C views over one VectorIndexOptions value. The source options and
+/// IndexModel objects must outlive this storage and the C call that uses it.
+class VectorIndexOptionsStorage {
+    LanceVectorIndexOptions options_{};
+    std::vector<const char*> storage_keys_;
+    std::vector<const char*> storage_values_;
+    LanceStringMap storage_{};
+    std::vector<const char*> runtime_keys_;
+    std::vector<const char*> runtime_values_;
+    LanceStringMap runtime_{};
+    std::vector<const char*> shuffle_buffers_;
+    LancePrecomputedShuffleBuffers shuffle_{};
+
+    static void set_optional(LanceOptionalU64& out,
+                             const std::optional<uint64_t>& value) {
+        out = {};
+        if (value) {
+            out.value = *value;
+            out.is_set = true;
+        }
+    }
+
+    static void set_map(const std::map<std::string, std::string>& source,
+                        std::vector<const char*>& keys,
+                        std::vector<const char*>& values,
+                        LanceStringMap& out) {
+        for (const auto& [key, value] : source) {
+            keys.push_back(key.c_str());
+            values.push_back(value.c_str());
+        }
+        out.keys = keys.empty() ? nullptr : keys.data();
+        out.values = values.empty() ? nullptr : values.data();
+        out.count = keys.size();
+    }
+
+public:
+    explicit VectorIndexOptionsStorage(const VectorIndexOptions& options) {
+        options_.index_type = static_cast<int32_t>(options.index_type);
+        options_.metric = static_cast<int32_t>(options.metric);
+        set_optional(options_.num_partitions, options.num_partitions);
+        set_optional(options_.target_partition_size, options.target_partition_size);
+        set_optional(options_.max_iters, options.max_iters);
+        set_optional(options_.sample_rate, options.sample_rate);
+        set_optional(options_.streaming_sample_rate,
+                     options.streaming_sample_rate);
+        set_optional(options_.streaming_coreset_rate,
+                     options.streaming_coreset_rate);
+        options_.streaming_refine_passes = options.streaming_refine_passes;
+        options_.precomputed_partitions_file =
+            options.precomputed_partitions_file
+                ? options.precomputed_partitions_file->c_str()
+                : nullptr;
+        if (options.precomputed_shuffle_buffers) {
+            shuffle_.path = options.precomputed_shuffle_buffers->first.c_str();
+            for (const auto& buffer : options.precomputed_shuffle_buffers->second) {
+                shuffle_buffers_.push_back(buffer.c_str());
+            }
+            shuffle_.buffers =
+                shuffle_buffers_.empty() ? nullptr : shuffle_buffers_.data();
+            shuffle_.buffer_count = shuffle_buffers_.size();
+            options_.precomputed_shuffle_buffers = &shuffle_;
+        }
+        set_optional(options_.shuffle_partition_batches,
+                     options.shuffle_partition_batches);
+        set_optional(options_.shuffle_partition_concurrency,
+                     options.shuffle_partition_concurrency);
+        if (options.storage_options) {
+            set_map(*options.storage_options, storage_keys_, storage_values_,
+                    storage_);
+            options_.storage_options = &storage_;
+        }
+        set_optional(options_.num_sub_vectors, options.num_sub_vectors);
+        set_optional(options_.num_bits, options.num_bits);
+        if (options.ivf_centroids) {
+            options_.ivf_centroids = options.ivf_centroids->array();
+            options_.ivf_centroids_schema = options.ivf_centroids->schema();
+        }
+        if (options.pq_codebook) {
+            options_.pq_codebook = options.pq_codebook->array();
+            options_.pq_codebook_schema = options.pq_codebook->schema();
+        }
+        options_.rabitq_model_json = options.rabitq_model_json
+                                         ? options.rabitq_model_json->c_str()
+                                         : nullptr;
+        set_optional(options_.hnsw_max_level, options.hnsw_max_level);
+        set_optional(options_.hnsw_m, options.hnsw_m);
+        set_optional(options_.hnsw_ef_construction,
+                     options.hnsw_ef_construction);
+        options_.index_file_version =
+            static_cast<int32_t>(options.index_file_version);
+        options_.skip_transpose = options.skip_transpose;
+        set_map(options.runtime_hints, runtime_keys_, runtime_values_, runtime_);
+        options_.runtime_hints = &runtime_;
+        if (options.train) {
+            options_.has_train = true;
+            options_.train = *options.train;
+        }
+    }
+
+    VectorIndexOptionsStorage(const VectorIndexOptionsStorage&) = delete;
+    VectorIndexOptionsStorage& operator=(const VectorIndexOptionsStorage&) =
+        delete;
+
+    const LanceVectorIndexOptions* get() const { return &options_; }
+};
+
+}  // namespace detail
 
 /// Parsed metadata for one physical index segment.
 class IndexSegmentMetadata {
@@ -3514,6 +3728,46 @@ inline IndexSegmentBuilder Dataset::new_vector_index_segment_builder(
     };
     auto* builder = lance_index_segment_builder_new_vector(
         handle_.get(), column.c_str(), index_name_c, &segment_params, options);
+    if (!builder) check_error();
+    return IndexSegmentBuilder(builder);
+}
+
+inline void Dataset::create_vector_index_with_options(
+    const std::string& column,
+    const VectorIndexOptions& options,
+    const std::string& name,
+    bool replace) {
+    detail::VectorIndexOptionsStorage storage(options);
+    const char* name_c = name.empty() ? nullptr : name.c_str();
+    if (lance_dataset_create_vector_index_with_options(
+            handle_.get(), column.c_str(), name_c, storage.get(), replace) != 0) {
+        check_error();
+    }
+}
+
+inline IndexSegmentBuilder Dataset::new_vector_index_segment_builder_with_options(
+    const std::string& column,
+    const VectorIndexOptions& options,
+    const std::string& index_name,
+    std::optional<std::vector<uint32_t>> fragment_ids,
+    const std::array<uint8_t, 16>* index_uuid) const {
+    detail::VectorIndexOptionsStorage storage(options);
+    const char* index_name_c = index_name.empty() ? nullptr : index_name.c_str();
+    static const uint32_t empty_fragment_id = 0;
+    LanceVectorIndexSegmentScope scope{};
+    if (fragment_ids) {
+        scope.fragment_ids = fragment_ids->empty()
+                                 ? &empty_fragment_id
+                                 : fragment_ids->data();
+        scope.fragment_count = fragment_ids->size();
+    }
+    if (index_uuid) {
+        scope.index_uuid = index_uuid->data();
+    }
+    const LanceVectorIndexSegmentScope* scope_ptr =
+        (fragment_ids || index_uuid) ? &scope : nullptr;
+    auto* builder = lance_index_segment_builder_new_vector_with_options(
+        handle_.get(), column.c_str(), index_name_c, storage.get(), scope_ptr);
     if (!builder) check_error();
     return IndexSegmentBuilder(builder);
 }
