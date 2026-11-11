@@ -152,11 +152,12 @@ static int verify_stream(
         const ArrowArray *label = batch.children[1];
         const int32_t *ids = (const int32_t *)id->buffers[1];
         for (int64_t row = 0; row < batch.length; row++) {
-            if (ids[row] != first_id + rows) {
+            if (ids[row] != first_id + rows + (int)row) {
                 fprintf(stderr,
                         "VERIFY id mismatch row=%lld value=%d expected=%d "
                         "batch_len=%lld rows=%d\n",
-                        (long long)row, ids[row], first_id + rows,
+                        (long long)row, ids[row],
+                        first_id + rows + (int)row,
                         (long long)batch.length, rows);
                 return 0;
             }
@@ -165,8 +166,6 @@ static int verify_stream(
             if (strcmp(label_at(label, 1), "two") != 0) return 0;
             if (label_at(label, 2) != NULL) return 0;
         }
-        fprintf(stderr, "VERIFY batch len=%lld first_id=%d rows=%d\n",
-                (long long)batch.length, first_id, rows);
         rows += (int)batch.length;
         batch.release(&batch);
     }
