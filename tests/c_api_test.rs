@@ -44859,3 +44859,166 @@ fn test_memwal_closed_writer_consumes_streams() {
         lance_dataset_close(ds);
     }
 }
+
+#[test]
+fn test_memwal_string_sharding_and_schema_factory() {
+    use lance::dataset::mem_wal::evaluate_sharding_spec;
+    use lance_table::system_index::mem_wal::{ShardingField, ShardingSpec};
+
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+
+    // Shared Arrow -> native schema factory. `name` gets a fresh native id.
+    let arrow_schema = FFI_ArrowSchema::try_from(mw_schema()).unwrap();
+    let mut native_schema = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_schema_from_arrow(&arrow_schema, &mut native_schema) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut name_id = 0;
+    assert_eq!(
+        unsafe { lance_schema_field_id(native_schema, c"name".as_ptr(), &mut name_id) },
+        0
+    );
+    assert!(name_id > 0);
+
+    let mut field = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_sharding_field_new(
+                c"bucket".as_ptr(),
+                &name_id,
+                1,
+                c"bucket".as_ptr(),
+                ptr::null(),
+                c"int32".as_ptr(),
+                [c"num_buckets".as_ptr()].as_ptr(),
+                [c"8".as_ptr()].as_ptr(),
+                1,
+                &mut field,
+            )
+        },
+        0
+    );
+    let fields = [field as *const LanceMemWalShardingField];
+    let mut spec = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_mem_wal_sharding_spec_new(1, fields.as_ptr(), 1, &mut spec) },
+        0
+    );
+
+    let input = mw_batch(
+        &[1, 2, 3],
+        &[Some("a"), Some("b"), None],
+        &[[0.0; 4], [1.0; 4], [2.0; 4]],
+    );
+    let (mut array, arrow_schema_in) = ffi_record_batch(&input);
+    let mut batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &arrow_schema_in, &mut batch) },
+        0
+    );
+    let mut output = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_evaluate_sharding_spec_with_schema(
+                batch,
+                spec,
+                native_schema,
+                &mut output,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut ffi_array = arrow::ffi::FFI_ArrowArray::empty();
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_batch_to_arrow(output, &mut ffi_array, &mut ffi_schema) },
+        0
+    );
+    let c_out = RecordBatch::from(StructArray::from(
+        unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap(),
+    ));
+    let c_values = c_out
+        .column_by_name("bucket")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(c_values, vec![1, 5, 0]);
+
+    let native_values = lance_c::runtime::block_on(async {
+        let native = Dataset::open(&uri).await.unwrap();
+        let name_id = native.schema().field("name").unwrap().id;
+        let native_spec = ShardingSpec {
+            spec_id: 1,
+            fields: vec![ShardingField {
+                field_id: "bucket".to_string(),
+                source_ids: vec![name_id],
+                transform: Some("bucket".to_string()),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters: HashMap::from([("num_buckets".to_string(), "8".to_string())]),
+            }],
+        };
+        evaluate_sharding_spec(&input, &native_spec, native.schema()).unwrap()
+    });
+    let native_ids = native_values
+        .column_by_name("bucket")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(c_values, native_ids);
+
+    // Empty input still succeeds and produces an empty column.
+    let empty = mw_batch(&[], &[], &[]);
+    let (mut array, arrow_schema_in) = ffi_record_batch(&empty);
+    let mut empty_batch = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_batch_from_arrow(&mut array, &arrow_schema_in, &mut empty_batch) },
+        0
+    );
+    let mut empty_output = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_mem_wal_evaluate_sharding_spec_with_schema(
+                empty_batch,
+                spec,
+                native_schema,
+                &mut empty_output,
+            )
+        },
+        0
+    );
+    let mut ffi_array = arrow::ffi::FFI_ArrowArray::empty();
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_batch_to_arrow(empty_output, &mut ffi_array, &mut ffi_schema) },
+        0
+    );
+    let empty_out = RecordBatch::from(StructArray::from(
+        unsafe { from_ffi(ffi_array, &ffi_schema) }.unwrap(),
+    ));
+    assert_eq!(empty_out.num_rows(), 0);
+
+    unsafe {
+        lance_batch_free(empty_output);
+        lance_batch_free(empty_batch);
+        lance_batch_free(output);
+        lance_batch_free(batch);
+        lance_mem_wal_sharding_spec_free(spec);
+        lance_mem_wal_sharding_field_free(field);
+        lance_schema_close(native_schema);
+        lance_dataset_close(ds);
+    }
+}
