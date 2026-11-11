@@ -85,10 +85,10 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let uri = format!("{}/dataset", dir.path().display());
-        let native = create_fixture(&uri).await;
+        let native = lance_c::runtime::block_on(create_fixture(&uri));
         drop(native);
         let c_uri = c_string(&uri);
         let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
@@ -380,7 +380,7 @@ fn assert_values(dataset: &Dataset, expected: &[(i32, Option<i32>, Option<i32>)]
 
 #[test]
 fn data_overlay_value_and_operation_lifetimes() {
-    let fixture = lance_c::runtime::block_on(Fixture::new());
+    let fixture = Fixture::new();
     let fragment_count = unsafe { lance_dataset_fragment_count(fixture.dataset) };
     assert_eq!(fragment_count, 2);
     let mut ids = vec![0u64; fragment_count as usize];
@@ -482,7 +482,7 @@ fn data_overlay_value_and_operation_lifetimes() {
 
 #[test]
 fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
-    let fixture = lance_c::runtime::block_on(Fixture::new());
+    let fixture = Fixture::new();
     let native = lance_c::runtime::block_on(Dataset::open(&fixture.uri)).unwrap();
     assert_eq!(native.version().version, 2);
     let mut ids = vec![0u64; 2];
@@ -778,7 +778,7 @@ fn data_overlay_validation_errors() {
         LanceErrorCode::InvalidArgument
     ));
 
-    let fixture = lance_c::runtime::block_on(Fixture::new());
+    let fixture = Fixture::new();
     let fragment = open_fragment(fixture.dataset, 0);
     let schema = projected_schema(fragment, &["a"]);
     let writer = new_writer(fragment, schema);
