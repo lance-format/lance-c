@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
@@ -15936,7 +15936,7 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
             "{expected_type} disabled-index control must not load an index"
         );
 
-        let segments_json = lance_dataset_index_segments_json(dataset);
+        let segments_json = unsafe { lance_dataset_index_segments_json(dataset) };
         assert!(!segments_json.is_null(), "{}", take_last_error_message());
         let segments: serde_json::Value =
             serde_json::from_str(unsafe { CStr::from_ptr(segments_json) }.to_str().unwrap())
@@ -16099,7 +16099,7 @@ fn test_vector_index_options_native_defaults_explicit_zero_and_train_false() {
         unsafe { lance_dataset_version(dataset) },
         version_before + 1
     );
-    let segments_json = lance_dataset_index_segments_json(dataset);
+    let segments_json = unsafe { lance_dataset_index_segments_json(dataset) };
     assert!(!segments_json.is_null());
     let segments: serde_json::Value =
         serde_json::from_str(unsafe { CStr::from_ptr(segments_json) }.to_str().unwrap()).unwrap();
@@ -16342,15 +16342,13 @@ fn test_vector_index_segment_options_scope_native_validation_and_caller_lifetime
     // Builder creation imported independent Arrow references. The caller may
     // release the original model and schema before execution.
     if let Some(release) = centroids.release {
-        release(&mut centroids);
+        unsafe { release(&mut centroids) };
     }
     if let Some(release) = centroids_schema.release {
-        release(&mut centroids_schema);
+        unsafe { release(&mut centroids_schema) };
     }
-    options.ivf_centroids = ptr::null_mut();
-    options.ivf_centroids_schema = ptr::null();
 
-    let mut execute = |builder: *mut LanceIndexSegmentBuilder| {
+    let execute = |builder: *mut LanceIndexSegmentBuilder| {
         let mut bytes = ptr::null_mut();
         let mut len = 0_usize;
         let rc = unsafe {
@@ -16479,7 +16477,7 @@ fn test_vector_index_options_shared_models_and_single_version_publication() {
         unsafe { lance_dataset_fragment_ids(pq_dataset, fragment_ids.as_mut_ptr()) },
         0
     );
-    let (mut centroids, centroids_schema, mut codebook, codebook_schema) =
+    let (mut centroids, mut centroids_schema, mut codebook, mut codebook_schema) =
         train_segment_pq_models(pq_dataset, &column, LanceMetricType::L2);
 
     let mut pq_options = vector_index_options(LanceVectorIndexType::IvfPq, LanceMetricType::L2);
@@ -16627,7 +16625,7 @@ fn test_vector_index_options_shared_models_and_single_version_publication() {
         "{}",
         take_last_error_message()
     );
-    let rq_json = lance_index_build_rq_model(8, 0);
+    let rq_json = unsafe { lance_index_build_rq_model(8, 0) };
     assert!(!rq_json.is_null(), "{}", take_last_error_message());
     assert!(
         unsafe { CStr::from_ptr(rq_json) }
