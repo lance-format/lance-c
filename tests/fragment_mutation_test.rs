@@ -866,7 +866,7 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
     let native_delete = native_delete.unwrap().unwrap();
     assert_eq!(
         fragment_logical_rows(staged_second),
-        lance_c::runtime::block_on(native_delete.count_rows(None)).unwrap()
+        lance_c::runtime::block_on(native_delete.count_rows(None)).unwrap() as u64
     );
     assert_eq!(fragment_logical_rows(staged_second), 3);
 
