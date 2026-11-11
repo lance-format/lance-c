@@ -6742,6 +6742,97 @@ static void test_diagnostics(const char *uri) {
     printf("OK\n");
 }
 
+
+static void test_dataset_deep_clone(const char *src_uri) {
+    printf("  test_dataset_deep_clone... ");
+
+    LanceDataset *source = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(source != NULL, "deep clone source open failed");
+    const uint64_t source_version = lance_dataset_version(source);
+    const uint64_t source_rows = lance_dataset_count_rows(source);
+    CHECK_OK();
+    ASSERT(source_rows > 0, "deep clone source must not be empty");
+
+    char target_a[2048];
+    char target_b[2048];
+    char target_c[2048];
+    ASSERT(strlen(src_uri) + 32 < sizeof(target_a),
+           "deep clone fixture uri is too long");
+    snprintf(target_a, sizeof(target_a), "%s.deep-clone-a", src_uri);
+    snprintf(target_b, sizeof(target_b), "%s.deep-clone-b", src_uri);
+    snprintf(target_c, sizeof(target_c), "%s.deep-clone-c", src_uri);
+
+    LanceStorageOptionsAccessor *accessor =
+        lance_storage_options_accessor_new(NULL, NULL);
+    ASSERT(accessor != NULL, "deep clone accessor create failed");
+    CHECK_OK();
+
+    LanceDataset *cloned = NULL;
+    ASSERT(lance_dataset_deep_clone(source, target_a, NULL, accessor, &cloned) == 0,
+           "deep clone with NULL ref failed");
+    CHECK_OK();
+    lance_storage_options_accessor_close(accessor);
+    ASSERT(cloned != NULL, "deep clone did not write the out handle");
+    ASSERT(lance_dataset_version(cloned) == 1,
+           "deep clone target must start at version 1");
+    ASSERT(lance_dataset_count_rows(cloned) == source_rows,
+           "deep clone row count mismatch");
+    CHECK_OK();
+    lance_dataset_close(cloned);
+
+    LanceRef *version_ref = lance_ref_version_number(source_version);
+    ASSERT(version_ref != NULL, "deep clone version ref create failed");
+    CHECK_OK();
+    cloned = NULL;
+    ASSERT(lance_dataset_deep_clone(source, target_b, version_ref, NULL, &cloned) == 0,
+           "deep clone with explicit version ref failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(cloned) == source_rows,
+           "deep clone version ref row count mismatch");
+    CHECK_OK();
+    lance_dataset_close(cloned);
+    lance_ref_close(version_ref);
+
+    LanceDataset *sentinel = NULL;
+    ASSERT(lance_dataset_deep_clone(source, target_a, NULL, NULL, &sentinel) == -1,
+           "deep clone over an existing target must fail");
+    ASSERT(sentinel == NULL, "failed deep clone must not write the out handle");
+    expect_error(LANCE_ERR_DATASET_ALREADY_EXISTS, "deep clone existing target");
+
+    LanceRef *missing = lance_ref_tag("deep-clone-missing-tag");
+    ASSERT(missing != NULL, "deep clone missing tag ref create failed");
+    CHECK_OK();
+    sentinel = NULL;
+    ASSERT(lance_dataset_deep_clone(source, target_c, missing, NULL, &sentinel) == -1,
+           "deep clone with a missing tag must fail");
+    ASSERT(sentinel == NULL, "missing tag must not write the out handle");
+    expect_error(LANCE_ERR_NOT_FOUND, "deep clone missing tag");
+    lance_ref_close(missing);
+
+    ASSERT(lance_dataset_deep_clone(NULL, target_c, NULL, NULL, &sentinel) == -1,
+           "deep clone with a NULL dataset must fail");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "deep clone NULL dataset");
+    ASSERT(lance_dataset_deep_clone(source, NULL, NULL, NULL, &sentinel) == -1,
+           "deep clone with a NULL target path must fail");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "deep clone NULL target path");
+    ASSERT(lance_dataset_deep_clone(source, target_c, NULL, NULL, NULL) == -1,
+           "deep clone with a NULL out slot must fail");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "deep clone NULL out slot");
+
+    lance_dataset_close(source);
+
+    cloned = lance_dataset_open(target_a, NULL, 0);
+    ASSERT(cloned != NULL, "deep clone target reopen failed");
+    ASSERT(lance_dataset_version(cloned) == 1,
+           "reopened deep clone target version mismatch");
+    ASSERT(lance_dataset_count_rows(cloned) == source_rows,
+           "reopened deep clone target row count mismatch");
+    CHECK_OK();
+    lance_dataset_close(cloned);
+
+    PASS();
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -6803,6 +6894,7 @@ int main(int argc, char **argv) {
     test_native_scalar_indexes(uri);
     test_minhash_lsh(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_dataset_deep_clone(write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
     test_diagnostics(uri);

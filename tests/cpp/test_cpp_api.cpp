@@ -4777,6 +4777,44 @@ static void test_diagnostics(const std::string& uri) {
     PASS();
 }
 
+
+static void test_dataset_deep_clone(const std::string& src_uri) {
+    TEST(test_dataset_deep_clone);
+
+    auto source = lance::Dataset::open(src_uri);
+    const uint64_t source_version = source.version();
+    const uint64_t source_rows = source.count_rows();
+    assert(source_rows > 0);
+
+    const std::string target_a = src_uri + ".deep-clone-cpp-a";
+    const std::string target_b = src_uri + ".deep-clone-cpp-b";
+
+    {
+        lance::StorageOptionsAccessor accessor(std::nullopt, nullptr);
+        auto cloned = source.deep_clone(target_a, nullptr, &accessor);
+        assert(cloned.version() == 1);
+        assert(cloned.count_rows() == source_rows);
+    }
+
+    auto version_ref = lance::Ref::version_number(source_version);
+    auto cloned = source.deep_clone(target_b, &version_ref);
+    assert(cloned.count_rows() == source_rows);
+
+    bool threw = false;
+    try {
+        (void)source.deep_clone(target_a);
+    } catch (const lance::Error&) {
+        threw = true;
+    }
+    assert(threw);
+
+    auto reopened = lance::Dataset::open(target_a);
+    assert(reopened.version() == 1);
+    assert(reopened.count_rows() == source_rows);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 12) {
         fprintf(stderr,
@@ -4844,6 +4882,7 @@ int main(int argc, char** argv) {
     test_commit_index_segments(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_dataset_deep_clone(write_uri);
     test_write_options_and_config(uri, write_uri);
     test_data_statistics(write_uri);
     test_diagnostics(uri);

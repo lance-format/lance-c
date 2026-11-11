@@ -1287,6 +1287,52 @@ LanceDataset* lance_dataset_checkout_ref(
     const LanceRef* reference
 );
 
+/**
+ * Deep clone a dataset snapshot into a new dataset at `target_path`.
+ *
+ * The whole operation is performed by Lance's native
+ * `Dataset::deep_clone` on a private clone of the source handle's snapshot.
+ * The source handle is not modified and no source write lock is held while
+ * files are copied.
+ *
+ * `reference == NULL` clones the source handle's current snapshot: its branch
+ * and version id are pinned into `Ref::Version(branch, Some(version))`. Treat
+ * it as "clone this exact snapshot", not "clone the latest head". Pass an
+ * explicit `LanceRef` from `lance_ref_version(NULL, false, 0)` to clone the
+ * current head of the default branch.
+ *
+ * `target_storage_options` is an existing storage-options accessor, or NULL.
+ * Its native accessor Arc is forwarded into `ObjectStoreParams` without
+ * resolving, snapshotting, or copying credentials, so a dynamic provider keeps
+ * its refresh behavior. NULL passes native `None`; a non-NULL accessor is
+ * forwarded as `Some`, including an accessor with no initial options.
+ *
+ * Files are copied and the target dataset is published by native Lance. The
+ * out handle is written only on success. On failure the out parameter is
+ * untouched and no target dataset is published, but object-store copies are
+ * not transactional: partial objects may remain under `target_path`, and a
+ * retry fails the native target-exists preflight until they are removed.
+ *
+ * For datasets with additional base paths, source credentials come from the
+ * source dataset's native session and per-base store binding. This call does
+ * not create extra providers, caches, registries, or per-base credential sets.
+ *
+ * Caller closes the returned handle with lance_dataset_close().
+ * @param dataset source dataset handle (must not be NULL)
+ * @param target_path UTF-8 target dataset URI (must not be NULL)
+ * @param reference snapshot ref, or NULL for the source handle's snapshot
+ * @param target_storage_options target accessor, or NULL for native None
+ * @param out receives the new dataset handle on success (must not be NULL)
+ * @return 0 on success, -1 on error; the out handle is not written on error
+ */
+int32_t lance_dataset_deep_clone(
+    const LanceDataset* dataset,
+    const char* target_path,
+    const LanceRef* reference,
+    const struct LanceStorageOptionsAccessor* target_storage_options,
+    LanceDataset** out
+);
+
 /* ─── Branches ─── */
 
 /**
