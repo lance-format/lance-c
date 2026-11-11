@@ -164,6 +164,7 @@ public:
 class Scanner;
 class Dataset;
 class Fragment;
+class FragmentOverlayWriter;
 class LanceSchema;
 class IndexModel;
 class IndexSegmentBuilder;
@@ -705,6 +706,181 @@ public:
     }
 };
 
+/// Coverage layout of a native data overlay value.
+enum class OverlayCoverageKind : int32_t {
+    Shared = LANCE_DATA_OVERLAY_COVERAGE_SHARED,
+    PerField = LANCE_DATA_OVERLAY_COVERAGE_PER_FIELD,
+};
+
+/// Owned native `DataOverlayFile` snapshot. Move-only.
+///
+/// Coverage is supplied as portable 32-bit Roaring bitmap bytes. Shared
+/// coverage takes exactly one bitmap; per-field coverage takes one bitmap per
+/// `data_file.fields` entry, in order.
+class DataOverlayFile {
+    Handle<LanceDataOverlayFile, lance_data_overlay_file_close> handle_;
+
+public:
+    explicit DataOverlayFile(LanceDataOverlayFile* file) : handle_(file) {}
+
+    DataOverlayFile(const DataFile& data_file,
+                    OverlayCoverageKind coverage_kind,
+                    const std::vector<std::vector<uint8_t>>& bitmaps,
+                    uint64_t committed_version = 0)
+        : handle_(nullptr) {
+        std::vector<const uint8_t*> pointers;
+        std::vector<size_t> lengths;
+        pointers.reserve(bitmaps.size());
+        lengths.reserve(bitmaps.size());
+        for (const auto& bitmap : bitmaps) {
+            pointers.push_back(bitmap.empty() ? nullptr : bitmap.data());
+            lengths.push_back(bitmap.size());
+        }
+        auto* raw = lance_data_overlay_file_new(
+            data_file.c_handle(), static_cast<int32_t>(coverage_kind),
+            pointers.empty() ? nullptr : pointers.data(),
+            lengths.empty() ? nullptr : lengths.data(), bitmaps.size(),
+            committed_version);
+        if (!raw) check_error();
+        handle_ = Handle<LanceDataOverlayFile, lance_data_overlay_file_close>(
+            raw);
+    }
+
+    DataOverlayFile(DataOverlayFile&&) noexcept = default;
+    DataOverlayFile& operator=(DataOverlayFile&&) noexcept = default;
+    DataOverlayFile(const DataOverlayFile&) = delete;
+    DataOverlayFile& operator=(const DataOverlayFile&) = delete;
+
+    /// Complete native data-file metadata owned by the overlay.
+    DataFile data_file() const {
+        LanceDataFile* file = lance_data_overlay_file_data_file(handle_.get());
+        if (!file) check_error();
+        return DataFile(file);
+    }
+
+    OverlayCoverageKind coverage_kind() const {
+        int32_t kind = 0;
+        if (lance_data_overlay_file_coverage_kind(
+                handle_.get(), &kind) != 0) {
+            check_error();
+        }
+        return static_cast<OverlayCoverageKind>(kind);
+    }
+
+    /// Number of coverage bitmaps: 1 for shared, field count for per-field.
+    uint64_t bitmap_count() const {
+        uint64_t count = 0;
+        if (lance_data_overlay_file_bitmap_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Copy one portable Roaring coverage bitmap into owned bytes.
+    std::vector<uint8_t> bitmap_at(size_t index) const {
+        uint8_t* bytes = nullptr;
+        size_t len = 0;
+        if (lance_data_overlay_file_bitmap_at(
+                handle_.get(), index, &bytes, &len) != 0) {
+            check_error();
+        }
+        std::vector<uint8_t> out;
+        if (len != 0) out.assign(bytes, bytes + len);
+        if (bytes) lance_free_bytes(bytes);
+        return out;
+    }
+
+    /// Native committed-version stamp. Zero is the pre-commit placeholder.
+    uint64_t committed_version() const {
+        uint64_t version = 0;
+        if (lance_data_overlay_file_committed_version(
+                handle_.get(), &version) != 0) {
+            check_error();
+        }
+        return version;
+    }
+
+    /// Clone this snapshot into an independently owned handle.
+    DataOverlayFile clone() const {
+        auto* raw = lance_data_overlay_file_clone(handle_.get());
+        if (!raw) check_error();
+        return DataOverlayFile(raw);
+    }
+
+    const LanceDataOverlayFile* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native `DataOverlayGroup` snapshot. Move-only.
+class DataOverlayGroup {
+    Handle<LanceDataOverlayGroup, lance_data_overlay_group_close> handle_;
+
+public:
+    explicit DataOverlayGroup(LanceDataOverlayGroup* group) : handle_(group) {}
+
+    /// Construct a group by cloning the given overlay values in order.
+    DataOverlayGroup(uint64_t fragment_id,
+                     const std::vector<const DataOverlayFile*>& overlays)
+        : handle_(nullptr) {
+        std::vector<const LanceDataOverlayFile*> handles;
+        handles.reserve(overlays.size());
+        for (const auto* overlay : overlays) {
+            if (!overlay) {
+                throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                            "data overlay file must not be null");
+            }
+            handles.push_back(overlay->c_handle());
+        }
+        auto* raw = lance_data_overlay_group_new(
+            fragment_id, handles.empty() ? nullptr : handles.data(),
+            handles.size());
+        if (!raw) check_error();
+        handle_ = Handle<LanceDataOverlayGroup, lance_data_overlay_group_close>(
+            raw);
+    }
+
+    DataOverlayGroup(DataOverlayGroup&&) noexcept = default;
+    DataOverlayGroup& operator=(DataOverlayGroup&&) noexcept = default;
+    DataOverlayGroup(const DataOverlayGroup&) = delete;
+    DataOverlayGroup& operator=(const DataOverlayGroup&) = delete;
+
+    uint64_t fragment_id() const {
+        uint64_t id = 0;
+        if (lance_data_overlay_group_fragment_id(handle_.get(), &id) != 0) {
+            check_error();
+        }
+        return id;
+    }
+
+    uint64_t overlay_count() const {
+        uint64_t count = 0;
+        if (lance_data_overlay_group_overlay_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one overlay into an independent owned value.
+    DataOverlayFile overlay_at(size_t index) const {
+        LanceDataOverlayFile* overlay = nullptr;
+        if (lance_data_overlay_group_overlay_at(
+                handle_.get(), index, &overlay) != 0) {
+            check_error();
+        }
+        return DataOverlayFile(overlay);
+    }
+
+    /// Clone this snapshot into an independently owned handle.
+    DataOverlayGroup clone() const {
+        auto* raw = lance_data_overlay_group_clone(handle_.get());
+        if (!raw) check_error();
+        return DataOverlayGroup(raw);
+    }
+
+    const LanceDataOverlayGroup* c_handle() const { return handle_.get(); }
+};
+
 enum class OperationKind : int32_t {
     Unknown             = LANCE_OPERATION_UNKNOWN,
     Append              = LANCE_OPERATION_APPEND,
@@ -860,6 +1036,12 @@ public:
     static Operation make_data_replacement(
         const std::vector<const DataReplacementGroup*>& replacements);
 
+    /// Construct an owned native DataOverlay operation. Group handles are
+    /// borrowed and cloned in input order. Native commit validation remains
+    /// authoritative for fragment existence, coverage and layout.
+    static Operation make_data_overlay(
+        const std::vector<const DataOverlayGroup*>& groups);
+
     /// Construct an owned native Project operation from a native schema.
     /// `preserves_nullability` is stored unchanged as the caller's explicit
     /// assertion that the projection does not tighten nullability; conflict
@@ -892,6 +1074,26 @@ public:
             check_error();
         }
         return DataReplacementGroup(group);
+    }
+
+    /// Number of data overlay groups.
+    uint64_t data_overlay_group_count() const {
+        uint64_t count = 0;
+        if (lance_operation_data_overlay_group_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one data overlay group.
+    DataOverlayGroup data_overlay_group_at(size_t index) const {
+        LanceDataOverlayGroup* group = nullptr;
+        if (lance_operation_data_overlay_group_at(
+                handle_.get(), index, &group) != 0) {
+            check_error();
+        }
+        return DataOverlayGroup(group);
     }
 
     /// Number of updated fragments in a Delete operation.
@@ -2595,6 +2797,11 @@ public:
     /// deletion returns `std::nullopt`.
     std::optional<Fragment> delete_if(const std::string& predicate) const;
 
+    /// Open an overlay writer for this bound fragment. The schema may be a
+    /// compatible subset of the fragment schema. Commit the resulting overlay
+    /// with the dataset read version used to open the writer.
+    FragmentOverlayWriter write_overlay(const LanceSchema& schema) const;
+
     const LanceFragment* c_handle() const { return handle_.get(); }
 };
 
@@ -2814,6 +3021,23 @@ inline Operation Operation::make_data_replacement(
         handles.push_back(replacement->c_handle());
     }
     auto* operation = lance_operation_data_replacement_new(
+        handles.empty() ? nullptr : handles.data(), handles.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline Operation Operation::make_data_overlay(
+    const std::vector<const DataOverlayGroup*>& groups) {
+    std::vector<const LanceDataOverlayGroup*> handles;
+    handles.reserve(groups.size());
+    for (const auto* group : groups) {
+        if (!group) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "data overlay group must not be null");
+        }
+        handles.push_back(group->c_handle());
+    }
+    auto* operation = lance_operation_data_overlay_new(
         handles.empty() ? nullptr : handles.data(), handles.size());
     if (!operation) check_error();
     return Operation(operation);
@@ -8126,6 +8350,69 @@ public:
 
     const LanceBatch* c_handle() const { return handle_.get(); }
 };
+
+/// Move-only owner of a staged fragment overlay writer.
+///
+/// A live writer is closed without finishing on destruction. `finish()` and
+/// `abort()` release the C allocation before invoking consuming native calls.
+class FragmentOverlayWriter {
+    Handle<LanceFragmentOverlayWriter, lance_fragment_overlay_writer_close>
+        handle_;
+
+public:
+    explicit FragmentOverlayWriter(LanceFragmentOverlayWriter* writer)
+        : handle_(writer) {}
+
+    FragmentOverlayWriter(FragmentOverlayWriter&&) noexcept = default;
+    FragmentOverlayWriter& operator=(FragmentOverlayWriter&&) noexcept =
+        default;
+    FragmentOverlayWriter(const FragmentOverlayWriter&) = delete;
+    FragmentOverlayWriter& operator=(const FragmentOverlayWriter&) = delete;
+
+    /// Write one borrowed batch of overlay values.
+    void write_batch(const Batch& batch) {
+        if (lance_fragment_overlay_writer_write_batch(
+                handle_.get(), batch.c_handle()) != 0) {
+            check_error();
+        }
+    }
+
+    /// Finish the staged overlay. Returns `std::nullopt` when the native
+    /// coverage was empty. The writer is consumed on every return.
+    std::optional<DataOverlayGroup> finish() {
+        auto* raw = handle_.release();
+        LanceDataOverlayGroup* group = nullptr;
+        if (lance_fragment_overlay_writer_finish(raw, &group) != 0) {
+            check_error();
+        }
+        if (!group) return std::nullopt;
+        return DataOverlayGroup(group);
+    }
+
+    /// Discard staged data best-effort. The writer is consumed.
+    void abort() {
+        auto* raw = handle_.release();
+        if (raw) lance_fragment_overlay_writer_abort(raw);
+    }
+
+    const LanceFragmentOverlayWriter* c_handle() const {
+        return handle_.get();
+    }
+};
+
+inline FragmentOverlayWriter Fragment::write_overlay(
+    const LanceSchema& schema) const {
+    LanceFragmentOverlayWriter* raw = nullptr;
+    if (lance_fragment_overlay_writer_new(
+            handle_.get(), schema.c_handle(), &raw) != 0) {
+        check_error();
+    }
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "native overlay writer returned NULL on success");
+    }
+    return FragmentOverlayWriter(raw);
+}
 
 // ─── Raw file ownership and snapshots ───────────────────────────────────────
 
