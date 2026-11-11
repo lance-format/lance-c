@@ -3643,7 +3643,8 @@ static void test_native_write_data_options(
     ASSERT(conflict_options != NULL,
            "native blob-conflict options must be constructed");
     CHECK_OK();
-    NativeWriteInput conflict_input = native_write_input(src_uri);
+    NativeWriteInput conflict_input =
+        native_write_external_blob_input(write_uri);
     dataset = NULL;
     rc = native_write_ordinary(
         blob_output_uri,
