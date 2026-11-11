@@ -29,7 +29,7 @@ fn set_shared_library_install_name() {
             // appear in `liblance_c.so`. Hiding archive members keeps the
             // public `lance_*` ABI while preventing dependency symbols from
             // colliding with a `dlopen`-ing host.
-            println!("cargo::rustc-cdylib-link-arg=-Wl,--exclude-libs,ALL");
+            println!("cargo::rustc-cdylib-link-arg=-Wl,--exclude-libs=ALL");
         }
         "macos" | "ios" => {
             // ld64 unions rustc's generated `-exported_symbols_list` with any
