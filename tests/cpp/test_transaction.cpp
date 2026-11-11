@@ -786,11 +786,414 @@ static void test_data_replacement(const std::string& source_uri,
     std::printf("C++ data replacement OK\n");
 }
 
+namespace {
+
+void publication_release_schema(ArrowSchema* schema) {
+    if (schema) schema->release = nullptr;
+}
+
+void publication_release_array(ArrowArray* array) {
+    if (array) array->release = nullptr;
+}
+
+/// Root release callback for the stack-built replacement record batches.
+/// The root owns the child arrays, so releasing the root must release each
+/// child once (notably the prepared descriptor array from the blob writer).
+void publication_release_root_array(ArrowArray* array) {
+    if (!array) return;
+    for (int64_t i = 0; i < array->n_children; ++i) {
+        ArrowArray* child = array->children[i];
+        if (child && child->release) child->release(child);
+    }
+    array->release = nullptr;
+}
+
+struct PublicationRow {
+    uint32_t id = 0;
+    bool blob_is_null = false;
+    std::vector<uint8_t> blob;
+    uint64_t row_id = 0;
+};
+
+int64_t publication_column(const ArrowSchema& schema, const char* name) {
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (std::strcmp(schema.children[i]->name, name) == 0) return i;
+    }
+    std::fprintf(stderr, "missing column %s\n", name);
+    std::exit(1);
+}
+
+std::vector<PublicationRow> read_publication_rows(
+    const lance::Dataset& dataset) {
+    auto scanner = dataset.scan();
+    scanner.with_row_id(true);
+    scanner.blob_handling(LANCE_BLOB_HANDLING_ALL_BINARY);
+    ArrowArrayStream raw{};
+    scanner.to_arrow_stream(&raw);
+    lance::ArrowStream stream(raw);
+
+    ArrowSchema schema{};
+    CHECK(stream->get_schema(stream.get(), &schema) == 0);
+    const int64_t id_column = publication_column(schema, "id");
+    const int64_t blob_column = publication_column(schema, "blob");
+    const int64_t row_id_column = publication_column(schema, "_rowid");
+    CHECK(std::strcmp(schema.children[blob_column]->format, "Z") == 0);
+
+    std::vector<PublicationRow> rows;
+    while (true) {
+        ArrowArray batch{};
+        CHECK(stream->get_next(stream.get(), &batch) == 0);
+        if (!batch.release) break;
+        CHECK(batch.n_children == schema.n_children);
+        const ArrowArray& ids = *batch.children[id_column];
+        const ArrowArray& blobs = *batch.children[blob_column];
+        const ArrowArray& row_ids = *batch.children[row_id_column];
+        CHECK(ids.offset == 0 && blobs.offset == 0 && row_ids.offset == 0);
+        const auto* id_values =
+            static_cast<const uint32_t*>(ids.buffers[1]);
+        const auto* row_id_values =
+            static_cast<const uint64_t*>(row_ids.buffers[1]);
+        const auto* offsets =
+            static_cast<const int64_t*>(blobs.buffers[1]);
+        const auto* data = static_cast<const uint8_t*>(blobs.buffers[2]);
+        const auto* validity =
+            static_cast<const uint8_t*>(blobs.buffers[0]);
+        for (int64_t i = 0; i < batch.length; ++i) {
+            const int64_t index = batch.offset + i;
+            PublicationRow row;
+            row.id = id_values[index];
+            row.row_id = row_id_values[index];
+            const bool valid =
+                !validity || (validity[index / 8] & (1u << (index % 8)));
+            if (valid) {
+                row.blob.assign(data + offsets[index],
+                                data + offsets[index + 1]);
+            } else {
+                row.blob_is_null = true;
+            }
+            rows.push_back(std::move(row));
+        }
+        if (batch.release) batch.release(&batch);
+    }
+    if (schema.release) schema.release(&schema);
+    std::sort(rows.begin(), rows.end(),
+              [](const PublicationRow& a, const PublicationRow& b) {
+                  return a.id < b.id;
+              });
+    return rows;
+}
+
+const PublicationRow& publication_row(const std::vector<PublicationRow>& rows,
+                                      uint32_t id) {
+    for (const auto& row : rows) {
+        if (row.id == id) return row;
+    }
+    std::fprintf(stderr, "missing published row id=%u\n", id);
+    std::exit(1);
+}
+
+void check_publication_blob(const std::vector<PublicationRow>& rows,
+                            uint32_t id,
+                            const std::string& expected) {
+    const auto& row = publication_row(rows, id);
+    CHECK(!row.blob_is_null);
+    CHECK(row.blob == std::vector<uint8_t>(expected.begin(), expected.end()));
+}
+
+void check_publication_null(const std::vector<PublicationRow>& rows,
+                            uint32_t id) {
+    const auto& row = publication_row(rows, id);
+    CHECK(row.blob_is_null);
+    CHECK(row.blob.empty());
+}
+
+struct ReplacementBatch {
+    std::vector<uint32_t> ids;
+    ArrowArray* blob_array;
+};
+
+/// Write one or more pre-finished blob-descriptor batches to a raw Lance file.
+///
+/// The first batch may hold many packed descriptors; a dedicated file is
+/// assembled by appending one-row batches through the same writer. The blob
+/// field comes from `finish_array`, so its native metadata is preserved.
+void write_blob_replacement_file(
+    const std::string& uri,
+    const std::string& filename,
+    const ArrowSchema* blob_field,
+    const std::vector<ReplacementBatch>& batches) {
+    ArrowSchema id_field{};
+    id_field.format = "I";
+    id_field.name = "id";
+    id_field.release = &publication_release_schema;
+
+    ArrowSchema root_schema{};
+    ArrowSchema* schema_children[2] = {
+        &id_field, const_cast<ArrowSchema*>(blob_field)};
+    root_schema.format = "+s";
+    root_schema.name = "";
+    root_schema.n_children = 2;
+    root_schema.children = schema_children;
+    root_schema.release = &publication_release_schema;
+
+    lance::FileSession files("file://" + uri + "/data");
+    lance::FileWriterOptions options;
+    options.version = std::string("2.2");
+    auto writer = files.open_writer(filename, &root_schema, options);
+
+    uint64_t written = 0;
+    for (const auto& replacement : batches) {
+        const void* id_buffers[2] = {nullptr, replacement.ids.data()};
+        ArrowArray id_array{};
+        id_array.length = static_cast<int64_t>(replacement.ids.size());
+        id_array.n_buffers = 2;
+        id_array.buffers = id_buffers;
+        id_array.release = &publication_release_array;
+
+        ArrowArray* array_children[2] = {&id_array, replacement.blob_array};
+        const void* root_buffers[1] = {nullptr};
+        ArrowArray root_array{};
+        root_array.length = static_cast<int64_t>(replacement.ids.size());
+        root_array.n_buffers = 1;
+        root_array.buffers = root_buffers;
+        root_array.n_children = 2;
+        root_array.children = array_children;
+        root_array.release = &publication_release_root_array;
+
+        auto batch = lance::Batch::from_arrow(&root_array, &root_schema);
+        writer.write_batch(batch);
+        written += replacement.ids.size();
+    }
+
+    auto summary = writer.finish();
+    CHECK(summary.num_rows == written);
+}
+
+}  // namespace
+
+static void test_blob_writer_data_replacement(const std::string& blob_uri) {
+    auto dataset = lance::Dataset::open(blob_uri);
+    CHECK(dataset.version() == 3);
+    CHECK(dataset.data_storage_version() == "2.2");
+    CHECK(dataset.has_stable_row_ids());
+    CHECK(dataset.count_rows() == 7);
+    CHECK(dataset.fragment_count() == 3);
+    const auto fragment_ids = dataset.fragment_ids();
+
+    const auto initial = read_publication_rows(dataset);
+    CHECK(initial.size() == 7);
+    check_publication_blob(initial, 0, "old-packed-0");
+    check_publication_null(initial, 1);
+    check_publication_blob(initial, 2, "");
+    check_publication_blob(initial, 3, "old-dedicated-3");
+    check_publication_blob(initial, 4, "old-dedicated-4");
+    check_publication_blob(initial, 5, "keep-c5");
+    check_publication_blob(initial, 6, "keep-c6");
+
+    CHECK(dataset.delete_rows("id = 1") == 1);
+    CHECK(dataset.version() == 4);
+    CHECK(dataset.count_rows() == 6);
+    const auto before = read_publication_rows(dataset);
+    CHECK(before.size() == 6);
+    check_publication_blob(before, 0, "old-packed-0");
+    check_publication_blob(before, 2, "");
+    check_publication_blob(before, 3, "old-dedicated-3");
+    check_publication_blob(before, 4, "old-dedicated-4");
+
+    const std::string packed_name = "cpp-packed-publication.lance";
+    const std::string dedicated_name = "cpp-dedicated-publication.lance";
+    lance::FileSession files("file://" + blob_uri + "/data");
+
+    std::vector<uint8_t> packed_validity(1, 0x05);
+    std::vector<int32_t> packed_offsets{0};
+    std::vector<uint8_t> packed_data;
+    auto append_packed = [&](const char* value) {
+        packed_data.insert(packed_data.end(), value, value + std::strlen(value));
+        packed_offsets.push_back(static_cast<int32_t>(packed_data.size()));
+    };
+    append_packed("new-packed-0");
+    packed_offsets.push_back(static_cast<int32_t>(packed_data.size()));
+    packed_offsets.push_back(static_cast<int32_t>(packed_data.size()));
+    const void* packed_buffers[3] = {
+        packed_validity.data(), packed_offsets.data(), packed_data.data()};
+    ArrowArray packed_payloads{};
+    packed_payloads.length = 3;
+    packed_payloads.null_count = 1;
+    packed_payloads.n_buffers = 3;
+    packed_payloads.buffers = packed_buffers;
+    packed_payloads.release = &publication_release_array;
+    ArrowSchema packed_payload_schema{};
+    packed_payload_schema.format = "z";
+    packed_payload_schema.name = "blob";
+    packed_payload_schema.flags = 2;
+    packed_payload_schema.release = &publication_release_schema;
+
+    auto packed_writer = files.open_packed_blob_writer(packed_name, 7001);
+    CHECK(packed_writer.blob_id() == 7001);
+    const std::string packed_sidecar = packed_writer.path();
+    CHECK(packed_sidecar != packed_name);
+    packed_writer.write_blobs(&packed_payloads, &packed_payload_schema);
+    CHECK(packed_payloads.release == nullptr);
+    CHECK(packed_payload_schema.release != nullptr);
+    ArrowArray packed_array{};
+    ArrowSchema packed_field{};
+    packed_writer.finish_array("blob", &packed_array, &packed_field);
+    CHECK(packed_array.length == 3);
+    CHECK(packed_field.release != nullptr);
+
+    ArrowArray dedicated_a{};
+    ArrowSchema dedicated_a_field{};
+    ArrowArray dedicated_b{};
+    ArrowSchema dedicated_b_field{};
+    std::string dedicated_sidecar_a;
+    std::string dedicated_sidecar_b;
+    {
+        const std::string payload = "new-dedicated-3";
+        auto writer =
+            files.open_dedicated_blob_writer(dedicated_name, 7002);
+        CHECK(writer.blob_id() == 7002);
+        dedicated_sidecar_a = writer.path();
+        writer.write(reinterpret_cast<const uint8_t*>(payload.data()),
+                     payload.size());
+        writer.finish_array("blob", &dedicated_a, &dedicated_a_field);
+        CHECK(dedicated_a.length == 1);
+    }
+    {
+        const std::string payload = "new-dedicated-4";
+        auto writer =
+            files.open_dedicated_blob_writer(dedicated_name, 7003);
+        CHECK(writer.blob_id() == 7003);
+        dedicated_sidecar_b = writer.path();
+        writer.write(reinterpret_cast<const uint8_t*>(payload.data()),
+                     payload.size());
+        writer.finish_array("blob", &dedicated_b, &dedicated_b_field);
+        CHECK(dedicated_b.length == 1);
+    }
+    CHECK(dedicated_sidecar_a != dedicated_sidecar_b);
+    CHECK(dedicated_sidecar_a != packed_sidecar);
+
+    write_blob_replacement_file(
+        blob_uri, packed_name, &packed_field,
+        {ReplacementBatch{{0, 1, 2}, &packed_array}});
+    CHECK(packed_array.release == nullptr);
+    write_blob_replacement_file(
+        blob_uri, dedicated_name, &dedicated_a_field,
+        {ReplacementBatch{{3}, &dedicated_a},
+         ReplacementBatch{{4}, &dedicated_b}});
+    CHECK(dedicated_a.release == nullptr);
+    CHECK(dedicated_b.release == nullptr);
+    if (packed_field.release) packed_field.release(&packed_field);
+    if (dedicated_a_field.release) {
+        dedicated_a_field.release(&dedicated_a_field);
+    }
+    if (dedicated_b_field.release) {
+        dedicated_b_field.release(&dedicated_b_field);
+    }
+
+    auto packed_file = dataset.create_data_file(packed_name);
+    auto dedicated_file = dataset.create_data_file(dedicated_name);
+    CHECK(packed_file.path() == packed_name);
+    CHECK(dedicated_file.path() == dedicated_name);
+    CHECK(packed_file.file_version() ==
+          std::make_pair(uint32_t{2}, uint32_t{2}));
+    CHECK(dedicated_file.file_version() ==
+          std::make_pair(uint32_t{2}, uint32_t{2}));
+    CHECK(!packed_file.fields().empty());
+    CHECK(packed_file.fields() == dedicated_file.fields());
+    CHECK(!packed_file.column_indices().empty());
+    CHECK(packed_file.column_indices() == dedicated_file.column_indices());
+    CHECK(packed_file.file_size().has_value() && *packed_file.file_size() > 0);
+    CHECK(dedicated_file.file_size().has_value() &&
+          *dedicated_file.file_size() > 0);
+    CHECK(!packed_file.base_id().has_value());
+    CHECK(!dedicated_file.base_id().has_value());
+
+    auto packed_group =
+        lance::DataReplacementGroup(fragment_ids[0], packed_file);
+    auto dedicated_group =
+        lance::DataReplacementGroup(fragment_ids[1], dedicated_file);
+    auto operation = lance::Operation::make_data_replacement(
+        {&packed_group, &dedicated_group});
+    CHECK(operation.data_replacement_count() == 2);
+    CHECK(operation.data_replacement_at(0).fragment_id() == fragment_ids[0]);
+    CHECK(operation.data_replacement_at(1).fragment_id() == fragment_ids[1]);
+
+    lance::CommitOptions commit_options;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = lance::CommitTimeoutMode::Disabled;
+    auto committed = lance::Dataset::commit(
+        blob_uri,
+        lance::Transaction::from_operation(dataset.version(), operation),
+        commit_options);
+    CHECK(committed.version() == dataset.version() + 1);
+    CHECK(committed.count_rows() == 6);
+    CHECK(committed.fragment_count() == 3);
+    CHECK(committed.fragment_ids() == fragment_ids);
+
+    auto history = committed.read_transaction();
+    CHECK(history.has_value());
+    CHECK(history->operation().data_replacement_count() == 2);
+
+    auto first = committed.open_fragment(fragment_ids[0]);
+    CHECK(first.physical_rows() == 3);
+    CHECK(first.deleted_rows() == 1);
+    CHECK(first.logical_rows() == 2);
+    auto second = committed.open_fragment(fragment_ids[1]);
+    CHECK(second.physical_rows() == 2);
+    CHECK(second.deleted_rows() == 0);
+    CHECK(second.logical_rows() == 2);
+    auto third = committed.open_fragment(fragment_ids[2]);
+    CHECK(third.physical_rows() == 2);
+    CHECK(third.logical_rows() == 2);
+
+    const auto after = read_publication_rows(committed);
+    CHECK(after.size() == 6);
+    check_publication_blob(after, 0, "new-packed-0");
+    check_publication_blob(after, 2, "");
+    check_publication_blob(after, 3, "new-dedicated-3");
+    check_publication_blob(after, 4, "new-dedicated-4");
+    check_publication_blob(after, 5, "keep-c5");
+    check_publication_blob(after, 6, "keep-c6");
+    for (const auto& row : before) {
+        CHECK(publication_row(after, row.id).row_id == row.row_id);
+    }
+
+    auto old_after_delete = lance::Dataset::open(blob_uri, {}, 4);
+    CHECK(old_after_delete.version() == 4);
+    const auto old_rows = read_publication_rows(old_after_delete);
+    check_publication_blob(old_rows, 0, "old-packed-0");
+    check_publication_blob(old_rows, 3, "old-dedicated-3");
+    auto pristine = lance::Dataset::open(blob_uri, {}, 3);
+    CHECK(pristine.count_rows() == 7);
+    const auto pristine_rows = read_publication_rows(pristine);
+    check_publication_blob(pristine_rows, 0, "old-packed-0");
+    check_publication_null(pristine_rows, 1);
+
+    const std::vector<uint64_t> live_indices{0, 1, 2, 3, 4, 5};
+    auto blobs = committed.take_blobs_by_indices(
+        live_indices.data(), live_indices.size(), "blob");
+    CHECK(blobs.size() == 6);
+    const std::vector<std::string> expected{
+        "new-packed-0", "", "new-dedicated-3", "new-dedicated-4",
+        "keep-c5", "keep-c6"};
+    for (size_t i = 0; i < expected.size(); ++i) {
+        CHECK(blobs[i].has_value());
+        CHECK(blobs[i]->size() == expected[i].size());
+        const auto bytes = blobs[i]->read();
+        CHECK(bytes == std::vector<uint8_t>(expected[i].begin(),
+                                            expected[i].end()));
+    }
+    const std::vector<uint8_t> expected_range{'p', 'a', 'c', 'k', 'e', 'd', '-'};
+    CHECK(blobs[0]->read_range(4, 7) == expected_range);
+
+    std::printf("C++ blob writer publication OK\n");
+}
+
 int main(int argc, char** argv) {
-    if (argc != 4) {
+    if (argc != 5) {
         std::fprintf(stderr,
                      "usage: %s <source-dataset-uri> <base-path> "
-                     "<native-schema-uri>\n",
+                     "<native-schema-uri> <blob-publication-uri>\n",
                      argv[0]);
         return 2;
     }
@@ -802,6 +1205,7 @@ int main(int argc, char** argv) {
         test_data_replacement(argv[1], argv[2]);
 
         test_native_schema(argv[3]);
+        test_blob_writer_data_replacement(argv[4]);
     } catch (const lance::Error& error) {
         std::fprintf(stderr, "lance::Error(%d): %s\n",
                      static_cast<int>(error.code), error.what());
