@@ -932,6 +932,142 @@ static void test_take_blobs(const std::string& blob_uri) {
     PASS();
 }
 
+static void test_blob_native_read_slice(const std::string& blob_uri) {
+    TEST(test_blob_native_read_slice);
+
+    std::vector<std::optional<lance::BlobFile>> addressed_survivors;
+    {
+        auto ds = lance::Dataset::open(blob_uri);
+        uint64_t addresses[] = {
+            0,
+            (uint64_t{1} << 32) | 2,
+            (uint64_t{1} << 32) | 1,
+            3,
+            4,
+            0,
+        };
+        addressed_survivors =
+            ds.take_blobs_by_addresses(addresses, 6, "blob");
+        assert(addressed_survivors.size() == 6);
+        const uint64_t sizes[] = {8, 1024, 128, 0, 0, 8};
+        for (size_t i = 0; i < 6; i++) {
+            if (i == 4) {
+                assert(!addressed_survivors[i].has_value());
+            } else {
+                assert(addressed_survivors[i].has_value());
+                assert(addressed_survivors[i]->size() == sizes[i]);
+            }
+        }
+
+        // Empty by-address selections still validate the column natively.
+        bool unknown_column = false;
+        try {
+            ds.take_blobs_by_addresses(nullptr, 0, "does_not_exist");
+        } catch (const lance::Error& error) {
+            unknown_column = error.code == LANCE_ERR_INTERNAL;
+        }
+        assert(unknown_column);
+
+        bool non_blob = false;
+        try {
+            ds.take_blobs_by_addresses(nullptr, 0, "raw");
+        } catch (const lance::Error& error) {
+            non_blob = error.code == LANCE_ERR_INVALID_ARGUMENT;
+        }
+        assert(non_blob);
+
+        // The old C++ take wrapper keeps its empty-selection shortcut.
+        auto legacy = ds.take_blobs(nullptr, 0, "does_not_exist");
+        assert(legacy.empty());
+
+        uint64_t invalid_addresses[] = {0, UINT64_MAX - 1};
+        bool invalid_address = false;
+        try {
+            ds.take_blobs_by_addresses(invalid_addresses, 2, "blob");
+        } catch (const lance::Error& error) {
+            invalid_address = error.code == LANCE_ERR_INVALID_ARGUMENT;
+        }
+        assert(invalid_address);
+    }
+
+    // The dataset is gone; every handle still owns its reader.
+    for (size_t i = 0; i < addressed_survivors.size(); i++) {
+        if (i == 4) continue;
+        assert(addressed_survivors[i].has_value());
+        if (i == 5) {
+            assert(addressed_survivors[i]->tell() == 0);
+        }
+        assert_blob_payload(addressed_survivors[i]->read(), 0);
+    }
+
+    lance::BlobFile& packed = *addressed_survivors[2];
+    packed.seek(5);
+    std::vector<lance::BlobRange> ranges = {
+        {100, 20},
+        {128, 0},
+        {40, 16},
+        {100, 8},
+        {127, 1},
+        {0, 128},
+    };
+    auto parts = packed.read_ranges(ranges);
+    assert(parts.size() == ranges.size());
+    const size_t sizes[] = {20, 0, 16, 8, 1, 128};
+    for (size_t i = 0; i < parts.size(); i++) {
+        assert(parts[i].size() == sizes[i]);
+        assert_blob_payload(parts[i], ranges[i].offset);
+    }
+    assert(packed.tell() == 5);
+    assert(packed.read_ranges(std::vector<lance::BlobRange>{}).empty());
+    assert(packed.tell() == 5);
+
+    // read_into reuses the C read_up_to path and reports EOF as zero bytes.
+    packed.seek(120);
+    std::array<uint8_t, 16> tail{};
+    size_t bytes_read = packed.read_into(tail.data(), tail.size());
+    assert(bytes_read == 8);
+    std::vector<uint8_t> tail_bytes(tail.begin(), tail.begin() + 8);
+    assert_blob_payload(tail_bytes, 120);
+    assert(packed.tell() == 128);
+    assert(packed.read_into(nullptr, 0) == 0);
+
+    packed.set_buffer_size(0);
+    packed.set_buffer_size(64);
+    assert(!packed.closed());
+    packed.close();
+    assert(packed.closed());
+    assert(packed.size() == 128);
+    packed.close();
+    assert(packed.closed());
+
+    bool set_buffer_failed = false;
+    try {
+        packed.set_buffer_size(32);
+    } catch (const lance::Error& error) {
+        set_buffer_failed = error.code == LANCE_ERR_INVALID_ARGUMENT;
+    }
+    assert(set_buffer_failed);
+
+    bool ranges_failed = false;
+    try {
+        packed.read_ranges(std::vector<lance::BlobRange>{});
+    } catch (const lance::Error& error) {
+        ranges_failed = error.code == LANCE_ERR_INVALID_ARGUMENT;
+    }
+    assert(ranges_failed);
+    assert(packed.read_range(0, 0).empty());
+
+    bool read_into_failed = false;
+    try {
+        packed.read_into(tail.data(), 1);
+    } catch (const lance::Error& error) {
+        read_into_failed = error.code == LANCE_ERR_INVALID_ARGUMENT;
+    }
+    assert(read_into_failed);
+
+    PASS();
+}
+
 static void test_dataset_take(const std::string& uri) {
     TEST(test_dataset_take);
 
@@ -3777,6 +3913,7 @@ int main(int argc, char** argv) {
     test_scanner_async_stream_ownership(uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
+    test_blob_native_read_slice(blob_uri);
     test_dataset_take(uri);
     test_dataset_take_rows(uri);
     test_raii_cleanup(uri);
