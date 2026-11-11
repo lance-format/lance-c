@@ -1780,13 +1780,45 @@ fn storage_provider_none_some_empty_error_expiry_and_force() {
         lance_storage_options_accessor_close(accessor);
         lance_storage_options_provider_close(provider);
     }
+    assert_eq!(
+        counters.provider_releases.load(Ordering::SeqCst),
+        0,
+        "the native S3 object store retains the provider after C handles close"
+    );
+    drop(provider_id);
+
+    let root = tempfile::tempdir().unwrap();
+    let counters = ProviderCounters::default();
+    let context = ProviderTestContext {
+        counters: counters.clone(),
+        fetch_options: None,
+        force_options: None,
+        error: None,
+        expires_at_millis: None,
+        refresh_offset_millis: None,
+    };
+    let (provider, counters, provider_id) = create_test_provider(context, false);
+    let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), provider) };
+    let local_uri = c_string(&format!("file://{}", root.path().display()));
+    let local_session =
+        unsafe { lance_file_session_new(local_uri.as_ptr(), accessor, ptr::null(), ptr::null()) };
+    assert!(!local_session.is_null());
+    unsafe {
+        lance_file_session_close(local_session);
+        lance_storage_options_accessor_close(accessor);
+        lance_storage_options_provider_close(provider);
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while counters.provider_releases.load(Ordering::SeqCst) == 0
         && std::time::Instant::now() < deadline
     {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(counters.provider_releases.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        counters.provider_releases.load(Ordering::SeqCst),
+        1,
+        "file-backed registry ownership must release the provider exactly once"
+    );
     drop(provider_id);
 
     let counters = ProviderCounters::default();
