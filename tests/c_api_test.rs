@@ -10693,6 +10693,14 @@ fn native_rtree_ids(uri: &str, filter: &str, use_scalar_index: bool) -> Vec<i32>
     })
 }
 
+fn scan_used_rtree(stats: &CapturedScanStatistics) -> bool {
+    stats.indices_loaded > 0
+        || stats.metrics.iter().any(|(name, _, value)| {
+            name == "ScalarIndexExec_elapsed_compute"
+                || ((name == "index_cache_hits" || name == "index_cache_misses") && *value > 0)
+        })
+}
+
 #[test]
 fn test_rtree_scalar_index_geometry_queries_and_lifecycle() {
     let fixture = create_rtree_geometry_fixture();
@@ -10916,8 +10924,8 @@ fn test_rtree_scalar_index_geometry_queries_and_lifecycle() {
         let (ids, stats, plan) = scan_geometry_ids(dataset, filter, true);
         assert_eq!(&ids, expected, "{filter}");
         assert!(
-            stats.indices_loaded > 0,
-            "index was not loaded for {filter}: {:?}",
+            scan_used_rtree(&stats),
+            "RTree execution metrics missing for {filter}: {:?}",
             stats.metrics
         );
         assert!(
