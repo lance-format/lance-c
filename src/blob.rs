@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Blob v2 C API: take per-row blob handles and read their bytes.
+//! Blob v2 C API: construct blob fields and prepared descriptor arrays, take
+//! per-row blob handles, and read their bytes.
 //!
 //! A [`LanceBlobFile`] wraps an upstream `BlobFile`, so it stays usable after
 //! the dataset handle is closed. [`lance_blob_file_read`] and
@@ -9,10 +10,17 @@
 //! [`lance_blob_file_read_range`] and [`lance_blob_file_read_ranges`] do not.
 
 use std::ffi::c_char;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::ptr;
 
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, to_ffi};
+use arrow_schema::Field;
 use lance::dataset::BlobFile;
+use lance::{
+    BlobDescriptor, BlobDescriptorArrayBuilder, BlobFieldOptions, BlobRange, blob_field,
+    blob_field_with_options,
+};
 use lance_core::Result;
 
 use crate::dataset::LanceDataset;
@@ -25,6 +33,26 @@ pub struct LanceBlobFile {
     inner: BlobFile,
 }
 
+/// Native blob-field storage thresholds.
+///
+/// The `has_*` flags distinguish an absent native `Option` from an explicit
+/// value. `inline_size_threshold = 0` is valid; an enabled dedicated
+/// threshold of zero cannot be represented by native `NonZeroUsize` and is
+/// rejected.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LanceBlobFieldOptions {
+    /// Whether `inline_size_threshold` is present.
+    pub has_inline_size_threshold: bool,
+    /// Maximum payload size kept inline in the data file.
+    pub inline_size_threshold: u64,
+    /// Whether `dedicated_size_threshold` is present.
+    pub has_dedicated_size_threshold: bool,
+    /// Maximum payload size stored in packed storage before using dedicated
+    /// storage. Must be non-zero when present.
+    pub dedicated_size_threshold: u64,
+}
+
 /// One blob-relative read range for [`lance_blob_file_read_ranges`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +61,543 @@ pub struct LanceBlobRange {
     pub offset: u64,
     /// Number of bytes to read.
     pub length: u64,
+}
+
+/// Opaque owner of one native [`BlobDescriptorArrayBuilder`].
+///
+/// The prepared field is retained separately so `field` remains available
+/// after the consuming native `finish`. There is no second descriptor list or
+/// builder state: `inner` is `Some` until `finish` consumes it.
+pub struct LanceBlobDescriptorArrayBuilder {
+    field: Field,
+    inner: Option<BlobDescriptorArrayBuilder>,
+}
+
+// ---------------------------------------------------------------------------
+// Blob v2 field construction
+// ---------------------------------------------------------------------------
+
+fn blob_field_options_from_ffi(options: *const LanceBlobFieldOptions) -> Result<BlobFieldOptions> {
+    let mut native = BlobFieldOptions::default();
+    if options.is_null() {
+        return Ok(native);
+    }
+
+    let options = unsafe { &*options };
+    if options.has_inline_size_threshold {
+        let threshold = usize::try_from(options.inline_size_threshold).map_err(|_| {
+            lance_core::Error::invalid_input(format!(
+                "inline_size_threshold {} exceeds usize::MAX on this platform",
+                options.inline_size_threshold
+            ))
+        })?;
+        native.inline_size_threshold = Some(threshold);
+    }
+    if options.has_dedicated_size_threshold {
+        let threshold = usize::try_from(options.dedicated_size_threshold).map_err(|_| {
+            lance_core::Error::invalid_input(format!(
+                "dedicated_size_threshold {} exceeds usize::MAX on this platform",
+                options.dedicated_size_threshold
+            ))
+        })?;
+        let threshold = NonZeroUsize::new(threshold).ok_or_else(|| {
+            lance_core::Error::invalid_input(
+                "dedicated_size_threshold must be greater than 0 when present",
+            )
+        })?;
+        native.dedicated_size_threshold = Some(threshold);
+    }
+    Ok(native)
+}
+
+unsafe fn blob_field_inner(
+    name: *const c_char,
+    nullable: bool,
+    options: *const LanceBlobFieldOptions,
+    out: *mut FFI_ArrowSchema,
+) -> Result<i32> {
+    if name.is_null() {
+        return Err(lance_core::Error::invalid_input("name must not be NULL"));
+    }
+    if out.is_null() {
+        return Err(lance_core::Error::invalid_input("out must not be NULL"));
+    }
+    let name = unsafe { helpers::parse_c_string(name)? }
+        .expect("name was checked for NULL above")
+        .to_string();
+    let options = blob_field_options_from_ffi(options)?;
+    let field = blob_field_with_options(&name, nullable, options);
+    let ffi_field = FFI_ArrowSchema::try_from(&field)?;
+    unsafe { ptr::write_unaligned(out, ffi_field) };
+    Ok(0)
+}
+
+/// Construct a blob v2 field with native default storage thresholds.
+///
+/// See `lance.h` for the complete contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_field(
+    name: *const c_char,
+    nullable: bool,
+    out: *mut FFI_ArrowSchema,
+) -> i32 {
+    ffi_try!(
+        unsafe { blob_field_inner(name, nullable, ptr::null(), out) },
+        neg
+    )
+}
+
+/// Construct a blob v2 field with explicit native storage thresholds.
+///
+/// `options == NULL` selects native defaults. See `lance.h` for the complete
+/// contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_field_with_options(
+    name: *const c_char,
+    nullable: bool,
+    options: *const LanceBlobFieldOptions,
+    out: *mut FFI_ArrowSchema,
+) -> i32 {
+    ffi_try!(
+        unsafe { blob_field_inner(name, nullable, options, out) },
+        neg
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Prepared blob descriptor arrays
+// ---------------------------------------------------------------------------
+
+unsafe fn descriptor_builder_ref<'a>(
+    builder: *const LanceBlobDescriptorArrayBuilder,
+) -> Result<&'a LanceBlobDescriptorArrayBuilder> {
+    if builder.is_null() {
+        return Err(lance_core::Error::invalid_input("builder must not be NULL"));
+    }
+    Ok(unsafe { &*builder })
+}
+
+unsafe fn descriptor_builder_mut<'a>(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+) -> Result<&'a mut LanceBlobDescriptorArrayBuilder> {
+    if builder.is_null() {
+        return Err(lance_core::Error::invalid_input("builder must not be NULL"));
+    }
+    Ok(unsafe { &mut *builder })
+}
+
+fn native_descriptor_builder_mut(
+    state: &mut LanceBlobDescriptorArrayBuilder,
+) -> Result<&mut BlobDescriptorArrayBuilder> {
+    state.inner.as_mut().ok_or_else(|| {
+        lance_core::Error::invalid_input(
+            "blob descriptor array builder is already finished; field remains available",
+        )
+    })
+}
+
+/// Create a native prepared blob descriptor array builder.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_new(
+    column: *const c_char,
+) -> *mut LanceBlobDescriptorArrayBuilder {
+    ffi_try!(
+        unsafe { blob_descriptor_array_builder_new_inner(column) },
+        null
+    )
+}
+
+unsafe fn blob_descriptor_array_builder_new_inner(
+    column: *const c_char,
+) -> Result<*mut LanceBlobDescriptorArrayBuilder> {
+    if column.is_null() {
+        return Err(lance_core::Error::invalid_input("column must not be NULL"));
+    }
+    let column = unsafe { helpers::parse_c_string(column)? }
+        .expect("column was checked for NULL above")
+        .to_string();
+    let inner = BlobDescriptorArrayBuilder::new(column);
+    let field = inner.field().clone();
+    Ok(Box::into_raw(Box::new(LanceBlobDescriptorArrayBuilder {
+        field,
+        inner: Some(inner),
+    })))
+}
+
+/// Export the builder's native prepared Arrow field.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_field(
+    builder: *const LanceBlobDescriptorArrayBuilder,
+    out: *mut FFI_ArrowSchema,
+) -> i32 {
+    ffi_try!(
+        unsafe { blob_descriptor_array_builder_field_inner(builder, out) },
+        neg
+    )
+}
+
+unsafe fn blob_descriptor_array_builder_field_inner(
+    builder: *const LanceBlobDescriptorArrayBuilder,
+    out: *mut FFI_ArrowSchema,
+) -> Result<i32> {
+    let builder = unsafe { descriptor_builder_ref(builder)? };
+    if out.is_null() {
+        return Err(lance_core::Error::invalid_input("out must not be NULL"));
+    }
+    let ffi_field = FFI_ArrowSchema::try_from(&builder.field)?;
+    unsafe { ptr::write_unaligned(out, ffi_field) };
+    Ok(0)
+}
+
+/// Append an inline blob value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_append_inline(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    ffi_try!(
+        unsafe { blob_descriptor_array_builder_append_inline_inner(builder, data, len) },
+        neg
+    )
+}
+
+unsafe fn blob_descriptor_array_builder_append_inline_inner(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    data: *const u8,
+    len: usize,
+) -> Result<i32> {
+    let state = unsafe { descriptor_builder_mut(builder)? };
+    let inner = native_descriptor_builder_mut(state)?;
+    if data.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input(format!(
+            "data must not be NULL when len = {len}"
+        )));
+    }
+    let bytes = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    inner.push_inline(bytes)?;
+    Ok(0)
+}
+
+/// Append a null blob value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_append_null(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+) -> i32 {
+    ffi_try!(
+        unsafe { blob_descriptor_array_builder_append_null_inner(builder) },
+        neg
+    )
+}
+
+unsafe fn blob_descriptor_array_builder_append_null_inner(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+) -> Result<i32> {
+    let state = unsafe { descriptor_builder_mut(builder)? };
+    native_descriptor_builder_mut(state)?.push_null()?;
+    Ok(0)
+}
+
+/// Append one packed blob descriptor.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_append_packed(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    blob_id: u32,
+    offset: u64,
+    length: u64,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            blob_descriptor_array_builder_append_packed_inner(builder, blob_id, offset, length)
+        },
+        neg
+    )
+}
+
+unsafe fn blob_descriptor_array_builder_append_packed_inner(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    blob_id: u32,
+    offset: u64,
+    length: u64,
+) -> Result<i32> {
+    let state = unsafe { descriptor_builder_mut(builder)? };
+    native_descriptor_builder_mut(state)?.push_packed(
+        blob_id,
+        BlobRange {
+            offset,
+            size: length,
+        },
+    )?;
+    Ok(0)
+}
+
+/// Append one packed descriptor per element of a foreign range array.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_extend_packed(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    blob_id: u32,
+    ranges: *const LanceBlobRange,
+    num_ranges: usize,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            blob_descriptor_array_builder_extend_packed_inner(builder, blob_id, ranges, num_ranges)
+        },
+        neg
+    )
+}
+
+unsafe fn blob_descriptor_array_builder_extend_packed_inner(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    blob_id: u32,
+    ranges: *const LanceBlobRange,
+    num_ranges: usize,
+) -> Result<i32> {
+    let state = unsafe { descriptor_builder_mut(builder)? };
+    let inner = native_descriptor_builder_mut(state)?;
+    if num_ranges > 0 && ranges.is_null() {
+        return Err(lance_core::Error::invalid_input(format!(
+            "ranges must not be NULL when num_ranges = {num_ranges}"
+        )));
+    }
+    let ranges = if num_ranges == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ranges, num_ranges) }
+    };
+    // Native pushes one range at a time. A later validation failure therefore
+    // keeps the successfully appended prefix, exactly as the native builder.
+    for range in ranges {
+        inner.push_packed(
+            blob_id,
+            BlobRange {
+                offset: range.offset,
+                size: range.length,
+            },
+        )?;
+    }
+    Ok(0)
+}
+
+/// Append one dedicated blob descriptor.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_append_dedicated(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    blob_id: u32,
+    length: u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { blob_descriptor_array_builder_append_dedicated_inner(builder, blob_id, length) },
+        neg
+    )
+}
+
+unsafe fn blob_descriptor_array_builder_append_dedicated_inner(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    blob_id: u32,
+    length: u64,
+) -> Result<i32> {
+    let state = unsafe { descriptor_builder_mut(builder)? };
+    native_descriptor_builder_mut(state)?.push_dedicated(blob_id, length)?;
+    Ok(0)
+}
+
+/// Append one managed descriptor, preserving `None` versus `Some(0)` base IDs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_append_managed(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    uri: *const c_char,
+    offset: u64,
+    length: u64,
+    has_base_id: bool,
+    base_id: u32,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            blob_descriptor_array_builder_append_managed_inner(
+                builder,
+                uri,
+                offset,
+                length,
+                has_base_id,
+                base_id,
+            )
+        },
+        neg
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn blob_descriptor_array_builder_append_managed_inner(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    uri: *const c_char,
+    offset: u64,
+    length: u64,
+    has_base_id: bool,
+    base_id: u32,
+) -> Result<i32> {
+    let state = unsafe { descriptor_builder_mut(builder)? };
+    let inner = native_descriptor_builder_mut(state)?;
+    if uri.is_null() {
+        return Err(lance_core::Error::invalid_input("uri must not be NULL"));
+    }
+    let uri = unsafe { helpers::parse_c_string(uri)? }
+        .expect("uri was checked for NULL above")
+        .to_string();
+    inner.push(BlobDescriptor::Managed {
+        base_id: has_base_id.then_some(base_id),
+        uri,
+        offset,
+        size: length,
+    })?;
+    Ok(0)
+}
+
+/// Append one external descriptor with an explicit base ID.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_append_external(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    base_id: u32,
+    uri: *const c_char,
+    offset: u64,
+    length: u64,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            blob_descriptor_array_builder_append_external_inner(
+                builder, base_id, uri, offset, length,
+            )
+        },
+        neg
+    )
+}
+
+unsafe fn blob_descriptor_array_builder_append_external_inner(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    base_id: u32,
+    uri: *const c_char,
+    offset: u64,
+    length: u64,
+) -> Result<i32> {
+    let state = unsafe { descriptor_builder_mut(builder)? };
+    let inner = native_descriptor_builder_mut(state)?;
+    if uri.is_null() {
+        return Err(lance_core::Error::invalid_input("uri must not be NULL"));
+    }
+    let uri = unsafe { helpers::parse_c_string(uri)? }
+        .expect("uri was checked for NULL above")
+        .to_string();
+    inner.push(BlobDescriptor::External {
+        base_id,
+        uri,
+        offset,
+        size: length,
+    })?;
+    Ok(0)
+}
+
+/// Append an external descriptor through native `push_external`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_push_external(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    uri: *const c_char,
+    has_range: bool,
+    offset: u64,
+    length: u64,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            blob_descriptor_array_builder_push_external_inner(
+                builder, uri, has_range, offset, length,
+            )
+        },
+        neg
+    )
+}
+
+unsafe fn blob_descriptor_array_builder_push_external_inner(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    uri: *const c_char,
+    has_range: bool,
+    offset: u64,
+    length: u64,
+) -> Result<i32> {
+    let state = unsafe { descriptor_builder_mut(builder)? };
+    let inner = native_descriptor_builder_mut(state)?;
+    if uri.is_null() {
+        return Err(lance_core::Error::invalid_input("uri must not be NULL"));
+    }
+    let uri = unsafe { helpers::parse_c_string(uri)? }
+        .expect("uri was checked for NULL above")
+        .to_string();
+    let range = has_range.then_some(BlobRange {
+        offset,
+        size: length,
+    });
+    inner.push_external(uri, range)?;
+    Ok(0)
+}
+
+/// Finish and export the native prepared descriptor array and field.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_finish(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> i32 {
+    ffi_try!(
+        unsafe { blob_descriptor_array_builder_finish_inner(builder, out_array, out_schema) },
+        neg
+    )
+}
+
+unsafe fn blob_descriptor_array_builder_finish_inner(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> Result<i32> {
+    let state = unsafe { descriptor_builder_mut(builder)? };
+    if out_array.is_null() || out_schema.is_null() {
+        return Err(lance_core::Error::invalid_input(
+            "out_array and out_schema must not be NULL",
+        ));
+    }
+
+    // Native finish consumes the builder. Drop our owner before calling it so
+    // every later append observes the finished state even if finish fails.
+    let inner = state.inner.take().ok_or_else(|| {
+        lance_core::Error::invalid_input(
+            "blob descriptor array builder is already finished; field remains available",
+        )
+    })?;
+    let (field, array) = inner.finish()?.into_parts();
+    let (ffi_array, generated_schema) = to_ffi(&array.to_data())?;
+    // The generated schema carries only the array's data type. Replace it with
+    // the native prepared field so extension and threshold metadata survive.
+    drop(generated_schema);
+    let ffi_schema = FFI_ArrowSchema::try_from(&field)?;
+    unsafe {
+        ptr::write_unaligned(out_array, ffi_array);
+        ptr::write_unaligned(out_schema, ffi_schema);
+    }
+    Ok(0)
+}
+
+/// Free a descriptor builder's opaque allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_blob_descriptor_array_builder_close(
+    builder: *mut LanceBlobDescriptorArrayBuilder,
+) {
+    if builder.is_null() {
+        return;
+    }
+    swallow_unwind("lance_blob_descriptor_array_builder_close", || unsafe {
+        drop(Box::from_raw(builder));
+    });
 }
 
 /// Row addressing used by a take entry point.

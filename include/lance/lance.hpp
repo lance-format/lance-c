@@ -1177,6 +1177,186 @@ struct BlobRange {
     uint64_t length;
 };
 
+/// Native storage thresholds for `blob_field`.
+///
+/// An engaged inline threshold of zero is valid. An engaged dedicated
+/// threshold must be non-zero. Values not representable by `size_t` are
+/// rejected by the C boundary.
+struct BlobFieldOptions {
+    std::optional<size_t> inline_size_threshold;
+    std::optional<size_t> dedicated_size_threshold;
+};
+
+/// Export the native blob v2 field with default storage thresholds.
+///
+/// `out` is caller-owned and must be released exactly once. It is written only
+/// on success.
+inline void blob_field(
+    const std::string& name,
+    bool nullable,
+    ArrowSchema* out) {
+    if (lance_blob_field(name.c_str(), nullable, out) != 0) check_error();
+}
+
+/// Export the native blob v2 field with explicit storage thresholds.
+///
+/// `out` is caller-owned and must be released exactly once. It is written only
+/// on success.
+inline void blob_field_with_options(
+    const std::string& name,
+    bool nullable,
+    const BlobFieldOptions& options,
+    ArrowSchema* out) {
+    LanceBlobFieldOptions raw{};
+    if (options.inline_size_threshold) {
+        raw.has_inline_size_threshold = true;
+        raw.inline_size_threshold =
+            static_cast<uint64_t>(*options.inline_size_threshold);
+    }
+    if (options.dedicated_size_threshold) {
+        raw.has_dedicated_size_threshold = true;
+        raw.dedicated_size_threshold =
+            static_cast<uint64_t>(*options.dedicated_size_threshold);
+    }
+    if (lance_blob_field_with_options(name.c_str(), nullable, &raw, out) != 0)
+        check_error();
+}
+
+/// RAII owner of a native writer-prepared blob descriptor array builder.
+///
+/// This produces the prepared Arrow field/array consumed by dataset writes.
+/// `finish()` consumes the native builder; `field()` remains available
+/// afterwards, while later appends throw. The wrapper does not write payload
+/// objects or commit data.
+class BlobDescriptorArrayBuilder {
+    Handle<LanceBlobDescriptorArrayBuilder,
+           lance_blob_descriptor_array_builder_close>
+        handle_;
+
+public:
+    explicit BlobDescriptorArrayBuilder(const std::string& column)
+        : handle_(lance_blob_descriptor_array_builder_new(column.c_str())) {
+        if (!handle_) check_error();
+    }
+
+    void append_inline(const uint8_t* data, size_t len) {
+        if (lance_blob_descriptor_array_builder_append_inline(
+                handle_.get(), data, len) != 0) {
+            check_error();
+        }
+    }
+
+    void append_inline(const std::vector<uint8_t>& data) {
+        append_inline(data.empty() ? nullptr : data.data(), data.size());
+    }
+
+    void append_null() {
+        if (lance_blob_descriptor_array_builder_append_null(handle_.get()) != 0)
+            check_error();
+    }
+
+    void append_packed(uint32_t blob_id, uint64_t offset, uint64_t length) {
+        if (lance_blob_descriptor_array_builder_append_packed(
+                handle_.get(), blob_id, offset, length) != 0) {
+            check_error();
+        }
+    }
+
+    void append_packed(uint32_t blob_id, const BlobRange& range) {
+        append_packed(blob_id, range.offset, range.length);
+    }
+
+    void extend_packed(uint32_t blob_id,
+                       const std::vector<BlobRange>& ranges) {
+        std::vector<LanceBlobRange> raw;
+        raw.reserve(ranges.size());
+        for (const auto& range : ranges) {
+            raw.push_back({range.offset, range.length});
+        }
+        if (lance_blob_descriptor_array_builder_extend_packed(
+                handle_.get(), blob_id, raw.data(), raw.size()) != 0) {
+            check_error();
+        }
+    }
+
+    void append_dedicated(uint32_t blob_id, uint64_t length) {
+        if (lance_blob_descriptor_array_builder_append_dedicated(
+                handle_.get(), blob_id, length) != 0) {
+            check_error();
+        }
+    }
+
+    void append_managed(
+        const std::string& uri,
+        uint64_t offset,
+        uint64_t length,
+        std::optional<uint32_t> base_id = std::nullopt) {
+        if (lance_blob_descriptor_array_builder_append_managed(
+                handle_.get(), uri.c_str(), offset, length, base_id.has_value(),
+                base_id.value_or(0)) != 0) {
+            check_error();
+        }
+    }
+
+    void append_external(uint32_t base_id,
+                         const std::string& uri,
+                         uint64_t offset,
+                         uint64_t length) {
+        if (lance_blob_descriptor_array_builder_append_external(
+                handle_.get(), base_id, uri.c_str(), offset, length) != 0) {
+            check_error();
+        }
+    }
+
+    void push_external(const std::string& uri,
+                       std::optional<BlobRange> range = std::nullopt) {
+        if (lance_blob_descriptor_array_builder_push_external(
+                handle_.get(), uri.c_str(), range.has_value(),
+                range ? range->offset : 0, range ? range->length : 0) != 0) {
+            check_error();
+        }
+    }
+
+    /// Export the prepared field. `out` is caller-owned and must be released.
+    void field(ArrowSchema* out) const {
+        if (lance_blob_descriptor_array_builder_field(handle_.get(), out) != 0)
+            check_error();
+    }
+
+    /// Consume the native builder and export its prepared array and field.
+    /// Both outputs are caller-owned and must each be released exactly once.
+    void finish(ArrowArray* out_array, ArrowSchema* out_schema) {
+        if (lance_blob_descriptor_array_builder_finish(
+                handle_.get(), out_array, out_schema) != 0) {
+            check_error();
+        }
+    }
+};
+
+/// Row selector for planned whole-blob and range reads.
+enum class BlobRowSelector : int32_t {
+    None      = LANCE_BLOB_ROWS_NONE,
+    Ids       = LANCE_BLOB_ROWS_IDS,
+    Addresses = LANCE_BLOB_ROWS_ADDRESSES,
+    Indices   = LANCE_BLOB_ROWS_INDICES,
+};
+
+/// Options for `Dataset::read_blobs()` and `Dataset::read_blob_ranges()`.
+///
+/// `io_buffer_size` defaults to native `None`; an engaged zero is forwarded to
+/// native and rejected there.
+struct BlobReadOptions {
+    std::optional<uint64_t> io_buffer_size;
+    bool preserve_order = true;
+};
+
+/// One row-specific blob-range request for `Dataset::read_blob_ranges()`.
+struct BlobRangeRequest {
+    uint64_t row = 0;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+};
+
 /// RAII handle over one value of a Blob v2 column, from `Dataset::take_blobs()`,
 /// `take_blobs_by_indices()` or `take_blobs_by_addresses()`. Stays usable
 /// after the Dataset is destroyed. `read()`, `read_up_to()` and `read_into()`
@@ -3198,6 +3378,70 @@ public:
         }
         adopt_blobs(raw, blobs);
         return blobs;
+    }
+
+    /// Plan and stream whole-blob reads. Returns the existing move-only
+    /// ArrowStream. Each stream record contains `row_address` and nullable
+    /// LargeBinary `data`; native order, duplicates and NULL-versus-empty
+    /// values are preserved. The stream remains valid after this Dataset is
+    /// destroyed.
+    ArrowStream read_blobs(
+        const std::string& column,
+        BlobRowSelector selector,
+        const std::vector<uint64_t>& rows,
+        const BlobReadOptions& options = {}) const {
+        LanceBlobReadOptions raw{};
+        if (options.io_buffer_size) {
+            raw.has_io_buffer_size = true;
+            raw.io_buffer_size = *options.io_buffer_size;
+        }
+        raw.order = options.preserve_order
+            ? LANCE_BLOB_READ_PRESERVE_ORDER
+            : LANCE_BLOB_READ_UNORDERED;
+        const uint64_t* rows_ptr =
+            selector == BlobRowSelector::None ? nullptr : rows.data();
+        ArrowStream stream;
+        if (lance_dataset_read_blobs(
+                handle_.get(), column.c_str(), static_cast<int32_t>(selector),
+                rows_ptr, rows.size(), &raw, stream.get()) != 0) {
+            check_error();
+        }
+        return stream;
+    }
+
+    /// Plan and stream one blob-local range read per request. Returns the
+    /// existing move-only ArrowStream. Each record contains `request_index`,
+    /// `row_address`, `offset`, `length` and nullable LargeBinary `data`.
+    /// `request_index` identifies duplicate/unordered requests. The stream
+    /// remains valid after this Dataset is destroyed.
+    ArrowStream read_blob_ranges(
+        const std::string& column,
+        BlobRowSelector selector,
+        const std::vector<BlobRangeRequest>& requests,
+        const BlobReadOptions& options = {}) const {
+        std::vector<LanceBlobRangeRequest> raw_requests;
+        raw_requests.reserve(requests.size());
+        for (const auto& request : requests) {
+            raw_requests.push_back(
+                {request.row, request.offset, request.length});
+        }
+        LanceBlobReadOptions raw{};
+        if (options.io_buffer_size) {
+            raw.has_io_buffer_size = true;
+            raw.io_buffer_size = *options.io_buffer_size;
+        }
+        raw.order = options.preserve_order
+            ? LANCE_BLOB_READ_PRESERVE_ORDER
+            : LANCE_BLOB_READ_UNORDERED;
+        const LanceBlobRangeRequest* requests_ptr =
+            selector == BlobRowSelector::None ? nullptr : raw_requests.data();
+        ArrowStream stream;
+        if (lance_dataset_read_blob_ranges(
+                handle_.get(), column.c_str(), static_cast<int32_t>(selector),
+                requests_ptr, raw_requests.size(), &raw, stream.get()) != 0) {
+            check_error();
+        }
+        return stream;
     }
 
     /// Create a Scanner builder for this dataset.

@@ -1414,6 +1414,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "chrono",
  "datafusion-catalog",
  "datafusion-catalog-listing",

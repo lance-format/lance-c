@@ -208,6 +208,7 @@ typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
 typedef struct LanceFtsQuery LanceFtsQuery;
 typedef struct LanceBlobFile LanceBlobFile;
+typedef struct LanceBlobDescriptorArrayBuilder LanceBlobDescriptorArrayBuilder;
 typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
@@ -2742,6 +2743,367 @@ int32_t lance_blob_file_is_closed(
  * @param blob  Blob handle, or NULL.
  */
 void lance_blob_file_close(LanceBlobFile* blob);
+
+/* ─── Blob v2 fields and prepared descriptor arrays ─── */
+
+/**
+ * Native storage thresholds for a blob v2 field.
+ *
+ * Each optional threshold is selected by its `has_*` flag. An enabled inline
+ * threshold of zero is valid. An enabled dedicated threshold must be non-zero
+ * because native `NonZeroUsize` cannot represent zero. Values wider than the
+ * platform `size_t` are rejected rather than truncated. A zero-initialized
+ * struct selects native defaults (both thresholds absent).
+ */
+typedef struct LanceBlobFieldOptions {
+    bool has_inline_size_threshold;
+    uint64_t inline_size_threshold;
+    bool has_dedicated_size_threshold;
+    uint64_t dedicated_size_threshold;
+} LanceBlobFieldOptions;
+
+/**
+ * Export the native blob v2 field with default storage thresholds.
+ *
+ * The exported field is the complete native `lance::blob_field` result:
+ * `Struct<data: LargeBinary?, uri: Utf8?>`, extension name
+ * `lance.blob.v2`, and its native field metadata. The caller owns `out` and
+ * must invoke its non-NULL release callback exactly once. `out` is written
+ * only on success.
+ *
+ * @param name      Field name. May be empty but must not be NULL.
+ * @param nullable  Native field nullability.
+ * @param out       Caller-owned ArrowSchema. Must not be NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_field(
+    const char* name,
+    bool nullable,
+    struct ArrowSchema* out
+);
+
+/**
+ * Export the native blob v2 field with explicit storage thresholds.
+ *
+ * `options == NULL` selects native defaults. Threshold conversion follows
+ * LanceBlobFieldOptions. The result is otherwise identical to
+ * lance_blob_field().
+ *
+ * @param name      Field name. May be empty but must not be NULL.
+ * @param nullable  Native field nullability.
+ * @param options   Optional threshold options, or NULL for defaults.
+ * @param out       Caller-owned ArrowSchema. Must not be NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_field_with_options(
+    const char* name,
+    bool nullable,
+    const LanceBlobFieldOptions* options,
+    struct ArrowSchema* out
+);
+
+/**
+ * Create a native writer-prepared blob descriptor array builder.
+ *
+ * This wraps `lance::BlobDescriptorArrayBuilder`. It builds the prepared
+ * struct representation consumed by dataset writes; it does not allocate blob
+ * IDs, write payload objects, choose sidecar paths, or commit data.
+ *
+ * @param column  Blob column name. Must not be NULL.
+ * @return Builder handle, or NULL on error.
+ */
+LanceBlobDescriptorArrayBuilder* lance_blob_descriptor_array_builder_new(
+    const char* column
+);
+
+/**
+ * Export the complete native prepared field for this column.
+ *
+ * The field remains exportable after a successful or failed finish. `out` is
+ * caller-owned and is written only on success.
+ *
+ * @param builder  Builder handle. Must not be NULL.
+ * @param out      Caller-owned ArrowSchema. Must not be NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_field(
+    const LanceBlobDescriptorArrayBuilder* builder,
+    struct ArrowSchema* out
+);
+
+/**
+ * Append an inline payload.
+ *
+ * `data == NULL && len == 0` is a valid empty inline blob. A NULL data pointer
+ * with non-zero len is an error. Foreign bytes are copied before the call
+ * returns.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_inline(
+    LanceBlobDescriptorArrayBuilder* builder,
+    const uint8_t* data,
+    size_t len
+);
+
+/**
+ * Append a null blob descriptor.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_null(
+    LanceBlobDescriptorArrayBuilder* builder
+);
+
+/**
+ * Append one packed descriptor for `offset..offset + length`.
+ *
+ * `length` maps to native `BlobRange.size`. Native validates the blob ID and
+ * the 64-bit range before appending.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_packed(
+    LanceBlobDescriptorArrayBuilder* builder,
+    uint32_t blob_id,
+    uint64_t offset,
+    uint64_t length
+);
+
+/**
+ * Append one packed descriptor per range in input order.
+ *
+ * Native pushes one range at a time. If a later range is invalid, all ranges
+ * before it remain appended and the error is returned. `ranges` may be NULL
+ * only when `num_ranges == 0`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_extend_packed(
+    LanceBlobDescriptorArrayBuilder* builder,
+    uint32_t blob_id,
+    const LanceBlobRange* ranges,
+    size_t num_ranges
+);
+
+/**
+ * Append one dedicated descriptor. Native validates the blob ID.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_dedicated(
+    LanceBlobDescriptorArrayBuilder* builder,
+    uint32_t blob_id,
+    uint64_t length
+);
+
+/**
+ * Append one Managed descriptor.
+ *
+ * `has_base_id == false` maps to native `base_id: None`; true maps to
+ * `Some(base_id)`, including explicit base ID 0. Native validates that `uri`
+ * is a canonical relative object path and that `offset + length` does not
+ * overflow. Whether the base is registered and whether the dataset schema opts
+ * in through `lance.blob.managed=true` are validated by the native dataset
+ * write path, not by this builder.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_managed(
+    LanceBlobDescriptorArrayBuilder* builder,
+    const char* uri,
+    uint64_t offset,
+    uint64_t length,
+    bool has_base_id,
+    uint32_t base_id
+);
+
+/**
+ * Append one External descriptor with an explicit native base ID.
+ *
+ * Native rejects an empty URI and an overflowing `offset + length`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_external(
+    LanceBlobDescriptorArrayBuilder* builder,
+    uint32_t base_id,
+    const char* uri,
+    uint64_t offset,
+    uint64_t length
+);
+
+/**
+ * Append an External descriptor through native `push_external`.
+ *
+ * This convenience sets native `base_id = 0`. When `has_range` is false,
+ * native receives `None` and stores offset 0, length 0. When true, the range is
+ * passed through, including an explicit 0/0 range. `offset` and `length` are
+ * ignored when `has_range` is false.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_push_external(
+    LanceBlobDescriptorArrayBuilder* builder,
+    const char* uri,
+    bool has_range,
+    uint64_t offset,
+    uint64_t length
+);
+
+/**
+ * Finish the native prepared descriptor column and export both parts.
+ *
+ * This consumes the native builder. On every return path, later append calls
+ * report that the builder is finished; `field` remains available. On success
+ * `out_array` receives an owned ArrowArray and `out_schema` receives the
+ * complete native prepared field (including extension and threshold
+ * metadata). The caller must release each non-NULL output exactly once.
+ *
+ * Both outputs are written only after the complete native finish and both FFI
+ * conversions succeed. On error neither output is modified.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_finish(
+    LanceBlobDescriptorArrayBuilder* builder,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Free a descriptor builder handle. NULL is a no-op. An unfinished native
+ * builder is dropped without sidecar rollback or publication.
+ */
+void lance_blob_descriptor_array_builder_close(
+    LanceBlobDescriptorArrayBuilder* builder
+);
+
+/* ─── Planned whole-blob and blob-range reads ─── */
+
+/**
+ * Row selector for planned blob reads. The C ABI passes this as an int32_t,
+ * so callers built with non-default enum sizing cannot mismatch the Rust ABI.
+ *
+ * NONE leaves the native builder without a selection and therefore preserves
+ * the native "requires a row selection" error. IDS, ADDRESSES and INDICES with
+ * a zero count are explicit empty selections and produce an empty stream.
+ */
+typedef enum {
+    LANCE_BLOB_ROWS_NONE      = 0,
+    LANCE_BLOB_ROWS_IDS       = 1,
+    LANCE_BLOB_ROWS_ADDRESSES = 2,
+    LANCE_BLOB_ROWS_INDICES   = 3,
+} LanceBlobRowSelector;
+
+/**
+ * Result ordering for planned blob reads.
+ */
+typedef enum {
+    LANCE_BLOB_READ_PRESERVE_ORDER = 0,
+    LANCE_BLOB_READ_UNORDERED      = 1,
+} LanceBlobReadOrder;
+
+/**
+ * Optional controls for planned blob reads.
+ *
+ * A NULL options pointer means `io_buffer_size = None` and native
+ * `preserve_order = true`. `has_io_buffer_size = true` forwards the value
+ * verbatim; zero is an explicit native value and is rejected by the native
+ * builder rather than replaced with a default. `order` is a
+ * LanceBlobReadOrder value.
+ */
+typedef struct LanceBlobReadOptions {
+    bool has_io_buffer_size;
+    uint64_t io_buffer_size;
+    int32_t order;
+} LanceBlobReadOptions;
+
+/**
+ * One row-specific blob-range request.
+ *
+ * `row` has the meaning selected by LanceBlobRowSelector. `offset` and
+ * `length` are blob-local bytes and map directly to native
+ * `BlobReadRange.offset/length`.
+ */
+typedef struct LanceBlobRangeRequest {
+    uint64_t row;
+    uint64_t offset;
+    uint64_t length;
+} LanceBlobRangeRequest;
+
+/**
+ * Plan and export whole-blob reads.
+ *
+ * The returned Arrow stream schema is, in order:
+ * 1. `row_address: UInt64`, non-null
+ * 2. `data: LargeBinary`, nullable
+ *
+ * Exactly one Arrow record follows each native `ReadBlob` result. NULL blob
+ * values have a null `data` entry; valid empty blobs have a non-null empty
+ * buffer. Native ordering, duplicate selection and payload bytes are
+ * preserved. Selected input rows are copied before native state retains them.
+ *
+ * Column lookup and read planning run in this factory and their errors are
+ * returned before any output stream exists. Payload I/O errors happen while
+ * consuming the stream and use the ArrowArrayStream error contract
+ * (`get_next` nonzero plus `get_last_error`). Closing the dataset handle does
+ * not invalidate a successfully created stream.
+ *
+ * `out` is written only after successful native planning and Arrow stream
+ * export, and must then be released exactly once. On error it is untouched.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_read_blobs(
+    const LanceDataset* dataset,
+    const char* column,
+    int32_t selector,
+    const uint64_t* rows,
+    size_t num_rows,
+    const LanceBlobReadOptions* options,
+    struct ArrowArrayStream* out
+);
+
+/**
+ * Plan and export one blob-local range read per request.
+ *
+ * The returned Arrow stream schema is, in order:
+ * 1. `request_index: UInt64`, non-null
+ * 2. `row_address: UInt64`, non-null
+ * 3. `offset: UInt64`, non-null
+ * 4. `length: UInt64`, non-null
+ * 5. `data: LargeBinary`, nullable
+ *
+ * Exactly one Arrow record follows each native `ReadBlobRange`. `request_index`
+ * is the zero-based input position and remains present for duplicate and
+ * unordered requests. NULL blobs have null `data`; a non-null blob with an
+ * empty range has a non-null empty buffer.
+ *
+ * Native validation stages are retained. Request offset-plus-length overflow,
+ * scheduler buffer validation and physical range planning happen in the
+ * factory. Native null-blob requests skip logical bounds checks. Payload I/O
+ * errors happen while consuming the stream and use the ArrowArrayStream error
+ * contract.
+ *
+ * Planning retains O(request_count) metadata. `io_buffer_size` bounds each
+ * scheduler-visible physical batch after range coalescing, except that one
+ * request larger than the buffer is materialized by itself. The scheduler
+ * separately applies byte backpressure to physical I/O; this is not a hard cap
+ * on all process memory.
+ *
+ * `out` is written only after successful native planning and Arrow stream
+ * export, and must then be released exactly once. On error it is untouched.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_read_blob_ranges(
+    const LanceDataset* dataset,
+    const char* column,
+    int32_t selector,
+    const LanceBlobRangeRequest* requests,
+    size_t num_requests,
+    const LanceBlobReadOptions* options,
+    struct ArrowArrayStream* out
+);
 
 /* ─── Scanner builder ─── */
 
