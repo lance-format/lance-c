@@ -1142,10 +1142,14 @@ pub(crate) unsafe fn prepare_vector_build(
         true
     };
 
-    let mut ivf = IvfBuildParams::default();
-    ivf.num_partitions = parse_optional_usize(options.num_partitions, "num_partitions")?;
-    ivf.target_partition_size =
-        parse_optional_usize(options.target_partition_size, "target_partition_size")?;
+    let mut ivf = IvfBuildParams {
+        num_partitions: parse_optional_usize(options.num_partitions, "num_partitions")?,
+        target_partition_size: parse_optional_usize(
+            options.target_partition_size,
+            "target_partition_size",
+        )?,
+        ..Default::default()
+    };
     if let Some(value) = parse_optional_usize(options.max_iters, "max_iters")? {
         ivf.max_iters = value;
     }
