@@ -7471,8 +7471,9 @@ int32_t lance_dataset_write_with_native_options(
  * on every return path except a NULL `stream`.
  *
  * The returned transaction owns metadata and uncommitted data-file
- * references. It does not retain the options handle or its session/accessor;
- * pass those to the later commit entry point when commit I/O needs them.
+ * references. It does not retain the options handle, its session, accessor or
+ * commit lock; pass those to the later commit entry point when commit I/O
+ * needs them.
  * Publication naming remains controlled by the commit entry point's
  * `LanceCommitOptions`. Returns 0 on success, -1 on error; a failed stage is
  * guaranteed not to publish a version.

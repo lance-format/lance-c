@@ -26738,6 +26738,7 @@ struct NativeWriteProgressState {
     bytes: AtomicU64,
     files: AtomicU32,
     fail_begin: AtomicBool,
+    bad_complete_info: AtomicBool,
 }
 
 struct NativeWriteProgressContext {
@@ -26779,10 +26780,17 @@ unsafe extern "C" fn native_write_begin(
 
 unsafe extern "C" fn native_write_complete(
     callback_ctx: *mut c_void,
-    _info: *const LanceWriteFragmentProgressInfo,
+    info: *const LanceWriteFragmentProgressInfo,
     _error: *mut LanceCallbackError,
 ) -> i32 {
     let context = unsafe { &*callback_ctx.cast::<NativeWriteProgressContext>() };
+    let info = unsafe { &*info };
+    if info.has_physical_rows == 0 || info.file_count == 0 {
+        context
+            .state
+            .bad_complete_info
+            .store(true, AtomicOrdering::SeqCst);
+    }
     context.state.completes.fetch_add(1, AtomicOrdering::SeqCst);
     0
 }
@@ -26857,6 +26865,10 @@ fn test_native_write_options_progress_and_failure_without_commit() {
     assert_eq!(state.rows.load(AtomicOrdering::SeqCst), 5);
     assert!(state.bytes.load(AtomicOrdering::SeqCst) > 0);
     assert!(state.files.load(AtomicOrdering::SeqCst) >= 5);
+    assert!(
+        !state.bad_complete_info.load(AtomicOrdering::SeqCst),
+        "complete-fragment progress must carry physical rows and a data file"
+    );
     assert_eq!(
         state.releases.load(AtomicOrdering::SeqCst),
         0,
@@ -26912,14 +26924,17 @@ fn test_native_write_options_progress_and_failure_without_commit() {
 
 struct NativeWriteLockContext {
     releases: Arc<AtomicUsize>,
+    acquires: Arc<AtomicUsize>,
 }
 
 unsafe extern "C" fn native_write_lock_acquire(
-    _callback_ctx: *mut c_void,
+    callback_ctx: *mut c_void,
     _version: u64,
     out_lease: *mut *mut c_void,
     _error: *mut LanceCallbackError,
 ) -> i32 {
+    let context = unsafe { &*callback_ctx.cast::<NativeWriteLockContext>() };
+    context.acquires.fetch_add(1, AtomicOrdering::SeqCst);
     if !out_lease.is_null() {
         unsafe { *out_lease = ptr::null_mut() };
     }
@@ -26948,8 +26963,10 @@ fn test_native_write_options_retain_source_owners() {
     assert!(!session.is_null() && !accessor.is_null());
 
     let releases = Arc::new(AtomicUsize::new(0));
+    let acquires = Arc::new(AtomicUsize::new(0));
     let lock_context = Box::new(NativeWriteLockContext {
         releases: Arc::clone(&releases),
+        acquires: Arc::clone(&acquires),
     });
     let callbacks = LanceCommitLockCallbacks {
         lock: Some(native_write_lock_acquire),
@@ -26994,6 +27011,10 @@ fn test_native_write_options_retain_source_owners() {
     assert_eq!(rc, 0, "{}", take_last_error_message());
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
     assert!(progress_state.begins.load(AtomicOrdering::SeqCst) >= 1);
+    assert!(
+        acquires.load(AtomicOrdering::SeqCst) >= 1,
+        "the options handle must forward the commit lock to the native write"
+    );
     unsafe { lance_dataset_close(ds) };
     unsafe { lance_native_write_options_close(options) };
 

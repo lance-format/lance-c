@@ -387,8 +387,9 @@ pub unsafe extern "C" fn lance_dataset_write_uncommitted_stream_with_commit_lock
 /// except a NULL `stream`.
 ///
 /// The returned transaction owns metadata and uncommitted data-file
-/// references. It does not retain the options handle or its session/accessor;
-/// pass those to the later commit entry point when commit I/O needs them.
+/// references. It does not retain the options handle, its session, accessor or
+/// commit lock; pass those to the later commit entry point when commit I/O
+/// needs them.
 /// `enable_v2_manifest_paths` and the commit lock affect the native staging
 /// context; publication naming remains controlled by the commit entry point's
 /// `LanceCommitOptions`.

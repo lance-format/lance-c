@@ -706,6 +706,10 @@ The C++ RAII wrapper is `lance::NativeWriteOptions` with
 `lance::NativeWriteOptionsSpec`; use `Dataset::write_with_native_options` and
 `Dataset::write_uncommitted_with_native_options`.
 
+The returned staged transaction owns only uncommitted data-file metadata. It
+does not retain the options handle, session, storage accessor or commit lock;
+pass those owners to the later commit when commit I/O needs them.
+
 Option presence is preserved. A NULL list pointer maps to native `None`; a
 non-NULL list pointer with count zero maps to `Some(empty)`. An explicit empty
 target list and all native target-base conflicts are reported by Lance core,
