@@ -570,14 +570,16 @@ LanceDataset* lance_dataset_open_with_session(
  * closing either input handle afterwards does not invalidate this dataset,
  * its scanners, or later commits performed through it.
  *
- * @return Dataset handle, or NULL on error
+ * @param out_dataset receives the dataset handle on success; must not be NULL
+ * @return 0 on success, -1 on error
  */
-LanceDataset* lance_dataset_open_with_commit_lock(
+int32_t lance_dataset_open_with_commit_lock(
     const char* uri,
     const LanceStorageOptionsAccessor* storage_accessor,
     uint64_t version,
     const LanceSession* session,
-    const LanceCommitLock* commit_lock
+    const LanceCommitLock* commit_lock,
+    LanceDataset** out_dataset
 );
 
 /** Close and free a dataset handle. Safe to call with NULL. */

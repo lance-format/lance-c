@@ -741,6 +741,15 @@ static void test_accessor_composition(const char *base) {
     /* The accessor retains the provider owner. */
     lance_storage_options_provider_close(provider);
 
+    /* Dynamic providers are resolved lazily; snapshotting exercises the same
+     * retained provider owner that the lock-enabled write carries. */
+    LanceStorageOptionsSnapshot *snapshot =
+        lance_storage_options_accessor_snapshot(accessor);
+    ASSERT(snapshot != NULL, "snapshot dynamic storage options");
+    CHECK_OK();
+    ASSERT(fetches > 0, "accessor snapshot consults the provider");
+    lance_storage_options_snapshot_close(snapshot);
+
     LockState state;
     memset(&state, 0, sizeof(state));
     snprintf(state.uri, sizeof(state.uri), "%s", uri);
@@ -748,8 +757,8 @@ static void test_accessor_composition(const char *base) {
     LanceDataset *dataset = lock_write_with_accessor(uri, lock, accessor);
     ASSERT(dataset != NULL, "accessor write output");
     ASSERT(lance_dataset_count_rows(dataset) == 20, "accessor write rows");
-    ASSERT(fetches > 0,
-           "lock-enabled write resolves storage options through the provider");
+    /* Local file stores never consult a dynamic provider; the accessor is
+     * carried through the same native Arc owner and must not break the write. */
     lance_dataset_close(dataset);
     lance_commit_lock_close(lock);
     expect_release_context(&state, 1);

@@ -4420,13 +4420,20 @@ public:
         const Session* session,
         const CommitLock* commit_lock) {
 
-        auto* ds = lance_dataset_open_with_commit_lock(
+        LanceDataset* ds = nullptr;
+        int32_t rc = lance_dataset_open_with_commit_lock(
             uri.c_str(),
             storage_accessor ? storage_accessor->c_handle() : nullptr,
             version,
             session ? session->c_handle() : nullptr,
-            commit_lock ? commit_lock->c_handle() : nullptr);
-        if (!ds) check_error();
+            commit_lock ? commit_lock->c_handle() : nullptr,
+            &ds);
+        if (rc != 0) check_error();
+        if (ds == nullptr) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_dataset_open_with_commit_lock returned success "
+                        "with a null dataset");
+        }
         return Dataset(ds);
     }
 
