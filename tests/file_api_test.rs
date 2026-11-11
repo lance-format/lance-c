@@ -385,14 +385,10 @@ fn native_reader_with_options(uri: &str, options: NativeReaderOptions) -> Native
             .open_file(&path, &CachedFileSize::unknown())
             .await
             .unwrap();
-        let metadata = NativeFileReader::read_all_metadata(&file).await.unwrap();
-        let io = Arc::new(lance_file::LanceEncodingsIo::new(file));
-        NativeFileReader::try_open_with_file_metadata(
-            io,
-            path,
+        NativeFileReader::try_open(
+            file,
             None,
             Arc::<DecoderPlugins>::default(),
-            Arc::new(metadata),
             &LanceCache::no_cache(),
             options,
         )
@@ -869,6 +865,72 @@ fn metadata_statistics_pages_and_global_buffers_match_native() {
         lance_file_metadata_close(metadata);
         lance_file_reader_close(reader);
     }
+}
+
+#[test]
+fn reader_read_chunk_size_follows_native_io_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let uri = root.path().join("read-chunks.lance");
+    let uri = uri.to_str().unwrap();
+    write_fixture(uri, Some("2.2"), false, None, None, None, None, false);
+
+    let options = LanceFileReaderOptions {
+        has_read_chunk_size: 1,
+        read_chunk_size: 1,
+        ..Default::default()
+    };
+    let (_, batches) = read_all_c(uri, Some(&options));
+    assert_fixture_batches(&batches);
+    let native = native_reader_with_options(
+        uri,
+        NativeReaderOptions {
+            read_chunk_size: 1,
+            ..Default::default()
+        },
+    );
+    assert_batches_match_ignoring_root_metadata(&batches, &native_batches(&native));
+
+    // The scheduler can coalesce contiguous chunks again, so physical I/O
+    // counters cannot prove that this option reached the encoding layer.
+    // Native zero-size chunks fail on nonempty reads and distinguish forwarding
+    // an explicit value from silently falling back to the default chunk size.
+    let native_zero = native_reader_with_options(
+        uri,
+        NativeReaderOptions {
+            read_chunk_size: 0,
+            ..Default::default()
+        },
+    );
+    let panic = catch_unwind(AssertUnwindSafe(|| native_batches(&native_zero)))
+        .expect_err("the native encoding layer rejects zero-size chunks");
+    let native_message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        native_message.contains("divide by zero"),
+        "{native_message}"
+    );
+
+    let zero_options = LanceFileReaderOptions {
+        read_chunk_size: 0,
+        ..options
+    };
+    let reader = open_c_reader(uri, Some(&zero_options));
+    let mut stream = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    let status = unsafe { lance_file_reader_read_all(reader, 3, 2, &mut stream) };
+    let error = if status == 0 {
+        let mut stream = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+        stream.find_map(Result::err).map(|error| error.to_string())
+    } else {
+        let (code, message) = take_error();
+        assert_eq!(code, LanceErrorCode::Panic);
+        Some(message)
+    };
+    unsafe { lance_file_reader_close(reader) };
+    let error = error.expect("the C reader must forward read_chunk_size=0 to native I/O");
+    assert!(error.contains("divide by zero"), "{error}");
 }
 
 #[test]
