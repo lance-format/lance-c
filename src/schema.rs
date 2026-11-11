@@ -278,7 +278,10 @@ unsafe fn schema_project_inner(
         }
     }
 
-    let projected = schema.inner.project(&projected_columns)?;
+    let projected = schema
+        .inner
+        .project(&projected_columns)
+        .map_err(schema_lookup_error)?;
     unsafe {
         *out_schema = Box::into_raw(Box::new(LanceSchema { inner: projected }));
     }
@@ -300,6 +303,19 @@ pub unsafe extern "C" fn lance_schema_field_id(
         unsafe { schema_field_id_inner(schema, column, out_field_id) },
         neg
     )
+}
+
+/// Translate the native missing-column error into the C API's argument error.
+///
+/// Existing APIs keep their historical LANCE_ERR_INTERNAL mapping; the native
+/// schema entry points promise LANCE_ERR_INVALID_ARGUMENT for unknown columns.
+fn schema_lookup_error(err: lance_core::Error) -> lance_core::Error {
+    match err {
+        lance_core::Error::FieldNotFound { .. } => {
+            lance_core::Error::invalid_input_source(format!("{err}").into())
+        }
+        other => other,
+    }
 }
 
 unsafe fn schema_field_id_inner(

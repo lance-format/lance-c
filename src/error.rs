@@ -70,9 +70,7 @@ pub fn set_last_error(code: LanceErrorCode, message: impl AsRef<str>) {
 pub fn error_code_from_lance(err: &lance_core::Error) -> LanceErrorCode {
     use lance_core::Error;
     match err {
-        Error::InvalidInput { .. } | Error::InvalidRef { .. } | Error::FieldNotFound { .. } => {
-            LanceErrorCode::InvalidArgument
-        }
+        Error::InvalidInput { .. } | Error::InvalidRef { .. } => LanceErrorCode::InvalidArgument,
         Error::DatasetAlreadyExists { .. } => LanceErrorCode::DatasetAlreadyExists,
         Error::CommitConflict { .. }
         | Error::RetryableCommitConflict { .. }
