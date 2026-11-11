@@ -143,9 +143,11 @@ unsafe fn create_scalar_index_inner(
         ));
     }
     let ds = unsafe { &*dataset };
-    let column_str = unsafe { helpers::parse_c_string(column)? }.ok_or_else(|| {
-        lance_core::Error::invalid_input_source("column must not be empty".into())
-    })?;
+    let column_str = unsafe { helpers::parse_c_string(column)? }
+        .filter(|column| !column.is_empty())
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source("column must not be empty".into())
+        })?;
     let name = unsafe { helpers::parse_c_string(index_name)? }.map(|s| s.to_string());
     let params_str = unsafe { helpers::parse_c_string(params_json)? };
 
