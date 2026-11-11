@@ -598,6 +598,20 @@ public:
         const std::vector<uint64_t>& deleted_fragment_ids,
         const std::string& predicate);
 
+    /// Construct an owned native CreateIndex operation. Metadata handles are
+    /// borrowed and their complete native values are copied. Native
+    /// `Operation::CreateIndex` owns replacement, name and coverage semantics.
+    static Operation make_create_index(
+        const std::vector<const IndexSegmentMetadata*>& new_indices,
+        const std::vector<const IndexSegmentMetadata*>& removed_indices);
+
+    /// New-index metadata cloned from a CreateIndex operation. Each returned
+    /// value is independent of this operation handle.
+    std::vector<IndexSegmentMetadata> create_index_new() const;
+
+    /// Removed-index metadata cloned from a CreateIndex operation.
+    std::vector<IndexSegmentMetadata> create_index_removed() const;
+
     /// Number of updated fragments in a Delete operation.
     uint64_t delete_updated_fragment_count() const {
         uint64_t count = 0;
@@ -4336,6 +4350,26 @@ public:
 
 }  // namespace detail
 
+/// One file recorded in an index segment's native metadata.
+struct IndexSegmentFile {
+    std::string path;
+    uint64_t size_bytes = 0;
+
+    bool operator==(const IndexSegmentFile& other) const {
+        return path == other.path && size_bytes == other.size_bytes;
+    }
+
+    bool operator!=(const IndexSegmentFile& other) const {
+        return !(*this == other);
+    }
+};
+
+/// Whole seconds plus nanoseconds since the Unix epoch.
+struct IndexTimestamp {
+    int64_t unix_seconds = 0;
+    uint32_t nanos = 0;
+};
+
 /// Parsed metadata for one physical index segment.
 class IndexSegmentMetadata {
     Handle<LanceIndexSegmentMetadata, lance_index_segment_metadata_free> handle_;
@@ -4433,8 +4467,155 @@ public:
         return out;
     }
 
+    /// Clone the complete in-memory native metadata value.
+    IndexSegmentMetadata clone() const {
+        LanceIndexSegmentMetadata* raw =
+            lance_index_segment_metadata_clone(handle_.get());
+        if (!raw) check_error();
+        return IndexSegmentMetadata(raw);
+    }
+
+    std::vector<int32_t> covering_field_ids() const {
+        size_t count =
+            lance_index_segment_metadata_covering_field_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+
+        std::vector<int32_t> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            int32_t field_id = 0;
+            if (lance_index_segment_metadata_covering_field_id_at(
+                    handle_.get(), i, &field_id) != 0)
+                check_error();
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Native `index_details.value` bytes. Empty when the present Any value is
+    /// empty; throws when `index_details` is absent.
+    std::vector<uint8_t> index_details_value() const {
+        size_t len = 0;
+        const uint8_t* bytes =
+            lance_index_segment_metadata_index_details_value(handle_.get(),
+                                                              &len);
+        if (!bytes) check_error();
+        if (len == 0) return {};
+        return std::vector<uint8_t>(bytes, bytes + len);
+    }
+
+    std::vector<IndexSegmentFile> files() const {
+        size_t count = lance_index_segment_metadata_file_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+
+        std::vector<IndexSegmentFile> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            const char* path =
+                lance_index_segment_metadata_file_path_at(handle_.get(), i);
+            if (!path) check_error();
+            uint64_t size = 0;
+            if (lance_index_segment_metadata_file_size_at(
+                    handle_.get(), i, &size) != 0)
+                check_error();
+            out.push_back(IndexSegmentFile{path, size});
+        }
+        return out;
+    }
+
+    std::optional<IndexTimestamp> created_at() const {
+        LanceOptionalTimestamp timestamp{};
+        if (lance_index_segment_metadata_created_at(handle_.get(),
+                                                    &timestamp) != 0)
+            check_error();
+        if (!timestamp.is_set) return std::nullopt;
+        return IndexTimestamp{timestamp.unix_seconds, timestamp.nanos};
+    }
+
+    std::optional<uint32_t> base_id() const {
+        bool is_set = false;
+        uint32_t base_id = 0;
+        if (lance_index_segment_metadata_base_id(handle_.get(), &is_set,
+                                                 &base_id) != 0)
+            check_error();
+        if (!is_set) return std::nullopt;
+        return base_id;
+    }
+
     const LanceIndexSegmentMetadata* c_handle() const { return handle_.get(); }
 };
+
+inline Operation Operation::make_create_index(
+    const std::vector<const IndexSegmentMetadata*>& new_indices,
+    const std::vector<const IndexSegmentMetadata*>& removed_indices) {
+    std::vector<const LanceIndexSegmentMetadata*> new_raw;
+    new_raw.reserve(new_indices.size());
+    for (const auto* metadata : new_indices) {
+        if (!metadata) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "new index metadata entries must not be null");
+        }
+        new_raw.push_back(metadata->c_handle());
+    }
+    std::vector<const LanceIndexSegmentMetadata*> removed_raw;
+    removed_raw.reserve(removed_indices.size());
+    for (const auto* metadata : removed_indices) {
+        if (!metadata) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "removed index metadata entries must not be null");
+        }
+        removed_raw.push_back(metadata->c_handle());
+    }
+
+    LanceOperation* operation = lance_operation_create_index_new(
+        new_raw.data(), new_raw.size(), removed_raw.data(), removed_raw.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline std::vector<IndexSegmentMetadata> Operation::create_index_new() const {
+    uint64_t count = 0;
+    if (lance_operation_create_index_new_count(handle_.get(), &count) != 0)
+        check_error();
+
+    std::vector<IndexSegmentMetadata> out;
+    out.reserve(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        LanceIndexSegmentMetadata* metadata = nullptr;
+        if (lance_operation_create_index_new_at(
+                handle_.get(), static_cast<size_t>(i), &metadata) != 0)
+            check_error();
+        if (!metadata) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_operation_create_index_new_at returned success "
+                        "with null metadata");
+        }
+        out.emplace_back(IndexSegmentMetadata(metadata));
+    }
+    return out;
+}
+
+inline std::vector<IndexSegmentMetadata> Operation::create_index_removed() const {
+    uint64_t count = 0;
+    if (lance_operation_create_index_removed_count(handle_.get(), &count) != 0)
+        check_error();
+
+    std::vector<IndexSegmentMetadata> out;
+    out.reserve(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        LanceIndexSegmentMetadata* metadata = nullptr;
+        if (lance_operation_create_index_removed_at(
+                handle_.get(), static_cast<size_t>(i), &metadata) != 0)
+            check_error();
+        if (!metadata) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_operation_create_index_removed_at returned "
+                        "success with null metadata");
+        }
+        out.emplace_back(IndexSegmentMetadata(metadata));
+    }
+    return out;
+}
 
 /// Move-only builder for one uncommitted physical index segment.
 class IndexSegmentBuilder {

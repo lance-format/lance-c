@@ -16,13 +16,14 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::Result;
-use lance_table::format::{Fragment, pb};
+use lance_table::format::{Fragment, IndexMetadata, pb};
 use prost::Message;
 
 use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::fragment::{LanceFragment, fragment_metadata_json};
 use crate::helpers;
+use crate::index_segment::{LanceIndexSegmentMetadata, metadata_handle};
 use crate::runtime::block_on;
 
 /// Owned native transaction value.
@@ -131,6 +132,24 @@ fn delete_operation_parts(operation: &LanceOperation) -> Result<(&[Fragment], &[
         other => Err(lance_core::Error::not_supported_source(
             format!(
                 "Delete inspection is not supported for {} operations",
+                other.name()
+            )
+            .into(),
+        )),
+    }
+}
+
+fn create_index_operation_parts(
+    operation: &LanceOperation,
+) -> Result<(&[IndexMetadata], &[IndexMetadata])> {
+    match &operation.inner {
+        Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } => Ok((new_indices, removed_indices)),
+        other => Err(lance_core::Error::not_supported_source(
+            format!(
+                "CreateIndex inspection is not supported for {} operations",
                 other.name()
             )
             .into(),
@@ -260,6 +279,88 @@ unsafe fn operation_delete_new_inner(
             updated_fragments,
             deleted_fragment_ids,
             predicate: predicate.to_string(),
+        },
+    })))
+}
+
+unsafe fn clone_index_metadata_array(
+    metadata: *const *const LanceIndexSegmentMetadata,
+    count: usize,
+    label: &str,
+) -> Result<Vec<IndexMetadata>> {
+    if metadata.is_null() {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{label} must not be NULL when {label}_count = {count}").into(),
+        ));
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > isize::MAX as usize / std::mem::size_of::<*const LanceIndexSegmentMetadata>() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{label}_count {count} exceeds the maximum addressable pointer slice length")
+                .into(),
+        ));
+    }
+    let metadata = unsafe { std::slice::from_raw_parts(metadata, count) };
+    let mut out = Vec::with_capacity(count);
+    for (position, entry) in metadata.iter().enumerate() {
+        if entry.is_null() {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("{label}[{position}] must not be NULL when {label}_count = {count}").into(),
+            ));
+        }
+        out.push(unsafe { &**entry }.native_metadata().clone());
+    }
+    Ok(out)
+}
+
+/// Construct an owned native CreateIndex operation.
+///
+/// `new_indices` and `removed_indices` are borrowed arrays of metadata handles;
+/// every entry is cloned before this function returns. A NULL array is valid
+/// only with a zero count, and a non-NULL array with a zero count is ignored.
+/// Native `Operation::CreateIndex` owns index replacement, name handling and
+/// coverage semantics; this constructor does not add binding-side validation.
+/// Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_create_index_new(
+    new_indices: *const *const LanceIndexSegmentMetadata,
+    new_index_count: usize,
+    removed_indices: *const *const LanceIndexSegmentMetadata,
+    removed_index_count: usize,
+) -> *mut LanceOperation {
+    ffi_try!(
+        unsafe {
+            operation_create_index_new_inner(
+                new_indices,
+                new_index_count,
+                removed_indices,
+                removed_index_count,
+            )
+        },
+        null
+    )
+}
+
+unsafe fn operation_create_index_new_inner(
+    new_indices: *const *const LanceIndexSegmentMetadata,
+    new_index_count: usize,
+    removed_indices: *const *const LanceIndexSegmentMetadata,
+    removed_index_count: usize,
+) -> Result<*mut LanceOperation> {
+    let new_indices =
+        unsafe { clone_index_metadata_array(new_indices, new_index_count, "new_indices") }?;
+    let removed_indices = unsafe {
+        clone_index_metadata_array(removed_indices, removed_index_count, "removed_indices")
+    }?;
+    Ok(Box::into_raw(Box::new(LanceOperation {
+        inner: Operation::CreateIndex {
+            new_indices,
+            removed_indices,
         },
     })))
 }
@@ -676,6 +777,155 @@ unsafe fn operation_fragment_count_inner(
     };
     unsafe {
         ptr::write(out_count, count);
+    }
+    Ok(0)
+}
+
+/// Read the number of new index metadata entries in a CreateIndex operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_create_index_new_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_create_index_new_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_create_index_new_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let (new_indices, _) = create_index_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_count, new_indices.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Clone one new index metadata entry from a CreateIndex operation.
+///
+/// Returns 0 on success and writes `*out_metadata`; -1 on error and leaves the
+/// output slot unchanged. The returned metadata remains valid after the
+/// operation handle is closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_create_index_new_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_metadata: *mut *mut LanceIndexSegmentMetadata,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_create_index_new_at_inner(operation, index, out_metadata) },
+        neg
+    )
+}
+
+unsafe fn operation_create_index_new_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_metadata: *mut *mut LanceIndexSegmentMetadata,
+) -> Result<i32> {
+    if out_metadata.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_metadata must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let (new_indices, _) = create_index_operation_parts(operation)?;
+    let metadata = new_indices.get(index).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "new index metadata index {index} is out of range for {} entries",
+                new_indices.len()
+            )
+            .into(),
+        )
+    })?;
+    let metadata = metadata_handle(metadata.clone())?;
+    unsafe {
+        ptr::write(out_metadata, metadata);
+    }
+    Ok(0)
+}
+
+/// Read the number of removed index metadata entries in a CreateIndex
+/// operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_create_index_removed_count(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_create_index_removed_count_inner(operation, out_count) },
+        neg
+    )
+}
+
+unsafe fn operation_create_index_removed_count_inner(
+    operation: *const LanceOperation,
+    out_count: *mut u64,
+) -> Result<i32> {
+    if out_count.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_count must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let (_, removed_indices) = create_index_operation_parts(operation)?;
+    unsafe {
+        ptr::write(out_count, removed_indices.len() as u64);
+    }
+    Ok(0)
+}
+
+/// Clone one removed index metadata entry from a CreateIndex operation.
+///
+/// Returns 0 on success and writes `*out_metadata`; -1 on error and leaves the
+/// output slot unchanged. The returned metadata remains valid after the
+/// operation handle is closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_create_index_removed_at(
+    operation: *const LanceOperation,
+    index: usize,
+    out_metadata: *mut *mut LanceIndexSegmentMetadata,
+) -> i32 {
+    ffi_try!(
+        unsafe { operation_create_index_removed_at_inner(operation, index, out_metadata) },
+        neg
+    )
+}
+
+unsafe fn operation_create_index_removed_at_inner(
+    operation: *const LanceOperation,
+    index: usize,
+    out_metadata: *mut *mut LanceIndexSegmentMetadata,
+) -> Result<i32> {
+    if out_metadata.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_metadata must not be NULL".into(),
+        ));
+    }
+    let operation = operation_at(operation)?;
+    let (_, removed_indices) = create_index_operation_parts(operation)?;
+    let metadata = removed_indices.get(index).ok_or_else(|| {
+        lance_core::Error::invalid_input_source(
+            format!(
+                "removed index metadata index {index} is out of range for {} entries",
+                removed_indices.len()
+            )
+            .into(),
+        )
+    })?;
+    let metadata = metadata_handle(metadata.clone())?;
+    unsafe {
+        ptr::write(out_metadata, metadata);
     }
     Ok(0)
 }
