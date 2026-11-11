@@ -1930,19 +1930,30 @@ static void test_base_paths_and_add(const char *uri, const char *alternate_uri) 
            "explicit empty transaction properties must be accepted");
     CHECK_OK();
 
-    uint64_t stable_version = lance_dataset_version(ds);
+    uint64_t before_empty = lance_dataset_version(ds);
     CHECK_OK();
-    ASSERT(lance_dataset_add_bases(ds, NULL, 0, NULL) == -1,
-           "empty base registration must fail");
-    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
-           "empty base registration error code");
-    const char *message = lance_last_error_message();
-    if (message) lance_free_string(message);
+    const char *before_empty_json = lance_dataset_base_paths_json(ds);
+    ASSERT(before_empty_json != NULL, "base paths before empty registration");
+    ASSERT(lance_dataset_add_bases(ds, NULL, 0, NULL) == 0,
+           "empty base registration must use native commit behavior");
+    CHECK_OK();
+    ASSERT(lance_dataset_add_bases(ds, empty_bases, 0, &empty_properties) == 0,
+           "non-NULL empty base array must use native commit behavior");
+    CHECK_OK();
+    uint64_t stable_version = lance_dataset_version(ds);
+    ASSERT(stable_version == before_empty + 2,
+           "each empty registration commits one native version");
+    const char *after_empty_json = lance_dataset_base_paths_json(ds);
+    ASSERT(after_empty_json != NULL, "base paths after empty registration");
+    ASSERT(strcmp(before_empty_json, after_empty_json) == 0,
+           "empty registration preserves the base registry");
+    lance_free_string(before_empty_json);
+    lance_free_string(after_empty_json);
     ASSERT(lance_dataset_add_bases(ds, NULL, 1, NULL) == -1,
            "NULL base array must fail");
     ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
            "NULL base array error code");
-    message = lance_last_error_message();
+    const char *message = lance_last_error_message();
     if (message) lance_free_string(message);
 
     LanceBasePath missing_path = {3, NULL, NULL, false};

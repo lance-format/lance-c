@@ -1831,17 +1831,16 @@ static void test_base_paths_and_add(
         {lance::BasePath{0, empty_path, std::string("empty-props"), false}},
         empty_options);
 
+    const uint64_t before_empty = ds.version();
+    const std::string before_empty_json = ds.base_paths_json();
+    ds.add_bases({});
+    ds.add_bases({}, empty_options);
     const uint64_t stable_version = ds.version();
-    bool caught = false;
-    try {
-        ds.add_bases({});
-    } catch (const lance::Error& error) {
-        caught = true;
-        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
-    }
-    assert(caught);
+    assert(stable_version == before_empty + 2);
+    assert(ds.base_paths_json() == before_empty_json);
+    assert(old.version() == old_version);
 
-    caught = false;
+    bool caught = false;
     try {
         ds.add_bases(
             {lance::BasePath{0, alternate_uri, std::string("duplicate"), false}});

@@ -1563,8 +1563,8 @@ typedef struct LanceTransactionProperties {
  * Register new base paths and commit one native `Dataset::add_bases`
  * transaction.
  *
- * `bases` must be non-NULL and `base_count` must be greater than zero. An
- * empty registration is rejected before committing.
+ * `bases` may be NULL when `base_count == 0`. An empty list is passed to
+ * the native transaction builder and follows its commit behavior.
  *
  * `transaction_properties == NULL` maps to native `None`. A non-NULL pointer
  * with `count == 0` maps to native `Some(empty map)`, so the caller's explicit

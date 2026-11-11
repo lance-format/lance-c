@@ -92,7 +92,8 @@ unsafe fn base_paths_json_inner(dataset: *const LanceDataset) -> Result<*const c
 /// Register new base paths and commit one native `Dataset::add_bases`
 /// transaction.
 ///
-/// `bases` must be non-NULL and `base_count` must be greater than zero.
+/// `bases` may be NULL when `base_count == 0`. An empty list is passed to
+/// the native transaction builder.
 /// Each `bases[i]` is copied before the asynchronous native operation starts.
 /// A zero ID requests native allocation, and conflicts with existing IDs,
 /// names or paths are reported by Lance core.
@@ -126,12 +127,7 @@ unsafe fn add_bases_inner(
     if dataset.is_null() {
         return Err(lance_core::Error::invalid_input("dataset must not be NULL"));
     }
-    if base_count == 0 {
-        return Err(lance_core::Error::invalid_input(
-            "base_count must be greater than 0; an empty registration is not an add operation",
-        ));
-    }
-    if bases.is_null() {
+    if base_count > 0 && bases.is_null() {
         return Err(lance_core::Error::invalid_input(format!(
             "bases must not be NULL when base_count = {base_count}"
         )));

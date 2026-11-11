@@ -24421,13 +24421,47 @@ fn test_dataset_base_paths_and_add_bases_match_native() {
         take_last_error_message()
     );
 
-    let version = unsafe { lance_dataset_version(dataset) };
+    let native_fixture = create_config_base_files_fixture();
+    let native = Arc::new(lance_c::runtime::block_on(Dataset::open(&native_fixture.uri)).unwrap());
+    let native_version = native.version().version;
+    let native_bases = serde_json::to_value(&native.manifest().base_paths).unwrap();
+    let native_rows = lance_c::runtime::block_on(native.count_rows(None)).unwrap();
+    let native = Arc::new(lance_c::runtime::block_on(native.add_bases(Vec::new(), None)).unwrap());
+    let native = lance_c::runtime::block_on(
+        native.add_bases(Vec::new(), Some(std::collections::HashMap::new())),
+    )
+    .unwrap();
+    assert_eq!(native.version().version, native_version + 2);
+    assert_eq!(
+        serde_json::to_value(&native.manifest().base_paths).unwrap(),
+        native_bases
+    );
+    assert_eq!(
+        lance_c::runtime::block_on(native.count_rows(None)).unwrap(),
+        native_rows
+    );
+
+    let version_before_empty = unsafe { lance_dataset_version(dataset) };
+    let bases_before_empty = c_base_paths_json(dataset);
     assert_eq!(
         unsafe { lance_dataset_add_bases(dataset, ptr::null(), 0, ptr::null()) },
-        -1
+        0,
+        "{}",
+        take_last_error_message()
     );
-    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe { lance_dataset_add_bases(dataset, bases.as_ptr(), 0, &empty_properties) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let version = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        version - version_before_empty,
+        native.version().version - native_version
+    );
+    assert_eq!(c_base_paths_json(dataset), bases_before_empty);
+    assert_eq!(unsafe { lance_dataset_version(old_dataset) }, old_version);
     assert_eq!(
         unsafe { lance_dataset_add_bases(dataset, ptr::null(), 1, ptr::null()) },
         -1

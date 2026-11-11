@@ -2186,7 +2186,8 @@ public:
     ///
     /// `id == 0` requests native allocation. `name == std::nullopt` maps to
     /// native `None`; an engaged empty string is preserved. An empty `bases`
-    /// vector is rejected. Transaction properties distinguish native `None`
+    /// vector follows the native transaction's commit behavior.
+    /// Transaction properties distinguish native `None`
     /// (unset optional) from `Some(empty map)` (engaged empty vector). Native
     /// duplicate/conflict validation and ID allocation remain authoritative.
     /// Throws lance::Error on failure.
