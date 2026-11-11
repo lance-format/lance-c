@@ -212,7 +212,7 @@ fn create_overlay_dataset_on_disk(name: &str) -> (tempfile::TempDir, String) {
     )
     .unwrap();
     lance_c::runtime::block_on(async {
-        let dataset = Dataset::write(
+        let mut dataset = Dataset::write(
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
             &uri,
             Some(WriteParams {

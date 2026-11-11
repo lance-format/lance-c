@@ -63,7 +63,7 @@ async fn create_fixture(uri: &str) -> Dataset {
         ],
     )
     .unwrap();
-    let dataset = Dataset::write(
+    let mut dataset = Dataset::write(
         arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
         uri,
         Some(WriteParams {
@@ -88,6 +88,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let uri = format!("{}/dataset", dir.path().display());
         let native = create_fixture(&uri).await;
+        drop(native);
         let c_uri = c_string(&uri);
         let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
         assert!(!dataset.is_null(), "{:?}", take_error());
@@ -288,7 +289,7 @@ fn commit(
     assert!(!transaction.is_null(), "{:?}", take_error());
     let mut dataset = ptr::null_mut();
     let uri = c_string(uri);
-    let status = unsafe {
+    let _status = unsafe {
         lance_transaction_commit(
             uri.as_ptr(),
             transaction,
@@ -432,7 +433,7 @@ fn data_overlay_value_and_operation_lifetimes() {
         unsafe { lance_data_overlay_file_coverage_kind(overlay, &mut kind) },
         0
     );
-    assert_eq!(kind, LANCE_DATA_OVERLAY_COVERAGE_SHARED);
+    assert_eq!(kind, 0);
     let mut committed_version = 1u64;
     assert_eq!(
         unsafe { lance_data_overlay_file_committed_version(overlay, &mut committed_version) },
@@ -497,7 +498,7 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
         unsafe { lance_dataset_fragment_ids(fixture.dataset, ids.as_mut_ptr()) },
         0
     );
-    let base = lance_c::runtime::block_on(read_native_batch(&native));
+    let base = read_native_batch(&native);
     let base_rowids: Vec<u64> = (1..=20)
         .map(|id| row_values(&base, id).map(|values| values.2).unwrap_or(0))
         .collect();
@@ -530,7 +531,7 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
         unsafe { lance_data_overlay_file_coverage_kind(overlay0, &mut kind) },
         0
     );
-    assert_eq!(kind, LANCE_DATA_OVERLAY_COVERAGE_SHARED);
+    assert_eq!(kind, 0);
     unsafe { lance_data_overlay_file_close(overlay0) };
 
     let fragment1 = open_fragment(fixture.dataset, ids[1]);
@@ -563,7 +564,7 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
         unsafe { lance_data_overlay_file_coverage_kind(overlay1, &mut kind) },
         0
     );
-    assert_eq!(kind, LANCE_DATA_OVERLAY_COVERAGE_PER_FIELD);
+    assert_eq!(kind, 1);
     let mut bitmap_count = 0u64;
     assert_eq!(
         unsafe { lance_data_overlay_file_bitmap_count(overlay1, &mut bitmap_count) },
@@ -579,9 +580,9 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
         )
     };
     assert!(!operation.is_null(), "{:?}", take_error());
-    let mut op_kind = LANCE_OPERATION_UNKNOWN;
+    let mut op_kind = LanceOperationKind::Unknown;
     assert_eq!(unsafe { lance_operation_kind(operation, &mut op_kind) }, 0);
-    assert_eq!(op_kind, LANCE_OPERATION_DATA_OVERLAY);
+    assert_eq!(op_kind, LanceOperationKind::DataOverlay);
     let groups = operation_groups(operation);
     assert_eq!(groups.len(), 2);
     let mut cloned_fragment = 0u64;
@@ -706,7 +707,11 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
         );
         let group = finish(writer);
         let (committed, code) = commit(&fixture.uri, 3, &[group]);
-        assert!(code == LANCE_OK, "second commit failed: {:?}", take_error());
+        assert!(
+            code == LanceErrorCode::Ok,
+            "second commit failed: {:?}",
+            take_error()
+        );
         unsafe {
             lance_data_overlay_group_close(group);
             lance_schema_close(projected);
@@ -727,11 +732,8 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
     let c_uri = c_string(&fixture.uri);
     let mut old_handle = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 1) };
     assert!(!old_handle.is_null());
-    let mut old_fragment = ptr::null_mut();
-    assert_eq!(
-        unsafe { lance_dataset_open_fragment(old_handle, ids[0], &mut old_fragment) },
-        0
-    );
+    let old_fragment = unsafe { lance_dataset_open_fragment(old_handle, ids[0]) };
+    assert!(!old_fragment.is_null());
     let mut old_schema = ptr::null_mut();
     assert_eq!(
         unsafe { lance_fragment_schema_clone(old_fragment, &mut old_schema) },
@@ -752,7 +754,12 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
     let stale_group = finish(stale_writer);
     let (stale_committed, stale_code) = commit(&fixture.uri, 1, &[stale_group]);
     assert!(stale_committed.is_null());
-    assert_eq!(stale_code, LANCE_ERR_COMMIT_CONFLICT, "{:?}", take_error());
+    assert_eq!(
+        stale_code,
+        LanceErrorCode::CommitConflict,
+        "{:?}",
+        take_error()
+    );
     unsafe {
         lance_data_overlay_group_close(stale_group);
         lance_schema_close(old_projected);
@@ -771,14 +778,13 @@ fn data_overlay_shared_and_per_field_commit_and_stale_conflict() {
 
 #[test]
 fn data_overlay_validation_errors() {
-    let mut file = ptr::null_mut();
     assert!(
         unsafe { lance_data_overlay_file_new(ptr::null(), 0, ptr::null(), ptr::null(), 0, 0) }
             .is_null()
     );
     assert!(error_is(
         lance_last_error_code(),
-        LANCE_ERR_INVALID_ARGUMENT
+        LanceErrorCode::InvalidArgument
     ));
 
     let fixture = lance_c::runtime::block_on(Fixture::new());
@@ -802,7 +808,7 @@ fn data_overlay_validation_errors() {
     assert!(unsafe { lance_data_overlay_file_new(data_file, 2, &pointer, &len, 1, 0) }.is_null());
     assert!(error_is(
         lance_last_error_code(),
-        LANCE_ERR_INVALID_ARGUMENT
+        LanceErrorCode::InvalidArgument
     ));
     assert!(take_error().1.contains("coverage_kind"));
 
@@ -838,24 +844,30 @@ fn data_overlay_validation_errors() {
     );
     assert!(error_is(
         lance_last_error_code(),
-        LANCE_ERR_INVALID_ARGUMENT
+        LanceErrorCode::InvalidArgument
     ));
 
     let mut group_out = ptr::null_mut();
     assert!(unsafe { lance_data_overlay_group_new(1, ptr::null(), 1) }.is_null());
     assert!(error_is(
         lance_last_error_code(),
-        LANCE_ERR_INVALID_ARGUMENT
+        LanceErrorCode::InvalidArgument
     ));
 
-    let null_group = ptr::null_mut();
-    assert_eq!(
-        unsafe { lance_operation_data_overlay_new(&null_group, 1) },
-        ptr::null_mut()
+    let null_group: *mut LanceDataOverlayGroup = ptr::null_mut();
+    assert!(
+        unsafe {
+            lance_operation_data_overlay_new(
+                (&null_group as *const *mut LanceDataOverlayGroup)
+                    as *const *const LanceDataOverlayGroup,
+                1,
+            )
+        }
+        .is_null()
     );
     assert!(error_is(
         lance_last_error_code(),
-        LANCE_ERR_INVALID_ARGUMENT
+        LanceErrorCode::InvalidArgument
     ));
 
     let mut writer_out = ptr::null_mut();
@@ -865,7 +877,7 @@ fn data_overlay_validation_errors() {
     );
     assert!(error_is(
         lance_last_error_code(),
-        LANCE_ERR_INVALID_ARGUMENT
+        LanceErrorCode::InvalidArgument
     ));
 
     let mut null_writer = ptr::null_mut();
@@ -875,7 +887,7 @@ fn data_overlay_validation_errors() {
     );
     assert!(error_is(
         lance_last_error_code(),
-        LANCE_ERR_INVALID_ARGUMENT
+        LanceErrorCode::InvalidArgument
     ));
     assert!(null_writer.is_null());
 
@@ -885,7 +897,7 @@ fn data_overlay_validation_errors() {
     );
     assert!(error_is(
         lance_last_error_code(),
-        LANCE_ERR_INVALID_ARGUMENT
+        LanceErrorCode::InvalidArgument
     ));
 
     let batch = overlay_batch(vec![row_address(0, 0)], Some(vec![Some(1)]), None);
@@ -897,7 +909,7 @@ fn data_overlay_validation_errors() {
     );
     assert!(error_is(
         lance_last_error_code(),
-        LANCE_ERR_INVALID_ARGUMENT
+        LanceErrorCode::InvalidArgument
     ));
     assert_eq!(
         unsafe { lance_fragment_overlay_writer_write_batch(active_writer, imported) },
@@ -914,7 +926,7 @@ fn data_overlay_validation_errors() {
     );
     assert!(error_is(
         lance_last_error_code(),
-        LANCE_ERR_INVALID_ARGUMENT
+        LanceErrorCode::InvalidArgument
     ));
     unsafe {
         lance_fragment_overlay_writer_close(ptr::null_mut());
@@ -926,5 +938,4 @@ fn data_overlay_validation_errors() {
         lance_schema_close(schema);
         lance_fragment_close(fragment);
     }
-    assert!(file.is_null());
 }
