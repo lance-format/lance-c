@@ -98,6 +98,8 @@ jobs:
           sudo apt-get install -y protobuf-compiler lld
       - name: Build library artifacts
         run: cargo build --lib
+      - name: Verify shared-library exports
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.so include/lance/lance.h linux
       - name: Run tests
         run: cargo test
       - name: Run C/C++ compilation tests
@@ -113,6 +115,7 @@ jobs:
       CC: clang
       CXX: clang++
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+      CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER: ${{ github.workspace }}/.github/scripts/limit-macos-exports.sh
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -123,6 +126,8 @@ jobs:
         run: brew install protobuf
       - name: Build library artifacts
         run: cargo build --lib
+      - name: Verify shared-library exports
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance/lance.h macos
       - name: Run tests
         run: cargo test
       - name: Run C/C++ compilation tests

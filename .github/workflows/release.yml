@@ -68,6 +68,9 @@ jobs:
       CC: clang
       CXX: clang++
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # rustc's Mach-O export list includes dependency no_mangle symbols.
+      # Replace it for liblance_c.dylib before ld64 runs.
+      CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER: ${{ github.workspace }}/.github/scripts/limit-macos-exports.sh
     steps:
       # Runs before checkout so git is present for the clone and for the
       # Corrosion FetchContent. The image has no sudo and runs as root.
@@ -89,12 +92,14 @@ jobs:
             curl \
             git \
             libprotobuf-dev \
-            libssl-dev \
             perl \
             pkg-config \
             protobuf-compiler \
             xz-utils \
             zstd
+          # TLS stays on rustls; Cargo.lock has no openssl-sys or native-tls.
+          # libssl-dev must not be installed here: an accidental libssl or
+          # libcrypto DT_NEEDED breaks dlopen in minimal Linux images.
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git (container)
         if: matrix.container != ''
@@ -128,6 +133,17 @@ jobs:
           cmake --build build --parallel
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
+      - name: Strip release shared library
+        run: bash .github/scripts/strip-release-shared.sh stage ${{ matrix.os_label }}
+      - name: Verify Linux shared-library exports
+        if: matrix.os_label == 'linux'
+        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.so stage/include/lance/lance.h linux
+      - name: Verify macOS shared-library exports
+        if: matrix.os_label == 'macos'
+        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.dylib stage/include/lance/lance.h macos
+      - name: Verify Linux staged runtime dependencies
+        if: matrix.os_label == 'linux'
+        run: bash .github/scripts/verify-linux-staging.sh stage ${{ matrix.target }}
       - name: Verify macOS staged libraries
         if: matrix.os_label == 'macos'
         run: bash .github/scripts/verify-macos-staging.sh stage arm64
