@@ -10739,9 +10739,12 @@ fn test_rtree_scalar_index_geometry_queries_and_lifecycle() {
         },
         -1
     );
-    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::IndexError);
     let message = take_last_error_message();
-    assert!(!message.is_empty(), "missing native schema error");
+    assert!(
+        message.contains("Construct GeoArrowArray from an Arrow Array failed"),
+        "{message}"
+    );
 
     assert_eq!(
         unsafe {
