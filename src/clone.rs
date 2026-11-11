@@ -747,8 +747,7 @@ mod tests {
 
         for index in 0..10u64 {
             let row = index as usize;
-            let expected =
-                blob_row_sizes()[row % 5].map(|len| blob_payload(len, (row / 5) as usize * 100));
+            let expected = blob_row_sizes()[row % 5].map(|len| blob_payload(len, (row / 5) * 100));
             assert_eq!(read_blob_by_index(cloned, index), expected, "row {index}");
         }
 
