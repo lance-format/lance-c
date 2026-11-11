@@ -5758,6 +5758,52 @@ static void test_native_scalar_indexes(const char *uri) {
     printf("OK\n");
 }
 
+/* Index names are JSON strings; a real C consumer must receive complete
+ * escaping for backslashes, quotes and control characters. */
+static void test_index_list_json_escaping(const char *uri) {
+    printf("  test_index_list_json_escaping... ");
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    const char *names[] = {
+        "c_index\\q",
+        "c_index\\n",
+        "c_index\"quote",
+        "c_index\nline\ttab",
+        "c_索引列",
+    };
+    const size_t count = sizeof(names) / sizeof(names[0]);
+    for (size_t i = 0; i < count; ++i) {
+        ASSERT(lance_dataset_create_scalar_index(
+                   ds, "id", names[i], LANCE_SCALAR_BTREE, NULL, 0) == 0,
+               "escaped index creation failed");
+        CHECK_OK();
+    }
+
+    char *json = (char *)lance_dataset_index_list_json(ds);
+    ASSERT(json != NULL, "escaped index list failed");
+    ASSERT(strstr(json, "\"name\":\"c_index\\\\q\"") != NULL,
+           "backslash-q index name was not escaped");
+    ASSERT(strstr(json, "\"name\":\"c_index\\\\n\"") != NULL,
+           "backslash-n index name was not escaped");
+    ASSERT(strstr(json, "\"name\":\"c_index\\\"quote\"") != NULL,
+           "quoted index name was not escaped");
+    ASSERT(strstr(json, "\"name\":\"c_index\\nline\\ttab\"") != NULL,
+           "control characters in index name were not escaped");
+    ASSERT(strstr(json, "\"name\":\"c_索引列\"") != NULL,
+           "non-ASCII index name was not preserved");
+    lance_free_string(json);
+
+    for (size_t i = 0; i < count; ++i) {
+        ASSERT(lance_dataset_drop_index(ds, names[i]) == 0,
+               "escaped index drop failed");
+        CHECK_OK();
+    }
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static int collect_minhash_alice(struct ArrowArrayStream *stream) {
     struct ArrowSchema schema = {0};
     ASSERT(stream->get_schema(stream, &schema) == 0,
@@ -6801,6 +6847,7 @@ int main(int argc, char **argv) {
     test_vector_index_options_and_rq_model(uri);
     test_commit_index_segments(uri);
     test_native_scalar_indexes(uri);
+    test_index_list_json_escaping(uri);
     test_minhash_lsh(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);

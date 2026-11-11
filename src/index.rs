@@ -984,7 +984,7 @@ unsafe fn index_list_json_inner(dataset: *const LanceDataset) -> Result<*const c
         .map(|d| (d.name().to_string(), d.index_type().to_string()))
         .collect();
 
-    let mut entries: Vec<String> = Vec::new();
+    let mut entries = Vec::with_capacity(indices.len());
     for idx in indices.iter() {
         if lance_index::is_system_index(idx) {
             continue;
@@ -998,27 +998,18 @@ unsafe fn index_list_json_inner(dataset: *const LanceDataset) -> Result<*const c
             .get(&idx.name)
             .cloned()
             .unwrap_or_else(|| "Unknown".to_string());
-        let cols_json = columns
-            .iter()
-            .map(|c| format!("\"{}\"", c.replace('"', "\\\"")))
-            .collect::<Vec<_>>()
-            .join(",");
-        entries.push(format!(
-            "{{\"name\":\"{}\",\"uuid\":\"{}\",\"columns\":[{}],\"type\":\"{}\",\"dataset_version\":{}}}",
-            idx.name.replace('"', "\\\""),
-            idx.uuid,
-            cols_json,
-            type_str,
-            idx.dataset_version,
-        ));
+        entries.push(json!({
+            "name": idx.name,
+            "uuid": idx.uuid.to_string(),
+            "columns": columns,
+            "type": type_str,
+            "dataset_version": idx.dataset_version,
+        }));
     }
-    let json = format!("[{}]", entries.join(","));
-
-    // A JSON payload with an interior NUL cannot cross the C boundary as a
-    // `char*`; return NULL without an error message, as before.
-    Ok(CString::new(json)
-        .map(|s| s.into_raw() as *const c_char)
-        .unwrap_or(std::ptr::null()))
+    let json = serde_json::to_string(&entries).map_err(|error| {
+        lance_core::Error::internal(format!("failed to serialize index list: {error}"))
+    })?;
+    export_owned_string(json)
 }
 
 fn export_owned_string(value: String) -> Result<*const c_char> {

@@ -12104,6 +12104,47 @@ fn create_native_scalar_index_dataset() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a dataset whose real field names require every JSON string escape:
+/// backslash-q, backslash-n, quote, newline, tab and non-ASCII.
+fn create_escaped_index_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("escaped_index_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let column_names = [
+        "backslash\\q",
+        "backslash\\n",
+        "quote\"\n\tcolumn",
+        "非ASCII列",
+    ];
+    let schema = Arc::new(Schema::new(
+        std::iter::once(Field::new("id", DataType::Int32, false))
+            .chain(
+                column_names
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Int32, false)),
+            )
+            .collect::<Vec<_>>(),
+    ));
+    let values: arrow_array::ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![values; column_names.len() + 1]).unwrap();
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    (tmp, uri)
+}
+
 const MINHASH_BASE: &str = "the quick brown fox jumps over the lazy dog and runs away very fast";
 const MINHASH_NEAR: &str = "the quick brown fox jumps over the lazy dog and runs away very quickly";
 const MINHASH_UNRELATED: &str =
@@ -13785,6 +13826,109 @@ fn test_list_indices_json() {
     assert!(json.contains("\"columns\":[\"id\"]"), "json was: {}", json);
     assert!(json.contains("\"type\""), "json was: {}", json);
 
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_list_indices_json_escapes_special_names_and_columns() {
+    use lance::index::DatasetIndexExt;
+
+    let cases = [
+        ("backslash\\q", "index\\q"),
+        ("backslash\\n", "index\\n"),
+        ("quote\"\n\tcolumn", "quote\"\n\tname"),
+        ("非ASCII列", "非ASCII名"),
+    ];
+    let (_tmp, uri) = create_escaped_index_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    for (column, name) in cases {
+        assert_eq!(
+            unsafe {
+                lance_dataset_create_scalar_index(
+                    ds,
+                    c_str(column).as_ptr(),
+                    c_str(name).as_ptr(),
+                    LanceScalarIndexType::BTree as i32,
+                    ptr::null(),
+                    false,
+                )
+            },
+            0,
+            "create index {name:?} on column {column:?}: {}",
+            take_last_error_message()
+        );
+    }
+
+    let json = c_string_value(unsafe { lance_dataset_index_list_json(ds) });
+    unsafe { lance_dataset_close(ds) };
+    let entries: serde_json::Value = serde_json::from_str(&json)
+        .unwrap_or_else(|error| panic!("index list must be valid JSON ({error}): {json:?}"));
+
+    let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
+    let indices = lance_c::runtime::block_on(native.load_indices()).unwrap();
+    let schema = native.schema();
+    let expected = indices
+        .iter()
+        .filter(|index| !lance_index::is_system_index(index))
+        .map(|index| {
+            serde_json::json!({
+                "name": index.name,
+                "uuid": index.uuid.to_string(),
+                "columns": index
+                    .fields
+                    .iter()
+                    .filter_map(|field_id| {
+                        schema
+                            .field_by_id(*field_id)
+                            .map(|field| field.name.clone())
+                    })
+                    .collect::<Vec<_>>(),
+                "type": "BTree",
+                "dataset_version": index.dataset_version,
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        serde_json::Value::Array(expected),
+        "raw JSON: {json}"
+    );
+
+    let by_name = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| (entry["name"].as_str().unwrap(), entry))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(by_name.len(), cases.len(), "{json}");
+    for (column, name) in cases {
+        let entry = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing index {name:?}: {json}"));
+        assert_eq!(entry["name"], name, "{json}");
+        assert_eq!(entry["columns"], serde_json::json!([column]), "{json}");
+        assert!(entry["uuid"].is_string(), "{json}");
+        assert!(entry["dataset_version"].is_u64(), "{json}");
+    }
+}
+
+#[test]
+fn test_list_indices_json_empty_and_null() {
+    assert!(unsafe { lance_dataset_index_list_json(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("dataset is NULL"), "{message}");
+
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        take_json_value(unsafe { lance_dataset_index_list_json(ds) }),
+        serde_json::json!([])
+    );
     unsafe { lance_dataset_close(ds) };
 }
 
