@@ -1457,7 +1457,7 @@ fn test_delta_timestamp_representability() {
         message.contains("not representable"),
         "native chrono representability error should surface, got: {message}"
     );
-    // A non-normalized nanosecond field is equally rejected by chrono.
+    // At Unix second zero, chrono rejects a nanosecond component of 1e9.
     let over_nanos = LanceDeltaTimestamp {
         unix_seconds: 0,
         nanos: 1_000_000_000,

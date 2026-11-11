@@ -9100,14 +9100,13 @@ int32_t lance_sql_query_into_stream(
  * Timestamp for delta date-mode ranges.
  *
  * `unix_seconds` is a signed Unix timestamp in whole seconds and `nanos` the
- * nanoseconds within that second. The native chrono construction in the
- * builder owns representability and range validation, so out-of-range or
- * non-normalized values are rejected when the delta is built. There is no
- * invented epoch or reset value.
+ * nanosecond component. Native chrono timestamp construction defines
+ * representability, including leap seconds. An unrepresentable value is
+ * rejected by the timestamp setter.
  */
 typedef struct LanceDeltaTimestamp {
     int64_t unix_seconds;
-    uint32_t nanos; /* Native-validated 0..=999999999. */
+    uint32_t nanos; /* Validated by the native timestamp constructor. */
 } LanceDeltaTimestamp;
 
 /**

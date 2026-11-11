@@ -6583,11 +6583,11 @@ public:
                                                    &count) != 0) {
             check_error();
         }
-        std::unique_ptr<LanceTransaction*,
-                        std::function<void(LanceTransaction**)>>
-            guard(transactions, [count](LanceTransaction** t) {
-                lance_transaction_array_free(t, count);
-            });
+        auto free_transactions = [count](LanceTransaction** items) {
+            lance_transaction_array_free(items, count);
+        };
+        std::unique_ptr<LanceTransaction*, decltype(free_transactions)>
+            guard(transactions, free_transactions);
         std::vector<Transaction> out;
         out.reserve(count);
         for (size_t i = 0; i < count; ++i) {

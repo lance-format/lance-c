@@ -27,16 +27,15 @@ use crate::transaction::LanceTransaction;
 /// Timestamp for delta date-mode ranges.
 ///
 /// `unix_seconds` is a signed Unix timestamp in whole seconds and `nanos`
-/// the nanoseconds within that second; the native `chrono` construction owns
-/// representability and range validation, so out-of-range or non-normalized
-/// values are rejected when the builder is used. There is no invented epoch
-/// or reset value.
+/// the nanosecond component. Native `chrono::DateTime::from_timestamp` defines
+/// representability, including leap seconds. An unrepresentable value is
+/// rejected by the timestamp setter.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LanceDeltaTimestamp {
     /// Signed Unix seconds.
     pub unix_seconds: i64,
-    /// Nanoseconds within the second (native-validated range 0..=999_999_999).
+    /// Nanosecond component, validated by the native timestamp constructor.
     pub nanos: u32,
 }
 
