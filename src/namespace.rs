@@ -181,7 +181,7 @@ pub unsafe extern "C" fn lance_namespace_id(namespace: *const LanceNamespace) ->
         || {
             let namespace = unsafe { namespace.as_ref() }
                 .ok_or_else(|| Error::invalid_input_source("namespace must not be NULL".into()))?;
-            Ok(alloc_c_string(&namespace.id())?)
+            alloc_c_string(&namespace.id())
         },
         |_| ptr::null_mut(),
     )
@@ -199,9 +199,7 @@ pub unsafe extern "C" fn lance_namespace_retrieve_ops_metrics(
         || {
             let namespace = unsafe { namespace.as_ref() }
                 .ok_or_else(|| Error::invalid_input_source("namespace must not be NULL".into()))?;
-            Ok(alloc_c_string(&serde_json::to_string(
-                &namespace.metrics()?,
-            )?)?)
+            alloc_c_string(&serde_json::to_string(&namespace.metrics()?)?)
         },
         |_| ptr::null_mut(),
     )
@@ -882,7 +880,7 @@ unsafe fn dataset_write_namespace_inner(
             options,
             false,
             ptr::null(),
-            unsafe { session.as_ref() }.map(|session| session.inner.clone()),
+            session.as_ref().map(|session| session.inner.clone()),
         )?
     };
     if !storage_options.is_empty() {

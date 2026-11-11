@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -87,13 +88,12 @@ void write_table(
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
-        char root_template[] = "/tmp/lance-ns-cpp-XXXXXX";
-        if (mkdtemp(root_template) == nullptr) {
-            throw std::runtime_error("mkdtemp failed");
-        }
-        const std::string root = std::string(root_template) + "/backend";
+        require(argc > 1, "missing test root argument");
+        const std::string root =
+            (std::filesystem::path(argv[1]) / "backend").string();
+        std::filesystem::create_directories(root);
 
         lance::Namespace backend = lance::Namespace::directory({
             {"root", root},

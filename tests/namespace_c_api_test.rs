@@ -28,13 +28,13 @@ fn owned_string(value: &str) -> *mut c_char {
     c_string(value).into_raw()
 }
 
-fn take_and_free(value: *mut c_char) -> String {
+fn take_and_free(value: *const c_char) -> String {
     assert!(!value.is_null(), "expected a copied C string");
     let text = unsafe { CStr::from_ptr(value) }
         .to_str()
         .unwrap()
         .to_owned();
-    unsafe { lance_free_string(value) };
+    unsafe { lance_free_string(value.cast_mut()) };
     text
 }
 
@@ -133,7 +133,7 @@ fn assert_call_ok(
         rc,
         0,
         "{operation} failed: code={:?} error={} native={:?}",
-        unsafe { lance_last_error_code() },
+        lance_last_error_code(),
         last_error(),
         result.native_error()
     );
@@ -144,7 +144,7 @@ fn assert_native_unsupported(namespace: *const LanceNamespace, operation: &str, 
     let (rc, result) = call(namespace, operation, request, None);
     assert_ne!(rc, 0, "{operation} must not report success");
     assert_eq!(
-        unsafe { lance_last_error_code() },
+        lance_last_error_code(),
         LanceErrorCode::NotSupported,
         "{operation} generic code: {}",
         last_error()
@@ -233,7 +233,7 @@ fn write_namespace(
         rc,
         0,
         "namespace write mode {mode} failed: code={:?} error={}",
-        unsafe { lance_last_error_code() },
+        lance_last_error_code(),
         last_error()
     );
     assert!(!dataset.is_null());
@@ -255,7 +255,7 @@ fn directory_namespace(root: &str) -> *mut LanceNamespace {
     assert!(
         !namespace.is_null(),
         "directory namespace failed: {:?} {}",
-        unsafe { lance_last_error_code() },
+        lance_last_error_code(),
         last_error()
     );
     namespace
@@ -359,7 +359,7 @@ fn directory_lifecycle_dataset_versions_metrics_and_dispatch() {
         rc,
         0,
         "namespace URI commit failed: code={:?} error={}",
-        unsafe { lance_last_error_code() },
+        lance_last_error_code(),
         last_error()
     );
     assert!(!committed.is_null());
@@ -575,7 +575,7 @@ unsafe fn delegate_call(
     unsafe {
         (*error).code = lance_last_error_code() as i32;
         let message = lance_last_error_message();
-        (*error).message.data = message;
+        (*error).message.data = message.cast_mut();
         (*error).message.release = Some(free_owned_string);
     }
     1
@@ -688,7 +688,7 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
     assert_ne!(rc, 0, "conflicting managed version must fail");
     assert!(failed.is_null(), "failed write must not publish a dataset");
     assert_eq!(
-        unsafe { lance_last_error_code() },
+        lance_last_error_code(),
         LanceErrorCode::CommitConflict,
         "{}",
         last_error()
@@ -805,7 +805,7 @@ fn rest_adapter_client_context_headers_metrics_and_native_errors() {
         None,
     );
     assert_ne!(rc, 0);
-    assert_eq!(unsafe { lance_last_error_code() }, LanceErrorCode::NotFound);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
     assert_eq!(result.native_error().unwrap().0, 4);
 
     let metrics = unsafe { lance_namespace_retrieve_ops_metrics(client) };
@@ -901,6 +901,7 @@ unsafe extern "C" fn changing_storage_describe(
 fn snapshot_value(snapshot: *const LanceStorageOptionsSnapshot, key: &str) -> String {
     let count = unsafe { lance_storage_options_snapshot_count(snapshot) };
     for index in 0..count {
+        let index = usize::try_from(index).unwrap();
         let candidate = unsafe { lance_storage_options_snapshot_key_at(snapshot, index) };
         assert!(!candidate.is_null());
         if unsafe { CStr::from_ptr(candidate) }.to_str().unwrap() == key {
@@ -930,10 +931,7 @@ fn constructor_failures_release_foreign_contexts_exactly_once() {
     };
     let namespace = unsafe { lance_namespace_custom_new(&spec) };
     assert!(namespace.is_null(), "incomplete custom client must fail");
-    assert_eq!(
-        unsafe { lance_last_error_code() },
-        LanceErrorCode::InvalidArgument
-    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!(released.load(Ordering::SeqCst), 1);
 
     let provider_context = Box::into_raw(Box::new(released.clone())) as *mut c_void;
@@ -946,9 +944,6 @@ fn constructor_failures_release_foreign_contexts_exactly_once() {
     let namespace =
         unsafe { lance_namespace_rest_new(invalid_properties.as_ptr(), &provider_spec) };
     assert!(namespace.is_null(), "invalid REST properties must fail");
-    assert_eq!(
-        unsafe { lance_last_error_code() },
-        LanceErrorCode::InvalidArgument
-    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!(released.load(Ordering::SeqCst), 2);
 }

@@ -923,12 +923,14 @@ fn test_native_namespace_compilation_and_execution() {
         .join("cpp");
 
     let c_source = tests_dir.join("test_namespace.c");
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap();
     let c_binary = build_dir.path().join("test_namespace_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C native namespace test compilation failed"
     );
-    run_test_binary(&c_binary);
+    run_test_binary_with_dataset(&c_binary, root);
 
     let cpp_source = tests_dir.join("test_namespace.cpp");
     let cpp_binary = build_dir.path().join("test_namespace_cpp");
@@ -936,5 +938,5 @@ fn test_native_namespace_compilation_and_execution() {
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ native namespace test compilation failed"
     );
-    run_test_binary(&cpp_binary);
+    run_test_binary_with_dataset(&cpp_binary, root);
 }

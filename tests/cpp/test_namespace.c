@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #define CHECK(cond, message)                                                   \
     do {                                                                       \
@@ -112,11 +113,11 @@ static void write_table(
     lance_dataset_close(dataset);
 }
 
-int main(void) {
-    char root_template[] = "/tmp/lance-ns-c-XXXXXX";
-    CHECK(mkdtemp(root_template) != NULL, "mkdtemp");
+int main(int argc, char** argv) {
+    CHECK(argc > 1, "missing test root argument");
     char root[512];
-    snprintf(root, sizeof(root), "%s/namespace", root_template);
+    snprintf(root, sizeof(root), "%s/namespace", argv[1]);
+    CHECK(mkdir(root, 0755) == 0 || access(root, F_OK) == 0, "namespace root");
     char properties[1024];
     snprintf(properties, sizeof(properties),
              "{\"root\":\"%s\",\"manifest_enabled\":\"true\","
