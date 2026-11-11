@@ -93,7 +93,7 @@ static void check_call(
     LanceNamespaceResult result;
     memset(&result, 0, sizeof(result));
     CHECK(lance_namespace_call(ns, operation, request, NULL, 0, &result) == 0, operation);
-    CHECK(contains(result.result_json, expected), operation);
+    CHECK(expected == NULL || contains(result.result_json, expected), operation);
     lance_namespace_result_close(&result);
 }
 

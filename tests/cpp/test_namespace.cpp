@@ -56,6 +56,12 @@ struct IntStream {
         stream.release = [](ArrowArrayStream* raw) { raw->release = nullptr; };
         stream.private_data = this;
     }
+
+    void reset() {
+        emitted = 0;
+        array.release = noop_array_release;
+        stream.release = [](ArrowArrayStream* raw) { raw->release = nullptr; };
+    }
 };
 
 bool contains(const std::string& value, const std::string& needle) {
@@ -73,6 +79,7 @@ void write_table(
     const std::vector<std::string>& table_id,
     lance::WriteMode mode,
     IntStream& fixture) {
+    fixture.reset();
     auto dataset = lance::Dataset::write_namespace(
         ns, table_id, &fixture.stream, mode, lance::WriteOptions{});
     require(dataset.count_rows() > 0, "written dataset has rows");

@@ -7032,7 +7032,7 @@ char* lance_namespace_id(const LanceNamespace* namespace);
 char* lance_namespace_retrieve_ops_metrics(const LanceNamespace* namespace);
 
 /** Reset the native operation counters. */
-int32_t lance_namespace_reset_ops_metrics(LanceNamespace* namespace);
+int32_t lance_namespace_reset_ops_metrics(const LanceNamespace* namespace);
 
 /**
  * Synchronous, infallible dynamic context provider.

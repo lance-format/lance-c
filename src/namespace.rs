@@ -16,7 +16,7 @@
 //! `LANCE_OK`.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::fmt;
 use std::ptr;
 use std::sync::Arc;
@@ -27,8 +27,8 @@ use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance::Dataset;
+use lance::dataset::WriteParams;
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::{CommitBuilder, WriteParams};
 use lance_core::{Error, Result};
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_namespace::compat::merge_insert_request_from_json;
@@ -48,7 +48,7 @@ use serde_json::Value;
 use crate::callback::{
     LanceCallbackError, LanceOwnedString, release_message_only, take_owned_string,
 };
-use crate::commit::commit_builder_from_ffi_with_handler;
+use crate::commit::{commit_builder_from_ffi_with_handler, dataset_handle};
 use crate::dataset::LanceDataset;
 use crate::error::{LanceErrorCode, ffi_guard_with, swallow_unwind};
 use crate::helpers::parse_c_string;
@@ -304,7 +304,7 @@ unsafe fn directory_new_inner(
 ) -> Result<*mut LanceNamespace> {
     let provider = unsafe { context_provider_from_spec(context_provider)? };
     let properties = unsafe { properties_from_json(properties_json, "properties_json")? };
-    let session = session.as_ref().map(|session| session.inner.clone());
+    let session = unsafe { session.as_ref() }.map(|session| session.inner.clone());
     let mut builder = DirectoryNamespaceBuilder::from_properties(properties, session)?;
     if let Some(provider) = provider {
         builder = builder.context_provider(provider);
@@ -376,7 +376,7 @@ unsafe fn connect_new_inner(
         .ok_or_else(|| Error::invalid_input("impl_name must not be empty"))?;
     let properties = unsafe { properties_from_json(properties_json, "properties_json")? };
     let mut builder = ConnectBuilder::new(impl_name).properties(properties);
-    if let Some(session) = session.as_ref() {
+    if let Some(session) = unsafe { session.as_ref() } {
         builder = builder.session(session.inner.clone());
     }
     if let Some(provider) = provider {
@@ -436,21 +436,26 @@ pub unsafe extern "C" fn lance_namespace_call(
         );
     }
     ffi_guard_with(
-        || unsafe {
-            namespace_call_inner(
-                namespace,
-                operation,
-                request_json,
-                request_bytes,
-                request_bytes_len,
-                out_result,
-            )
+        || {
+            block_on(async {
+                unsafe {
+                    namespace_call_inner(
+                        namespace,
+                        operation,
+                        request_json,
+                        request_bytes,
+                        request_bytes_len,
+                        out_result,
+                    )
+                    .await
+                }
+            })
         },
         |_| -1,
     )
 }
 
-unsafe fn namespace_call_inner(
+async unsafe fn namespace_call_inner(
     namespace: *const LanceNamespace,
     operation: *const c_char,
     request_json: *const c_char,
@@ -768,13 +773,11 @@ unsafe fn dataset_open_namespace_inner(
     if version != 0 {
         builder = builder.with_version(version);
     }
-    if let Some(session) = session.as_ref() {
+    if let Some(session) = unsafe { session.as_ref() } {
         builder = builder.with_session(session.inner.clone());
     }
     let dataset = block_on(builder.load())?;
-    Ok(Box::into_raw(Box::new(crate::dataset::dataset_handle(
-        dataset,
-    ))))
+    Ok(Box::into_raw(Box::new(dataset_handle(dataset))))
 }
 
 /// Write an Arrow stream into a native namespace-managed table.
@@ -859,7 +862,7 @@ unsafe fn dataset_write_namespace_inner(
     let table_id = unsafe { table_id_from_json(table_id_json)? };
     let expected_schema = ArrowSchema::try_from(unsafe { &*schema })
         .map_err(|error| Error::invalid_input_source(format!("invalid schema: {error}").into()))?;
-    let stream_schema = reader.schema();
+    let stream_schema = reader.arrow_schema();
     if stream_schema.fields() != expected_schema.fields() {
         return Err(Error::invalid_input_source(
             format!(
@@ -878,7 +881,7 @@ unsafe fn dataset_write_namespace_inner(
             options,
             false,
             ptr::null(),
-            session.as_ref().map(|session| session.inner.clone()),
+            unsafe { session.as_ref() }.map(|session| session.inner.clone()),
         )?
     };
     if !storage_options.is_empty() {
@@ -924,7 +927,7 @@ unsafe fn dataset_write_namespace_inner(
     unsafe {
         ptr::write(
             out_dataset,
-            Box::into_raw(Box::new(crate::dataset::dataset_handle(dataset))),
+            Box::into_raw(Box::new(dataset_handle(dataset))),
         );
     }
     Ok(0)
@@ -1012,7 +1015,7 @@ unsafe fn transaction_commit_namespace_uri_inner(
     unsafe {
         ptr::write(
             out_dataset,
-            Box::into_raw(Box::new(crate::dataset::dataset_handle(dataset))),
+            Box::into_raw(Box::new(dataset_handle(dataset))),
         );
     }
     Ok(0)
