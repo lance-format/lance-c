@@ -1009,9 +1009,10 @@ fn test_delta_date_mode_matches_resolved_version_range() {
     });
 
     // Begin is exclusive and end inclusive; resolve the same window natively
-    // in-process so the expectation does not depend on clock granularity.
-    let begin = timestamps[1]; // version 2
-    let end = timestamps[4]; // version 5
+    // in-process so the expectation does not depend on clock granularity. The
+    // window opens at version 3's commit, which resolves the begin to 2.
+    let begin = timestamps[2];
+    let end = timestamps[4];
     let mut resolved_begin = 0_u64;
     let mut resolved_end = 0_u64;
     for version in &versions {
@@ -1027,6 +1028,11 @@ fn test_delta_date_mode_matches_resolved_version_range() {
         }
     }
 
+    assert_eq!(
+        (resolved_begin, resolved_end),
+        (2, 5),
+        "the exclusive begin and inclusive end resolve to versions 2 and 5"
+    );
     let delta = build_c_delta(ds, |builder| {
         let begin_ts = LanceDeltaTimestamp {
             unix_seconds: begin.0,

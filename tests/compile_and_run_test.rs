@@ -1586,8 +1586,10 @@ fn test_native_sql_delta_compilation_and_execution() {
     assert_eq!(timestamps.len(), 5, "history fixture versions");
 
     // A window from version 2 (exclusive) to version 5 (inclusive): the
-    // inserted, updated and deleted change sets are all non-empty there.
-    let begin = timestamps[1];
+    // inserted, updated and deleted change sets are all non-empty there. The
+    // begin date is exclusive, so opening the window at version 3's commit
+    // timestamp resolves the begin to version 2.
+    let begin = timestamps[2];
     let end = timestamps[4];
     let (resolved_begin, resolved_end) = resolve_sql_delta_window(&history_uri, begin, end);
     assert_eq!(resolved_begin, 2, "begin resolves to the exclusive version");
