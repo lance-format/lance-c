@@ -16,7 +16,7 @@ use arrow_schema::{DataType, Field};
 use chrono::{DateTime, Utc};
 use lance::Dataset;
 use lance::index::DatasetIndexExt;
-use lance::index::vector::VectorIndexParams as LanceCoreVectorIndexParams;
+use lance::index::vector::{StageParams, VectorIndexParams as LanceCoreVectorIndexParams};
 use lance_core::{Error, Result};
 use lance_index::progress::IndexBuildProgress;
 use lance_index::scalar::ScalarIndexParams;
@@ -1065,43 +1065,12 @@ unsafe fn new_vector_builder_inner(
         None
     };
 
-    let has_codebook = codebook.is_some();
     let centroids = centroids.map(Arc::new);
     // Construct now so all supported parameter/model mismatches fail while
     // creating the builder. Fragment validation itself stays in Lance core.
     let core_params = build_vector_params_with_models(&params, centroids, codebook)?;
 
-    // TODO(upstream-lance): Remove this fail-fast once Lance's distributed
-    // vector-index path reconstructs a supplied PQ codebook with an L2
-    // ProductQuantizer, matching the ordinary full-dataset path. Pinned Lance
-    // revision ab6b5bbe rewraps supplied codebooks with DistanceType::Dot in
-    // `make_global_pq`, which silently switches PQ code assignment away from
-    // the L2 contract shared by full-dataset builds and index readers.
-    if matches!(
-        params.index_type,
-        LanceVectorIndexType::IvfPq | LanceVectorIndexType::IvfHnswPq
-    ) && params.metric == LanceMetricType::Dot
-        && has_codebook
-        && let Some(fragment_ids) = parsed.fragment_ids.as_ref()
-    {
-        // Compare against the current snapshot to detect an effective strict
-        // subset, mirroring core `effective_vector_fragments`.
-        let all_fragment_ids: HashSet<u32> = dataset
-            .get_fragments()
-            .iter()
-            .filter_map(|fragment| u32::try_from(fragment.id()).ok())
-            .collect();
-        let selected_fragment_ids: HashSet<u32> = fragment_ids.iter().copied().collect();
-        if selected_fragment_ids != all_fragment_ids {
-            return Err(invalid_input(format!(
-                "pq_codebook is supplied for metric=DOT, index_type={:?}, mode={:?}, and an effective strict fragment subset ({} of {} fragments): pinned Lance revision ab6b5bbe reconstructs the supplied codebook with a DOT ProductQuantizer in the distributed build path (make_global_pq), silently breaking the L2 PQ-assignment contract; cover the full dataset in one segment (pass NULL fragment_ids or list every fragment) or wait for upstream Lance DOT support",
-                params.index_type,
-                parsed.mode,
-                selected_fragment_ids.len(),
-                all_fragment_ids.len()
-            )));
-        }
-    }
+    validate_precomputed_pq_fragment_scope(&dataset, &core_params, parsed.fragment_ids.as_deref())?;
 
     Ok(Box::into_raw(Box::new(LanceIndexSegmentBuilder {
         dataset,
@@ -1116,6 +1085,40 @@ unsafe fn new_vector_builder_inner(
         progress: None,
         executed: false,
     })))
+}
+
+// The selected core's distributed path reconstructs supplied PQ codebooks with
+// the query metric. Index readers and ordinary builds use L2 PQ assignment,
+// so preserve the existing restriction for DOT models on fragment subsets
+// until the core's make_global_pq uses the same assignment metric.
+fn validate_precomputed_pq_fragment_scope(
+    dataset: &Dataset,
+    params: &LanceCoreVectorIndexParams,
+    fragment_ids: Option<&[u32]>,
+) -> Result<()> {
+    let has_codebook = params
+        .stages
+        .iter()
+        .any(|stage| matches!(stage, StageParams::PQ(pq) if pq.codebook.is_some()));
+    if params.metric_type == LanceMetricType::Dot.to_distance()
+        && has_codebook
+        && let Some(fragment_ids) = fragment_ids
+    {
+        let all_fragment_ids: HashSet<u32> = dataset
+            .get_fragments()
+            .iter()
+            .filter_map(|fragment| u32::try_from(fragment.id()).ok())
+            .collect();
+        let selected_fragment_ids: HashSet<u32> = fragment_ids.iter().copied().collect();
+        if selected_fragment_ids != all_fragment_ids {
+            return Err(invalid_input(format!(
+                "pq_codebook with metric=DOT and an effective strict fragment subset ({} of {} fragments) is unsupported on Lance revision 40f15ed1. Its distributed make_global_pq path reconstructs the supplied codebook with a DOT ProductQuantizer, breaking the L2 PQ-assignment contract. Cover the full dataset in one segment by passing NULL fragment_ids or every fragment.",
+                selected_fragment_ids.len(),
+                all_fragment_ids.len()
+            )));
+        }
+    }
+    Ok(())
 }
 
 unsafe fn parse_vector_segment_scope(
@@ -1195,6 +1198,7 @@ unsafe fn new_vector_builder_with_options_inner(
     let prepared = unsafe { prepare_vector_build(options)? };
     let (fragment_ids, index_uuid) = unsafe { parse_vector_segment_scope(scope)? };
     let dataset = unsafe { &*dataset }.snapshot().as_ref().clone();
+    validate_precomputed_pq_fragment_scope(&dataset, &prepared.params, fragment_ids.as_deref())?;
 
     Ok(Box::into_raw(Box::new(LanceIndexSegmentBuilder {
         dataset,

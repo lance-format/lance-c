@@ -13999,7 +13999,7 @@ fn test_vector_index_segment_rejects_strict_subset_dot_pq() {
     let message = take_last_error_message();
     assert!(message.contains("metric=DOT"), "{message}");
     assert!(message.contains("strict fragment subset"), "{message}");
-    assert!(message.contains("ab6b5bbe"), "{message}");
+    assert!(message.contains("40f15ed1"), "{message}");
     assert!(message.contains("1 of 2 fragments"), "{message}");
     assert!(!centroids.is_released());
     assert!(!codebook.is_released());
