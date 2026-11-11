@@ -178,9 +178,13 @@ impl FfiStorageOptionsProvider {
     ) -> Result<Option<HashMap<String, String>>> {
         let mut result = empty_fetch_result();
         let mut error = LanceCallbackError::empty();
-        // SAFETY: the context and callback table remain valid for the complete
-        // synchronous invocation. The output slots are initialized and writable.
-        let status = unsafe { callback(self.context.callback_ctx, &mut result, &mut error) };
+        // Foreign callbacks may synchronously read through independent handles.
+        // Leave the async runtime context while they call blocking C APIs.
+        let status = tokio::task::block_in_place(|| {
+            // SAFETY: the context and callback table remain valid for the complete
+            // synchronous invocation. The output slots are initialized and writable.
+            unsafe { callback(self.context.callback_ctx, &mut result, &mut error) }
+        });
         let _snapshot = FetchSnapshot::new(&result);
 
         if status != 0 {
