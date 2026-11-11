@@ -268,6 +268,7 @@ unsafe fn merge_insert_inner(
             "on_columns must not be NULL when num_on_columns > 0".into(),
         ));
     }
+    helpers::validate_slice_length::<*const c_char>(num_on_columns, "on_columns")?;
 
     // Materialize key columns up front so a precise per-index error fires
     // before the write lock is taken.
@@ -395,6 +396,10 @@ unsafe fn parse_compacted_sstables(
             .into(),
         ));
     }
+    helpers::validate_slice_length::<LanceCompactedSsTable>(
+        num_compacted_sstables,
+        "compacted_sstables",
+    )?;
     let entries = unsafe { std::slice::from_raw_parts(compacted_sstables, num_compacted_sstables) };
     Ok(entries
         .iter()

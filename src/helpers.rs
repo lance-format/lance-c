@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! C string parsing utilities.
+//! Foreign input parsing utilities.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
@@ -16,6 +16,23 @@ use lance_core::Result;
 use lance_core::datatypes::Schema as LanceSchema;
 
 use crate::error::panic_payload_message;
+
+/// Validate an element count before allocating or constructing a Rust slice.
+pub(crate) fn validate_slice_length<T>(count: usize, label: &str) -> Result<()> {
+    let element_size = std::mem::size_of::<T>();
+    let byte_length = count.checked_mul(element_size).ok_or_else(|| {
+        lance_core::Error::invalid_input(format!(
+            "{label} count {count} overflows the byte length for elements of size {element_size}"
+        ))
+    })?;
+    if byte_length > isize::MAX as usize {
+        return Err(lance_core::Error::invalid_input(format!(
+            "{label} count {count} with element size {element_size} exceeds the maximum slice byte length {}",
+            isize::MAX
+        )));
+    }
+    Ok(())
+}
 
 /// Parse a nullable C string pointer into an `Option<&str>`.
 pub unsafe fn parse_c_string<'a>(ptr: *const c_char) -> Result<Option<&'a str>> {

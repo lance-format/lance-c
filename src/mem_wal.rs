@@ -237,6 +237,7 @@ unsafe fn c_string_array(
             "{name} must not be NULL when its count is {count}"
         )));
     }
+    crate::helpers::validate_slice_length::<*const c_char>(count, name)?;
     let entries = unsafe { slice::from_raw_parts(ptr, count) };
     let mut values = Vec::with_capacity(count);
     for (index, entry) in entries.iter().enumerate() {
@@ -260,6 +261,7 @@ unsafe fn snapshots_from_c(
             "snapshots must not be NULL when num_snapshots is {count}"
         )));
     }
+    crate::helpers::validate_slice_length::<*const LanceMemWalShardSnapshot>(count, "snapshots")?;
     let entries = unsafe { slice::from_raw_parts(snapshots, count) };
     let mut values = Vec::with_capacity(count);
     for (index, entry) in entries.iter().enumerate() {
@@ -765,6 +767,7 @@ unsafe fn sharding_field_new_inner(
                 "source_ids must not be NULL when num_source_ids is {num_source_ids}"
             )));
         }
+        crate::helpers::validate_slice_length::<i32>(num_source_ids, "source_ids")?;
         unsafe { slice::from_raw_parts(source_ids, num_source_ids) }.to_vec()
     };
     let transform = unsafe { parse_c_string(transform)? }.map(str::to_string);
@@ -778,6 +781,7 @@ unsafe fn sharding_field_new_inner(
             "parameter_keys and parameter_values must not be NULL when num_parameters > 0",
         ));
     }
+    crate::helpers::validate_slice_length::<*const c_char>(num_parameters, "parameters")?;
     let mut parameters = HashMap::with_capacity(num_parameters);
     for index in 0..num_parameters {
         let key_ptr = unsafe { *parameter_keys.add(index) };
@@ -946,6 +950,10 @@ pub unsafe extern "C" fn lance_mem_wal_sharding_spec_new(
     ffi_try!(
         unsafe {
             require_out(out, "out")?;
+            crate::helpers::validate_slice_length::<*const LanceMemWalShardingField>(
+                num_fields,
+                "fields",
+            )?;
             let mut cloned = Vec::with_capacity(num_fields);
             if num_fields > 0 {
                 if fields.is_null() {
@@ -1368,6 +1376,10 @@ unsafe fn parse_writer_config(
                 raw.num_hnsw_params
             )));
         }
+        crate::helpers::validate_slice_length::<LanceMemWalHnswParams>(
+            raw.num_hnsw_params,
+            "hnsw_params",
+        )?;
         let entries = unsafe { slice::from_raw_parts(raw.hnsw_params, raw.num_hnsw_params) };
         for (index, entry) in entries.iter().enumerate() {
             let name = unsafe { parse_c_string(entry.index_name)? }
@@ -2359,6 +2371,7 @@ unsafe fn vector_plan_inner(
                 "query must not be NULL when query_len is {query_len}"
             )));
         }
+        crate::helpers::validate_slice_length::<f32>(query_len, "query")?;
         unsafe { slice::from_raw_parts(query, query_len) }
     };
     let refine = bool_flag(refine_base_table, "refine_base_table")?;
