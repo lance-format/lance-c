@@ -3946,6 +3946,125 @@ static void check_native_scalar_query(
            "disabled scalar index must not load an index");
 }
 
+static size_t scan_rtree_ids_with_statistics(
+    const char *uri,
+    const char *filter,
+    int use_scalar_index,
+    int32_t *out,
+    size_t capacity,
+    ScanStatisticsCapture *captured) {
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "RTree geometry dataset open failed");
+    const char *columns[] = {"id", "geometry", NULL};
+    LanceScanner *scanner = lance_scanner_new(ds, columns, filter);
+    ASSERT(scanner != NULL, "RTree geometry scanner creation failed");
+    ASSERT(lance_scanner_set_use_scalar_index(
+               scanner, use_scalar_index != 0) == 0,
+           "RTree use_scalar_index setter failed");
+    memset(captured, 0, sizeof(*captured));
+    ASSERT(lance_scanner_set_statistics_callback(
+               scanner, capture_scan_statistics, captured) == 0,
+           "RTree statistics callback registration failed");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "RTree geometry stream failed");
+    size_t count = collect_ordering_ids(&stream, out, capacity);
+    lance_scanner_close(scanner);
+    lance_dataset_close(ds);
+    return count;
+}
+
+static void check_rtree_query(
+    const char *uri,
+    const char *filter,
+    const int32_t *expected,
+    size_t expected_count) {
+    int32_t actual[32];
+    ScanStatisticsCapture stats;
+    size_t count =
+        scan_rtree_ids_with_statistics(uri, filter, 1, actual, 32, &stats);
+    assert_ids_match(actual, count, expected, expected_count);
+    ASSERT(stats.calls == 1, "RTree statistics callback count mismatch");
+    ASSERT(stats.indices_loaded > 0,
+           "RTree query must load the native index");
+
+    count = scan_rtree_ids_with_statistics(uri, filter, 0, actual, 32, &stats);
+    assert_ids_match(actual, count, expected, expected_count);
+    ASSERT(stats.indices_loaded == 0,
+           "disabled scalar index must not load RTree");
+}
+
+static void test_rtree_scalar_index(const char *uri) {
+    printf("  test_rtree_scalar_index... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "RTree geometry dataset open failed");
+    ASSERT(lance_dataset_fragment_count(ds) == 3,
+           "RTree geometry fixture fragment count");
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "geometry", "c_geometry_rtree", LANCE_SCALAR_RTREE,
+               NULL, 0) == 0,
+           "C RTree index creation failed");
+    ASSERT(lance_dataset_index_count(ds) == 1,
+           "C RTree index count mismatch");
+    ASSERT(lance_dataset_index_segment_count(ds, "c_geometry_rtree") == 1,
+           "C RTree segment count mismatch");
+
+    char *json = (char *)lance_dataset_index_list_json(ds);
+    ASSERT(json != NULL, "C RTree index list failed");
+    ASSERT(strstr(json, "\"name\":\"c_geometry_rtree\"") != NULL &&
+               strstr(json, "\"type\":\"RTree\"") != NULL &&
+               strstr(json, "\"columns\":[\"geometry\"]") != NULL,
+           "C RTree index listing mismatch");
+    lance_free_string(json);
+    json = (char *)lance_dataset_index_segments_json(ds);
+    ASSERT(json != NULL, "C RTree segment list failed");
+    ASSERT(strstr(json, "\"name\":\"c_geometry_rtree\"") != NULL &&
+               strstr(json, "\"type\":\"RTree\"") != NULL &&
+               strstr(json, "\"fragment_ids\":[0,1,2]") != NULL,
+           "C RTree segment listing mismatch");
+    lance_free_string(json);
+
+    const int32_t point[] = {101, 114};
+    const int32_t recheck[] = {106};
+    const int32_t origin[] = {100};
+    const int32_t nulls[] = {103, 108};
+    check_rtree_query(
+        uri, "ST_Intersects(geometry, ST_GeomFromText('POINT (0 10)'))",
+        point, 2);
+    check_rtree_query(
+        uri,
+        "ST_Intersects(geometry, ST_GeomFromText('LINESTRING (25 25, 26 26)'))",
+        recheck, 1);
+    check_rtree_query(
+        uri, "ST_Intersects(geometry, ST_GeomFromText('POINT (0 0)'))",
+        origin, 1);
+    check_rtree_query(uri, "geometry IS NULL", nulls, 2);
+
+    ASSERT(lance_dataset_prewarm_index(ds, "c_geometry_rtree") == 0,
+           "C RTree prewarm failed");
+    lance_dataset_close(ds);
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "C RTree dataset reopen failed");
+    ASSERT(lance_dataset_create_scalar_index(
+               ds, "geometry", "c_geometry_rtree", LANCE_SCALAR_RTREE,
+               "{\"page_size\":8}", 1) == 0,
+           "C RTree replacement failed");
+    ASSERT(lance_dataset_index_count(ds) == 1,
+           "C RTree replacement changed the index count");
+    check_rtree_query(
+        uri, "ST_Intersects(geometry, ST_GeomFromText('POINT (0 10)'))",
+        point, 2);
+    ASSERT(lance_dataset_drop_index(ds, "c_geometry_rtree") == 0,
+           "C RTree drop failed");
+    ASSERT(lance_dataset_index_count(ds) == 0,
+           "C dropped RTree index remains listed");
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 static void test_native_scalar_indexes(const char *uri) {
     printf("  test_native_scalar_indexes... ");
 
@@ -4756,11 +4875,12 @@ static void test_fragment_read_operations(const char *uri) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-    if (argc < 12) {
+    if (argc < 13) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
                 "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri> "
-                "<aggregate_plan_path> <config_base_uri> <alternate_base_uri>\n",
+                "<rtree_geometry_uri> <aggregate_plan_path> <config_base_uri> "
+                "<alternate_base_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -4773,9 +4893,10 @@ int main(int argc, char **argv) {
     const char *fragment_uri = argv[6];
     const char *fragment_read_uri = argv[7];
     const char *cleanup_uri = argv[8];
-    const char *aggregate_plan_path = argv[9];
-    const char *config_base_uri = argv[10];
-    const char *alternate_base_uri = argv[11];
+    const char *rtree_geometry_uri = argv[9];
+    const char *aggregate_plan_path = argv[10];
+    const char *config_base_uri = argv[11];
+    const char *alternate_base_uri = argv[12];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_batch_nearest(uri);
@@ -4805,6 +4926,7 @@ int main(int argc, char **argv) {
     test_vector_models_and_reusable_segments(uri);
     test_commit_index_segments(uri);
     test_native_scalar_indexes(uri);
+    test_rtree_scalar_index(rtree_geometry_uri);
     test_minhash_lsh(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_write_options_and_config(uri, write_uri);

@@ -60,6 +60,9 @@ uuid = { version = "1", features = ["v4"] }
 lance = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
 lance-datagen = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-file = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+geo-types = "0.7.18"
+geoarrow-array = "0.8.0"
+geoarrow-schema = "0.8.0"
 datafusion-substrait = { version = "=54.1.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "58.0.0"

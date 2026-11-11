@@ -143,6 +143,7 @@ typedef enum {
     LANCE_SCALAR_ZONE_MAP     = 6,
     LANCE_SCALAR_BLOOM_FILTER = 7,
     LANCE_SCALAR_MINHASH_LSH  = 8,
+    LANCE_SCALAR_RTREE        = 9,
 } LanceScalarIndexType;
 
 typedef enum {
@@ -3466,7 +3467,7 @@ int32_t lance_dataset_create_vector_index(
  *                    ZoneMap uses `rows_per_zone`/`use_seeds` and BloomFilter
  *                    uses `number_of_items`/`probability`. MinHash LSH uses
  *                    `num_hashes`, `num_bands`, `shingle_size`, and
- *                    `tokenizer`.
+ *                    `tokenizer`. RTree uses `page_size`.
  * @return 0 on success, -1 on error.
  */
 int32_t lance_dataset_create_scalar_index(
