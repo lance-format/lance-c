@@ -35,6 +35,7 @@ class ExportShimTests(unittest.TestCase):
         self.shim = Path(__file__).with_name("limit-macos-exports.sh")
 
     def run_link(self, flags, output="liblance_c.dylib"):
+        self.capture.unlink(missing_ok=True)
         args = ["-o", str(self.root / output), *flags]
         result = subprocess.run(["bash", str(self.shim), *args], env=self.env,
                                 text=True, capture_output=True)
