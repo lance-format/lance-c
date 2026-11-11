@@ -4,7 +4,7 @@
 //! Native fragment mutation and staging acceptance.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_void};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchIterator;
-use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray, StructArray};
+use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray};
 use arrow_schema::{DataType, Field, Fields, Schema};
 use lance::Dataset;
 use lance::dataset::fragment::FileFragment;
@@ -131,7 +131,14 @@ fn create_mutation_fixture(name: &str) -> (tempfile::TempDir, String) {
             .await
             .unwrap();
         dataset.drop_columns(&["stale"]).await.unwrap();
-        assert_eq!(dataset.delete("id IN (2, 10)").await.unwrap(), 2);
+        assert_eq!(
+            dataset
+                .delete("id IN (2, 10)")
+                .await
+                .unwrap()
+                .num_deleted_rows,
+            2
+        );
         assert_eq!(dataset.version().version, 5);
         assert_eq!(dataset.get_fragments().len(), 3);
     });
@@ -163,7 +170,9 @@ fn open_bound_fragment(uri: &str, fragment_id: u64) -> *mut LanceFragment {
 
 fn native_fragment(uri: &str, fragment_id: u64) -> FileFragment {
     let dataset = lance_c::runtime::block_on(Dataset::open(uri)).unwrap();
-    dataset.get_fragment(fragment_id).unwrap()
+    dataset
+        .get_fragment(usize::try_from(fragment_id).unwrap())
+        .unwrap()
 }
 
 fn schema_field_id(schema: *const LanceSchema, name: &str) -> i32 {
@@ -854,7 +863,7 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
         "delete_rows failed: {:?}",
         take_error()
     );
-    let native_delete = native_delete.unwrap();
+    let native_delete = native_delete.unwrap().unwrap();
     assert_eq!(
         fragment_logical_rows(staged_second),
         lance_c::runtime::block_on(native_delete.count_rows(None)).unwrap()
