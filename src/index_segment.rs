@@ -2659,7 +2659,11 @@ mod tests {
             slice::from_raw_parts(empty_encoded, empty_encoded_len)
         })
         .unwrap();
-        assert_eq!(empty_decoded.fragment_bitmap, None);
+        assert_eq!(
+            empty_decoded.fragment_bitmap,
+            Some(Default::default()),
+            "an empty roaring bitmap has a non-empty protobuf encoding"
+        );
         assert_eq!(empty_decoded.files, None);
 
         unsafe {
