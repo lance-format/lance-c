@@ -3028,6 +3028,88 @@ static int32_t native_write_staged(
     return rc;
 }
 
+static NativeWriteInput native_write_external_blob_input(const char *write_uri) {
+    char payload_path[4096];
+    char payload_uri[4100];
+    snprintf(
+        payload_path,
+        sizeof(payload_path),
+        "%s_native_blob_payload.bin",
+        write_uri);
+    snprintf(payload_uri, sizeof(payload_uri), "file://%s", payload_path);
+
+    unsigned char payload[32];
+    for (size_t index = 0; index < sizeof(payload); ++index) {
+        payload[index] = (unsigned char)(index + 1);
+    }
+    FILE *payload_file = fopen(payload_path, "wb");
+    ASSERT(payload_file != NULL, "create external blob payload");
+    ASSERT(fwrite(payload, 1, sizeof(payload), payload_file) == sizeof(payload),
+           "write external blob payload");
+    ASSERT(fclose(payload_file) == 0, "close external blob payload");
+
+    LanceBlobDescriptorArrayBuilder *builder =
+        lance_blob_descriptor_array_builder_new("blob");
+    ASSERT(builder != NULL, "external blob descriptor builder creation failed");
+    CHECK_OK();
+    ASSERT(lance_blob_descriptor_array_builder_append_external(
+               builder, 0, payload_uri, 0, sizeof(payload)) == 0,
+           "append external blob descriptor");
+    CHECK_OK();
+
+    struct ArrowSchema *argument_child =
+        (struct ArrowSchema *)calloc(1, sizeof(*argument_child));
+    struct ArrowSchema *stream_child =
+        (struct ArrowSchema *)calloc(1, sizeof(*stream_child));
+    ASSERT(argument_child != NULL && stream_child != NULL,
+           "allocate external blob schemas");
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, argument_child) == 0,
+           "export external blob argument field");
+    CHECK_OK();
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, stream_child) == 0,
+           "export external blob stream field");
+    CHECK_OK();
+
+    struct ArrowArray prepared_array = {0};
+    struct ArrowSchema finished_field = {0};
+    ASSERT(lance_blob_descriptor_array_builder_finish(
+               builder, &prepared_array, &finished_field) == 0,
+           "finish external blob descriptor");
+    CHECK_OK();
+    finished_field.release(&finished_field);
+    lance_blob_descriptor_array_builder_close(builder);
+
+    struct ArrowArray *array =
+        (struct ArrowArray *)calloc(1, sizeof(*array));
+    ASSERT(array != NULL, "allocate external blob array");
+    *array = prepared_array;
+    memset(&prepared_array, 0, sizeof(prepared_array));
+
+    struct ArrowSchema *argument_schema = wrap_record_schema(argument_child, 0);
+    PreparedStreamState *state =
+        (PreparedStreamState *)calloc(1, sizeof(*state));
+    ASSERT(state != NULL, "allocate external blob stream state");
+    struct ArrowSchema *wrapped_schema = wrap_record_schema(stream_child, 0);
+    state->schema = *wrapped_schema;
+    free(wrapped_schema);
+    struct ArrowArray *wrapped_array = wrap_record_array(array);
+    state->array = *wrapped_array;
+    free(wrapped_array);
+
+    NativeWriteInput input;
+    memset(&input, 0, sizeof(input));
+    input.schema = *argument_schema;
+    free(argument_schema);
+    input.stream.get_schema = prepared_stream_get_schema;
+    input.stream.get_next = prepared_stream_get_next;
+    input.stream.get_last_error = prepared_stream_last_error;
+    input.stream.release = prepared_stream_release;
+    input.stream.private_data = state;
+    return input;
+}
+
 static size_t native_write_fragment_ids(
     LanceDataset *dataset,
     uint64_t *ids,
@@ -3460,7 +3542,6 @@ static void test_native_write_base_placement(
  * count is directly observable. */
 static void test_native_write_data_options(
     const char *src_uri,
-    const char *blob_uri,
     const char *write_uri) {
     printf("  test_native_write_data_options... ");
     char file_uri[4096];
@@ -3522,13 +3603,7 @@ static void test_native_write_data_options(
         lance_native_write_options_new(&blob_spec);
     ASSERT(blob_options != NULL, "blob write options must be created");
     CHECK_OK();
-    LanceDataset *blob_source = lance_dataset_open(blob_uri, NULL, 0);
-    ASSERT(blob_source != NULL, "open blob source failed");
-    CHECK_OK();
-    uint64_t blob_rows = lance_dataset_count_rows(blob_source);
-    CHECK_OK();
-    lance_dataset_close(blob_source);
-    NativeWriteInput blob_input = native_write_input(blob_uri);
+    NativeWriteInput blob_input = native_write_external_blob_input(write_uri);
     rc = native_write_ordinary(
         blob_output_uri,
         &blob_input,
@@ -3545,7 +3620,7 @@ static void test_native_write_data_options(
         exit(1);
     }
     CHECK_OK();
-    ASSERT(lance_dataset_count_rows(dataset) == blob_rows,
+    ASSERT(lance_dataset_count_rows(dataset) == 1,
            "blob option create row count mismatch");
     lance_dataset_close(dataset);
     lance_native_write_options_close(blob_options);
@@ -3568,7 +3643,7 @@ static void test_native_write_data_options(
     ASSERT(conflict_options != NULL,
            "native blob-conflict options must be constructed");
     CHECK_OK();
-    NativeWriteInput conflict_input = native_write_input(blob_uri);
+    NativeWriteInput conflict_input = native_write_input(src_uri);
     dataset = NULL;
     rc = native_write_ordinary(
         blob_output_uri,
@@ -3587,7 +3662,7 @@ static void test_native_write_data_options(
     dataset = lance_dataset_open(blob_output_uri, NULL, 0);
     ASSERT(dataset != NULL, "reopen blob-option dataset failed");
     CHECK_OK();
-    ASSERT(lance_dataset_count_rows(dataset) == blob_rows,
+    ASSERT(lance_dataset_count_rows(dataset) == 1,
            "native blob validation error must not publish the append");
     lance_dataset_close(dataset);
     printf("OK\n");
@@ -7993,7 +8068,7 @@ int main(int argc, char **argv) {
     test_write_options_and_config(uri, write_uri);
     test_native_write_options(uri, write_uri);
     test_native_write_base_placement(uri, write_uri);
-    test_native_write_data_options(uri, blob_uri, write_uri);
+    test_native_write_data_options(uri, write_uri);
     test_native_write_progress_and_owners(uri, write_uri);
     test_data_statistics(write_uri);
     test_diagnostics(uri);

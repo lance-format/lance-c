@@ -2565,7 +2565,6 @@ static void test_native_write_base_and_presence(
 
 static void test_native_write_data_option_errors(
     const std::string& src_uri,
-    const std::string& blob_uri,
     const std::string& dst_uri) {
     TEST(test_native_write_data_option_errors);
 
@@ -2600,18 +2599,17 @@ static void test_native_write_data_option_errors(
     }
 
     const std::string output_uri = dst_uri + "_cpp_native_blob_error";
-    uint64_t blob_rows = 0;
+    uint64_t baseline_rows = 0;
     {
         lance::NativeWriteOptionsSpec spec;
         spec.write.params.data_storage_version = "2.2";
-        spec.external_blob_mode = lance::ExternalBlobMode::Ingest;
         spec.blob_pack_file_size_threshold = 1;
         lance::NativeWriteOptions options(spec);
-        auto stream = native_write_source_stream(blob_uri);
+        auto stream = native_write_source_stream(src_uri);
         auto created = lance::Dataset::write_with_native_options(
             output_uri, &stream, lance::WriteMode::Create, options);
-        blob_rows = created.count_rows();
-        assert(blob_rows > 0);
+        baseline_rows = created.count_rows();
+        assert(baseline_rows > 0);
     }
 
     {
@@ -2622,7 +2620,7 @@ static void test_native_write_data_option_errors(
         lance::NativeWriteOptions options(spec);
         bool caught = false;
         try {
-            auto stream = native_write_source_stream(blob_uri);
+            auto stream = native_write_source_stream(src_uri);
             auto rejected = lance::Dataset::write_with_native_options(
                 output_uri, &stream, lance::WriteMode::Append, options);
             (void)rejected;
@@ -2637,7 +2635,7 @@ static void test_native_write_data_option_errors(
     }
 
     auto reopened = lance::Dataset::open(output_uri);
-    assert(reopened.count_rows() == blob_rows);
+    assert(reopened.count_rows() == baseline_rows);
     PASS();
 }
 
@@ -5456,7 +5454,7 @@ int main(int argc, char** argv) {
     test_write_options_and_config(uri, write_uri);
     test_native_write_options(uri, write_uri);
     test_native_write_base_and_presence(uri, write_uri);
-    test_native_write_data_option_errors(uri, blob_uri, write_uri);
+    test_native_write_data_option_errors(uri, write_uri);
     test_native_write_progress_errors(uri, write_uri);
     test_native_write_owner_lifetime_and_commit_error(uri, write_uri);
     test_data_statistics(write_uri);
