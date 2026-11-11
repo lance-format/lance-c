@@ -5655,6 +5655,70 @@ int32_t lance_write_fragments(
     const char* const* storage_opts
 );
 
+/**
+ * Event codes for LanceIndexBuildProgressCallback, passed as the `event`
+ * argument. Exactly one stage is active at a time: a stage's
+ * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE is always delivered before the
+ * next stage's LANCE_INDEX_BUILD_PROGRESS_STAGE_START.
+ */
+typedef enum {
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_START = 0,
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS = 1,
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE = 2,
+} LanceIndexBuildProgressEvent;
+
+/**
+ * Receives progress from an ordinary index creation or an uncommitted segment
+ * build.
+ *
+ * `stage` is non-NULL, NUL-terminated, and borrowed: it is valid only for the
+ * duration of this call. `unit` is non-NULL and NUL-terminated, but is the
+ * empty string ("") for LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS and
+ * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE. The parameter mapping is:
+ *
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_START: `stage` is the stage name,
+ *    `total` is the number of work units (0 = unknown), `unit` describes what
+ *    is being counted (e.g. "partitions", "batches", "rows"; "" = unknown),
+ *    and `completed` is 0.
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS: `total` is 0, `unit` is "",
+ *    and `completed` is the number of units completed so far.
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE: `total` is 0, `unit` is "",
+ *    and `completed` is 0.
+ *
+ * Stage names are index-type-specific (for example "train_ivf", "shuffle",
+ * "merge_partitions" and "load_data") and are diagnostic-only: they are not a
+ * stable cross-version contract, so consumers must treat them as opaque
+ * strings.
+ *
+ * The callback is invoked from lance-c's internal tokio runtime worker
+ * threads. Certain stages report progress concurrently from parallel worker
+ * tasks, so the callback MUST be thread-safe. It must be non-blocking and must
+ * not call runtime-backed `lance_*` entry points or access the dataset handle
+ * being indexed. An ordinary build holds that dataset's mutation lock for the
+ * duration of the call, so the callback must not synchronously re-enter the
+ * same handle or start or block on a nested runtime.
+ * Non-runtime leaf utilities such as `lance_free_string` are unaffected.
+ *
+ * `callback_ctx` is opaque and may be NULL. The callback and context must
+ * remain valid until the blocking call that installed them returns. lance-c
+ * disables the callback and drains in-flight invocations through a retirement
+ * gate before returning, including on error, so no invocation remains after
+ * that boundary. Progress reporting is advisory and cannot affect the build
+ * outcome or cancel the build.
+ *
+ * The callback is invoked without a panic guard: it must return normally,
+ * because unwinding or throwing across this boundary can abort the host
+ * process.
+ */
+typedef void (*LanceIndexBuildProgressCallback)(
+    void* callback_ctx,
+    int32_t event,
+    const char* stage,
+    uint64_t total,
+    const char* unit,
+    uint64_t completed
+);
+
 /* ─── Index lifecycle (Phase 2) ─── */
 
 /**
@@ -5671,6 +5735,33 @@ int32_t lance_dataset_create_vector_index(
     const char* column,
     const char* index_name,
     const LanceVectorIndexParams* params,
+    bool replace
+);
+
+/**
+ * Create a vector index from legacy parameters with optional progress.
+ *
+ * This is the legacy `LanceVectorIndexParams` entry point plus an observer.
+ * A NULL `callback` disables observation and preserves the legacy behavior;
+ * a non-NULL callback follows LanceIndexBuildProgressCallback's contract and
+ * is retired before this blocking call returns. Parameters, name generation,
+ * replacement and native errors are the same as
+ * lance_dataset_create_vector_index().
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_vector_index_with_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexParams* params,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
     bool replace
 );
 
@@ -5695,6 +5786,32 @@ int32_t lance_dataset_create_vector_index_with_options(
 );
 
 /**
+ * Create a vector index from additive native options with optional progress.
+ *
+ * This is lance_dataset_create_vector_index_with_options() plus an observer.
+ * A NULL `callback` disables observation and preserves the legacy behavior;
+ * a non-NULL callback follows LanceIndexBuildProgressCallback's contract and
+ * is retired before this blocking call returns. All option forms, train
+ * controls, name generation, replacement and native errors are unchanged.
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_vector_index_with_options_and_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexOptions* options,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
+    bool replace
+);
+
+/**
  * Create a scalar index on a column.
  * @param params_json Optional JSON params forwarded unchanged to the native
  *                    Lance scalar-index plugin, or NULL for plugin defaults.
@@ -5715,6 +5832,33 @@ int32_t lance_dataset_create_scalar_index(
 );
 
 /**
+ * Create a scalar index with optional ordinary native build progress.
+ *
+ * This is the legacy scalar entry point plus an observer. A NULL `callback`
+ * disables observation and preserves the legacy behavior; a non-NULL callback
+ * follows LanceIndexBuildProgressCallback's contract and is retired before
+ * this blocking call returns. `params_json`, name generation, replacement and
+ * native errors are unchanged.
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_scalar_index_with_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    LanceScalarIndexType index_type,
+    const char* params_json,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
+    bool replace
+);
+
+/**
  * Create a scalar index with the additive native train control.
  *
  * `options == NULL` or `options->has_train == false` preserves the native
@@ -5727,6 +5871,34 @@ int32_t lance_dataset_create_scalar_index_with_options(
     LanceScalarIndexType index_type,
     const char* params_json,
     const LanceScalarIndexOptions* options,
+    bool replace
+);
+
+/**
+ * Create a scalar index with native train controls and optional progress.
+ *
+ * This is lance_dataset_create_scalar_index_with_options() plus an observer.
+ * A NULL `callback` disables observation and preserves the legacy behavior;
+ * a non-NULL callback follows LanceIndexBuildProgressCallback's contract and
+ * is retired before this blocking call returns. `options == NULL` or
+ * `options->has_train == false` still preserves the native train default.
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_scalar_index_with_options_and_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    LanceScalarIndexType index_type,
+    const char* params_json,
+    const LanceScalarIndexOptions* options,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
     bool replace
 );
 
@@ -6055,61 +6227,6 @@ int32_t lance_index_segment_builder_execute_uncommitted(
 );
 
 /**
- * Event codes for LanceIndexBuildProgressCallback, passed as the `event`
- * argument. Exactly one stage is active at a time: a stage's
- * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE is always delivered before the
- * next stage's LANCE_INDEX_BUILD_PROGRESS_STAGE_START.
- */
-typedef enum {
-    LANCE_INDEX_BUILD_PROGRESS_STAGE_START = 0,
-    LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS = 1,
-    LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE = 2,
-} LanceIndexBuildProgressEvent;
-
-/**
- * Receives index build progress events while
- * lance_index_segment_builder_execute_uncommitted runs.
- *
- * `stage` is non-NULL, NUL-terminated, and borrowed: it is valid only for the
- * duration of this call. `unit` is non-NULL and NUL-terminated, but is the
- * empty string ("") for LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS and
- * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE. The parameter mapping is:
- *
- *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_START: `stage` is the stage name,
- *    `total` is the number of work units (0 = unknown), `unit` describes what
- *    is being counted (e.g. "partitions", "batches", "rows"; "" = unknown),
- *    and `completed` is 0.
- *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS: `total` is 0, `unit` is "",
- *    and `completed` is the number of units completed so far.
- *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE: `total` is 0, `unit` is "",
- *    and `completed` is 0.
- *
- * Stage names are index-type-specific (e.g. "train_ivf", "shuffle",
- * "merge_partitions" for vector indices; "load_data" for scalar indices) and
- * are diagnostic-only: they are not a stable cross-version contract, so
- * consumers must treat them as opaque strings.
- *
- * The callback is invoked from lance-c's internal tokio runtime worker
- * threads. Certain stages report progress concurrently from parallel worker
- * tasks, so the callback MUST be thread-safe and reentrant. It must be
- * non-blocking and must not call back into any `lance_*` function (no
- * reentrancy).
- *
- * The callback is invoked without a panic guard: it must return normally,
- * because unwinding or throwing across this boundary can abort the host
- * process. The callback cannot abort the build; progress reporting is
- * advisory and diagnostic and cannot affect the build outcome.
- */
-typedef void (*LanceIndexBuildProgressCallback)(
-    void* callback_ctx,
-    int32_t event,
-    const char* stage,
-    uint64_t total,
-    const char* unit,
-    uint64_t completed
-);
-
-/**
  * Register the index-build progress callback for a segment builder.
  *
  * Must be called before the builder is executed; the builder is single-use,
@@ -6126,7 +6243,7 @@ typedef void (*LanceIndexBuildProgressCallback)(
  * afterwards. `callback` and `callback_ctx` must therefore remain valid and
  * safe to invoke until lance_index_segment_builder_execute_uncommitted
  * returns. See LanceIndexBuildProgressCallback for the full threading and
- * reentrancy contract.
+ * lifetime contract.
  *
  * @return 0 on success, -1 on error.
  */

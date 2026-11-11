@@ -16854,6 +16854,328 @@ fn test_scalar_index_segment_progress_callback_sees_load_data() {
 }
 
 #[test]
+fn test_ordinary_scalar_index_progress_replaces_nulls_and_reopens() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let column = c_str("id");
+    let index_name = c_str("ordinary_scalar_progress");
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index_with_progress(
+                dataset,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                Some(record_build_progress),
+                capture_ctx,
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1,
+        "ordinary scalar creation must publish exactly one version"
+    );
+    let capture = take_progress_capture(capture_ctx);
+    assert!(
+        !capture.events.is_empty(),
+        "expected scalar progress events"
+    );
+    assert_progress_events_well_formed(&capture);
+    assert!(
+        capture
+            .events
+            .iter()
+            .any(|(event, stage, ..)| { *event == 0 && stage == "load_data" }),
+        "expected an ordinary scalar load_data stage, saw {:?}",
+        capture.events
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let mut dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let (ids, statistics) = scan_index_ids(dataset, "id = 3", true);
+    assert_eq!(ids, vec![3]);
+    assert!(
+        statistics.indices_loaded > 0,
+        "reopened scalar query must load the persisted index"
+    );
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let options = LanceScalarIndexOptions {
+        has_train: true,
+        train: true,
+    };
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index_with_options_and_progress(
+                dataset,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                &options,
+                Some(record_build_progress),
+                capture_ctx,
+                true,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1,
+        "ordinary scalar replacement must publish exactly one version"
+    );
+    let replacement_capture = take_progress_capture(capture_ctx);
+    assert!(
+        !replacement_capture.events.is_empty(),
+        "expected replacement progress events"
+    );
+    assert_progress_events_well_formed(&replacement_capture);
+    unsafe { lance_dataset_close(dataset) };
+
+    dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let (ids, statistics) = scan_index_ids(dataset, "id = 3", true);
+    assert_eq!(ids, vec![3]);
+    assert!(
+        statistics.indices_loaded > 0,
+        "reopened replacement query must load the persisted index"
+    );
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index_with_options_and_progress(
+                dataset,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                ptr::null(),
+                None,
+                0xC0FFEE_usize as *mut c_void,
+                true,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1,
+        "NULL observer replacement must publish exactly one version"
+    );
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index_with_progress(
+                dataset,
+                c_str("no_such_scalar_column").as_ptr(),
+                c_str("ordinary_scalar_failure").as_ptr(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                Some(record_build_progress),
+                capture_ctx,
+                false,
+            )
+        },
+        -1
+    );
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before,
+        "failed ordinary scalar creation must not publish a version"
+    );
+    let failed_capture = take_progress_capture(capture_ctx);
+    assert_progress_events_well_formed(&failed_capture);
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_ordinary_vector_index_progress_replaces_nulls_and_reopens() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(1, 256, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let column = c_str("embedding");
+    let index_name = c_str("ordinary_vector_progress");
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfFlat,
+        metric: LanceMetricType::L2,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 10,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 128,
+    };
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index_with_progress(
+                dataset,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                &params,
+                Some(record_build_progress),
+                capture_ctx,
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1,
+        "ordinary vector creation must publish exactly one version"
+    );
+    let capture = take_progress_capture(capture_ctx);
+    assert!(
+        !capture.events.is_empty(),
+        "expected vector progress events"
+    );
+    assert_progress_events_well_formed(&capture);
+    assert!(
+        capture
+            .events
+            .iter()
+            .any(|(event, stage, ..)| { *event == 0 && stage == "shuffle" }),
+        "expected an ordinary vector shuffle stage, saw {:?}",
+        capture.events
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    let mut dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let query: Vec<f32> = (0..8)
+        .map(|component| 5.25 + component as f32 / 8.0)
+        .collect();
+    let (ids, statistics) = nearest_ids_and_statistics(dataset, "embedding", &query, true, 3);
+    assert_eq!(ids, vec![5, 6, 4]);
+    assert!(
+        statistics.index_partitions_loaded > 0,
+        "reopened vector query must load the persisted index"
+    );
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let mut options = vector_index_options(LanceVectorIndexType::IvfFlat, LanceMetricType::L2);
+    options.num_partitions = set_option(2);
+    options.max_iters = set_option(10);
+    options.sample_rate = set_option(128);
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index_with_options_and_progress(
+                dataset,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                &options,
+                Some(record_build_progress),
+                capture_ctx,
+                true,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1,
+        "ordinary vector replacement must publish exactly one version"
+    );
+    let replacement_capture = take_progress_capture(capture_ctx);
+    assert!(
+        !replacement_capture.events.is_empty(),
+        "expected replacement progress events"
+    );
+    assert_progress_events_well_formed(&replacement_capture);
+    unsafe { lance_dataset_close(dataset) };
+
+    dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let (ids, statistics) = nearest_ids_and_statistics(dataset, "embedding", &query, true, 3);
+    assert_eq!(ids, vec![5, 6, 4]);
+    assert!(
+        statistics.index_partitions_loaded > 0,
+        "reopened vector replacement query must load the persisted index"
+    );
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index_with_progress(
+                dataset,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                &params,
+                None,
+                0xC0FFEE_usize as *mut c_void,
+                true,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1,
+        "NULL observer vector replacement must publish exactly one version"
+    );
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index_with_progress(
+                dataset,
+                c_str("no_such_vector_column").as_ptr(),
+                c_str("ordinary_vector_failure").as_ptr(),
+                &params,
+                Some(record_build_progress),
+                capture_ctx,
+                false,
+            )
+        },
+        -1
+    );
+    assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before,
+        "failed ordinary vector creation must not publish a version"
+    );
+    let failed_capture = take_progress_capture(capture_ctx);
+    assert_progress_events_well_formed(&failed_capture);
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
 fn test_vector_index_segment_progress_callback_multi_fragment_subset() {
     let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
     let uri_c = c_str(&uri);

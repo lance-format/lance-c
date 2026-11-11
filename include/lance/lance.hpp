@@ -9689,6 +9689,30 @@ public:
             check_error();
     }
 
+    /// Create a vector index from legacy parameters with optional progress.
+    ///
+    /// A null callback disables observation. A non-null callback may run
+    /// concurrently on internal runtime worker threads while this call holds
+    /// the dataset mutation lock; it must be thread-safe, non-blocking, and
+    /// must not access this dataset, call runtime-backed lance_* entry points,
+    /// or start a nested runtime. Non-runtime leaf utilities are unaffected. The
+    /// callback and context are borrowed only through this synchronous call
+    /// and are retired before it returns. Native publication/reload errors can
+    /// leave the returned state uncertain; reopen to inspect the version.
+    void create_vector_index_with_progress(
+        const std::string& column,
+        const LanceVectorIndexParams& params,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
+        const std::string& name = "",
+        bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        if (lance_dataset_create_vector_index_with_progress(
+                handle_.get(), column.c_str(), name_c, &params, callback,
+                callback_ctx, replace) != 0)
+            check_error();
+    }
+
     /// Create a vector index from additive native options.
     ///
     /// Native Lance performs the commit before reloading index metadata. An
@@ -9697,6 +9721,17 @@ public:
     void create_vector_index_with_options(
         const std::string& column,
         const VectorIndexOptions& options,
+        const std::string& name = "",
+        bool replace = false);
+
+    /// Create a vector index from additive native options with optional
+    /// progress. See create_vector_index_with_progress for the callback and
+    /// publication-error contract.
+    void create_vector_index_with_options_and_progress(
+        const std::string& column,
+        const VectorIndexOptions& options,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
         const std::string& name = "",
         bool replace = false);
 
@@ -9711,6 +9746,25 @@ public:
         if (lance_dataset_create_scalar_index(handle_.get(), column.c_str(),
                                                name_c, index_type,
                                                json_c, replace) != 0)
+            check_error();
+    }
+
+    /// Create a scalar index with optional progress. A null callback disables
+    /// observation; a non-null callback has the same synchronous lifetime and
+    /// non-reentrancy rules as create_vector_index_with_progress.
+    void create_scalar_index_with_progress(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
+        const std::string& name = "",
+        const std::string& params_json = "",
+        bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        if (lance_dataset_create_scalar_index_with_progress(
+                handle_.get(), column.c_str(), name_c, index_type, json_c,
+                callback, callback_ctx, replace) != 0)
             check_error();
     }
 
@@ -9732,6 +9786,32 @@ public:
         if (lance_dataset_create_scalar_index_with_options(
                 handle_.get(), column.c_str(), name_c, index_type, json_c,
                 &scalar_options, replace) != 0)
+            check_error();
+    }
+
+    /// Create a scalar index with native train controls and optional progress.
+    /// A null callback disables observation. The callback follows the same
+    /// synchronous lifetime and non-reentrancy rules as
+    /// create_vector_index_with_progress.
+    void create_scalar_index_with_options_and_progress(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        const ScalarIndexOptions& options,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
+        const std::string& index_name = "",
+        const std::string& params_json = "",
+        bool replace = false) {
+        const char* name_c = index_name.empty() ? nullptr : index_name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        LanceScalarIndexOptions scalar_options{};
+        if (options.train) {
+            scalar_options.has_train = true;
+            scalar_options.train = *options.train;
+        }
+        if (lance_dataset_create_scalar_index_with_options_and_progress(
+                handle_.get(), column.c_str(), name_c, index_type, json_c,
+                &scalar_options, callback, callback_ctx, replace) != 0)
             check_error();
     }
 
@@ -11089,8 +11169,9 @@ public:
     /// before execute_uncommitted; the builder is single-use. The callback is
     /// invoked from internal worker threads and may be called concurrently
     /// from parallel worker tasks, so it must be thread-safe, non-blocking,
-    /// and must not re-enter any lance_* function. It must return normally;
-    /// unwinding or throwing across this boundary can abort the host process.
+    /// and must not access the indexed dataset or call runtime-backed lance_*
+    /// entry points. Non-runtime leaf utilities are unaffected. Callbacks must
+    /// return normally: unwinding or throwing can abort the host process.
     /// Invocations occur only while execute_uncommitted runs, and this is
     /// enforced: lance-c disables the callback and drains in-flight
     /// invocations before that call returns, including on error, so a worker
@@ -11178,6 +11259,22 @@ inline void Dataset::create_vector_index_with_options(
     const char* name_c = name.empty() ? nullptr : name.c_str();
     if (lance_dataset_create_vector_index_with_options(
             handle_.get(), column.c_str(), name_c, storage.get(), replace) != 0) {
+        check_error();
+    }
+}
+
+inline void Dataset::create_vector_index_with_options_and_progress(
+    const std::string& column,
+    const VectorIndexOptions& options,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
+    const std::string& name,
+    bool replace) {
+    detail::VectorIndexOptionsStorage storage(options);
+    const char* name_c = name.empty() ? nullptr : name.c_str();
+    if (lance_dataset_create_vector_index_with_options_and_progress(
+            handle_.get(), column.c_str(), name_c, storage.get(), callback,
+            callback_ctx, replace) != 0) {
         check_error();
     }
 }

@@ -32,6 +32,9 @@
 typedef struct {
     _Atomic uint64_t events;
     _Atomic int invalid;
+    _Atomic int closed;
+    _Atomic int late;
+    void *expected_ctx;
 } ProgressCapture;
 
 static void capture_progress(
@@ -49,6 +52,13 @@ static void capture_progress(
         event > LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE) {
         if (capture != NULL) atomic_store(&capture->invalid, 1);
         return;
+    }
+    if (capture->expected_ctx != NULL &&
+        callback_ctx != capture->expected_ctx) {
+        atomic_store(&capture->invalid, 1);
+    }
+    if (atomic_load(&capture->closed)) {
+        atomic_store(&capture->late, 1);
     }
     atomic_fetch_add(&capture->events, 1);
 }
@@ -753,6 +763,148 @@ static void test_distributed_metadata_publication(LanceDataset *dataset,
     printf("Distributed inverted metadata publication C path passed\n");
 }
 
+static void test_ordinary_index_progress(const char *uri) {
+    printf("  test_ordinary_index_progress... ");
+    LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "ordinary progress dataset open failed");
+    CHECK_OK();
+
+    uint64_t version = lance_dataset_version(dataset);
+    CHECK_OK();
+    ProgressCapture scalar_capture = {0};
+    scalar_capture.expected_ctx = &scalar_capture;
+    ASSERT(lance_dataset_create_scalar_index_with_progress(
+               dataset, "id", "c_btree_progress", LANCE_SCALAR_BTREE, NULL,
+               capture_progress, &scalar_capture, false) == 0,
+           "ordinary scalar progress creation failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == version + 1,
+           "ordinary scalar creation must publish one version");
+    ASSERT(atomic_load(&scalar_capture.events) > 0,
+           "ordinary scalar creation reported no progress");
+    ASSERT(atomic_load(&scalar_capture.invalid) == 0 &&
+               atomic_load(&scalar_capture.late) == 0,
+           "ordinary scalar callback contract violated");
+    atomic_store(&scalar_capture.closed, 1);
+
+    version = lance_dataset_version(dataset);
+    CHECK_OK();
+    ProgressCapture scalar_replacement = {0};
+    scalar_replacement.expected_ctx = &scalar_replacement;
+    ASSERT(lance_dataset_create_scalar_index_with_progress(
+               dataset, "id", "c_btree_progress", LANCE_SCALAR_BTREE, NULL,
+               capture_progress, &scalar_replacement, true) == 0,
+           "ordinary scalar progress replacement failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == version + 1,
+           "ordinary scalar replacement must publish one version");
+    ASSERT(atomic_load(&scalar_replacement.events) > 0,
+           "ordinary scalar replacement reported no progress");
+    ASSERT(atomic_load(&scalar_replacement.invalid) == 0 &&
+               atomic_load(&scalar_replacement.late) == 0,
+           "ordinary scalar replacement callback contract violated");
+    atomic_store(&scalar_replacement.closed, 1);
+
+    version = lance_dataset_version(dataset);
+    CHECK_OK();
+    ASSERT(lance_dataset_create_scalar_index_with_options_and_progress(
+               dataset, "id", "c_btree_progress", LANCE_SCALAR_BTREE, NULL,
+               NULL, NULL, (void *)(uintptr_t)1, true) == 0,
+           "NULL scalar progress observer must preserve creation");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == version + 1,
+           "NULL scalar observer replacement must publish one version");
+
+    LanceVectorIndexParams params = {
+        LANCE_INDEX_IVF_FLAT, LANCE_METRIC_L2, 2, 0, 0, 10, 0, 0, 128,
+    };
+    version = lance_dataset_version(dataset);
+    CHECK_OK();
+    ProgressCapture vector_capture = {0};
+    vector_capture.expected_ctx = &vector_capture;
+    ASSERT(lance_dataset_create_vector_index_with_progress(
+               dataset, "embedding", "c_ivf_progress", &params,
+               capture_progress, &vector_capture, false) == 0,
+           "ordinary vector progress creation failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == version + 1,
+           "ordinary vector creation must publish one version");
+    ASSERT(atomic_load(&vector_capture.events) > 0,
+           "ordinary vector creation reported no progress");
+    ASSERT(atomic_load(&vector_capture.invalid) == 0 &&
+               atomic_load(&vector_capture.late) == 0,
+           "ordinary vector callback contract violated");
+    atomic_store(&vector_capture.closed, 1);
+
+    version = lance_dataset_version(dataset);
+    CHECK_OK();
+    ProgressCapture vector_replacement = {0};
+    vector_replacement.expected_ctx = &vector_replacement;
+    ASSERT(lance_dataset_create_vector_index_with_progress(
+               dataset, "embedding", "c_ivf_progress", &params,
+               capture_progress, &vector_replacement, true) == 0,
+           "ordinary vector progress replacement failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == version + 1,
+           "ordinary vector replacement must publish one version");
+    ASSERT(atomic_load(&vector_replacement.events) > 0,
+           "ordinary vector replacement reported no progress");
+    ASSERT(atomic_load(&vector_replacement.invalid) == 0 &&
+               atomic_load(&vector_replacement.late) == 0,
+           "ordinary vector replacement callback contract violated");
+    atomic_store(&vector_replacement.closed, 1);
+
+    LanceVectorIndexOptions vector = vector_options(2);
+    version = lance_dataset_version(dataset);
+    CHECK_OK();
+    ASSERT(lance_dataset_create_vector_index_with_options_and_progress(
+               dataset, "embedding", "c_ivf_progress", &vector, NULL,
+               (void *)(uintptr_t)1, true) == 0,
+           "NULL vector options observer must preserve creation");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(dataset) == version + 1,
+           "NULL vector options observer must publish one version");
+
+    version = lance_dataset_version(dataset);
+    CHECK_OK();
+    ProgressCapture failed_capture = {0};
+    failed_capture.expected_ctx = &failed_capture;
+    ASSERT(lance_dataset_create_vector_index_with_progress(
+               dataset, "no_such_vector_column", "c_ivf_progress_failure",
+               &params, capture_progress, &failed_capture, false) == -1,
+           "ordinary vector creation on a missing column must fail");
+    ASSERT(lance_last_error_code() != LANCE_OK,
+           "ordinary vector failure must set the error channel");
+    ASSERT(lance_dataset_version(dataset) == version,
+           "failed ordinary vector creation must not publish a version");
+    atomic_store(&failed_capture.closed, 1);
+    {
+        const char *message = lance_last_error_message();
+        if (message) lance_free_string(message);
+    }
+    lance_dataset_close(dataset);
+
+    dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "ordinary progress dataset reopen failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows_filtered(dataset, "id = 20") == 1,
+           "reopened scalar-indexed query returned the wrong row count");
+    CHECK_OK();
+    const float query[8] = {20.0f, 20.1f, 20.2f, 20.3f,
+                            20.4f, 20.5f, 20.6f, 20.7f};
+    ASSERT(query_vector_rows(dataset, query, 3, 1, 2, 0, 0.0, 0) == 3,
+           "reopened vector-indexed query returned the wrong row count");
+    CHECK_OK();
+    ASSERT(lance_dataset_drop_index(dataset, "c_btree_progress") == 0,
+           "ordinary scalar progress index cleanup failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_drop_index(dataset, "c_ivf_progress") == 0,
+           "ordinary vector progress index cleanup failed");
+    CHECK_OK();
+    lance_dataset_close(dataset);
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -761,6 +913,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    test_ordinary_index_progress(argv[1]);
     LanceDataset *dataset = lance_dataset_open(argv[1], NULL, 0);
     ASSERT(dataset != NULL, "dataset open failed");
     CHECK_OK();
