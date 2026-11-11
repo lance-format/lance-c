@@ -4552,6 +4552,241 @@ static void test_index_segment_builder(const char *uri) {
     printf("OK\n");
 }
 
+/* Build two real ZoneMap segments, inspect the complete metadata, construct a
+ * CreateIndex operation, and publish it through the existing transaction
+ * commit path. */
+static void test_create_index_operation(const char *uri) {
+    printf("  test_create_index_operation... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "create-index fixture open failed");
+    CHECK_OK();
+    uint64_t version = lance_dataset_version(ds);
+    CHECK_OK();
+    uint64_t fragment_count = lance_dataset_fragment_count(ds);
+    CHECK_OK();
+    ASSERT(fragment_count >= 2, "fixture must contain at least two fragments");
+    uint64_t *fragment_ids =
+        (uint64_t *)calloc((size_t)fragment_count, sizeof(uint64_t));
+    ASSERT(fragment_ids != NULL, "fragment-id allocation failed");
+    ASSERT(lance_dataset_fragment_ids(ds, fragment_ids) == 0,
+           "fragment enumeration failed");
+    CHECK_OK();
+
+    const char *params = "{\"rows_per_zone\":2,\"use_seeds\":false}";
+    uint32_t first_fragment = (uint32_t)fragment_ids[0];
+    uint32_t second_fragment = (uint32_t)fragment_ids[1];
+    free(fragment_ids);
+    const uint8_t first_uuid[16] = {
+        0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x47, 0x68,
+        0x89, 0x9a, 0xab, 0xbc, 0xcd, 0xde, 0xef, 0xf0,
+    };
+    const uint8_t second_uuid[16] = {
+        0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
+        0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f,
+    };
+
+    LanceIndexSegmentMetadata *segments[2] = {NULL, NULL};
+    const uint8_t *uuids[2] = {first_uuid, second_uuid};
+    uint32_t selected[2] = {first_fragment, second_fragment};
+    for (size_t i = 0; i < 2; i++) {
+        LanceIndexSegmentBuildOptions options;
+        memset(&options, 0, sizeof(options));
+        options.fragment_ids = &selected[i];
+        options.fragment_count = 1;
+        options.index_uuid = uuids[i];
+        options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+        LanceIndexSegmentBuilder *builder =
+            lance_index_segment_builder_new_scalar(
+                ds, "score", "c_create_index_zonemap",
+                LANCE_SCALAR_ZONE_MAP, params, &options);
+        ASSERT(builder != NULL, "create-index segment builder failed");
+        uint8_t *bytes = NULL;
+        size_t len = 0;
+        ASSERT(lance_index_segment_builder_execute_uncommitted(
+                   builder, &bytes, &len) == 0,
+               "create-index segment execution failed");
+        ASSERT(bytes != NULL && len > 0, "empty create-index metadata");
+        ASSERT(lance_index_segment_metadata_parse(bytes, len, &segments[i]) ==
+                   0,
+               "create-index metadata parse failed");
+        CHECK_OK();
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+
+        ASSERT(lance_index_segment_metadata_covering_field_count(segments[i]) ==
+                   0,
+               "ZoneMap segment must not declare covering fields");
+        CHECK_OK();
+        size_t details_len = 0;
+        const uint8_t *details =
+            lance_index_segment_metadata_index_details_value(
+                segments[i], &details_len);
+        ASSERT(details != NULL && details_len > 0,
+               "ZoneMap details value must be present and non-empty");
+        CHECK_OK();
+        size_t file_count =
+            lance_index_segment_metadata_file_count(segments[i]);
+        CHECK_OK();
+        ASSERT(file_count > 0, "segment metadata must record files");
+        for (size_t file = 0; file < file_count; file++) {
+            const char *path =
+                lance_index_segment_metadata_file_path_at(segments[i], file);
+            ASSERT(path != NULL && path[0] != '\0',
+                   "segment file path must be present");
+            CHECK_OK();
+            uint64_t size = 0;
+            ASSERT(lance_index_segment_metadata_file_size_at(
+                       segments[i], file, &size) == 0,
+                   "segment file size read failed");
+            CHECK_OK();
+            ASSERT(size > 0, "segment file size must be positive");
+        }
+        LanceOptionalTimestamp created_at;
+        memset(&created_at, 0, sizeof(created_at));
+        ASSERT(lance_index_segment_metadata_created_at(
+                   segments[i], &created_at) == 0,
+               "segment created_at read failed");
+        CHECK_OK();
+        ASSERT(created_at.is_set && created_at.unix_seconds > 0,
+               "real segment metadata must record created_at");
+        bool base_id_is_set = true;
+        uint32_t base_id = UINT32_MAX;
+        ASSERT(lance_index_segment_metadata_base_id(
+                   segments[i], &base_id_is_set, &base_id) == 0,
+               "segment base_id read failed");
+        CHECK_OK();
+        ASSERT(!base_id_is_set && base_id == 0,
+               "locally built segment must report absent base_id");
+
+        LanceIndexSegmentMetadata *clone =
+            lance_index_segment_metadata_clone(segments[i]);
+        ASSERT(clone != NULL, "metadata clone failed");
+        CHECK_OK();
+        uint8_t clone_uuid[16] = {0};
+        ASSERT(lance_index_segment_metadata_uuid(clone, clone_uuid) == 0,
+               "cloned metadata UUID read failed");
+        CHECK_OK();
+        ASSERT(memcmp(clone_uuid, uuids[i], 16) == 0,
+               "cloned metadata UUID mismatch");
+        ASSERT(strcmp(lance_index_segment_metadata_name(clone),
+                      "c_create_index_zonemap") == 0,
+               "cloned metadata name mismatch");
+        lance_index_segment_metadata_free(segments[i]);
+        segments[i] = clone;
+    }
+
+    const LanceIndexSegmentMetadata *new_indices[2] = {
+        segments[0], segments[1],
+    };
+    LanceOperation *operation =
+        lance_operation_create_index_new(new_indices, 2, NULL, 0);
+    ASSERT(operation != NULL, "CreateIndex construction failed");
+    CHECK_OK();
+    LanceOperationKind kind = LANCE_OPERATION_UNKNOWN;
+    ASSERT(lance_operation_kind(operation, &kind) == 0,
+           "CreateIndex kind read failed");
+    CHECK_OK();
+    ASSERT(kind == LANCE_OPERATION_CREATE_INDEX,
+           "CreateIndex kind mismatch");
+    uint64_t new_count = 0;
+    uint64_t removed_count = UINT64_MAX;
+    ASSERT(lance_operation_create_index_new_count(operation, &new_count) == 0,
+           "CreateIndex new count read failed");
+    ASSERT(lance_operation_create_index_removed_count(
+               operation, &removed_count) == 0,
+           "CreateIndex removed count read failed");
+    CHECK_OK();
+    ASSERT(new_count == 2 && removed_count == 0,
+           "CreateIndex counts mismatch");
+
+    LanceIndexSegmentMetadata *inspected_first = NULL;
+    LanceIndexSegmentMetadata *inspected_second = NULL;
+    ASSERT(lance_operation_create_index_new_at(
+               operation, 0, &inspected_first) == 0,
+           "CreateIndex first new metadata read failed");
+    ASSERT(lance_operation_create_index_new_at(
+               operation, 1, &inspected_second) == 0,
+           "CreateIndex second new metadata read failed");
+    CHECK_OK();
+    uint8_t inspected_first_uuid[16] = {0};
+    uint8_t inspected_second_uuid[16] = {0};
+    ASSERT(lance_index_segment_metadata_uuid(
+               inspected_first, inspected_first_uuid) == 0,
+           "first inspected metadata UUID read failed");
+    ASSERT(lance_index_segment_metadata_uuid(
+               inspected_second, inspected_second_uuid) == 0,
+           "second inspected metadata UUID read failed");
+    CHECK_OK();
+    ASSERT(memcmp(inspected_first_uuid, first_uuid, 16) == 0 &&
+               memcmp(inspected_second_uuid, second_uuid, 16) == 0,
+           "CreateIndex new metadata order mismatch");
+
+    lance_operation_close(operation);
+    lance_index_segment_metadata_free(segments[0]);
+    lance_index_segment_metadata_free(segments[1]);
+    ASSERT(strcmp(lance_index_segment_metadata_name(inspected_first),
+                  "c_create_index_zonemap") == 0,
+           "metadata cloned from an operation must outlive the parent");
+
+    LanceTransaction *transaction =
+        lance_transaction_new(version, NULL, NULL);
+    ASSERT(transaction == NULL &&
+               lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL operation must be rejected");
+    const char *error_message = lance_last_error_message();
+    if (error_message) lance_free_string(error_message);
+
+    /* The operation is needed again for the transaction; rebuild it from the
+     * independently cloned operation metadata. */
+    const LanceIndexSegmentMetadata *reused_indices[2] = {
+        inspected_first, inspected_second,
+    };
+    operation = lance_operation_create_index_new(reused_indices, 2, NULL, 0);
+    ASSERT(operation != NULL, "CreateIndex rebuild failed");
+    transaction = lance_transaction_new(version, operation, NULL);
+    ASSERT(transaction != NULL, "CreateIndex transaction construction failed");
+    CHECK_OK();
+    lance_operation_close(operation);
+    lance_index_segment_metadata_free(inspected_first);
+    lance_index_segment_metadata_free(inspected_second);
+    lance_dataset_close(ds);
+
+    LanceCommitOptions commit_options;
+    memset(&commit_options, 0, sizeof(commit_options));
+    commit_options.has_max_retries = true;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = LANCE_COMMIT_TIMEOUT_DISABLED;
+    LanceDataset *committed = NULL;
+    int32_t rc = lance_transaction_commit(
+        uri, transaction, &commit_options, NULL, NULL, &committed);
+    ASSERT(rc == 0 && committed != NULL, "CreateIndex transaction commit failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(committed) == version + 1,
+           "CreateIndex must publish exactly one version");
+    ASSERT(lance_dataset_index_segment_count(
+               committed, "c_create_index_zonemap") == 2,
+           "CreateIndex must publish both segments");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows_filtered(committed, "score = 80") == 1,
+           "CreateIndex fixture query must return the expected row");
+    CHECK_OK();
+    lance_transaction_close(transaction);
+    lance_dataset_close(committed);
+
+    LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(reopened != NULL, "CreateIndex reopen failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(reopened) == version + 1,
+           "CreateIndex version must persist");
+    ASSERT(lance_dataset_index_segment_count(
+               reopened, "c_create_index_zonemap") == 2,
+           "CreateIndex segments must persist");
+    CHECK_OK();
+    lance_dataset_close(reopened);
+    printf("OK\n");
+}
+
 /* Runs a small vector segment build with a progress callback and verifies
  * events are delivered with a readable stage name and a round-tripped
  * callback context. */
@@ -6292,6 +6527,7 @@ int main(int argc, char **argv) {
     test_restore_to_current(uri);
     test_error_handling();
     test_index_segment_builder(uri);
+    test_create_index_operation(uri);
     test_index_segment_builder_progress(uri);
     test_vector_models_and_reusable_segments(uri);
     test_vector_index_options_and_rq_model(uri);
