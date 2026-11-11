@@ -985,6 +985,45 @@ metadata model. The list is an object keyed by branch name; each
 Map enumeration order is unspecified. Branch metadata replacement writes the
 whole native map, so an empty map clears all entries.
 
+### Deep clone a dataset
+
+`lance_dataset_deep_clone` copies one source snapshot into a new target dataset
+using native `Dataset::deep_clone`. A `NULL` reference clones the source
+handle's current snapshot; pass a `LanceRef` to select the current head, a
+version, a tag, or a branch:
+
+```c
+LanceDataset* copy = NULL;
+if (lance_dataset_deep_clone(ds, "copy.lance", NULL, NULL, &copy) != 0) {
+    /* handle error */
+}
+
+LanceRef* ref = lance_ref_version_number(7);
+LanceDataset* at_seven = NULL;
+int32_t rc = lance_dataset_deep_clone(ds, "copy-v7.lance", ref, NULL, &at_seven);
+lance_ref_close(ref);
+```
+
+```cpp
+lance::Dataset copy = ds.deep_clone("copy.lance");
+auto ref = lance::Ref::version_number(7);
+lance::Dataset at_seven = ds.deep_clone("copy-v7.lance", &ref);
+```
+
+The target must not exist yet. The returned handle is a normal dataset whose
+version id is the cloned snapshot's version; the source handle keeps its
+snapshot and no source write lock is held during copying. The optional storage
+options accessor contributes its native `Arc` without resolving or copying
+credentials; NULL, or an accessor created with neither static options nor a
+provider, passes native `None`. For datasets with additional base paths, native
+deep clone reads them through the source dataset's object store; per-base
+distinct source credentials are not supported. Native clone commits resolve the
+target URI through the default object-store registry, so target schemes
+registered only on a custom session are rejected. A copy or commit error does
+not guarantee that the target remains unpublished; reopen the target to check
+its state. Copied objects may remain under the target path and are not rolled
+back.
+
 ## Releasing
 
 Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds five prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, and macOS arm64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. Intel macOS consumers use the source build described above.
