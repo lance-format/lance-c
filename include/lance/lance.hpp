@@ -7658,9 +7658,9 @@ public:
     /// static options or a provider (an accessor with neither passes None),
     /// without resolving or copying credentials. The returned dataset keeps
     /// the cloned snapshot's version id (native clone commit semantics), so
-    /// `version()` is not necessarily 1. On failure the target is not
-    /// published, but partial objects may remain under `target_path` and are
-    /// not rolled back.
+    /// `version()` is not necessarily 1. Copy or commit errors can leave the
+    /// target's publication state uncertain; reopen it to check its state.
+    /// Partial objects may remain under `target_path` and are not rolled back.
     /// The target URI must use a scheme known to the default object-store
     /// registry, because native clone commits resolve it there.
     /// For datasets with additional base paths, native deep clone reads them
