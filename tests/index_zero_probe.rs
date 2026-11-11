@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Temporary validation-only native trainer zero-control probe.
 
 use std::any::Any;
