@@ -62,7 +62,9 @@ verify_consumer_prefix() {
         "$install_prefix/lib/liblance_c.so" \
         "$install_prefix/lib/liblance_c.dylib"; do
         if [ -f "$library" ]; then
-            file "$library"
+            if command -v file >/dev/null 2>&1; then
+                file "$library"
+            fi
             if command -v sha256sum >/dev/null 2>&1; then
                 sha256sum "$library"
             else
