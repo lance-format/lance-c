@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
     scanner.limit(10);
     auto table = scanner.to_table();
     CHECK(!table.batches.empty());
+    CHECK(static_cast<bool>(table.schema));
 
     auto snapshot = writer.snapshot();
     if (snapshot.has_value()) {

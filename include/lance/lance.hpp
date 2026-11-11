@@ -9477,9 +9477,11 @@ inline std::vector<Batch> LsmScanner::to_batches() const {
 
 inline Table LsmScanner::to_table() const {
     Table table;
-    if (lance_lsm_scanner_schema(handle_.get(), table.schema.get()) != 0) {
+    ArrowSchema raw{};
+    if (lance_lsm_scanner_schema(handle_.get(), &raw) != 0) {
         check_error();
     }
+    table.schema = ArrowSchemaOwner(raw);
     table.batches = to_batches();
     return table;
 }
