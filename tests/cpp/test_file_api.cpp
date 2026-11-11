@@ -204,9 +204,9 @@ int test_transfer_write_failures(const std::string& base_path) {
               << ", download_bytes=" << downloaded.size()
               << ", upload_error=" << upload_error
               << ", upload_bytes=" << uploaded.size() << std::endl;
-    CHECK(download_error == LANCE_ERR_IO_ERROR, "download reports buffered I/O failure");
+    CHECK(download_error == LANCE_ERR_IO, "download reports buffered I/O failure");
     CHECK(downloaded == expected, "failed download preserves original bytes");
-    CHECK(upload_error == LANCE_ERR_IO_ERROR, "upload reports buffered I/O failure");
+    CHECK(upload_error == LANCE_ERR_IO, "upload reports buffered I/O failure");
     CHECK(uploaded == expected, "failed upload preserves original bytes");
     return failures == 0 ? 0 : 1;
 }
