@@ -9021,7 +9021,7 @@ int32_t lance_sql_query_builder_set_with_row_id(
     LanceSqlQueryBuilder* builder, bool enabled);
 
 /**
- * Ask the native planner to inject the `_row_address` system column into the
+ * Ask the native planner to inject the `_rowaddr` system column into the
  * scan output where it is safe to do so. Passed to the native builder
  * unchanged.
  *

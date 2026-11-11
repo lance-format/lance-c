@@ -151,7 +151,7 @@ pub unsafe extern "C" fn lance_sql_query_builder_set_with_row_id(
     )
 }
 
-/// Inject the native `_row_address` system column into the scan output where
+/// Inject the native `_rowaddr` system column into the scan output where
 /// the native planner permits it. Passed to the native builder unchanged.
 ///
 /// Returns 0 on success, -1 on error.

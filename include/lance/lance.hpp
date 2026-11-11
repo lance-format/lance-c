@@ -6505,7 +6505,7 @@ public:
         return *this;
     }
 
-    /// Ask the native planner to inject the `_row_address` system column
+    /// Ask the native planner to inject the `_rowaddr` system column
     /// where safe.
     SqlQueryBuilder& with_row_addr(bool enabled = true) {
         if (lance_sql_query_builder_set_with_row_addr(handle_.get(), enabled) !=
@@ -6694,8 +6694,7 @@ public:
 
     /// Set the begin date for date-mode ranges. Native build requires a
     /// begin date when an end date is provided. A timestamp the native
-    /// chrono constructor cannot represent is rejected when the delta is
-    /// built.
+    /// chrono constructor cannot represent is rejected by this setter.
     DatasetDeltaBuilder& begin_timestamp(const LanceDeltaTimestamp& timestamp) {
         if (lance_dataset_delta_builder_set_begin_timestamp(handle_.get(),
                                                              &timestamp) != 0) {
