@@ -867,10 +867,7 @@ fn custom_dispatch_identifies_all_managed_versions_concurrently() {
         ]
     );
 
-    let (rc, result) = call(namespace, "list_tables", r#"{"id":["workspace"]}"#, None);
-    assert_ne!(rc, 0);
-    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
-    assert!(!result.native_error().unwrap().1.is_empty());
+    assert_native_unsupported(namespace, "list_tables", r#"{"id":["workspace"]}"#);
     let operations = unsafe { &*(context.cast::<DispatchConcurrencyContext>()) }
         .operations
         .lock()
