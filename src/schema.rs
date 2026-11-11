@@ -320,7 +320,11 @@ unsafe fn schema_field_id_inner(
     }
     let column = unsafe { parse_c_string(column) }?
         .ok_or_else(|| lance_core::Error::invalid_input_source("column must not be NULL".into()))?;
-    let field_id = schema.inner.field_id(column)?;
+    let field_id = schema.inner.field_id(column).map_err(|err| {
+        lance_core::Error::invalid_input_source(
+            format!("column '{column}' is not in the native schema: {err}").into(),
+        )
+    })?;
     unsafe {
         *out_field_id = field_id;
     }
