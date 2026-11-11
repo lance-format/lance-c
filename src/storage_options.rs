@@ -80,7 +80,7 @@ pub struct LanceStorageOptionsProviderSpec {
 }
 
 pub struct LanceStorageOptionsProvider {
-    inner: Arc<FfiStorageOptionsProvider>,
+    pub(crate) inner: Arc<dyn StorageOptionsProvider>,
 }
 
 pub struct LanceStorageOptionsAccessor {
@@ -305,7 +305,7 @@ unsafe fn storage_options_accessor_new_inner(
     let provider = if provider.is_null() {
         None
     } else {
-        Some(unsafe { &*provider }.inner.clone() as Arc<dyn StorageOptionsProvider>)
+        Some(unsafe { &*provider }.inner.clone())
     };
 
     let inner = match (initial, provider) {

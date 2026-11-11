@@ -338,6 +338,8 @@ typedef struct LanceBlobDescriptorArrayBuilder LanceBlobDescriptorArrayBuilder;
 typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
+typedef struct LanceNamespace LanceNamespace;
+typedef struct LanceRestAdapter LanceRestAdapter;
 
 /* ─── Shared session ─── */
 
@@ -6943,6 +6945,15 @@ LanceStorageOptionsProvider* lance_storage_options_provider_new(
 );
 void lance_storage_options_provider_close(LanceStorageOptionsProvider* provider);
 
+/**
+ * Return the native provider identity as a copied string.
+ *
+ * Free with `lance_free_string`. Returns NULL on invalid input or allocation
+ * failure.
+ */
+char* lance_storage_options_provider_id(
+    const LanceStorageOptionsProvider* provider);
+
 LanceStorageOptionsAccessor* lance_storage_options_accessor_new(
     const LanceStorageOptionsInput* initial,
     const LanceStorageOptionsProvider* provider
@@ -6977,6 +6988,285 @@ const char* lance_storage_options_snapshot_value_at(
 );
 void lance_storage_options_snapshot_close(
     LanceStorageOptionsSnapshot* snapshot
+);
+
+/* ─── Native Lance namespaces ─────────────────────────────────────────────── */
+
+/**
+ * Result of one native namespace operation.
+ *
+ * Zero-initialize this structure. Release it exactly once with
+ * lance_namespace_result_close, including after a failed call.
+ *
+ * `result_json` encodes the native response model, except that unit operations
+ * leave it NULL, count_table_rows stores a JSON number, and
+ * explain/analyze_table_query_plan store a JSON string. `query_table` leaves
+ * `result_json` NULL and returns the native Arrow IPC stream in `result_bytes`.
+ *
+ * On failure `has_namespace_error` is nonzero and the native NamespaceError is
+ * preserved separately from the generic C error code. Native Unsupported is
+ * code 0; the generic return value is still a failure and is never LANCE_OK.
+ */
+typedef struct LanceNamespaceResult {
+    char* result_json;
+    uint8_t* result_bytes;
+    size_t result_bytes_len;
+    int32_t has_namespace_error;
+    uint32_t namespace_error_code;
+    char* namespace_error_message;
+} LanceNamespaceResult;
+
+void lance_namespace_result_close(LanceNamespaceResult* result);
+
+/**
+ * Copy the native namespace identifier. Free with lance_free_string().
+ */
+char* lance_namespace_id(const LanceNamespace* namespace);
+
+/**
+ * Retrieve native operation counters as a JSON object of integer values.
+ * Free with lance_free_string(). Directory and REST handles use the selected
+ * native implementation's counters. Connected and custom handles return
+ * LANCE_ERR_NOT_SUPPORTED because they have no concrete native counter store.
+ */
+char* lance_namespace_retrieve_ops_metrics(const LanceNamespace* namespace);
+
+/** Reset the native operation counters. */
+int32_t lance_namespace_reset_ops_metrics(LanceNamespace* namespace);
+
+/**
+ * Synchronous, infallible dynamic context provider.
+ *
+ * Return a JSON object of string values through `out_result_json`. The native
+ * REST client strips the `headers.` prefix from keys and applies them after
+ * base headers, so they override conflicts. `operation` and `object_id` are
+ * the native OperationInfo values and must not be retained.
+ *
+ * A nonzero status or malformed JSON is logged by the native path and treated
+ * as an empty map; the request continues. Initialize the output and error with
+ * zeroed LanceOwnedString/LanceCallbackError values.
+ */
+typedef int32_t (*LanceNamespaceContextProviderFn)(
+    void* provider_ctx,
+    const char* operation,
+    const char* object_id,
+    LanceOwnedString* out_result_json,
+    LanceCallbackError* out_error
+);
+
+/**
+ * Dynamic context provider declaration.
+ *
+ * Ownership of `provider_ctx` and `release` transfers when this spec is passed
+ * to a namespace constructor, including when construction fails. It is
+ * released exactly once after the final native owner drops.
+ */
+typedef struct LanceNamespaceContextProviderSpec {
+    LanceNamespaceContextProviderFn provide_context;
+    void (*release)(void* provider_ctx);
+    void* provider_ctx;
+} LanceNamespaceContextProviderSpec;
+
+/**
+ * Create a directory namespace from native DirectoryNamespaceBuilder.
+ *
+ * `properties_json` is a JSON object of string values; NULL or an empty string
+ * uses native defaults. `session` may be NULL. Native keys, defaults and
+ * validation follow the selected Lance core. `context_provider` may be NULL.
+ */
+LanceNamespace* lance_namespace_directory_new(
+    const char* properties_json,
+    const LanceSession* session,
+    const LanceNamespaceContextProviderSpec* context_provider
+);
+
+/**
+ * Create a REST namespace from native RestNamespaceBuilder.
+ *
+ * Native properties include uri, delimiter, header.*, tls.* and
+ * ops_metrics_enabled. TLS and validation behavior are native.
+ */
+LanceNamespace* lance_namespace_rest_new(
+    const char* properties_json,
+    const LanceNamespaceContextProviderSpec* context_provider
+);
+
+/**
+ * Connect through native ConnectBuilder, for example impl_name "dir" or
+ * "rest". The selected properties are native impl properties.
+ */
+LanceNamespace* lance_namespace_connect_new(
+    const char* impl_name,
+    const char* properties_json,
+    const LanceSession* session,
+    const LanceNamespaceContextProviderSpec* context_provider
+);
+
+/**
+ * Close a namespace handle. Datasets, storage providers and adapters retain
+ * their own native Arc ownership; foreign contexts are released after the
+ * final native owner drops.
+ */
+void lance_namespace_close(LanceNamespace* namespace);
+
+/**
+ * Invoke one of the 54 native namespace trait operations.
+ *
+ * `operation` is the exact native snake_case method name. Requests are JSON
+ * encodings of the native request models; NULL or empty means `{}`.
+ * `request_bytes` is the request body for create_table, insert_into_table and
+ * merge_insert_into_table and is ignored otherwise. `query_table` returns its
+ * native Arrow IPC bytes in the result.
+ *
+ * Successful unit operations leave result_json NULL. Model responses use JSON.
+ * On failure the native NamespaceError code/message are copied into the
+ * result, separately from the returned generic LanceErrorCode.
+ *
+ * @return 0 on success, -1 on failure. `out_result` must not be NULL and must
+ *         not already own resources.
+ */
+int32_t lance_namespace_call(
+    const LanceNamespace* namespace,
+    const char* operation,
+    const char* request_json,
+    const uint8_t* request_bytes,
+    size_t request_bytes_len,
+    LanceNamespaceResult* out_result
+);
+
+/**
+ * Native namespace storage-options provider.
+ *
+ * The provider calls describe_table with vend_credentials=true and retains the
+ * namespace. Table identity refreshes and lifetime are native. Close with
+ * lance_storage_options_provider_close. `table_id_json` is a JSON array of
+ * strings.
+ */
+LanceStorageOptionsProvider* lance_namespace_storage_options_provider_new(
+    const LanceNamespace* namespace,
+    const char* table_id_json
+);
+
+/**
+ * Open a dataset through native DatasetBuilder::from_namespace.
+ *
+ * Namespace-provided location and storage options use native precedence.
+ * `storage_options_json` entries are merged over namespace initial options and
+ * the native refresh provider stays attached. version 0 selects latest.
+ */
+LanceDataset* lance_dataset_open_namespace(
+    const LanceNamespace* namespace,
+    const char* table_id_json,
+    const char* storage_options_json,
+    uint64_t version,
+    const LanceSession* session
+);
+
+/**
+ * Write an Arrow stream into a native namespace-managed table.
+ *
+ * CREATE uses native declare_table. APPEND/OVERWRITE use native describe_table
+ * and the native namespace commit handler. A non-NULL `branch` calls native
+ * write_into_namespace_on_branch; NULL keeps main. `params` and `options` use
+ * the existing write conversion but with native write defaults (legacy
+ * auto-cleanup is not applied). `storage_options_json` is merged by native
+ * namespace write logic. The stream is consumed on every return once it has
+ * been accepted. `out_dataset` may be NULL to discard the result.
+ */
+int32_t lance_dataset_write_namespace(
+    const LanceNamespace* namespace,
+    const char* table_id_json,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceWriteParams* params,
+    const LanceWriteOptions* options,
+    const char* storage_options_json,
+    const LanceSession* session,
+    const char* branch,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Commit a transaction to a namespace-managed table URI.
+ *
+ * Uses LanceNamespaceExternalManifestStore::for_table_uri and the native
+ * ExternalManifestCommitHandler, then reuses CommitBuilder option conversion,
+ * storage options, session, retries and transaction semantics. Use the
+ * namespace open/write entry points for normal access; a namespace-opened
+ * dataset keeps its native commit handler.
+ */
+int32_t lance_transaction_commit_namespace_uri(
+    const LanceNamespace* namespace,
+    const char* table_id_json,
+    const char* uri,
+    const LanceTransaction* transaction,
+    const LanceCommitOptions* options,
+    const char* const* storage_opts,
+    const LanceSession* session,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Start a native REST adapter over an existing namespace backend.
+ *
+ * `host` NULL or empty uses the native default. port 0 binds an ephemeral
+ * port; read it with lance_rest_adapter_port. The native adapter retains the
+ * backend and its server task; close or shutdown releases them.
+ */
+int32_t lance_rest_adapter_start(
+    const LanceNamespace* namespace,
+    const char* host,
+    uint16_t port,
+    LanceRestAdapter** out_adapter
+);
+
+/** Bound port, or 0 when the adapter is not running. */
+uint16_t lance_rest_adapter_port(const LanceRestAdapter* adapter);
+
+/** Gracefully stop the server. Idempotent; in-flight requests complete. */
+void lance_rest_adapter_shutdown(LanceRestAdapter* adapter);
+
+/** Stop and destroy the adapter. */
+void lance_rest_adapter_close(LanceRestAdapter* adapter);
+
+/**
+ * Foreign client for the four managed table/version callbacks Python exposes.
+ *
+ * Each callback receives the native request model as JSON and must return the
+ * native response model as JSON. Nonzero status reports failure through
+ * LanceCallbackError; partial output is released exactly once. Generic
+ * callback codes map to native NamespaceError classes (for example
+ * LANCE_ERR_COMMIT_CONFLICT becomes ConcurrentModification). All other
+ * operations keep native Unsupported behavior.
+ *
+ * Callbacks may synchronously call independent C handles. They run in the
+ * established reentrant blocking region and must not assume the same mutating
+ * dataset handle is reentrant.
+ *
+ * Ownership of `client_ctx` and `release` transfers when this function is
+ * called, including on construction failure. The context is released exactly
+ * once after the final native namespace Arc drops.
+ */
+typedef int32_t (*LanceNamespaceOperationFn)(
+    void* client_ctx,
+    const char* request_json,
+    LanceOwnedString* out_response_json,
+    LanceCallbackError* out_error
+);
+
+typedef struct LanceNamespaceCustomClientSpec {
+    LanceNamespaceOperationFn describe_table;
+    LanceNamespaceOperationFn describe_table_version;
+    LanceNamespaceOperationFn create_table_version;
+    LanceNamespaceOperationFn list_table_versions;
+    void (*release)(void* client_ctx);
+    void* client_ctx;
+    const char* namespace_id;
+} LanceNamespaceCustomClientSpec;
+
+LanceNamespace* lance_namespace_custom_new(
+    const LanceNamespaceCustomClientSpec* spec
 );
 
 /* ─── Raw Lance-file session ──────────────────────────────────────────────── */

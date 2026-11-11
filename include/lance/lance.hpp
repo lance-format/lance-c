@@ -178,6 +178,7 @@ class OptimizeIndexMerge;
 class IndexSegmentResult;
 class FtsQueryContext;
 class FtsQuery;
+class Namespace;
 
 // ─── Version history ─────────────────────────────────────────────────────────
 
@@ -1134,6 +1135,14 @@ public:
         Fetch force_fetch = {});
 
     const LanceStorageOptionsProvider* c_handle() const { return handle_.get(); }
+
+    std::string provider_id() const {
+        char* value = lance_storage_options_provider_id(handle_.get());
+        if (value == nullptr) check_error();
+        std::string out(value);
+        lance_free_string(value);
+        return out;
+    }
 };
 
 namespace storage_options_detail {
@@ -3556,6 +3565,40 @@ public:
         return write_impl(
             uri, stream, mode, nullptr, &c_options, storage_opts);
     }
+
+    /// Open through a native namespace. Namespace location/storage options and
+    /// managed-version behavior follow `DatasetBuilder::from_namespace`.
+    static Dataset open_namespace(
+        const Namespace& ns,
+        const std::vector<std::string>& table_id,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        uint64_t version = 0,
+        const Session* session = nullptr);
+
+    /// Write into a namespace-managed table. CREATE uses native declare_table;
+    /// APPEND/OVERWRITE use native describe/commit-handler behavior. A
+    /// non-empty branch selects native write_into_namespace_on_branch. Native
+    /// write defaults apply (the legacy 20/14 cleanup policy is not added).
+    static Dataset write_namespace(
+        const Namespace& ns,
+        const std::vector<std::string>& table_id,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const std::optional<std::string>& branch = std::nullopt,
+        const Session* session = nullptr);
+
+    /// Commit a transaction through a namespace-managed table URI using the
+    /// native external manifest store and existing CommitBuilder semantics.
+    static Dataset commit_namespace_uri(
+        const Namespace& ns,
+        const std::vector<std::string>& table_id,
+        const std::string& uri,
+        const Transaction& transaction,
+        const CommitOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
 
     /// Write an Arrow stream without committing, returning the owned native
     /// transaction for later publication with `Dataset::commit`.
@@ -7446,6 +7489,568 @@ inline void write_fragments(
     if (lance_write_fragments(uri.c_str(), schema, stream, opts_ptr) != 0) {
         check_error();
     }
+}
+
+// ─── Native namespaces ───────────────────────────────────────────────────────
+
+namespace namespace_detail {
+
+inline std::string json_escape(std::string_view value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    for (unsigned char c : value) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            default:
+                if (c < 0x20) {
+                    static const char hex[] = "0123456789abcdef";
+                    out += "\\u00";
+                    out += hex[(c >> 4) & 0xF];
+                    out += hex[c & 0xF];
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+inline std::string json_string(std::string_view value) {
+    return std::string("\"") + json_escape(value) + "\"";
+}
+
+inline std::string json_string_array(const std::vector<std::string>& values) {
+    std::string out = "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) out += ",";
+        out += json_string(values[i]);
+    }
+    out += "]";
+    return out;
+}
+
+inline std::string json_string_object(
+    const std::vector<std::pair<std::string, std::string>>& entries) {
+    std::string out = "{";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i != 0) out += ",";
+        out += json_string(entries[i].first);
+        out += ":";
+        out += json_string(entries[i].second);
+    }
+    out += "}";
+    return out;
+}
+
+inline void free_owned_string(LanceOwnedString* value) noexcept {
+    delete[] value->data;
+    value->data = nullptr;
+    value->release = nullptr;
+}
+
+inline void set_owned_string(LanceOwnedString* out, std::string value) {
+    auto* data = new char[value.size() + 1];
+    std::memcpy(data, value.data(), value.size());
+    data[value.size()] = '\0';
+    out->data = data;
+    out->release = &free_owned_string;
+}
+
+inline void set_callback_error(
+    LanceCallbackError* error, int32_t code, const std::string& message) noexcept {
+    error->code = code;
+    try {
+        set_owned_string(&error->message, message);
+    } catch (...) {
+        error->message.data = nullptr;
+        error->message.release = nullptr;
+    }
+}
+
+} // namespace namespace_detail
+
+/// Namespace operation error that preserves both the generic C error class and
+/// the native NamespaceError code/message.
+class NamespaceError : public Error {
+public:
+    bool has_native_code;
+    uint32_t native_code;
+    std::string native_message;
+
+    NamespaceError(
+        LanceErrorCode code,
+        std::string message,
+        uint32_t native_code,
+        std::string native_message)
+        : Error(code, std::move(message)),
+          has_native_code(true),
+          native_code(native_code),
+          native_message(std::move(native_message)) {}
+};
+
+/// Owning copy of one native namespace call result. The C result is released
+/// before this object is returned, so no native resources outlive it.
+class NamespaceResult {
+    std::optional<std::string> json_;
+    std::vector<uint8_t> bytes_;
+
+    friend class Namespace;
+
+    NamespaceResult(std::optional<std::string> json, std::vector<uint8_t> bytes)
+        : json_(std::move(json)), bytes_(std::move(bytes)) {}
+
+public:
+    NamespaceResult() = default;
+    NamespaceResult(NamespaceResult&&) noexcept = default;
+    NamespaceResult& operator=(NamespaceResult&&) noexcept = default;
+    NamespaceResult(const NamespaceResult&) = delete;
+    NamespaceResult& operator=(const NamespaceResult&) = delete;
+
+    bool has_json() const noexcept { return json_.has_value(); }
+    const std::optional<std::string>& json() const noexcept { return json_; }
+    const std::vector<uint8_t>& bytes() const noexcept { return bytes_; }
+};
+
+/// Synchronous, infallible dynamic context provider. C++ exceptions are
+/// converted to a callback error; the native client logs it and sends an empty
+/// map. The callback receives the native operation name and object id.
+class DynamicContextProvider {
+public:
+    using Callback = std::function<std::map<std::string, std::string>(
+        const std::string&, const std::string&)>;
+
+private:
+    Callback callback_;
+
+public:
+    explicit DynamicContextProvider(Callback callback)
+        : callback_(std::move(callback)) {}
+    const Callback& callback() const noexcept { return callback_; }
+};
+
+/// Move-only namespace handle with native concrete-implementation retention.
+class Namespace {
+    Handle<LanceNamespace, lance_namespace_close> handle_;
+
+    struct ContextProviderContext {
+        std::function<std::map<std::string, std::string>(
+            const std::string&, const std::string&)> callback;
+    };
+
+    struct CustomClientContext {
+        std::function<std::string(const std::string&)> describe_table;
+        std::function<std::string(const std::string&)> describe_table_version;
+        std::function<std::string(const std::string&)> create_table_version;
+        std::function<std::string(const std::string&)> list_table_versions;
+    };
+
+    static void context_provider_release(void* ctx) noexcept {
+        delete static_cast<ContextProviderContext*>(ctx);
+    }
+
+    static void custom_client_release(void* ctx) noexcept {
+        delete static_cast<CustomClientContext*>(ctx);
+    }
+
+    static int32_t context_provider_call(
+        void* raw_ctx,
+        const char* operation,
+        const char* object_id,
+        LanceOwnedString* out_json,
+        LanceCallbackError* out_error) noexcept {
+        auto* ctx = static_cast<ContextProviderContext*>(raw_ctx);
+        try {
+            std::map<std::string, std::string> context = ctx->callback(
+                operation ? operation : "", object_id ? object_id : "");
+            std::string json = "{";
+            bool first = true;
+            for (const auto& [key, value] : context) {
+                if (!first) json += ",";
+                first = false;
+                json += namespace_detail::json_string(key);
+                json += ":";
+                json += namespace_detail::json_string(value);
+            }
+            json += "}";
+            namespace_detail::set_owned_string(out_json, std::move(json));
+            return 0;
+        } catch (const lance::Error& error) {
+            namespace_detail::set_callback_error(
+                out_error, static_cast<int32_t>(error.code), error.what());
+        } catch (const std::exception& error) {
+            namespace_detail::set_callback_error(
+                out_error, static_cast<int32_t>(LANCE_ERR_INTERNAL), error.what());
+        } catch (...) {
+            namespace_detail::set_callback_error(
+                out_error,
+                static_cast<int32_t>(LANCE_ERR_INTERNAL),
+                "unknown C++ exception in namespace context provider");
+        }
+        return 1;
+    }
+
+    static int32_t invoke_custom(
+        CustomClientContext* ctx,
+        std::function<std::string(const std::string&)>& callback,
+        const char* request_json,
+        LanceOwnedString* out_json,
+        LanceCallbackError* out_error) noexcept {
+        (void)ctx;
+        try {
+            std::string response = callback(request_json ? request_json : "{}");
+            namespace_detail::set_owned_string(out_json, std::move(response));
+            return 0;
+        } catch (const lance::Error& error) {
+            namespace_detail::set_callback_error(
+                out_error, static_cast<int32_t>(error.code), error.what());
+        } catch (const std::exception& error) {
+            namespace_detail::set_callback_error(
+                out_error, static_cast<int32_t>(LANCE_ERR_INTERNAL), error.what());
+        } catch (...) {
+            namespace_detail::set_callback_error(
+                out_error,
+                static_cast<int32_t>(LANCE_ERR_INTERNAL),
+                "unknown C++ exception in namespace callback");
+        }
+        return 1;
+    }
+
+    static int32_t custom_describe_table(
+        void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomClientContext*>(ctx);
+        return invoke_custom(client, client->describe_table, req, out, err);
+    }
+    static int32_t custom_describe_table_version(
+        void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomClientContext*>(ctx);
+        return invoke_custom(client, client->describe_table_version, req, out, err);
+    }
+    static int32_t custom_create_table_version(
+        void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomClientContext*>(ctx);
+        return invoke_custom(client, client->create_table_version, req, out, err);
+    }
+    static int32_t custom_list_table_versions(
+        void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomClientContext*>(ctx);
+        return invoke_custom(client, client->list_table_versions, req, out, err);
+    }
+
+    static LanceNamespaceContextProviderSpec make_context_spec(
+        const DynamicContextProvider* provider) {
+        LanceNamespaceContextProviderSpec spec{};
+        if (provider) {
+            auto* ctx = new ContextProviderContext{provider->callback()};
+            spec.provide_context = &context_provider_call;
+            spec.release = &context_provider_release;
+            spec.provider_ctx = ctx;
+        }
+        return spec;
+    }
+
+    explicit Namespace(LanceNamespace* handle) : handle_(handle) {}
+
+public:
+    /// Foreign client for the four Python-compatible managed-version
+    /// callbacks. Each callback receives native request JSON and returns
+    /// native response JSON. Other operations keep native Unsupported.
+    struct CustomClientSpec {
+        std::function<std::string(const std::string&)> describe_table;
+        std::function<std::string(const std::string&)> describe_table_version;
+        std::function<std::string(const std::string&)> create_table_version;
+        std::function<std::string(const std::string&)> list_table_versions;
+        std::string namespace_id = "custom";
+    };
+
+    Namespace(Namespace&&) noexcept = default;
+    Namespace& operator=(Namespace&&) noexcept = default;
+    Namespace(const Namespace&) = delete;
+    Namespace& operator=(const Namespace&) = delete;
+
+    static Namespace directory(
+        const std::vector<std::pair<std::string, std::string>>& properties = {},
+        const Session* session = nullptr,
+        const DynamicContextProvider* context_provider = nullptr) {
+        auto json = namespace_detail::json_string_object(properties);
+        auto spec = make_context_spec(context_provider);
+        auto* raw = lance_namespace_directory_new(
+            json.c_str(), session ? session->c_handle() : nullptr, &spec);
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    static Namespace rest(
+        const std::vector<std::pair<std::string, std::string>>& properties,
+        const DynamicContextProvider* context_provider = nullptr) {
+        auto json = namespace_detail::json_string_object(properties);
+        auto spec = make_context_spec(context_provider);
+        auto* raw = lance_namespace_rest_new(json.c_str(), &spec);
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    static Namespace connect(
+        const std::string& impl_name,
+        const std::vector<std::pair<std::string, std::string>>& properties = {},
+        const Session* session = nullptr,
+        const DynamicContextProvider* context_provider = nullptr) {
+        auto json = namespace_detail::json_string_object(properties);
+        auto spec = make_context_spec(context_provider);
+        auto* raw = lance_namespace_connect_new(
+            impl_name.c_str(),
+            json.c_str(),
+            session ? session->c_handle() : nullptr,
+            &spec);
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    static Namespace custom(const CustomClientSpec& spec) {
+        if (!spec.describe_table || !spec.describe_table_version ||
+            !spec.create_table_version || !spec.list_table_versions) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "custom namespace requires all four managed-version callbacks");
+        }
+        auto* ctx = new CustomClientContext{
+            spec.describe_table,
+            spec.describe_table_version,
+            spec.create_table_version,
+            spec.list_table_versions};
+        std::unique_ptr<CustomClientContext> guard(ctx);
+        LanceNamespaceCustomClientSpec c_spec{};
+        c_spec.describe_table = &custom_describe_table;
+        c_spec.describe_table_version = &custom_describe_table_version;
+        c_spec.create_table_version = &custom_create_table_version;
+        c_spec.list_table_versions = &custom_list_table_versions;
+        c_spec.release = &custom_client_release;
+        c_spec.client_ctx = ctx;
+        c_spec.namespace_id = spec.namespace_id.c_str();
+        auto* raw = lance_namespace_custom_new(&c_spec);
+        // The C constructor consumes the context on every invocation.
+        guard.release();
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    std::string id() const {
+        const char* raw = lance_namespace_id(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    std::string ops_metrics_json() const {
+        const char* raw = lance_namespace_retrieve_ops_metrics(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    void reset_ops_metrics() {
+        if (lance_namespace_reset_ops_metrics(handle_.get()) != 0) check_error();
+    }
+
+    NamespaceResult call(
+        const std::string& operation,
+        const std::string& request_json = "{}",
+        const uint8_t* request_bytes = nullptr,
+        size_t request_bytes_len = 0) const {
+        LanceNamespaceResult raw{};
+        struct ResultGuard {
+            LanceNamespaceResult* result;
+            ~ResultGuard() { if (result) lance_namespace_result_close(result); }
+        } guard{&raw};
+        int32_t rc = lance_namespace_call(
+            handle_.get(),
+            operation.c_str(),
+            request_json.c_str(),
+            request_bytes,
+            request_bytes_len,
+            &raw);
+        std::optional<std::string> json;
+        std::vector<uint8_t> bytes;
+        if (raw.result_json) json = std::string(raw.result_json);
+        if (raw.result_bytes && raw.result_bytes_len != 0) {
+            bytes.assign(raw.result_bytes, raw.result_bytes + raw.result_bytes_len);
+        }
+        bool has_native = raw.has_namespace_error != 0;
+        uint32_t native_code = raw.namespace_error_code;
+        std::string native_message =
+            raw.namespace_error_message ? raw.namespace_error_message : "";
+        lance_namespace_result_close(&raw);
+        guard.result = nullptr;
+        if (rc != 0) {
+            LanceErrorCode code = lance_last_error_code();
+            const char* message = lance_last_error_message();
+            std::string owned(message ? message : "Unknown error");
+            if (message) lance_free_string(message);
+            if (has_native) {
+                throw NamespaceError(
+                    code, std::move(owned), native_code, std::move(native_message));
+            }
+            throw Error(code, std::move(owned));
+        }
+        return NamespaceResult(std::move(json), std::move(bytes));
+    }
+
+    NamespaceResult call(
+        const std::string& operation,
+        const std::string& request_json,
+        const std::vector<uint8_t>& request_bytes) const {
+        return call(
+            operation,
+            request_json,
+            request_bytes.empty() ? nullptr : request_bytes.data(),
+            request_bytes.size());
+    }
+
+    const LanceNamespace* c_handle() const noexcept { return handle_.get(); }
+};
+
+/// Move-only owner of a running native REST adapter.
+class RestAdapter {
+    Handle<LanceRestAdapter, lance_rest_adapter_close> handle_;
+    uint16_t port_ = 0;
+
+    explicit RestAdapter(LanceRestAdapter* raw) : handle_(raw) {}
+
+public:
+    RestAdapter(RestAdapter&& other) noexcept
+        : handle_(std::move(other.handle_)), port_(other.port_) {
+        other.port_ = 0;
+    }
+    RestAdapter& operator=(RestAdapter&& other) noexcept {
+        if (this != &other) {
+            handle_ = std::move(other.handle_);
+            port_ = other.port_;
+            other.port_ = 0;
+        }
+        return *this;
+    }
+    RestAdapter(const RestAdapter&) = delete;
+    RestAdapter& operator=(const RestAdapter&) = delete;
+
+    static RestAdapter start(
+        const Namespace& backend,
+        const std::string& host = "127.0.0.1",
+        uint16_t port = 0) {
+        LanceRestAdapter* raw = nullptr;
+        if (lance_rest_adapter_start(
+                backend.c_handle(), host.c_str(), port, &raw) != 0) {
+            check_error();
+        }
+        if (!raw) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_rest_adapter_start returned success with null adapter");
+        }
+        RestAdapter adapter(raw);
+        adapter.port_ = lance_rest_adapter_port(raw);
+        return adapter;
+    }
+
+    uint16_t port() const noexcept { return port_; }
+
+    void shutdown() {
+        lance_rest_adapter_shutdown(handle_.get());
+        port_ = 0;
+    }
+};
+
+inline Dataset Dataset::open_namespace(
+    const Namespace& ns,
+    const std::vector<std::string>& table_id,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    uint64_t version,
+    const Session* session) {
+    auto table_json = namespace_detail::json_string_array(table_id);
+    auto storage_json = namespace_detail::json_string_object(storage_opts);
+    auto* raw = lance_dataset_open_namespace(
+        ns.c_handle(),
+        table_json.c_str(),
+        storage_json.c_str(),
+        version,
+        session ? session->c_handle() : nullptr);
+    if (!raw) check_error();
+    return Dataset(raw);
+}
+
+inline Dataset Dataset::write_namespace(
+    const Namespace& ns,
+    const std::vector<std::string>& table_id,
+    ArrowArrayStream* stream,
+    WriteMode mode,
+    const WriteOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const std::optional<std::string>& branch,
+    const Session* session) {
+    ArrowStreamInput input(stream);
+    const ArrowSchema* schema = input.read_schema();
+    auto table_json = namespace_detail::json_string_array(table_id);
+    auto storage_json = namespace_detail::json_string_object(storage_opts);
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions c_options = to_c_write_options(options, cleanup);
+    LanceDataset* out = nullptr;
+    auto* owned_stream = input.consume();
+    int32_t rc = lance_dataset_write_namespace(
+        ns.c_handle(),
+        table_json.c_str(),
+        schema,
+        owned_stream,
+        static_cast<int32_t>(mode),
+        nullptr,
+        &c_options,
+        storage_json.c_str(),
+        session ? session->c_handle() : nullptr,
+        branch ? branch->c_str() : nullptr,
+        &out);
+    if (rc != 0) check_error();
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_dataset_write_namespace returned success with null out_dataset");
+    }
+    return Dataset(out);
+}
+
+inline Dataset Dataset::commit_namespace_uri(
+    const Namespace& ns,
+    const std::vector<std::string>& table_id,
+    const std::string& uri,
+    const Transaction& transaction,
+    const CommitOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+    auto table_json = namespace_detail::json_string_array(table_id);
+    auto kv = to_c_key_values(storage_opts);
+    const char* const* opts_ptr = storage_opts.empty() ? nullptr : kv.data();
+    LanceCommitOptions c_options = to_c_commit_options(options);
+    LanceDataset* out = nullptr;
+    int32_t rc = lance_transaction_commit_namespace_uri(
+        ns.c_handle(),
+        table_json.c_str(),
+        uri.c_str(),
+        transaction.c_handle(),
+        &c_options,
+        opts_ptr,
+        session ? session->c_handle() : nullptr,
+        &out);
+    if (rc != 0) check_error();
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_transaction_commit_namespace_uri returned success with null out_dataset");
+    }
+    return Dataset(out);
 }
 
 } // namespace lance
