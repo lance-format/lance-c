@@ -37972,7 +37972,7 @@ fn test_ivf_model_centroids_and_partition_streams() {
     for partition in 0..4 {
         assert_eq!(
             unsafe { lance_ivf_model_partition_size(model, partition) },
-            vector_index.ivf_model().partition_size(partition) as u64
+            vector_index.ivf_model().partition_size(partition as usize) as u64
         );
     }
 
