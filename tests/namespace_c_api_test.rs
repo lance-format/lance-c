@@ -529,6 +529,8 @@ struct DelegateContext {
     directory: *const LanceNamespace,
     describe_calls: AtomicUsize,
     fail_next_version: AtomicUsize,
+    read_dataset: *mut LanceDataset,
+    reentrant_count: AtomicUsize,
 }
 
 unsafe fn delegate_call(
@@ -542,40 +544,63 @@ unsafe fn delegate_call(
     if operation == "describe_table" {
         context.describe_calls.fetch_add(1, Ordering::SeqCst);
     }
-    if operation == "create_table_version"
-        && context.fail_next_version.swap(0, Ordering::SeqCst) > 0
-    {
-        unsafe {
-            (*error).code = LanceErrorCode::CommitConflict as i32;
-            (*error).message.data = owned_string("injected managed version conflict");
-            (*error).message.release = Some(free_owned_string);
+    if operation == "create_table_version" {
+        if !context.read_dataset.is_null() {
+            let count = unsafe { lance_dataset_count_rows(context.read_dataset) };
+            context
+                .reentrant_count
+                .store(count as usize, Ordering::SeqCst);
         }
-        return 1;
+        if context.fail_next_version.swap(0, Ordering::SeqCst) > 0 {
+            unsafe {
+                (*error).code = LanceErrorCode::CommitConflict as i32;
+                (*error).message.data = owned_string("injected managed version conflict");
+                (*error).message.release = Some(free_owned_string);
+            }
+            return 1;
+        }
     }
-    let operation = c_string(operation);
-    let mut result = NamespaceResult::default();
-    let rc = unsafe {
-        lance_namespace_call(
-            context.directory,
-            operation.as_ptr(),
-            request,
-            ptr::null(),
-            0,
-            &mut result.0,
-        )
-    };
+
+    // The native callback already runs inside a blocking region. Run the
+    // nested namespace call on an independent thread so it can enter the
+    // global runtime without nesting block_on on the callback thread.
+    let directory = context.directory as usize;
+    let request = request as usize;
+    let operation = operation.to_owned();
+    let (rc, json, code, message) = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let operation = c_string(&operation);
+                let mut result = NamespaceResult::default();
+                let rc = unsafe {
+                    lance_namespace_call(
+                        directory as *const LanceNamespace,
+                        operation.as_ptr(),
+                        request as *const c_char,
+                        ptr::null(),
+                        0,
+                        &mut result.0,
+                    )
+                };
+                let json = result.json().unwrap_or_default();
+                let code = lance_last_error_code() as i32;
+                let message = last_error();
+                (rc, json, code, message)
+            })
+            .join()
+            .unwrap()
+    });
+
     if rc == 0 {
         unsafe {
-            (*response).data = result.0.result_json;
+            (*response).data = owned_string(&json);
             (*response).release = Some(free_owned_string);
-            result.0.result_json = ptr::null_mut();
         }
         return 0;
     }
     unsafe {
-        (*error).code = lance_last_error_code() as i32;
-        let message = lance_last_error_message();
-        (*error).message.data = message.cast_mut();
+        (*error).code = code;
+        (*error).message.data = owned_string(&message);
         (*error).message.release = Some(free_owned_string);
     }
     1
@@ -642,11 +667,22 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
     let table_id = r#"["workspace","managed"]"#;
     let dataset = write_namespace(directory, table_id, 0, &schema, batch.clone());
     unsafe { lance_dataset_close(dataset) };
+    let read_table = c_string(table_id);
+    let read_dataset = unsafe {
+        lance_dataset_open_namespace(directory, read_table.as_ptr(), ptr::null(), 0, ptr::null())
+    };
+    assert!(
+        !read_dataset.is_null(),
+        "read dataset open failed: {}",
+        last_error()
+    );
 
     let context = Box::into_raw(Box::new(DelegateContext {
         directory,
         describe_calls: AtomicUsize::new(0),
         fail_next_version: AtomicUsize::new(0),
+        read_dataset,
+        reentrant_count: AtomicUsize::new(0),
     })) as *mut c_void;
     let namespace_id = c_string("custom-managed");
     let spec = LanceNamespaceCustomClientSpec {
@@ -665,7 +701,7 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
         last_error()
     );
 
-    let dataset = write_namespace(custom, table_id, 1, &schema, batch);
+    let dataset = write_namespace(custom, table_id, 1, &schema, batch.clone());
     unsafe { lance_dataset_close(dataset) };
     let table_id_c = c_string(table_id);
     let opened = unsafe {
@@ -680,6 +716,11 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
     unsafe { lance_dataset_close(opened) };
     let delegate_context = unsafe { &*(context.cast::<DelegateContext>()) };
     assert!(delegate_context.describe_calls.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        delegate_context.reentrant_count.load(Ordering::SeqCst),
+        3,
+        "callback must synchronously read an independent dataset handle"
+    );
 
     delegate_context
         .fail_next_version
@@ -705,6 +746,7 @@ fn custom_namespace_managed_versions_and_reentrant_reads() {
 
     close_namespace(custom);
     close_namespace(directory);
+    unsafe { lance_dataset_close(read_dataset) };
 }
 
 unsafe extern "C" fn dynamic_context(
