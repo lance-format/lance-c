@@ -1083,6 +1083,202 @@ inline int32_t insert_fragment_trampoline(
 
 }  // namespace callback_detail
 
+// ─── Storage options ─────────────────────────────────────────────────────────
+
+using StorageOptions = std::map<std::string, std::string>;
+
+class StorageOptionsProvider {
+    Handle<LanceStorageOptionsProvider, lance_storage_options_provider_close> handle_;
+
+public:
+    using Fetch = std::function<std::optional<StorageOptions>()>;
+
+    StorageOptionsProvider(
+        std::string provider_id,
+        Fetch fetch,
+        Fetch force_fetch = {});
+
+    const LanceStorageOptionsProvider* c_handle() const { return handle_.get(); }
+};
+
+namespace storage_options_detail {
+
+struct FetchSnapshot {
+    std::vector<std::string> strings;
+    std::vector<const char*> keys;
+    std::vector<const char*> values;
+};
+
+inline void release_fetch_snapshot(void* raw) noexcept {
+    delete static_cast<FetchSnapshot*>(raw);
+}
+
+inline int32_t fetch_impl(
+    const StorageOptionsProvider::Fetch& fetch,
+    LanceStorageOptionsFetchResult* out,
+    LanceCallbackError* error,
+    const char* context) noexcept {
+    (void)context;
+    try {
+        auto options = fetch();
+        if (!options) {
+            out->has_options = 0;
+            return 0;
+        }
+
+        std::unique_ptr<FetchSnapshot> snapshot(new FetchSnapshot());
+        snapshot->strings.reserve(options->size() * 2);
+        snapshot->keys.reserve(options->size());
+        snapshot->values.reserve(options->size());
+        for (const auto& [key, value] : *options) {
+            snapshot->strings.push_back(key);
+            snapshot->strings.push_back(value);
+        }
+        for (std::size_t index = 0; index < options->size(); index++) {
+            snapshot->keys.push_back(snapshot->strings[index * 2].c_str());
+            snapshot->values.push_back(snapshot->strings[index * 2 + 1].c_str());
+        }
+        out->has_options = 1;
+        out->keys = snapshot->keys.data();
+        out->values = snapshot->values.data();
+        out->count = snapshot->keys.size();
+        out->snapshot_ctx = snapshot.release();
+        out->release_snapshot = &release_fetch_snapshot;
+        return 0;
+    } catch (const lance::Error& exception) {
+        callback_detail::set_callback_error(
+            error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        callback_detail::set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, "unknown C++ exception in storage options fetch");
+        return -1;
+    }
+}
+
+struct ProviderContext {
+    StorageOptionsProvider::Fetch fetch;
+    StorageOptionsProvider::Fetch force_fetch;
+};
+
+inline int32_t fetch_callback(
+    void* callback_ctx,
+    LanceStorageOptionsFetchResult* out,
+    LanceCallbackError* error) noexcept {
+    auto* context = static_cast<ProviderContext*>(callback_ctx);
+    return fetch_impl(context->fetch, out, error, "storage options fetch");
+}
+
+inline int32_t force_fetch_callback(
+    void* callback_ctx,
+    LanceStorageOptionsFetchResult* out,
+    LanceCallbackError* error) noexcept {
+    auto* context = static_cast<ProviderContext*>(callback_ctx);
+    return fetch_impl(
+        context->force_fetch, out, error, "storage options force fetch");
+}
+
+inline void provider_release(void* callback_ctx) noexcept {
+    delete static_cast<ProviderContext*>(callback_ctx);
+}
+
+LanceStorageOptionsProvider* create_provider(
+    const std::string& provider_id,
+    StorageOptionsProvider::Fetch fetch,
+    StorageOptionsProvider::Fetch force_fetch) {
+    auto* context = new ProviderContext{
+        std::move(fetch), std::move(force_fetch)};
+    LanceStorageOptionsProviderSpec spec{};
+    spec.fetch = &fetch_callback;
+    spec.force_fetch =
+        context->force_fetch ? &force_fetch_callback : nullptr;
+    spec.release = &provider_release;
+    spec.provider_ctx = context;
+    spec.provider_id = provider_id.c_str();
+    auto* provider = lance_storage_options_provider_new(&spec);
+    if (provider == nullptr) {
+        // Ownership transfers only on success.
+        delete context;
+    }
+    return provider;
+}
+
+}  // namespace storage_options_detail
+
+inline StorageOptionsProvider::StorageOptionsProvider(
+    std::string provider_id,
+    Fetch fetch,
+    Fetch force_fetch)
+    : handle_(storage_options_detail::create_provider(
+          provider_id, std::move(fetch), std::move(force_fetch))) {
+    if (!handle_) check_error();
+}
+
+class StorageOptionsAccessor {
+    Handle<LanceStorageOptionsAccessor, lance_storage_options_accessor_close> handle_;
+
+public:
+    /// NULL optional means native None; an engaged empty map means Some(empty).
+    explicit StorageOptionsAccessor(
+        std::optional<StorageOptions> initial = std::nullopt,
+        const StorageOptionsProvider* provider = nullptr)
+        : handle_(nullptr) {
+        std::vector<const char*> keys;
+        std::vector<const char*> values;
+        LanceStorageOptionsInput input{};
+        const LanceStorageOptionsInput* input_ptr = nullptr;
+        if (initial) {
+            keys.reserve(initial->size());
+            values.reserve(initial->size());
+            for (const auto& [key, value] : *initial) {
+                keys.push_back(key.c_str());
+                values.push_back(value.c_str());
+            }
+            input.keys = keys.data();
+            input.values = values.data();
+            input.count = keys.size();
+            input_ptr = &input;
+        }
+        auto* raw = lance_storage_options_accessor_new(
+            input_ptr, provider ? provider->c_handle() : nullptr);
+        if (raw == nullptr) check_error();
+        handle_ = Handle<LanceStorageOptionsAccessor,
+                         lance_storage_options_accessor_close>(raw);
+    }
+
+    /// Resolve with native cache and expiration behavior.
+    std::optional<StorageOptions> snapshot() const {
+        auto* raw = lance_storage_options_accessor_snapshot(handle_.get());
+        if (raw == nullptr) check_error();
+        Handle<LanceStorageOptionsSnapshot,
+               lance_storage_options_snapshot_close>
+            snapshot(raw);
+        int32_t has_options =
+            lance_storage_options_snapshot_has_options(snapshot.get());
+        if (has_options < 0) check_error();
+        if (has_options == 0) return std::nullopt;
+        StorageOptions options;
+        uint64_t count =
+            lance_storage_options_snapshot_count(snapshot.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        for (uint64_t index = 0; index < count; index++) {
+            const char* key = lance_storage_options_snapshot_key_at(
+                snapshot.get(), static_cast<std::size_t>(index));
+            if (!key) check_error();
+            const char* value = lance_storage_options_snapshot_value_at(
+                snapshot.get(), static_cast<std::size_t>(index));
+            if (!value) check_error();
+            options.emplace(key, value);
+        }
+        return options;
+    }
+
+    const LanceStorageOptionsAccessor* c_handle() const { return handle_.get(); }
+};
+
 // ─── Shared Session ──────────────────────────────────────────────────────────
 
 enum class SessionCacheSpecKind : int32_t {
@@ -4776,12 +4972,784 @@ class Batch {
 public:
     explicit Batch(LanceBatch* b) : handle_(b) {}
 
-    /// Export as Arrow C Data Interface structs.
+    /// Adopt a non-NULL Arrow array. `schema` is borrowed and must outlive the
+    /// call. The C API consumes the array on every return; on failure the
+    /// source array is already released and this method throws.
+    static Batch from_arrow(ArrowArray* array, const ArrowSchema* schema) {
+        LanceBatch* raw = nullptr;
+        if (lance_batch_from_arrow(array, schema, &raw) != 0) {
+            check_error();
+        }
+        return Batch(raw);
+    }
+
+    /// Export the complete record-batch schema and top-level struct array.
     void to_arrow(ArrowArray* out_array, ArrowSchema* out_schema) const {
         if (lance_batch_to_arrow(handle_.get(), out_array, out_schema) != 0)
             check_error();
     }
+
+    const LanceBatch* c_handle() const { return handle_.get(); }
 };
+
+// ─── Raw file ownership and snapshots ───────────────────────────────────────
+
+/// Move-only owner of an Arrow C Data Interface schema.
+class ArrowSchemaOwner {
+    ArrowSchema schema_{};
+    bool active_ = false;
+
+public:
+    ArrowSchemaOwner() noexcept = default;
+    explicit ArrowSchemaOwner(ArrowSchema schema) noexcept
+        : schema_(schema), active_(schema.release != nullptr) {}
+    ~ArrowSchemaOwner() { reset(); }
+
+    ArrowSchemaOwner(const ArrowSchemaOwner&) = delete;
+    ArrowSchemaOwner& operator=(const ArrowSchemaOwner&) = delete;
+
+    ArrowSchemaOwner(ArrowSchemaOwner&& other) noexcept
+        : schema_(other.schema_), active_(other.active_) {
+        other.schema_ = {};
+        other.active_ = false;
+    }
+
+    ArrowSchemaOwner& operator=(ArrowSchemaOwner&& other) noexcept {
+        if (this != &other) {
+            reset();
+            schema_ = other.schema_;
+            active_ = other.active_;
+            other.schema_ = {};
+            other.active_ = false;
+        }
+        return *this;
+    }
+
+    void reset() noexcept {
+        if (active_ && schema_.release) schema_.release(&schema_);
+        schema_ = {};
+        active_ = false;
+    }
+
+    ArrowSchema* get() noexcept { return &schema_; }
+    const ArrowSchema* get() const noexcept { return &schema_; }
+    explicit operator bool() const noexcept { return active_; }
+};
+
+enum class FileCacheMode : int32_t {
+    None = LANCE_FILE_CACHE_NONE,
+    Session = LANCE_FILE_CACHE_SESSION,
+};
+
+enum class FileFormatVersion : int32_t {
+    V1 = LANCE_FILE_FORMAT_V1,
+    V2_0 = LANCE_FILE_FORMAT_V2_0,
+    V2_1 = LANCE_FILE_FORMAT_V2_1,
+    V2_2 = LANCE_FILE_FORMAT_V2_2,
+    V2_3 = LANCE_FILE_FORMAT_V2_3,
+};
+
+enum class FileEncodingKind : int32_t {
+    Absent = LANCE_FILE_ENCODING_ABSENT,
+    None = LANCE_FILE_ENCODING_NONE,
+    Direct = LANCE_FILE_ENCODING_DIRECT,
+    Indirect = LANCE_FILE_ENCODING_INDIRECT,
+};
+
+struct FileSchedulerConfig {
+    uint64_t io_buffer_size_bytes = 0;
+    LanceSchedulerLiteMode use_lite_scheduler = LANCE_SCHEDULER_LITE_AUTO;
+};
+
+struct FileReaderOptions {
+    std::optional<std::vector<std::string>> columns;
+    FileCacheMode cache_mode = FileCacheMode::None;
+    std::optional<uint64_t> read_chunk_size;
+    std::optional<uint64_t> batch_size_bytes;
+    std::optional<bool> cache_repetition_index;
+    std::optional<bool> validate_on_decode;
+    std::optional<bool> inline_scheduling;
+};
+
+struct FileWriterOptions {
+    std::optional<uint64_t> data_cache_bytes;
+    std::optional<uint64_t> max_page_bytes;
+    std::optional<bool> keep_original_array;
+    std::optional<std::string> version;
+};
+
+struct FileWriteSummary {
+    uint64_t num_rows = 0;
+    uint64_t size_bytes = 0;
+};
+
+struct FileMetadataInfo {
+    FileFormatVersion format_version = FileFormatVersion::V1;
+    uint16_t major_version = 0;
+    uint16_t minor_version = 0;
+    uint64_t num_rows = 0;
+    uint64_t num_data_bytes = 0;
+    uint64_t num_column_metadata_bytes = 0;
+    uint64_t num_global_buffer_bytes = 0;
+    uint64_t num_footer_bytes = 0;
+    uint64_t file_size_bytes = 0;
+    std::size_t num_columns = 0;
+    std::size_t num_physical_columns = 0;
+    std::size_t num_global_buffers = 0;
+};
+
+struct FileBufferDescriptor {
+    uint64_t position = 0;
+    uint64_t size = 0;
+};
+
+struct FileEncodingDescriptor {
+    FileEncodingKind kind = FileEncodingKind::Absent;
+    uint64_t buffer_location = 0;
+    uint64_t buffer_length = 0;
+    std::vector<uint8_t> direct_bytes;
+};
+
+struct FilePageMetadata {
+    std::vector<FileBufferDescriptor> buffers;
+    uint64_t num_rows = 0;
+    uint64_t priority = 0;
+    FileEncodingDescriptor encoding;
+    std::string encoding_description;
+};
+
+struct FileColumnMetadata {
+    std::vector<FileBufferDescriptor> column_buffers;
+    std::vector<FilePageMetadata> pages;
+    FileEncodingDescriptor encoding;
+};
+
+struct FileColumnStatistics {
+    std::size_t num_pages = 0;
+    uint64_t size_bytes = 0;
+};
+
+struct FileStoreInfo {
+    uint64_t block_size = 0;
+    uint64_t max_iop_size = 0;
+    uint64_t io_parallelism = 0;
+    bool is_local = false;
+    bool is_cloud = false;
+    bool prefers_lite_scheduler = false;
+};
+
+namespace file_detail {
+
+inline std::string take_string(const char* value) {
+    if (!value) check_error();
+    std::string output(value);
+    lance_free_string(value);
+    return output;
+}
+
+inline FileBufferDescriptor buffer_descriptor(
+    const LanceBufferDescriptor& descriptor) {
+    return FileBufferDescriptor{descriptor.position, descriptor.size};
+}
+
+inline FileEncodingDescriptor encoding_descriptor(
+    const LanceEncodingDescriptor& descriptor) {
+    FileEncodingDescriptor output;
+    output.kind = static_cast<FileEncodingKind>(descriptor.kind);
+    output.buffer_location = descriptor.buffer_location;
+    output.buffer_length = descriptor.buffer_length;
+    if (descriptor.direct_bytes_len != 0) {
+        if (!descriptor.direct_bytes) check_error();
+        output.direct_bytes.assign(
+            descriptor.direct_bytes,
+            descriptor.direct_bytes + descriptor.direct_bytes_len);
+    }
+    return output;
+}
+
+inline LanceFileReaderOptions reader_options(
+    const FileReaderOptions& options,
+    std::vector<const char*>& columns) {
+    LanceFileReaderOptions raw{};
+    if (options.columns) {
+        columns.reserve(options.columns->size());
+        for (const auto& column : *options.columns) {
+            columns.push_back(column.c_str());
+        }
+        raw.has_columns = 1;
+        raw.columns = columns.data();
+        raw.column_count = columns.size();
+    }
+    raw.cache_mode = static_cast<int32_t>(options.cache_mode);
+    if (options.read_chunk_size) {
+        raw.has_read_chunk_size = 1;
+        raw.read_chunk_size = *options.read_chunk_size;
+    }
+    if (options.batch_size_bytes) {
+        raw.has_batch_size_bytes = 1;
+        raw.batch_size_bytes = *options.batch_size_bytes;
+    }
+    if (options.cache_repetition_index) {
+        raw.has_cache_repetition_index = 1;
+        raw.cache_repetition_index = *options.cache_repetition_index ? 1 : 0;
+    }
+    if (options.validate_on_decode) {
+        raw.has_validate_on_decode = 1;
+        raw.validate_on_decode = *options.validate_on_decode ? 1 : 0;
+    }
+    if (options.inline_scheduling) {
+        raw.has_inline_scheduling = 1;
+        raw.inline_scheduling = *options.inline_scheduling ? 1 : 0;
+    }
+    return raw;
+}
+
+inline LanceFileWriterOptions writer_options(
+    const FileWriterOptions& options) {
+    LanceFileWriterOptions raw{};
+    if (options.data_cache_bytes) {
+        raw.has_data_cache_bytes = 1;
+        raw.data_cache_bytes = *options.data_cache_bytes;
+    }
+    if (options.max_page_bytes) {
+        raw.has_max_page_bytes = 1;
+        raw.max_page_bytes = *options.max_page_bytes;
+    }
+    if (options.keep_original_array) {
+        raw.has_keep_original_array = 1;
+        raw.keep_original_array = *options.keep_original_array ? 1 : 0;
+    }
+    if (options.version) raw.version = options.version->c_str();
+    return raw;
+}
+
+}  // namespace file_detail
+
+class FileMetadata {
+    Handle<LanceFileMetadata, lance_file_metadata_close> handle_;
+
+public:
+    explicit FileMetadata(LanceFileMetadata* metadata) : handle_(metadata) {}
+
+    FileMetadataInfo info() const {
+        LanceFileMetadataInfo raw{};
+        if (lance_file_metadata_get_info(handle_.get(), &raw) != 0)
+            check_error();
+        return FileMetadataInfo{
+            static_cast<FileFormatVersion>(raw.format_version),
+            raw.major_version,
+            raw.minor_version,
+            raw.num_rows,
+            raw.num_data_bytes,
+            raw.num_column_metadata_bytes,
+            raw.num_global_buffer_bytes,
+            raw.num_footer_bytes,
+            raw.file_size_bytes,
+            raw.num_columns,
+            raw.num_physical_columns,
+            raw.num_global_buffers,
+        };
+    }
+
+    ArrowSchemaOwner schema() const {
+        ArrowSchema raw{};
+        if (lance_file_metadata_get_schema(handle_.get(), &raw) != 0)
+            check_error();
+        return ArrowSchemaOwner(raw);
+    }
+
+    std::vector<FileBufferDescriptor> global_buffers() const {
+        const LanceBufferDescriptor* descriptors = nullptr;
+        std::size_t count = 0;
+        if (lance_file_metadata_get_global_buffers(
+                handle_.get(), &descriptors, &count) != 0) {
+            check_error();
+        }
+        std::vector<FileBufferDescriptor> output;
+        output.reserve(count);
+        for (std::size_t index = 0; index < count; index++) {
+            output.push_back(
+                file_detail::buffer_descriptor(descriptors[index]));
+        }
+        return output;
+    }
+
+    std::vector<FileColumnMetadata> columns() const {
+        const LanceColumnMetadata* columns = nullptr;
+        std::size_t count = 0;
+        if (lance_file_metadata_get_columns(
+                handle_.get(), &columns, &count) != 0) {
+            check_error();
+        }
+        std::vector<FileColumnMetadata> output;
+        output.reserve(count);
+        for (std::size_t index = 0; index < count; index++) {
+            const auto& raw_column = columns[index];
+            FileColumnMetadata column;
+            column.column_buffers.reserve(raw_column.column_buffer_count);
+            for (std::size_t buffer = 0;
+                 buffer < raw_column.column_buffer_count;
+                 buffer++) {
+                column.column_buffers.push_back(
+                    file_detail::buffer_descriptor(
+                        raw_column.column_buffers[buffer]));
+            }
+            column.encoding =
+                file_detail::encoding_descriptor(raw_column.encoding);
+            column.pages.reserve(raw_column.page_count);
+            for (std::size_t page = 0; page < raw_column.page_count; page++) {
+                const auto& raw_page = raw_column.pages[page];
+                FilePageMetadata output_page;
+                output_page.num_rows = raw_page.num_rows;
+                output_page.priority = raw_page.priority;
+                output_page.encoding =
+                    file_detail::encoding_descriptor(raw_page.encoding);
+                if (raw_page.encoding_description) {
+                    output_page.encoding_description =
+                        raw_page.encoding_description;
+                }
+                output_page.buffers.reserve(raw_page.buffer_count);
+                for (std::size_t buffer = 0;
+                     buffer < raw_page.buffer_count;
+                     buffer++) {
+                    output_page.buffers.push_back(
+                        file_detail::buffer_descriptor(
+                            raw_page.buffers[buffer]));
+                }
+                column.pages.push_back(std::move(output_page));
+            }
+            output.push_back(std::move(column));
+        }
+        return output;
+    }
+};
+
+class FileStatistics {
+    Handle<LanceFileStatistics, lance_file_statistics_close> handle_;
+
+public:
+    explicit FileStatistics(LanceFileStatistics* statistics)
+        : handle_(statistics) {}
+
+    std::vector<FileColumnStatistics> columns() const {
+        const LanceColumnStatistics* columns = nullptr;
+        std::size_t count = 0;
+        if (lance_file_statistics_get_columns(
+                handle_.get(), &columns, &count) != 0) {
+            check_error();
+        }
+        std::vector<FileColumnStatistics> output;
+        output.reserve(count);
+        for (std::size_t index = 0; index < count; index++) {
+            output.push_back(
+                FileColumnStatistics{columns[index].num_pages,
+                                     columns[index].size_bytes});
+        }
+        return output;
+    }
+};
+
+class ByteBuffer {
+    Handle<LanceByteBuffer, lance_byte_buffer_close> handle_;
+
+public:
+    explicit ByteBuffer(LanceByteBuffer* buffer) : handle_(buffer) {}
+
+    std::vector<uint8_t> bytes() const {
+        std::size_t length = lance_byte_buffer_len(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (length == 0) return {};
+        const uint8_t* data = lance_byte_buffer_data(handle_.get());
+        if (!data) check_error();
+        return std::vector<uint8_t>(data, data + length);
+    }
+};
+
+class PathList {
+    Handle<LancePathList, lance_path_list_close> handle_;
+
+public:
+    explicit PathList(LancePathList* list) : handle_(list) {}
+
+    std::vector<std::string> paths() const {
+        uint64_t count = lance_path_list_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<std::string> output;
+        output.reserve(static_cast<std::size_t>(count));
+        for (uint64_t index = 0; index < count; index++) {
+            const char* path = lance_path_list_at(
+                handle_.get(), static_cast<std::size_t>(index));
+            if (!path) check_error();
+            output.emplace_back(path);
+        }
+        return output;
+    }
+};
+
+class DelimitedList {
+    Handle<LanceDelimitedList, lance_delimited_list_close> handle_;
+
+public:
+    explicit DelimitedList(LanceDelimitedList* list) : handle_(list) {}
+
+    std::vector<std::string> common_prefixes() const {
+        uint64_t count =
+            lance_delimited_list_common_prefix_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<std::string> output;
+        output.reserve(static_cast<std::size_t>(count));
+        for (uint64_t index = 0; index < count; index++) {
+            const char* path = lance_delimited_list_common_prefix_at(
+                handle_.get(), static_cast<std::size_t>(index));
+            if (!path) check_error();
+            output.emplace_back(path);
+        }
+        return output;
+    }
+
+    std::vector<std::string> objects() const {
+        uint64_t count = lance_delimited_list_object_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<std::string> output;
+        output.reserve(static_cast<std::size_t>(count));
+        for (uint64_t index = 0; index < count; index++) {
+            const char* path = lance_delimited_list_object_at(
+                handle_.get(), static_cast<std::size_t>(index));
+            if (!path) check_error();
+            output.emplace_back(path);
+        }
+        return output;
+    }
+};
+
+class FileReader;
+class FileWriter;
+
+class FileSession {
+    Handle<LanceFileSession, lance_file_session_close> handle_;
+
+public:
+    FileSession(
+        const std::string& base_uri,
+        const StorageOptionsAccessor* storage_options = nullptr,
+        const Session* session = nullptr,
+        std::optional<FileSchedulerConfig> scheduler_config = std::nullopt)
+        : handle_(nullptr) {
+        LanceSchedulerConfig raw_config{};
+        const LanceSchedulerConfig* config_ptr = nullptr;
+        if (scheduler_config) {
+            raw_config.io_buffer_size_bytes =
+                scheduler_config->io_buffer_size_bytes;
+            raw_config.use_lite_scheduler =
+                static_cast<int32_t>(scheduler_config->use_lite_scheduler);
+            config_ptr = &raw_config;
+        }
+        auto* raw = lance_file_session_new(
+            base_uri.c_str(),
+            storage_options ? storage_options->c_handle() : nullptr,
+            session ? session->c_handle() : nullptr,
+            config_ptr);
+        if (!raw) check_error();
+        handle_ = Handle<LanceFileSession, lance_file_session_close>(raw);
+    }
+
+    FileSession(FileSession&&) noexcept = default;
+    FileSession& operator=(FileSession&&) noexcept = default;
+    FileSession(const FileSession&) = delete;
+    FileSession& operator=(const FileSession&) = delete;
+
+    void reset() noexcept {
+        handle_ = Handle<LanceFileSession, lance_file_session_close>();
+    }
+    explicit operator bool() const noexcept { return bool(handle_); }
+
+    std::string base_path() const {
+        return file_detail::take_string(
+            lance_file_session_base_path(handle_.get()));
+    }
+
+    FileReader open_reader(
+        const std::string& relative_path,
+        const FileReaderOptions& options = {}) const;
+    FileWriter open_writer(
+        const std::string& relative_path,
+        const ArrowSchema* schema,
+        const FileWriterOptions& options = {}) const;
+
+    bool contains(const std::string& relative_path) const {
+        int32_t exists = 0;
+        if (lance_file_session_contains(
+                handle_.get(), relative_path.c_str(), &exists) != 0) {
+            check_error();
+        }
+        return exists != 0;
+    }
+
+    PathList list(std::optional<std::string> relative_path = std::nullopt) const {
+        auto* raw = lance_file_session_list(
+            handle_.get(),
+            relative_path ? relative_path->c_str() : nullptr);
+        if (!raw) check_error();
+        return PathList(raw);
+    }
+
+    DelimitedList list_with_delimiter(
+        std::optional<std::string> relative_path = std::nullopt) const {
+        auto* raw = lance_file_session_list_with_delimiter(
+            handle_.get(),
+            relative_path ? relative_path->c_str() : nullptr);
+        if (!raw) check_error();
+        return DelimitedList(raw);
+    }
+
+    ByteBuffer read_range(
+        const std::string& relative_path,
+        uint64_t offset,
+        uint64_t length) const {
+        auto* raw = lance_file_session_read_range(
+            handle_.get(), relative_path.c_str(), offset, length);
+        if (!raw) check_error();
+        return ByteBuffer(raw);
+    }
+
+    void delete_file(const std::string& relative_path) const {
+        if (lance_file_session_delete_file(
+                handle_.get(), relative_path.c_str()) != 0) {
+            check_error();
+        }
+    }
+
+    void upload_file(
+        const std::string& local_path,
+        const std::string& relative_remote_path) const {
+        if (lance_file_session_upload_file(
+                handle_.get(),
+                local_path.c_str(),
+                relative_remote_path.c_str()) != 0) {
+            check_error();
+        }
+    }
+
+    void download_file(
+        const std::string& relative_remote_path,
+        const std::string& local_path) const {
+        if (lance_file_session_download_file(
+                handle_.get(),
+                relative_remote_path.c_str(),
+                local_path.c_str()) != 0) {
+            check_error();
+        }
+    }
+
+    LanceScanStats scheduler_stats() const {
+        LanceScanStats stats{};
+        if (lance_file_session_get_scheduler_stats(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+
+    LanceObjectStoreRegistryStats registry_stats() const {
+        LanceObjectStoreRegistryStats stats{};
+        if (lance_file_session_get_registry_stats(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+
+    FileStoreInfo store_info() const {
+        LanceObjectStoreInfo info{};
+        if (lance_file_session_get_store_info(handle_.get(), &info) != 0)
+            check_error();
+        return FileStoreInfo{
+            info.block_size,
+            info.max_iop_size,
+            info.io_parallelism,
+            info.is_local != 0,
+            info.is_cloud != 0,
+            info.prefers_lite_scheduler != 0,
+        };
+    }
+
+    LanceObjectStoreIoStats store_io_stats() const {
+        LanceObjectStoreIoStats stats{};
+        if (lance_file_session_get_store_io_stats(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+};
+
+class FileReader {
+    Handle<LanceFileReader, lance_file_reader_close> handle_;
+
+public:
+    explicit FileReader(LanceFileReader* reader) : handle_(reader) {}
+    FileReader(FileReader&&) noexcept = default;
+    FileReader& operator=(FileReader&&) noexcept = default;
+    FileReader(const FileReader&) = delete;
+    FileReader& operator=(const FileReader&) = delete;
+
+    void reset() noexcept {
+        handle_ = Handle<LanceFileReader, lance_file_reader_close>();
+    }
+    explicit operator bool() const noexcept { return bool(handle_); }
+
+    uint64_t num_rows() const {
+        uint64_t rows = 0;
+        if (lance_file_reader_num_rows(handle_.get(), &rows) != 0)
+            check_error();
+        return rows;
+    }
+
+    FileMetadata metadata() const {
+        LanceFileMetadata* metadata = nullptr;
+        if (lance_file_reader_get_metadata(handle_.get(), &metadata) != 0)
+            check_error();
+        return FileMetadata(metadata);
+    }
+
+    FileStatistics statistics() const {
+        LanceFileStatistics* statistics = nullptr;
+        if (lance_file_reader_get_statistics(handle_.get(), &statistics) != 0)
+            check_error();
+        return FileStatistics(statistics);
+    }
+
+    ByteBuffer read_global_buffer(uint32_t index) const {
+        LanceByteBuffer* buffer = nullptr;
+        if (lance_file_reader_read_global_buffer(
+                handle_.get(), index, &buffer) != 0) {
+            check_error();
+        }
+        return ByteBuffer(buffer);
+    }
+
+    ArrowStream read_all(
+        uint32_t batch_size = 1024,
+        uint32_t batch_readahead = 4) const {
+        ArrowArrayStream stream{};
+        if (lance_file_reader_read_all(
+                handle_.get(), batch_size, batch_readahead, &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    ArrowStream read_range(
+        uint64_t offset,
+        uint64_t num_rows,
+        uint32_t batch_size = 1024,
+        uint32_t batch_readahead = 4) const {
+        ArrowArrayStream stream{};
+        if (lance_file_reader_read_range(
+                handle_.get(),
+                offset,
+                num_rows,
+                batch_size,
+                batch_readahead,
+                &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    ArrowStream read_indices(
+        const std::vector<uint32_t>& indices,
+        uint32_t batch_size = 1024,
+        uint32_t batch_readahead = 4) const {
+        ArrowArrayStream stream{};
+        if (lance_file_reader_read_indices(
+                handle_.get(),
+                indices.empty() ? nullptr : indices.data(),
+                indices.size(),
+                batch_size,
+                batch_readahead,
+                &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    LanceScanStats io_stats() const {
+        LanceScanStats stats{};
+        if (lance_file_reader_get_io_stats(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+};
+
+class FileWriter {
+    Handle<LanceFileWriter, lance_file_writer_close> handle_;
+
+public:
+    explicit FileWriter(LanceFileWriter* writer) : handle_(writer) {}
+    FileWriter(FileWriter&&) noexcept = default;
+    FileWriter& operator=(FileWriter&&) noexcept = default;
+    FileWriter(const FileWriter&) = delete;
+    FileWriter& operator=(const FileWriter&) = delete;
+
+    void reset() noexcept {
+        handle_ = Handle<LanceFileWriter, lance_file_writer_close>();
+    }
+    explicit operator bool() const noexcept { return bool(handle_); }
+
+    void write_batch(const Batch& batch) {
+        if (lance_file_writer_write_batch(handle_.get(), batch.c_handle()) != 0)
+            check_error();
+    }
+
+    void add_schema_metadata(
+        const std::string& key,
+        const std::string& value) {
+        if (lance_file_writer_add_schema_metadata(
+                handle_.get(), key.c_str(), value.c_str()) != 0) {
+            check_error();
+        }
+    }
+
+    uint32_t add_global_buffer(const std::vector<uint8_t>& bytes) {
+        uint32_t index = 0;
+        if (lance_file_writer_add_global_buffer(
+                handle_.get(),
+                bytes.empty() ? nullptr : bytes.data(),
+                bytes.size(),
+                &index) != 0) {
+            check_error();
+        }
+        return index;
+    }
+
+    FileWriteSummary finish() {
+        LanceFileWriteSummary summary{};
+        if (lance_file_writer_finish(handle_.get(), &summary) != 0)
+            check_error();
+        return FileWriteSummary{summary.num_rows, summary.size_bytes};
+    }
+
+    void abort() {
+        if (lance_file_writer_abort(handle_.get()) != 0) check_error();
+    }
+};
+
+inline FileReader FileSession::open_reader(
+    const std::string& relative_path,
+    const FileReaderOptions& options) const {
+    std::vector<const char*> columns;
+    auto raw_options = file_detail::reader_options(options, columns);
+    auto* raw = lance_file_session_open_reader(
+        handle_.get(), relative_path.c_str(), &raw_options);
+    if (!raw) check_error();
+    return FileReader(raw);
+}
+
+inline FileWriter FileSession::open_writer(
+    const std::string& relative_path,
+    const ArrowSchema* schema,
+    const FileWriterOptions& options) const {
+    auto raw_options = file_detail::writer_options(options);
+    auto* raw = lance_file_session_open_writer(
+        handle_.get(), relative_path.c_str(), schema, &raw_options);
+    if (!raw) check_error();
+    return FileWriter(raw);
+}
 
 } // namespace lance
 

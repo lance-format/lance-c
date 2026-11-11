@@ -861,6 +861,34 @@ fn test_native_transaction_compilation_and_execution() {
     run_test_binary_with_two_args(&cpp_binary, &dataset_uri, base);
 }
 
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_raw_file_native_compilation_and_execution"]
+fn test_raw_file_native_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let base = tempfile::tempdir().unwrap();
+    let base_path = base.path().to_str().unwrap();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_file_api.c");
+    let c_binary = build_dir.path().join("test_file_api_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C raw-file test compilation failed"
+    );
+    run_test_binary_with_dataset(&c_binary, base_path);
+
+    let cpp_source = tests_dir.join("test_file_api.cpp");
+    let cpp_binary = build_dir.path().join("test_file_api_cpp");
+    assert!(
+        compile_cpp_test(&cpp_source, &cpp_binary, &include_dir, &lib_path),
+        "C++ raw-file test compilation failed"
+    );
+    run_test_binary_with_dataset(&cpp_binary, base_path);
+}
+
 /// A fresh C executable must initialize OpenDAL even when archive constructors are omitted.
 #[cfg(target_os = "linux")]
 #[test]
