@@ -6768,7 +6768,7 @@ fn scrub_fragment_paths(value: &mut serde_json::Value) {
             }
         }
         serde_json::Value::Object(values) => {
-            for (key, value) in values {
+            for (key, value) in values.iter_mut() {
                 if key == "path" {
                     *value = serde_json::Value::String("<generated>".to_string());
                 } else {
