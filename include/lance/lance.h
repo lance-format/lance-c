@@ -6934,6 +6934,13 @@ void lance_fragment_array_free(LanceFragment** fragments, size_t count);
  * native `None`; a pointer to zero maps to `Some(0)`, which the current native
  * format may ignore. Values that do not fit the native `usize` are rejected.
  *
+ * Native validates the file schema against the dataset snapshot, so a file
+ * whose stored schema is a physical representation that the native version
+ * cannot project to the dataset schema is rejected. Blob v2 data files are
+ * one such case: they store descriptor columns where the dataset schema has
+ * `blob.uri` and `blob.data`, and both the native and the C entry points
+ * report the same schema-mismatch error for them.
+ *
  * The dataset handle supplies the target snapshot and is not modified. The
  * output owns complete detached metadata and remains valid after the dataset
  * is closed; it is written only on success. Closing the handle never deletes

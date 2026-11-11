@@ -2638,7 +2638,9 @@ public:
     /// to the dataset's data directory. `physical_rows == std::nullopt` maps to
     /// native `None`; an engaged value maps to `Some(value)`. Native owns file
     /// version, schema compatibility and physical-row validation. The dataset
-    /// supplies the target snapshot and is not modified.
+    /// supplies the target snapshot and is not modified. A file whose stored
+    /// schema native cannot project to the dataset schema is rejected, as with
+    /// Blob v2 data files.
     static Fragment create_from_file(
         const Dataset& dataset,
         const std::string& filename,
