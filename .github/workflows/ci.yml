@@ -68,8 +68,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
-          # Keep the runner's Ubuntu HTTPS mirrors when Azure DNS is unavailable.
-          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          # Use an independent mirror while Ubuntu archive DNS is unavailable.
+          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Clippy
@@ -92,8 +92,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
-          # Keep the runner's Ubuntu HTTPS mirrors when Azure DNS is unavailable.
-          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          # Use an independent mirror while Ubuntu archive DNS is unavailable.
+          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler lld
       - name: Build library artifacts
@@ -142,8 +142,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
-          # Keep the runner's Ubuntu HTTPS mirrors when Azure DNS is unavailable.
-          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          # Use an independent mirror while Ubuntu archive DNS is unavailable.
+          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Check documentation
@@ -161,8 +161,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
-          # Keep the runner's Ubuntu HTTPS mirrors when Azure DNS is unavailable.
-          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          # Use an independent mirror while Ubuntu archive DNS is unavailable.
+          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Check MSRV
