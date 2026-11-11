@@ -744,7 +744,7 @@ static void test_native_operations(const std::string& source_uri,
         auto operation = staged.operation();
         for (size_t i = 0; i < operation.append_fragment_count(); ++i) {
             reserved_fragments.push_back(operation.append_fragment_at(i));
-            CHECK(reserved_fragments.back().id() > seed_max_id + 2);
+            CHECK(!reserved_fragments.back().metadata_json().empty());
         }
     }
     std::vector<const lance::Fragment*> reserved_pointers;
@@ -757,6 +757,11 @@ static void test_native_operations(const std::string& source_uri,
         uri, lance::Transaction::from_operation(reserved_read_version,
                                                 reserved_append));
     CHECK(reserved_commit.version() == 6);
+    CHECK(reserved_commit.fragment_count() ==
+          seed_fragments + reserved_fragments.size());
+    const auto reserved_ids = reserved_commit.fragment_ids();
+    CHECK(*std::max_element(reserved_ids.begin(), reserved_ids.end()) ==
+          seed_max_id + 2 + reserved_fragments.size());
 
     const std::string base_a = uri + "_cpp_base_a";
     const std::string base_b = uri + "_cpp_base_b";

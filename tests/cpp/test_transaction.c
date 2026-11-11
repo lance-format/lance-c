@@ -1273,9 +1273,6 @@ static void test_native_operation_construction(const char *src_uri,
                                                   &reserved_handles[i]) == 0,
                "reserved append fragment");
         CHECK_OK();
-        ASSERT(lance_fragment_id(reserved_handles[i]) > max_before + 2,
-               "reserve advances native fragment id allocation");
-        CHECK_OK();
     }
     LanceOperation *reserved_typed = lance_operation_append_new(
         (const LanceFragment *const *)reserved_handles, reserved_fragments);
@@ -1295,6 +1292,21 @@ static void test_native_operation_construction(const char *src_uri,
     CHECK_OK();
     lance_transaction_close(reserved_transaction);
     lance_operation_close(reserved_typed);
+    ASSERT(lance_dataset_fragment_count(dataset) ==
+               seed_fragments + reserved_fragments,
+           "reserved append fragment count");
+    CHECK_OK();
+    uint64_t reserved_ids[64] = {0};
+    ASSERT(lance_dataset_fragment_ids(dataset, reserved_ids) == 0,
+           "reserved append fragment ids");
+    CHECK_OK();
+    uint64_t max_after = 0;
+    for (uint64_t i = 0; i < seed_fragments + reserved_fragments; i++) {
+        if (reserved_ids[i] > max_after) max_after = reserved_ids[i];
+    }
+    ASSERT(max_after == max_before + 2 + reserved_fragments,
+           "reserve advances native fragment id allocation");
+    CHECK_OK();
     lance_dataset_close(dataset);
 
     char base_a[4096];
