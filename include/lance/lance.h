@@ -4263,6 +4263,25 @@ int32_t lance_batch_to_arrow(
     struct ArrowSchema* out_schema
 );
 
+/**
+ * Import one Arrow record batch.
+ *
+ * A non-NULL `array` is consumed on every return, including validation and
+ * conversion failures. The source slot is left in its canonical released
+ * state. `schema` is borrowed and is never released or modified. `out` is
+ * written only on success and is unchanged on failure.
+ *
+ * The complete schema is retained, including schema metadata, field metadata,
+ * and extension metadata. A zero-column batch retains its row count.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_batch_from_arrow(
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    LanceBatch** out
+);
+
 /** Free a batch handle. */
 void lance_batch_free(LanceBatch* batch);
 
@@ -6214,6 +6233,551 @@ int32_t lance_transaction_commit_batch(
     LanceDataset** out_dataset,
     LanceTransaction** out_merged_transaction
 );
+
+/* ─── Storage options ─────────────────────────────────────────────────────── */
+
+typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
+typedef struct LanceStorageOptionsProvider LanceStorageOptionsProvider;
+typedef struct LanceStorageOptionsSnapshot LanceStorageOptionsSnapshot;
+
+/**
+ * Borrowed static storage options.
+ *
+ * A NULL `LanceStorageOptionsInput*` passed to accessor construction means
+ * native None. A non-NULL input, including one with `count == 0`, means native
+ * Some, so an empty map is distinct from no options. Duplicate keys follow the
+ * native map's last-write-wins behavior.
+ */
+typedef struct LanceStorageOptionsInput {
+    const char* const* keys;
+    const char* const* values;
+    size_t count;
+} LanceStorageOptionsInput;
+
+/**
+ * Result of one provider fetch.
+ *
+ * `has_options == 0` means native None. Any nonzero value means native Some;
+ * `count == 0` then means Some(empty). Key and value arrays must contain
+ * exactly `count` entries.
+ *
+ * The library copies the complete map and the callback error message before
+ * calling `release_snapshot`. `release_snapshot`, when non-NULL, is called
+ * exactly once on every path after the result struct was initialized,
+ * including malformed partial results and callback errors. Without a release
+ * callback the map storage is borrowed for the callback only.
+ */
+typedef struct LanceStorageOptionsFetchResult {
+    int32_t has_options;
+    const char* const* keys;
+    const char* const* values;
+    size_t count;
+    void* snapshot_ctx;
+    void (*release_snapshot)(void* snapshot_ctx);
+} LanceStorageOptionsFetchResult;
+
+/**
+ * Fetch storage options.
+ *
+ * Return 0 on success. Return nonzero on failure and initialize `error` with a
+ * typed LanceCallbackError. A callback must not report failure through
+ * lance_last_error_* because it may run on a native worker thread.
+ */
+typedef int32_t (*LanceStorageOptionsFetchFn)(
+    void* provider_ctx,
+    LanceStorageOptionsFetchResult* out,
+    LanceCallbackError* error
+);
+
+/** Release the provider context exactly once. */
+typedef void (*LanceStorageOptionsProviderReleaseFn)(void* provider_ctx);
+
+/**
+ * Foreign storage-options provider declaration.
+ *
+ * `fetch` is required. `force_fetch` is optional; omission follows the native
+ * trait default and calls `fetch`. `provider_id` is copied and must be
+ * non-empty. It preserves native equality and object-store registry cache
+ * identity, so equal IDs may share a native store.
+ *
+ * Ownership of `provider_ctx` and `release` transfers only when
+ * lance_storage_options_provider_new succeeds. The library retains the context
+ * through every native Arc owner, including accessor and registry cache keys,
+ * and calls `release(provider_ctx)` exactly once when the final owner drops.
+ */
+typedef struct LanceStorageOptionsProviderSpec {
+    LanceStorageOptionsFetchFn fetch;
+    LanceStorageOptionsFetchFn force_fetch;
+    LanceStorageOptionsProviderReleaseFn release;
+    void* provider_ctx;
+    const char* provider_id;
+} LanceStorageOptionsProviderSpec;
+
+LanceStorageOptionsProvider* lance_storage_options_provider_new(
+    const LanceStorageOptionsProviderSpec* spec
+);
+void lance_storage_options_provider_close(LanceStorageOptionsProvider* provider);
+
+LanceStorageOptionsAccessor* lance_storage_options_accessor_new(
+    const LanceStorageOptionsInput* initial,
+    const LanceStorageOptionsProvider* provider
+);
+void lance_storage_options_accessor_close(LanceStorageOptionsAccessor* accessor);
+
+/**
+ * Resolve and copy the accessor's current options.
+ *
+ * Native StorageOptionsAccessor owns caching and expiration policy. The
+ * binding keeps no second refresh cache. A NULL accessor or provider error
+ * returns NULL and sets the thread-local error.
+ */
+LanceStorageOptionsSnapshot* lance_storage_options_accessor_snapshot(
+    const LanceStorageOptionsAccessor* accessor
+);
+
+/** 1 = Some, 0 = None, -1 = invalid handle with thread-local error. */
+int32_t lance_storage_options_snapshot_has_options(
+    const LanceStorageOptionsSnapshot* snapshot
+);
+uint64_t lance_storage_options_snapshot_count(
+    const LanceStorageOptionsSnapshot* snapshot
+);
+const char* lance_storage_options_snapshot_key_at(
+    const LanceStorageOptionsSnapshot* snapshot,
+    size_t index
+);
+const char* lance_storage_options_snapshot_value_at(
+    const LanceStorageOptionsSnapshot* snapshot,
+    size_t index
+);
+void lance_storage_options_snapshot_close(
+    LanceStorageOptionsSnapshot* snapshot
+);
+
+/* ─── Raw Lance-file session ──────────────────────────────────────────────── */
+
+typedef struct LanceFileSession LanceFileSession;
+typedef struct LanceFileReader LanceFileReader;
+typedef struct LanceFileWriter LanceFileWriter;
+typedef struct LanceFileMetadata LanceFileMetadata;
+typedef struct LanceFileStatistics LanceFileStatistics;
+typedef struct LancePathList LancePathList;
+typedef struct LanceDelimitedList LanceDelimitedList;
+typedef struct LanceByteBuffer LanceByteBuffer;
+
+typedef enum {
+    LANCE_FILE_CACHE_NONE = 0,
+    LANCE_FILE_CACHE_SESSION = 1
+} LanceFileCacheMode;
+
+/**
+ * Reader options.
+ *
+ * `has_columns` nonzero forwards exactly `column_count` names; count zero is
+ * an explicit empty projection and is rejected by native validation. A NULL
+ * options pointer uses native defaults and no projection.
+ *
+ * SESSION cache requires a shared LanceSession. NONE uses native
+ * LanceCache::no_cache and is the safe default. Native cache keys include the
+ * file path prefix but not the file version, etag, or content hash. Files read
+ * with a shared cache must remain immutable for the cache lifetime.
+ *
+ * `has_*` fields distinguish None from explicit zero/false. Boolean payloads
+ * must be 0 or 1 when set.
+ */
+typedef struct LanceFileReaderOptions {
+    int32_t has_columns;
+    const char* const* columns;
+    size_t column_count;
+    int32_t cache_mode;
+    int32_t has_read_chunk_size;
+    uint64_t read_chunk_size;
+    int32_t has_batch_size_bytes;
+    uint64_t batch_size_bytes;
+    int32_t has_cache_repetition_index;
+    int32_t cache_repetition_index;
+    int32_t has_validate_on_decode;
+    int32_t validate_on_decode;
+    int32_t has_inline_scheduling;
+    int32_t inline_scheduling;
+} LanceFileReaderOptions;
+
+/**
+ * Writer options. `has_*` fields distinguish None from explicit zero/false.
+ * `version == NULL` uses the native default; otherwise native parsing and
+ * unsupported-version errors are preserved.
+ */
+typedef struct LanceFileWriterOptions {
+    int32_t has_data_cache_bytes;
+    uint64_t data_cache_bytes;
+    int32_t has_max_page_bytes;
+    uint64_t max_page_bytes;
+    int32_t has_keep_original_array;
+    int32_t keep_original_array;
+    const char* version;
+} LanceFileWriterOptions;
+
+typedef struct LanceFileWriteSummary {
+    uint64_t num_rows;
+    uint64_t size_bytes;
+} LanceFileWriteSummary;
+
+typedef enum {
+    LANCE_SCHEDULER_LITE_AUTO = 0,
+    LANCE_SCHEDULER_LITE_STANDARD = 1,
+    LANCE_SCHEDULER_LITE_LITE = 2
+} LanceSchedulerLiteMode;
+
+/**
+ * Native scheduler configuration.
+ *
+ * `use_lite_scheduler` is a LanceSchedulerLiteMode. AUTO delegates to
+ * SchedulerConfig::new and its environment policy, STANDARD maps to
+ * Some(false), and LITE maps to Some(true).
+ */
+typedef struct LanceSchedulerConfig {
+    uint64_t io_buffer_size_bytes;
+    int32_t use_lite_scheduler;
+} LanceSchedulerConfig;
+
+typedef struct LanceScanStats {
+    uint64_t iops;
+    uint64_t requests;
+    uint64_t bytes_read;
+} LanceScanStats;
+
+typedef struct LanceObjectStoreRegistryStats {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t active_stores;
+} LanceObjectStoreRegistryStats;
+
+typedef struct LanceObjectStoreIoStats {
+    uint64_t read_iops;
+    uint64_t read_bytes;
+    uint64_t write_iops;
+    uint64_t written_bytes;
+} LanceObjectStoreIoStats;
+
+typedef struct LanceObjectStoreInfo {
+    uint64_t block_size;
+    uint64_t max_iop_size;
+    uint64_t io_parallelism;
+    int32_t is_local;
+    int32_t is_cloud;
+    int32_t prefers_lite_scheduler;
+} LanceObjectStoreInfo;
+
+/**
+ * Create a raw-file session over `base_uri`.
+ *
+ * `storage_options` may be NULL. `session` may be NULL; otherwise the session's
+ * existing object-store registry is shared. `scheduler_config` may be NULL,
+ * which uses native SchedulerConfig::max_bandwidth for the resolved store.
+ */
+LanceFileSession* lance_file_session_new(
+    const char* base_uri,
+    const LanceStorageOptionsAccessor* storage_options,
+    const LanceSession* session,
+    const LanceSchedulerConfig* scheduler_config
+);
+void lance_file_session_close(LanceFileSession* session);
+
+/** Release the returned string with lance_free_string(). */
+const char* lance_file_session_base_path(const LanceFileSession* session);
+
+LanceFileReader* lance_file_session_open_reader(
+    const LanceFileSession* session,
+    const char* relative_path,
+    const LanceFileReaderOptions* options
+);
+LanceFileWriter* lance_file_session_open_writer(
+    const LanceFileSession* session,
+    const char* relative_path,
+    const struct ArrowSchema* schema,
+    const LanceFileWriterOptions* options
+);
+
+int32_t lance_file_session_contains(
+    const LanceFileSession* session,
+    const char* relative_path,
+    int32_t* out_exists
+);
+LancePathList* lance_file_session_list(
+    const LanceFileSession* session,
+    const char* relative_path
+);
+LanceDelimitedList* lance_file_session_list_with_delimiter(
+    const LanceFileSession* session,
+    const char* relative_path
+);
+LanceByteBuffer* lance_file_session_read_range(
+    const LanceFileSession* session,
+    const char* relative_path,
+    uint64_t offset,
+    uint64_t length
+);
+int32_t lance_file_session_delete_file(
+    const LanceFileSession* session,
+    const char* relative_path
+);
+int32_t lance_file_session_upload_file(
+    const LanceFileSession* session,
+    const char* local_path,
+    const char* relative_remote_path
+);
+int32_t lance_file_session_download_file(
+    const LanceFileSession* session,
+    const char* relative_remote_path,
+    const char* local_path
+);
+int32_t lance_file_session_get_scheduler_stats(
+    const LanceFileSession* session,
+    LanceScanStats* out_stats
+);
+int32_t lance_file_session_get_registry_stats(
+    const LanceFileSession* session,
+    LanceObjectStoreRegistryStats* out_stats
+);
+int32_t lance_file_session_get_store_info(
+    const LanceFileSession* session,
+    LanceObjectStoreInfo* out_info
+);
+int32_t lance_file_session_get_store_io_stats(
+    const LanceFileSession* session,
+    LanceObjectStoreIoStats* out_stats
+);
+
+/* ─── Raw Lance-file reader ───────────────────────────────────────────────── */
+
+LanceFileReader* lance_file_reader_open(
+    const char* uri_or_path,
+    const LanceStorageOptionsAccessor* storage_options,
+    const LanceFileReaderOptions* options,
+    const LanceSession* session,
+    const LanceSchedulerConfig* scheduler_config
+);
+
+int32_t lance_file_reader_num_rows(
+    const LanceFileReader* reader,
+    uint64_t* out_rows
+);
+int32_t lance_file_reader_get_metadata(
+    const LanceFileReader* reader,
+    LanceFileMetadata** out_metadata
+);
+int32_t lance_file_reader_get_statistics(
+    const LanceFileReader* reader,
+    LanceFileStatistics** out_statistics
+);
+int32_t lance_file_reader_read_global_buffer(
+    const LanceFileReader* reader,
+    uint32_t index,
+    LanceByteBuffer** out_bytes
+);
+int32_t lance_file_reader_read_all(
+    const LanceFileReader* reader,
+    uint32_t batch_size,
+    uint32_t batch_readahead,
+    struct ArrowArrayStream* out
+);
+int32_t lance_file_reader_read_range(
+    const LanceFileReader* reader,
+    uint64_t offset,
+    uint64_t num_rows,
+    uint32_t batch_size,
+    uint32_t batch_readahead,
+    struct ArrowArrayStream* out
+);
+int32_t lance_file_reader_read_indices(
+    const LanceFileReader* reader,
+    const uint32_t* indices,
+    size_t count,
+    uint32_t batch_size,
+    uint32_t batch_readahead,
+    struct ArrowArrayStream* out
+);
+int32_t lance_file_reader_get_io_stats(
+    const LanceFileReader* reader,
+    LanceScanStats* out_stats
+);
+void lance_file_reader_close(LanceFileReader* reader);
+
+/* ─── Raw Lance-file metadata snapshots ──────────────────────────────────── */
+
+typedef enum {
+    LANCE_FILE_FORMAT_V1 = 0,
+    LANCE_FILE_FORMAT_V2_0 = 1,
+    LANCE_FILE_FORMAT_V2_1 = 2,
+    LANCE_FILE_FORMAT_V2_2 = 3,
+    LANCE_FILE_FORMAT_V2_3 = 4
+} LanceFileFormatVersion;
+
+typedef struct LanceFileMetadataInfo {
+    int32_t format_version;
+    uint16_t major_version;
+    uint16_t minor_version;
+    uint64_t num_rows;
+    uint64_t num_data_bytes;
+    uint64_t num_column_metadata_bytes;
+    uint64_t num_global_buffer_bytes;
+    uint64_t num_footer_bytes;
+    uint64_t file_size_bytes;
+    size_t num_columns;
+    size_t num_physical_columns;
+    size_t num_global_buffers;
+} LanceFileMetadataInfo;
+
+typedef struct LanceBufferDescriptor {
+    uint64_t position;
+    uint64_t size;
+} LanceBufferDescriptor;
+
+typedef enum {
+    LANCE_FILE_ENCODING_ABSENT = 0,
+    LANCE_FILE_ENCODING_NONE = 1,
+    LANCE_FILE_ENCODING_DIRECT = 2,
+    LANCE_FILE_ENCODING_INDIRECT = 3
+} LanceFileEncodingKind;
+
+typedef struct LanceEncodingDescriptor {
+    int32_t kind;
+    uint64_t buffer_location;
+    uint64_t buffer_length;
+    const uint8_t* direct_bytes;
+    size_t direct_bytes_len;
+} LanceEncodingDescriptor;
+
+typedef struct LancePageMetadata {
+    const LanceBufferDescriptor* buffers;
+    size_t buffer_count;
+    uint64_t num_rows;
+    uint64_t priority;
+    LanceEncodingDescriptor encoding;
+    const char* encoding_description;
+} LancePageMetadata;
+
+typedef struct LanceColumnMetadata {
+    const LanceBufferDescriptor* column_buffers;
+    size_t column_buffer_count;
+    const LancePageMetadata* pages;
+    size_t page_count;
+    LanceEncodingDescriptor encoding;
+} LanceColumnMetadata;
+
+int32_t lance_file_metadata_get_info(
+    const LanceFileMetadata* metadata,
+    LanceFileMetadataInfo* out_info
+);
+int32_t lance_file_metadata_get_schema(
+    const LanceFileMetadata* metadata,
+    struct ArrowSchema* out_schema
+);
+int32_t lance_file_metadata_get_global_buffers(
+    const LanceFileMetadata* metadata,
+    const LanceBufferDescriptor** out_buffers,
+    size_t* out_count
+);
+int32_t lance_file_metadata_get_columns(
+    const LanceFileMetadata* metadata,
+    const LanceColumnMetadata** out_columns,
+    size_t* out_count
+);
+void lance_file_metadata_close(LanceFileMetadata* metadata);
+
+typedef struct LanceColumnStatistics {
+    size_t num_pages;
+    uint64_t size_bytes;
+} LanceColumnStatistics;
+
+int32_t lance_file_statistics_get_columns(
+    const LanceFileStatistics* statistics,
+    const LanceColumnStatistics** out_columns,
+    size_t* out_count
+);
+void lance_file_statistics_close(LanceFileStatistics* statistics);
+
+/* ─── Raw Lance-file writer ───────────────────────────────────────────────── */
+
+LanceFileWriter* lance_file_writer_open(
+    const char* uri_or_path,
+    const struct ArrowSchema* schema,
+    const LanceFileWriterOptions* options,
+    const LanceStorageOptionsAccessor* storage_options,
+    const LanceSession* session
+);
+
+/** Write one borrowed LanceBatch. The writer may clone its Arrow arrays. */
+int32_t lance_file_writer_write_batch(
+    LanceFileWriter* writer,
+    const LanceBatch* batch
+);
+int32_t lance_file_writer_add_schema_metadata(
+    LanceFileWriter* writer,
+    const char* key,
+    const char* value
+);
+int32_t lance_file_writer_add_global_buffer(
+    LanceFileWriter* writer,
+    const uint8_t* data,
+    size_t len,
+    uint32_t* out_index
+);
+
+/**
+ * Finish the file.
+ *
+ * Native mutable state and errors are forwarded directly. Repeated finish,
+ * writes after finish or abort, and failures retain the selected core's
+ * behavior; this binding does not add terminal-state rejection.
+ */
+int32_t lance_file_writer_finish(
+    LanceFileWriter* writer,
+    LanceFileWriteSummary* out_summary
+);
+
+/**
+ * Call native FileWriter::abort.
+ *
+ * Native v2.x abort bodies are currently empty. Allocation close drops the
+ * native writer, which owns remaining object-writer cleanup. This call does not
+ * implicitly destroy the allocation, and repeated calls are forwarded.
+ */
+int32_t lance_file_writer_abort(LanceFileWriter* writer);
+
+/**
+ * Destroy the writer allocation.
+ *
+ * Native drop performs object-writer cleanup. This is not a successful
+ * finalization and does not replace an explicit fallible finish.
+ */
+void lance_file_writer_close(LanceFileWriter* writer);
+
+/* ─── Owned raw-file path and byte snapshots ──────────────────────────────── */
+
+uint64_t lance_path_list_count(const LancePathList* list);
+const char* lance_path_list_at(const LancePathList* list, size_t index);
+void lance_path_list_close(LancePathList* list);
+
+uint64_t lance_delimited_list_common_prefix_count(
+    const LanceDelimitedList* list
+);
+const char* lance_delimited_list_common_prefix_at(
+    const LanceDelimitedList* list,
+    size_t index
+);
+uint64_t lance_delimited_list_object_count(
+    const LanceDelimitedList* list
+);
+const char* lance_delimited_list_object_at(
+    const LanceDelimitedList* list,
+    size_t index
+);
+void lance_delimited_list_close(LanceDelimitedList* list);
+
+const uint8_t* lance_byte_buffer_data(const LanceByteBuffer* buffer);
+size_t lance_byte_buffer_len(const LanceByteBuffer* buffer);
+void lance_byte_buffer_close(LanceByteBuffer* buffer);
 
 #ifdef __cplusplus
 } /* extern "C" */

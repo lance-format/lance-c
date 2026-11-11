@@ -26,6 +26,7 @@ bytes = "1"
 # Keep every Lance crate on the upstream v14.0.2 release commit.
 lance = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
 lance-core = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-encoding = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-file = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-index = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-io = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
@@ -44,11 +45,11 @@ arrow-schema = "58.0.0"
 # timestamps); already in the graph transitively via lance.
 chrono = { version = "0.4", default-features = false }
 half = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "io-util"] }
 futures = "0.3"
 log = "0.4"
 libc = "0.2"
-# The IVF precomputed-shuffle option carries a native object-store path.
+# Direct for native object-store paths and raw-file sessions.
 object_store = "=0.14.2"
 # Explicitly install the HTTP transport when embedded in a static C/C++ executable.
 opendal = { version = "=0.59.2", default-features = false, features = ["http-transport-reqwest"] }

@@ -3712,6 +3712,7 @@ dependencies = [
  "lance-core",
  "lance-datafusion",
  "lance-datagen",
+ "lance-encoding",
  "lance-file",
  "lance-index",
  "lance-io",
