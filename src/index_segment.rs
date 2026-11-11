@@ -2554,7 +2554,7 @@ mod tests {
             lance_index_segment_metadata_clone_with_fragment_ids(
                 source,
                 false,
-                1 as *const u32,
+                std::ptr::NonNull::<u32>::dangling().as_ptr(),
                 usize::MAX,
             )
         };
@@ -2693,7 +2693,7 @@ mod tests {
                 lance_index_segment_metadata_clone_with_fragment_ids(
                     source,
                     true,
-                    1 as *const u32,
+                    std::ptr::NonNull::<u32>::dangling().as_ptr(),
                     oversized,
                 )
             }
@@ -2703,7 +2703,7 @@ mod tests {
             lance_index_segment_metadata_clone_with_fragment_ids(
                 source,
                 false,
-                1 as *const u32,
+                std::ptr::NonNull::<u32>::dangling().as_ptr(),
                 usize::MAX,
             )
         };
