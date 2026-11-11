@@ -1476,6 +1476,328 @@ static void test_dynamic_storage_accessor(
     std::printf("C++ dynamic storage accessor OK\n");
 }
 
+
+static std::map<std::string, std::string> typed_arrow_metadata(
+    const char* metadata) {
+    std::map<std::string, std::string> out;
+    if (metadata == nullptr) return out;
+    const char* cursor = metadata;
+    int32_t pair_count = 0;
+    std::memcpy(&pair_count, cursor, sizeof(pair_count));
+    cursor += sizeof(pair_count);
+    for (int32_t i = 0; i < pair_count; ++i) {
+        int32_t key_len = 0;
+        std::memcpy(&key_len, cursor, sizeof(key_len));
+        cursor += sizeof(key_len);
+        std::string key(cursor, static_cast<size_t>(key_len));
+        cursor += key_len;
+        int32_t value_len = 0;
+        std::memcpy(&value_len, cursor, sizeof(value_len));
+        cursor += sizeof(value_len);
+        std::string value(cursor, static_cast<size_t>(value_len));
+        cursor += value_len;
+        out.emplace(std::move(key), std::move(value));
+    }
+    return out;
+}
+
+static void check_typed_schema_metadata(const lance::Dataset& dataset,
+                                        const std::string& key,
+                                        const std::optional<std::string>& value) {
+    ArrowSchema schema;
+    std::memset(&schema, 0, sizeof(schema));
+    dataset.schema(&schema);
+    auto metadata = typed_arrow_metadata(schema.metadata);
+    if (value) {
+        CHECK(metadata.find(key) != metadata.end() && metadata.at(key) == *value);
+    } else {
+        CHECK(metadata.find(key) == metadata.end());
+    }
+    if (schema.release) schema.release(&schema);
+}
+
+static void check_typed_field_metadata(const lance::Dataset& dataset,
+                                       size_t field_index,
+                                       const std::string& key,
+                                       const std::optional<std::string>& value) {
+    ArrowSchema schema;
+    std::memset(&schema, 0, sizeof(schema));
+    dataset.schema(&schema);
+    CHECK(field_index < static_cast<size_t>(schema.n_children));
+    auto metadata = typed_arrow_metadata(schema.children[field_index]->metadata);
+    if (value) {
+        CHECK(metadata.find(key) != metadata.end() && metadata.at(key) == *value);
+    } else {
+        CHECK(metadata.find(key) == metadata.end());
+    }
+    if (schema.release) schema.release(&schema);
+}
+
+static void test_typed_native_operations(const std::string& source_uri,
+                                         const std::string& base) {
+    const std::string seed_uri = base + "/cpp_typed_seed";
+    const std::string overwrite_uri = base + "/cpp_typed_overwrite";
+    const std::string clone_uri = base + "/cpp_typed_clone";
+    const std::string deep_uri = base + "/cpp_typed_clone_deep";
+    const std::string rejection_uri = base + "/cpp_typed_rejection";
+    const std::string deletable_uri = base + "/cpp_typed_deletable";
+
+    auto source = lance::Dataset::open(source_uri);
+    const uint64_t source_rows = source.count_rows();
+    const uint64_t source_version = source.version();
+
+    lance::UncommittedWriteOptions write_options;
+    write_options.write.params.max_rows_per_file = 2;
+    {
+        auto seed = lance::Dataset::commit(
+            seed_uri, write_uncommitted(source_uri, seed_uri,
+                                        lance::WriteMode::Create, write_options));
+        CHECK(seed.version() == 1);
+        CHECK(seed.count_rows() == source_rows);
+        CHECK(seed.fragment_count() >= 2);
+    }
+
+    auto seed = lance::Dataset::open(seed_uri);
+    CHECK(seed.fragment_count() >= 2);
+    auto seed_ids = seed.fragment_ids();
+    std::vector<lance::Fragment> seed_fragments;
+    std::vector<const lance::Fragment*> seed_fragment_ptrs;
+    seed_fragments.reserve(seed_ids.size());
+    for (uint64_t fragment_id : seed_ids) {
+        seed_fragments.push_back(seed.open_fragment(fragment_id));
+    }
+    for (const auto& fragment : seed_fragments) {
+        seed_fragment_ptrs.push_back(&fragment);
+    }
+    auto schema = seed.native_schema();
+    const int32_t seed_id_field = schema.field_id("id");
+    const int32_t seed_name_field = schema.field_id("name");
+    CHECK(seed_id_field >= 0);
+    CHECK(seed_name_field >= 0);
+
+    lance::UpdateMap config(
+        std::vector<std::string>{"owner", "empty"},
+        std::vector<std::optional<std::string>>{std::string("alice"),
+                                               std::string("")},
+        true);
+    std::vector<std::pair<std::string, std::string>> config_upserts = {
+        {"owner", "alice"},
+        {"empty", ""},
+    };
+    std::vector<lance::BasePath> bases;
+    bases.push_back(lance::BasePath{9001, base + "/cpp_typed_base",
+                                    std::optional<std::string>("primary"),
+                                    false});
+    auto overwrite = lance::Operation::make_overwrite(
+        schema, seed_fragment_ptrs,
+        std::optional<std::vector<std::pair<std::string, std::string>>>(
+            config_upserts),
+        std::optional<std::vector<lance::BasePath>>(bases));
+    CHECK(overwrite.kind() == lance::OperationKind::Overwrite);
+    CHECK(overwrite.overwrite_fragment_count() == seed_fragment_ptrs.size());
+    CHECK(overwrite.has_config_upsert_values());
+    CHECK(overwrite.config_upsert_count() == 2);
+    std::map<std::string, std::string> overwrite_config;
+    for (size_t index = 0; index < overwrite.config_upsert_count(); ++index) {
+        overwrite_config.emplace(overwrite.config_upsert_key_at(index),
+                                 overwrite.config_upsert_value_at(index));
+    }
+    CHECK(overwrite_config.at("owner") == "alice");
+    CHECK(overwrite_config.at("empty").empty());
+    CHECK(overwrite.has_initial_bases());
+    CHECK(overwrite.initial_base_count() == 1);
+    auto initial_bases = overwrite.initial_bases();
+    CHECK(initial_bases.size() == 1);
+    CHECK(initial_bases[0].id == 9001);
+    CHECK(initial_bases[0].path == base + "/cpp_typed_base");
+    CHECK(initial_bases[0].name == std::optional<std::string>("primary"));
+    auto overwrite_schema = overwrite.overwrite_schema();
+    CHECK(overwrite_schema.field_id("id") == seed_id_field);
+    auto detached = overwrite.overwrite_fragment_at(1);
+    CHECK(!detached.metadata_json().empty());
+
+    bool wrong_kind_rejected = false;
+    try {
+        (void)overwrite.merge_fragment_count();
+    } catch (const lance::Error& error) {
+        wrong_kind_rejected = error.code == LANCE_ERR_NOT_SUPPORTED;
+    }
+    CHECK(wrong_kind_rejected);
+
+    auto published = lance::Dataset::commit(
+        overwrite_uri, lance::Transaction::from_operation(0, overwrite));
+    CHECK(published.version() == 1);
+    CHECK(published.count_rows() == source_rows);
+    CHECK(published.fragment_count() == seed_fragment_ptrs.size());
+    auto published_ids = published.fragment_ids();
+    CHECK(published_ids.size() == seed_fragment_ptrs.size());
+    for (size_t index = 0; index < published_ids.size(); ++index) {
+        CHECK(published_ids[index] == index);
+    }
+    auto published_config = published.config();
+    CHECK(published_config.at("owner") == "alice");
+    CHECK(published_config.at("empty").empty());
+    CHECK(published.base_paths_json().find("\"9001\"") != std::string::npos);
+    CHECK(published.base_paths_json().find("primary") != std::string::npos);
+    CHECK(published.native_schema().field_id("id") == seed_id_field);
+    CHECK(published.native_schema().field_id("name") == seed_name_field);
+
+    auto merge =
+        lance::Operation::make_merge(schema, seed_fragment_ptrs, false);
+    CHECK(merge.kind() == lance::OperationKind::Merge);
+    CHECK(merge.merge_fragment_count() == seed_fragment_ptrs.size());
+    CHECK(!merge.merge_preserves_nullability());
+    CHECK(merge.merge_schema().field_id("id") == seed_id_field);
+    auto merged = lance::Dataset::commit(
+        seed_uri, lance::Transaction::from_operation(seed.version(), merge));
+    CHECK(merged.version() == 2);
+    CHECK(merged.count_rows() == source_rows);
+    CHECK(merged.fragment_count() == seed_fragment_ptrs.size());
+
+    auto shallow = lance::Operation::make_clone(
+        true, std::nullopt, source_version, source_uri, std::nullopt);
+    CHECK(shallow.kind() == lance::OperationKind::Clone);
+    CHECK(shallow.clone_is_shallow());
+    CHECK(!shallow.clone_ref_name().has_value());
+    CHECK(shallow.clone_ref_version() == source_version);
+    CHECK(shallow.clone_ref_path() == source_uri);
+    CHECK(!shallow.clone_branch_name().has_value());
+    auto cloned = lance::Dataset::commit(
+        clone_uri,
+        lance::Transaction::from_operation(source_version, shallow));
+    // A shallow clone copies the source manifest, including its version.
+    CHECK(cloned.version() == source_version);
+    CHECK(cloned.count_rows() == source_rows);
+
+    auto deep = lance::Operation::make_clone(
+        false, std::nullopt, source_version, source_uri,
+        std::optional<std::string>(""));
+    CHECK(!deep.clone_is_shallow());
+    CHECK(deep.clone_branch_name() == std::optional<std::string>(""));
+    bool deep_rejected = false;
+    try {
+        (void)lance::Dataset::commit(
+            deep_uri,
+            lance::Transaction::from_operation(source_version, deep));
+    } catch (const lance::Error& error) {
+        deep_rejected =
+            error.code == LANCE_ERR_INVALID_ARGUMENT &&
+            std::string(error.what())
+                    .find("deep Clone cannot be committed directly") !=
+                std::string::npos;
+    }
+    CHECK(deep_rejected);
+
+    lance::UpdateConfigOptions update_config_options;
+    update_config_options.config_updates.emplace(
+        std::vector<std::string>{"owner", "empty", "added"},
+        std::vector<std::optional<std::string>>{std::nullopt, std::nullopt,
+                                               std::string("yes")},
+        true);
+    update_config_options.table_metadata_updates.emplace(
+        std::vector<std::string>{"table-key"},
+        std::vector<std::optional<std::string>>{std::string("table-value")},
+        false);
+    update_config_options.schema_metadata_updates.emplace(
+        std::vector<std::string>{"schema-key"},
+        std::vector<std::optional<std::string>>{std::string("")}, false);
+    update_config_options.field_metadata_updates.emplace(
+        seed_id_field,
+        lance::UpdateMap(
+            std::vector<std::string>{"field-key", "field-old"},
+            std::vector<std::optional<std::string>>{std::string("field-value"),
+                                                   std::nullopt},
+            true));
+    auto update_config =
+        lance::Operation::make_update_config(update_config_options);
+    CHECK(update_config.kind() == lance::OperationKind::UpdateConfig);
+    CHECK(update_config.config_updates().has_value());
+    CHECK(update_config.config_updates()->count() == 3);
+    CHECK(update_config.config_updates()->key_at(0) == "owner");
+    CHECK(!update_config.config_updates()->value_at(0).has_value());
+    CHECK(update_config.table_metadata_updates().has_value());
+    CHECK(update_config.schema_metadata_updates().has_value());
+    auto field_maps = update_config.field_metadata_updates();
+    CHECK(field_maps.size() == 1);
+    CHECK(field_maps.at(seed_id_field).count() == 2);
+
+    auto updated = lance::Dataset::commit(
+        overwrite_uri,
+        lance::Transaction::from_operation(published.version(), update_config));
+    CHECK(updated.version() == 2);
+    auto updated_config = updated.config();
+    CHECK(updated_config.find("owner") == updated_config.end());
+    CHECK(updated_config.find("empty") == updated_config.end());
+    CHECK(updated_config.at("added") == "yes");
+    auto table_metadata = updated.metadata_json();
+    CHECK(table_metadata.find("table-key") != std::string::npos);
+    CHECK(table_metadata.find("table-value") != std::string::npos);
+    check_typed_schema_metadata(updated, "schema-key", std::string(""));
+    check_typed_field_metadata(updated, 0, "field-key",
+                               std::string("field-value"));
+    check_typed_field_metadata(updated, 0, "field-old", std::nullopt);
+
+    // The overwrite publication reuses source fragments, so deletion must run
+    // against a private copy whose data files are reachable from its own URI.
+    auto deletable = lance::Dataset::commit(
+        deletable_uri,
+        write_uncommitted(source_uri, deletable_uri, lance::WriteMode::Create));
+    CHECK(deletable.count_rows() == source_rows);
+    CHECK(deletable.delete_rows("id = 1") == 1);
+    CHECK(deletable.count_rows() == source_rows - 1);
+    std::optional<lance::Fragment> deleted_fragment;
+    auto updated_ids = deletable.fragment_ids();
+    for (uint64_t fragment_id : updated_ids) {
+        auto candidate = deletable.open_fragment(fragment_id);
+        if (candidate.metadata_json().find("\"deletion_file\"") !=
+            std::string::npos) {
+            deleted_fragment.emplace(std::move(candidate));
+            break;
+        }
+    }
+    CHECK(deleted_fragment.has_value());
+    auto updated_schema = deletable.native_schema();
+    auto deletion_overwrite = lance::Operation::make_overwrite(
+        updated_schema, {&*deleted_fragment}, std::nullopt, std::nullopt);
+    bool deletion_rejected = false;
+    try {
+        (void)lance::Dataset::commit(
+            rejection_uri,
+            lance::Transaction::from_operation(0, deletion_overwrite));
+    } catch (const lance::Error& error) {
+        deletion_rejected =
+            error.code == LANCE_ERR_INVALID_ARGUMENT &&
+            std::string(error.what()).find("carries deletion file") !=
+                std::string::npos;
+    }
+    CHECK(deletion_rejected);
+
+    lance::UpdateMap ordered(
+        std::vector<std::string>{"dup", "deleted", "dup", "empty"},
+        std::vector<std::optional<std::string>>{
+            std::string("first"), std::nullopt, std::string("second"),
+            std::string("")},
+        true);
+    CHECK(ordered.count() == 4);
+    CHECK(ordered.replace());
+    CHECK(ordered.key_at(0) == "dup");
+    CHECK(ordered.key_at(2) == "dup");
+    CHECK(!ordered.value_at(1).has_value());
+    CHECK(ordered.value_at(3) == std::optional<std::string>(""));
+    auto ordered_clone = ordered.clone();
+    CHECK(ordered_clone.count() == 4);
+    CHECK(ordered_clone.key_at(3) == "empty");
+    bool missing_key_rejected = false;
+    try {
+        (void)lance::UpdateMap(
+            std::vector<std::string>{"only-key"},
+            std::vector<std::optional<std::string>>{}, false);
+    } catch (const lance::Error& error) {
+        missing_key_rejected = error.code == LANCE_ERR_INVALID_ARGUMENT;
+    }
+    CHECK(missing_key_rejected);
+}
+
 int main(int argc, char** argv) {
     if (argc != 5) {
         std::fprintf(stderr,
@@ -1495,6 +1817,7 @@ int main(int argc, char** argv) {
         test_native_schema(argv[3]);
         test_blob_writer_data_replacement(argv[4]);
         test_native_operations(argv[1], argv[2]);
+        test_typed_native_operations(argv[1], argv[2]);
     } catch (const lance::Error& error) {
         std::fprintf(stderr, "lance::Error(%d): %s\n",
                      static_cast<int>(error.code), error.what());

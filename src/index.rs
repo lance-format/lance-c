@@ -1676,7 +1676,7 @@ fn parse_optional_u8(field: LanceOptionalU64, name: &str) -> Result<Option<u8>> 
         .transpose()
 }
 
-unsafe fn parse_string_map(
+pub(crate) unsafe fn parse_string_map(
     map: *const LanceStringMap,
     label: &str,
 ) -> Result<Option<HashMap<String, String>>> {

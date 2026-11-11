@@ -189,6 +189,18 @@ class FtsQueryContext;
 class FtsQuery;
 class Namespace;
 
+/// One native `BasePath` for `Dataset::add_bases` and `Operation`
+/// construction.
+///
+/// `id == 0` requests native allocation. `name == std::nullopt` maps to native
+/// `None`; an engaged empty string is an explicit empty name.
+struct BasePath {
+    uint32_t id = 0;
+    std::string path;
+    std::optional<std::string> name;
+    bool is_dataset_root = false;
+};
+
 // ─── Version history ─────────────────────────────────────────────────────────
 
 /// Metadata for a single dataset version.
@@ -711,6 +723,101 @@ public:
     }
 };
 
+/// Owned native `UpdateMap` snapshot. Move-only.
+///
+/// Entries are an ordered list, not a hash map: duplicate keys, order and
+/// absent values are native data. `replace == true` makes native commit code
+/// clear the target and insert only entries with values; `replace == false`
+/// upserts values and removes keys whose value is `std::nullopt`.
+class UpdateMap {
+    Handle<LanceUpdateMap, lance_update_map_close> handle_;
+
+public:
+    explicit UpdateMap(LanceUpdateMap* map) : handle_(map) {}
+
+    /// Construct from parallel key/value lists. Every key is required; a
+    /// `std::nullopt` value is a native `None` entry. Duplicate keys and input
+    /// order are preserved.
+    UpdateMap(const std::vector<std::string>& keys,
+              const std::vector<std::optional<std::string>>& values,
+              bool replace)
+        : handle_(nullptr) {
+        if (keys.size() != values.size()) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "UpdateMap keys and values must have the same length");
+        }
+        std::vector<const char*> key_ptrs;
+        std::vector<const char*> value_ptrs;
+        key_ptrs.reserve(keys.size());
+        value_ptrs.reserve(values.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            key_ptrs.push_back(keys[i].c_str());
+            value_ptrs.push_back(values[i] ? values[i]->c_str() : nullptr);
+        }
+        auto* raw = lance_update_map_new(
+            key_ptrs.empty() ? nullptr : key_ptrs.data(),
+            value_ptrs.empty() ? nullptr : value_ptrs.data(), keys.size(),
+            replace);
+        if (!raw) check_error();
+        handle_ = Handle<LanceUpdateMap, lance_update_map_close>(raw);
+    }
+
+    UpdateMap(UpdateMap&&) noexcept = default;
+    UpdateMap& operator=(UpdateMap&&) noexcept = default;
+    UpdateMap(const UpdateMap&) = delete;
+    UpdateMap& operator=(const UpdateMap&) = delete;
+
+    size_t count() const {
+        size_t count = lance_update_map_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    std::string key_at(size_t index) const {
+        const char* key = lance_update_map_key_at(handle_.get(), index);
+        if (!key) check_error();
+        return std::string(key);
+    }
+
+    std::optional<std::string> value_at(size_t index) const {
+        bool present = false;
+        const char* value = nullptr;
+        if (lance_update_map_value_at(handle_.get(), index, &present, &value) !=
+            0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return std::string(value);
+    }
+
+    bool replace() const {
+        bool replace = lance_update_map_replace(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return replace;
+    }
+
+    /// Clone this snapshot into an independently owned handle.
+    UpdateMap clone() const {
+        auto* raw = lance_update_map_clone(handle_.get());
+        if (!raw) check_error();
+        return UpdateMap(raw);
+    }
+
+    const LanceUpdateMap* c_handle() const { return handle_.get(); }
+};
+
+/// Options for Operation::make_update_config.
+///
+/// A disengaged optional maps to native `None`; an engaged empty `UpdateMap`
+/// maps to native `Some(empty)`. Duplicate field IDs follow native `HashMap`
+/// last-write-wins semantics where the last complete map wins.
+struct UpdateConfigOptions {
+    std::optional<UpdateMap> config_updates;
+    std::optional<UpdateMap> table_metadata_updates;
+    std::optional<UpdateMap> schema_metadata_updates;
+    std::map<int32_t, UpdateMap> field_metadata_updates;
+};
+
 enum class OperationKind : int32_t {
     Unknown             = LANCE_OPERATION_UNKNOWN,
     Append              = LANCE_OPERATION_APPEND,
@@ -822,6 +929,281 @@ public:
 
     /// New base paths cloned from an UpdateBases operation.
     std::vector<BasePath> update_bases() const;
+
+    /// Number of fragments in an Overwrite operation.
+    uint64_t overwrite_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_overwrite_fragment_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one Overwrite fragment as an independent detached fragment.
+    Fragment overwrite_fragment_at(size_t index) const;
+
+    /// Clone the in-memory schema of an Overwrite operation.
+    LanceSchema overwrite_schema() const;
+
+    /// Whether the Overwrite operation carries native `Some` config upserts.
+    /// `Some(empty)` is distinct from `None`.
+    bool has_config_upsert_values() const {
+        bool present = false;
+        if (lance_operation_overwrite_has_config_upsert_values(
+                handle_.get(), &present) != 0) {
+            check_error();
+        }
+        return present;
+    }
+
+    /// Number of config upsert entries. Native `None` reports 0.
+    uint64_t config_upsert_count() const {
+        uint64_t count = 0;
+        if (lance_operation_overwrite_config_upsert_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Borrowed config upsert key by native iteration position.
+    std::string config_upsert_key_at(size_t index) const {
+        const char* key = lance_operation_overwrite_config_upsert_key_at(
+            handle_.get(), index);
+        if (!key) check_error();
+        return std::string(key);
+    }
+
+    /// Borrowed config upsert value by native iteration position.
+    std::string config_upsert_value_at(size_t index) const {
+        const char* value = lance_operation_overwrite_config_upsert_value_at(
+            handle_.get(), index);
+        if (!value) check_error();
+        return std::string(value);
+    }
+
+    /// Whether the Overwrite operation carries native `Some` initial bases.
+    /// `Some(empty)` is distinct from `None`.
+    bool has_initial_bases() const {
+        bool present = false;
+        if (lance_operation_overwrite_has_initial_bases(
+                handle_.get(), &present) != 0) {
+            check_error();
+        }
+        return present;
+    }
+
+    /// Number of initial base paths. Native `None` reports 0.
+    uint64_t initial_base_count() const {
+        uint64_t count = 0;
+        if (lance_operation_overwrite_initial_base_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Borrowed initial base path from an Overwrite operation. The strings
+    /// remain valid until this operation handle is closed.
+    LanceBasePathView initial_base_at(size_t index) const {
+        LanceBasePathView base{};
+        if (lance_operation_overwrite_initial_base_at(
+                handle_.get(), index, &base) != 0) {
+            check_error();
+        }
+        return base;
+    }
+
+    /// Initial base paths cloned from an Overwrite operation.
+    std::vector<BasePath> initial_bases() const {
+        std::vector<BasePath> out;
+        const uint64_t count = initial_base_count();
+        out.reserve(static_cast<size_t>(count));
+        for (uint64_t i = 0; i < count; ++i) {
+            LanceBasePathView view = initial_base_at(static_cast<size_t>(i));
+            BasePath base;
+            base.id = view.id;
+            base.path = view.path ? view.path : "";
+            base.name = view.name ? std::optional<std::string>(view.name)
+                                  : std::nullopt;
+            base.is_dataset_root = view.is_dataset_root;
+            out.push_back(std::move(base));
+        }
+        return out;
+    }
+
+    /// Number of fragments in a Merge operation.
+    uint64_t merge_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_merge_fragment_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one Merge fragment as an independent detached fragment.
+    Fragment merge_fragment_at(size_t index) const;
+
+    /// Clone the in-memory schema of a Merge operation.
+    LanceSchema merge_schema() const;
+
+    /// Native `preserves_nullability` assertion from a Merge operation.
+    bool merge_preserves_nullability() const {
+        bool value = false;
+        if (lance_operation_merge_preserves_nullability(
+                handle_.get(), &value) != 0) {
+            check_error();
+        }
+        return value;
+    }
+
+    /// Clone the in-memory schema of a Project operation.
+    LanceSchema project_schema() const;
+
+    /// Shallow-clone flag of a Clone operation.
+    bool clone_is_shallow() const {
+        bool value = false;
+        if (lance_operation_clone_is_shallow(handle_.get(), &value) != 0) {
+            check_error();
+        }
+        return value;
+    }
+
+    /// Optional native reference name of a Clone operation.
+    std::optional<std::string> clone_ref_name() const {
+        bool present = false;
+        const char* value = nullptr;
+        if (lance_operation_clone_ref_name(
+                handle_.get(), &present, &value) != 0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return std::string(value);
+    }
+
+    /// Native reference version of a Clone operation.
+    uint64_t clone_ref_version() const {
+        uint64_t version = 0;
+        if (lance_operation_clone_ref_version(handle_.get(), &version) != 0) {
+            check_error();
+        }
+        return version;
+    }
+
+    /// Borrowed native reference path of a Clone operation.
+    std::string clone_ref_path() const {
+        const char* path = lance_operation_clone_ref_path(handle_.get());
+        if (!path) check_error();
+        return std::string(path);
+    }
+
+    /// Optional native branch name of a Clone operation.
+    std::optional<std::string> clone_branch_name() const {
+        bool present = false;
+        const char* value = nullptr;
+        if (lance_operation_clone_branch_name(
+                handle_.get(), &present, &value) != 0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return std::string(value);
+    }
+
+    /// Optional native config updates map from an UpdateConfig operation.
+    std::optional<UpdateMap> config_updates() const {
+        LanceUpdateMap* map = nullptr;
+        if (lance_operation_update_config_config_updates(
+                handle_.get(), &map) != 0) {
+            check_error();
+        }
+        if (!map) return std::nullopt;
+        return UpdateMap(map);
+    }
+
+    /// Optional native table metadata updates map.
+    std::optional<UpdateMap> table_metadata_updates() const {
+        LanceUpdateMap* map = nullptr;
+        if (lance_operation_update_config_table_metadata_updates(
+                handle_.get(), &map) != 0) {
+            check_error();
+        }
+        if (!map) return std::nullopt;
+        return UpdateMap(map);
+    }
+
+    /// Optional native schema metadata updates map.
+    std::optional<UpdateMap> schema_metadata_updates() const {
+        LanceUpdateMap* map = nullptr;
+        if (lance_operation_update_config_schema_metadata_updates(
+                handle_.get(), &map) != 0) {
+            check_error();
+        }
+        if (!map) return std::nullopt;
+        return UpdateMap(map);
+    }
+
+    /// Per-field native metadata update maps keyed by field ID.
+    std::map<int32_t, UpdateMap> field_metadata_updates() const {
+        uint64_t count = 0;
+        if (lance_operation_update_config_field_metadata_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::map<int32_t, UpdateMap> out;
+        for (uint64_t i = 0; i < count; ++i) {
+            int32_t field_id = 0;
+            LanceUpdateMap* map = nullptr;
+            if (lance_operation_update_config_field_metadata_at(
+                    handle_.get(), static_cast<size_t>(i), &field_id, &map) !=
+                0) {
+                check_error();
+            }
+            if (!map) {
+                throw Error(LANCE_ERR_INTERNAL,
+                            "UpdateConfig field metadata returned a null map");
+            }
+            out.emplace(field_id, UpdateMap(map));
+        }
+        return out;
+    }
+
+    /// Construct an owned native Overwrite operation from a native schema and
+    /// borrowed fragment handles. Fragment metadata is copied. Native commit
+    /// assigns fresh fragment IDs and rejects fragments with deletion files.
+    /// `config_upsert_values == std::nullopt` maps to native `None`; an
+    /// engaged empty vector maps to `Some(empty)`. `initial_bases` follows the
+    /// same presence mapping.
+    static Operation make_overwrite(
+        const LanceSchema& schema,
+        const std::vector<const Fragment*>& fragments,
+        std::optional<std::vector<std::pair<std::string, std::string>>>
+            config_upsert_values = std::nullopt,
+        std::optional<std::vector<BasePath>> initial_bases = std::nullopt);
+
+    /// Construct an owned native Merge operation. `fragments` is the final
+    /// native fragment list. `preserves_nullability` is stored unchanged as
+    /// the caller's assertion; native commit owns schema-change and conflict
+    /// validation.
+    static Operation make_merge(
+        const LanceSchema& schema,
+        const std::vector<const Fragment*>& fragments,
+        bool preserves_nullability = false);
+
+    /// Construct an owned native Clone operation. `ref_name == std::nullopt`
+    /// maps to native `None`; an engaged empty string is `Some("")`.
+    /// `branch_name` follows the same mapping. Native commit owns shallow
+    /// publication and deep-clone rejection.
+    static Operation make_clone(
+        bool is_shallow,
+        std::optional<std::string> ref_name,
+        uint64_t ref_version,
+        std::string ref_path,
+        std::optional<std::string> branch_name);
+
+    /// Construct an owned native UpdateConfig operation. Every map is cloned;
+    /// native commit applies replacement and incremental semantics.
+    static Operation make_update_config(const UpdateConfigOptions& options);
 
     /// Construct an owned native Append operation. Fragment handles are
     /// borrowed and their complete native metadata is copied.
@@ -1121,17 +1503,6 @@ public:
 /// One native `Dataset::update_config` entry. `value == std::nullopt` removes
 /// the key; otherwise the value is upserted.
 using ConfigUpdate = std::pair<std::string, std::optional<std::string>>;
-
-/// One native `BasePath` for `Dataset::add_bases`.
-///
-/// `id == 0` requests native allocation. `name == std::nullopt` maps to native
-/// `None`; an engaged empty string is an explicit empty name.
-struct BasePath {
-    uint32_t id = 0;
-    std::string path;
-    std::optional<std::string> name;
-    bool is_dataset_root = false;
-};
 
 /// Optional native transaction properties for one base registration.
 ///
@@ -2756,6 +3127,199 @@ inline std::vector<BasePath> Operation::update_bases() const {
         out.push_back(std::move(base));
     }
     return out;
+}
+
+inline Fragment Operation::overwrite_fragment_at(size_t index) const {
+    LanceFragment* raw = nullptr;
+    if (lance_operation_overwrite_fragment_at(handle_.get(), index, &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_overwrite_fragment_at returned success "
+                    "with null fragment");
+    }
+    return Fragment(raw);
+}
+
+inline LanceSchema Operation::overwrite_schema() const {
+    ::LanceSchema* raw = nullptr;
+    if (lance_operation_overwrite_schema_clone(handle_.get(), &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_overwrite_schema_clone returned success "
+                    "with null schema");
+    }
+    return LanceSchema(raw);
+}
+
+inline Fragment Operation::merge_fragment_at(size_t index) const {
+    LanceFragment* raw = nullptr;
+    if (lance_operation_merge_fragment_at(handle_.get(), index, &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_merge_fragment_at returned success "
+                    "with null fragment");
+    }
+    return Fragment(raw);
+}
+
+inline LanceSchema Operation::merge_schema() const {
+    ::LanceSchema* raw = nullptr;
+    if (lance_operation_merge_schema_clone(handle_.get(), &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_merge_schema_clone returned success "
+                    "with null schema");
+    }
+    return LanceSchema(raw);
+}
+
+inline LanceSchema Operation::project_schema() const {
+    ::LanceSchema* raw = nullptr;
+    if (lance_operation_project_schema_clone(handle_.get(), &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_project_schema_clone returned success "
+                    "with null schema");
+    }
+    return LanceSchema(raw);
+}
+
+inline Operation Operation::make_overwrite(
+    const LanceSchema& schema,
+    const std::vector<const Fragment*>& fragments,
+    std::optional<std::vector<std::pair<std::string, std::string>>>
+        config_upsert_values,
+    std::optional<std::vector<BasePath>> initial_bases) {
+    std::vector<const LanceFragment*> fragment_handles;
+    fragment_handles.reserve(fragments.size());
+    for (const Fragment* fragment : fragments) {
+        if (!fragment) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "Operation::make_overwrite received a null fragment");
+        }
+        fragment_handles.push_back(fragment->c_handle());
+    }
+
+    // The native constructor copies all strings before returning.
+    std::vector<std::string> config_keys;
+    std::vector<std::string> config_values;
+    std::vector<const char*> config_key_ptrs;
+    std::vector<const char*> config_value_ptrs;
+    LanceStringMap config_storage{};
+    const LanceStringMap* config_map = nullptr;
+    if (config_upsert_values) {
+        config_keys.reserve(config_upsert_values->size());
+        config_values.reserve(config_upsert_values->size());
+        for (const auto& [key, value] : *config_upsert_values) {
+            config_keys.push_back(key);
+            config_values.push_back(value);
+        }
+        for (size_t i = 0; i < config_keys.size(); ++i) {
+            config_key_ptrs.push_back(config_keys[i].c_str());
+            config_value_ptrs.push_back(config_values[i].c_str());
+        }
+        config_storage.keys =
+            config_key_ptrs.empty() ? nullptr : config_key_ptrs.data();
+        config_storage.values =
+            config_value_ptrs.empty() ? nullptr : config_value_ptrs.data();
+        config_storage.count = config_key_ptrs.size();
+        config_map = &config_storage;
+    }
+
+    std::vector<LanceBasePath> base_views;
+    LanceBasePath empty_base{};
+    LanceBasePathList base_list{};
+    const LanceBasePathList* initial_base_list = nullptr;
+    if (initial_bases) {
+        base_views.reserve(initial_bases->size());
+        for (const BasePath& base : *initial_bases) {
+            LanceBasePath view{};
+            view.id = base.id;
+            view.path = base.path.c_str();
+            view.name = base.name ? base.name->c_str() : nullptr;
+            view.is_dataset_root = base.is_dataset_root;
+            base_views.push_back(view);
+        }
+        base_list.items =
+            base_views.empty() ? &empty_base : base_views.data();
+        base_list.count = base_views.size();
+        initial_base_list = &base_list;
+    }
+
+    auto* raw = lance_operation_overwrite_new(
+        schema.c_handle(),
+        fragment_handles.empty() ? nullptr : fragment_handles.data(),
+        fragment_handles.size(), config_map, initial_base_list);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_merge(
+    const LanceSchema& schema,
+    const std::vector<const Fragment*>& fragments,
+    bool preserves_nullability) {
+    std::vector<const LanceFragment*> fragment_handles;
+    fragment_handles.reserve(fragments.size());
+    for (const Fragment* fragment : fragments) {
+        if (!fragment) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "Operation::make_merge received a null fragment");
+        }
+        fragment_handles.push_back(fragment->c_handle());
+    }
+    auto* raw = lance_operation_merge_new(
+        schema.c_handle(),
+        fragment_handles.empty() ? nullptr : fragment_handles.data(),
+        fragment_handles.size(), preserves_nullability);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_clone(
+    bool is_shallow, std::optional<std::string> ref_name,
+    uint64_t ref_version, std::string ref_path,
+    std::optional<std::string> branch_name) {
+    auto* raw = lance_operation_clone_new(
+        is_shallow, ref_name ? ref_name->c_str() : nullptr, ref_version,
+        ref_path.c_str(), branch_name ? branch_name->c_str() : nullptr);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_update_config(
+    const UpdateConfigOptions& options) {
+    std::vector<LanceFieldMetadataUpdateMap> field_updates;
+    field_updates.reserve(options.field_metadata_updates.size());
+    for (const auto& [field_id, updates] : options.field_metadata_updates) {
+        LanceFieldMetadataUpdateMap entry{};
+        entry.field_id = field_id;
+        entry.updates = updates.c_handle();
+        field_updates.push_back(entry);
+    }
+
+    LanceUpdateConfigOperationOptions c_options{};
+    c_options.config_updates =
+        options.config_updates ? options.config_updates->c_handle() : nullptr;
+    c_options.table_metadata_updates =
+        options.table_metadata_updates
+            ? options.table_metadata_updates->c_handle()
+            : nullptr;
+    c_options.schema_metadata_updates =
+        options.schema_metadata_updates
+            ? options.schema_metadata_updates->c_handle()
+            : nullptr;
+    c_options.field_metadata_updates =
+        field_updates.empty() ? nullptr : field_updates.data();
+    c_options.field_metadata_update_count = field_updates.size();
+
+    auto* raw = lance_operation_update_config_new(&c_options);
+    if (!raw) check_error();
+    return Operation(raw);
 }
 
 inline Operation Operation::make_append(

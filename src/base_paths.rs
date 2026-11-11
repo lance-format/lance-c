@@ -150,6 +150,32 @@ pub(crate) unsafe fn parse_base_paths(
     Ok(parsed_bases)
 }
 
+/// Borrowed native base-path list with explicit presence.
+///
+/// A NULL pointer maps to native `None`, including for Overwrite. A non-NULL
+/// pointer with `count == 0` maps to native `Some(empty list)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LanceBasePathList {
+    pub items: *const LanceBasePath,
+    pub count: usize,
+}
+
+/// Parse a borrowed `LanceBasePathList` pointer as an optional native list.
+///
+/// The entries are copied into native `BasePath` values. Native commit code
+/// owns ID allocation, path/name conflicts and replacement semantics.
+pub(crate) unsafe fn parse_base_path_list(
+    list: *const LanceBasePathList,
+) -> Result<Option<Vec<BasePath>>> {
+    if list.is_null() {
+        return Ok(None);
+    }
+    let list = unsafe { &*list };
+    let bases = unsafe { parse_base_paths(list.items, list.count) }?;
+    Ok(Some(bases))
+}
+
 /// Return the current snapshot's native base-path registry as a JSON object
 /// keyed by decimal base ID.
 ///
