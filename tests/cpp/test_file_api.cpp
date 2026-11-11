@@ -130,7 +130,7 @@ bool verify_stream(
         const ArrowArray *ids = batch.children[0];
         const auto *values = static_cast<const int32_t *>(ids->buffers[1]);
         for (int64_t row = 0; row < batch.length; row++) {
-            if (values[row] != first_id + rows) return false;
+            if (values[row] != first_id + rows + row) return false;
         }
         if (rows == 0 && batch.length > 2) {
             const char *second = label_at(*batch.children[1], 1);
