@@ -1171,9 +1171,17 @@ public:
 
 // ─── Blob file ───────────────────────────────────────────────────────────────
 
-/// RAII handle over one value of a Blob v2 column, from `Dataset::take_blobs()`
-/// or `take_blobs_by_indices()`. Stays usable after the Dataset is destroyed.
-/// `read()` and `read_up_to()` advance the cursor, `read_range()` does not.
+/// One blob-relative byte range for `BlobFile::read_ranges()`.
+struct BlobRange {
+    uint64_t offset;
+    uint64_t length;
+};
+
+/// RAII handle over one value of a Blob v2 column, from `Dataset::take_blobs()`,
+/// `take_blobs_by_indices()` or `take_blobs_by_addresses()`. Stays usable
+/// after the Dataset is destroyed. `read()`, `read_up_to()` and `read_into()`
+/// advance the cursor, while `read_range()` and `read_ranges()` do not.
+/// `close()` marks the native file closed; the destructor frees the handle.
 /// Not thread-safe per handle.
 class BlobFile {
     Handle<LanceBlobFile, lance_blob_file_close> handle_;
@@ -1212,6 +1220,17 @@ public:
         return out;
     }
 
+    /// Read at most `len` bytes from the current cursor into caller storage.
+    /// Returns the number of bytes written, which is shorter than `len` at the
+    /// end of the blob. Reuses the C `read_up_to` operation.
+    size_t read_into(uint8_t* dst, size_t len) {
+        size_t bytes_read = 0;
+        if (lance_blob_file_read_up_to(
+                handle_.get(), dst, len, &bytes_read) != 0)
+            check_error();
+        return bytes_read;
+    }
+
     /// Read exactly `len` bytes at `offset` without moving the cursor. The
     /// range must lie within the blob.
     std::vector<uint8_t> read_range(uint64_t offset, size_t len) const {
@@ -1220,6 +1239,43 @@ public:
                 handle_.get(), offset, out.data(), len) != 0)
             check_error();
         return out;
+    }
+
+    /// Read multiple ranges without moving the cursor. The result for
+    /// `ranges[i]` contains exactly `ranges[i].length` bytes; order,
+    /// duplicates and overlaps are preserved.
+    std::vector<std::vector<uint8_t>> read_ranges(
+        const std::vector<BlobRange>& ranges) const {
+        std::vector<LanceBlobRange> c_ranges;
+        std::vector<std::vector<uint8_t>> out;
+        c_ranges.reserve(ranges.size());
+        out.reserve(ranges.size());
+        for (const auto& range : ranges) {
+            c_ranges.push_back({range.offset, range.length});
+            out.emplace_back(static_cast<size_t>(range.length));
+        }
+
+        std::vector<uint8_t*> destinations;
+        std::vector<size_t> destination_lens;
+        destinations.reserve(out.size());
+        destination_lens.reserve(out.size());
+        for (auto& buffer : out) {
+            destinations.push_back(buffer.empty() ? nullptr : buffer.data());
+            destination_lens.push_back(buffer.size());
+        }
+
+        if (lance_blob_file_read_ranges(
+                handle_.get(), c_ranges.data(), c_ranges.size(),
+                destinations.data(), destination_lens.data()) != 0) {
+            check_error();
+        }
+        return out;
+    }
+
+    /// Set the native sequential read-ahead size. Zero disables read-ahead.
+    void set_buffer_size(size_t buffer_size) {
+        if (lance_blob_file_set_buffer_size(handle_.get(), buffer_size) != 0)
+            check_error();
     }
 
     /// Move the cursor. Seeking past the end is allowed; reads then return
@@ -1233,6 +1289,20 @@ public:
         uint64_t pos = 0;
         if (lance_blob_file_tell(handle_.get(), &pos) != 0) check_error();
         return pos;
+    }
+
+    /// Mark the native blob file closed. Idempotent. The allocation remains
+    /// owned until destruction.
+    void close() {
+        if (lance_blob_file_mark_closed(handle_.get()) != 0) check_error();
+    }
+
+    /// Native closed state.
+    bool closed() const {
+        bool value = false;
+        if (lance_blob_file_is_closed(handle_.get(), &value) != 0)
+            check_error();
+        return value;
     }
 };
 
@@ -1730,10 +1800,10 @@ class Dataset {
     /// Move raw handles into RAII owners. `blobs` must be reserved up front so
     /// nothing can throw while handles are still unowned.
     ///
-    /// Leak-freedom also rests on the C side: `lance_dataset_take_blobs*` fill
-    /// `out` all-or-nothing and leave it untouched on error. A partial fill
-    /// before an error would leak, because `check_error()` throws before this
-    /// runs and `raw` owns nothing.
+    /// Leak-freedom also rests on the C side: all `lance_dataset_take_blobs*`
+    /// entry points fill `out` all-or-nothing and leave it untouched on error.
+    /// A partial fill before an error would leak, because `check_error()`
+    /// throws before this runs and `raw` owns nothing.
     static void adopt_blobs(const std::vector<LanceBlobFile*>& raw,
                             std::vector<std::optional<BlobFile>>& blobs) {
         for (auto* blob : raw) {
@@ -3101,6 +3171,29 @@ public:
             lance_dataset_take_blobs_by_indices(
                 handle_.get(), indices, num_indices,
                 column.c_str(), raw.data()) != 0) {
+            check_error();
+        }
+        adopt_blobs(raw, blobs);
+        return blobs;
+    }
+
+    /// Take blob handles by physical row address; element `i` is for
+    /// `row_addresses[i]`, `std::nullopt` for a null blob value. An empty
+    /// selection still validates `column` through native.
+    std::vector<std::optional<BlobFile>> take_blobs_by_addresses(
+        const uint64_t* row_addresses, size_t num_row_addresses,
+        const std::string& column) const {
+        std::vector<LanceBlobFile*> raw(num_row_addresses, nullptr);
+        std::vector<std::optional<BlobFile>> blobs;
+        blobs.reserve(num_row_addresses);
+        // Keep the native call for an empty selection so column validation
+        // still runs; an empty vector's data() may be null.
+        LanceBlobFile* empty_out = nullptr;
+        LanceBlobFile** out =
+            num_row_addresses == 0 ? &empty_out : raw.data();
+        if (lance_dataset_take_blobs_by_addresses(
+                handle_.get(), row_addresses, num_row_addresses,
+                column.c_str(), out) != 0) {
             check_error();
         }
         adopt_blobs(raw, blobs);
