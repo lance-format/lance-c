@@ -1593,6 +1593,17 @@ public:
     const LanceStorageOptionsAccessor* c_handle() const { return handle_.get(); }
 };
 
+/// Additive options for `Dataset::open_with_options`.
+///
+/// Zero-initialization opens the latest version with native storage defaults.
+/// A NULL accessor selects native defaults; a non-NULL accessor is retained by
+/// the native dataset and later I/O uses its provider, refresh and error
+/// behavior. Static options belong in the accessor's initial options.
+struct DatasetOpenOptions {
+    uint64_t version = 0;
+    const StorageOptionsAccessor* storage_options_accessor = nullptr;
+};
+
 // ─── Shared Session ──────────────────────────────────────────────────────────
 
 enum class SessionCacheSpecKind : int32_t {
@@ -4151,7 +4162,8 @@ class Dataset {
         WriteMode mode,
         const LanceWriteParams* legacy_params,
         const LanceWriteOptions* native_options,
-        const std::vector<std::pair<std::string, std::string>>& storage_opts) {
+        const std::vector<std::pair<std::string, std::string>>& storage_opts,
+        const StorageOptionsAccessor* storage_options_accessor = nullptr) {
 
         ArrowStreamInput input(stream);
         const ArrowSchema* schema = input.read_schema();
@@ -4171,7 +4183,35 @@ class Dataset {
         LanceDataset* out = nullptr;
         int32_t rc;
         const char* entry_point;
-        if (native_options) {
+        if (storage_options_accessor) {
+            if (!storage_opts.empty()) {
+                throw Error(
+                    LANCE_ERR_INVALID_ARGUMENT,
+                    "storage_opts must be empty when a storage options "
+                    "accessor is provided");
+            }
+            if (native_options) {
+                entry_point = "lance_dataset_write_with_options_and_accessor";
+                rc = lance_dataset_write_with_options_and_accessor(
+                    uri.c_str(),
+                    schema,
+                    owned_stream,
+                    static_cast<int32_t>(mode),
+                    native_options,
+                    storage_options_accessor->c_handle(),
+                    &out);
+            } else {
+                entry_point = "lance_dataset_write_with_params_and_accessor";
+                rc = lance_dataset_write_with_params_and_accessor(
+                    uri.c_str(),
+                    schema,
+                    owned_stream,
+                    static_cast<int32_t>(mode),
+                    legacy_params,
+                    storage_options_accessor->c_handle(),
+                    &out);
+            }
+        } else if (native_options) {
             entry_point = "lance_dataset_write_with_options";
             rc = lance_dataset_write_with_options(
                 uri.c_str(),
@@ -4242,6 +4282,31 @@ public:
         return Dataset(ds);
     }
 
+    /// Open a dataset with additive options and an optional shared session.
+    ///
+    /// A NULL `storage_options_accessor` selects native storage defaults. A
+    /// non-NULL accessor is retained by the returned dataset, so the C++
+    /// wrapper may be destroyed immediately after this call; later I/O uses
+    /// the native provider refresh, error and cache policy.
+    static Dataset open_with_options(
+        const std::string& uri,
+        const DatasetOpenOptions& options = {},
+        const Session* session = nullptr) {
+
+        LanceDatasetOpenOptions c_options = {};
+        c_options.version = options.version;
+        c_options.storage_options_accessor =
+            options.storage_options_accessor
+                ? options.storage_options_accessor->c_handle()
+                : nullptr;
+        auto* ds = lance_dataset_open_with_options(
+            uri.c_str(),
+            &c_options,
+            session ? session->c_handle() : nullptr);
+        if (!ds) check_error();
+        return Dataset(ds);
+    }
+
     /// Write an Arrow record batch stream to a Lance dataset and return the
     /// open dataset at the committed version.
     ///
@@ -4301,6 +4366,75 @@ public:
 
         return write_impl(
             uri, stream, mode, nullptr, &c_options, storage_opts);
+    }
+
+    /// Write with a retained native dynamic storage-options accessor. This
+    /// keeps the legacy 20/14 auto-cleanup policy. The returned dataset retains
+    /// the accessor and provider for later I/O.
+    static Dataset write_with_accessor(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const StorageOptionsAccessor& storage_options_accessor) {
+
+        return write_impl(
+            uri,
+            stream,
+            mode,
+            nullptr,
+            nullptr,
+            {},
+            &storage_options_accessor);
+    }
+
+    /// Write with explicit legacy `WriteParams` and a retained native dynamic
+    /// storage-options accessor.
+    static Dataset write_with_params_and_accessor(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteParams& params,
+        const StorageOptionsAccessor& storage_options_accessor) {
+
+        LanceWriteParams c_params = {};
+        c_params.max_rows_per_file = params.max_rows_per_file;
+        c_params.max_rows_per_group = params.max_rows_per_group;
+        c_params.max_bytes_per_file = params.max_bytes_per_file;
+        c_params.data_storage_version =
+            params.data_storage_version ? params.data_storage_version->c_str()
+                                        : nullptr;
+        c_params.enable_stable_row_ids = params.enable_stable_row_ids;
+
+        return write_impl(
+            uri,
+            stream,
+            mode,
+            &c_params,
+            nullptr,
+            {},
+            &storage_options_accessor);
+    }
+
+    /// Write with native `WriteParams::default()` semantics and a retained
+    /// native dynamic storage-options accessor.
+    static Dataset write_with_options_and_accessor(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteOptions& options,
+        const StorageOptionsAccessor& storage_options_accessor) {
+
+        LanceAutoCleanupParams c_cleanup = {};
+        LanceWriteOptions c_options = to_c_write_options(options, c_cleanup);
+
+        return write_impl(
+            uri,
+            stream,
+            mode,
+            nullptr,
+            &c_options,
+            {},
+            &storage_options_accessor);
     }
 
     /// Open through a native namespace. Namespace location/storage options and
@@ -4399,6 +4533,64 @@ public:
         return Transaction(transaction);
     }
 
+    /// Write uncommitted data with a native dynamic accessor for data-file
+    /// writes performed by this call.
+    ///
+    /// The returned transaction carries transaction metadata only and does not
+    /// retain the accessor; pass it again to `commit_with_accessor` when commit
+    /// I/O needs dynamic storage options. All other stream and transaction
+    /// semantics match `write_uncommitted`.
+    static Transaction write_uncommitted_with_accessor(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const StorageOptionsAccessor& storage_options_accessor,
+        const UncommittedWriteOptions& options = {},
+        const Session* session = nullptr) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+
+        LanceAutoCleanupParams cleanup = {};
+        LanceWriteOptions c_write = to_c_write_options(options.write, cleanup);
+
+        std::vector<const char*> properties;
+        if (options.transaction_properties) {
+            properties.reserve(options.transaction_properties->size() * 2 + 1);
+            for (const auto& [key, value] : *options.transaction_properties) {
+                properties.push_back(key.c_str());
+                properties.push_back(value.c_str());
+            }
+            properties.push_back(nullptr);
+        }
+
+        LanceUncommittedWriteOptions c_options = {};
+        c_options.write = c_write;
+        c_options.transaction_properties =
+            options.transaction_properties ? properties.data() : nullptr;
+
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceTransaction* transaction = nullptr;
+        if (lance_dataset_write_uncommitted_stream_with_accessor(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                &c_options,
+                storage_options_accessor.c_handle(),
+                session ? session->c_handle() : nullptr,
+                &transaction) != 0) {
+            check_error();
+        }
+        if (!transaction) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_uncommitted_stream_with_accessor "
+                "returned success with null out_transaction");
+        }
+        return Transaction(transaction);
+    }
+
     /// Publish one native transaction through the URI's native CommitBuilder.
     /// The transaction handle remains valid and is cloned by the C API.
     static Dataset commit(
@@ -4431,6 +4623,35 @@ public:
         return Dataset(dataset);
     }
 
+    /// Publish one native transaction with a retained dynamic storage-options
+    /// accessor. The returned dataset retains the accessor and provider.
+    static Dataset commit_with_accessor(
+        const std::string& uri,
+        const Transaction& transaction,
+        const StorageOptionsAccessor& storage_options_accessor,
+        const CommitOptions& options = {},
+        const Session* session = nullptr) {
+
+        LanceCommitOptions c_options = to_c_commit_options(options);
+        LanceDataset* dataset = nullptr;
+        if (lance_transaction_commit_with_accessor(
+                uri.c_str(),
+                transaction.c_handle(),
+                &c_options,
+                storage_options_accessor.c_handle(),
+                session ? session->c_handle() : nullptr,
+                &dataset) != 0) {
+            check_error();
+        }
+        if (!dataset) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_transaction_commit_with_accessor returned success with "
+                "null out_dataset");
+        }
+        return Dataset(dataset);
+    }
+
     /// Commit native append transactions as one version. Native eligibility and
     /// merge semantics apply; non-append batches throw LANCE_ERR_NOT_SUPPORTED.
     static BatchCommitResult commit_batch(
@@ -4438,6 +4659,16 @@ public:
         const std::vector<std::reference_wrapper<const Transaction>>& transactions,
         const CommitOptions& options = {},
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
+
+    /// Commit append transactions as one version with a retained dynamic
+    /// storage-options accessor. The returned dataset retains the accessor and
+    /// provider; the merged transaction carries transaction metadata only.
+    static BatchCommitResult commit_batch_with_accessor(
+        const std::string& uri,
+        const std::vector<std::reference_wrapper<const Transaction>>& transactions,
+        const StorageOptionsAccessor& storage_options_accessor,
+        const CommitOptions& options = {},
         const Session* session = nullptr);
 
     /// Clone this handle as an independent in-memory snapshot.
@@ -6296,6 +6527,44 @@ inline BatchCommitResult Dataset::commit_batch(
         throw Error(
             LANCE_ERR_INTERNAL,
             "lance_transaction_commit_batch returned success with null output");
+    }
+    return BatchCommitResult(Dataset(dataset), Transaction(merged));
+}
+
+inline BatchCommitResult Dataset::commit_batch_with_accessor(
+    const std::string& uri,
+    const std::vector<std::reference_wrapper<const Transaction>>& transactions,
+    const StorageOptionsAccessor& storage_options_accessor,
+    const CommitOptions& options,
+    const Session* session) {
+
+    std::vector<const LanceTransaction*> raw;
+    raw.reserve(transactions.size());
+    for (const auto& transaction : transactions) {
+        raw.push_back(transaction.get().c_handle());
+    }
+
+    LanceCommitOptions c_options = to_c_commit_options(options);
+    LanceDataset* dataset = nullptr;
+    LanceTransaction* merged = nullptr;
+    if (lance_transaction_commit_batch_with_accessor(
+            uri.c_str(),
+            raw.data(),
+            raw.size(),
+            &c_options,
+            storage_options_accessor.c_handle(),
+            session ? session->c_handle() : nullptr,
+            &dataset,
+            &merged) != 0) {
+        check_error();
+    }
+    if (!dataset || !merged) {
+        if (dataset) lance_dataset_close(dataset);
+        if (merged) lance_transaction_close(merged);
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_transaction_commit_batch_with_accessor returned success "
+            "with null output");
     }
     return BatchCommitResult(Dataset(dataset), Transaction(merged));
 }
