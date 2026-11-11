@@ -10942,10 +10942,7 @@ fn dataset_segment_uuids(dataset: *const LanceDataset, index_name: &str) -> Vec<
         take_last_error_message()
     );
     assert_eq!(written, count);
-    uuids
-        .chunks_exact(16)
-        .map(|chunk| chunk.try_into().unwrap())
-        .collect()
+    uuids.as_chunks::<16>().0.to_vec()
 }
 
 fn metadata_from_operation(
