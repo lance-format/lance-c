@@ -10,13 +10,15 @@
 //! place of a native oracle; the small fixed id sets below are independent
 //! expectations derived from the fixture's known row history.
 
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString};
 use std::ptr;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
-use arrow_array::{Array, Int32Array, LargeBinaryArray, RecordBatch, StringArray};
+use arrow_array::{
+    Array, Int32Array, LargeBinaryArray, RecordBatch, RecordBatchReader, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::dataset::delta::DatasetDeltaBuilder as NativeDeltaBuilder;
@@ -82,7 +84,6 @@ fn collect_native(
 fn collect_native_df(
     stream: datafusion::execution::SendableRecordBatchStream,
 ) -> (Schema, Vec<RecordBatch>) {
-    use datafusion::physical_plan::RecordBatchStream;
     let schema = stream.schema().as_ref().clone();
     let batches = lance_c::runtime::block_on(async {
         stream
@@ -152,8 +153,7 @@ fn history_batch(rows: &[(i32, &str)]) -> RecordBatch {
 fn batch_iterator(
     batch: RecordBatch,
     schema: Arc<Schema>,
-) -> arrow::record_batch::RecordBatchIterator<impl Iterator<Item = arrow::error::Result<RecordBatch>>>
-{
+) -> arrow::record_batch::RecordBatchIterator<Vec<arrow::error::Result<RecordBatch>>> {
     arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema)
 }
 
@@ -322,6 +322,11 @@ fn create_sql_dataset() -> (tempfile::TempDir, String) {
 
 // ─── SQL oracles and tests ───────────────────────────────────────────────────
 
+/// Pass-through for oracle calls that keep the native builder unconfigured.
+fn unchanged<T>(value: T) -> T {
+    value
+}
+
 fn native_sql(
     uri: &str,
     sql: &str,
@@ -366,8 +371,8 @@ fn c_sql(
 }
 
 fn assert_matches_oracle(
-    c_result: (Schema, Vec<RecordBatch>),
-    native_result: (Schema, Vec<RecordBatch>),
+    c_result: &(Schema, Vec<RecordBatch>),
+    native_result: &(Schema, Vec<RecordBatch>),
     context: &str,
 ) {
     let (c_schema, c_batches) = c_result;
@@ -396,15 +401,15 @@ fn test_sql_multi_fragment_projection_filter_order_aggregate() {
         "SELECT DISTINCT name FROM dataset WHERE id <= 3 ORDER BY name",
     ];
     for sql in cases {
-        let native = native_sql(&uri, sql, |builder| builder);
+        let native = native_sql(&uri, sql, unchanged);
         let c_result = c_sql(ds, sql, |_| {});
-        assert_matches_oracle(c_result, native, sql);
+        assert_matches_oracle(&c_result, &native, sql);
     }
 
     // A version-pinned snapshot only sees its own rows.
     let historical = open_dataset(&uri, 1);
     let sql = "SELECT id FROM dataset ORDER BY id";
-    let native = native_sql(&uri, sql, |builder| builder);
+    let native = native_sql(&uri, sql, unchanged);
     let c_all = c_sql(ds, sql, |_| {});
     let c_historical = c_sql(historical, sql, |_| {});
     assert_eq!(ids_of(&c_all.1), ids_of(&native.1));
@@ -430,7 +435,7 @@ fn test_sql_renamed_table_and_system_columns() {
             0
         );
     });
-    assert_matches_oracle(c_result, native, renamed);
+    assert_matches_oracle(&c_result, &native, renamed);
 
     let c_bad = c_str("SELECT id FROM dataset");
     let builder = unsafe { lance_dataset_sql_builder_new(ds, c_bad.as_ptr()) };
@@ -459,7 +464,7 @@ fn test_sql_renamed_table_and_system_columns() {
             0
         );
     });
-    assert_matches_oracle(c_plain, native_plain, plain);
+    assert_matches_oracle(&c_plain, &native_plain, plain);
     let plain_row_ids = row_ids_of(&c_plain.1);
     assert_eq!(plain_row_ids.len(), 4);
     let mut distinct = plain_row_ids.clone();
@@ -474,7 +479,7 @@ fn test_sql_renamed_table_and_system_columns() {
             0
         );
     });
-    assert_matches_oracle(c_addr, native_addr, addr);
+    assert_matches_oracle(&c_addr, &native_addr, addr);
     assert!(c_addr.0.field_with_name("_rowaddr").is_ok());
 
     // Aggregates collapse rows, so the planner must not inject clients.
@@ -492,7 +497,7 @@ fn test_sql_renamed_table_and_system_columns() {
             0
         );
     });
-    assert_matches_oracle(c_aggregate, native_aggregate, aggregate);
+    assert_matches_oracle(&c_aggregate, &native_aggregate, aggregate);
     assert!(c_aggregate.0.field_with_name("_rowid").is_err());
     assert_eq!(
         c_aggregate.1[0]
@@ -520,7 +525,7 @@ fn test_sql_renamed_table_and_system_columns() {
             0
         );
     });
-    assert_matches_oracle(c_history.clone(), native_history, history_sql);
+    assert_matches_oracle(&c_history, &native_history, history_sql);
     assert_eq!(ids_of(&c_history.1), vec![1, 2, 4]);
     assert_eq!(row_ids_of(&c_history.1), vec![0, 1, 3]);
     unsafe { lance_dataset_close(history) };
@@ -543,7 +548,7 @@ fn test_sql_batching_blob_modes_and_limits() {
             0
         );
     });
-    assert_matches_oracle(c_small.clone(), native_small, "batch_size = 3");
+    assert_matches_oracle(&c_small, &native_small, "batch_size = 3");
     assert!(
         c_small.1.len() > 1,
         "batch_size = 3 must split 30 rows into several batches, got {}",
@@ -559,7 +564,7 @@ fn test_sql_batching_blob_modes_and_limits() {
             0
         );
     });
-    assert_matches_oracle(c_bytes, native_bytes, "batch_size_bytes = 512");
+    assert_matches_oracle(&c_bytes, &native_bytes, "batch_size_bytes = 512");
 
     // Native validation owns the accepted range; the C layer only forwards.
     let too_large = u32::MAX as u64 + 1;
@@ -598,7 +603,7 @@ fn test_sql_batching_blob_modes_and_limits() {
             0
         );
     });
-    assert_matches_oracle(c_binary.clone(), native_binary, "blob ALL_BINARY");
+    assert_matches_oracle(&c_binary, &native_binary, "blob ALL_BINARY");
     assert_eq!(
         *c_binary.0.field_with_name("blob").unwrap().data_type(),
         DataType::LargeBinary
@@ -625,8 +630,8 @@ fn test_sql_batching_blob_modes_and_limits() {
         );
     });
     assert_matches_oracle(
-        c_descriptions.clone(),
-        native_descriptions,
+        &c_descriptions,
+        &native_descriptions,
         "blob ALL_DESCRIPTIONS",
     );
     assert!(

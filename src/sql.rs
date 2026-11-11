@@ -131,7 +131,9 @@ unsafe fn sql_builder_set_table_name_inner(
     // string valid for this call.
     let name = unsafe { helpers::parse_c_string(table_name)? }
         .expect("non-NULL table_name parses to a string");
-    apply_sql_builder(builder, |inner| inner.table_name(name))
+    // SAFETY: `apply_sql_builder` dereferences `builder`, which the caller
+    // guarantees is a live handle for this call.
+    unsafe { apply_sql_builder(builder, |inner| inner.table_name(name)) }
 }
 
 /// Inject the native `_rowid` system column into the scan output where the
@@ -195,7 +197,8 @@ unsafe fn sql_builder_set_blob_handling_inner(
             )));
         }
     };
-    apply_sql_builder(builder, |inner| inner.blob_handling(parsed))
+    // SAFETY: see `lance_sql_query_builder_set_table_name`.
+    unsafe { apply_sql_builder(builder, |inner| inner.blob_handling(parsed)) }
 }
 
 /// Set the native target output batch size (rows). The native builder
@@ -225,7 +228,8 @@ unsafe fn sql_builder_set_batch_size_inner(
             usize::MAX
         ))
     })?;
-    apply_sql_builder(builder, |inner| inner.batch_size(batch_size))
+    // SAFETY: see `lance_sql_query_builder_set_table_name`.
+    unsafe { apply_sql_builder(builder, |inner| inner.batch_size(batch_size)) }
 }
 
 /// Set the native target output batch size in bytes. `None` until set; the

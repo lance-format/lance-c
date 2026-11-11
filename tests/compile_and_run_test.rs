@@ -1554,11 +1554,10 @@ fn create_sql_delta_blob_dataset() -> (tempfile::TempDir, String) {
 /// Resolve a date window to the version range the native delta reader uses:
 /// the begin timestamp is exclusive, the end timestamp inclusive.
 fn resolve_sql_delta_window(uri: &str, begin: (i64, u32), end: (i64, u32)) -> (u64, u64) {
-    let versions = lance_c::runtime::block_on(Dataset::open(uri))
-        .unwrap()
-        .versions()
-        .await
-        .unwrap();
+    let versions = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        dataset.versions().await.unwrap()
+    });
     let mut begin_version = 0_u64;
     let mut end_version = 0_u64;
     for version in &versions {

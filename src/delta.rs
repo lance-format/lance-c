@@ -206,10 +206,14 @@ unsafe fn set_delta_timestamp(
     // `LanceDeltaTimestamp` for the duration of this call.
     let ts = unsafe { &*timestamp };
     let native = delta_timestamp_from_ffi(ts)?;
-    if is_end {
-        apply_delta_builder(builder, |inner| inner.with_end_date(native))
-    } else {
-        apply_delta_builder(builder, |inner| inner.with_begin_date(native))
+    // SAFETY: `apply_delta_builder` dereferences `builder`, which the caller
+    // guarantees is a live handle for this call.
+    unsafe {
+        if is_end {
+            apply_delta_builder(builder, |inner| inner.with_end_date(native))
+        } else {
+            apply_delta_builder(builder, |inner| inner.with_begin_date(native))
+        }
     }
 }
 
@@ -334,7 +338,7 @@ unsafe fn dataset_delta_list_transactions_inner(
     // and writable output slots for the duration of this call.
     let delta = unsafe { &*delta };
     let transactions = block_on(delta.inner.list_transactions())?;
-    let mut items: Vec<*mut LanceTransaction> = transactions
+    let items: Vec<*mut LanceTransaction> = transactions
         .into_iter()
         .map(|inner| Box::into_raw(Box::new(LanceTransaction { inner })))
         .collect();
