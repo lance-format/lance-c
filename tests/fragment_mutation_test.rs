@@ -401,6 +401,18 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
         state.calls.fetch_add(1, Ordering::SeqCst);
         let count = unsafe { lance_dataset_count_rows(state.dataset) };
         if count != 12 {
+            let code = lance_last_error_code();
+            let message = lance_last_error_message();
+            let text = if message.is_null() {
+                String::new()
+            } else {
+                let text = unsafe { CStr::from_ptr(message) }
+                    .to_string_lossy()
+                    .into_owned();
+                unsafe { lance_free_string(message) };
+                text
+            };
+            eprintln!("independent callback count={count} error={code:?}: {text}");
             return -1;
         }
         state.independent_count.fetch_add(1, Ordering::SeqCst);
