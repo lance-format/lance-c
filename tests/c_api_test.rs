@@ -38073,16 +38073,34 @@ fn test_search_effort_preserves_native_probe_precedence() {
         take_last_error_message()
     );
     let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
-    let query = [20.0, 20.1, 20.2, 20.3, 20.4, 20.5, 20.6, 20.7];
+    let fixed_probe = ProbeArgs {
+        nprobes: Some(1),
+        minimum: None,
+        maximum: None,
+        effort: None,
+        effort_first: false,
+    };
+    let full_effort_probe = ProbeArgs {
+        nprobes: None,
+        minimum: None,
+        maximum: None,
+        effort: Some(1.0),
+        effort_first: false,
+    };
+    // Avoid relying on an accidental difference at one query. Choose an
+    // asymmetric boundary query where the same persisted native index itself
+    // distinguishes one fixed partition from full search effort.
+    let (query, k) = (0..192)
+        .find_map(|id| {
+            let query = [id as f32 + 0.8; 8];
+            (native_vector_ids(&native, &query, 1, fixed_probe)
+                != native_vector_ids(&native, &query, 1, full_effort_probe))
+            .then_some((query, 1))
+        })
+        .expect("persisted index must distinguish a fixed partition from full effort");
 
     let configurations = [
-        ProbeArgs {
-            nprobes: Some(1),
-            minimum: None,
-            maximum: None,
-            effort: None,
-            effort_first: false,
-        },
+        fixed_probe,
         ProbeArgs {
             nprobes: Some(1),
             minimum: None,
@@ -38112,22 +38130,11 @@ fn test_search_effort_preserves_native_probe_precedence() {
             effort_first: true,
         },
     ];
-    let mut fixed_ids = Vec::new();
-    let mut effort_ids = Vec::new();
     for args in configurations {
-        let actual = c_vector_ids(dataset, &query, 60, args);
-        let expected = native_vector_ids(&native, &query, 60, args);
+        let actual = c_vector_ids(dataset, &query, k, args);
+        let expected = native_vector_ids(&native, &query, k, args);
         assert_eq!(actual, expected, "probe config mismatch: {args:?}");
-        if args.effort.is_some() {
-            effort_ids = actual;
-        } else {
-            fixed_ids = actual;
-        }
     }
-    assert_ne!(
-        fixed_ids, effort_ids,
-        "the persisted index must distinguish fixed nprobes from effort"
-    );
 
     let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
     for invalid in [f64::NAN, -0.1, 1.1, f64::INFINITY] {
