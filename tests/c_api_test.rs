@@ -41224,6 +41224,19 @@ fn test_prewarm_scalar_train_and_index_merge_lifecycle() {
         take_last_error_message()
     );
     prewarm.has_segment_selection = true;
+    prewarm.segment_count = isize::MAX as usize / 16 + 1;
+    assert_eq!(
+        unsafe {
+            lance_dataset_prewarm_index_with_options(
+                dataset,
+                c_str("idx_caps_fts").as_ptr(),
+                &prewarm,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("maximum addressable byte slice length"));
     prewarm.segment_uuids = ptr::null();
     prewarm.segment_count = 0;
     assert_eq!(

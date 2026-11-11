@@ -511,6 +511,12 @@ unsafe fn parse_prewarm_options(
             options.segment_count
         ))
     })?;
+    if byte_len > isize::MAX as usize {
+        return Err(lance_core::Error::invalid_input(format!(
+            "segment_count {} * 16 exceeds the maximum addressable byte slice length",
+            options.segment_count
+        )));
+    }
     if options.segment_uuids.is_null() {
         return Err(lance_core::Error::invalid_input(format!(
             "segment_uuids must not be NULL when segment_count is {}",
@@ -519,11 +525,10 @@ unsafe fn parse_prewarm_options(
     }
     let bytes = unsafe { slice::from_raw_parts(options.segment_uuids, byte_len) };
     let segments = bytes
-        .chunks_exact(16)
-        .map(|uuid| {
-            let uuid: [u8; 16] = uuid.try_into().expect("chunks_exact yields 16 bytes");
-            Uuid::from_bytes(uuid)
-        })
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|uuid| Uuid::from_bytes(*uuid))
         .collect();
     Ok((options.with_position, Some(segments)))
 }
