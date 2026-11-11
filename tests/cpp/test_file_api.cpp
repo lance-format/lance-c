@@ -416,7 +416,7 @@ int main(int argc, char **argv) {
           "packed prepared field name");
 #if defined(__unix__) || defined(__APPLE__)
     CHECK(read_local_file(object_path_on_disk(packed_path)) ==
-              std::vector<uint8_t>{'b', 'e', 't', 'a'},
+              (std::vector<uint8_t>{'b', 'e', 't', 'a'}),
           "packed sidecar survives session close");
 #endif
     bool packed_repeated_finish_threw = false;
@@ -451,8 +451,8 @@ int main(int argc, char **argv) {
     CHECK(dedicated_array.length == 1, "dedicated prepared rows");
 #if defined(__unix__) || defined(__APPLE__)
     CHECK(read_local_file(object_path_on_disk(dedicated_path)) ==
-              std::vector<uint8_t>(
-                  {'a', 'l', 'p', 'h', 'a', 'o', 'm', 'e', 'g', 'a'}),
+              (std::vector<uint8_t>(
+                  {'a', 'l', 'p', 'h', 'a', 'o', 'm', 'e', 'g', 'a'})),
           "dedicated writes concatenate");
 #endif
     bool dedicated_write_after_finish_threw = false;

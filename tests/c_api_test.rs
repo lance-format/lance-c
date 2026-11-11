@@ -41,6 +41,7 @@ use lance::dataset::{AutoCleanupParams, WriteParams};
 use lance::io::RecordBatchStream;
 use lance::session::{CacheSpec as NativeCacheSpec, Session as NativeSession};
 use lance_c::*;
+use lance_core::utils::path::LancePathExt;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::DocumentGranularity;
 use lance_index::scalar::inverted::query::{
@@ -14326,12 +14327,14 @@ fn expected_payload_bytes(rows: &[Option<Vec<u8>>]) -> Vec<u8> {
         .collect()
 }
 
-fn binary_payload_cases() -> Vec<(
+type BinaryPayloadCase = (
     &'static str,
     Field,
     arrow_array::ArrayRef,
     Vec<Option<Vec<u8>>>,
-)> {
+);
+
+fn binary_payload_cases() -> Vec<BinaryPayloadCase> {
     let binary = BinaryArray::from(vec![
         Some(b"ignored".as_slice()),
         Some(b"alpha".as_slice()),
@@ -14341,6 +14344,7 @@ fn binary_payload_cases() -> Vec<(
     ]);
     let binary = binary.slice(1, 4);
     let binary_field = Field::new("payload", binary.data_type().clone(), true);
+    let binary: arrow_array::ArrayRef = Arc::new(binary);
 
     let large = LargeBinaryArray::from(vec![
         Some(b"ignored".as_slice()),
@@ -14351,6 +14355,7 @@ fn binary_payload_cases() -> Vec<(
     ]);
     let large = large.slice(1, 4);
     let large_field = Field::new("payload", large.data_type().clone(), true);
+    let large: arrow_array::ArrayRef = Arc::new(large);
 
     let view = arrow_array::BinaryViewArray::from(vec![
         Some(b"ignored".as_slice()),
@@ -14361,6 +14366,7 @@ fn binary_payload_cases() -> Vec<(
     ]);
     let view = view.slice(1, 4);
     let view_field = Field::new("payload", view.data_type().clone(), true);
+    let view: arrow_array::ArrayRef = Arc::new(view);
 
     let fixed = arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
         [
@@ -14375,6 +14381,7 @@ fn binary_payload_cases() -> Vec<(
     .unwrap();
     let fixed = fixed.slice(1, 3);
     let fixed_field = Field::new("payload", fixed.data_type().clone(), true);
+    let fixed: arrow_array::ArrayRef = Arc::new(fixed);
 
     vec![
         (
