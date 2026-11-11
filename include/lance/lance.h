@@ -9677,10 +9677,30 @@ int32_t lance_updated_fragment_offsets_offset_count_at(
 );
 
 /**
+ * Copy all offsets for one entry in ascending native bitmap order.
+ *
+ * The caller owns out_offsets, with count writable uint32_t elements. count
+ * must equal the value written by
+ * lance_updated_fragment_offsets_offset_count_at() for the same index. NULL
+ * out_offsets is valid for a valid empty entry with count == 0. Repeated input
+ * offsets remain collapsed into the native set, and values remain valid after
+ * the source handle is closed.
+ *
+ * @return 0 on success, -1 on error. The output buffer is unchanged on error.
+ */
+int32_t lance_updated_fragment_offsets_copy_at(
+    const LanceUpdatedFragmentOffsets* offsets,
+    size_t index,
+    uint32_t* out_offsets,
+    size_t count
+);
+
+/**
  * Read one offset by entry index and ascending offset position.
  *
  * Native bitmaps are ordered, so position 0 is the smallest offset of that
- * fragment entry.
+ * fragment entry. For all offsets, prefer lance_updated_fragment_offsets_copy_at()
+ * to avoid restarting the bitmap traversal for each index.
  *
  * @return 0 on success, -1 on error.
  */
