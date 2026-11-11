@@ -19,7 +19,7 @@ use arrow_array::{
     RecordBatch, RecordBatchOptions, StringArray, StructArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_c::*;
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -432,7 +432,7 @@ fn native_indices_batches(
             .map_err(|error| error.to_string())?;
         stream
             .map(|batch| batch.map_err(|error| error.to_string()))
-            .collect::<Result<Vec<_>, _>>()
+            .try_collect::<Vec<_>>()
             .await
     })
 }
