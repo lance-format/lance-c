@@ -2113,6 +2113,93 @@ fn accessor_has_options(accessor: *const LanceStorageOptionsAccessor) -> Option<
 }
 
 #[test]
+fn storage_provider_callback_can_read_an_independent_file() {
+    struct ReadContext {
+        uri: CString,
+        reads: Arc<Mutex<Vec<Result<u64, String>>>>,
+        counters: ProviderCounters,
+    }
+
+    unsafe extern "C" fn fetch(
+        raw: *mut c_void,
+        out: *mut LanceStorageOptionsFetchResult,
+        _error: *mut LanceCallbackError,
+    ) -> i32 {
+        let context = unsafe { &*raw.cast::<ReadContext>() };
+        let reader = unsafe {
+            lance_file_reader_open(
+                context.uri.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        let result = if reader.is_null() {
+            Err(take_error().1)
+        } else {
+            let mut rows = 0;
+            let status = unsafe { lance_file_reader_num_rows(reader, &mut rows) };
+            unsafe { lance_file_reader_close(reader) };
+            if status == 0 {
+                Ok(rows)
+            } else {
+                Err(take_error().1)
+            }
+        };
+        context.reads.lock().unwrap().push(result);
+        unsafe {
+            write_provider_snapshot(
+                out,
+                Some(HashMap::new()),
+                context.counters.snapshot_releases.clone(),
+            )
+        };
+        0
+    }
+
+    unsafe extern "C" fn release(raw: *mut c_void) {
+        let context = unsafe { Box::from_raw(raw.cast::<ReadContext>()) };
+        context
+            .counters
+            .provider_releases
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let uri = root.path().join("provider-read.lance");
+    let uri = uri.to_str().unwrap();
+    write_fixture(uri, Some("2.2"), false, None, None, None, None, false);
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let counters = ProviderCounters::default();
+    let context = Box::into_raw(Box::new(ReadContext {
+        uri: c_string(uri),
+        reads: reads.clone(),
+        counters: counters.clone(),
+    }));
+    let spec = LanceStorageOptionsProviderSpec {
+        fetch: Some(fetch),
+        force_fetch: Some(fetch),
+        release: Some(release),
+        provider_ctx: context.cast(),
+        provider_id: c"independent-file-read-provider".as_ptr(),
+    };
+    let provider = unsafe { lance_storage_options_provider_new(&spec) };
+    assert!(!provider.is_null());
+    let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), provider) };
+    assert!(!accessor.is_null());
+    let options = snapshot_options(accessor);
+    unsafe {
+        lance_storage_options_accessor_close(accessor);
+        lance_storage_options_provider_close(provider);
+    }
+    assert_eq!(options.unwrap(), Some(HashMap::new()));
+    assert_eq!(*reads.lock().unwrap(), vec![Ok(7)]);
+    assert_eq!(counters.snapshot_releases.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.provider_releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn storage_options_static_provider_optional_maps_and_release() {
     let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), ptr::null()) };
     assert!(!accessor.is_null());
