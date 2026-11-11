@@ -8,6 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct ArrowSchema ArrowSchema;
+typedef struct ArrowArray ArrowArray;
+typedef struct ArrowArrayStream ArrowArrayStream;
+
 #define ARROW_FLAG_NULLABLE 2
 
 static int failures = 0;
