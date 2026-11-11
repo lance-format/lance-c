@@ -1243,8 +1243,24 @@ static void test_blob_planned_reads(const std::string& blob_uri) {
             const auto* offsets =
                 static_cast<const int64_t*>(data->buffers[1]);
             int64_t first = data->offset;
-            assert(static_cast<size_t>(offsets[first + 1] - offsets[first]) ==
-                   expected_sizes[row]);
+            size_t len =
+                static_cast<size_t>(offsets[first + 1] - offsets[first]);
+            if (len != expected_sizes[row]) {
+                fprintf(stderr,
+                        "whole row=%zu addr=%llu data_offset=%lld "
+                        "offsets=[%lld,%lld] len=%zu expected=%zu "
+                        "null_count=%lld n_buffers=%lld\n",
+                        row,
+                        (unsigned long long)expected_addresses[row],
+                        (long long)first,
+                        (long long)offsets[0],
+                        (long long)offsets[1],
+                        len,
+                        expected_sizes[row],
+                        (long long)data->null_count,
+                        (long long)data->n_buffers);
+            }
+            assert(len == expected_sizes[row]);
         }
         array.release(&array);
     }

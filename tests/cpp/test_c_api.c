@@ -1539,6 +1539,21 @@ static void test_blob_planned_reads(const char *blob_uri) {
             int64_t first = data->offset;
             size_t len =
                 (size_t)(offsets[first + 1] - offsets[first]);
+            if (len != expected_sizes[row]) {
+                fprintf(stderr,
+                        "whole row=%zu addr=%llu data_offset=%lld "
+                        "offsets=[%lld,%lld] len=%zu expected=%zu "
+                        "null_count=%lld n_buffers=%lld\n",
+                        row,
+                        (unsigned long long)expected_addresses[row],
+                        (long long)first,
+                        (long long)offsets[0],
+                        (long long)offsets[1],
+                        len,
+                        expected_sizes[row],
+                        (long long)data->null_count,
+                        (long long)data->n_buffers);
+            }
             ASSERT(len == expected_sizes[row], "whole payload length");
             assert_blob_payload_with_seed(
                 (const uint8_t *)data->buffers[2] + offsets[first],
