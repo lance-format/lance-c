@@ -634,6 +634,7 @@ mod tests {
         assert_eq!(expected.field("profile.tags").unwrap().parent_id, 3);
 
         let dataset = block_on(Dataset::open(&uri)).unwrap();
+        let reopened_schema = dataset.schema().clone();
         let handle = Box::new(LanceDataset {
             inner: RwLock::new(Arc::new(dataset)),
         });
@@ -644,7 +645,11 @@ mod tests {
         );
         assert!(!cloned.is_null());
         let cloned_value = unsafe { (*cloned).inner.clone() };
-        assert_eq!(cloned_value, expected);
+        assert_eq!(cloned_value, reopened_schema);
+        assert!(
+            cloned_value.field("name").unwrap().dictionary.is_some(),
+            "reopened schema must retain the dictionary encoding"
+        );
 
         // The clone is independent of the dataset handle.
         unsafe { lance_schema_close(cloned) };
