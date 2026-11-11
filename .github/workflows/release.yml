@@ -98,6 +98,8 @@ jobs:
             xz-utils \
             zstd
           # TLS stays on rustls; Cargo.lock has no openssl-sys or native-tls.
+          # openssl-probe only discovers certificate locations; it does not
+          # link OpenSSL.
           # libssl-dev must not be installed here: an accidental libssl or
           # libcrypto DT_NEEDED breaks dlopen in minimal Linux images.
       - uses: actions/checkout@v4
