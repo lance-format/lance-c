@@ -362,7 +362,7 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
         take_error()
     );
     take_stream_consumed(&reader_stream);
-    assert!(schema_field_id(reader_schema, "reader_value") > sql_field_id);
+    assert!(schema_field_id(reader_schema, "reader_value") > 5);
 
     let null_field = Field::new("null_value", DataType::Int32, true);
     let null_arrow_schema = FFI_ArrowSchema::try_from(&Schema::new(vec![null_field])).unwrap();
@@ -381,7 +381,7 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
         "AllNulls add_columns failed: {:?}",
         take_error()
     );
-    assert!(schema_field_id(null_schema, "null_value") > sql_field_id);
+    assert!(schema_field_id(null_schema, "null_value") > 5);
 
     struct CallbackState {
         output_schema: Arc<Schema>,
@@ -458,7 +458,7 @@ fn test_fragment_add_columns_variants_preserve_native_schema() {
         "BatchUDF add_columns failed: {:?}",
         take_error()
     );
-    assert!(schema_field_id(udf_schema_out, "udf_value") > sql_field_id);
+    assert!(schema_field_id(udf_schema_out, "udf_value") > 5);
     assert!(state.calls.load(Ordering::SeqCst) > 0);
     assert_eq!(
         state.calls.load(Ordering::SeqCst),
@@ -548,8 +548,8 @@ fn test_fragment_merge_and_update_match_native_oracle() {
     );
     assert_eq!(schema_field_id(merged_schema, "profile.score"), 4);
     assert_eq!(
-        fragment_physical_rows(merged_fragment),
-        native_merge.0.physical_rows.unwrap() as u64
+        fragment_metadata(merged_fragment)["physical_rows"].as_u64(),
+        native_merge.0.physical_rows.map(|rows| rows as u64)
     );
     assert_eq!(
         fragment_metadata(merged_fragment)["files"]
@@ -688,8 +688,8 @@ fn test_fragment_merge_and_update_match_native_oracle() {
     );
     unsafe { lance_fragment_update_columns_result_close(update_result) };
     assert_eq!(
-        fragment_physical_rows(updated_fragment),
-        native_update.fragment.physical_rows.unwrap() as u64
+        fragment_metadata(updated_fragment)["physical_rows"].as_u64(),
+        native_update.fragment.physical_rows.map(|rows| rows as u64)
     );
     assert_eq!(
         fragment_metadata(updated_fragment)["files"]
@@ -825,6 +825,33 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
     );
     assert_eq!((major, minor), (2, 2));
 
+    let native_v1_error = lance_c::runtime::block_on(async {
+        let native = native_fragment(&oracle_uri, 0).await;
+        let schema = native.dataset().schema().project(&["value"]).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+            ]))],
+        )
+        .unwrap();
+        native
+            .write_column_with_version(
+                futures::stream::iter([Ok(batch)]),
+                &schema,
+                lance_file::version::ConcreteFileVersion::V1,
+            )
+            .await
+            .unwrap_err()
+    });
+
     let mut v1_stream = one_column_stream("value", vec![Some(1), Some(2), Some(3), Some(4)]);
     let mut sentinel_group = 1usize as *mut LanceDataReplacementGroup;
     let unchanged_group = sentinel_group;
@@ -840,10 +867,11 @@ fn test_fragment_write_columns_and_offset_deletion_match_native_oracle() {
         },
         -1
     );
-    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!(sentinel_group, unchanged_group);
     take_stream_consumed(&v1_stream);
-    let _ = take_error();
+    let (_, message) = take_error();
+    assert_eq!(message, native_v1_error.to_string());
 
     let second = open_bound_fragment(&uri, 1);
     let native_delete = lance_c::runtime::block_on(async {
