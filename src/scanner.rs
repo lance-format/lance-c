@@ -360,7 +360,7 @@ struct ProbeConfig {
 }
 
 impl ProbeConfig {
-    fn exact(nprobes: u32) -> Result<Self> {
+    fn with_nprobes(self, nprobes: u32) -> Result<Self> {
         if nprobes == 0 {
             return Err(lance_core::Error::invalid_input_source(
                 "nprobes must be greater than 0, got 0".into(),
@@ -368,6 +368,7 @@ impl ProbeConfig {
         }
         Ok(Self {
             nprobes: Some(nprobes),
+            search_effort: self.search_effort,
             ..Self::default()
         })
     }
@@ -3916,7 +3917,7 @@ unsafe fn scanner_set_nprobes_inner(scanner: *mut LanceScanner, nprobes: u32) ->
     }
     let scanner = unsafe { &mut *scanner };
     scanner.ensure_scan_not_started("nprobes")?;
-    let next = ProbeConfig::exact(nprobes)?;
+    let next = scanner.probe.with_nprobes(nprobes)?;
     scanner.probe = next;
     Ok(0)
 }
@@ -5107,11 +5108,17 @@ mod tests {
 
         // The combined setter replaces both bounds.
         assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 4) }, 0);
-        assert_eq!(unsafe { &*scanner }.probe, ProbeConfig::exact(4).unwrap());
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig::default().with_nprobes(4).unwrap()
+        );
 
         // A failed partial update leaves both bounds unchanged.
         assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 5) }, -1);
-        assert_eq!(unsafe { &*scanner }.probe, ProbeConfig::exact(4).unwrap());
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig::default().with_nprobes(4).unwrap()
+        );
 
         // Widening the maximum first makes the new minimum valid.
         assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 6) }, 0);
@@ -5128,10 +5135,29 @@ mod tests {
 
         // A later combined call deterministically replaces the widened range.
         assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 3) }, 0);
-        assert_eq!(unsafe { &*scanner }.probe, ProbeConfig::exact(3).unwrap());
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig::default().with_nprobes(3).unwrap()
+        );
         assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 2) }, -1);
         assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 0) }, -1);
-        assert_eq!(unsafe { &*scanner }.probe, ProbeConfig::exact(3).unwrap());
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig::default().with_nprobes(3).unwrap()
+        );
+
+        // The combined setter clears explicit bounds but never discards an
+        // effort supplied before it.
+        assert_eq!(unsafe { lance_scanner_set_search_effort(scanner, 0.5) }, 0);
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 2) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig {
+                nprobes: Some(2),
+                search_effort: Some(0.5),
+                ..ProbeConfig::default()
+            }
+        );
 
         unsafe {
             lance_scanner_close(scanner);

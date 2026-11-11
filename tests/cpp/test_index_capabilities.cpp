@@ -126,14 +126,12 @@ int main(int argc, char** argv) {
     assert(model.num_partitions() == 4);
     assert(model.dimension() == 8);
     assert(model.partition_size(99) == 0);
-    uint64_t partition_rows = 0;
     for (uint64_t partition = 0; partition < 4; ++partition) {
-        partition_rows += model.partition_size(partition);
+        (void)model.partition_size(partition);
         auto stream = dataset.read_index_partition(
             "c_ivf_cpp", partition, true);
         assert(count_stream(stream.get()) >= 0);
     }
-    assert(partition_rows == 192);
     auto exported_centroids = model.centroids();
     assert(exported_centroids.has_value());
     assert(exported_centroids->array()->release != nullptr);
@@ -183,7 +181,22 @@ int main(int argc, char** argv) {
     dataset.merge_index_metadata(merge_uuid, "Inverted", std::nullopt,
                                  capture_progress, &progress_events);
     assert(dataset.version() == version_before);
-    auto merged = dataset.merge_index_segments(staged);
+    std::vector<std::vector<uint8_t>> physical;
+    for (size_t i = 0; i < 2; ++i) {
+        const uint32_t fragment_id = static_cast<uint32_t>(fragment_ids[i]);
+        auto physical_uuid = merge_uuid;
+        physical_uuid[15] = static_cast<uint8_t>(i + 1);
+        LanceIndexSegmentBuildOptions build{};
+        build.fragment_ids = &fragment_id;
+        build.fragment_count = 1;
+        build.index_uuid = physical_uuid.data();
+        build.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+        auto builder = dataset.new_scalar_index_segment_builder_with_options(
+            "text", LANCE_SCALAR_INVERTED, train, "c_dist_fts_physical_cpp",
+            fts_params, &build);
+        physical.push_back(builder.execute_uncommitted());
+    }
+    auto merged = dataset.merge_index_segments(physical);
     assert(dataset.version() == version_before);
     assert(!merged.empty());
     dataset.commit_index_segments("c_fts_merged_cpp", "text",

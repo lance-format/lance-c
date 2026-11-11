@@ -37753,6 +37753,11 @@ fn test_describe_and_statistics_match_native_metadata() {
         "{}",
         take_last_error_message()
     );
+    // Compare against persisted metadata rather than newer in-memory
+    // timestamps retained by the creating handle.
+    unsafe { lance_dataset_close(dataset) };
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
     let version = unsafe { lance_dataset_version(dataset) };
     let describe = take_json_value(unsafe { lance_dataset_describe_indices_json(dataset) });
     assert_eq!(unsafe { lance_dataset_version(dataset) }, version);
@@ -37923,11 +37928,6 @@ fn test_ivf_model_centroids_and_partition_streams() {
     assert!(unsafe { lance_ivf_model_has_centroids(model) });
     assert_eq!(unsafe { lance_ivf_model_num_partitions(model) }, 4);
     assert_eq!(unsafe { lance_ivf_model_dimension(model) }, 8);
-    let mut partition_rows = 0_u64;
-    for partition in 0..4 {
-        partition_rows += unsafe { lance_ivf_model_partition_size(model, partition) };
-    }
-    assert_eq!(partition_rows, 192);
     assert_eq!(unsafe { lance_ivf_model_partition_size(model, 99) }, 0);
     assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
 
@@ -37969,6 +37969,12 @@ fn test_ivf_model_centroids_and_partition_streams() {
         exported,
         vector_index.ivf_model().centroids_array().unwrap()
     );
+    for partition in 0..4 {
+        assert_eq!(
+            unsafe { lance_ivf_model_partition_size(model, partition) },
+            vector_index.ivf_model().partition_size(partition) as u64
+        );
+    }
 
     let mut flat_rows = 0_usize;
     for partition in 0..4 {
@@ -38561,6 +38567,46 @@ fn test_prewarm_scalar_train_and_index_merge_lifecycle() {
         metadata.push((bytes, len));
         unsafe { lance_index_segment_builder_free(builder) };
     }
+    let mut physical_metadata = Vec::new();
+    for (position, fragment_id) in fragment_ids[..2].iter().enumerate() {
+        let mut physical_uuid = index_uuid;
+        physical_uuid[15] = (position + 1) as u8;
+        let fragment_id = *fragment_id as u32;
+        let options = LanceIndexSegmentBuildOptions {
+            fragment_ids: &fragment_id,
+            fragment_count: 1,
+            index_uuid: physical_uuid.as_ptr(),
+            ivf_centroids: ptr::null_mut(),
+            ivf_centroids_schema: ptr::null(),
+            pq_codebook: ptr::null_mut(),
+            pq_codebook_schema: ptr::null(),
+            mode: LanceIndexSegmentBuildMode::Auto as i32,
+        };
+        let builder = unsafe {
+            lance_index_segment_builder_new_scalar_with_options(
+                dataset,
+                c_str("text").as_ptr(),
+                c_str("idx_caps_physical").as_ptr(),
+                LanceScalarIndexType::Inverted as i32,
+                fts_params.as_ptr(),
+                &train,
+                &options,
+            )
+        };
+        assert!(!builder.is_null(), "{}", take_last_error_message());
+        let mut bytes = ptr::null_mut();
+        let mut len = 0_usize;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len)
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        physical_metadata.push((bytes, len));
+        unsafe { lance_index_segment_builder_free(builder) };
+    }
 
     let version = unsafe { lance_dataset_version(dataset) };
     let progress = IndexMergeProgress {
@@ -38587,11 +38633,14 @@ fn test_prewarm_scalar_train_and_index_merge_lifecycle() {
     assert!(!progress.invalid.load(AtomicOrdering::SeqCst));
     assert_eq!(unsafe { lance_dataset_version(dataset) }, version);
 
-    let pointers = metadata
+    let pointers = physical_metadata
         .iter()
         .map(|(bytes, _)| *bytes as *const u8)
         .collect::<Vec<_>>();
-    let lengths = metadata.iter().map(|(_, len)| *len).collect::<Vec<_>>();
+    let lengths = physical_metadata
+        .iter()
+        .map(|(_, len)| *len)
+        .collect::<Vec<_>>();
     let mut merged = ptr::null_mut();
     let mut merged_len = 0_usize;
     assert_eq!(
@@ -38624,7 +38673,11 @@ fn test_prewarm_scalar_train_and_index_merge_lifecycle() {
     let mut parsed_source = ptr::null_mut();
     assert_eq!(
         unsafe {
-            lance_index_segment_metadata_parse(metadata[0].0, metadata[0].1, &mut parsed_source)
+            lance_index_segment_metadata_parse(
+                physical_metadata[0].0,
+                physical_metadata[0].1,
+                &mut parsed_source,
+            )
         },
         0
     );
@@ -38719,6 +38772,9 @@ fn test_prewarm_scalar_train_and_index_merge_lifecycle() {
         lance_index_segment_metadata_free(merged_metadata);
         lance_free_bytes(merged);
         for (bytes, _) in metadata {
+            lance_free_bytes(bytes);
+        }
+        for (bytes, _) in physical_metadata {
             lance_free_bytes(bytes);
         }
         lance_dataset_close(dataset);
