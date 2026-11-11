@@ -41547,6 +41547,23 @@ fn test_prewarm_scalar_train_and_index_merge_lifecycle() {
     let _ = take_last_error_message();
     assert_eq!(
         unsafe {
+            lance_dataset_merge_index_segments(
+                dataset,
+                pointers.as_ptr(),
+                lengths.as_ptr(),
+                usize::MAX,
+                &mut untouched_bytes,
+                &mut untouched_len,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(untouched_bytes.is_null());
+    assert_eq!(untouched_len, usize::MAX);
+    let _ = take_last_error_message();
+    assert_eq!(
+        unsafe {
             lance_dataset_merge_index_metadata(
                 dataset,
                 index_uuid.as_ptr(),
