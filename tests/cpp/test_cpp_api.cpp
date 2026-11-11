@@ -1208,6 +1208,7 @@ static void test_blob_planned_reads(const std::string& blob_uri) {
             std::vector<uint64_t>{7, 2, 3, 4, 9, 0});
         // Dataset destruction must not invalidate the exported stream.
     }
+    assert(static_cast<bool>(stream));
     ArrowSchema schema{};
     assert(stream->get_schema(stream.get(), &schema) == 0);
     assert(schema.n_children == 2);
@@ -1265,6 +1266,7 @@ static void test_blob_planned_reads(const std::string& blob_uri) {
             {4, 1000, 100},
         },
         read_options);
+    assert(static_cast<bool>(range_stream));
     ArrowSchema range_schema{};
     assert(range_stream->get_schema(range_stream.get(), &range_schema) == 0);
     assert(range_schema.n_children == 5);

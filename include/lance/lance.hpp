@@ -3402,13 +3402,13 @@ public:
             : LANCE_BLOB_READ_UNORDERED;
         const uint64_t* rows_ptr =
             selector == BlobRowSelector::None ? nullptr : rows.data();
-        ArrowStream stream;
+        ArrowArrayStream stream{};
         if (lance_dataset_read_blobs(
                 handle_.get(), column.c_str(), static_cast<int32_t>(selector),
-                rows_ptr, rows.size(), &raw, stream.get()) != 0) {
+                rows_ptr, rows.size(), &raw, &stream) != 0) {
             check_error();
         }
-        return stream;
+        return ArrowStream(stream);
     }
 
     /// Plan and stream one blob-local range read per request. Returns the
@@ -3439,13 +3439,13 @@ public:
             : LANCE_BLOB_READ_UNORDERED;
         const LanceBlobRangeRequest* requests_ptr =
             selector == BlobRowSelector::None ? nullptr : raw_requests.data();
-        ArrowStream stream;
+        ArrowArrayStream stream{};
         if (lance_dataset_read_blob_ranges(
                 handle_.get(), column.c_str(), static_cast<int32_t>(selector),
-                requests_ptr, raw_requests.size(), &raw, stream.get()) != 0) {
+                requests_ptr, raw_requests.size(), &raw, &stream) != 0) {
             check_error();
         }
-        return stream;
+        return ArrowStream(stream);
     }
 
     /// Create a Scanner builder for this dataset.
