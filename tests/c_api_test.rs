@@ -29108,7 +29108,7 @@ fn data_file_page_payloads(uri: &str) -> Vec<Vec<u8>> {
         let mut payloads = Vec::new();
         for fragment in dataset.get_fragments().iter() {
             for data_file in &fragment.metadata().files {
-                let full_uri = format!("{}/{}", uri.trim_end_matches('/'), data_file.path);
+                let full_uri = format!("{}/data/{}", uri.trim_end_matches('/'), data_file.path);
                 let object_path =
                     ObjectStore::extract_path_from_uri(Arc::new(Default::default()), &full_uri)
                         .unwrap();
@@ -29120,8 +29120,12 @@ fn data_file_page_payloads(uri: &str) -> Vec<Vec<u8>> {
                     LanceFileReader::read_all_metadata(&file_scheduler)
                         .await
                         .unwrap();
-                let file_bytes =
-                    std::fs::read(std::path::Path::new(&uri).join(&data_file.path)).unwrap();
+                let file_bytes = std::fs::read(
+                    std::path::Path::new(&uri)
+                        .join("data")
+                        .join(&data_file.path),
+                )
+                .unwrap();
                 for column in &metadata.column_infos {
                     for page in column.page_infos.iter() {
                         let mut payload = Vec::new();
