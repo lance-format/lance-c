@@ -120,7 +120,7 @@ fn transaction_at<'a>(transaction: *const LanceTransaction) -> Result<&'a LanceT
     Ok(unsafe { &*transaction })
 }
 
-fn operation_at<'a>(operation: *const LanceOperation) -> Result<&'a LanceOperation> {
+pub(crate) fn operation_at<'a>(operation: *const LanceOperation) -> Result<&'a LanceOperation> {
     if operation.is_null() {
         return Err(lance_core::Error::invalid_input_source(
             "operation must not be NULL".into(),

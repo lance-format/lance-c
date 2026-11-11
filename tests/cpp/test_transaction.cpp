@@ -121,6 +121,148 @@ static std::vector<int32_t> collect_cpp_ids(const std::string& uri) {
     return ids;
 }
 
+
+struct RowPair {
+    int64_t id;
+    uint64_t rowid;
+};
+
+static std::vector<RowPair> read_id_rowid_pairs(lance::Dataset& dataset) {
+    auto scanner = dataset.scan();
+    scanner.project(std::vector<lance::ProjectionColumn>{{"id", "id"}});
+    scanner.with_row_id(true);
+    ArrowArrayStream stream;
+    std::memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    std::vector<RowPair> rows;
+    for (;;) {
+        ArrowArray batch;
+        std::memset(&batch, 0, sizeof(batch));
+        CHECK(stream.get_next(&stream, &batch) == 0);
+        if (!batch.release) break;
+        CHECK(batch.n_children == 2);
+        const ArrowArray* ids = batch.children[0];
+        const ArrowArray* rowids = batch.children[1];
+        CHECK(ids->buffers[1] != nullptr);
+        CHECK(rowids->buffers[1] != nullptr);
+        const auto* id_values =
+            static_cast<const int64_t*>(ids->buffers[1]);
+        const auto* rowid_values =
+            static_cast<const uint64_t*>(rowids->buffers[1]);
+        for (int64_t i = 0; i < batch.length; ++i) {
+            rows.push_back(RowPair{id_values[ids->offset + i],
+                                   rowid_values[rowids->offset + i]});
+        }
+        batch.release(&batch);
+    }
+    stream.release(&stream);
+    return rows;
+}
+
+static void test_native_schema(const std::string& uri) {
+    auto old_dataset = lance::Dataset::open(uri);
+    const uint64_t old_version = old_dataset.version();
+    CHECK(old_dataset.count_rows() == 8);
+    CHECK(old_dataset.fragment_count() == 3);
+    CHECK(old_dataset.has_stable_row_ids());
+
+    auto schema = old_dataset.native_schema();
+    CHECK(schema.field_id("id") == 0);
+    CHECK(schema.field_id("name") == 2);
+    CHECK(schema.field_id("profile") == 3);
+    CHECK(schema.field_id("profile.score") == 4);
+    CHECK(schema.field_id("profile.tags") == 5);
+
+    ArrowSchema arrow;
+    std::memset(&arrow, 0, sizeof(arrow));
+    schema.to_arrow(&arrow);
+    CHECK(arrow.n_children == 3);
+    CHECK(std::string(arrow.children[0]->name) == "id");
+    CHECK(std::string(arrow.children[2]->name) == "profile");
+    arrow.release(&arrow);
+
+    auto clone = schema.clone();
+    bool threw = false;
+    try {
+        (void)clone.field_id("missing.column");
+    } catch (const lance::Error& error) {
+        threw = true;
+        CHECK(error.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    CHECK(threw);
+
+    const auto before = read_id_rowid_pairs(old_dataset);
+    CHECK(before.size() == 8);
+
+    auto projected =
+        lance::LanceSchema::project(schema, {"id", "name"});
+    CHECK(projected.field_id("id") == 0);
+    CHECK(projected.field_id("name") == 2);
+    threw = false;
+    try {
+        (void)projected.field_id("profile.tags");
+    } catch (const lance::Error& error) {
+        threw = true;
+        CHECK(error.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    CHECK(threw);
+
+    auto non_preserving =
+        lance::Operation::make_project(projected, false);
+    CHECK(non_preserving.kind() == lance::OperationKind::Project);
+    CHECK(!non_preserving.preserves_nullability());
+
+    auto operation = lance::Operation::make_project(projected, true);
+    CHECK(operation.kind() == lance::OperationKind::Project);
+    CHECK(operation.preserves_nullability());
+    auto operation_schema = lance::LanceSchema::from_operation(operation);
+    CHECK(operation_schema.field_id("name") == 2);
+    auto operation_schema_clone = operation_schema.clone();
+    CHECK(operation_schema_clone.field_id("id") == 0);
+
+    lance::CommitOptions commit_options;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = lance::CommitTimeoutMode::Disabled;
+    projected = lance::LanceSchema::project(schema, {"id", "name"});
+    operation = lance::Operation::make_project(projected, true);
+    auto transaction =
+        lance::Transaction::from_operation(old_version, operation);
+    auto committed = lance::Dataset::commit(uri, transaction, commit_options);
+    CHECK(committed.version() == old_version + 1);
+    CHECK(committed.count_rows() == 8);
+    CHECK(committed.fragment_count() == 3);
+    CHECK(committed.native_schema().field_id("name") == 2);
+
+    // The pre-commit snapshot keeps its original schema and rows.
+    CHECK(old_dataset.count_rows() == 8);
+    CHECK(old_dataset.native_schema().field_id("profile.tags") == 5);
+
+    auto reopened = lance::Dataset::open(uri);
+    CHECK(reopened.version() == old_version + 1);
+    CHECK(reopened.count_rows() == 8);
+    CHECK(reopened.fragment_count() == 3);
+    auto reopened_schema = reopened.native_schema();
+    CHECK(reopened_schema.field_id("id") == 0);
+    CHECK(reopened_schema.field_id("name") == 2);
+    ArrowSchema reopened_arrow;
+    std::memset(&reopened_arrow, 0, sizeof(reopened_arrow));
+    reopened_schema.to_arrow(&reopened_arrow);
+    CHECK(reopened_arrow.n_children == 2);
+    reopened_arrow.release(&reopened_arrow);
+    CHECK(reopened.count_rows("id = 2") == 0);
+    CHECK(reopened.count_rows("name = 'alpha'") == 3);
+    CHECK(reopened.count_rows("name = 'beta'") == 2);
+    CHECK(reopened.count_rows("name = 'gamma'") == 3);
+
+    const auto after = read_id_rowid_pairs(reopened);
+    CHECK(after.size() == before.size());
+    for (size_t i = 0; i < after.size(); ++i) {
+        CHECK(after[i].id == before[i].id);
+        CHECK(after[i].rowid == before[i].rowid);
+    }
+    std::printf("C++ native schema and Project OK\n");
+}
+
 static void test_create_append_overwrite_and_batch(
     const std::string& source_uri,
     const std::string& base) {
@@ -645,9 +787,11 @@ static void test_data_replacement(const std::string& source_uri,
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
+    if (argc != 4) {
         std::fprintf(stderr,
-                     "usage: %s <source-dataset-uri> <base-path>\n", argv[0]);
+                     "usage: %s <source-dataset-uri> <base-path> "
+                     "<native-schema-uri>\n",
+                     argv[0]);
         return 2;
     }
     try {
@@ -656,6 +800,8 @@ int main(int argc, char** argv) {
         test_fragment_delete(argv[1], argv[2]);
         test_create_index_operation(argv[1], argv[2]);
         test_data_replacement(argv[1], argv[2]);
+
+        test_native_schema(argv[3]);
     } catch (const lance::Error& error) {
         std::fprintf(stderr, "lance::Error(%d): %s\n",
                      static_cast<int>(error.code), error.what());

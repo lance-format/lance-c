@@ -18,9 +18,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
+use arrow_array::builder::ListBuilder;
+use arrow_array::types::Int32Type;
 use arrow_array::{
-    BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
-    StructArray, UInt32Array,
+    BinaryArray, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, StructArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use lance::Dataset;
@@ -174,6 +176,147 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
         .unwrap();
     });
 
+    (tmp, uri)
+}
+
+/// Three-fragment, stable-row-ID fixture with non-contiguous field IDs, nested
+/// fields, a dictionary column, and root/field metadata. Arrow export loses
+/// these native details, so consumers use it as the native-schema oracle.
+fn create_native_schema_fixture(name: &str) -> (tempfile::TempDir, String) {
+    use std::collections::HashMap;
+
+    fn field(name: &str, data_type: DataType, nullable: bool, extra: &[(&str, &str)]) -> Field {
+        let mut metadata = HashMap::new();
+        for (key, value) in extra {
+            metadata.insert((*key).to_string(), (*value).to_string());
+        }
+        Field::new(name, data_type, nullable).with_metadata(metadata)
+    }
+
+    fn dictionary_names(keys: &[i32]) -> std::sync::Arc<dyn arrow_array::Array> {
+        let values = std::sync::Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"]));
+        let keys = Int32Array::from(keys.to_vec());
+        std::sync::Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap())
+    }
+
+    fn tags_list(rows: &[&[&str]]) -> std::sync::Arc<dyn arrow_array::Array> {
+        let mut builder = ListBuilder::new(arrow_array::builder::StringBuilder::new());
+        for tags in rows {
+            for tag in *tags {
+                builder.values().append_value(*tag);
+            }
+            builder.append(true);
+        }
+        std::sync::Arc::new(builder.finish())
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join(name).to_str().unwrap().to_string();
+    let score = field(
+        "score",
+        DataType::Int32,
+        true,
+        &[("fixture_role", "nested-score")],
+    );
+    let tags = field(
+        "tags",
+        DataType::List(std::sync::Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))),
+        true,
+        &[("fixture_role", "nested-tags")],
+    );
+    let profile = field(
+        "profile",
+        DataType::Struct(Fields::from(vec![score, tags])),
+        true,
+        &[("fixture_role", "profile")],
+    );
+    let id = field("id", DataType::Int64, false, &[("fixture_role", "row-id")]);
+    let name = field(
+        "name",
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        true,
+        &[("fixture_role", "dictionary-name")],
+    );
+    let drop_me = field("drop_me", DataType::Utf8, true, &[]);
+    let mut metadata = HashMap::new();
+    metadata.insert("fixture".to_string(), "native-schema".to_string());
+    metadata.insert("owner".to_string(), "lance-c".to_string());
+    let schema = std::sync::Arc::new(Schema::new_with_metadata(
+        vec![id, drop_me, name, profile],
+        metadata,
+    ));
+
+    let make_batch = |ids: &[i64], name_keys: &[i32]| {
+        let names = dictionary_names(name_keys);
+        let scores = std::sync::Arc::new(Int32Array::from(
+            ids.iter()
+                .map(|id| Some(*id as i32 * 10))
+                .collect::<Vec<_>>(),
+        ));
+        let tag_rows: Vec<Vec<&str>> = ids
+            .iter()
+            .map(|id| vec!["tag-a", if id % 2 == 0 { "even" } else { "odd" }])
+            .collect();
+        let tag_refs: Vec<&[&str]> = tag_rows.iter().map(|tags| tags.as_slice()).collect();
+        let tags = tags_list(&tag_refs);
+        let profile_fields = match &schema.field(3).data_type() {
+            DataType::Struct(fields) => fields.clone(),
+            other => panic!("profile must be a struct, got {other:?}"),
+        };
+        let profile = std::sync::Arc::new(
+            StructArray::try_new(profile_fields, vec![scores, tags], None).unwrap(),
+        );
+        let drop_me = std::sync::Arc::new(StringArray::from(vec!["drop"; ids.len()]));
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(Int64Array::from(ids.to_vec())),
+                drop_me,
+                names,
+                profile,
+            ],
+        )
+        .unwrap()
+    };
+
+    let first = make_batch(&[1, 2, 3], &[0, 1, 2]);
+    let second = make_batch(&[4, 5], &[1, 0]);
+    let third = make_batch(&[6, 7, 8, 9], &[2, 2, 0, 1]);
+    lance_c::runtime::block_on(async {
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            Some(params),
+        )
+        .await
+        .unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(third)], schema),
+                None,
+            )
+            .await
+            .unwrap();
+        // Dropping `drop_me` leaves a real gap in the surviving field IDs.
+        dataset.drop_columns(&["drop_me"]).await.unwrap();
+        dataset.delete("id = 2").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
+    });
     (tmp, uri)
 }
 
@@ -821,6 +964,30 @@ fn run_test_binary_with_two_args(binary: &Path, first: &str, second: &str) {
     );
 }
 
+fn run_test_binary_with_three_args(binary: &Path, first: &str, second: &str, third: &str) {
+    let output = Command::new(binary)
+        .arg(first)
+        .arg(second)
+        .arg(third)
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("--- stdout ---\n{stdout}");
+    if !stderr.is_empty() {
+        eprintln!("--- stderr ---\n{stderr}");
+    }
+    assert!(
+        output.status.success(),
+        "Test binary {} failed with exit code {:?}\nstdout: {}\nstderr: {}",
+        binary.display(),
+        output.status.code(),
+        stdout,
+        stderr
+    );
+}
+
 #[test]
 #[ignore = "requires C compiler (cc); run with: cargo test -p lance-c -- --ignored test_c_compilation"]
 fn test_c_compilation_and_execution() {
@@ -970,6 +1137,8 @@ fn test_native_index_capabilities_consumers() {
 fn test_native_transaction_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
     let (tmp, dataset_uri) = create_test_dataset_on_disk();
+    let (_c_schema_tmp, c_schema_uri) = create_native_schema_fixture("c_native_schema");
+    let (_cpp_schema_tmp, cpp_schema_uri) = create_native_schema_fixture("cpp_native_schema");
     let base = tmp.path().join("native_transactions");
     std::fs::create_dir_all(&base).unwrap();
     let base = base.to_str().unwrap();
@@ -984,7 +1153,7 @@ fn test_native_transaction_compilation_and_execution() {
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C transaction test compilation failed"
     );
-    run_test_binary_with_two_args(&c_binary, &dataset_uri, base);
+    run_test_binary_with_three_args(&c_binary, &dataset_uri, base, &c_schema_uri);
 
     let cpp_source = tests_dir.join("test_transaction.cpp");
     let cpp_binary = build_dir.path().join("test_transaction_cpp");
@@ -992,7 +1161,7 @@ fn test_native_transaction_compilation_and_execution() {
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ transaction test compilation failed"
     );
-    run_test_binary_with_two_args(&cpp_binary, &dataset_uri, base);
+    run_test_binary_with_three_args(&cpp_binary, &dataset_uri, base, &cpp_schema_uri);
 }
 
 #[test]
