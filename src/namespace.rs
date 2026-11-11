@@ -1118,6 +1118,14 @@ type NamespaceOperationCallback = unsafe extern "C" fn(
     out_error: *mut LanceCallbackError,
 ) -> i32;
 
+type NamespaceDispatchCallback = unsafe extern "C" fn(
+    client_ctx: *mut c_void,
+    operation: *const c_char,
+    request_json: *const c_char,
+    out_response_json: *mut LanceOwnedString,
+    out_error: *mut LanceCallbackError,
+) -> i32;
+
 /// Foreign client for the four managed table/version callbacks that Python's
 /// custom namespace client implements.
 ///
@@ -1134,6 +1142,28 @@ pub struct LanceNamespaceCustomClientSpec {
     pub describe_table_version: Option<NamespaceOperationCallback>,
     pub create_table_version: Option<NamespaceOperationCallback>,
     pub list_table_versions: Option<NamespaceOperationCallback>,
+    pub release: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub client_ctx: *mut c_void,
+    /// Optional copied identity used in native storage-provider cache keys.
+    /// NULL or empty assigns a unique identity for this client's lifetime.
+    pub namespace_id: *const c_char,
+}
+
+/// Foreign client using one dispatch callback for the same four managed
+/// table/version operations.
+///
+/// The callback receives the exact native snake_case operation name:
+/// `describe_table`, `describe_table_version`, `create_table_version`, or
+/// `list_table_versions`. The operation and request JSON are borrowed for the
+/// callback only. All other operations keep the native trait defaults and fail
+/// with native `Unsupported`.
+///
+/// Ownership and callback execution follow [`LanceNamespaceCustomClientSpec`]:
+/// `client_ctx` and `release` transfer on every constructor call, including
+/// construction failure, and are released after the final native owner drops.
+#[repr(C)]
+pub struct LanceNamespaceCustomClientDispatchSpec {
+    pub dispatch: Option<NamespaceDispatchCallback>,
     pub release: Option<unsafe extern "C" fn(*mut c_void)>,
     pub client_ctx: *mut c_void,
     /// Optional copied identity used in native storage-provider cache keys.
@@ -1174,10 +1204,49 @@ unsafe fn custom_new_inner(
     let namespace = CustomNamespace {
         id,
         context,
-        describe_table,
-        describe_table_version,
-        create_table_version,
-        list_table_versions,
+        callbacks: CustomOperationCallbacks::Fixed(FixedNamespaceCallbacks {
+            describe_table,
+            describe_table_version,
+            create_table_version,
+            list_table_versions,
+        }),
+    };
+    Ok(Box::into_raw(Box::new(LanceNamespace {
+        inner: NamespaceKind::Custom(Arc::new(namespace)),
+    })))
+}
+
+/// Create a foreign-client namespace with one shared dispatch callback.
+///
+/// See [`LanceNamespaceCustomClientDispatchSpec`] for the operation names and
+/// ownership contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_namespace_custom_dispatch_new(
+    spec: *const LanceNamespaceCustomClientDispatchSpec,
+) -> *mut LanceNamespace {
+    ffi_guard_with(
+        || unsafe { custom_dispatch_new_inner(spec) },
+        |_| ptr::null_mut(),
+    )
+}
+
+unsafe fn custom_dispatch_new_inner(
+    spec: *const LanceNamespaceCustomClientDispatchSpec,
+) -> Result<*mut LanceNamespace> {
+    let spec = unsafe { spec.as_ref() }
+        .ok_or_else(|| Error::invalid_input_source("spec must not be NULL".into()))?;
+    let context = OwnedCallbackContext::new(spec.client_ctx, spec.release);
+    let dispatch = spec
+        .dispatch
+        .ok_or_else(|| Error::invalid_input_source("spec.dispatch must not be NULL".into()))?;
+    let id = unsafe { parse_c_string(spec.namespace_id)? }
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let namespace = CustomNamespace {
+        id,
+        context,
+        callbacks: CustomOperationCallbacks::Dispatch(dispatch),
     };
     Ok(Box::into_raw(Box::new(LanceNamespace {
         inner: NamespaceKind::Custom(Arc::new(namespace)),
@@ -1225,13 +1294,84 @@ impl Drop for OwnedCallbackContext {
     }
 }
 
-struct CustomNamespace {
-    id: String,
-    context: OwnedCallbackContext,
+#[derive(Clone, Copy)]
+struct FixedNamespaceCallbacks {
     describe_table: NamespaceOperationCallback,
     describe_table_version: NamespaceOperationCallback,
     create_table_version: NamespaceOperationCallback,
     list_table_versions: NamespaceOperationCallback,
+}
+
+#[derive(Clone, Copy)]
+enum CustomOperation {
+    DescribeTable,
+    DescribeTableVersion,
+    CreateTableVersion,
+    ListTableVersions,
+}
+
+impl CustomOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DescribeTable => "describe_table",
+            Self::DescribeTableVersion => "describe_table_version",
+            Self::CreateTableVersion => "create_table_version",
+            Self::ListTableVersions => "list_table_versions",
+        }
+    }
+
+    fn as_c_ptr(self) -> *const c_char {
+        match self {
+            Self::DescribeTable => c"describe_table".as_ptr(),
+            Self::DescribeTableVersion => c"describe_table_version".as_ptr(),
+            Self::CreateTableVersion => c"create_table_version".as_ptr(),
+            Self::ListTableVersions => c"list_table_versions".as_ptr(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CustomOperationCallbacks {
+    Fixed(FixedNamespaceCallbacks),
+    Dispatch(NamespaceDispatchCallback),
+}
+
+impl CustomOperationCallbacks {
+    unsafe fn call(
+        self,
+        operation: CustomOperation,
+        client_ctx: *mut c_void,
+        request_json: *const c_char,
+        out_response_json: *mut LanceOwnedString,
+        out_error: *mut LanceCallbackError,
+    ) -> i32 {
+        match self {
+            Self::Fixed(callbacks) => {
+                let callback = match operation {
+                    CustomOperation::DescribeTable => callbacks.describe_table,
+                    CustomOperation::DescribeTableVersion => callbacks.describe_table_version,
+                    CustomOperation::CreateTableVersion => callbacks.create_table_version,
+                    CustomOperation::ListTableVersions => callbacks.list_table_versions,
+                };
+                unsafe { callback(client_ctx, request_json, out_response_json, out_error) }
+            }
+            Self::Dispatch(callback) => unsafe {
+                callback(
+                    client_ctx,
+                    operation.as_c_ptr(),
+                    request_json,
+                    out_response_json,
+                    out_error,
+                )
+            },
+        }
+    }
+}
+
+struct CustomNamespace {
+    id: String,
+    context: OwnedCallbackContext,
+    callbacks: CustomOperationCallbacks,
 }
 
 impl fmt::Debug for CustomNamespace {
@@ -1246,9 +1386,8 @@ impl fmt::Debug for CustomNamespace {
 impl CustomNamespace {
     fn invoke<Request: Serialize, Response: DeserializeOwned>(
         &self,
-        callback: NamespaceOperationCallback,
+        operation: CustomOperation,
         request: &Request,
-        operation: &str,
     ) -> Result<Response> {
         let request_json = serde_json::to_string(request)?;
         let request_json = CString::new(request_json)
@@ -1257,7 +1396,8 @@ impl CustomNamespace {
         let mut error = LanceCallbackError::empty();
         // Foreign callbacks may synchronously read through independent handles.
         let status = tokio::task::block_in_place(|| unsafe {
-            callback(
+            self.callbacks.call(
+                operation,
                 self.context.callback_ctx,
                 request_json.as_ptr(),
                 &mut response,
@@ -1265,9 +1405,11 @@ impl CustomNamespace {
             )
         });
         let error_code = error.code;
-        let error_message = unsafe { take_owned_string(&mut error.message) }.into_display_string(
-            &format!("{operation} callback returned error status {status} without a message"),
-        );
+        let error_message =
+            unsafe { take_owned_string(&mut error.message) }.into_display_string(&format!(
+                "{} callback returned error status {status} without a message",
+                operation.as_str()
+            ));
         unsafe { release_message_only(&mut error) };
         if status != 0 {
             // Release a partial response even on failure so callback-owned
@@ -1276,15 +1418,20 @@ impl CustomNamespace {
             return Err(namespace_error_from_callback(
                 error_code,
                 error_message,
-                operation,
+                operation.as_str(),
             ));
         }
         let response_json = unsafe { take_owned_string(&mut response) }.into_string(&format!(
-            "{operation} callback returned non-UTF-8 response JSON"
+            "{} callback returned non-UTF-8 response JSON",
+            operation.as_str()
         ))?;
         serde_json::from_str(&response_json).map_err(|error| {
             Error::invalid_input_source(
-                format!("{operation} callback returned invalid JSON response: {error}").into(),
+                format!(
+                    "{} callback returned invalid JSON response: {error}",
+                    operation.as_str()
+                )
+                .into(),
             )
         })
     }
@@ -1317,32 +1464,28 @@ impl NativeLanceNamespace for CustomNamespace {
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
-        self.invoke(self.describe_table, &request, "describe_table")
+        self.invoke(CustomOperation::DescribeTable, &request)
     }
 
     async fn describe_table_version(
         &self,
         request: DescribeTableVersionRequest,
     ) -> Result<DescribeTableVersionResponse> {
-        self.invoke(
-            self.describe_table_version,
-            &request,
-            "describe_table_version",
-        )
+        self.invoke(CustomOperation::DescribeTableVersion, &request)
     }
 
     async fn create_table_version(
         &self,
         request: CreateTableVersionRequest,
     ) -> Result<CreateTableVersionResponse> {
-        self.invoke(self.create_table_version, &request, "create_table_version")
+        self.invoke(CustomOperation::CreateTableVersion, &request)
     }
 
     async fn list_table_versions(
         &self,
         request: ListTableVersionsRequest,
     ) -> Result<ListTableVersionsResponse> {
-        self.invoke(self.list_table_versions, &request, "list_table_versions")
+        self.invoke(CustomOperation::ListTableVersions, &request)
     }
 }
 

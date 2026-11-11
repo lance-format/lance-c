@@ -10026,6 +10026,48 @@ LanceNamespace* lance_namespace_custom_new(
     const LanceNamespaceCustomClientSpec* spec
 );
 
+/**
+ * Shared dispatch callback for the same four managed table/version operations.
+ *
+ * `operation` is one of the exact native snake_case names
+ * "describe_table", "describe_table_version", "create_table_version", or
+ * "list_table_versions". It is borrowed for this callback only and must not be
+ * retained. `request_json` has the same call-scoped lifetime. Response JSON
+ * ownership, callback errors, reentrant blocking behavior, and unsupported
+ * operations are identical to the per-operation callbacks above.
+ */
+typedef int32_t (*LanceNamespaceCustomDispatchFn)(
+    void* client_ctx,
+    const char* operation,
+    const char* request_json,
+    LanceOwnedString* out_response_json,
+    LanceCallbackError* out_error
+);
+
+/**
+ * Foreign client with one dispatch callback for the four managed
+ * table/version operations.
+ *
+ * Ownership of `client_ctx` and `release` transfers when this spec is passed
+ * to `lance_namespace_custom_dispatch_new`, including on construction failure.
+ * The context is released exactly once after the final native namespace Arc
+ * drops. `namespace_id` follows the same copied identity and cache semantics as
+ * LanceNamespaceCustomClientSpec. All operations other than the four listed
+ * above keep native Unsupported behavior.
+ */
+typedef struct LanceNamespaceCustomClientDispatchSpec {
+    LanceNamespaceCustomDispatchFn dispatch;
+    void (*release)(void* client_ctx);
+    void* client_ctx;
+    /** Copied identity used in native storage-provider cache keys. NULL or
+     * empty assigns a unique identity stable for this client's lifetime. */
+    const char* namespace_id;
+} LanceNamespaceCustomClientDispatchSpec;
+
+LanceNamespace* lance_namespace_custom_dispatch_new(
+    const LanceNamespaceCustomClientDispatchSpec* spec
+);
+
 /* ─── Raw Lance-file session ──────────────────────────────────────────────── */
 
 typedef struct LanceFileSession LanceFileSession;

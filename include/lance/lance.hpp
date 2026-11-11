@@ -12143,12 +12143,20 @@ class Namespace {
         std::function<std::string(const std::string&)> list_table_versions;
     };
 
+    struct CustomDispatchContext {
+        std::function<std::string(const std::string&, const std::string&)> dispatch;
+    };
+
     static void context_provider_release(void* ctx) noexcept {
         delete static_cast<ContextProviderContext*>(ctx);
     }
 
     static void custom_client_release(void* ctx) noexcept {
         delete static_cast<CustomClientContext*>(ctx);
+    }
+
+    static void custom_dispatch_release(void* ctx) noexcept {
+        delete static_cast<CustomDispatchContext*>(ctx);
     }
 
     static int32_t context_provider_call(
@@ -12188,13 +12196,12 @@ class Namespace {
         return 1;
     }
 
+    template <typename Callback>
     static int32_t invoke_custom(
-        CustomClientContext* ctx,
-        std::function<std::string(const std::string&)>& callback,
+        Callback&& callback,
         const char* request_json,
         LanceOwnedString* out_json,
         LanceCallbackError* out_error) noexcept {
-        (void)ctx;
         try {
             std::string response = callback(request_json ? request_json : "{}");
             namespace_detail::set_owned_string(out_json, std::move(response));
@@ -12217,22 +12224,41 @@ class Namespace {
     static int32_t custom_describe_table(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->describe_table, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->describe_table(request);
+        }, req, out, err);
     }
     static int32_t custom_describe_table_version(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->describe_table_version, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->describe_table_version(request);
+        }, req, out, err);
     }
     static int32_t custom_create_table_version(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->create_table_version, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->create_table_version(request);
+        }, req, out, err);
     }
     static int32_t custom_list_table_versions(
         void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
         auto* client = static_cast<CustomClientContext*>(ctx);
-        return invoke_custom(client, client->list_table_versions, req, out, err);
+        return invoke_custom([client](const char* request) {
+            return client->list_table_versions(request);
+        }, req, out, err);
+    }
+    static int32_t custom_dispatch_call(
+        void* ctx,
+        const char* operation,
+        const char* req,
+        LanceOwnedString* out,
+        LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomDispatchContext*>(ctx);
+        return invoke_custom([client, operation](const char* request) {
+            return client->dispatch(operation ? operation : "", request);
+        }, req, out, err);
     }
 
     static LanceNamespaceContextProviderSpec make_context_spec(
@@ -12258,6 +12284,16 @@ public:
         std::function<std::string(const std::string&)> describe_table_version;
         std::function<std::string(const std::string&)> create_table_version;
         std::function<std::string(const std::string&)> list_table_versions;
+        /// Empty assigns a unique identity stable for this client's lifetime.
+        std::string namespace_id;
+    };
+
+    /// Foreign client using one callback for the same four managed-version
+    /// operations. The callback receives the exact native snake_case operation
+    /// name and native request JSON; both strings are borrowed for the call
+    /// only. Other operations keep native Unsupported.
+    struct CustomDispatchSpec {
+        std::function<std::string(const std::string&, const std::string&)> dispatch;
         /// Empty assigns a unique identity stable for this client's lifetime.
         std::string namespace_id;
     };
@@ -12330,6 +12366,26 @@ public:
         c_spec.client_ctx = ctx;
         c_spec.namespace_id = spec.namespace_id.c_str();
         auto* raw = lance_namespace_custom_new(&c_spec);
+        // The C constructor consumes the context on every invocation.
+        guard.release();
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    static Namespace custom_dispatch(const CustomDispatchSpec& spec) {
+        if (!spec.dispatch) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "custom dispatch namespace requires a dispatch callback");
+        }
+        auto* ctx = new CustomDispatchContext{spec.dispatch};
+        std::unique_ptr<CustomDispatchContext> guard(ctx);
+        LanceNamespaceCustomClientDispatchSpec c_spec{};
+        c_spec.dispatch = &custom_dispatch_call;
+        c_spec.release = &custom_dispatch_release;
+        c_spec.client_ctx = ctx;
+        c_spec.namespace_id = spec.namespace_id.c_str();
+        auto* raw = lance_namespace_custom_dispatch_new(&c_spec);
         // The C constructor consumes the context on every invocation.
         guard.release();
         if (!raw) check_error();
