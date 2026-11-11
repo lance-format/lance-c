@@ -1158,6 +1158,17 @@ fn writer_zero_column_and_failure_boundaries_are_native() {
     let zero_uri_c = c_string(zero_uri.to_str().unwrap());
     let zero_batch = zero_column_batch();
     let zero_schema = FFI_ArrowSchema::try_from(zero_batch.schema().as_ref()).unwrap();
+    let native_zero_uri = root.path().join("native-zero.lance");
+    let native_zero_success = native_success(|| {
+        let mut native = native_writer(
+            native_zero_uri.to_str().unwrap(),
+            &Schema::empty(),
+            NativeWriterOptions::default(),
+        )?;
+        native_write_batch(&mut native, &zero_batch)?;
+        lance_c::runtime::block_on(native.finish())?;
+        Ok::<(), lance_core::Error>(())
+    });
     let writer = unsafe {
         lance_file_writer_open(
             zero_uri_c.as_ptr(),
@@ -1176,7 +1187,8 @@ fn writer_zero_column_and_failure_boundaries_are_native() {
     } else {
         -1
     };
-    if write_status != 0 || finish_status != 0 {
+    let c_zero_success = write_status == 0 && finish_status == 0;
+    if !c_zero_success {
         let (code, message) = take_error();
         assert_eq!(code, LanceErrorCode::InvalidArgument);
         assert!(!message.is_empty());
@@ -1205,12 +1217,34 @@ fn writer_zero_column_and_failure_boundaries_are_native() {
         assert_eq!(code, LanceErrorCode::InvalidArgument);
         unsafe { lance_file_reader_close(reader) };
     }
+    assert_eq!(c_zero_success, native_zero_success);
     unsafe {
         lance_batch_free(raw_zero);
         lance_file_writer_close(writer);
     }
 
     let cache_uri = root.path().join("zero-cache.lance");
+    let native_cache_uri = root.path().join("native-zero-cache.lance");
+    let native_cache_panic = catch_unwind(AssertUnwindSafe(|| {
+        let mut native = native_writer(
+            native_cache_uri.to_str().unwrap(),
+            &Schema::empty(),
+            NativeWriterOptions {
+                data_cache_bytes: Some(1024),
+                ..Default::default()
+            },
+        )
+        .expect("native zero-column writer should construct before encoding");
+        lance_c::runtime::block_on(native.write_batch(&zero_batch))
+            .expect("native zero-column write should panic before returning");
+        lance_c::runtime::block_on(native.finish())
+            .expect("native zero-column finish should panic before returning");
+    }))
+    .is_err();
+    assert!(
+        native_cache_panic,
+        "native zero-column writer with an explicit cache must panic"
+    );
     let cache_uri_c = c_string(cache_uri.to_str().unwrap());
     let cache_options = LanceFileWriterOptions {
         has_data_cache_bytes: 1,
@@ -1226,6 +1260,7 @@ fn writer_zero_column_and_failure_boundaries_are_native() {
             ptr::null(),
         )
     };
+    let c_cache_panic;
     if !cache_writer.is_null() {
         let raw_zero = import_batch(&zero_batch);
         let status = unsafe { lance_file_writer_write_batch(cache_writer, raw_zero) };
@@ -1233,21 +1268,21 @@ fn writer_zero_column_and_failure_boundaries_are_native() {
             let mut summary = LanceFileWriteSummary::default();
             let status = unsafe { lance_file_writer_finish(cache_writer, &mut summary) };
             if status != 0 {
-                let (code, _) = take_error();
-                assert_eq!(code, LanceErrorCode::Panic);
+                c_cache_panic = take_error().0 == LanceErrorCode::Panic;
+            } else {
+                c_cache_panic = false;
             }
         } else {
-            let (code, _) = take_error();
-            assert_eq!(code, LanceErrorCode::Panic);
+            c_cache_panic = take_error().0 == LanceErrorCode::Panic;
         }
         unsafe {
             lance_batch_free(raw_zero);
             lance_file_writer_close(cache_writer);
         }
     } else {
-        let (code, _) = take_error();
-        assert_eq!(code, LanceErrorCode::Panic);
+        c_cache_panic = take_error().0 == LanceErrorCode::Panic;
     }
+    assert!(c_cache_panic, "C zero-column cache path must report panic");
 
     let empty_uri = root.path().join("empty.lance");
     let empty_uri_c = c_string(empty_uri.to_str().unwrap());
