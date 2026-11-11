@@ -16,7 +16,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{
     BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
@@ -35,37 +35,64 @@ mod substrait_aggregate;
 
 use substrait_aggregate::{AggregateKind, aggregate_plan};
 
-/// Build the lance-c cdylib and return the path to the shared library and include dir.
+/// Build the lance-c cdylib/staticlib once per test binary and return the path
+/// to the shared library and include dir.
 fn build_lance_c() -> (PathBuf, PathBuf) {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    static BUILT: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
 
-    // Build the cdylib in debug mode.
-    let status = Command::new("cargo")
-        .args(["build", "--lib"])
-        .current_dir(&manifest_dir)
-        .status()
-        .expect("Failed to run cargo build");
-    assert!(status.success(), "cargo build failed");
+    BUILT
+        .get_or_init(|| {
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let cargo_bin = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
 
-    let target_dir = manifest_dir.join("target").join("debug");
+            // `cargo test` injects package and build-script variables (`OUT_DIR`,
+            // `CARGO_PKG_*`, `CARGO_MANIFEST_*`, etc.) into the test process.
+            // Dependencies like `ring` emit `cargo:rerun-if-env-changed` for those
+            // variables, so inheriting them in a nested `cargo build` invalidates
+            // fingerprints and forces a full dependency rebuild.
+            let mut command = Command::new(cargo_bin);
+            command.args(["build", "--lib"]).current_dir(&manifest_dir);
+            for (key, _) in std::env::vars_os() {
+                if let Some(name) = key.to_str()
+                    && (name == "OUT_DIR"
+                        || name == "CARGO"
+                        || name == "CARGO_CRATE_NAME"
+                        || name == "CARGO_BIN_NAME"
+                        || name == "CARGO_PRIMARY_PACKAGE"
+                        || name.starts_with("CARGO_MANIFEST_")
+                        || name.starts_with("CARGO_PKG_"))
+                {
+                    command.env_remove(&key);
+                }
+            }
 
-    // Find the shared library.
-    let lib_path = if cfg!(target_os = "macos") {
-        target_dir.join("liblance_c.dylib")
-    } else if cfg!(target_os = "linux") {
-        target_dir.join("liblance_c.so")
-    } else {
-        panic!("Unsupported OS for C/C++ link test");
-    };
+            let status = command.status().expect("Failed to run cargo build");
+            assert!(status.success(), "cargo build failed");
 
-    assert!(
-        lib_path.exists(),
-        "Shared library not found at {}",
-        lib_path.display()
-    );
+            let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| manifest_dir.join("target"))
+                .join("debug");
 
-    let include_dir = manifest_dir.join("include");
-    (lib_path, include_dir)
+            // Find the shared library.
+            let lib_path = if cfg!(target_os = "macos") {
+                target_dir.join("liblance_c.dylib")
+            } else if cfg!(target_os = "linux") {
+                target_dir.join("liblance_c.so")
+            } else {
+                panic!("Unsupported OS for C/C++ link test");
+            };
+
+            assert!(
+                lib_path.exists(),
+                "Shared library not found at {}",
+                lib_path.display()
+            );
+
+            let include_dir = manifest_dir.join("include");
+            (lib_path, include_dir)
+        })
+        .clone()
 }
 
 /// Create a test dataset on disk and return (TempDir, path_string).
