@@ -744,7 +744,7 @@ int main(int argc, char **argv) {
         new_writer(old_fragment, old_a_schema);
     OverlayBatch stale_batch;
     init_overlay_batch(&stale_batch, 1, 1, 0);
-    set_rowaddr(&stale_batch, 0, ROW_ADDRESS(old_fragment_ids[0], 1));
+    set_rowaddr(&stale_batch, 0, ROW_ADDRESS(old_fragment_ids[0], 9));
     set_a(&stale_batch, 0, 777);
     LanceBatch *stale_imported = import_overlay_batch(&stale_batch);
     ASSERT(lance_fragment_overlay_writer_write_batch(stale_writer,

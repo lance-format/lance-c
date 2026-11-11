@@ -435,7 +435,7 @@ int main(int argc, char** argv) {
         auto old_schema = old_fragment.native_schema().project({"a"});
         auto stale_writer = old_fragment.write_overlay(old_schema);
         OverlayBatch stale_batch(1, true, false);
-        stale_batch.set_rowaddr(0, row_address(old.fragment_ids()[0], 1));
+        stale_batch.set_rowaddr(0, row_address(old.fragment_ids()[0], 9));
         stale_batch.set_a(0, 777);
         write_batch(stale_writer, stale_batch);
         auto stale_finished = stale_writer.finish();
