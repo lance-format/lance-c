@@ -47,6 +47,10 @@ fn invalid(message: impl Into<String>) -> lance_core::Error {
 /// is published only by the final manifest commit. A retry then fails the
 /// native target-exists preflight until those objects are removed.
 ///
+/// The returned dataset is a fresh `LanceDataset` whose manifest keeps the
+/// cloned snapshot's version id (native clone commit semantics), so its version
+/// is the cloned version, not necessarily 1.
+///
 /// For datasets with additional base paths, source credentials come from the
 /// source dataset's native session and per-base store binding. This function
 /// does not construct extra providers, caches, registries, or per-base
@@ -80,6 +84,9 @@ unsafe fn deep_clone_inner(
     }
     let target_path = unsafe { helpers::parse_c_string(target_path)? }
         .ok_or_else(|| invalid("target_path must not be NULL"))?;
+    if target_path.trim().is_empty() {
+        return Err(invalid("target_path must not be empty"));
+    }
 
     let snapshot = unsafe { &*dataset }.snapshot();
     let reference = if reference.is_null() {
@@ -377,7 +384,8 @@ mod tests {
         assert_eq!(rc, 0, "clone failed");
         assert!(!cloned.is_null());
         // A fresh target publishes its own first version.
-        assert_eq!(unsafe { lance_dataset_version(cloned) }, 1);
+        // Native clone commits preserve the cloned snapshot's version id.
+        assert_eq!(unsafe { lance_dataset_version(cloned) }, source_version);
         assert_eq!(unsafe { lance_dataset_count_rows(cloned) }, 5);
         assert_eq!(unsafe { lance_dataset_version(dataset) }, source_version);
 
@@ -389,12 +397,12 @@ mod tests {
         }
         let fresh = Arc::new(Session::new(0, 0, Arc::new(registry_with(&[DST_SCHEME]))));
         let reopened = open_with(&dst_uri, fresh.clone());
-        assert_eq!(reopened.version_id(), 1);
+        assert_eq!(reopened.version_id(), source_version + 1);
         assert_eq!(block_on(reopened.count_rows(None)).unwrap(), 5);
         assert_eq!(rows(&reopened), expected);
         assert_eq!(
-            reopened.schema().to_arrow_schema().metadata(),
-            source.schema().to_arrow_schema().metadata()
+            Schema::from(reopened.schema()).metadata(),
+            Schema::from(source.schema()).metadata()
         );
         assert!(
             block_on(
@@ -491,6 +499,7 @@ mod tests {
             },
             0
         );
+        assert_eq!(unsafe { lance_dataset_version(out_head) }, 2);
         assert_eq!(
             unsafe { lance_dataset_count_rows(out_head) },
             block_on(source.count_rows(None)).unwrap() as u64

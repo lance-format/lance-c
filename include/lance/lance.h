@@ -1315,6 +1315,10 @@ LanceDataset* lance_dataset_checkout_ref(
  * not transactional: partial objects may remain under `target_path`, and a
  * retry fails the native target-exists preflight until they are removed.
  *
+ * The returned dataset is a normal LanceDataset whose manifest keeps the
+ * cloned snapshot's version id (native clone commit semantics), so its
+ * `lance_dataset_version` is the cloned version rather than always 1.
+ *
  * For datasets with additional base paths, source credentials come from the
  * source dataset's native session and per-base store binding. This call does
  * not create extra providers, caches, registries, or per-base credential sets.

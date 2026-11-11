@@ -4802,7 +4802,8 @@ static void test_dataset_deep_clone(const std::string& feature_uri) {
     {
         lance::StorageOptionsAccessor accessor(std::nullopt, nullptr);
         auto cloned = source.deep_clone(target_a, nullptr, &accessor);
-        assert(cloned.version() == 1);
+        // Native clone commits preserve the cloned snapshot version id.
+        assert(cloned.version() == source.version());
         assert(cloned.count_rows() == 6);
     }
 
@@ -4827,7 +4828,7 @@ static void test_dataset_deep_clone(const std::string& feature_uri) {
     // Reopen the independent target with a fresh session.
     lance::Session session(0, 0);
     auto reopened = lance::Dataset::open_with_session(session, target_a);
-    assert(reopened.version() == 1);
+    assert(reopened.version() == source.version());
     assert(reopened.count_rows() == 6);
 
     PASS();

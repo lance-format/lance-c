@@ -4886,7 +4886,9 @@ public:
     /// the default branch. `storage_options == nullptr` passes native None;
     /// otherwise the accessor's native Arc is forwarded as-is when it holds
     /// static options or a provider (an accessor with neither passes None),
-    /// without resolving or copying credentials. On failure the target is not
+    /// without resolving or copying credentials. The returned dataset keeps
+    /// the cloned snapshot's version id (native clone commit semantics), so
+    /// `version()` is not necessarily 1. On failure the target is not
     /// published, but partial objects may remain under `target_path`.
     Dataset deep_clone(
         const std::string& target_path,

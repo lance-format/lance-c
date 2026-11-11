@@ -6856,6 +6856,7 @@ static void test_dataset_deep_clone(const char *feature_uri) {
     ASSERT(branch_ref != NULL, "deep clone branch ref create failed");
     CHECK_OK();
 
+    const uint64_t fixture_version = lance_dataset_version(fixture);
     const int32_t expected_snapshot[] = {2, 3, 10, 11, 13};
     const int32_t expected_v1[] = {0, 2, 3, 10, 11, 13};
 
@@ -6870,8 +6871,8 @@ static void test_dataset_deep_clone(const char *feature_uri) {
     lance_storage_options_accessor_close(accessor);
     CHECK_OK();
     ASSERT(snapshot != NULL, "deep clone did not write the out handle");
-    ASSERT(lance_dataset_version(snapshot) == 1,
-           "deep clone target must start at version 1");
+    ASSERT(lance_dataset_version(snapshot) == fixture_version,
+           "deep clone must preserve the cloned snapshot version");
     ASSERT(lance_dataset_count_rows(snapshot) == 5,
            "deep clone snapshot row count mismatch");
     expect_sorted_ids("deep clone snapshot ids changed", snapshot,
@@ -6985,7 +6986,7 @@ static void test_dataset_deep_clone(const char *feature_uri) {
         lance_dataset_open_with_session(target_a, NULL, 0, session);
     ASSERT(reopened != NULL, "deep clone target reopen failed");
     CHECK_OK();
-    ASSERT(lance_dataset_version(reopened) == 1,
+    ASSERT(lance_dataset_version(reopened) == fixture_version,
            "reopened deep clone target version mismatch");
     ASSERT(lance_dataset_count_rows(reopened) == 5,
            "reopened deep clone target row count mismatch");
