@@ -14,13 +14,16 @@
 
 #include "lance/lance.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -30,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 // Arrow C Data Interface flag bits — see arrow_schema/arrow_c_data_interface.h.
@@ -37,6 +41,19 @@
 
 #define TEST(name) printf("  %s... ", #name)
 #define PASS()     printf("OK\n")
+
+static_assert(sizeof(LanceCompactionOptions) == 40);
+static_assert(std::is_move_constructible_v<lance::CompactionOptions>);
+static_assert(std::is_move_constructible_v<lance::CompactionPlan>);
+static_assert(std::is_move_constructible_v<lance::CompactionTask>);
+static_assert(std::is_move_constructible_v<lance::RewriteResult>);
+static_assert(std::is_move_constructible_v<lance::OptimizeIndicesOptions>);
+static_assert(std::is_move_constructible_v<lance::OptimizeIndicesPlan>);
+static_assert(std::is_move_constructible_v<lance::OptimizeIndexTask>);
+static_assert(std::is_move_constructible_v<lance::OptimizeIndexMerge>);
+static_assert(std::is_move_constructible_v<lance::IndexSegmentResult>);
+static_assert(!std::is_copy_constructible_v<lance::CompactionPlan>);
+static_assert(!std::is_copy_constructible_v<lance::IndexSegmentResult>);
 
 static const char* arrow_field_metadata_value(
     const ArrowSchema* field,
@@ -116,6 +133,130 @@ static void assert_field_metadata_absent(
     }
     assert(arrow_field_metadata_value(field, key) == nullptr);
 }
+
+static void test_noop_schema_release(ArrowSchema* schema) {
+    if (schema) schema->release = nullptr;
+}
+
+static void test_noop_array_release(ArrowArray* array) {
+    if (array) array->release = nullptr;
+}
+
+struct MergeStreamFixture {
+    ArrowSchema top{};
+    ArrowSchema key{};
+    ArrowSchema value{};
+    ArrowSchema* schema_children[2]{};
+    ArrowArray top_array{};
+    ArrowArray key_array{};
+    ArrowArray value_array{};
+    ArrowArray* array_children[2]{};
+    const void* top_buffers[1]{};
+    const void* key_buffers[2]{};
+    const void* value_buffers[2]{};
+    std::array<int32_t, 4> ids{{1, 2, 3, 4}};
+    std::array<int64_t, 4> values{{9001, 9002, 9003, 9004}};
+    std::string value_name;
+    int emitted = 0;
+    ArrowArrayStream stream{};
+
+    explicit MergeStreamFixture(std::string name) : value_name(std::move(name)) {
+        schema_children[0] = &key;
+        schema_children[1] = &value;
+        top.format = "+s";
+        top.n_children = 2;
+        top.children = schema_children;
+        top.release = test_noop_schema_release;
+        key.format = "i";
+        key.name = "id";
+        key.release = test_noop_schema_release;
+        value.format = "l";
+        value.name = value_name.c_str();
+        value.flags = ARROW_FLAG_NULLABLE;
+        value.release = test_noop_schema_release;
+
+        top_buffers[0] = nullptr;
+        key_buffers[0] = nullptr;
+        key_buffers[1] = ids.data();
+        value_buffers[0] = nullptr;
+        value_buffers[1] = values.data();
+        array_children[0] = &key_array;
+        array_children[1] = &value_array;
+        key_array.length = static_cast<int64_t>(ids.size());
+        key_array.n_buffers = 2;
+        key_array.buffers = key_buffers;
+        key_array.release = test_noop_array_release;
+        value_array.length = static_cast<int64_t>(values.size());
+        value_array.n_buffers = 2;
+        value_array.buffers = value_buffers;
+        value_array.release = test_noop_array_release;
+        top_array.length = static_cast<int64_t>(ids.size());
+        top_array.n_buffers = 1;
+        top_array.buffers = top_buffers;
+        top_array.n_children = 2;
+        top_array.children = array_children;
+        top_array.release = test_noop_array_release;
+
+        stream.get_schema = [](ArrowArrayStream* raw, ArrowSchema* out) {
+            auto* self = static_cast<MergeStreamFixture*>(raw->private_data);
+            *out = self->top;
+            out->release = test_noop_schema_release;
+            return 0;
+        };
+        stream.get_next = [](ArrowArrayStream* raw, ArrowArray* out) {
+            auto* self = static_cast<MergeStreamFixture*>(raw->private_data);
+            if (self->emitted) {
+                *out = {};
+                return 0;
+            }
+            self->emitted = 1;
+            *out = self->top_array;
+            out->release = test_noop_array_release;
+            return 0;
+        };
+        stream.get_last_error = [](ArrowArrayStream*) -> const char* {
+            return nullptr;
+        };
+        stream.release = [](ArrowArrayStream* raw) {
+            if (raw) raw->release = nullptr;
+        };
+        stream.private_data = this;
+    }
+};
+
+struct CppInt64Batch {
+    ArrowArray top{};
+    ArrowArray child{};
+    ArrowArray* children[1]{};
+    const void* top_buffers[1]{};
+    const void* child_buffers[2]{};
+    std::vector<int64_t> values;
+
+    CppInt64Batch(int64_t rows, int64_t base) : values(static_cast<size_t>(rows)) {
+        for (int64_t row = 0; row < rows; ++row) {
+            values[static_cast<size_t>(row)] = base + row;
+        }
+        top_buffers[0] = nullptr;
+        child_buffers[0] = nullptr;
+        child_buffers[1] = values.data();
+        children[0] = &child;
+        child.length = rows;
+        child.n_buffers = 2;
+        child.buffers = child_buffers;
+        child.release = test_noop_array_release;
+        top.length = rows;
+        top.n_buffers = 1;
+        top.buffers = top_buffers;
+        top.n_children = 1;
+        top.children = children;
+        top.release = [](ArrowArray* array) {
+            delete static_cast<CppInt64Batch*>(array->private_data);
+            array->release = nullptr;
+            array->private_data = nullptr;
+        };
+        top.private_data = this;
+    }
+};
 
 struct ScanStatisticsCapture {
     uint64_t calls = 0;
@@ -1068,6 +1209,271 @@ static void test_blob_native_read_slice(const std::string& blob_uri) {
     PASS();
 }
 
+static int64_t cpp_schema_field_index(const ArrowSchema* schema,
+                                      const char* name) {
+    for (int64_t i = 0; i < schema->n_children; ++i) {
+        if (schema->children[i] && schema->children[i]->name &&
+            strcmp(schema->children[i]->name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool cpp_array_value_is_null(const ArrowArray* array, int64_t index) {
+    if (array->null_count == 0) return false;
+    assert(array->buffers[0] != nullptr);
+    int64_t bit = array->offset + index;
+    const auto* validity = static_cast<const uint8_t*>(array->buffers[0]);
+    return (validity[bit / 8] & static_cast<uint8_t>(1u << (bit % 8))) == 0;
+}
+
+static uint64_t cpp_u64_array_value(const ArrowArray* array, int64_t index) {
+    assert(array->buffers[1] != nullptr);
+    const auto* values = static_cast<const uint64_t*>(array->buffers[1]);
+    return values[array->offset + index];
+}
+
+static uint32_t cpp_u32_array_value(const ArrowArray* array, int64_t index) {
+    assert(array->buffers[1] != nullptr);
+    const auto* values = static_cast<const uint32_t*>(array->buffers[1]);
+    return values[array->offset + index];
+}
+
+static void test_blob_fields_and_descriptors() {
+    TEST(test_blob_fields_and_descriptors);
+
+    lance::BlobFieldOptions options;
+    options.inline_size_threshold = size_t{0};
+    options.dedicated_size_threshold = size_t{256};
+    ArrowSchema field{};
+    lance::blob_field_with_options("blob", true, options, &field);
+    assert(strcmp(field.name, "blob") == 0);
+    assert(strcmp(field.format, "+s") == 0);
+    assert((field.flags & ARROW_FLAG_NULLABLE) != 0);
+    assert_field_metadata(&field, "ARROW:extension:name", "lance.blob.v2");
+    assert_field_metadata(
+        &field, "lance-encoding:blob-inline-size-threshold", "0");
+    assert_field_metadata(
+        &field, "lance-encoding:blob-dedicated-size-threshold", "256");
+    field.release(&field);
+
+    ArrowSchema default_field{};
+    lance::blob_field("default", false, &default_field);
+    assert(strcmp(default_field.name, "default") == 0);
+    assert((default_field.flags & ARROW_FLAG_NULLABLE) == 0);
+    assert_field_metadata_absent(
+        &default_field, "lance-encoding:blob-inline-size-threshold");
+    default_field.release(&default_field);
+
+    lance::BlobDescriptorArrayBuilder builder("blob");
+    builder.append_inline(
+        reinterpret_cast<const uint8_t*>("inline payload"), 14);
+    builder.append_null();
+    builder.append_packed(7, 100, 8);
+    builder.append_dedicated(9, 1024);
+    builder.append_managed("data/a.blob", 2, 3);
+    builder.append_managed("data/b.blob", 4, 5, uint32_t{0});
+    builder.extend_packed(11, {{1, 2}, {3, 4}});
+    builder.push_external(
+        "file:///tmp/external.bin", lance::BlobRange{7, 9});
+    builder.append_external(3, "s3://bucket/object", 11, 13);
+    builder.append_inline(nullptr, 0);
+
+    ArrowSchema builder_field{};
+    builder.field(&builder_field);
+    assert_field_metadata(
+        &builder_field, "ARROW:extension:name", "lance.blob.v2");
+    builder_field.release(&builder_field);
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    builder.finish(&array, &schema);
+    assert(array.length == 11);
+    assert(array.n_children == 6 && schema.n_children == 6);
+    const char* prepared_names[] = {
+        "kind", "data", "uri", "blob_id", "blob_size", "position",
+    };
+    for (size_t i = 0; i < 6; ++i) {
+        assert(std::string(schema.children[i]->name) == prepared_names[i]);
+    }
+
+    const ArrowArray* kinds = array.children[0];
+    const ArrowArray* data = array.children[1];
+    const ArrowArray* blob_ids = array.children[3];
+    const auto* kind_values = static_cast<const uint8_t*>(kinds->buffers[1]);
+    assert(!cpp_array_value_is_null(kinds, 0) && kind_values[0] == 0);
+    assert(cpp_array_value_is_null(kinds, 1));
+    assert(kind_values[2] == 1);
+    assert(kind_values[3] == 2);
+    assert(kind_values[4] == 4);
+    assert(kind_values[5] == 5);
+    assert(kind_values[8] == 3 && kind_values[9] == 3);
+    assert(cpp_array_value_is_null(blob_ids, 4));
+    assert(!cpp_array_value_is_null(blob_ids, 5) &&
+           cpp_u32_array_value(blob_ids, 5) == 0);
+    const auto* data_offsets =
+        static_cast<const int64_t*>(data->buffers[1]);
+    assert(data_offsets[1] - data_offsets[0] == 14);
+    assert(memcmp(static_cast<const uint8_t*>(data->buffers[2]) +
+                      data_offsets[0],
+                  "inline payload", 14) == 0);
+
+    ArrowSchema post_finish_field{};
+    builder.field(&post_finish_field);
+    assert(strcmp(post_finish_field.name, "blob") == 0);
+    post_finish_field.release(&post_finish_field);
+    bool finished = false;
+    try {
+        builder.append_null();
+    } catch (const lance::Error& error) {
+        finished = error.code == LANCE_ERR_INVALID_ARGUMENT &&
+                   std::string(error.what()).find("already finished") !=
+                       std::string::npos;
+    }
+    assert(finished);
+
+    array.release(&array);
+    schema.release(&schema);
+    PASS();
+}
+
+static void test_blob_planned_reads(const std::string& blob_uri) {
+    TEST(test_blob_planned_reads);
+
+    lance::ArrowStream stream;
+    {
+        auto ds = lance::Dataset::open(blob_uri);
+        stream = ds.read_blobs(
+            "blob", lance::BlobRowSelector::Indices,
+            std::vector<uint64_t>{7, 2, 3, 4, 9, 0});
+        // Dataset destruction must not invalidate the exported stream.
+    }
+    assert(static_cast<bool>(stream));
+    ArrowSchema schema{};
+    assert(stream->get_schema(stream.get(), &schema) == 0);
+    assert(schema.n_children == 2);
+    assert(cpp_schema_field_index(&schema, "row_address") == 0);
+    assert(cpp_schema_field_index(&schema, "data") == 1);
+    assert(strcmp(schema.children[0]->format, "L") == 0);
+    assert(strcmp(schema.children[1]->format, "Z") == 0);
+    schema.release(&schema);
+
+    const uint64_t expected_addresses[] = {
+        (uint64_t{1} << 32) | 2,
+        2,
+        3,
+        4,
+        (uint64_t{1} << 32) | 4,
+        0,
+    };
+    const size_t expected_sizes[] = {1024, 1024, 0, 0, 0, 8};
+    const bool expected_null[] = {false, false, false, true, true, false};
+    for (size_t row = 0; row < 6; ++row) {
+        ArrowArray array{};
+        assert(stream->get_next(stream.get(), &array) == 0);
+        assert(array.release != nullptr);
+        assert(array.length == 1 && array.n_children == 2);
+        assert(cpp_u64_array_value(array.children[0], 0) ==
+               expected_addresses[row]);
+        const ArrowArray* data = array.children[1];
+        if (expected_null[row]) {
+            assert(cpp_array_value_is_null(data, 0));
+        } else {
+            assert(!cpp_array_value_is_null(data, 0));
+            const auto* offsets =
+                static_cast<const int64_t*>(data->buffers[1]);
+            int64_t first = data->offset;
+            assert(static_cast<size_t>(offsets[first + 1] - offsets[first]) ==
+                   expected_sizes[row]);
+        }
+        array.release(&array);
+    }
+    ArrowArray eos{};
+    assert(stream->get_next(stream.get(), &eos) == 0 &&
+           eos.release == nullptr);
+
+    auto ds = lance::Dataset::open(blob_uri);
+    lance::BlobReadOptions read_options;
+    read_options.io_buffer_size = uint64_t{64};
+    read_options.preserve_order = false;
+    auto range_stream = ds.read_blob_ranges(
+        "blob", lance::BlobRowSelector::Indices,
+        std::vector<lance::BlobRangeRequest>{
+            {7, 100, 20},
+            {2, 128, 0},
+            {9, 40, 16},
+            {2, 100, 8},
+            {3, 0, 0},
+            {4, 1000, 100},
+        },
+        read_options);
+    assert(static_cast<bool>(range_stream));
+    ArrowSchema range_schema{};
+    assert(range_stream->get_schema(range_stream.get(), &range_schema) == 0);
+    assert(range_schema.n_children == 5);
+    assert(cpp_schema_field_index(&range_schema, "request_index") == 0);
+    assert(cpp_schema_field_index(&range_schema, "row_address") == 1);
+    assert(cpp_schema_field_index(&range_schema, "offset") == 2);
+    assert(cpp_schema_field_index(&range_schema, "length") == 3);
+    assert(cpp_schema_field_index(&range_schema, "data") == 4);
+    range_schema.release(&range_schema);
+    std::set<size_t> request_indices;
+    while (true) {
+        ArrowArray array{};
+        assert(range_stream->get_next(range_stream.get(), &array) == 0);
+        if (!array.release) break;
+        assert(array.length == 1 && array.n_children == 5);
+        size_t request =
+            static_cast<size_t>(cpp_u64_array_value(array.children[0], 0));
+        assert(request_indices.insert(request).second);
+        const ArrowArray* data = array.children[4];
+        if (request == 2 || request == 5) {
+            assert(cpp_array_value_is_null(data, 0));
+        } else {
+            assert(!cpp_array_value_is_null(data, 0));
+        }
+        array.release(&array);
+    }
+    assert(request_indices.size() == 6);
+
+    auto empty = ds.read_blobs(
+        "blob", lance::BlobRowSelector::Ids, std::vector<uint64_t>{});
+    ArrowSchema empty_schema{};
+    assert(empty->get_schema(empty.get(), &empty_schema) == 0);
+    ArrowArray empty_array{};
+    assert(empty->get_next(empty.get(), &empty_array) == 0 &&
+           empty_array.release == nullptr);
+    empty_schema.release(&empty_schema);
+
+    bool no_selection = false;
+    try {
+        (void)ds.read_blobs("blob", lance::BlobRowSelector::None, {});
+    } catch (const lance::Error& error) {
+        no_selection =
+            error.code == LANCE_ERR_INVALID_ARGUMENT &&
+            std::string(error.what()).find("requires a row selection") !=
+                std::string::npos;
+    }
+    assert(no_selection);
+
+    bool zero_buffer = false;
+    try {
+        lance::BlobReadOptions invalid;
+        invalid.io_buffer_size = uint64_t{0};
+        (void)ds.read_blobs(
+            "blob", lance::BlobRowSelector::Indices,
+            std::vector<uint64_t>{0}, invalid);
+    } catch (const lance::Error& error) {
+        zero_buffer = error.code == LANCE_ERR_INVALID_ARGUMENT &&
+                      std::string(error.what()).find("greater than 0") !=
+                          std::string::npos;
+    }
+    assert(zero_buffer);
+
+    PASS();
+}
+
 static void test_dataset_take(const std::string& uri) {
     TEST(test_dataset_take);
 
@@ -1656,6 +2062,67 @@ static void test_vector_models_and_reusable_segments(const std::string& uri) {
     PASS();
 }
 
+static void test_vector_index_options_and_model_adoption(
+    const std::string& uri) {
+    TEST(test_vector_index_options_and_model_adoption);
+
+    auto ds = lance::Dataset::open(uri);
+    auto all_ids = ds.fragment_ids();
+    assert(!all_ids.empty());
+    auto centroids = ds.train_ivf_model("embedding", 2, LANCE_METRIC_L2);
+    auto adopted = lance::IndexModel::adopt(
+        centroids.array(), const_cast<ArrowSchema*>(centroids.schema()));
+    assert(centroids.array()->release == nullptr);
+    assert(centroids.schema()->release == nullptr);
+
+    lance::VectorIndexOptions options;
+    options.index_type = LANCE_INDEX_IVF_RQ;
+    options.metric = LANCE_METRIC_L2;
+    options.num_partitions = 2;
+    options.ivf_centroids = &adopted;
+    options.rabitq_model_json = lance::build_rq_model(8, 0);
+    options.storage_options = std::map<std::string, std::string>{};
+    options.runtime_hints["cpp.option"] = "value";
+    options.skip_transpose = true;
+
+    std::optional<std::vector<uint32_t>> fragment_ids =
+        std::vector<uint32_t>{static_cast<uint32_t>(all_ids.front())};
+    std::array<uint8_t, 16> uuid = {
+        0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93,
+        0x23, 0x84, 0x62, 0x64, 0x33, 0x83, 0x27, 0x95,
+    };
+    auto builder = ds.new_vector_index_segment_builder_with_options(
+        "embedding", options, "cpp_options_rq_segment", fragment_ids, &uuid);
+    auto bytes = builder.execute_uncommitted();
+    auto metadata = lance::IndexSegmentMetadata::parse(bytes);
+    assert(metadata.index_type() == LANCE_INDEX_IVF_RQ);
+    assert(metadata.index_version() == 2);
+    assert(metadata.uuid() == uuid);
+    assert(metadata.fragment_ids() == *fragment_ids);
+    assert(adopted.array()->release != nullptr);
+
+    // An engaged empty selection is Some(empty), not absent.
+    lance::VectorIndexOptions empty = options;
+    empty.train = false;
+    auto empty_builder = ds.new_vector_index_segment_builder_with_options(
+        "embedding", empty, "cpp_empty_scope", std::vector<uint32_t>{});
+    auto empty_bytes = empty_builder.execute_uncommitted();
+    auto empty_metadata = lance::IndexSegmentMetadata::parse(empty_bytes);
+    assert(empty_metadata.fragment_ids().empty());
+
+    // Exercise the committed options entry point without training a second
+    // index on the same column.
+    empty.index_type = LANCE_INDEX_IVF_FLAT;
+    empty.ivf_centroids = nullptr;
+    empty.rabitq_model_json.reset();
+    empty.train = false;
+    ds.create_vector_index_with_options("embedding", empty,
+                                        "cpp_options_definition_only");
+    ds.drop_index("cpp_options_definition_only");
+
+    PASS();
+}
+
 static void test_commit_index_segments(const std::string& uri) {
     TEST(test_commit_index_segments);
 
@@ -1847,6 +2314,516 @@ static void test_write_options_and_config(const std::string& src_uri,
     assert(config.at("cpp.key") == "value");
     assert(config.find("lance.auto_cleanup.interval") == config.end());
 
+    PASS();
+}
+
+static void test_native_write_options(const std::string& src_uri,
+                                      const std::string& dst_uri) {
+    TEST(test_native_write_options);
+
+    const std::string uri = dst_uri + "_cpp_native_options";
+    const std::string staged_uri = dst_uri + "_cpp_native_staged";
+    auto src = lance::Dataset::open(src_uri);
+    const auto source_rows = src.count_rows();
+    auto fragment_events =
+        std::make_shared<std::atomic<std::size_t>>(0);
+    auto stats_events =
+        std::make_shared<std::atomic<std::size_t>>(0);
+
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.max_rows_per_file = 2;
+        spec.enable_v2_manifest_paths = false;
+        spec.file_writer_options = lance::DatasetFileWriterOptions{
+            1024 * 1024,
+            4096,
+            false,
+        };
+        spec.transaction_properties =
+            std::vector<std::pair<std::string, std::string>>{
+                {"engine", "cpp-native-options"}};
+        spec.progress.begin_fragment =
+            [fragment_events](const lance::FragmentWriteProgressInfo&) {
+                fragment_events->fetch_add(1, std::memory_order_seq_cst);
+            };
+        spec.progress.complete_fragment =
+            [fragment_events](const lance::FragmentWriteProgressInfo&) {
+                fragment_events->fetch_add(1, std::memory_order_seq_cst);
+            };
+        spec.progress.write_stats =
+            [stats_events](const lance::NativeWriteStats& stats) {
+                stats_events->fetch_add(1, std::memory_order_seq_cst);
+                assert(stats.rows_written > 0);
+            };
+
+        lance::NativeWriteOptions options(spec);
+        auto write_mode = [&](lance::WriteMode mode) {
+            auto scanner = src.scan();
+            ArrowArrayStream stream{};
+            scanner.to_arrow_stream(&stream);
+            return lance::Dataset::write_with_native_options(
+                uri, &stream, mode, options);
+        };
+
+        auto created = write_mode(lance::WriteMode::Create);
+        assert(created.count_rows() == source_rows);
+        auto appended = write_mode(lance::WriteMode::Append);
+        assert(appended.count_rows() == source_rows * 2);
+        auto overwritten = write_mode(lance::WriteMode::Overwrite);
+        assert(overwritten.count_rows() == source_rows);
+        assert(overwritten.read_transaction().has_value());
+        assert(overwritten.read_transaction()->properties().at("engine") ==
+               "cpp-native-options");
+        assert(fragment_events->load(std::memory_order_seq_cst) > 0);
+        assert(stats_events->load(std::memory_order_seq_cst) > 0);
+
+        {
+            auto scanner = src.scan();
+            ArrowArrayStream stream;
+            memset(&stream, 0, sizeof(stream));
+            scanner.to_arrow_stream(&stream);
+            auto transaction = lance::Dataset::write_uncommitted_with_native_options(
+                staged_uri, &stream, lance::WriteMode::Create, options);
+            assert(transaction.has_properties());
+            assert(transaction.properties().at("engine") == "cpp-native-options");
+            auto committed = lance::Dataset::commit(staged_uri, transaction);
+            assert(committed.count_rows() == source_rows);
+            assert(committed.read_transaction().has_value());
+            assert(committed.read_transaction()->properties().at("engine") ==
+                   "cpp-native-options");
+        }
+    }
+
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        if (fragment_events.use_count() == 1 &&
+            stats_events.use_count() == 1) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(fragment_events.use_count() == 1);
+    assert(stats_events.use_count() == 1);
+
+    auto reopened = lance::Dataset::open(uri);
+    assert(reopened.count_rows() == source_rows);
+    assert(reopened.read_transaction().has_value());
+    assert(reopened.read_transaction()->properties().at("engine") ==
+           "cpp-native-options");
+    auto staged = lance::Dataset::open(staged_uri);
+    assert(staged.count_rows() == source_rows);
+    assert(staged.read_transaction().has_value());
+    assert(staged.read_transaction()->properties().at("engine") ==
+           "cpp-native-options");
+
+    PASS();
+}
+
+ArrowArrayStream native_write_source_stream(const std::string& uri) {
+    auto source = lance::Dataset::open(uri);
+    auto scanner = source.scan();
+    ArrowArrayStream stream{};
+    scanner.to_arrow_stream(&stream);
+    return stream;
+}
+
+std::vector<std::optional<uint32_t>> native_write_file_base_ids(
+    const lance::Dataset& dataset) {
+    std::vector<std::optional<uint32_t>> base_ids;
+    for (auto fragment_id : dataset.fragment_ids()) {
+        auto fragment = dataset.open_fragment(fragment_id);
+        for (std::size_t index = 0; index < fragment.data_file_count();
+             ++index) {
+            base_ids.push_back(fragment.data_file_at(index).base_id());
+        }
+    }
+    return base_ids;
+}
+
+struct NativeWriteLockState {
+    std::atomic<int> acquires{0};
+    std::atomic<int> releases{0};
+    std::atomic<int> release_true{0};
+    std::atomic<bool> fail_release_once{false};
+};
+
+class NativeWriteLease final : public lance::CommitLease {
+    std::shared_ptr<NativeWriteLockState> state_;
+    bool released_ = false;
+
+public:
+    explicit NativeWriteLease(std::shared_ptr<NativeWriteLockState> state)
+        : state_(std::move(state)) {}
+
+    void release(bool success) override {
+        state_->releases.fetch_add(1, std::memory_order_seq_cst);
+        if (success) {
+            state_->release_true.fetch_add(1, std::memory_order_seq_cst);
+        }
+        released_ = true;
+        if (state_->fail_release_once.exchange(
+                false, std::memory_order_seq_cst)) {
+            throw lance::Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "cpp native write lease release failed after publication");
+        }
+    }
+
+    ~NativeWriteLease() noexcept override { assert(released_); }
+};
+
+lance::CommitLock make_native_write_lock(
+    const std::shared_ptr<NativeWriteLockState>& state) {
+    return lance::CommitLock(
+        [state](uint64_t) -> std::unique_ptr<lance::CommitLease> {
+            state->acquires.fetch_add(1, std::memory_order_seq_cst);
+            return std::unique_ptr<lance::CommitLease>(
+                new NativeWriteLease(state));
+        });
+}
+
+static void test_native_write_base_and_presence(
+    const std::string& src_uri,
+    const std::string& dst_uri) {
+    TEST(test_native_write_base_and_presence);
+
+    auto source = lance::Dataset::open(src_uri);
+    const auto source_rows = source.count_rows();
+    const std::string uri = dst_uri + "_cpp_native_bases";
+    const std::string base_uri = dst_uri + "_cpp_native_registered_base";
+
+    std::vector<std::optional<uint32_t>> before;
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.max_rows_per_file = 5;
+        spec.initial_bases = std::vector<lance::BasePath>{
+            lance::BasePath{
+                7,
+                base_uri,
+                std::string("cpp-registered"),
+                false,
+            },
+        };
+        spec.target_bases = std::vector<uint32_t>{7};
+        lance::DatasetBaseStoreParams store;
+        store.base_path = base_uri;
+        store.block_size = 4096;
+        spec.base_store_params =
+            std::vector<lance::DatasetBaseStoreParams>{store};
+        lance::NativeWriteOptions options(spec);
+
+        auto stream = native_write_source_stream(src_uri);
+        auto created = lance::Dataset::write_with_native_options(
+            uri, &stream, lance::WriteMode::Create, options);
+        assert(created.count_rows() == source_rows);
+        before = native_write_file_base_ids(created);
+        assert(!before.empty());
+        for (const auto& base_id : before) {
+            assert(base_id == std::optional<uint32_t>(7));
+        }
+        assert(created.base_paths_json().find("\"7\"") != std::string::npos);
+    }
+
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.max_rows_per_file = 5;
+        lance::NativeWriteOptions options(spec);
+        auto stream = native_write_source_stream(src_uri);
+        auto appended = lance::Dataset::write_with_native_options(
+            uri, &stream, lance::WriteMode::Append, options);
+        assert(appended.count_rows() == source_rows * 2);
+        auto after = native_write_file_base_ids(appended);
+        assert(after.size() > before.size());
+        for (std::size_t index = before.size(); index < after.size();
+             ++index) {
+            assert(!after[index].has_value());
+        }
+    }
+
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.target_bases = std::vector<uint32_t>{};
+        lance::NativeWriteOptions options(spec);
+        bool caught = false;
+        try {
+            auto stream = native_write_source_stream(src_uri);
+            auto rejected = lance::Dataset::write_with_native_options(
+                uri, &stream, lance::WriteMode::Append, options);
+            (void)rejected;
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::strstr(error.what(), "target_bases cannot be empty") !=
+                   nullptr);
+        }
+        assert(caught);
+    }
+
+    auto reopened = lance::Dataset::open(uri);
+    assert(reopened.count_rows() == source_rows * 2);
+    PASS();
+}
+
+static void test_native_write_data_option_errors(
+    const std::string& src_uri,
+    const std::string& dst_uri) {
+    TEST(test_native_write_data_option_errors);
+
+    const std::string file_uri = dst_uri + "_cpp_native_file_error";
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.data_storage_version = "2.2";
+        spec.file_writer_options = lance::DatasetFileWriterOptions{
+            1024 * 1024,
+            0,
+            false,
+        };
+        lance::NativeWriteOptions options(spec);
+        bool caught = false;
+        try {
+            auto stream = native_write_source_stream(src_uri);
+            auto rejected = lance::Dataset::write_with_native_options(
+                file_uri, &stream, lance::WriteMode::Create, options);
+            (void)rejected;
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            if (std::strstr(error.what(), "max_page_bytes") == nullptr) {
+                std::fprintf(
+                    stderr,
+                    "unexpected file-writer error: %s\n",
+                    error.what());
+            }
+            assert(std::strstr(error.what(), "max_page_bytes") != nullptr);
+        }
+        assert(caught);
+    }
+
+    const std::string output_uri = dst_uri + "_cpp_native_blob_error";
+    uint64_t baseline_rows = 0;
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.data_storage_version = "2.2";
+        spec.blob_pack_file_size_threshold = 1;
+        lance::NativeWriteOptions options(spec);
+        auto stream = native_write_source_stream(src_uri);
+        auto created = lance::Dataset::write_with_native_options(
+            output_uri, &stream, lance::WriteMode::Create, options);
+        baseline_rows = created.count_rows();
+        assert(baseline_rows > 0);
+    }
+
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.data_storage_version = "2.2";
+        spec.allow_external_blob_outside_bases = true;
+        spec.external_blob_mode = lance::ExternalBlobMode::Ingest;
+        lance::NativeWriteOptions options(spec);
+        bool caught = false;
+        try {
+            auto stream = native_write_source_stream(src_uri);
+            auto rejected = lance::Dataset::write_with_native_options(
+                output_uri, &stream, lance::WriteMode::Append, options);
+            (void)rejected;
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+            assert(std::strstr(
+                       error.what(),
+                       "allow_external_blob_outside_bases") != nullptr);
+        }
+        assert(caught);
+    }
+
+    auto reopened = lance::Dataset::open(output_uri);
+    assert(reopened.count_rows() == baseline_rows);
+    PASS();
+}
+
+static void test_native_write_progress_errors(
+    const std::string& src_uri,
+    const std::string& dst_uri) {
+    TEST(test_native_write_progress_errors);
+
+    const std::string baseline_uri = dst_uri + "_cpp_native_progress";
+    auto source = lance::Dataset::open(src_uri);
+    const auto source_rows = source.count_rows();
+    {
+        lance::NativeWriteOptionsSpec spec;
+        lance::NativeWriteOptions options(spec);
+        auto stream = native_write_source_stream(src_uri);
+        auto created = lance::Dataset::write_with_native_options(
+            baseline_uri, &stream, lance::WriteMode::Create, options);
+        assert(created.count_rows() == source_rows);
+    }
+
+    {
+        auto capture = std::make_shared<std::atomic<std::size_t>>(0);
+        {
+            lance::NativeWriteOptionsSpec spec;
+            spec.progress.begin_fragment =
+                [capture](const lance::FragmentWriteProgressInfo&) {
+                    capture->fetch_add(1, std::memory_order_seq_cst);
+                    throw lance::Error(
+                        LANCE_ERR_INVALID_ARGUMENT,
+                        "cpp native write progress refused fragment");
+                };
+            lance::NativeWriteOptions options(spec);
+            bool caught = false;
+            try {
+                auto stream = native_write_source_stream(src_uri);
+                auto rejected = lance::Dataset::write_with_native_options(
+                    baseline_uri,
+                    &stream,
+                    lance::WriteMode::Append,
+                    options);
+                (void)rejected;
+            } catch (const lance::Error& error) {
+                caught = true;
+                assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+                assert(std::strstr(
+                           error.what(),
+                           "cpp native write progress refused") != nullptr);
+            }
+            assert(caught);
+            assert(capture->load(std::memory_order_seq_cst) > 0);
+        }
+        for (int attempt = 0; attempt < 10000; ++attempt) {
+            if (capture.use_count() == 1) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        assert(capture.use_count() == 1);
+    }
+
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.progress.begin_fragment =
+            [](const lance::FragmentWriteProgressInfo&) {
+                throw std::runtime_error(
+                    "cpp native write progress runtime exception");
+            };
+        lance::NativeWriteOptions options(spec);
+        bool caught = false;
+        try {
+            auto stream = native_write_source_stream(src_uri);
+            auto rejected = lance::Dataset::write_with_native_options(
+                baseline_uri,
+                &stream,
+                lance::WriteMode::Append,
+                options);
+            (void)rejected;
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == LANCE_ERR_INTERNAL);
+            assert(std::strstr(
+                       error.what(),
+                       "cpp native write progress runtime exception") !=
+                   nullptr);
+        }
+        assert(caught);
+    }
+
+    auto stats_calls =
+        std::make_shared<std::atomic<std::size_t>>(0);
+    {
+        lance::NativeWriteOptionsSpec spec;
+        spec.progress.write_stats =
+            [stats_calls](const lance::NativeWriteStats&) {
+                stats_calls->fetch_add(1, std::memory_order_seq_cst);
+                throw std::runtime_error(
+                    "stats callback exceptions have no native error channel");
+            };
+        lance::NativeWriteOptions options(spec);
+        auto stream = native_write_source_stream(src_uri);
+        auto appended = lance::Dataset::write_with_native_options(
+            baseline_uri, &stream, lance::WriteMode::Append, options);
+        assert(appended.count_rows() == source_rows * 2);
+    }
+    assert(stats_calls->load(std::memory_order_seq_cst) > 0);
+
+    auto reopened = lance::Dataset::open(baseline_uri);
+    assert(reopened.count_rows() == source_rows * 2);
+    PASS();
+}
+
+static void test_native_write_owner_lifetime_and_commit_error(
+    const std::string& src_uri,
+    const std::string& dst_uri) {
+    TEST(test_native_write_owner_lifetime_and_commit_error);
+
+    auto source = lance::Dataset::open(src_uri);
+    const auto source_rows = source.count_rows();
+    const std::string uri = dst_uri + "_cpp_native_owners";
+    auto lock_state = std::make_shared<NativeWriteLockState>();
+    std::weak_ptr<NativeWriteLockState> lock_weak = lock_state;
+    auto progress_state =
+        std::make_shared<std::atomic<std::size_t>>(0);
+    std::weak_ptr<std::atomic<std::size_t>> progress_weak = progress_state;
+
+    std::optional<lance::NativeWriteOptions> options;
+    {
+        lance::Session session(4 * 1024 * 1024, 1024 * 1024);
+        lance::StorageOptionsAccessor accessor(
+            std::optional<lance::StorageOptions>{lance::StorageOptions{}},
+            nullptr);
+        lance::CommitLock source_lock =
+            make_native_write_lock(lock_state);
+        lance::NativeWriteOptionsSpec spec;
+        spec.write.params.max_rows_per_file = 4;
+        spec.session = &session;
+        spec.storage_options_accessor = &accessor;
+        spec.commit_lock = &source_lock;
+        spec.progress.begin_fragment =
+            [progress_state](const lance::FragmentWriteProgressInfo&) {
+                progress_state->fetch_add(1, std::memory_order_seq_cst);
+            };
+        spec.progress.write_stats =
+            [progress_state](const lance::NativeWriteStats&) {
+                progress_state->fetch_add(1, std::memory_order_seq_cst);
+            };
+        options.emplace(spec);
+    }
+    lock_state.reset();
+    progress_state.reset();
+
+    {
+        auto stream = native_write_source_stream(src_uri);
+        auto created = lance::Dataset::write_with_native_options(
+            uri, &stream, lance::WriteMode::Create, *options);
+        assert(created.count_rows() == source_rows);
+    }
+    auto state = lock_weak.lock();
+    assert(state);
+    assert(state->acquires.load(std::memory_order_seq_cst) > 0);
+    assert(state->release_true.load(std::memory_order_seq_cst) > 0);
+    state->fail_release_once.store(true, std::memory_order_seq_cst);
+    state.reset();
+
+    bool caught = false;
+    try {
+        auto stream = native_write_source_stream(src_uri);
+        auto failed = lance::Dataset::write_with_native_options(
+            uri, &stream, lance::WriteMode::Append, *options);
+        (void)failed;
+    } catch (const lance::Error& error) {
+        caught = true;
+        assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        assert(std::strstr(
+                   error.what(),
+                   "lease release failed after publication") != nullptr);
+    }
+    assert(caught);
+
+    {
+        auto reopened = lance::Dataset::open(uri);
+        assert(reopened.count_rows() == source_rows * 2);
+    }
+    options.reset();
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        if (lock_weak.expired() && progress_weak.expired()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(lock_weak.expired());
+    assert(progress_weak.expired());
     PASS();
 }
 
@@ -2819,6 +3796,120 @@ static void test_add_columns(const std::string& dst_uri) {
     PASS();
 }
 
+// Exercises native Dataset::merge plus BatchUDF callbacks, checkpoint methods,
+// and C++ exception containment through the header-only wrappers.
+static void test_merge_and_batch_udf(const std::string& dst_uri) {
+    TEST(test_merge_and_batch_udf);
+
+    auto ds = lance::Dataset::open(dst_uri);
+    uint64_t version = ds.version();
+    ArrowSchema schema_before{};
+    ds.schema(&schema_before);
+    const int64_t fields_before = schema_before.n_children;
+    schema_before.release(&schema_before);
+
+    MergeStreamFixture merge{"c_merged_cpp"};
+    ds.merge(&merge.stream, "id", "id");
+    assert(ds.version() > version);
+    version = ds.version();
+
+    MergeStreamFixture merge_default{"c_merged_default"};
+    ds.merge(&merge_default.stream, "id");
+    assert(ds.version() > version);
+
+    ArrowSchema schema_after_merge{};
+    ds.schema(&schema_after_merge);
+    assert(schema_after_merge.n_children == fields_before + 2);
+    schema_after_merge.release(&schema_after_merge);
+
+    ArrowSchema udf_column{};
+    ArrowSchema* udf_children[1] = {&udf_column};
+    udf_column.format = "l";
+    udf_column.name = "c_udf_cpp";
+    udf_column.flags = ARROW_FLAG_NULLABLE;
+    udf_column.release = test_noop_schema_release;
+    ArrowSchema udf_schema{};
+    udf_schema.format = "+s";
+    udf_schema.n_children = 1;
+    udf_schema.children = udf_children;
+    udf_schema.release = test_noop_schema_release;
+
+    auto expect_error = [&](lance::BatchUDF udf, LanceErrorCode expected) {
+        bool caught = false;
+        try {
+            ds.add_columns_batch_udf(udf);
+        } catch (const lance::Error& error) {
+            caught = true;
+            assert(error.code == expected);
+        }
+        assert(caught);
+    };
+
+    lance::BatchUDF lance_error;
+    lance_error.output_schema = &udf_schema;
+    lance_error.mapper = [](const ArrowArray&, const ArrowSchema&, ArrowArray&) {
+        throw lance::Error(LANCE_ERR_NOT_SUPPORTED, "mapper lance error");
+    };
+    expect_error(lance_error, LANCE_ERR_NOT_SUPPORTED);
+
+    lance::BatchUDF std_error;
+    std_error.output_schema = &udf_schema;
+    std_error.mapper = [](const ArrowArray&, const ArrowSchema&, ArrowArray&) {
+        throw std::runtime_error("mapper std error");
+    };
+    expect_error(std_error, LANCE_ERR_INTERNAL);
+
+    lance::BatchUDF unknown_error;
+    unknown_error.output_schema = &udf_schema;
+    unknown_error.mapper = [](const ArrowArray&, const ArrowSchema&, ArrowArray&) {
+        throw 17;
+    };
+    expect_error(unknown_error, LANCE_ERR_INTERNAL);
+
+    std::atomic<int> get_batch_calls{0};
+    std::atomic<int> insert_batch_calls{0};
+    std::atomic<int> get_fragment_calls{0};
+    std::atomic<int> insert_fragment_calls{0};
+    lance::BatchUDF udf;
+    udf.output_schema = &udf_schema;
+    udf.mapper = [](const ArrowArray& input, const ArrowSchema&, ArrowArray& out) {
+        auto* batch = new CppInt64Batch(input.length, 12000);
+        out = batch->top;
+    };
+    lance::UDFCheckpointStore checkpoint;
+    checkpoint.get_batch = [&](const lance::BatchUDFInfo&, ArrowArray&) {
+        get_batch_calls.fetch_add(1);
+        return false;
+    };
+    checkpoint.insert_batch = [&](const lance::BatchUDFInfo&, ArrowArray&, ArrowSchema&) {
+        insert_batch_calls.fetch_add(1);
+    };
+    checkpoint.get_fragment = [&](uint32_t) -> std::optional<std::string> {
+        get_fragment_calls.fetch_add(1);
+        return std::nullopt;
+    };
+    checkpoint.insert_fragment = [&](uint64_t, const std::string&) {
+        insert_fragment_calls.fetch_add(1);
+    };
+    udf.checkpoint_store = std::move(checkpoint);
+
+    uint64_t udf_version = ds.version();
+    ds.add_columns_batch_udf(
+        udf, std::vector<std::string>{}, std::optional<uint32_t>{1});
+    assert(ds.version() > udf_version);
+    assert(get_batch_calls.load() > 0);
+    assert(insert_batch_calls.load() > 0);
+    assert(get_fragment_calls.load() > 0);
+    assert(insert_fragment_calls.load() > 0);
+
+    ArrowSchema schema_after_udf{};
+    ds.schema(&schema_after_udf);
+    assert(schema_after_udf.n_children == fields_before + 3);
+    schema_after_udf.release(&schema_after_udf);
+
+    PASS();
+}
+
 // Re-opens the dataset just written by `test_dataset_write_roundtrip` and
 // exercises `Dataset::compact_files`. The smoke fixture is a single fragment
 // so the default planner has nothing to compact — we expect a no-op (zero
@@ -2833,6 +3924,59 @@ static void test_compact_files(const std::string& dst_uri) {
     assert(metrics.fragments_removed == 0);
     assert(metrics.fragments_added == 0);
     assert(ds.version() == v_before);
+
+    lance::CompactionOptions options;
+    options.set_target_rows_per_fragment(100)
+        .set_max_rows_per_group(1024)
+        .set_max_bytes_per_file(std::nullopt)
+        .set_materialize_deletions(true)
+        .set_materialize_deletions_threshold(0.5f)
+        .set_num_threads(std::optional<uint64_t>{0})
+        .set_batch_size(std::nullopt)
+        .set_io_buffer_size(std::optional<uint64_t>{0})
+        .set_defer_index_remap(false)
+        .set_index_remap_mode(LANCE_INDEX_REMAP_DIRECT)
+        .set_compaction_mode(std::nullopt)
+        .set_binary_copy_read_batch_bytes(std::nullopt)
+        .set_max_source_fragments(std::nullopt)
+        .set_max_source_rows(std::nullopt)
+        .set_max_source_bytes(std::nullopt)
+        .set_excluded_fragment_ids({})
+        .set_max_overlays_per_fragment(std::nullopt)
+        .set_data_storage_version(std::string{"2.1"})
+        .set_transaction_properties(std::nullopt);
+
+    auto from_dataset = lance::CompactionOptions::from_dataset(ds);
+    auto plan = ds.plan_compaction(&options);
+    assert(plan.read_version() == v_before);
+    assert(plan.num_tasks() == 0);
+    auto plan_options = plan.options();
+    (void)plan_options;
+    auto plan_json = plan.json();
+    auto decoded_plan = lance::CompactionPlan::from_json(plan_json);
+    assert(decoded_plan.read_version() == v_before);
+    auto moved_plan = std::move(decoded_plan);
+    assert(moved_plan.num_tasks() == 0);
+
+    auto v2_metrics = ds.compact_files_with_options(&from_dataset);
+    assert(v2_metrics.fragments_removed == 0);
+    assert(v2_metrics.fragments_added == 0);
+    assert(ds.version() == v_before);
+
+    lance::OptimizeIndicesOptions index_options;
+    index_options.set_num_indices_to_merge(std::optional<uint64_t>{0})
+        .set_enable_partition_rebalancing(false)
+        .set_index_names(std::vector<std::string>{})
+        .set_retrain(false)
+        .set_transaction_properties(std::nullopt)
+        .set_max_rows_per_task(std::nullopt)
+        .set_max_rows_per_segment(std::nullopt);
+    auto index_plan = ds.plan_optimize_indices(&index_options);
+    assert(index_plan.num_tasks() == 0);
+    auto index_plan_json = index_plan.json();
+    auto decoded_index_plan =
+        lance::OptimizeIndicesPlan::from_json(index_plan_json);
+    assert(decoded_index_plan.num_merges() == 0);
 
     PASS();
 }
@@ -3503,6 +4647,38 @@ static void test_native_scalar_indexes(const std::string& uri) {
     PASS();
 }
 
+// Index names are JSON strings; the C++ wrapper must return complete escaping
+// and own the underlying C string until it has copied it.
+static void test_index_list_json_escaping(const std::string& uri) {
+    TEST(test_index_list_json_escaping);
+
+    auto ds = lance::Dataset::open(uri);
+    const std::vector<std::string> names = {
+        "cpp_index\\q",
+        "cpp_index\\n",
+        "cpp_index\"quote",
+        "cpp_index\nline\ttab",
+        "cpp_索引列",
+    };
+    for (const auto& name : names) {
+        ds.create_scalar_index("id", LANCE_SCALAR_BTREE, name);
+    }
+
+    auto json = ds.list_indices_json();
+    assert(json.find("\"name\":\"cpp_index\\\\q\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_index\\\\n\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_index\\\"quote\"") != std::string::npos);
+    assert(json.find("\"name\":\"cpp_index\\nline\\ttab\"") !=
+           std::string::npos);
+    assert(json.find("\"name\":\"cpp_索引列\"") != std::string::npos);
+
+    for (const auto& name : names) {
+        ds.drop_index(name);
+    }
+
+    PASS();
+}
+
 static int collect_minhash_alice(ArrowArrayStream& stream) {
     ArrowSchema schema{};
     assert(stream.get_schema(&stream, &schema) == 0);
@@ -3948,6 +5124,339 @@ static void test_fragment_read_operations(const std::string& uri) {
     PASS();
 }
 
+static void test_clone_handle(const std::string& uri) {
+    TEST(test_clone_handle);
+
+    assert(lance_dataset_clone_handle(nullptr) == nullptr);
+    assert(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT);
+    const char* null_message = lance_last_error_message();
+    assert(null_message != nullptr);
+    assert(std::string(null_message).find("dataset is NULL") !=
+           std::string::npos);
+    lance_free_string(null_message);
+
+    std::optional<lance::Dataset> source;
+    source.emplace(lance::Dataset::open(uri));
+    const uint64_t source_version = source->version();
+    assert(source_version == 3);
+    assert(source->count_rows() == 6);
+
+    auto clone = source->clone_handle();
+    assert(clone.version() == source_version);
+    assert(clone.count_rows() == 6);
+
+    ArrowSchema source_schema{};
+    ArrowSchema clone_schema{};
+    source->schema(&source_schema);
+    clone.schema(&clone_schema);
+    assert(source_schema.n_children == 3);
+    assert(clone_schema.n_children == 3);
+    source_schema.release(&source_schema);
+    clone_schema.release(&clone_schema);
+
+    assert(clone.delete_rows("id = 2") == 1);
+    const uint64_t clone_version = source_version + 1;
+    assert(clone.version() == clone_version);
+    assert(clone.count_rows() == 5);
+    assert(source->version() == source_version);
+    assert(source->count_rows() == 6);
+
+    std::vector<uint64_t> source_indices{0, 1, 2, 3, 4, 5};
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    source->take(source_indices.data(), source_indices.size(), &stream);
+    assert((read_fragment_take_ids(stream, false) ==
+            std::vector<int32_t>{0, 2, 3, 10, 11, 13}));
+
+    ArrowSchema source_schema_after{};
+    source->schema(&source_schema_after);
+    assert(source_schema_after.n_children == 3);
+    source_schema_after.release(&source_schema_after);
+
+    std::vector<uint64_t> clone_indices{0, 1, 2, 3, 4};
+    memset(&stream, 0, sizeof(stream));
+    clone.take(clone_indices.data(), clone_indices.size(), &stream);
+    assert((read_fragment_take_ids(stream, false) ==
+            std::vector<int32_t>{0, 3, 10, 11, 13}));
+
+    /* The source can be destroyed before the clone. */
+    source.reset();
+    assert(clone.version() == clone_version);
+    assert(clone.count_rows() == 5);
+    memset(&stream, 0, sizeof(stream));
+    clone.take(clone_indices.data(), clone_indices.size(), &stream);
+    assert((read_fragment_take_ids(stream, false) ==
+            std::vector<int32_t>{0, 3, 10, 11, 13}));
+    clone = lance::Dataset::open(uri).clone_handle();
+    assert(clone.version() == clone_version);
+
+    /* A clone can be destroyed before the source. */
+    source.emplace(lance::Dataset::open(uri));
+    assert(source->version() == clone_version);
+    assert(source->count_rows() == 5);
+    {
+        auto short_lived = source->clone_handle();
+        assert(short_lived.version() == clone_version);
+    }
+    assert(source->version() == clone_version);
+    assert(source->count_rows() == 5);
+
+    /* A cloned handle can be mutating under its write lock while the source
+     * handle is read. The mapper blocks deterministically inside the clone's
+     * exclusive section; a timeout watchdog fails the test rather than
+     * hanging if the source ever waits for the clone's lock. */
+    struct MutationGate {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool mapper_entered = false;
+        bool allow_mapper = false;
+        bool failed = false;
+        std::exception_ptr error;
+    } gate;
+
+    ArrowSchema udf_column{};
+    ArrowSchema* udf_children[1] = {&udf_column};
+    udf_column.format = "l";
+    udf_column.name = "clone_gate";
+    udf_column.flags = ARROW_FLAG_NULLABLE;
+    udf_column.release = test_noop_schema_release;
+    ArrowSchema udf_schema{};
+    udf_schema.format = "+s";
+    udf_schema.n_children = 1;
+    udf_schema.children = udf_children;
+    udf_schema.release = test_noop_schema_release;
+
+    lance::BatchUDF udf;
+    udf.output_schema = &udf_schema;
+    udf.mapper = [&gate](const ArrowArray& input, const ArrowSchema&,
+                         ArrowArray& output) {
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        gate.mapper_entered = true;
+        gate.changed.notify_all();
+        gate.changed.wait(lock, [&gate] { return gate.allow_mapper; });
+        lock.unlock();
+        auto* batch = new CppInt64Batch(input.length, 12000);
+        output = batch->top;
+    };
+
+    auto concurrent_clone = source->clone_handle();
+    const uint64_t concurrent_source_version = source->version();
+    std::thread mutation([&] {
+        try {
+            concurrent_clone.add_columns_batch_udf(udf);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(gate.mutex);
+            gate.failed = true;
+            gate.error = std::current_exception();
+            gate.changed.notify_all();
+        }
+    });
+
+    bool mapper_started = false;
+    {
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        mapper_started = gate.changed.wait_for(
+            lock, std::chrono::seconds(30), [&gate] {
+                return gate.mapper_entered || gate.failed;
+            });
+    }
+    if (!mapper_started) {
+        {
+            std::lock_guard<std::mutex> lock(gate.mutex);
+            gate.allow_mapper = true;
+        }
+        gate.changed.notify_all();
+        mutation.join();
+        if (gate.error) std::rethrow_exception(gate.error);
+        assert(mapper_started && "clone mutation never reached the mapper");
+    }
+
+    auto source_read = std::async(std::launch::async, [&source] {
+        const uint64_t rows = source->count_rows();
+        std::vector<uint64_t> indices{0, 1, 2, 3, 4};
+        ArrowArrayStream read_stream;
+        memset(&read_stream, 0, sizeof(read_stream));
+        source->take(indices.data(), indices.size(), &read_stream);
+        return std::make_pair(rows, read_fragment_take_ids(read_stream, false));
+    });
+    const bool source_read_completed =
+        source_read.wait_for(std::chrono::seconds(30)) ==
+        std::future_status::ready;
+
+    {
+        std::lock_guard<std::mutex> lock(gate.mutex);
+        gate.allow_mapper = true;
+    }
+    gate.changed.notify_all();
+    mutation.join();
+    if (gate.error) std::rethrow_exception(gate.error);
+
+    std::pair<uint64_t, std::vector<int32_t>> source_result;
+    if (source_read_completed) {
+        source_result = source_read.get();
+    } else {
+        source_read.wait();
+        (void)source_read.get();
+    }
+    assert(source_read_completed &&
+           "source reads must not wait for a cloned handle mutation");
+    assert(source_result.first == 5);
+    assert((source_result.second ==
+            std::vector<int32_t>{0, 3, 10, 11, 13}));
+
+    assert(concurrent_clone.version() == concurrent_source_version + 1);
+    assert(source->version() == concurrent_source_version);
+    assert(source->count_rows() == 5);
+    ArrowSchema source_schema_concurrent{};
+    source->schema(&source_schema_concurrent);
+    assert(source_schema_concurrent.n_children == 3);
+    source_schema_concurrent.release(&source_schema_concurrent);
+    ArrowSchema clone_schema_concurrent{};
+    concurrent_clone.schema(&clone_schema_concurrent);
+    assert(clone_schema_concurrent.n_children == 4);
+    clone_schema_concurrent.release(&clone_schema_concurrent);
+
+    PASS();
+}
+
+static void test_diagnostics(const std::string& uri) {
+    TEST(test_diagnostics);
+
+    auto tokens = lance::FtsTokenList::tokenize("the Cats and Dogs");
+    assert(tokens.size() == 2);
+    auto cat = tokens.at(0);
+    auto dog = tokens.at(1);
+    assert(cat.text == "cat" && cat.position == 0);
+    assert(dog.text == "dog" && dog.position == 2);
+    assert(tokens.tokens().size() == 2);
+    bool range_rejected = false;
+    try {
+        (void)tokens.at(2);
+    } catch (const lance::Error&) {
+        range_rejected = true;
+    }
+    assert(range_rejected && "out-of-range token must throw");
+
+    auto empty = lance::FtsTokenList::tokenize(
+        std::string_view("", 0));
+    assert(empty.empty());
+
+    const std::string raw_text("a\0b", 3);
+    auto raw = lance::FtsTokenList::tokenize(
+        raw_text, std::string(R"({"base_tokenizer":"raw"})"));
+    assert(raw.size() == 1);
+    assert(raw.at(0).text == raw_text && raw.at(0).position == 0);
+
+    const std::string invalid_utf8(1, static_cast<char>(0xff));
+    bool utf8_rejected = false;
+    try {
+        (void)lance::FtsTokenList::tokenize(invalid_utf8);
+    } catch (const lance::Error&) {
+        utf8_rejected = true;
+    }
+    assert(utf8_rejected && "invalid UTF-8 must throw");
+
+    bool params_rejected = false;
+    try {
+        (void)lance::FtsTokenList::tokenize(
+            "code",
+            std::string(
+                R"({"base_tokenizer":"code","analyzer":"text"})"));
+    } catch (const lance::Error&) {
+        params_rejected = true;
+    }
+    assert(params_rejected && "invalid tokenizer params must throw");
+
+    auto simd = lance::simd_info_json();
+    assert(simd.find("\"tier\"") != std::string::npos);
+    assert(simd.find("\"target_arch\"") != std::string::npos);
+    assert(simd.find("\"host_features\"") != std::string::npos);
+
+    auto iops_before = lance::process_iops_counter();
+    auto bytes_before = lance::process_bytes_read_counter();
+    auto counters_before = lance::process_io_counters();
+    assert(counters_before.iops >= iops_before);
+    assert(counters_before.bytes_read >= bytes_before);
+
+    auto ds = lance::Dataset::open(uri);
+    auto snapshot_before = ds.io_stats_snapshot();
+    auto incremental_before = ds.io_stats_incremental();
+    assert(incremental_before.read_iops == snapshot_before.read_iops);
+    assert(incremental_before.read_bytes == snapshot_before.read_bytes);
+    assert(ds.count_rows() > 0);
+    auto snapshot_after = ds.io_stats_snapshot();
+    auto incremental_after = ds.io_stats_incremental();
+    assert(snapshot_after.read_iops == incremental_after.read_iops);
+    assert(snapshot_after.read_bytes == incremental_after.read_bytes);
+    assert(lance::process_iops_counter() >= iops_before);
+    assert(lance::process_bytes_read_counter() >= bytes_before);
+
+    PASS();
+}
+
+
+static void test_dataset_deep_clone(const std::string& feature_uri) {
+    TEST(test_dataset_deep_clone);
+
+    // The nested fragment fixture has nullable struct fields, stable row ids,
+    // two fragments and deletions. Earlier tests advance its head, so the
+    // selected snapshot is whatever this handle pinned, and v1 keeps 4 rows.
+    auto source = lance::Dataset::open(feature_uri);
+    const uint64_t source_version = source.version();
+    const uint64_t source_rows = source.count_rows();
+    assert(source_rows > 0 && source_rows <= 6);
+
+    // Tag and branch creation commit to the same storage; `create_branch`
+    // replaces the handle's dataset with the branch, so use a separate handle
+    // and keep `source` pinned to its original snapshot.
+    auto ref_source = lance::Dataset::open(feature_uri);
+    auto v1 = lance::Ref::version_number(1);
+    ref_source.create_tag("deep-clone-cpp-v1", v1);
+    auto tag = lance::Ref::tag("deep-clone-cpp-v1");
+    ref_source.create_branch("deep-clone-cpp-branch", v1);
+    auto branch_ref =
+        lance::Ref::version("deep-clone-cpp-branch", std::nullopt);
+
+    const std::string target_a = feature_uri + ".deep-clone-cpp-a";
+    const std::string target_b = feature_uri + ".deep-clone-cpp-b";
+    const std::string target_c = feature_uri + ".deep-clone-cpp-c";
+    const std::string target_d = feature_uri + ".deep-clone-cpp-d";
+
+    {
+        lance::StorageOptionsAccessor accessor(std::nullopt, nullptr);
+        auto cloned = source.deep_clone(target_a, nullptr, &accessor);
+        // Native clone commits preserve the cloned snapshot version id.
+        assert(cloned.version() == source_version);
+        assert(cloned.count_rows() == source_rows);
+    }
+
+    auto from_version = source.deep_clone(target_b, &v1);
+    assert(from_version.version() == 1);
+    assert(from_version.count_rows() == 4);
+
+    auto from_tag = source.deep_clone(target_c, &tag);
+    assert(from_tag.count_rows() == 4);
+
+    auto from_branch = source.deep_clone(target_d, &branch_ref);
+    assert(from_branch.count_rows() == 4);
+
+    bool threw = false;
+    try {
+        (void)source.deep_clone(target_a);
+    } catch (const lance::Error&) {
+        threw = true;
+    }
+    assert(threw);
+
+    // Reopen the independent target with a fresh session.
+    lance::Session session(0, 0);
+    auto reopened = lance::Dataset::open_with_session(session, target_a);
+    assert(reopened.version() == source_version);
+    assert(reopened.count_rows() == source_rows);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 13) {
         fprintf(stderr,
@@ -3985,12 +5494,15 @@ int main(int argc, char** argv) {
     test_scanner_introspection(uri);
     test_fragment_snapshots(fragment_uri);
     test_fragment_read_operations(fragment_read_uri);
+    test_clone_handle(fragment_read_uri);
     test_scanner_row_addr_lists(uri);
     test_distance_range(uri);
     test_scanner_async_stream_ownership(uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_blob_native_read_slice(blob_uri);
+    test_blob_fields_and_descriptors();
+    test_blob_planned_reads(blob_uri);
     test_dataset_take(uri);
     test_dataset_take_rows(uri);
     test_raii_cleanup(uri);
@@ -4001,6 +5513,7 @@ int main(int argc, char** argv) {
     test_error_exception(uri);
     test_index_lifecycle(uri);
     test_native_scalar_indexes(uri);
+    test_index_list_json_escaping(uri);
     test_rtree_scalar_index(rtree_geometry_uri);
     test_minhash_lsh(uri);
     test_batch_nearest(uri);
@@ -4011,11 +5524,19 @@ int main(int argc, char** argv) {
     test_index_segment_builder(uri);
     test_index_segment_builder_progress(uri);
     test_vector_models_and_reusable_segments(uri);
+    test_vector_index_options_and_model_adoption(uri);
     test_commit_index_segments(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_dataset_deep_clone(fragment_read_uri);
     test_write_options_and_config(uri, write_uri);
+    test_native_write_options(uri, write_uri);
+    test_native_write_base_and_presence(uri, write_uri);
+    test_native_write_data_option_errors(uri, write_uri);
+    test_native_write_progress_errors(uri, write_uri);
+    test_native_write_owner_lifetime_and_commit_error(uri, write_uri);
     test_data_statistics(write_uri);
+    test_diagnostics(uri);
     test_config_replacement(config_base_uri);
     test_base_paths_and_add(config_base_uri, alternate_base_uri);
     test_file_stream_ownership(config_base_uri, alternate_base_uri);
@@ -4027,6 +5548,7 @@ int main(int argc, char** argv) {
     test_alter_columns(write_uri);
     test_drop_columns(write_uri);
     test_add_columns(write_uri);
+    test_merge_and_batch_udf(write_uri);
     test_compact_files(write_uri);
     test_delete_rows(write_uri);
 

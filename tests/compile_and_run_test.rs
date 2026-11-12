@@ -16,11 +16,13 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use arrow_array::builder::{ListBuilder, StringBuilder};
+use arrow_array::types::Int32Type;
 use arrow_array::{
-    BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
-    StructArray, UInt32Array,
+    BinaryArray, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use lance::Dataset;
@@ -35,37 +37,64 @@ mod substrait_aggregate;
 
 use substrait_aggregate::{AggregateKind, aggregate_plan};
 
-/// Build the lance-c cdylib and return the path to the shared library and include dir.
+/// Build the lance-c cdylib/staticlib once per test binary and return the path
+/// to the shared library and include dir.
 fn build_lance_c() -> (PathBuf, PathBuf) {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    static BUILT: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
 
-    // Build the cdylib in debug mode.
-    let status = Command::new("cargo")
-        .args(["build", "--lib"])
-        .current_dir(&manifest_dir)
-        .status()
-        .expect("Failed to run cargo build");
-    assert!(status.success(), "cargo build failed");
+    BUILT
+        .get_or_init(|| {
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let cargo_bin = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
 
-    let target_dir = manifest_dir.join("target").join("debug");
+            // `cargo test` injects package and build-script variables (`OUT_DIR`,
+            // `CARGO_PKG_*`, `CARGO_MANIFEST_*`, etc.) into the test process.
+            // Dependencies like `ring` emit `cargo:rerun-if-env-changed` for those
+            // variables, so inheriting them in a nested `cargo build` invalidates
+            // fingerprints and forces a full dependency rebuild.
+            let mut command = Command::new(cargo_bin);
+            command.args(["build", "--lib"]).current_dir(&manifest_dir);
+            for (key, _) in std::env::vars_os() {
+                if let Some(name) = key.to_str()
+                    && (name == "OUT_DIR"
+                        || name == "CARGO"
+                        || name == "CARGO_CRATE_NAME"
+                        || name == "CARGO_BIN_NAME"
+                        || name == "CARGO_PRIMARY_PACKAGE"
+                        || name.starts_with("CARGO_MANIFEST_")
+                        || name.starts_with("CARGO_PKG_"))
+                {
+                    command.env_remove(&key);
+                }
+            }
 
-    // Find the shared library.
-    let lib_path = if cfg!(target_os = "macos") {
-        target_dir.join("liblance_c.dylib")
-    } else if cfg!(target_os = "linux") {
-        target_dir.join("liblance_c.so")
-    } else {
-        panic!("Unsupported OS for C/C++ link test");
-    };
+            let status = command.status().expect("Failed to run cargo build");
+            assert!(status.success(), "cargo build failed");
 
-    assert!(
-        lib_path.exists(),
-        "Shared library not found at {}",
-        lib_path.display()
-    );
+            let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| manifest_dir.join("target"))
+                .join("debug");
 
-    let include_dir = manifest_dir.join("include");
-    (lib_path, include_dir)
+            // Find the shared library.
+            let lib_path = if cfg!(target_os = "macos") {
+                target_dir.join("liblance_c.dylib")
+            } else if cfg!(target_os = "linux") {
+                target_dir.join("liblance_c.so")
+            } else {
+                panic!("Unsupported OS for C/C++ link test");
+            };
+
+            assert!(
+                lib_path.exists(),
+                "Shared library not found at {}",
+                lib_path.display()
+            );
+
+            let include_dir = manifest_dir.join("include");
+            (lib_path, include_dir)
+        })
+        .clone()
 }
 
 /// Create a test dataset on disk and return (TempDir, path_string).
@@ -145,6 +174,275 @@ fn create_test_dataset_on_disk() -> (tempfile::TempDir, String) {
         )
         .await
         .unwrap();
+    });
+
+    (tmp, uri)
+}
+
+/// Two-fragment fixture for data overlay consumers. Version 1 holds ids 1-20
+/// across ten-row fragments; version 2 deletes id 10. Values are `a = id * 10`
+/// and `b = id * 100`, with NULL `a` at ids 7 and 16.
+fn create_overlay_dataset_on_disk(name: &str) -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join(name).to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int32, true),
+    ]));
+    let ids: Vec<i32> = (1..=20).collect();
+    let a = ids
+        .iter()
+        .map(|id| {
+            if *id == 7 || *id == 16 {
+                None
+            } else {
+                Some(id * 10)
+            }
+        })
+        .collect::<Vec<_>>();
+    let b = ids.iter().map(|id| Some(id * 100)).collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Int32Array::from(a)),
+            Arc::new(Int32Array::from(b)),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id = 10").await.unwrap();
+    });
+    (tmp, uri)
+}
+
+/// Three-fragment, stable-row-ID fixture with non-contiguous field IDs, nested
+/// fields, a dictionary column, and root/field metadata. Arrow export loses
+/// these native details, so consumers use it as the native-schema oracle.
+fn create_native_schema_fixture(name: &str) -> (tempfile::TempDir, String) {
+    use std::collections::HashMap;
+
+    fn field(name: &str, data_type: DataType, nullable: bool, extra: &[(&str, &str)]) -> Field {
+        let mut metadata = HashMap::new();
+        for (key, value) in extra {
+            metadata.insert((*key).to_string(), (*value).to_string());
+        }
+        Field::new(name, data_type, nullable).with_metadata(metadata)
+    }
+
+    fn dictionary_names(keys: &[i32]) -> std::sync::Arc<dyn arrow_array::Array> {
+        let values = std::sync::Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"]));
+        let keys = Int32Array::from(keys.to_vec());
+        std::sync::Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap())
+    }
+
+    fn tags_list(rows: &[&[&str]]) -> std::sync::Arc<dyn arrow_array::Array> {
+        let mut builder = ListBuilder::new(arrow_array::builder::StringBuilder::new());
+        for tags in rows {
+            for tag in *tags {
+                builder.values().append_value(*tag);
+            }
+            builder.append(true);
+        }
+        std::sync::Arc::new(builder.finish())
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join(name).to_str().unwrap().to_string();
+    let score = field(
+        "score",
+        DataType::Int32,
+        true,
+        &[("fixture_role", "nested-score")],
+    );
+    let tags = field(
+        "tags",
+        DataType::List(std::sync::Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))),
+        true,
+        &[("fixture_role", "nested-tags")],
+    );
+    let profile = field(
+        "profile",
+        DataType::Struct(Fields::from(vec![score, tags])),
+        true,
+        &[("fixture_role", "profile")],
+    );
+    let id = field("id", DataType::Int64, false, &[("fixture_role", "row-id")]);
+    let name = field(
+        "name",
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        true,
+        &[("fixture_role", "dictionary-name")],
+    );
+    let drop_me = field("drop_me", DataType::Utf8, true, &[]);
+    let mut metadata = HashMap::new();
+    metadata.insert("fixture".to_string(), "native-schema".to_string());
+    metadata.insert("owner".to_string(), "lance-c".to_string());
+    let schema = std::sync::Arc::new(Schema::new_with_metadata(
+        vec![id, drop_me, name, profile],
+        metadata,
+    ));
+
+    let make_batch = |ids: &[i64], name_keys: &[i32]| {
+        let names = dictionary_names(name_keys);
+        let scores = std::sync::Arc::new(Int32Array::from(
+            ids.iter()
+                .map(|id| Some(*id as i32 * 10))
+                .collect::<Vec<_>>(),
+        ));
+        let tag_rows: Vec<Vec<&str>> = ids
+            .iter()
+            .map(|id| vec!["tag-a", if id % 2 == 0 { "even" } else { "odd" }])
+            .collect();
+        let tag_refs: Vec<&[&str]> = tag_rows.iter().map(|tags| tags.as_slice()).collect();
+        let tags = tags_list(&tag_refs);
+        let profile_fields = match &schema.field(3).data_type() {
+            DataType::Struct(fields) => fields.clone(),
+            other => panic!("profile must be a struct, got {other:?}"),
+        };
+        let profile = std::sync::Arc::new(
+            StructArray::try_new(profile_fields, vec![scores, tags], None).unwrap(),
+        );
+        let drop_me = std::sync::Arc::new(StringArray::from(vec!["drop"; ids.len()]));
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(Int64Array::from(ids.to_vec())),
+                drop_me,
+                names,
+                profile,
+            ],
+        )
+        .unwrap()
+    };
+
+    let first = make_batch(&[1, 2, 3], &[0, 1, 2]);
+    let second = make_batch(&[4, 5], &[1, 0]);
+    let third = make_batch(&[6, 7, 8, 9], &[2, 2, 0, 1]);
+    lance_c::runtime::block_on(async {
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            Some(params),
+        )
+        .await
+        .unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(third)], schema),
+                None,
+            )
+            .await
+            .unwrap();
+        // Dropping `drop_me` leaves a real gap in the surviving field IDs.
+        dataset.drop_columns(&["drop_me"]).await.unwrap();
+        dataset.delete("id = 2").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
+    });
+    (tmp, uri)
+}
+
+/// Three-fragment dataset with deterministic vectors and positional text for
+/// the focused native-index consumers.
+fn create_index_capability_dataset_on_disk(name: &str) -> (tempfile::TempDir, String) {
+    const DIM: i32 = 8;
+    const ROWS_PER_FRAGMENT: i32 = 64;
+    const FRAGMENTS: i32 = 3;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join(name).to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("dist_text", DataType::Utf8, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), DIM),
+            false,
+        ),
+    ]));
+
+    lance_c::runtime::block_on(async {
+        for fragment in 0..FRAGMENTS {
+            let ids = (0..ROWS_PER_FRAGMENT)
+                .map(|row| fragment * ROWS_PER_FRAGMENT + row)
+                .collect::<Vec<_>>();
+            let texts = ids
+                .iter()
+                .map(|id| {
+                    if id % 4 == 0 {
+                        format!("alpha beta doc{id}")
+                    } else {
+                        format!("beta alpha doc{id}")
+                    }
+                })
+                .collect::<Vec<_>>();
+            let text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+            let dist_text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+            let values = ids
+                .iter()
+                .flat_map(|id| (0..DIM).map(move |component| *id as f32 + component as f32 / 10.0))
+                .collect::<Vec<_>>();
+            let embeddings = FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                DIM,
+                Arc::new(Float32Array::from(values)),
+                None,
+            )
+            .unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(text_refs)),
+                    Arc::new(StringArray::from(dist_text_refs)),
+                    Arc::new(embeddings),
+                ],
+            )
+            .unwrap();
+            let params = WriteParams {
+                mode: if fragment == 0 {
+                    WriteMode::Create
+                } else {
+                    WriteMode::Append
+                },
+                ..Default::default()
+            };
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                &uri,
+                Some(params),
+            )
+            .await
+            .unwrap();
+        }
     });
 
     (tmp, uri)
@@ -329,6 +627,157 @@ fn create_typed_fts_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a two-fragment dataset whose only indexed column is a nullable list
+/// of text. Each list element is one FTS document.
+fn create_typed_fts_list_dataset_on_disk() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("typed_fts_list_c_test_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+
+    let make_batch = |ids: Vec<i32>, lists: &[Option<Vec<Option<&str>>>]| {
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        for list in lists {
+            match list {
+                Some(items) => {
+                    for item in items {
+                        match item {
+                            Some(value) => tags.values().append_value(*value),
+                            None => tags.values().append_null(),
+                        }
+                    }
+                    tags.append(true);
+                }
+                None => tags.append(false),
+            }
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(tags.finish())],
+        )
+        .unwrap()
+    };
+    let first = make_batch(
+        vec![1, 2, 3, 4, 5],
+        &[
+            Some(vec![
+                Some("alpha beta"),
+                Some("gamma alpha"),
+                None,
+                Some(""),
+                Some("delta"),
+            ]),
+            Some(vec![Some("alpha"), Some("beta alpha")]),
+            None,
+            Some(Vec::new()),
+            Some(vec![None, None]),
+        ],
+    );
+    let second = make_batch(
+        vec![6, 7, 8, 9, 10, 11],
+        &[
+            Some(vec![Some("!!!"), Some("epsilon")]),
+            Some(vec![Some("")]),
+            Some(vec![Some("alpha"), Some("alpha")]),
+            Some(vec![Some("alpha beta gamma")]),
+            Some(vec![Some("zeta"), Some("alpha beta")]),
+            Some(vec![Some("beta"), Some("gamma")]),
+        ],
+    );
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(first)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap()
+        .append(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(second)], schema),
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let uri_c = CString::new(uri.clone()).unwrap();
+    let dataset = unsafe { lance_c::lance_dataset_open(uri_c.as_ptr(), std::ptr::null(), 0) };
+    assert!(!dataset.is_null(), "failed to open typed FTS list dataset");
+    let params = CString::new(
+        r#"{"base_tokenizer":"simple","language":"English","with_position":true,"document_granularity":"list_element"}"#,
+    )
+    .unwrap();
+    let column = CString::new("tags").unwrap();
+    let rc = unsafe {
+        lance_c::lance_dataset_create_scalar_index(
+            dataset,
+            column.as_ptr(),
+            std::ptr::null(),
+            lance_c::LanceScalarIndexType::Inverted as i32,
+            params.as_ptr(),
+            false,
+        )
+    };
+    if rc != 0 {
+        let message = lance_c::lance_last_error_message();
+        let message = if message.is_null() {
+            "unknown error".to_string()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        panic!("failed to create list-element inverted index: {message}");
+    }
+    unsafe { lance_c::lance_dataset_close(dataset) };
+
+    (tmp, uri)
+}
+
+/// Return the `_rowid` of one dataset row for row-address allowlist tests.
+fn typed_fts_row_id(uri: &str, target: i32) -> u64 {
+    use futures::TryStreamExt;
+
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.with_row_id();
+        let mut stream = scanner.try_into_stream().await.unwrap();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                if ids.value(row) == target {
+                    return row_ids.value(row);
+                }
+            }
+        }
+        panic!("row id {target} not found in {uri}");
+    })
+}
+
 /// Create a two-fragment dataset for scanner ordering tests.
 fn create_ordering_dataset_on_disk() -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
@@ -478,6 +927,107 @@ fn create_fragment_dataset_on_disk(enable_stable_row_ids: bool) -> (tempfile::Te
     (tmp, uri)
 }
 
+/// Create the three-fragment mutation fixture used by C and C++ publication
+/// callers. The dataset has stable row IDs, nested field metadata, a removed
+/// column that leaves an ID gap, and one deleted row in the first and third
+/// fragments.
+fn create_fragment_mutation_dataset_on_disk(name: &str) -> (tempfile::TempDir, String) {
+    use std::collections::HashMap;
+
+    fn metadata(key: &str, value: &str) -> HashMap<String, String> {
+        HashMap::from([(key.to_owned(), value.to_owned())])
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join(name).to_str().unwrap().to_owned();
+    let profile_fields = Fields::from(vec![
+        Field::new("score", DataType::Int32, true).with_metadata(metadata("nested", "score")),
+        Field::new("tag", DataType::Utf8, true),
+    ]);
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("id", DataType::Int64, false).with_metadata(metadata("role", "id")),
+            Field::new("value", DataType::Int32, true).with_metadata(metadata("role", "value")),
+            Field::new("stale", DataType::Utf8, true),
+            Field::new("profile", DataType::Struct(profile_fields.clone()), true)
+                .with_metadata(metadata("role", "nested")),
+        ],
+        metadata("fixture", "fragment-mutation"),
+    ));
+
+    let make_batch = |ids: &[i64]| {
+        let values = ids
+            .iter()
+            .map(|id| Some(*id as i32 * 10))
+            .collect::<Vec<_>>();
+        let scores = Arc::new(Int32Array::from(
+            ids.iter()
+                .map(|id| Some(*id as i32 * 100))
+                .collect::<Vec<_>>(),
+        ));
+        let tags = Arc::new(StringArray::from(
+            ids.iter().map(|id| format!("tag-{id}")).collect::<Vec<_>>(),
+        ));
+        let profile = Arc::new(StructArray::new(
+            profile_fields.clone(),
+            vec![scores, tags],
+            None,
+        ));
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Int32Array::from(values)),
+                Arc::new(StringArray::from(vec!["stale"; ids.len()])),
+                profile,
+            ],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(
+                vec![Ok(make_batch(&[1, 2, 3, 4]))],
+                schema.clone(),
+            ),
+            &uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for ids in [[5_i64, 6, 7, 8], [9, 10, 11, 12]] {
+            dataset
+                .append(
+                    arrow::record_batch::RecordBatchIterator::new(
+                        vec![Ok(make_batch(&ids))],
+                        schema.clone(),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        dataset.drop_columns(&["stale"]).await.unwrap();
+        assert_eq!(
+            dataset
+                .delete("id IN (2, 10)")
+                .await
+                .unwrap()
+                .num_deleted_rows,
+            2
+        );
+        assert_eq!(dataset.version().version, 5);
+        assert_eq!(dataset.get_fragments().len(), 3);
+    });
+    (tmp, uri)
+}
+
 /// Create a two-fragment Blob v2 dataset on disk and return (TempDir, path_string).
 ///
 /// Each fragment has five rows: blobs of 8, 128 and 1024 bytes (inline, packed
@@ -548,6 +1098,99 @@ fn create_blob_dataset_on_disk() -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Create a Blob v2 dataset with three fragments for publication tests.
+///
+/// The first fragment has three rows (`old-packed-0`, a null and an empty
+/// blob), the second has two rows that are later replaced by dedicated
+/// sidecars, and the third has two rows that stay untouched. Stable row IDs
+/// and V2.2 make the C and C++ callers replace base data files in place and
+/// verify that row IDs survive the replacement.
+fn create_blob_publication_dataset_on_disk() -> (tempfile::TempDir, String) {
+    use lance::BlobArrayBuilder;
+
+    enum BlobValue {
+        Bytes(&'static [u8]),
+        Empty,
+        Null,
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("blob_publication_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        lance::blob_field_with_options(
+            "blob",
+            true,
+            lance::BlobFieldOptions {
+                inline_size_threshold: Some(16),
+                dedicated_size_threshold: std::num::NonZeroUsize::new(256),
+            },
+        ),
+    ]));
+
+    let fragments: Vec<Vec<(u32, BlobValue)>> = vec![
+        vec![
+            (0, BlobValue::Bytes(b"old-packed-0")),
+            (1, BlobValue::Null),
+            (2, BlobValue::Empty),
+        ],
+        vec![
+            (3, BlobValue::Bytes(b"old-dedicated-3")),
+            (4, BlobValue::Bytes(b"old-dedicated-4")),
+        ],
+        vec![
+            (5, BlobValue::Bytes(b"keep-c5")),
+            (6, BlobValue::Bytes(b"keep-c6")),
+        ],
+    ];
+
+    lance_c::runtime::block_on(async {
+        for (index, rows) in fragments.iter().enumerate() {
+            let mut blobs = BlobArrayBuilder::new(rows.len());
+            let mut ids = Vec::with_capacity(rows.len());
+            for (id, value) in rows {
+                ids.push(*id);
+                match value {
+                    BlobValue::Bytes(bytes) => blobs.push_bytes(*bytes).unwrap(),
+                    BlobValue::Empty => blobs.push_empty().unwrap(),
+                    BlobValue::Null => blobs.push_null().unwrap(),
+                }
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(UInt32Array::from(ids)), blobs.finish().unwrap()],
+            )
+            .unwrap();
+            let params = WriteParams {
+                mode: if index == 0 {
+                    WriteMode::Create
+                } else {
+                    WriteMode::Append
+                },
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                enable_stable_row_ids: true,
+                ..Default::default()
+            };
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                &uri,
+                Some(params),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    (tmp, uri)
+}
+
 /// Compile a C source file, linking against lance-c.
 fn compile_c_test(source: &Path, output: &Path, include_dir: &Path, lib_path: &Path) -> bool {
     let lib_dir = lib_path.parent().unwrap();
@@ -574,19 +1217,19 @@ fn compile_c_test(source: &Path, output: &Path, include_dir: &Path, lib_path: &P
         .success()
 }
 
-/// Compile a C++ source file, linking against lance-c.
-fn compile_cpp_test(source: &Path, output: &Path, include_dir: &Path, lib_path: &Path) -> bool {
+/// Compile C++ translation units together, linking against lance-c.
+fn compile_cpp_test(sources: &[&Path], output: &Path, include_dir: &Path, lib_path: &Path) -> bool {
     let lib_dir = lib_path.parent().unwrap();
     let lib_name = "lance_c";
 
     let status = Command::new("c++")
+        .args(sources)
         .args([
             "-std=c++17",
             "-Wall",
             "-Wextra",
             "-o",
             output.to_str().unwrap(),
-            source.to_str().unwrap(),
             &format!("-I{}", include_dir.display()),
             &format!("-L{}", lib_dir.display()),
             &format!("-l{lib_name}"),
@@ -694,10 +1337,9 @@ fn run_test_binary_with_dataset(binary: &Path, dataset_uri: &str) {
     );
 }
 
-fn run_test_binary_with_two_args(binary: &Path, first: &str, second: &str) {
+fn run_test_binary_with_args(binary: &Path, args: &[&str]) {
     let output = Command::new(binary)
-        .arg(first)
-        .arg(second)
+        .args(args)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -715,6 +1357,10 @@ fn run_test_binary_with_two_args(binary: &Path, first: &str, second: &str) {
         stdout,
         stderr
     );
+}
+
+fn run_test_binary_with_two_args(binary: &Path, first: &str, second: &str) {
+    run_test_binary_with_args(binary, &[first, second]);
 }
 
 #[test]
@@ -789,7 +1435,7 @@ fn test_cpp_compilation_and_execution() {
     let binary = build_dir.path().join("test_cpp_api");
 
     assert!(
-        compile_cpp_test(&source, &binary, &include_dir, &lib_path),
+        compile_cpp_test(&[&source], &binary, &include_dir, &lib_path),
         "C++ test compilation failed"
     );
     let aggregate_plan_path = write_ordering_aggregate_plan(build_dir.path());
@@ -815,6 +1461,8 @@ fn test_cpp_compilation_and_execution() {
 fn test_typed_fts_native_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
     let (_tmp, dataset_uri) = create_typed_fts_dataset_on_disk();
+    let (_list_tmp, list_dataset_uri) = create_typed_fts_list_dataset_on_disk();
+    let list_row_id = typed_fts_row_id(&list_dataset_uri, 1).to_string();
     let build_dir = tempfile::tempdir().unwrap();
     let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -826,15 +1474,46 @@ fn test_typed_fts_native_compilation_and_execution() {
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C FTS test compilation failed"
     );
-    run_test_binary_with_dataset(&c_binary, &dataset_uri);
+    run_test_binary_with_args(&c_binary, &[&dataset_uri, &list_dataset_uri, &list_row_id]);
 
     let cpp_source = tests_dir.join("test_fts_query.cpp");
     let cpp_binary = build_dir.path().join("test_fts_query_cpp");
     assert!(
-        compile_cpp_test(&cpp_source, &cpp_binary, &include_dir, &lib_path),
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ FTS test compilation failed"
     );
-    run_test_binary_with_dataset(&cpp_binary, &dataset_uri);
+    run_test_binary_with_args(
+        &cpp_binary,
+        &[&dataset_uri, &list_dataset_uri, &list_row_id],
+    );
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_index_capabilities_consumers"]
+fn test_native_index_capabilities_consumers() {
+    let (lib_path, include_dir) = build_lance_c();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let (_c_tmp, c_uri) = create_index_capability_dataset_on_disk("index_caps_c");
+    let c_source = tests_dir.join("test_index_capabilities.c");
+    let c_binary = build_dir.path().join("test_index_capabilities_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "focused C index capability consumer failed to compile"
+    );
+    run_test_binary_with_dataset(&c_binary, &c_uri);
+
+    let (_cpp_tmp, cpp_uri) = create_index_capability_dataset_on_disk("index_caps_cpp");
+    let cpp_source = tests_dir.join("test_index_capabilities.cpp");
+    let cpp_binary = build_dir.path().join("test_index_capabilities_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "focused C++ index capability consumer failed to compile"
+    );
+    run_test_binary_with_dataset(&cpp_binary, &cpp_uri);
 }
 
 #[test]
@@ -842,6 +1521,14 @@ fn test_typed_fts_native_compilation_and_execution() {
 fn test_native_transaction_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
     let (tmp, dataset_uri) = create_test_dataset_on_disk();
+    let (_c_schema_tmp, c_schema_uri) = create_native_schema_fixture("c_native_schema");
+    let (_cpp_schema_tmp, cpp_schema_uri) = create_native_schema_fixture("cpp_native_schema");
+    let (_c_blob_publication_tmp, c_blob_publication_uri) =
+        create_blob_publication_dataset_on_disk();
+    let (_cpp_blob_publication_tmp, cpp_blob_publication_uri) =
+        create_blob_publication_dataset_on_disk();
+    let (_c_blob_append_tmp, c_blob_append_uri) = create_blob_publication_dataset_on_disk();
+    let (_cpp_blob_append_tmp, cpp_blob_append_uri) = create_blob_publication_dataset_on_disk();
     let base = tmp.path().join("native_transactions");
     std::fs::create_dir_all(&base).unwrap();
     let base = base.to_str().unwrap();
@@ -856,15 +1543,145 @@ fn test_native_transaction_compilation_and_execution() {
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C transaction test compilation failed"
     );
-    run_test_binary_with_two_args(&c_binary, &dataset_uri, base);
+    run_test_binary_with_args(
+        &c_binary,
+        &[
+            &dataset_uri,
+            base,
+            &c_schema_uri,
+            &c_blob_publication_uri,
+            &c_blob_append_uri,
+        ],
+    );
 
     let cpp_source = tests_dir.join("test_transaction.cpp");
     let cpp_binary = build_dir.path().join("test_transaction_cpp");
     assert!(
-        compile_cpp_test(&cpp_source, &cpp_binary, &include_dir, &lib_path),
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ transaction test compilation failed"
     );
-    run_test_binary_with_two_args(&cpp_binary, &dataset_uri, base);
+    run_test_binary_with_args(
+        &cpp_binary,
+        &[
+            &dataset_uri,
+            base,
+            &cpp_schema_uri,
+            &cpp_blob_publication_uri,
+            &cpp_blob_append_uri,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_fragment_mutation_consumers"]
+fn test_native_fragment_mutation_consumers() {
+    let (lib_path, include_dir) = build_lance_c();
+    let c_add = create_fragment_mutation_dataset_on_disk("c_fragment_mutation_add");
+    let c_merge = create_fragment_mutation_dataset_on_disk("c_fragment_mutation_merge");
+    let c_update = create_fragment_mutation_dataset_on_disk("c_fragment_mutation_update");
+    let c_write = create_fragment_mutation_dataset_on_disk("c_fragment_mutation_write");
+    let c_delete = create_fragment_mutation_dataset_on_disk("c_fragment_mutation_delete");
+    let cpp_add = create_fragment_mutation_dataset_on_disk("cpp_fragment_mutation_add");
+    let cpp_merge = create_fragment_mutation_dataset_on_disk("cpp_fragment_mutation_merge");
+    let cpp_update = create_fragment_mutation_dataset_on_disk("cpp_fragment_mutation_update");
+    let cpp_write = create_fragment_mutation_dataset_on_disk("cpp_fragment_mutation_write");
+    let cpp_delete = create_fragment_mutation_dataset_on_disk("cpp_fragment_mutation_delete");
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_fragment_mutation.c");
+    let c_binary = build_dir.path().join("test_fragment_mutation_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C fragment mutation consumer failed to compile"
+    );
+    run_test_binary_with_args(
+        &c_binary,
+        &[&c_add.1, &c_merge.1, &c_update.1, &c_write.1, &c_delete.1],
+    );
+
+    let cpp_source = tests_dir.join("test_fragment_mutation.cpp");
+    let cpp_binary = build_dir.path().join("test_fragment_mutation_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "C++ fragment mutation consumer failed to compile"
+    );
+    run_test_binary_with_args(
+        &cpp_binary,
+        &[
+            &cpp_add.1,
+            &cpp_merge.1,
+            &cpp_update.1,
+            &cpp_write.1,
+            &cpp_delete.1,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_data_overlay_consumers"]
+fn test_native_data_overlay_consumers() {
+    let (lib_path, include_dir) = build_lance_c();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let (_c_tmp, c_uri) = create_overlay_dataset_on_disk("data_overlay_c");
+    let c_source = tests_dir.join("test_data_overlay.c");
+    let c_binary = build_dir.path().join("test_data_overlay_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C data overlay consumer failed to compile"
+    );
+    run_test_binary_with_dataset(&c_binary, &c_uri);
+
+    let (_cpp_tmp, cpp_uri) = create_overlay_dataset_on_disk("data_overlay_cpp");
+    let cpp_source = tests_dir.join("test_data_overlay.cpp");
+    let cpp_binary = build_dir.path().join("test_data_overlay_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "C++ data overlay consumer failed to compile"
+    );
+    run_test_binary_with_dataset(&cpp_binary, &cpp_uri);
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_raw_file_native_compilation_and_execution"]
+fn test_raw_file_native_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let base = tempfile::tempdir().unwrap();
+    let base_path = base.path().to_str().unwrap();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_file_api.c");
+    let c_binary = build_dir.path().join("test_file_api_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C raw-file test compilation failed"
+    );
+    run_test_binary_with_dataset(&c_binary, base_path);
+
+    let cpp_source = tests_dir.join("test_file_api.cpp");
+    let cpp_session_source = tests_dir.join("test_file_session.cpp");
+    let cpp_binary = build_dir.path().join("test_file_api_cpp");
+    assert!(
+        compile_cpp_test(
+            &[&cpp_source, &cpp_session_source],
+            &cpp_binary,
+            &include_dir,
+            &lib_path,
+        ),
+        "C++ raw-file test compilation failed"
+    );
+    run_test_binary_with_dataset(&cpp_binary, base_path);
+    #[cfg(unix)]
+    run_test_binary_with_two_args(&cpp_binary, base_path, "write-failure");
 }
 
 /// A fresh C executable must initialize OpenDAL even when archive constructors are omitted.
@@ -881,4 +1698,464 @@ fn test_static_oss_transport() {
         .status()
         .expect("failed to run the static OSS transport test");
     assert!(status.success(), "static OSS HTTP transport test failed");
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_namespace_compilation_and_execution"]
+fn test_native_namespace_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_namespace.c");
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap();
+    let c_binary = build_dir.path().join("test_namespace_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C native namespace test compilation failed"
+    );
+    run_test_binary_with_dataset(&c_binary, root);
+
+    let cpp_source = tests_dir.join("test_namespace.cpp");
+    let cpp_binary = build_dir.path().join("test_namespace_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "C++ native namespace test compilation failed"
+    );
+    run_test_binary_with_dataset(&cpp_binary, root);
+}
+
+/// Create the multi-fragment SQL dataset: three fragments of ten rows each.
+///
+/// Version 1 creates ids 1..=10, then two appends add 11..=20 and 21..=30, so
+/// the dataset also serves as the plain (non-stable-row-id) dataset the delta
+/// consumer compares between versions 1 and 2.
+fn create_sql_multi_fragment_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("sql_multi_fragment")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Int32, true),
+    ]));
+
+    let make_batch = |first_id: i32| {
+        let ids: Vec<i32> = (first_id..first_id + 10).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.clone())),
+                Arc::new(StringArray::from_iter_values(
+                    ids.iter().map(|id| format!("name-{id}")),
+                )),
+                Arc::new(Int32Array::from_iter_values(ids.iter().map(|id| id * 10))),
+            ],
+        )
+        .unwrap()
+    };
+
+    lance_c::runtime::block_on(async {
+        for (first_id, mode) in [
+            (1i32, WriteMode::Create),
+            (11, WriteMode::Append),
+            (21, WriteMode::Append),
+        ] {
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(
+                    vec![Ok(make_batch(first_id))],
+                    schema.clone(),
+                ),
+                &uri,
+                Some(WriteParams {
+                    mode,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    (tmp, uri)
+}
+
+/// Create the history dataset the SQL and delta consumers share.
+///
+/// Version history, with stable row ids from the start:
+///
+/// - v1 creates ids 1..=4 (`a`..`d`)
+/// - v2 appends ids 5 and 6 (`e`, `f`)
+/// - v3 updates id 2 to `updated-2`
+/// - v4 deletes id 3
+/// - v5 upserts id 6 and inserts id 7
+///
+/// Returns the commit timestamps so the caller can turn two of them into a
+/// date-mode window.
+fn create_sql_delta_history_dataset() -> (tempfile::TempDir, String, Vec<(i64, u32)>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("sql_delta_history")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("score", DataType::Int32, true),
+    ]));
+
+    let make_batch = |rows: &[(i32, &str)]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(Int32Array::from_iter_values(
+                    rows.iter().map(|row| row.0 * 10),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+
+    let iterator = |batch: RecordBatch| {
+        arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
+    };
+
+    let timestamps = lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::write(
+            iterator(make_batch(&[(1, "a"), (2, "b"), (3, "c"), (4, "d")])),
+            &uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .append(iterator(make_batch(&[(5, "e"), (6, "f")])), None)
+            .await
+            .unwrap();
+        lance::dataset::UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id = 2")
+            .unwrap()
+            .set("name", "'updated-2'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset.delete("id = 3").await.unwrap();
+
+        let mut merge = lance::dataset::write::merge_insert::MergeInsertBuilder::try_new(
+            Arc::new(dataset.clone()),
+            vec!["id".to_string()],
+        )
+        .unwrap();
+        merge
+            .when_matched(lance::dataset::write::merge_insert::WhenMatched::UpdateAll)
+            .when_not_matched(lance::dataset::write::merge_insert::WhenNotMatched::InsertAll);
+        merge
+            .try_build()
+            .unwrap()
+            .execute_batches(vec![make_batch(&[(6, "upserted-6"), (7, "g")])])
+            .await
+            .unwrap();
+
+        let versions = Dataset::open(&uri).await.unwrap().versions().await.unwrap();
+        assert_eq!(versions.len(), 5, "history records one version per commit");
+        versions
+            .iter()
+            .map(|version| {
+                (
+                    version.timestamp.timestamp(),
+                    version.timestamp.timestamp_subsec_nanos(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+
+    (tmp, uri, timestamps)
+}
+
+/// Create the blob-v2 dataset the SQL blob-handling modes read.
+///
+/// Three rows: an inline-sized payload, a null and a longer payload.
+fn create_sql_delta_blob_dataset() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("sql_delta_blob")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        lance::blob_field_with_options(
+            "blob",
+            true,
+            lance::BlobFieldOptions {
+                inline_size_threshold: Some(8),
+                dedicated_size_threshold: std::num::NonZeroUsize::new(64),
+            },
+        ),
+    ]));
+
+    let mut blobs = lance::BlobArrayBuilder::new(3);
+    blobs.push_bytes(b"inline-blob").unwrap();
+    blobs.push_null().unwrap();
+    blobs
+        .push_bytes(b"another-blob-value-longer-than-inline")
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(1..=3)),
+            blobs.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    (tmp, uri)
+}
+
+/// Resolve a date window to the version range the native delta reader uses:
+/// the begin timestamp is exclusive, the end timestamp inclusive.
+fn resolve_sql_delta_window(uri: &str, begin: (i64, u32), end: (i64, u32)) -> (u64, u64) {
+    let versions = lance_c::runtime::block_on(async {
+        let dataset = Dataset::open(uri).await.unwrap();
+        dataset.versions().await.unwrap()
+    });
+    let mut begin_version = 0_u64;
+    let mut end_version = 0_u64;
+    for version in &versions {
+        let stamp = (
+            version.timestamp.timestamp(),
+            version.timestamp.timestamp_subsec_nanos(),
+        );
+        if stamp < begin && version.version > begin_version {
+            begin_version = version.version;
+        }
+        if stamp <= end && version.version > end_version {
+            end_version = version.version;
+        }
+    }
+    (begin_version, end_version)
+}
+
+/// Real C11 and C++17 consumers of the native SQL and delta APIs.
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_sql_delta_compilation_and_execution"]
+fn test_native_sql_delta_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (_sql_tmp, sql_uri) = create_sql_multi_fragment_dataset();
+    let (_history_tmp, history_uri, timestamps) = create_sql_delta_history_dataset();
+    let (_blob_tmp, blob_uri) = create_sql_delta_blob_dataset();
+    assert_eq!(timestamps.len(), 5, "history fixture versions");
+
+    // A window from version 2 (exclusive) to version 5 (inclusive): the
+    // inserted, updated and deleted change sets are all non-empty there. The
+    // begin date is exclusive, so opening the window at version 3's commit
+    // timestamp resolves the begin to version 2.
+    let begin = timestamps[2];
+    let end = timestamps[4];
+    let (resolved_begin, resolved_end) = resolve_sql_delta_window(&history_uri, begin, end);
+    assert_eq!(resolved_begin, 2, "begin resolves to the exclusive version");
+    assert_eq!(resolved_end, 5, "end resolves to the inclusive version");
+
+    let begin_seconds = begin.0.to_string();
+    let begin_nanos = begin.1.to_string();
+    let end_seconds = end.0.to_string();
+    let end_nanos = end.1.to_string();
+    let resolved_begin = resolved_begin.to_string();
+    let resolved_end = resolved_end.to_string();
+
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_sql.c");
+    let c_binary = build_dir.path().join("test_sql_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C native SQL test compilation failed"
+    );
+    run_test_binary_with_args(
+        &c_binary,
+        &[sql_uri.as_str(), history_uri.as_str(), blob_uri.as_str()],
+    );
+
+    let delta_source = tests_dir.join("test_delta.c");
+    let delta_binary = build_dir.path().join("test_delta_c");
+    assert!(
+        compile_c_test(&delta_source, &delta_binary, &include_dir, &lib_path),
+        "C native delta test compilation failed"
+    );
+    run_test_binary_with_args(
+        &delta_binary,
+        &[
+            sql_uri.as_str(),
+            history_uri.as_str(),
+            blob_uri.as_str(),
+            begin_seconds.as_str(),
+            begin_nanos.as_str(),
+            end_seconds.as_str(),
+            end_nanos.as_str(),
+            resolved_begin.as_str(),
+            resolved_end.as_str(),
+        ],
+    );
+
+    let cpp_source = tests_dir.join("test_sql_delta.cpp");
+    let cpp_binary = build_dir.path().join("test_sql_delta_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "C++ native SQL and delta test compilation failed"
+    );
+    run_test_binary_with_args(
+        &cpp_binary,
+        &[
+            sql_uri.as_str(),
+            history_uri.as_str(),
+            blob_uri.as_str(),
+            begin_seconds.as_str(),
+            begin_nanos.as_str(),
+            end_seconds.as_str(),
+            end_nanos.as_str(),
+            resolved_begin.as_str(),
+            resolved_end.as_str(),
+        ],
+    );
+}
+
+fn create_mem_wal_dataset_on_disk() -> (tempfile::TempDir, String) {
+    use std::collections::HashMap;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("mem_wal_cpp_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut pk = HashMap::new();
+    pk.insert(
+        "lance-schema:unenforced-primary-key".to_string(),
+        "true".to_string(),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false).with_metadata(pk),
+        Field::new("name", DataType::Utf8, true),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+            true,
+        ),
+    ]));
+    let ids = vec![1_i32, 2, 3];
+    let names = vec!["a", "b", "c"];
+    let flat: Vec<f32> = (0..3).flat_map(|i| vec![i as f32, 0.0, 0.0, 0.0]).collect();
+    let vector = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        4,
+        Arc::new(Float32Array::from(flat)),
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(vector),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+    (tmp, uri)
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test --test compile_and_run_test -- --ignored test_mem_wal_cpp_compilation_and_execution"]
+fn test_mem_wal_cpp_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (_tmp, uri) = create_mem_wal_dataset_on_disk();
+    let build_dir = tempfile::tempdir().unwrap();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp")
+        .join("mem_wal_test.cpp");
+    let binary = build_dir.path().join("mem_wal_test_cpp");
+    assert!(
+        compile_cpp_test(&[&source], &binary, &include_dir, &lib_path),
+        "C++ MemWAL test compilation failed"
+    );
+    run_test_binary_with_dataset(&binary, &uri);
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_commit_lock_native_compilation_and_execution"]
+fn test_commit_lock_native_compilation_and_execution() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (_source, source_uri) = create_test_dataset_on_disk();
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch_path = scratch.path().to_str().unwrap();
+    let build_dir = tempfile::tempdir().unwrap();
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("cpp");
+
+    let c_source = tests_dir.join("test_commit_lock.c");
+    let c_binary = build_dir.path().join("test_commit_lock_c");
+    assert!(
+        compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
+        "C commit-lock test compilation failed"
+    );
+    run_test_binary_with_two_args(&c_binary, &source_uri, scratch_path);
+
+    let cpp_source = tests_dir.join("test_commit_lock.cpp");
+    let cpp_binary = build_dir.path().join("test_commit_lock_cpp");
+    assert!(
+        compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
+        "C++ commit-lock test compilation failed"
+    );
+    run_test_binary_with_two_args(&cpp_binary, &source_uri, scratch_path);
 }

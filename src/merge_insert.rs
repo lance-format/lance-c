@@ -17,6 +17,7 @@ use lance_core::Result;
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
+use crate::mem_wal::{LanceCompactedSsTable, parse_compacted_sstables};
 use crate::runtime::block_on;
 
 /// Behavior when a target row matches a source row on the join keys.
@@ -207,6 +208,8 @@ pub unsafe extern "C" fn lance_dataset_merge_insert(
                 num_on_columns,
                 source,
                 params,
+                std::ptr::null(),
+                0,
                 out_result,
             )
         },
@@ -214,12 +217,15 @@ pub unsafe extern "C" fn lance_dataset_merge_insert(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn merge_insert_inner(
     dataset: *mut LanceDataset,
     on_columns: *const *const c_char,
     num_on_columns: usize,
     source: *mut FFI_ArrowArrayStream,
     params: *const LanceMergeInsertParams,
+    compacted_sstables: *const LanceCompactedSsTable,
+    num_compacted_sstables: usize,
     out_result: *mut LanceMergeInsertResult,
 ) -> Result<i32> {
     // The stream NULL check is the only validation that runs *before* the
@@ -242,6 +248,11 @@ unsafe fn merge_insert_inner(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(source) }
         .map_err(|e| lance_core::Error::invalid_input_source(e.to_string().into()))?;
 
+    // The stream is now owned by `reader` and will be released on every return
+    // path below. Validate and copy the optional compaction progress next.
+    let compacted_sstables =
+        unsafe { parse_compacted_sstables(compacted_sstables, num_compacted_sstables)? };
+
     if dataset.is_null() {
         return Err(lance_core::Error::invalid_input_source(
             "dataset must not be NULL".into(),
@@ -257,6 +268,7 @@ unsafe fn merge_insert_inner(
             "on_columns must not be NULL when num_on_columns > 0".into(),
         ));
     }
+    helpers::validate_slice_length::<*const c_char>(num_on_columns, "on_columns")?;
 
     // Materialize key columns up front so a precise per-index error fires
     // before the write lock is taken.
@@ -307,6 +319,9 @@ unsafe fn merge_insert_inner(
                 .when_matched(resolved.when_matched)
                 .when_not_matched(resolved.when_not_matched)
                 .when_not_matched_by_source(when_not_matched_by_source);
+            if !compacted_sstables.is_empty() {
+                builder.mark_sstables_as_compacted(compacted_sstables.clone());
+            }
             let job = builder.try_build()?;
             let (new_dataset, stats) = job.execute_reader(reader).await?;
             *d = Arc::try_unwrap(new_dataset.clone()).unwrap_or_else(|arc| (*arc).clone());
@@ -328,6 +343,41 @@ unsafe fn merge_insert_inner(
         }
     }
     Ok(0)
+}
+
+/// Merge `source` into `dataset` and atomically advance native MemWAL
+/// compaction progress.
+///
+/// Identical to `lance_dataset_merge_insert` but also registers the supplied
+/// compacted SSTables in the same commit as the merged data. The stream is
+/// consumed on every return path once accepted. An empty list is equivalent
+/// to the plain merge. Entries are copied before execution.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_merge_insert_with_compaction(
+    dataset: *mut LanceDataset,
+    on_columns: *const *const c_char,
+    num_on_columns: usize,
+    source: *mut FFI_ArrowArrayStream,
+    params: *const LanceMergeInsertParams,
+    compacted_sstables: *const LanceCompactedSsTable,
+    num_compacted_sstables: usize,
+    out_result: *mut LanceMergeInsertResult,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            merge_insert_inner(
+                dataset,
+                on_columns,
+                num_on_columns,
+                source,
+                params,
+                compacted_sstables,
+                num_compacted_sstables,
+                out_result,
+            )
+        },
+        neg
+    )
 }
 
 /// Translate caller-supplied `LanceMergeInsertParams` (or NULL) into the

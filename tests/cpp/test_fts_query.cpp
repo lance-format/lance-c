@@ -6,7 +6,9 @@
  * @brief Functional C++ coverage for typed full-text query trees.
  *
  * The Rust harness creates a two-fragment dataset with two inverted-indexed
- * text columns and passes its URI as argv[1].
+ * text columns and passes its URI as argv[1]. It also creates a list-typed
+ * fixture and passes its URI as argv[2] plus one row id from that fixture as
+ * argv[3].
  */
 
 #include "lance/lance.hpp"
@@ -15,6 +17,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -108,6 +111,34 @@ static void expect_score(QueryResult result, int32_t id, float expected) {
     const float actual = score_of(result, id);
     const float tolerance = 1e-5f * std::max(1.0f, std::fabs(expected));
     assert(std::fabs(actual - expected) <= tolerance);
+}
+
+static std::vector<float> scores_of(const QueryResult& result, int32_t id) {
+    std::vector<float> scores;
+    for (size_t index = 0; index < result.ids.size(); ++index) {
+        if (result.ids[index] == id) scores.push_back(result.scores[index]);
+    }
+    std::sort(scores.begin(), scores.end());
+    return scores;
+}
+
+static void expect_scores_multiplied(const QueryResult& baseline,
+                                     const QueryResult& scaled, int32_t id,
+                                     float factor) {
+    const auto expected = scores_of(baseline, id);
+    const auto actual = scores_of(scaled, id);
+    assert(expected.size() == actual.size());
+    for (size_t index = 0; index < expected.size(); ++index) {
+        const float target = expected[index] * factor;
+        const float tolerance =
+            1e-5f * std::max(1.0f, std::fabs(target));
+        assert(std::fabs(actual[index] - target) <= tolerance);
+    }
+}
+
+static void expect_scores_equal(const QueryResult& expected,
+                                const QueryResult& actual, int32_t id) {
+    assert(scores_of(expected, id) == scores_of(actual, id));
 }
 
 static void test_match_boost_and_granularity(const lance::Dataset& dataset) {
@@ -278,16 +309,128 @@ static void test_validation_and_replacement(const lance::Dataset& dataset) {
     PASS();
 }
 
+static void test_list_element_execution(const lance::Dataset& dataset,
+                                        uint64_t row_id) {
+    TEST(test_list_element_execution);
+
+    const std::vector<int32_t> alpha_ids = {1, 1, 2, 2, 8, 8, 9, 10};
+    lance::FtsMatchOptions match_options;
+    match_options.document_granularity =
+        lance::FtsDocumentGranularity::ListElement;
+
+    auto scanner = dataset.scan();
+    {
+        auto query = lance::FtsQuery::match("alpha", std::string("tags"),
+                                            match_options);
+        scanner.full_text_search(query);
+    }
+    auto alpha = collect(scanner);
+    expect_ids(alpha, alpha_ids);
+    for (float score : alpha.scores) assert(score > 0.0f);
+
+    lance::FtsMatchOptions unspecified_options;
+    auto unspecified_scanner = dataset.scan();
+    {
+        auto query = lance::FtsQuery::match("alpha", std::string("tags"),
+                                            unspecified_options);
+        unspecified_scanner.full_text_search(query);
+    }
+    auto unspecified = collect(unspecified_scanner);
+    expect_ids(unspecified, alpha_ids);
+    for (int32_t id : {1, 2, 8, 9, 10})
+        expect_scores_equal(alpha, unspecified, id);
+
+    lance::FtsMatchOptions boost_options = match_options;
+    boost_options.boost = 2.0f;
+    auto boost_scanner = dataset.scan();
+    {
+        auto query =
+            lance::FtsQuery::match("alpha", std::string("tags"), boost_options);
+        boost_scanner.full_text_search(query);
+    }
+    auto boosted = collect(boost_scanner);
+    expect_ids(boosted, alpha_ids);
+    for (int32_t id : {1, 2, 8, 9, 10})
+        expect_scores_multiplied(alpha, boosted, id, 2.0f);
+
+    lance::FtsPhraseOptions phrase_options;
+    phrase_options.document_granularity =
+        lance::FtsDocumentGranularity::ListElement;
+    auto phrase = [&dataset, &phrase_options](const std::string& terms) {
+        auto phrase_scanner = dataset.scan();
+        {
+            auto query = lance::FtsQuery::phrase(terms, std::string("tags"),
+                                                 phrase_options);
+            phrase_scanner.full_text_search(query);
+        }
+        return collect(phrase_scanner);
+    };
+    expect_ids(phrase("alpha beta"), {1, 9, 10});
+    expect_ids(phrase("beta alpha"), {2});
+    expect_ids(phrase("beta gamma"), {9});
+
+    auto filtered_scanner = dataset.scan();
+    {
+        auto query = lance::FtsQuery::match("alpha", std::string("tags"),
+                                            match_options);
+        filtered_scanner.full_text_search(query);
+        filtered_scanner.row_addr_allowlist(&row_id, 1);
+    }
+    auto filtered = collect(filtered_scanner);
+    expect_ids(filtered, {1, 1});
+    expect_scores_equal(alpha, filtered, 1);
+
+    auto expect_rejection = [&dataset](lance::FtsQuery query,
+                                       LanceErrorCode code,
+                                       const std::string& first,
+                                       const std::string& second) {
+        auto rejection_scanner = dataset.scan();
+        rejection_scanner.full_text_search(query);
+        bool rejected = false;
+        try {
+            (void)collect(rejection_scanner);
+        } catch (const lance::Error& error) {
+            const std::string text = error.what();
+            rejected = error.code == code &&
+                       text.find(first) != std::string::npos &&
+                       (second.empty() ||
+                        text.find(second) != std::string::npos);
+        }
+        assert(rejected);
+    };
+
+    lance::FtsMatchOptions row_options;
+    row_options.document_granularity = lance::FtsDocumentGranularity::Row;
+    expect_rejection(
+        lance::FtsQuery::match("alpha", std::string("tags"), row_options),
+        LANCE_ERR_INVALID_ARGUMENT, "requested Row", "ListElement");
+    expect_rejection(lance::FtsQuery::multi_match("alpha", {"tags"}, {}),
+                     LANCE_ERR_NOT_SUPPORTED,
+                     "MultiMatch does not support ListElement document "
+                     "granularity",
+                     "");
+    expect_rejection(
+        lance::FtsQuery::combined_fields("alpha", {"tags"}, {}),
+        LANCE_ERR_NOT_SUPPORTED,
+        "combined_fields (BM25F) scores whole rows", "");
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
-    assert(argc == 2);
+    assert(argc == 4);
     const std::string uri(argv[1]);
+    const std::string list_uri(argv[2]);
+    const uint64_t list_row_id = std::strtoull(argv[3], nullptr, 10);
     printf("Running typed FTS C++ tests with dataset: %s\n", uri.c_str());
 
     auto dataset = lance::Dataset::open(uri);
+    auto list_dataset = lance::Dataset::open(list_uri);
     test_match_boost_and_granularity(dataset);
     test_boolean_phrase_and_boost(dataset);
     test_multi_match_and_combined_fields(dataset);
     test_validation_and_replacement(dataset);
+    test_list_element_execution(list_dataset, list_row_id);
 
     printf("All typed FTS C++ tests passed!\n");
     return 0;

@@ -4,7 +4,7 @@
 //! Restore C API: move a dataset's latest back to an older version by
 //! committing a new manifest whose fragments match the chosen version.
 //!
-//! Returns a fresh `LanceDataset*` positioned at the target version; the
+//! Returns a fresh `LanceDataset*` positioned at the newly committed version; the
 //! caller's original handle is untouched and remains usable.
 
 use std::sync::{Arc, RwLock};
@@ -27,7 +27,7 @@ use crate::runtime::block_on;
 /// current latest — this guarantees the caller's stated intent ("make `version`
 /// the new latest") holds under concurrent writers without a TOCTOU race.
 ///
-/// Returns a fresh `LanceDataset*` positioned at the target version on success
+/// Returns a fresh `LanceDataset*` positioned at the newly committed version
 /// (caller closes with `lance_dataset_close`), or NULL on error. Errors include
 /// `LANCE_ERR_NOT_FOUND` for an unknown `version` and `LANCE_ERR_COMMIT_CONFLICT`
 /// for a concurrent commit race.

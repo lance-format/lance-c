@@ -1,5 +1,6 @@
 # Rust build output
 /target
+/examples/cross-sdk-index-metadata/java/target/
 
 # Prerequisites
 *.d

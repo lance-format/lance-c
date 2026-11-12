@@ -18,10 +18,25 @@
 
 #include "lance/lance.h"
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+
+_Static_assert(sizeof(LanceCompactionOptions) == 40,
+               "legacy compaction options ABI must stay 40 bytes");
+_Static_assert(offsetof(LanceCompactionOptions, target_rows_per_fragment) == 0,
+               "legacy compaction field 0 moved");
+_Static_assert(offsetof(LanceCompactionOptions, max_rows_per_group) == 8,
+               "legacy compaction field 1 moved");
+_Static_assert(offsetof(LanceCompactionOptions, max_bytes_per_file) == 16,
+               "legacy compaction field 2 moved");
+_Static_assert(offsetof(LanceCompactionOptions, num_threads) == 24,
+               "legacy compaction field 3 moved");
+_Static_assert(offsetof(LanceCompactionOptions, batch_size) == 32,
+               "legacy compaction field 4 moved");
 
 /* Arrow C Data Interface flag bits — mirror arrow_schema/arrow_c_data_interface.h
  * so we don't depend on the full Arrow header just to read schema flags. */
@@ -211,6 +226,247 @@ static void capture_build_progress(
     else if (event != LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS)
         captured->invalid = 1;
     captured->events += 1;
+}
+
+static void test_noop_schema_release(struct ArrowSchema *schema) {
+    if (schema != NULL) schema->release = NULL;
+}
+
+static void test_noop_array_release(struct ArrowArray *array) {
+    if (array != NULL) array->release = NULL;
+}
+
+typedef struct {
+    struct ArrowSchema top;
+    struct ArrowSchema key;
+    struct ArrowSchema value;
+    struct ArrowSchema *schema_children[2];
+    struct ArrowArray top_array;
+    struct ArrowArray key_array;
+    struct ArrowArray value_array;
+    struct ArrowArray *array_children[2];
+    const void *top_buffers[1];
+    const void *key_buffers[2];
+    const void *value_buffers[2];
+    int32_t ids[4];
+    int64_t values[4];
+    int emitted;
+    struct ArrowArrayStream stream;
+} MergeStreamFixture;
+
+static int merge_stream_get_schema(
+    struct ArrowArrayStream *stream,
+    struct ArrowSchema *out
+) {
+    MergeStreamFixture *fixture = (MergeStreamFixture *)stream->private_data;
+    *out = fixture->top;
+    out->release = test_noop_schema_release;
+    return 0;
+}
+
+static int merge_stream_get_next(
+    struct ArrowArrayStream *stream,
+    struct ArrowArray *out
+) {
+    MergeStreamFixture *fixture = (MergeStreamFixture *)stream->private_data;
+    if (fixture->emitted) {
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
+    fixture->emitted = 1;
+    *out = fixture->top_array;
+    out->release = test_noop_array_release;
+    return 0;
+}
+
+static const char *merge_stream_last_error(struct ArrowArrayStream *stream) {
+    (void)stream;
+    return NULL;
+}
+
+static void merge_stream_release(struct ArrowArrayStream *stream) {
+    if (stream != NULL) stream->release = NULL;
+}
+
+static void init_merge_stream(MergeStreamFixture *fixture) {
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->ids[0] = 1;
+    fixture->ids[1] = 2;
+    fixture->ids[2] = 3;
+    fixture->ids[3] = 4;
+    fixture->values[0] = 1001;
+    fixture->values[1] = 1002;
+    fixture->values[2] = 1003;
+    fixture->values[3] = 1004;
+
+    fixture->schema_children[0] = &fixture->key;
+    fixture->schema_children[1] = &fixture->value;
+    fixture->top.format = "+s";
+    fixture->top.n_children = 2;
+    fixture->top.children = fixture->schema_children;
+    fixture->top.release = test_noop_schema_release;
+    fixture->key.format = "i";
+    fixture->key.name = "id";
+    fixture->key.release = test_noop_schema_release;
+    fixture->value.format = "l";
+    fixture->value.name = "c_merged";
+    fixture->value.flags = ARROW_FLAG_NULLABLE;
+    fixture->value.release = test_noop_schema_release;
+
+    fixture->top_buffers[0] = NULL;
+    fixture->key_buffers[0] = NULL;
+    fixture->key_buffers[1] = fixture->ids;
+    fixture->value_buffers[0] = NULL;
+    fixture->value_buffers[1] = fixture->values;
+
+    fixture->array_children[0] = &fixture->key_array;
+    fixture->array_children[1] = &fixture->value_array;
+    fixture->key_array.length = 4;
+    fixture->key_array.n_buffers = 2;
+    fixture->key_array.buffers = fixture->key_buffers;
+    fixture->key_array.release = test_noop_array_release;
+    fixture->value_array.length = 4;
+    fixture->value_array.n_buffers = 2;
+    fixture->value_array.buffers = fixture->value_buffers;
+    fixture->value_array.release = test_noop_array_release;
+    fixture->top_array.length = 4;
+    fixture->top_array.n_buffers = 1;
+    fixture->top_array.buffers = fixture->top_buffers;
+    fixture->top_array.n_children = 2;
+    fixture->top_array.children = fixture->array_children;
+    fixture->top_array.release = test_noop_array_release;
+
+    fixture->stream.get_schema = merge_stream_get_schema;
+    fixture->stream.get_next = merge_stream_get_next;
+    fixture->stream.get_last_error = merge_stream_last_error;
+    fixture->stream.release = merge_stream_release;
+    fixture->stream.private_data = fixture;
+}
+
+typedef struct {
+    struct ArrowArray top;
+    struct ArrowArray child;
+    struct ArrowArray *children[1];
+    const void *top_buffers[1];
+    const void *child_buffers[2];
+    int64_t *values;
+} Int64BatchAllocation;
+
+static void release_int64_batch(struct ArrowArray *array) {
+    if (array == NULL) return;
+    Int64BatchAllocation *allocation =
+        (Int64BatchAllocation *)array->private_data;
+    if (allocation != NULL) {
+        free(allocation->values);
+        free(allocation);
+    }
+    array->release = NULL;
+    array->private_data = NULL;
+}
+
+static int32_t test_batch_udf_mapper(
+    void *callback_ctx,
+    const struct ArrowArray *input,
+    const struct ArrowSchema *input_schema,
+    struct ArrowArray *out,
+    LanceCallbackError *error
+) {
+    (void)callback_ctx;
+    (void)input_schema;
+    (void)error;
+    size_t rows = (size_t)input->length;
+    Int64BatchAllocation *allocation =
+        (Int64BatchAllocation *)calloc(1, sizeof(*allocation));
+    if (allocation == NULL) return -1;
+    allocation->values = (int64_t *)malloc(rows * sizeof(int64_t));
+    if (allocation->values == NULL && rows > 0) {
+        free(allocation);
+        return -1;
+    }
+    for (size_t i = 0; i < rows; ++i) allocation->values[i] = 7000 + (int64_t)i;
+
+    allocation->top_buffers[0] = NULL;
+    allocation->child_buffers[0] = NULL;
+    allocation->child_buffers[1] = allocation->values;
+    allocation->children[0] = &allocation->child;
+    allocation->child.length = (int64_t)rows;
+    allocation->child.n_buffers = 2;
+    allocation->child.buffers = allocation->child_buffers;
+    allocation->child.release = test_noop_array_release;
+    allocation->top.length = (int64_t)rows;
+    allocation->top.n_buffers = 1;
+    allocation->top.buffers = allocation->top_buffers;
+    allocation->top.n_children = 1;
+    allocation->top.children = allocation->children;
+    allocation->top.release = release_int64_batch;
+    allocation->top.private_data = allocation;
+    *out = allocation->top;
+    return 0;
+}
+
+typedef struct {
+    uint64_t get_batch;
+    uint64_t insert_batch;
+    uint64_t get_fragment;
+    uint64_t insert_fragment;
+} CheckpointCalls;
+
+static int32_t checkpoint_get_batch(
+    void *callback_ctx,
+    const LanceUDFBatchInfo *info,
+    struct ArrowArray *out,
+    LanceCallbackError *error
+) {
+    (void)info;
+    (void)out;
+    (void)error;
+    CheckpointCalls *calls = (CheckpointCalls *)callback_ctx;
+    calls->get_batch += 1;
+    return 0;
+}
+
+static int32_t checkpoint_insert_batch(
+    void *callback_ctx,
+    const LanceUDFBatchInfo *info,
+    struct ArrowArray *batch,
+    struct ArrowSchema *batch_schema,
+    LanceCallbackError *error
+) {
+    (void)info;
+    (void)batch;
+    (void)batch_schema;
+    (void)error;
+    CheckpointCalls *calls = (CheckpointCalls *)callback_ctx;
+    calls->insert_batch += 1;
+    return 0;
+}
+
+static int32_t checkpoint_get_fragment(
+    void *callback_ctx,
+    uint32_t fragment_id,
+    LanceOwnedString *out_json,
+    LanceCallbackError *error
+) {
+    (void)fragment_id;
+    (void)out_json;
+    (void)error;
+    CheckpointCalls *calls = (CheckpointCalls *)callback_ctx;
+    calls->get_fragment += 1;
+    return 0;
+}
+
+static int32_t checkpoint_insert_fragment(
+    void *callback_ctx,
+    uint64_t fragment_id,
+    const char *fragment_json,
+    LanceCallbackError *error
+) {
+    (void)fragment_id;
+    (void)fragment_json;
+    (void)error;
+    CheckpointCalls *calls = (CheckpointCalls *)callback_ctx;
+    calls->insert_fragment += 1;
+    return 0;
 }
 
 static void test_open_and_metadata(const char *uri) {
@@ -1305,6 +1561,656 @@ static void test_blob_native_read_slice(const char *blob_uri) {
     printf("OK\n");
 }
 
+static int array_value_is_null(const struct ArrowArray *array, int64_t index) {
+    if (array->null_count == 0) return 0;
+    ASSERT(array->buffers[0] != NULL, "nullable array must carry a validity buffer");
+    int64_t bit = array->offset + index;
+    const uint8_t *validity = (const uint8_t *)array->buffers[0];
+    return (validity[bit / 8] & (uint8_t)(1u << (bit % 8))) == 0;
+}
+
+static uint64_t u64_array_value(const struct ArrowArray *array, int64_t index) {
+    ASSERT(array->buffers[1] != NULL, "UInt64 array must carry values");
+    const uint64_t *values = (const uint64_t *)array->buffers[1];
+    return values[array->offset + index];
+}
+
+static uint32_t u32_array_value(const struct ArrowArray *array, int64_t index) {
+    ASSERT(array->buffers[1] != NULL, "UInt32 array must carry values");
+    const uint32_t *values = (const uint32_t *)array->buffers[1];
+    return values[array->offset + index];
+}
+
+static void test_blob_fields_and_descriptors(void) {
+    printf("  test_blob_fields_and_descriptors... ");
+
+    LanceBlobFieldOptions options = {
+        true, 0,
+        true, 256,
+    };
+    struct ArrowSchema field_schema = {0};
+    ASSERT(lance_blob_field_with_options(
+               "blob", true, &options, &field_schema) == 0,
+           "blob_field_with_options failed");
+    ASSERT(strcmp(field_schema.name, "blob") == 0, "field name");
+    ASSERT(strcmp(field_schema.format, "+s") == 0, "blob field must be a struct");
+    ASSERT((field_schema.flags & ARROW_FLAG_NULLABLE) != 0, "nullable flag");
+    assert_field_metadata(
+        &field_schema, "ARROW:extension:name", "lance.blob.v2");
+    assert_field_metadata(
+        &field_schema,
+        "lance-encoding:blob-inline-size-threshold",
+        "0");
+    assert_field_metadata(
+        &field_schema,
+        "lance-encoding:blob-dedicated-size-threshold",
+        "256");
+    ASSERT(field_schema.n_children == 2, "minimal blob field child count");
+    ASSERT(strcmp(field_schema.children[0]->name, "data") == 0,
+           "blob field child 0");
+    ASSERT(strcmp(field_schema.children[1]->name, "uri") == 0,
+           "blob field child 1");
+    field_schema.release(&field_schema);
+
+    LanceBlobFieldOptions invalid = {0};
+    invalid.has_dedicated_size_threshold = true;
+    invalid.dedicated_size_threshold = 0;
+    struct ArrowSchema untouched = {0};
+    ASSERT(lance_blob_field_with_options(
+               "invalid", true, &invalid, &untouched) == -1,
+           "zero dedicated threshold must fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "greater than 0",
+        "zero dedicated threshold");
+    ASSERT(untouched.release == NULL && untouched.format == NULL,
+           "failed field export must leave out untouched");
+
+    LanceBlobDescriptorArrayBuilder *builder =
+        lance_blob_descriptor_array_builder_new("blob");
+    ASSERT(builder != NULL, "descriptor builder creation failed");
+    ASSERT(lance_blob_descriptor_array_builder_append_inline(
+               builder, (const uint8_t *)"inline payload", 14) == 0,
+           "inline append");
+    ASSERT(lance_blob_descriptor_array_builder_append_null(builder) == 0,
+           "null append");
+    ASSERT(lance_blob_descriptor_array_builder_append_packed(
+               builder, 7, 100, 8) == 0,
+           "packed append");
+    ASSERT(lance_blob_descriptor_array_builder_append_dedicated(
+               builder, 9, 1024) == 0,
+           "dedicated append");
+    ASSERT(lance_blob_descriptor_array_builder_append_managed(
+               builder, "data/a.blob", 2, 3, false, 0) == 0,
+           "managed base None append");
+    ASSERT(lance_blob_descriptor_array_builder_append_managed(
+               builder, "data/b.blob", 4, 5, true, 0) == 0,
+           "managed base Some(0) append");
+    const LanceBlobRange packed_ranges[] = {{1, 2}, {3, 4}};
+    ASSERT(lance_blob_descriptor_array_builder_extend_packed(
+               builder, 11, packed_ranges, 2) == 0,
+           "extend_packed");
+    ASSERT(lance_blob_descriptor_array_builder_push_external(
+               builder, "file:///tmp/external.bin", true, 7, 9) == 0,
+           "push_external");
+    ASSERT(lance_blob_descriptor_array_builder_append_external(
+               builder, 3, "s3://bucket/object", 11, 13) == 0,
+           "append_external");
+    ASSERT(lance_blob_descriptor_array_builder_append_inline(
+               builder, NULL, 0) == 0,
+           "valid empty inline append");
+
+    struct ArrowSchema builder_field = {0};
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, &builder_field) == 0,
+           "builder field export");
+    assert_field_metadata(
+        &builder_field, "ARROW:extension:name", "lance.blob.v2");
+    builder_field.release(&builder_field);
+
+    struct ArrowArray array = {0};
+    struct ArrowSchema schema = {0};
+    ASSERT(lance_blob_descriptor_array_builder_finish(
+               builder, &array, &schema) == 0,
+           "descriptor finish");
+    ASSERT(array.release != NULL && schema.release != NULL,
+           "finish must export both Arrow parts");
+    ASSERT(array.length == 11, "descriptor array length");
+    ASSERT(array.n_children == 6, "prepared descriptor child count");
+    ASSERT(schema.n_children == 6, "prepared schema child count");
+    const char *prepared_names[] = {
+        "kind", "data", "uri", "blob_id", "blob_size", "position",
+    };
+    for (size_t i = 0; i < 6; ++i) {
+        ASSERT(strcmp(schema.children[i]->name, prepared_names[i]) == 0,
+               "prepared schema child name/order");
+    }
+
+    const struct ArrowArray *kinds = array.children[0];
+    const struct ArrowArray *data = array.children[1];
+    const struct ArrowArray *blob_ids = array.children[3];
+    const uint8_t *kind_values = (const uint8_t *)kinds->buffers[1];
+    ASSERT(!array_value_is_null(kinds, 0) && kind_values[0] == 0,
+           "inline kind");
+    ASSERT(array_value_is_null(kinds, 1), "null row kind");
+    ASSERT(kind_values[2] == 1, "packed kind");
+    ASSERT(kind_values[3] == 2, "dedicated kind");
+    ASSERT(kind_values[4] == 4, "Managed without base kind");
+    ASSERT(kind_values[5] == 5, "ManagedWithBase kind");
+    ASSERT(kind_values[8] == 3 && kind_values[9] == 3,
+           "external descriptor kinds");
+    ASSERT(array_value_is_null(blob_ids, 4),
+           "Managed None must have a null blob_id");
+    ASSERT(!array_value_is_null(blob_ids, 5) &&
+               u32_array_value(blob_ids, 5) == 0,
+           "Managed Some(0) must retain an explicit zero blob_id");
+    ASSERT(!array_value_is_null(data, 0), "inline data must be non-null");
+    const int64_t *data_offsets = (const int64_t *)data->buffers[1];
+    ASSERT(data_offsets[1] - data_offsets[0] == 14,
+           "inline payload length");
+    ASSERT(memcmp((const uint8_t *)data->buffers[2] + data_offsets[0],
+                  "inline payload", 14) == 0,
+           "inline payload bytes");
+
+    struct ArrowSchema post_finish_field = {0};
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, &post_finish_field) == 0,
+           "field must remain available after finish");
+    post_finish_field.release(&post_finish_field);
+    ASSERT(lance_blob_descriptor_array_builder_append_null(builder) == -1,
+           "append after finish must fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "already finished", "append after finish");
+
+    array.release(&array);
+    schema.release(&schema);
+    lance_blob_descriptor_array_builder_close(builder);
+    printf("OK\n");
+}
+
+static void assert_blob_payload_with_seed(
+    const uint8_t *bytes,
+    size_t len,
+    size_t offset,
+    size_t seed) {
+    for (size_t i = 0; i < len; ++i) {
+        ASSERT(bytes[i] == (uint8_t)((offset + i) * 7 + 3 + seed),
+               "planned blob payload mismatch");
+    }
+}
+
+static void test_blob_planned_reads(const char *blob_uri) {
+    printf("  test_blob_planned_reads... ");
+
+    LanceDataset *ds = lance_dataset_open(blob_uri, NULL, 0);
+    ASSERT(ds != NULL, "blob dataset open failed");
+    const uint64_t indices[] = {7, 2, 3, 4, 9, 0};
+    const uint64_t expected_addresses[] = {
+        (((uint64_t)1) << 32) | 2,
+        2,
+        3,
+        4,
+        (((uint64_t)1) << 32) | 4,
+        0,
+    };
+    const size_t expected_sizes[] = {1024, 1024, 0, 0, 0, 8};
+    const size_t expected_seeds[] = {0, 0, 0, 0, 0, 0};
+    const int expected_null[] = {0, 0, 0, 1, 1, 0};
+
+    LanceBlobReadOptions options = {0};
+    options.order = LANCE_BLOB_READ_PRESERVE_ORDER;
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_dataset_read_blobs(
+               ds, "blob", LANCE_BLOB_ROWS_INDICES, indices, 6,
+               &options, &stream) == 0,
+           "planned whole-blob read failed");
+    struct ArrowSchema schema = {0};
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "whole schema");
+    ASSERT(schema.n_children == 2, "whole schema child count");
+    ASSERT(strcmp(schema.children[0]->name, "row_address") == 0 &&
+               strcmp(schema.children[0]->format, "L") == 0,
+           "whole row_address schema");
+    ASSERT(strcmp(schema.children[1]->name, "data") == 0 &&
+               strcmp(schema.children[1]->format, "Z") == 0,
+           "whole data schema");
+    schema.release(&schema);
+
+    for (size_t row = 0; row < 6; ++row) {
+        struct ArrowArray array = {0};
+        ASSERT(stream.get_next(&stream, &array) == 0,
+               "whole get_next failed");
+        ASSERT(array.release != NULL, "expected one whole record");
+        ASSERT(array.length == 1 && array.n_children == 2,
+               "one whole result per Arrow record");
+        ASSERT(u64_array_value(array.children[0], 0) == expected_addresses[row],
+               "whole row address");
+        const struct ArrowArray *data = array.children[1];
+        if (expected_null[row]) {
+            ASSERT(array_value_is_null(data, 0), "NULL blob must stay NULL");
+        } else {
+            ASSERT(!array_value_is_null(data, 0),
+                   "non-NULL blob must not be NULL");
+            const int64_t *offsets = (const int64_t *)data->buffers[1];
+            int64_t first = data->offset;
+            size_t len =
+                (size_t)(offsets[first + 1] - offsets[first]);
+            ASSERT(len == expected_sizes[row], "whole payload length");
+            assert_blob_payload_with_seed(
+                (const uint8_t *)data->buffers[2] + offsets[first],
+                len, 0, expected_seeds[row]);
+        }
+        array.release(&array);
+    }
+    struct ArrowArray eos = {0};
+    ASSERT(stream.get_next(&stream, &eos) == 0 && eos.release == NULL,
+           "whole stream must end after native results");
+    stream.release(&stream);
+
+    const LanceBlobRangeRequest requests[] = {
+        {7, 100, 20},
+        {2, 128, 0},
+        {9, 40, 16},
+        {2, 100, 8},
+        {3, 0, 0},
+        {4, 1000, 100},
+    };
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_read_blob_ranges(
+               ds, "blob", LANCE_BLOB_ROWS_INDICES, requests, 6,
+               &options, &stream) == 0,
+           "planned range read failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "range schema");
+    const char *range_names[] = {
+        "request_index", "row_address", "offset", "length", "data",
+    };
+    ASSERT(schema.n_children == 5, "range schema child count");
+    for (size_t i = 0; i < 5; ++i) {
+        ASSERT(strcmp(schema.children[i]->name, range_names[i]) == 0,
+               "range schema child name/order");
+    }
+    schema.release(&schema);
+
+    const uint8_t expected_null_range[] = {0, 0, 1, 0, 0, 1};
+    const size_t expected_range_sizes[] = {20, 0, 0, 8, 0, 0};
+    for (size_t request = 0; request < 6; ++request) {
+        struct ArrowArray array = {0};
+        ASSERT(stream.get_next(&stream, &array) == 0,
+               "range get_next failed");
+        ASSERT(array.release != NULL, "expected one range record");
+        ASSERT(array.length == 1 && array.n_children == 5,
+               "one range result per Arrow record");
+        ASSERT(u64_array_value(array.children[0], 0) == request,
+               "request_index identity");
+        ASSERT(u64_array_value(array.children[1], 0) ==
+                   (request == 0 ? ((((uint64_t)1) << 32) | 2) :
+                    request == 2 ? ((((uint64_t)1) << 32) | 4) :
+                    request == 3 ? 2 : request == 4 ? 3 :
+                    request == 5 ? 4 : 2),
+               "range row address");
+        const struct ArrowArray *data = array.children[4];
+        if (expected_null_range[request]) {
+            ASSERT(array_value_is_null(data, 0),
+                   "NULL range must stay NULL");
+        } else {
+            ASSERT(!array_value_is_null(data, 0),
+                   "non-NULL range must not be NULL");
+            const int64_t *offsets = (const int64_t *)data->buffers[1];
+            int64_t first = data->offset;
+            ASSERT((size_t)(offsets[first + 1] - offsets[first]) ==
+                       expected_range_sizes[request],
+                   "range payload length");
+        }
+        array.release(&array);
+    }
+    memset(&eos, 0, sizeof(eos));
+    ASSERT(stream.get_next(&stream, &eos) == 0 && eos.release == NULL,
+           "range stream must end");
+    stream.release(&stream);
+
+    memset(&stream, 0, sizeof(stream));
+    const uint64_t empty_rows = 0;
+    (void)empty_rows;
+    ASSERT(lance_dataset_read_blobs(
+               ds, "blob", LANCE_BLOB_ROWS_INDICES, NULL, 0,
+               &options, &stream) == 0,
+           "explicit empty planned read failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "empty read schema");
+    ASSERT(schema.n_children == 2, "empty read schema shape");
+    schema.release(&schema);
+    memset(&eos, 0, sizeof(eos));
+    ASSERT(stream.get_next(&stream, &eos) == 0 && eos.release == NULL,
+           "explicit empty selection must yield no records");
+    stream.release(&stream);
+
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_read_blobs(
+               ds, "blob", LANCE_BLOB_ROWS_NONE, NULL, 0,
+               &options, &stream) == -1,
+           "native no-selection must fail");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT, "requires a row selection",
+        "planned read no-selection");
+    ASSERT(stream.release == NULL, "failed factory must not write stream");
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+typedef struct {
+    struct ArrowSchema *child;
+} WrappedSchemaState;
+
+static void release_wrapped_schema(struct ArrowSchema *schema) {
+    WrappedSchemaState *state = (WrappedSchemaState *)schema->private_data;
+    if (state != NULL) {
+        if (state->child != NULL) {
+            if (state->child->release != NULL) {
+                state->child->release(state->child);
+            }
+            free(state->child);
+        }
+        free(state);
+    }
+    free((void *)schema->format);
+    free((void *)schema->name);
+    free((void *)schema->metadata);
+    free(schema->children);
+    schema->release = NULL;
+}
+
+static char *managed_schema_metadata(void) {
+    const char *key = "lance.blob.managed";
+    const char *value = "true";
+    int32_t key_len = (int32_t)strlen(key);
+    int32_t value_len = (int32_t)strlen(value);
+    int32_t pair_count = 1;
+    size_t size = sizeof(pair_count) + sizeof(key_len) + (size_t)key_len +
+                  sizeof(value_len) + (size_t)value_len;
+    char *metadata = (char *)malloc(size);
+    ASSERT(metadata != NULL, "allocate schema metadata");
+    char *cursor = metadata;
+    memcpy(cursor, &pair_count, sizeof(pair_count));
+    cursor += sizeof(pair_count);
+    memcpy(cursor, &key_len, sizeof(key_len));
+    cursor += sizeof(key_len);
+    memcpy(cursor, key, (size_t)key_len);
+    cursor += key_len;
+    memcpy(cursor, &value_len, sizeof(value_len));
+    cursor += sizeof(value_len);
+    memcpy(cursor, value, (size_t)value_len);
+    return metadata;
+}
+
+static struct ArrowSchema *wrap_record_schema(
+    struct ArrowSchema *child,
+    int managed_opt_in) {
+    struct ArrowSchema *schema =
+        (struct ArrowSchema *)calloc(1, sizeof(*schema));
+    WrappedSchemaState *state =
+        (WrappedSchemaState *)calloc(1, sizeof(*state));
+    ASSERT(schema != NULL && state != NULL, "allocate wrapped schema");
+    schema->format = strdup("+s");
+    schema->metadata = managed_opt_in ? managed_schema_metadata() : NULL;
+    schema->flags = 0;
+    schema->n_children = 1;
+    schema->children =
+        (struct ArrowSchema **)calloc(1, sizeof(struct ArrowSchema *));
+    ASSERT(schema->format != NULL && schema->children != NULL,
+           "allocate wrapped schema children");
+    state->child = child;
+    schema->children[0] = child;
+    schema->dictionary = NULL;
+    schema->release = release_wrapped_schema;
+    schema->private_data = state;
+    return schema;
+}
+
+static void release_wrapped_array(struct ArrowArray *array) {
+    for (int64_t i = 0; i < array->n_children; ++i) {
+        if (array->children != NULL && array->children[i] != NULL) {
+            if (array->children[i]->release != NULL) {
+                array->children[i]->release(array->children[i]);
+            }
+            free(array->children[i]);
+        }
+    }
+    free(array->children);
+    free((void *)array->buffers);
+    array->release = NULL;
+}
+
+static struct ArrowArray *wrap_record_array(struct ArrowArray *child) {
+    struct ArrowArray *array =
+        (struct ArrowArray *)calloc(1, sizeof(*array));
+    const void **buffers =
+        (const void **)calloc(1, sizeof(const void *));
+    struct ArrowArray **children =
+        (struct ArrowArray **)calloc(1, sizeof(struct ArrowArray *));
+    ASSERT(array != NULL && buffers != NULL && children != NULL,
+           "allocate wrapped array");
+    array->length = child->length;
+    array->null_count = 0;
+    array->offset = 0;
+    array->n_buffers = 1;
+    array->n_children = 1;
+    array->buffers = buffers;
+    array->children = children;
+    array->dictionary = NULL;
+    array->release = release_wrapped_array;
+    array->private_data = NULL;
+    array->children[0] = child;
+    return array;
+}
+
+typedef struct {
+    struct ArrowSchema schema;
+    int schema_taken;
+    struct ArrowArray array;
+    int array_taken;
+} PreparedStreamState;
+
+static int prepared_stream_get_schema(
+    struct ArrowArrayStream *stream,
+    struct ArrowSchema *out) {
+    PreparedStreamState *state =
+        (PreparedStreamState *)stream->private_data;
+    if (state->schema_taken) {
+        return -1;
+    }
+    *out = state->schema;
+    memset(&state->schema, 0, sizeof(state->schema));
+    state->schema_taken = 1;
+    return 0;
+}
+
+static int prepared_stream_get_next(
+    struct ArrowArrayStream *stream,
+    struct ArrowArray *out) {
+    PreparedStreamState *state =
+        (PreparedStreamState *)stream->private_data;
+    if (state->array_taken) {
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
+    *out = state->array;
+    memset(&state->array, 0, sizeof(state->array));
+    state->array_taken = 1;
+    return 0;
+}
+
+static const char *prepared_stream_last_error(
+    struct ArrowArrayStream *stream) {
+    (void)stream;
+    return NULL;
+}
+
+static void prepared_stream_release(struct ArrowArrayStream *stream) {
+    PreparedStreamState *state =
+        (PreparedStreamState *)stream->private_data;
+    if (state == NULL) return;
+    if (state->schema.release != NULL) state->schema.release(&state->schema);
+    if (state->array.release != NULL) state->array.release(&state->array);
+    free(state);
+    memset(stream, 0, sizeof(*stream));
+}
+
+static int write_managed_descriptor_stream(
+    const char *uri,
+    int32_t mode,
+    uint64_t offset,
+    uint64_t length,
+    int managed_opt_in) {
+    LanceBlobDescriptorArrayBuilder *builder =
+        lance_blob_descriptor_array_builder_new("blob");
+    ASSERT(builder != NULL, "managed descriptor builder creation failed");
+    ASSERT(lance_blob_descriptor_array_builder_append_managed(
+               builder, "_blobs/managed.bin", offset, length, false, 0) == 0,
+           "managed descriptor append failed");
+
+    struct ArrowSchema *argument_child =
+        (struct ArrowSchema *)calloc(1, sizeof(*argument_child));
+    struct ArrowSchema *stream_child =
+        (struct ArrowSchema *)calloc(1, sizeof(*stream_child));
+    ASSERT(argument_child != NULL && stream_child != NULL,
+           "allocate prepared helper schemas");
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, argument_child) == 0,
+           "argument field export failed");
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, stream_child) == 0,
+           "stream field export failed");
+
+    struct ArrowArray prepared_array = {0};
+    struct ArrowSchema finished_field = {0};
+    ASSERT(lance_blob_descriptor_array_builder_finish(
+               builder, &prepared_array, &finished_field) == 0,
+           "managed descriptor finish failed");
+    finished_field.release(&finished_field);
+    lance_blob_descriptor_array_builder_close(builder);
+
+    struct ArrowArray *array =
+        (struct ArrowArray *)calloc(1, sizeof(*array));
+    ASSERT(array != NULL, "allocate prepared array");
+    *array = prepared_array;
+    memset(&prepared_array, 0, sizeof(prepared_array));
+
+    struct ArrowSchema *argument_schema =
+        wrap_record_schema(argument_child, managed_opt_in);
+    PreparedStreamState *state =
+        (PreparedStreamState *)calloc(1, sizeof(*state));
+    ASSERT(state != NULL, "allocate prepared stream state");
+    struct ArrowSchema *wrapped_schema =
+        wrap_record_schema(stream_child, managed_opt_in);
+    state->schema = *wrapped_schema;
+    free(wrapped_schema);
+    struct ArrowArray *wrapped_array = wrap_record_array(array);
+    state->array = *wrapped_array;
+    free(wrapped_array);
+
+    struct ArrowArrayStream stream = {0};
+    stream.get_schema = prepared_stream_get_schema;
+    stream.get_next = prepared_stream_get_next;
+    stream.get_last_error = prepared_stream_last_error;
+    stream.release = prepared_stream_release;
+    stream.private_data = state;
+
+    LanceWriteParams params = {0};
+    params.data_storage_version = "2.2";
+    LanceDataset *dataset = NULL;
+    int32_t rc = lance_dataset_write_with_params(
+        uri, argument_schema, &stream, mode, &params, NULL, &dataset);
+    argument_schema->release(argument_schema);
+    free(argument_schema);
+    if (rc == 0) {
+        ASSERT(dataset != NULL, "managed write returned null dataset");
+        lance_dataset_close(dataset);
+    }
+    return rc;
+}
+
+static void test_managed_blob_descriptor_roundtrip(const char *write_uri) {
+    printf("  test_managed_blob_descriptor_roundtrip... ");
+
+    char managed_uri[4096];
+    char no_opt_in_uri[4096];
+    int written = snprintf(
+        managed_uri, sizeof(managed_uri), "%s.managed-blob", write_uri);
+    ASSERT(written > 0 && (size_t)written < sizeof(managed_uri),
+           "managed dataset URI too long");
+    written = snprintf(
+        no_opt_in_uri, sizeof(no_opt_in_uri), "%s.no-managed-opt-in",
+        write_uri);
+    ASSERT(written > 0 && (size_t)written < sizeof(no_opt_in_uri),
+           "no-opt-in dataset URI too long");
+
+    ASSERT(write_managed_descriptor_stream(
+               managed_uri, LANCE_WRITE_CREATE, 1, 5, 1) == 0,
+           "managed create failed");
+
+    char object_dir[4096];
+    char object_path[4096];
+    written = snprintf(object_dir, sizeof(object_dir), "%s/_blobs", managed_uri);
+    ASSERT(written > 0 && (size_t)written < sizeof(object_dir),
+           "managed object directory URI too long");
+    written = snprintf(
+        object_path, sizeof(object_path), "%s/managed.bin", object_dir);
+    ASSERT(written > 0 && (size_t)written < sizeof(object_path),
+           "managed object path too long");
+    (void)mkdir(object_dir, 0755);
+    FILE *object = fopen(object_path, "wb");
+    ASSERT(object != NULL, "create managed object");
+    ASSERT(fwrite("0123456789", 1, 10, object) == 10,
+           "write managed object");
+    ASSERT(fclose(object) == 0, "close managed object");
+
+    LanceDataset *ds = lance_dataset_open(managed_uri, NULL, 0);
+    ASSERT(ds != NULL, "managed dataset open failed");
+    const uint64_t first_index = 0;
+    LanceBlobFile *blob = NULL;
+    ASSERT(lance_dataset_take_blobs_by_indices(
+               ds, &first_index, 1, "blob", &blob) == 0 && blob != NULL,
+           "managed first read failed");
+    uint8_t bytes[16] = {0};
+    ASSERT(lance_blob_file_read(blob, bytes, 5) == 0, "managed blob read");
+    ASSERT(memcmp(bytes, "12345", 5) == 0, "managed first range bytes");
+    lance_blob_file_close(blob);
+    lance_dataset_close(ds);
+
+    ASSERT(write_managed_descriptor_stream(
+               managed_uri, LANCE_WRITE_APPEND, 5, 3, 1) == 0,
+           "managed append failed");
+    ds = lance_dataset_open(managed_uri, NULL, 0);
+    ASSERT(ds != NULL, "managed reopen failed");
+    const uint64_t both_indices[] = {0, 1};
+    LanceBlobFile *blobs[2] = {0};
+    ASSERT(lance_dataset_take_blobs_by_indices(
+               ds, both_indices, 2, "blob", blobs) == 0,
+           "managed reuse read failed");
+    ASSERT(blobs[0] != NULL && blobs[1] != NULL,
+           "managed reuse handles");
+    ASSERT(lance_blob_file_read(blobs[0], bytes, 5) == 0 &&
+               memcmp(bytes, "12345", 5) == 0,
+           "managed reuse first bytes");
+    ASSERT(lance_blob_file_read(blobs[1], bytes, 3) == 0 &&
+               memcmp(bytes, "567", 3) == 0,
+           "managed reuse second bytes");
+    lance_blob_file_close(blobs[0]);
+    lance_blob_file_close(blobs[1]);
+    lance_dataset_close(ds);
+
+    ASSERT(write_managed_descriptor_stream(
+               no_opt_in_uri, LANCE_WRITE_CREATE, 0, 1, 0) == -1,
+           "managed write must require schema opt-in");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "lance.blob.managed=true",
+        "managed schema opt-in");
+
+    printf("OK\n");
+}
+
 static void test_versions(const char *uri) {
     printf("  test_versions... ");
 
@@ -1967,6 +2873,923 @@ static void test_write_options_and_config(const char *src_uri,
     lance_dataset_close(reopened);
     lance_scanner_close(scanner);
     lance_dataset_close(src);
+    printf("OK\n");
+}
+
+typedef struct NativeWriteProgressCapture {
+    atomic_uint_fast64_t begins;
+    atomic_uint_fast64_t completes;
+    atomic_uint_fast64_t stats;
+    atomic_uint_fast64_t releases;
+    atomic_uint_fast64_t rows;
+    atomic_uint_fast64_t bytes;
+    atomic_uint_fast64_t files;
+    atomic_int fail_begin;
+    atomic_int bad_complete_info;
+} NativeWriteProgressCapture;
+
+static uint64_t native_write_load(const atomic_uint_fast64_t *value) {
+    return atomic_load_explicit(value, memory_order_seq_cst);
+}
+
+static void native_write_release_error_string(LanceOwnedString *self) {
+    free(self->data);
+    self->data = NULL;
+    self->release = NULL;
+}
+
+static void native_write_fill_error(LanceCallbackError *error) {
+    const char *message = "native write progress rejected the fragment";
+    error->code = LANCE_ERR_INVALID_ARGUMENT;
+    error->message.data = (char *)malloc(strlen(message) + 1);
+    ASSERT(error->message.data != NULL, "allocate progress callback error");
+    strcpy(error->message.data, message);
+    error->message.release = native_write_release_error_string;
+}
+
+static int32_t native_write_begin(void *callback_ctx,
+                                  const LanceWriteFragmentProgressInfo *info,
+                                  LanceCallbackError *error) {
+    NativeWriteProgressCapture *capture =
+        (NativeWriteProgressCapture *)callback_ctx;
+    (void)info;
+    atomic_fetch_add_explicit(
+        &capture->begins, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&capture->fail_begin, memory_order_seq_cst)) {
+        native_write_fill_error(error);
+        return -1;
+    }
+    return 0;
+}
+
+static int32_t native_write_complete(void *callback_ctx,
+                                     const LanceWriteFragmentProgressInfo *info,
+                                     LanceCallbackError *error) {
+    NativeWriteProgressCapture *capture =
+        (NativeWriteProgressCapture *)callback_ctx;
+    (void)error;
+    if (info == NULL || info->has_physical_rows == 0 ||
+        info->physical_rows == 0 || info->file_count == 0) {
+        atomic_store_explicit(
+            &capture->bad_complete_info, 1, memory_order_seq_cst);
+    }
+    atomic_fetch_add_explicit(
+        &capture->completes, 1, memory_order_seq_cst);
+    return 0;
+}
+
+static void native_write_stats(void *callback_ctx,
+                               const LanceWriteStats *stats) {
+    NativeWriteProgressCapture *capture =
+        (NativeWriteProgressCapture *)callback_ctx;
+    if (stats == NULL) {
+        atomic_store_explicit(
+            &capture->bad_complete_info, 1, memory_order_seq_cst);
+        return;
+    }
+    atomic_fetch_add_explicit(
+        &capture->stats, 1, memory_order_seq_cst);
+    atomic_store_explicit(
+        &capture->rows, stats->rows_written, memory_order_seq_cst);
+    atomic_store_explicit(
+        &capture->bytes, stats->bytes_written, memory_order_seq_cst);
+    atomic_store_explicit(
+        &capture->files, stats->files_written, memory_order_seq_cst);
+}
+
+static void native_write_release(void *callback_ctx) {
+    NativeWriteProgressCapture *capture =
+        (NativeWriteProgressCapture *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &capture->releases, 1, memory_order_seq_cst);
+}
+
+static void native_write_wait_release(NativeWriteProgressCapture *capture) {
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        if (native_write_load(&capture->releases) == 1) return;
+        struct timespec delay = {0, 1000000};
+        nanosleep(&delay, NULL);
+    }
+    ASSERT(native_write_load(&capture->releases) == 1,
+           "progress context must be released exactly once");
+}
+
+typedef struct NativeWriteInput {
+    struct ArrowArrayStream stream;
+    struct ArrowSchema schema;
+} NativeWriteInput;
+
+static NativeWriteInput native_write_input(const char *uri) {
+    NativeWriteInput input;
+    memset(&input, 0, sizeof(input));
+    LanceDataset *source = lance_dataset_open(uri, NULL, 0);
+    ASSERT(source != NULL, "open native-write source");
+    CHECK_OK();
+    LanceScanner *scanner = lance_scanner_new(source, NULL, NULL);
+    ASSERT(scanner != NULL, "create native-write source scanner");
+    CHECK_OK();
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &input.stream) == 0,
+           "export native-write source stream");
+    CHECK_OK();
+    ASSERT(input.stream.get_schema(&input.stream, &input.schema) == 0,
+           "read native-write source schema");
+    CHECK_OK();
+    lance_scanner_close(scanner);
+    lance_dataset_close(source);
+    return input;
+}
+
+static void native_write_input_release_schema(NativeWriteInput *input) {
+    if (input->schema.release) input->schema.release(&input->schema);
+    input->schema.release = NULL;
+}
+
+static int32_t native_write_ordinary(
+    const char *uri,
+    NativeWriteInput *input,
+    int32_t mode,
+    const LanceNativeWriteOptions *options,
+    LanceDataset **out_dataset) {
+    int32_t rc = lance_dataset_write_with_native_options(
+        uri, &input->schema, &input->stream, mode, options, out_dataset);
+    native_write_input_release_schema(input);
+    return rc;
+}
+
+static int32_t native_write_staged(
+    const char *uri,
+    NativeWriteInput *input,
+    int32_t mode,
+    const LanceNativeWriteOptions *options,
+    LanceTransaction **out_transaction) {
+    int32_t rc = lance_dataset_write_uncommitted_stream_with_native_options(
+        uri, &input->schema, &input->stream, mode, options, out_transaction);
+    native_write_input_release_schema(input);
+    return rc;
+}
+
+static NativeWriteInput native_write_external_blob_input(const char *write_uri) {
+    char payload_path[4096];
+    char payload_uri[4100];
+    snprintf(
+        payload_path,
+        sizeof(payload_path),
+        "%s_native_blob_payload.bin",
+        write_uri);
+    snprintf(payload_uri, sizeof(payload_uri), "file://%s", payload_path);
+
+    unsigned char payload[32];
+    for (size_t index = 0; index < sizeof(payload); ++index) {
+        payload[index] = (unsigned char)(index + 1);
+    }
+    FILE *payload_file = fopen(payload_path, "wb");
+    ASSERT(payload_file != NULL, "create external blob payload");
+    ASSERT(fwrite(payload, 1, sizeof(payload), payload_file) == sizeof(payload),
+           "write external blob payload");
+    ASSERT(fclose(payload_file) == 0, "close external blob payload");
+
+    LanceBlobDescriptorArrayBuilder *builder =
+        lance_blob_descriptor_array_builder_new("blob");
+    ASSERT(builder != NULL, "external blob descriptor builder creation failed");
+    CHECK_OK();
+    ASSERT(lance_blob_descriptor_array_builder_append_external(
+               builder, 0, payload_uri, 0, sizeof(payload)) == 0,
+           "append external blob descriptor");
+    CHECK_OK();
+
+    struct ArrowSchema *argument_child =
+        (struct ArrowSchema *)calloc(1, sizeof(*argument_child));
+    struct ArrowSchema *stream_child =
+        (struct ArrowSchema *)calloc(1, sizeof(*stream_child));
+    ASSERT(argument_child != NULL && stream_child != NULL,
+           "allocate external blob schemas");
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, argument_child) == 0,
+           "export external blob argument field");
+    CHECK_OK();
+    ASSERT(lance_blob_descriptor_array_builder_field(
+               builder, stream_child) == 0,
+           "export external blob stream field");
+    CHECK_OK();
+
+    struct ArrowArray prepared_array = {0};
+    struct ArrowSchema finished_field = {0};
+    ASSERT(lance_blob_descriptor_array_builder_finish(
+               builder, &prepared_array, &finished_field) == 0,
+           "finish external blob descriptor");
+    CHECK_OK();
+    finished_field.release(&finished_field);
+    lance_blob_descriptor_array_builder_close(builder);
+
+    struct ArrowArray *array =
+        (struct ArrowArray *)calloc(1, sizeof(*array));
+    ASSERT(array != NULL, "allocate external blob array");
+    *array = prepared_array;
+    memset(&prepared_array, 0, sizeof(prepared_array));
+
+    struct ArrowSchema *argument_schema = wrap_record_schema(argument_child, 0);
+    PreparedStreamState *state =
+        (PreparedStreamState *)calloc(1, sizeof(*state));
+    ASSERT(state != NULL, "allocate external blob stream state");
+    struct ArrowSchema *wrapped_schema = wrap_record_schema(stream_child, 0);
+    state->schema = *wrapped_schema;
+    free(wrapped_schema);
+    struct ArrowArray *wrapped_array = wrap_record_array(array);
+    state->array = *wrapped_array;
+    free(wrapped_array);
+
+    NativeWriteInput input;
+    memset(&input, 0, sizeof(input));
+    input.schema = *argument_schema;
+    free(argument_schema);
+    input.stream.get_schema = prepared_stream_get_schema;
+    input.stream.get_next = prepared_stream_get_next;
+    input.stream.get_last_error = prepared_stream_last_error;
+    input.stream.release = prepared_stream_release;
+    input.stream.private_data = state;
+    return input;
+}
+
+static size_t native_write_fragment_ids(
+    LanceDataset *dataset,
+    uint64_t *ids,
+    size_t capacity) {
+    uint64_t count = lance_dataset_fragment_count(dataset);
+    CHECK_OK();
+    ASSERT((size_t)count <= capacity, "fragment ID capacity exceeded");
+    if (count > 0) {
+        ASSERT(lance_dataset_fragment_ids(dataset, ids) == 0,
+               "read fragment IDs");
+        CHECK_OK();
+    }
+    return (size_t)count;
+}
+
+static int native_write_id_in(
+    const uint64_t *ids,
+    size_t count,
+    uint64_t candidate) {
+    for (size_t index = 0; index < count; ++index) {
+        if (ids[index] == candidate) return 1;
+    }
+    return 0;
+}
+
+static void native_write_assert_new_file_bases(
+    LanceDataset *dataset,
+    const uint64_t *old_ids,
+    size_t old_count,
+    int expect_present,
+    uint32_t expected_base_id) {
+    uint64_t ids[128];
+    size_t count = native_write_fragment_ids(dataset, ids, 128);
+    int saw_new_fragment = 0;
+    for (size_t index = 0; index < count; ++index) {
+        if (native_write_id_in(old_ids, old_count, ids[index])) continue;
+        saw_new_fragment = 1;
+        LanceFragment *fragment =
+            lance_dataset_open_fragment(dataset, ids[index]);
+        ASSERT(fragment != NULL, "open written fragment");
+        CHECK_OK();
+        uint64_t file_count = lance_fragment_data_file_count(fragment);
+        CHECK_OK();
+        ASSERT(file_count > 0, "written fragment must contain a data file");
+        for (uint64_t file_index = 0; file_index < file_count; ++file_index) {
+            LanceDataFile *file = NULL;
+            ASSERT(lance_fragment_data_file_at(
+                       fragment, (size_t)file_index, &file) == 0,
+                   "read written data file");
+            CHECK_OK();
+            ASSERT(file != NULL, "data file handle must be non-NULL");
+            bool present = false;
+            uint32_t base_id = 0;
+            ASSERT(lance_data_file_base_id(file, &present, &base_id) == 0,
+                   "read written data-file base ID");
+            CHECK_OK();
+            ASSERT(present == (expect_present != 0),
+                   "unexpected data-file base presence");
+            if (present) {
+                ASSERT(base_id == expected_base_id,
+                       "unexpected registered data-file base ID");
+            }
+            lance_data_file_close(file);
+        }
+        lance_fragment_close(fragment);
+    }
+    ASSERT(saw_new_fragment, "write must add at least one fragment");
+}
+
+/* Exercises the owned native-write options representation through a real C
+ * caller: source-owner retention, transaction properties, progress callbacks
+ * and staged publication. */
+static void test_native_write_options(const char *src_uri,
+                                      const char *write_uri) {
+    printf("  test_native_write_options... ");
+    char uri[4096];
+    char staged_uri[4096];
+    snprintf(uri, sizeof(uri), "%s_native_api", write_uri);
+    snprintf(staged_uri, sizeof(staged_uri), "%s_native_staged", write_uri);
+
+    NativeWriteProgressCapture progress = {0};
+    LanceNativeWriteProgress progress_desc = {0};
+    progress_desc.begin_fragment = native_write_begin;
+    progress_desc.complete_fragment = native_write_complete;
+    progress_desc.write_stats = native_write_stats;
+    progress_desc.release = native_write_release;
+    progress_desc.callback_ctx = &progress;
+
+    const char *property_keys[] = {"engine"};
+    const char *property_values[] = {"c-native-options"};
+    LanceTransactionProperties properties = {
+        property_keys, property_values, 1};
+
+    LanceWriteOptions write_options = {0};
+    write_options.params.max_rows_per_file = 2;
+    LanceNativeWriteOptionsSpec spec = {0};
+    spec.write_options = &write_options;
+    spec.transaction_properties = &properties;
+    spec.progress = &progress_desc;
+    spec.has_enable_v2_manifest_paths = 1;
+    spec.enable_v2_manifest_paths = false;
+
+    LanceSession *session = lance_session_new(4 * 1024 * 1024, 1 * 1024 * 1024);
+    LanceStorageOptionsAccessor *accessor =
+        lance_storage_options_accessor_new(NULL, NULL);
+    ASSERT(session != NULL && accessor != NULL, "native owners must be created");
+    spec.session = session;
+    spec.storage_options_accessor = accessor;
+
+    LanceNativeWriteOptions *options = lance_native_write_options_new(&spec);
+    ASSERT(options != NULL, "native write options must be created");
+    /* The handle clones these owners. */
+    lance_session_close(session);
+    lance_storage_options_accessor_close(accessor);
+
+    LanceDataset *src = lance_dataset_open(src_uri, NULL, 0);
+    ASSERT(src != NULL, "open source failed");
+    LanceScanner *scanner = lance_scanner_new(src, NULL, NULL);
+    ASSERT(scanner != NULL, "scanner creation failed");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "to_arrow_stream failed");
+    struct ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "schema read failed");
+
+    LanceDataset *ds = NULL;
+    int32_t rc = lance_dataset_write_with_native_options(
+        uri, &schema, &stream, LANCE_WRITE_CREATE, options, &ds);
+    if (schema.release) schema.release(&schema);
+    ASSERT(rc == 0, "native options create failed");
+    CHECK_OK();
+    ASSERT(ds != NULL, "out_dataset must be populated");
+    uint64_t source_rows = lance_dataset_count_rows(ds);
+    CHECK_OK();
+    ASSERT(source_rows > 0, "create must write rows");
+    ASSERT(native_write_load(&progress.begins) > 0 &&
+               native_write_load(&progress.completes) > 0,
+           "fragment progress callbacks must run");
+    ASSERT(native_write_load(&progress.stats) > 0 &&
+               native_write_load(&progress.rows) == source_rows &&
+               native_write_load(&progress.bytes) > 0 &&
+               native_write_load(&progress.files) > 0,
+           "native stats callbacks must carry cumulative values");
+    ASSERT(atomic_load_explicit(
+               &progress.bad_complete_info, memory_order_seq_cst) == 0,
+           "complete progress must carry physical rows and native files");
+    ASSERT(native_write_load(&progress.releases) == 0,
+           "callback context remains owned while the options handle is open");
+    lance_dataset_close(ds);
+    lance_scanner_close(scanner);
+
+    NativeWriteInput append_input = native_write_input(src_uri);
+    rc = native_write_ordinary(
+        uri, &append_input, LANCE_WRITE_APPEND, options, &ds);
+    ASSERT(rc == 0, "native options append failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(ds) == source_rows * 2,
+           "append must preserve and add rows");
+    lance_dataset_close(ds);
+
+    NativeWriteInput overwrite_input = native_write_input(src_uri);
+    rc = native_write_ordinary(
+        uri, &overwrite_input, LANCE_WRITE_OVERWRITE, options, &ds);
+    ASSERT(rc == 0, "native options overwrite failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(ds) == source_rows,
+           "overwrite must replace rows");
+    lance_dataset_close(ds);
+
+    LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen overwritten dataset failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(reopened) == source_rows,
+           "reopened overwrite row count mismatch");
+    LanceTransaction *read_transaction = NULL;
+    ASSERT(lance_dataset_read_transaction(reopened, &read_transaction) == 0,
+           "read ordinary native transaction failed");
+    CHECK_OK();
+    ASSERT(read_transaction != NULL,
+           "ordinary native write must retain its transaction");
+    bool has_properties = false;
+    ASSERT(lance_transaction_has_properties(read_transaction, &has_properties) ==
+               0,
+           "ordinary transaction property presence failed");
+    CHECK_OK();
+    ASSERT(has_properties, "ordinary transaction properties must be Some");
+    lance_transaction_close(read_transaction);
+    lance_dataset_close(reopened);
+
+    scanner = lance_scanner_new(src, NULL, NULL);
+    ASSERT(scanner != NULL, "staged scanner creation failed");
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "staged to_arrow_stream failed");
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(stream.get_schema(&stream, &schema) == 0,
+           "staged schema read failed");
+
+    LanceTransaction *transaction = NULL;
+    rc = lance_dataset_write_uncommitted_stream_with_native_options(
+        staged_uri, &schema, &stream, LANCE_WRITE_CREATE, options,
+        &transaction);
+    if (schema.release) schema.release(&schema);
+    ASSERT(rc == 0, "native options staged write failed");
+    CHECK_OK();
+    ASSERT(transaction != NULL, "out_transaction must be populated");
+    ASSERT(lance_transaction_has_properties(transaction, &has_properties) == 0,
+           "transaction property presence failed");
+    CHECK_OK();
+    ASSERT(has_properties, "transaction properties must be Some");
+    uint64_t property_count = 0;
+    ASSERT(lance_transaction_property_count(transaction, &property_count) == 0,
+           "transaction property count failed");
+    CHECK_OK();
+    ASSERT(property_count == 1, "one transaction property expected");
+    const char *property_key = lance_transaction_property_key_at(transaction, 0);
+    const char *property_value =
+        lance_transaction_property_value_at(transaction, 0);
+    ASSERT(property_key != NULL && property_value != NULL,
+           "property key/value must be present");
+    ASSERT(strcmp(property_key, "engine") == 0, "property key mismatch");
+    ASSERT(strcmp(property_value, "c-native-options") == 0,
+           "property value mismatch");
+    lance_free_string(property_key);
+    lance_free_string(property_value);
+
+    LanceDataset *committed = NULL;
+    rc = lance_transaction_commit(
+        staged_uri, transaction, NULL, NULL, NULL, &committed);
+    ASSERT(rc == 0, "staged commit failed");
+    CHECK_OK();
+    ASSERT(committed != NULL, "commit must return a dataset");
+    ASSERT(lance_dataset_count_rows(committed) == source_rows,
+           "staged commit must write rows");
+    lance_dataset_close(committed);
+    lance_transaction_close(transaction);
+    lance_scanner_close(scanner);
+    lance_dataset_close(src);
+
+    lance_native_write_options_close(options);
+    native_write_wait_release(&progress);
+
+    reopened = lance_dataset_open(staged_uri, NULL, 0);
+    ASSERT(reopened != NULL, "reopen staged dataset failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(reopened) == source_rows,
+           "reopened staged row count mismatch");
+    read_transaction = NULL;
+    ASSERT(lance_dataset_read_transaction(reopened, &read_transaction) == 0,
+           "read staged transaction after reopen failed");
+    CHECK_OK();
+    ASSERT(read_transaction != NULL,
+           "staged commit must retain its transaction");
+    ASSERT(lance_transaction_has_properties(read_transaction, &has_properties) ==
+               0,
+           "reopened transaction property presence failed");
+    CHECK_OK();
+    ASSERT(has_properties, "reopened transaction properties must be Some");
+    lance_transaction_close(read_transaction);
+    lance_dataset_close(reopened);
+    printf("OK\n");
+}
+
+typedef struct NativeWriteLockCapture {
+    atomic_int acquires;
+    atomic_int releases;
+    atomic_int destroys;
+    atomic_int context_releases;
+} NativeWriteLockCapture;
+
+static int32_t native_write_lock_acquire(
+    void *callback_ctx,
+    uint64_t version,
+    void **out_lease,
+    LanceCallbackError *error) {
+    (void)version;
+    (void)error;
+    NativeWriteLockCapture *capture =
+        (NativeWriteLockCapture *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &capture->acquires, 1, memory_order_seq_cst);
+    ASSERT(out_lease != NULL, "native write lock out_lease must be non-NULL");
+    *out_lease = NULL;
+    return 0;
+}
+
+static int32_t native_write_lock_release(
+    void *callback_ctx,
+    void *lease,
+    bool success,
+    LanceCallbackError *error) {
+    (void)lease;
+    (void)success;
+    (void)error;
+    NativeWriteLockCapture *capture =
+        (NativeWriteLockCapture *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &capture->releases, 1, memory_order_seq_cst);
+    return 0;
+}
+
+static void native_write_lock_destroy(void *callback_ctx, void *lease) {
+    (void)lease;
+    NativeWriteLockCapture *capture =
+        (NativeWriteLockCapture *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &capture->destroys, 1, memory_order_seq_cst);
+}
+
+static void native_write_lock_context_release(void *callback_ctx) {
+    NativeWriteLockCapture *capture =
+        (NativeWriteLockCapture *)callback_ctx;
+    atomic_fetch_add_explicit(
+        &capture->context_releases, 1, memory_order_seq_cst);
+}
+
+/* C11 presence rules and base placement: NULL target lists select native None,
+ * while a non-NULL zero-length list selects Some(empty) and must be rejected by
+ * Lance. Registered and primary data-file base IDs are read from the resulting
+ * fragment metadata. */
+static void test_native_write_base_placement(
+    const char *src_uri,
+    const char *write_uri) {
+    printf("  test_native_write_base_placement... ");
+    char uri[4096];
+    char base_uri[4096];
+    snprintf(uri, sizeof(uri), "%s_native_bases", write_uri);
+    snprintf(base_uri, sizeof(base_uri), "%s_native_registered_base", write_uri);
+
+    LanceBasePath initial = {0};
+    initial.id = 7;
+    initial.path = base_uri;
+    initial.name = "c-registered";
+    initial.is_dataset_root = false;
+    LanceBasePathList initial_list = {&initial, 1};
+
+    const uint32_t registered_base = 7;
+    LanceUInt32List target_list = {&registered_base, 1};
+    LanceBaseStoreParams base_store = {0};
+    base_store.base_path = base_uri;
+    base_store.has_block_size = 1;
+    base_store.block_size = 4096;
+    LanceBaseStoreParamsList base_store_list = {&base_store, 1};
+
+    LanceWriteOptions write_options = {0};
+    write_options.params.max_rows_per_file = 5;
+    LanceNativeWriteOptionsSpec spec = {0};
+    spec.write_options = &write_options;
+    spec.initial_bases = &initial_list;
+    spec.target_bases = &target_list;
+    spec.base_store_params = &base_store_list;
+    LanceNativeWriteOptions *options = lance_native_write_options_new(&spec);
+    ASSERT(options != NULL, "registered-base write options must be created");
+    CHECK_OK();
+
+    NativeWriteInput create_input = native_write_input(src_uri);
+    LanceDataset *dataset = NULL;
+    int32_t rc = native_write_ordinary(
+        uri, &create_input, LANCE_WRITE_CREATE, options, &dataset);
+    ASSERT(rc == 0, "registered-base create failed");
+    CHECK_OK();
+    ASSERT(dataset != NULL, "registered-base create output missing");
+    uint64_t source_rows = lance_dataset_count_rows(dataset);
+    CHECK_OK();
+    ASSERT(source_rows > 0, "registered-base create wrote no rows");
+    native_write_assert_new_file_bases(dataset, NULL, 0, 1, 7);
+    const char *base_paths = lance_dataset_base_paths_json(dataset);
+    ASSERT(base_paths != NULL, "registered-base registry snapshot failed");
+    ASSERT(strstr(base_paths, "\"7\"") != NULL,
+           "registered base ID must be present in the manifest");
+    lance_free_string(base_paths);
+
+    uint64_t old_ids[128];
+    size_t old_id_count =
+        native_write_fragment_ids(dataset, old_ids, 128);
+    lance_dataset_close(dataset);
+    lance_native_write_options_close(options);
+
+    LanceNativeWriteOptionsSpec append_spec = {0};
+    append_spec.write_options = &write_options;
+    LanceNativeWriteOptions *append_options =
+        lance_native_write_options_new(&append_spec);
+    ASSERT(append_options != NULL, "primary append options must be created");
+    CHECK_OK();
+    NativeWriteInput append_input = native_write_input(src_uri);
+    rc = native_write_ordinary(
+        uri, &append_input, LANCE_WRITE_APPEND, append_options, &dataset);
+    ASSERT(rc == 0, "absent target append failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == source_rows * 2,
+           "absent target append row count mismatch");
+    native_write_assert_new_file_bases(
+        dataset, old_ids, old_id_count, 0, 0);
+    lance_dataset_close(dataset);
+    lance_native_write_options_close(append_options);
+
+    const LanceUInt32List empty_targets = {NULL, 0};
+    LanceNativeWriteOptionsSpec empty_spec = {0};
+    empty_spec.target_bases = &empty_targets;
+    LanceNativeWriteOptions *empty_options =
+        lance_native_write_options_new(&empty_spec);
+    ASSERT(empty_options != NULL, "explicit-empty target options must be created");
+    CHECK_OK();
+    NativeWriteInput failed_input = native_write_input(src_uri);
+    dataset = NULL;
+    rc = native_write_ordinary(
+        uri, &failed_input, LANCE_WRITE_APPEND, empty_options, &dataset);
+    ASSERT(rc == -1, "explicit-empty target append must fail");
+    ASSERT(dataset == NULL, "failed append must not return a dataset");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "target_bases cannot be empty",
+        "explicit-empty native target selection");
+    lance_native_write_options_close(empty_options);
+
+    dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "reopen base-placement dataset failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == source_rows * 2,
+           "rejected empty target must not publish rows");
+    lance_dataset_close(dataset);
+    printf("OK\n");
+}
+
+/* C11 forwarding for file-writer and blob options. The valid paths write and
+ * reopen; the invalid paths assert constructor or native validation errors, and
+ * the native blob error is applied to an existing dataset so its unchanged row
+ * count is directly observable. */
+static void test_native_write_data_options(
+    const char *src_uri,
+    const char *write_uri) {
+    printf("  test_native_write_data_options... ");
+    char file_uri[4096];
+    char blob_output_uri[4096];
+    snprintf(file_uri, sizeof(file_uri), "%s_native_file_writer", write_uri);
+    snprintf(
+        blob_output_uri,
+        sizeof(blob_output_uri),
+        "%s_native_blob_options",
+        write_uri);
+
+    LanceWriteOptions write_options = {0};
+    write_options.params.data_storage_version = "2.2";
+    write_options.params.max_rows_per_file = 5;
+    LanceFileWriterOptions file_options = {0};
+    file_options.has_data_cache_bytes = 1;
+    file_options.data_cache_bytes = 1024 * 1024;
+    file_options.has_max_page_bytes = 1;
+    file_options.max_page_bytes = 4096;
+    file_options.has_keep_original_array = 1;
+    file_options.keep_original_array = 0;
+
+    LanceNativeWriteOptionsSpec file_spec = {0};
+    file_spec.write_options = &write_options;
+    file_spec.file_writer_options = &file_options;
+    LanceNativeWriteOptions *file_native =
+        lance_native_write_options_new(&file_spec);
+    ASSERT(file_native != NULL, "file-writer options must be created");
+    CHECK_OK();
+    NativeWriteInput file_input = native_write_input(src_uri);
+    LanceDataset *dataset = NULL;
+    int32_t rc = native_write_ordinary(
+        file_uri, &file_input, LANCE_WRITE_CREATE, file_native, &dataset);
+    ASSERT(rc == 0, "file-writer create failed");
+    CHECK_OK();
+    uint64_t source_rows = lance_dataset_count_rows(dataset);
+    CHECK_OK();
+    ASSERT(source_rows > 0, "file-writer create wrote no rows");
+    lance_dataset_close(dataset);
+    lance_native_write_options_close(file_native);
+
+    file_options.version = "2.1";
+    LanceNativeWriteOptionsSpec raw_version_spec = {0};
+    raw_version_spec.file_writer_options = &file_options;
+    ASSERT(lance_native_write_options_new(&raw_version_spec) == NULL,
+           "raw file-writer version must be rejected");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "file_writer_options.version",
+        "raw file-writer version validation");
+    file_options.version = NULL;
+
+    LanceNativeWriteOptionsSpec blob_spec = {0};
+    blob_spec.write_options = &write_options;
+    blob_spec.external_blob_mode = LANCE_EXTERNAL_BLOB_INGEST;
+    blob_spec.has_blob_pack_file_size_threshold = 1;
+    blob_spec.blob_pack_file_size_threshold = 1;
+    LanceNativeWriteOptions *blob_options =
+        lance_native_write_options_new(&blob_spec);
+    ASSERT(blob_options != NULL, "blob write options must be created");
+    CHECK_OK();
+    NativeWriteInput blob_input = native_write_external_blob_input(write_uri);
+    rc = native_write_ordinary(
+        blob_output_uri,
+        &blob_input,
+        LANCE_WRITE_CREATE,
+        blob_options,
+        &dataset);
+    if (rc != 0) {
+        const char *message = lance_last_error_message();
+        fprintf(
+            stderr,
+            "FAIL: blob option create failed: %s\n",
+            message != NULL ? message : "unknown error");
+        if (message) lance_free_string(message);
+        exit(1);
+    }
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == 1,
+           "blob option create row count mismatch");
+    lance_dataset_close(dataset);
+    lance_native_write_options_close(blob_options);
+
+    LanceNativeWriteOptionsSpec bad_mode_spec = {0};
+    bad_mode_spec.external_blob_mode = 2;
+    ASSERT(lance_native_write_options_new(&bad_mode_spec) == NULL,
+           "invalid external blob mode must be rejected");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "external_blob_mode=2",
+        "invalid external blob mode validation");
+
+    LanceNativeWriteOptionsSpec conflict_spec = {0};
+    conflict_spec.write_options = &write_options;
+    conflict_spec.allow_external_blob_outside_bases = true;
+    conflict_spec.external_blob_mode = LANCE_EXTERNAL_BLOB_INGEST;
+    LanceNativeWriteOptions *conflict_options =
+        lance_native_write_options_new(&conflict_spec);
+    ASSERT(conflict_options != NULL,
+           "native blob-conflict options must be constructed");
+    CHECK_OK();
+    NativeWriteInput conflict_input =
+        native_write_external_blob_input(write_uri);
+    dataset = NULL;
+    rc = native_write_ordinary(
+        blob_output_uri,
+        &conflict_input,
+        LANCE_WRITE_APPEND,
+        conflict_options,
+        &dataset);
+    ASSERT(rc == -1, "ingest plus allow-outside must fail natively");
+    ASSERT(dataset == NULL, "failed blob append must not return a dataset");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "allow_external_blob_outside_bases",
+        "native blob mode conflict");
+    lance_native_write_options_close(conflict_options);
+
+    dataset = lance_dataset_open(blob_output_uri, NULL, 0);
+    ASSERT(dataset != NULL, "reopen blob-option dataset failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == 1,
+           "native blob validation error must not publish the append");
+    lance_dataset_close(dataset);
+    printf("OK\n");
+}
+
+/* C11 callback teardown and source-owner retention. Session, accessor and lock
+ * source handles close before the write; the options handle retains native
+ * owners. Fragment progress failure is checked on both ordinary and staged
+ * appends, and the reopened dataset proves neither failure published rows. */
+static void test_native_write_progress_and_owners(
+    const char *src_uri,
+    const char *write_uri) {
+    printf("  test_native_write_progress_and_owners... ");
+    char uri[4096];
+    snprintf(uri, sizeof(uri), "%s_native_owners", write_uri);
+
+    NativeWriteProgressCapture progress = {0};
+    LanceNativeWriteProgress progress_desc = {0};
+    progress_desc.begin_fragment = native_write_begin;
+    progress_desc.complete_fragment = native_write_complete;
+    progress_desc.write_stats = native_write_stats;
+    progress_desc.release = native_write_release;
+    progress_desc.callback_ctx = &progress;
+
+    NativeWriteLockCapture lock = {0};
+    LanceCommitLockCallbacks lock_callbacks = {0};
+    lock_callbacks.lock = native_write_lock_acquire;
+    lock_callbacks.release = native_write_lock_release;
+    lock_callbacks.destroy_lease = native_write_lock_destroy;
+    lock_callbacks.callback_ctx = &lock;
+    lock_callbacks.release_context = native_write_lock_context_release;
+    LanceCommitLock *commit_lock = lance_commit_lock_new(&lock_callbacks);
+    ASSERT(commit_lock != NULL, "native write commit lock must be created");
+    CHECK_OK();
+
+    LanceSession *session = lance_session_new(4 * 1024 * 1024, 1024 * 1024);
+    LanceStorageOptionsInput empty_accessor_options = {0};
+    LanceStorageOptionsAccessor *accessor =
+        lance_storage_options_accessor_new(&empty_accessor_options, NULL);
+    ASSERT(session != NULL && accessor != NULL,
+           "native write source owners must be created");
+    CHECK_OK();
+
+    LanceWriteOptions write_options = {0};
+    write_options.params.max_rows_per_file = 4;
+    LanceNativeWriteOptionsSpec spec = {0};
+    spec.write_options = &write_options;
+    spec.session = session;
+    spec.storage_options_accessor = accessor;
+    spec.commit_lock = commit_lock;
+    spec.progress = &progress_desc;
+    LanceNativeWriteOptions *options = lance_native_write_options_new(&spec);
+    ASSERT(options != NULL, "owner-retaining write options must be created");
+    CHECK_OK();
+    lance_session_close(session);
+    lance_storage_options_accessor_close(accessor);
+    lance_commit_lock_close(commit_lock);
+
+    NativeWriteInput create_input = native_write_input(src_uri);
+    LanceDataset *dataset = NULL;
+    int32_t rc = native_write_ordinary(
+        uri, &create_input, LANCE_WRITE_CREATE, options, &dataset);
+    ASSERT(rc == 0, "owner-retaining create failed");
+    CHECK_OK();
+    uint64_t source_rows = lance_dataset_count_rows(dataset);
+    CHECK_OK();
+    ASSERT(source_rows > 0, "owner-retaining create wrote no rows");
+    ASSERT(atomic_load_explicit(
+               &lock.acquires, memory_order_seq_cst) > 0,
+           "retained commit lock must participate in the write");
+    ASSERT(atomic_load_explicit(
+               &lock.releases, memory_order_seq_cst) > 0,
+           "retained commit lock must release its lease");
+    ASSERT(atomic_load_explicit(
+               &lock.destroys, memory_order_seq_cst) > 0,
+           "retained commit lock must destroy the stateless lease token");
+    ASSERT(atomic_load_explicit(
+               &lock.context_releases, memory_order_seq_cst) == 0,
+           "source lock close must not release the retained native context");
+    ASSERT(native_write_load(&progress.begins) > 0 &&
+               native_write_load(&progress.completes) > 0 &&
+               native_write_load(&progress.stats) > 0,
+           "retained progress callbacks must receive native events");
+    ASSERT(atomic_load_explicit(
+               &progress.bad_complete_info, memory_order_seq_cst) == 0,
+           "retained fragment callbacks must receive complete native metadata");
+    lance_dataset_close(dataset);
+
+    atomic_store_explicit(
+        &progress.fail_begin, 1, memory_order_seq_cst);
+    NativeWriteInput failed_append = native_write_input(src_uri);
+    dataset = NULL;
+    rc = native_write_ordinary(
+        uri, &failed_append, LANCE_WRITE_APPEND, options, &dataset);
+    ASSERT(rc == -1, "rejected progress ordinary append must fail");
+    ASSERT(dataset == NULL, "rejected progress append output must be NULL");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "native write progress rejected",
+        "ordinary progress callback error");
+
+    NativeWriteInput failed_stage = native_write_input(src_uri);
+    LanceTransaction *transaction = NULL;
+    rc = native_write_staged(
+        uri, &failed_stage, LANCE_WRITE_APPEND, options, &transaction);
+    ASSERT(rc == -1, "rejected progress staged append must fail");
+    ASSERT(transaction == NULL, "failed stage output must be NULL");
+    expect_error_contains(
+        LANCE_ERR_INVALID_ARGUMENT,
+        "native write progress rejected",
+        "staged progress callback error");
+
+    dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "reopen progress dataset failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(dataset) == source_rows,
+           "progress callback failures must not publish rows");
+    lance_dataset_close(dataset);
+    ASSERT(native_write_load(&progress.releases) == 0,
+           "progress context must remain owned until the options handle closes");
+
+    lance_native_write_options_close(options);
+    native_write_wait_release(&progress);
+    ASSERT(atomic_load_explicit(
+               &lock.context_releases, memory_order_seq_cst) == 1,
+           "commit-lock context must be released exactly once");
     printf("OK\n");
 }
 
@@ -3453,6 +5276,101 @@ static void test_add_columns(const char *write_uri) {
     printf("OK\n");
 }
 
+/* Re-opens the dataset reduced by test_drop_columns and exercises native
+ * Dataset::merge plus BatchUDF with all four checkpoint callbacks. */
+static void test_merge_and_batch_udf(const char *write_uri) {
+    printf("  test_merge_and_batch_udf... ");
+
+    LanceDataset *ds = lance_dataset_open(write_uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    CHECK_OK();
+    uint64_t fields_before = 0;
+    struct ArrowSchema schema_before;
+    memset(&schema_before, 0, sizeof(schema_before));
+    ASSERT(lance_dataset_schema(ds, &schema_before) == 0, "schema export failed");
+    fields_before = (uint64_t)schema_before.n_children;
+    if (schema_before.release) schema_before.release(&schema_before);
+    uint64_t version_before = lance_dataset_version(ds);
+
+    MergeStreamFixture merge = {0};
+    init_merge_stream(&merge);
+    int32_t rc = lance_dataset_merge(ds, "id", "id", &merge.stream);
+    ASSERT(rc == 0, "lance_dataset_merge failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(ds) > version_before,
+           "merge must commit a new version");
+
+    uint64_t fields_after_merge = 0;
+    struct ArrowSchema schema_after_merge;
+    memset(&schema_after_merge, 0, sizeof(schema_after_merge));
+    ASSERT(lance_dataset_schema(ds, &schema_after_merge) == 0,
+           "schema export after merge failed");
+    fields_after_merge = (uint64_t)schema_after_merge.n_children;
+    if (schema_after_merge.release) schema_after_merge.release(&schema_after_merge);
+    ASSERT(fields_after_merge == fields_before + 1,
+           "merge must add exactly one column");
+
+    struct ArrowSchema udf_column;
+    struct ArrowSchema *udf_children[1];
+    memset(&udf_column, 0, sizeof(udf_column));
+    udf_children[0] = &udf_column;
+    udf_column.format = "l";
+    udf_column.name = "c_udf_c";
+    udf_column.flags = ARROW_FLAG_NULLABLE;
+    udf_column.release = test_noop_schema_release;
+    struct ArrowSchema udf_schema;
+    memset(&udf_schema, 0, sizeof(udf_schema));
+    udf_schema.format = "+s";
+    udf_schema.n_children = 1;
+    udf_schema.children = udf_children;
+    udf_schema.release = test_noop_schema_release;
+
+    CheckpointCalls calls = {0};
+    LanceUDFCheckpointStore store = {0};
+    store.get_batch = checkpoint_get_batch;
+    store.insert_batch = checkpoint_insert_batch;
+    store.get_fragment = checkpoint_get_fragment;
+    store.insert_fragment = checkpoint_insert_fragment;
+    store.callback_ctx = &calls;
+    LanceBatchUDF udf = {0};
+    udf.mapper = test_batch_udf_mapper;
+    udf.mapper_ctx = NULL;
+    udf.output_schema = &udf_schema;
+    udf.checkpoint_store = &store;
+
+    uint64_t version_before_udf = lance_dataset_version(ds);
+    rc = lance_dataset_add_columns_batch_udf(ds, &udf, NULL, NULL);
+    ASSERT(rc == 0, "lance_dataset_add_columns_batch_udf failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(ds) > version_before_udf,
+           "BatchUDF must commit a new version");
+    ASSERT(calls.get_fragment > 0 && calls.get_batch > 0 &&
+           calls.insert_batch > 0 && calls.insert_fragment > 0,
+           "all four checkpoint callbacks must be exercised");
+
+    uint64_t fields_after_udf = 0;
+    struct ArrowSchema schema_after_udf;
+    memset(&schema_after_udf, 0, sizeof(schema_after_udf));
+    ASSERT(lance_dataset_schema(ds, &schema_after_udf) == 0,
+           "schema export after BatchUDF failed");
+    fields_after_udf = (uint64_t)schema_after_udf.n_children;
+    if (schema_after_udf.release) schema_after_udf.release(&schema_after_udf);
+    ASSERT(fields_after_udf == fields_after_merge + 1,
+           "BatchUDF must add exactly one column");
+
+    rc = lance_dataset_merge(ds, "id", "id", NULL);
+    ASSERT(rc == -1, "NULL merge stream must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT for NULL merge stream");
+    rc = lance_dataset_add_columns_batch_udf(ds, NULL, NULL, NULL);
+    ASSERT(rc == -1, "NULL BatchUDF must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT for NULL BatchUDF");
+
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 /* Builds one uncommitted scalar index segment and exercises the byte-buffer
  * and parsed-metadata ownership APIs from a real C caller. */
 static void test_index_segment_builder(const char *uri) {
@@ -3548,6 +5466,241 @@ static void test_index_segment_builder(const char *uri) {
     lance_free_bytes(metadata_bytes);
     lance_index_segment_builder_free(builder);
     lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Build two real ZoneMap segments, inspect the complete metadata, construct a
+ * CreateIndex operation, and publish it through the existing transaction
+ * commit path. */
+static void test_create_index_operation(const char *uri) {
+    printf("  test_create_index_operation... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "create-index fixture open failed");
+    CHECK_OK();
+    uint64_t version = lance_dataset_version(ds);
+    CHECK_OK();
+    uint64_t fragment_count = lance_dataset_fragment_count(ds);
+    CHECK_OK();
+    ASSERT(fragment_count >= 2, "fixture must contain at least two fragments");
+    uint64_t *fragment_ids =
+        (uint64_t *)calloc((size_t)fragment_count, sizeof(uint64_t));
+    ASSERT(fragment_ids != NULL, "fragment-id allocation failed");
+    ASSERT(lance_dataset_fragment_ids(ds, fragment_ids) == 0,
+           "fragment enumeration failed");
+    CHECK_OK();
+
+    const char *params = "{\"rows_per_zone\":2,\"use_seeds\":false}";
+    uint32_t first_fragment = (uint32_t)fragment_ids[0];
+    uint32_t second_fragment = (uint32_t)fragment_ids[1];
+    free(fragment_ids);
+    const uint8_t first_uuid[16] = {
+        0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x47, 0x68,
+        0x89, 0x9a, 0xab, 0xbc, 0xcd, 0xde, 0xef, 0xf0,
+    };
+    const uint8_t second_uuid[16] = {
+        0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
+        0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f,
+    };
+
+    LanceIndexSegmentMetadata *segments[2] = {NULL, NULL};
+    const uint8_t *uuids[2] = {first_uuid, second_uuid};
+    uint32_t selected[2] = {first_fragment, second_fragment};
+    for (size_t i = 0; i < 2; i++) {
+        LanceIndexSegmentBuildOptions options;
+        memset(&options, 0, sizeof(options));
+        options.fragment_ids = &selected[i];
+        options.fragment_count = 1;
+        options.index_uuid = uuids[i];
+        options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+        LanceIndexSegmentBuilder *builder =
+            lance_index_segment_builder_new_scalar(
+                ds, "score", "c_create_index_zonemap",
+                LANCE_SCALAR_ZONE_MAP, params, &options);
+        ASSERT(builder != NULL, "create-index segment builder failed");
+        uint8_t *bytes = NULL;
+        size_t len = 0;
+        ASSERT(lance_index_segment_builder_execute_uncommitted(
+                   builder, &bytes, &len) == 0,
+               "create-index segment execution failed");
+        ASSERT(bytes != NULL && len > 0, "empty create-index metadata");
+        ASSERT(lance_index_segment_metadata_parse(bytes, len, &segments[i]) ==
+                   0,
+               "create-index metadata parse failed");
+        CHECK_OK();
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+
+        ASSERT(lance_index_segment_metadata_covering_field_count(segments[i]) ==
+                   0,
+               "ZoneMap segment must not declare covering fields");
+        CHECK_OK();
+        size_t details_len = 0;
+        const uint8_t *details =
+            lance_index_segment_metadata_index_details_value(
+                segments[i], &details_len);
+        ASSERT(details != NULL && details_len > 0,
+               "ZoneMap details value must be present and non-empty");
+        CHECK_OK();
+        size_t file_count =
+            lance_index_segment_metadata_file_count(segments[i]);
+        CHECK_OK();
+        ASSERT(file_count > 0, "segment metadata must record files");
+        for (size_t file = 0; file < file_count; file++) {
+            const char *path =
+                lance_index_segment_metadata_file_path_at(segments[i], file);
+            ASSERT(path != NULL && path[0] != '\0',
+                   "segment file path must be present");
+            CHECK_OK();
+            uint64_t size = 0;
+            ASSERT(lance_index_segment_metadata_file_size_at(
+                       segments[i], file, &size) == 0,
+                   "segment file size read failed");
+            CHECK_OK();
+            ASSERT(size > 0, "segment file size must be positive");
+        }
+        LanceOptionalTimestamp created_at;
+        memset(&created_at, 0, sizeof(created_at));
+        ASSERT(lance_index_segment_metadata_created_at(
+                   segments[i], &created_at) == 0,
+               "segment created_at read failed");
+        CHECK_OK();
+        ASSERT(created_at.is_set && created_at.unix_seconds > 0,
+               "real segment metadata must record created_at");
+        bool base_id_is_set = true;
+        uint32_t base_id = UINT32_MAX;
+        ASSERT(lance_index_segment_metadata_base_id(
+                   segments[i], &base_id_is_set, &base_id) == 0,
+               "segment base_id read failed");
+        CHECK_OK();
+        ASSERT(!base_id_is_set && base_id == 0,
+               "locally built segment must report absent base_id");
+
+        LanceIndexSegmentMetadata *clone =
+            lance_index_segment_metadata_clone(segments[i]);
+        ASSERT(clone != NULL, "metadata clone failed");
+        CHECK_OK();
+        uint8_t clone_uuid[16] = {0};
+        ASSERT(lance_index_segment_metadata_uuid(clone, clone_uuid) == 0,
+               "cloned metadata UUID read failed");
+        CHECK_OK();
+        ASSERT(memcmp(clone_uuid, uuids[i], 16) == 0,
+               "cloned metadata UUID mismatch");
+        ASSERT(strcmp(lance_index_segment_metadata_name(clone),
+                      "c_create_index_zonemap") == 0,
+               "cloned metadata name mismatch");
+        lance_index_segment_metadata_free(segments[i]);
+        segments[i] = clone;
+    }
+
+    const LanceIndexSegmentMetadata *new_indices[2] = {
+        segments[0], segments[1],
+    };
+    LanceOperation *operation =
+        lance_operation_create_index_new(new_indices, 2, NULL, 0);
+    ASSERT(operation != NULL, "CreateIndex construction failed");
+    CHECK_OK();
+    LanceOperationKind kind = LANCE_OPERATION_UNKNOWN;
+    ASSERT(lance_operation_kind(operation, &kind) == 0,
+           "CreateIndex kind read failed");
+    CHECK_OK();
+    ASSERT(kind == LANCE_OPERATION_CREATE_INDEX,
+           "CreateIndex kind mismatch");
+    uint64_t new_count = 0;
+    uint64_t removed_count = UINT64_MAX;
+    ASSERT(lance_operation_create_index_new_count(operation, &new_count) == 0,
+           "CreateIndex new count read failed");
+    ASSERT(lance_operation_create_index_removed_count(
+               operation, &removed_count) == 0,
+           "CreateIndex removed count read failed");
+    CHECK_OK();
+    ASSERT(new_count == 2 && removed_count == 0,
+           "CreateIndex counts mismatch");
+
+    LanceIndexSegmentMetadata *inspected_first = NULL;
+    LanceIndexSegmentMetadata *inspected_second = NULL;
+    ASSERT(lance_operation_create_index_new_at(
+               operation, 0, &inspected_first) == 0,
+           "CreateIndex first new metadata read failed");
+    ASSERT(lance_operation_create_index_new_at(
+               operation, 1, &inspected_second) == 0,
+           "CreateIndex second new metadata read failed");
+    CHECK_OK();
+    uint8_t inspected_first_uuid[16] = {0};
+    uint8_t inspected_second_uuid[16] = {0};
+    ASSERT(lance_index_segment_metadata_uuid(
+               inspected_first, inspected_first_uuid) == 0,
+           "first inspected metadata UUID read failed");
+    ASSERT(lance_index_segment_metadata_uuid(
+               inspected_second, inspected_second_uuid) == 0,
+           "second inspected metadata UUID read failed");
+    CHECK_OK();
+    ASSERT(memcmp(inspected_first_uuid, first_uuid, 16) == 0 &&
+               memcmp(inspected_second_uuid, second_uuid, 16) == 0,
+           "CreateIndex new metadata order mismatch");
+
+    lance_operation_close(operation);
+    lance_index_segment_metadata_free(segments[0]);
+    lance_index_segment_metadata_free(segments[1]);
+    ASSERT(strcmp(lance_index_segment_metadata_name(inspected_first),
+                  "c_create_index_zonemap") == 0,
+           "metadata cloned from an operation must outlive the parent");
+
+    LanceTransaction *transaction =
+        lance_transaction_new(version, NULL, NULL);
+    ASSERT(transaction == NULL &&
+               lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL operation must be rejected");
+    const char *error_message = lance_last_error_message();
+    if (error_message) lance_free_string(error_message);
+
+    /* The operation is needed again for the transaction; rebuild it from the
+     * independently cloned operation metadata. */
+    const LanceIndexSegmentMetadata *reused_indices[2] = {
+        inspected_first, inspected_second,
+    };
+    operation = lance_operation_create_index_new(reused_indices, 2, NULL, 0);
+    ASSERT(operation != NULL, "CreateIndex rebuild failed");
+    transaction = lance_transaction_new(version, operation, NULL);
+    ASSERT(transaction != NULL, "CreateIndex transaction construction failed");
+    CHECK_OK();
+    lance_operation_close(operation);
+    lance_index_segment_metadata_free(inspected_first);
+    lance_index_segment_metadata_free(inspected_second);
+    lance_dataset_close(ds);
+
+    LanceCommitOptions commit_options;
+    memset(&commit_options, 0, sizeof(commit_options));
+    commit_options.has_max_retries = true;
+    commit_options.max_retries = 0;
+    commit_options.timeout_mode = LANCE_COMMIT_TIMEOUT_DISABLED;
+    LanceDataset *committed = NULL;
+    int32_t rc = lance_transaction_commit(
+        uri, transaction, &commit_options, NULL, NULL, &committed);
+    ASSERT(rc == 0 && committed != NULL, "CreateIndex transaction commit failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(committed) == version + 1,
+           "CreateIndex must publish exactly one version");
+    ASSERT(lance_dataset_index_segment_count(
+               committed, "c_create_index_zonemap") == 2,
+           "CreateIndex must publish both segments");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows_filtered(committed, "score = 80") == 1,
+           "CreateIndex fixture query must return the expected row");
+    CHECK_OK();
+    lance_transaction_close(transaction);
+    lance_dataset_close(committed);
+
+    LanceDataset *reopened = lance_dataset_open(uri, NULL, 0);
+    ASSERT(reopened != NULL, "CreateIndex reopen failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(reopened) == version + 1,
+           "CreateIndex version must persist");
+    ASSERT(lance_dataset_index_segment_count(
+               reopened, "c_create_index_zonemap") == 2,
+           "CreateIndex segments must persist");
+    CHECK_OK();
+    lance_dataset_close(reopened);
     printf("OK\n");
 }
 
@@ -3672,6 +5825,103 @@ static void test_vector_models_and_reusable_segments(const char *uri) {
     if (codebook.release) codebook.release(&codebook);
     if (codebook_schema.release) codebook_schema.release(&codebook_schema);
     lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+static int32_t first_nearest_id(LanceDataset *ds, const float *query) {
+    LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+    ASSERT(scanner != NULL, "create nearest scanner failed");
+    ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                 LANCE_DTYPE_FLOAT32, 3) == 0,
+           "nearest failed");
+    ASSERT(lance_scanner_set_nprobes(scanner, 2) == 0, "set_nprobes failed");
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "nearest stream failed");
+
+    struct ArrowSchema schema = {0};
+    ASSERT(stream.get_schema(&stream, &schema) == 0, "nearest schema failed");
+    int id_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (strcmp(schema.children[i]->name, "id") == 0) {
+            id_column = (int)i;
+            break;
+        }
+    }
+    ASSERT(id_column >= 0, "nearest result is missing id");
+    ASSERT(strcmp(schema.children[id_column]->format, "i") == 0,
+           "nearest id column type mismatch");
+    schema.release(&schema);
+
+    int32_t id = -1;
+    while (1) {
+        struct ArrowArray array = {0};
+        ASSERT(stream.get_next(&stream, &array) == 0, "nearest get_next failed");
+        if (array.release == NULL) break;
+        if (id < 0 && array.length > 0) {
+            const struct ArrowArray *ids = array.children[id_column];
+            const int32_t *values = (const int32_t *)ids->buffers[1];
+            id = values[ids->offset];
+        }
+        array.release(&array);
+    }
+    stream.release(&stream);
+    lance_scanner_close(scanner);
+    return id;
+}
+
+static void test_vector_index_options_and_rq_model(const char *uri) {
+    printf("  test_vector_index_options_and_rq_model... ");
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    struct ArrowArray centroids = {0};
+    struct ArrowSchema centroids_schema = {0};
+    ASSERT(lance_index_train_ivf_model(
+               ds, "embedding", 2, LANCE_METRIC_L2, NULL, 0,
+               &centroids, &centroids_schema) == 0,
+           "IVF training failed");
+    const char *rq_json = lance_index_build_rq_model(8, 0);
+    ASSERT(rq_json != NULL, "RQ model generation failed");
+    ASSERT(strstr(rq_json, "\"num_bits\":5") != NULL,
+           "RQ zero bits must select the native default");
+
+    LanceVectorIndexOptions options = {0};
+    options.index_type = LANCE_INDEX_IVF_RQ;
+    options.metric = LANCE_METRIC_L2;
+    options.num_partitions = (LanceOptionalU64){2, true};
+    options.ivf_centroids = &centroids;
+    options.ivf_centroids_schema = &centroids_schema;
+    options.rabitq_model_json = rq_json;
+    options.index_file_version = LANCE_INDEX_FILE_VERSION_V3;
+    ASSERT(lance_dataset_create_vector_index_with_options(
+               ds, "embedding", "c_options_rq_idx", &options, false) == 0,
+           "options vector create failed");
+
+    float query[8];
+    for (int i = 0; i < 8; ++i) query[i] = 0.3f + (float)i;
+    ASSERT(first_nearest_id(ds, query) == 3,
+           "IVF_RQ nearest result mismatch");
+    const char *segments = lance_dataset_index_segments_json(ds);
+    ASSERT(segments != NULL, "index segments JSON failed");
+    ASSERT(strstr(segments, "\"type\":\"IVF_RQ\"") != NULL,
+           "missing IVF_RQ metadata type");
+    ASSERT(strstr(segments, "\"index_version\":2") != NULL,
+           "missing IVF_RQ index version");
+    lance_free_string(segments);
+    lance_dataset_close(ds);
+
+    ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "reopen failed");
+    ASSERT(first_nearest_id(ds, query) == 3,
+           "IVF_RQ nearest result changed after reopen");
+    ASSERT(lance_dataset_drop_index(ds, "c_options_rq_idx") == 0,
+           "drop IVF_RQ index failed");
+
+    lance_dataset_close(ds);
+    lance_free_string(rq_json);
+    if (centroids.release) centroids.release(&centroids);
+    if (centroids_schema.release) centroids_schema.release(&centroids_schema);
     printf("OK\n");
 }
 
@@ -3809,6 +6059,116 @@ static void test_compact_files(const char *write_uri) {
     ASSERT(rc == -1, "NULL dataset must fail");
     ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
            "expected INVALID_ARGUMENT");
+
+    LanceCompactionOptionsV2 *v2 = lance_compaction_options_v2_new();
+    ASSERT(v2 != NULL, "create compaction options v2 failed");
+    ASSERT(lance_compaction_options_v2_set_target_rows_per_fragment(v2, 100) == 0,
+           "set compaction target failed");
+    ASSERT(lance_compaction_options_v2_set_max_source_rows(v2, true, 0) == 0,
+           "set explicit zero source rows failed");
+    ASSERT(lance_compaction_options_v2_set_max_source_rows(v2, false, 0) == 0,
+           "clear source rows failed");
+    ASSERT(lance_compaction_options_v2_set_max_bytes_per_file(v2, false, 0) == 0,
+           "clear max bytes failed");
+    ASSERT(lance_compaction_options_v2_set_num_threads(v2, true, 0) == 0,
+           "set explicit zero threads failed");
+    ASSERT(lance_compaction_options_v2_set_batch_size(v2, false, 0) == 0,
+           "clear batch size failed");
+    ASSERT(lance_compaction_options_v2_set_io_buffer_size(v2, true, 0) == 0,
+           "set explicit zero IO buffer failed");
+    ASSERT(lance_compaction_options_v2_set_materialize_deletions(v2, true) == 0,
+           "set materialize deletions failed");
+    ASSERT(lance_compaction_options_v2_set_materialize_deletions_threshold(v2, 0.5f) == 0,
+           "set deletion threshold failed");
+    ASSERT(lance_compaction_options_v2_set_defer_index_remap(v2, false) == 0,
+           "set defer remap failed");
+    ASSERT(lance_compaction_options_v2_set_index_remap_mode(
+               v2, LANCE_INDEX_REMAP_DIRECT) == 0,
+           "set remap mode failed");
+    ASSERT(lance_compaction_options_v2_set_compaction_mode(
+               v2, true, LANCE_COMPACTION_REENCODE) == 0,
+           "set compaction mode failed");
+    ASSERT(lance_compaction_options_v2_set_binary_copy_read_batch_bytes(
+               v2, false, 0) == 0,
+           "clear binary-copy batch failed");
+    ASSERT(lance_compaction_options_v2_set_max_source_fragments(v2, false, 0) == 0,
+           "clear source fragments failed");
+    ASSERT(lance_compaction_options_v2_set_max_source_bytes(v2, false, 0) == 0,
+           "clear source bytes failed");
+    ASSERT(lance_compaction_options_v2_set_excluded_fragment_ids(v2, NULL, 0) == 0,
+           "clear excluded fragments failed");
+    ASSERT(lance_compaction_options_v2_set_max_overlays_per_fragment(v2, true, 0) == 0,
+           "set overlay trigger failed");
+    ASSERT(lance_compaction_options_v2_set_data_storage_version(v2, "2.1") == 0,
+           "set storage version failed");
+    LanceCompactionOptionsV2 *v2_clone = lance_compaction_options_v2_clone(v2);
+    ASSERT(v2_clone != NULL, "clone compaction options failed");
+    LanceCompactionOptionsV2 *v2_from_dataset =
+        lance_compaction_options_v2_from_dataset(ds);
+    ASSERT(v2_from_dataset != NULL, "from-dataset compaction options failed");
+
+    memset(&metrics, 0, sizeof(metrics));
+    rc = lance_dataset_compact_files_v2(ds, v2, &metrics);
+    ASSERT(rc == 0, "compact_files_v2 failed");
+    ASSERT(metrics.fragments_removed == 0 && metrics.fragments_added == 0,
+           "expected v2 no-op metrics");
+    ASSERT(lance_dataset_version(ds) == v_before,
+           "v2 no-op compaction must not bump the version");
+
+    LanceCompactionPlan *plan = lance_dataset_plan_compaction(ds, v2);
+    ASSERT(plan != NULL, "plan compaction failed");
+    ASSERT(lance_compaction_plan_read_version(plan) == v_before,
+           "plan read version mismatch");
+    ASSERT(lance_compaction_plan_task_count(plan) == 0,
+           "clean smoke fixture must have no compaction tasks");
+    const char *plan_json = lance_compaction_plan_json(plan);
+    ASSERT(plan_json != NULL, "serialize compaction plan failed");
+    LanceCompactionPlan *decoded_plan = lance_compaction_plan_from_json(plan_json);
+    ASSERT(decoded_plan != NULL, "decode compaction plan failed");
+    lance_free_string(plan_json);
+    lance_compaction_plan_close(decoded_plan);
+    lance_compaction_plan_close(plan);
+
+    LanceOptimizeIndicesOptions *index_options =
+        lance_optimize_indices_options_new();
+    ASSERT(index_options != NULL, "create index options failed");
+    ASSERT(lance_optimize_indices_options_set_index_names(
+               index_options, true, NULL, 0) == 0,
+           "set empty index names failed");
+    ASSERT(lance_optimize_indices_options_set_num_indices_to_merge(
+               index_options, true, 0) == 0,
+           "set append mode failed");
+    LanceOptimizeIndicesOptions *index_options_clone =
+        lance_optimize_indices_options_clone(index_options);
+    ASSERT(index_options_clone != NULL, "clone index options failed");
+    LanceOptimizeIndicesPlan *index_plan =
+        lance_dataset_plan_optimize_indices(ds, index_options);
+    ASSERT(index_plan != NULL, "plan index optimization failed");
+    uint8_t plan_uuid[16];
+    ASSERT(lance_optimize_indices_plan_id(index_plan, plan_uuid) == 0,
+           "read index plan id failed");
+    const char *index_plan_json = lance_optimize_indices_plan_json(index_plan);
+    ASSERT(index_plan_json != NULL, "serialize index plan failed");
+    LanceOptimizeIndicesPlan *decoded_index_plan =
+        lance_optimize_indices_plan_from_json(index_plan_json);
+    ASSERT(decoded_index_plan != NULL, "decode index plan failed");
+    lance_free_string(index_plan_json);
+    lance_optimize_indices_plan_close(decoded_index_plan);
+    lance_optimize_indices_plan_close(index_plan);
+    lance_optimize_indices_options_free(index_options_clone);
+    lance_optimize_indices_options_free(index_options);
+    lance_compaction_options_v2_free(v2_clone);
+    lance_compaction_options_v2_free(v2_from_dataset);
+    lance_compaction_options_v2_free(v2);
+
+    rc = lance_dataset_migrate_manifest_paths_v2(NULL);
+    ASSERT(rc == -1, "NULL migration must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT for NULL migration");
+    rc = lance_dataset_truncate_table(NULL);
+    ASSERT(rc == -1, "NULL truncate must fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "expected INVALID_ARGUMENT for NULL truncate");
 
     lance_dataset_close(ds);
     printf("OK\n");
@@ -4431,6 +6791,52 @@ static void test_native_scalar_indexes(const char *uri) {
                strstr(json, "c_id_bloom") == NULL,
            "C dropped native scalar indexes remain listed");
     lance_free_string(json);
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
+/* Index names are JSON strings; a real C consumer must receive complete
+ * escaping for backslashes, quotes and control characters. */
+static void test_index_list_json_escaping(const char *uri) {
+    printf("  test_index_list_json_escaping... ");
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+
+    const char *names[] = {
+        "c_index\\q",
+        "c_index\\n",
+        "c_index\"quote",
+        "c_index\nline\ttab",
+        "c_索引列",
+    };
+    const size_t count = sizeof(names) / sizeof(names[0]);
+    for (size_t i = 0; i < count; ++i) {
+        ASSERT(lance_dataset_create_scalar_index(
+                   ds, "id", names[i], LANCE_SCALAR_BTREE, NULL, 0) == 0,
+               "escaped index creation failed");
+        CHECK_OK();
+    }
+
+    char *json = (char *)lance_dataset_index_list_json(ds);
+    ASSERT(json != NULL, "escaped index list failed");
+    ASSERT(strstr(json, "\"name\":\"c_index\\\\q\"") != NULL,
+           "backslash-q index name was not escaped");
+    ASSERT(strstr(json, "\"name\":\"c_index\\\\n\"") != NULL,
+           "backslash-n index name was not escaped");
+    ASSERT(strstr(json, "\"name\":\"c_index\\\"quote\"") != NULL,
+           "quoted index name was not escaped");
+    ASSERT(strstr(json, "\"name\":\"c_index\\nline\\ttab\"") != NULL,
+           "control characters in index name were not escaped");
+    ASSERT(strstr(json, "\"name\":\"c_索引列\"") != NULL,
+           "non-ASCII index name was not preserved");
+    lance_free_string(json);
+
+    for (size_t i = 0; i < count; ++i) {
+        ASSERT(lance_dataset_drop_index(ds, names[i]) == 0,
+               "escaped index drop failed");
+        CHECK_OK();
+    }
+
     lance_dataset_close(ds);
     printf("OK\n");
 }
@@ -5152,6 +7558,571 @@ static void test_fragment_read_operations(const char *uri) {
     printf("OK\n");
 }
 
+static void test_clone_handle(const char *uri) {
+    printf("  test_clone_handle... ");
+
+    LanceDataset *missing = lance_dataset_clone_handle(NULL);
+    ASSERT(missing == NULL, "clone_handle(NULL) must return NULL");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "clone_handle(NULL) must report INVALID_ARGUMENT");
+    const char *message = lance_last_error_message();
+    ASSERT(message != NULL && strstr(message, "dataset is NULL") != NULL,
+           "clone_handle(NULL) must name the NULL dataset");
+    lance_free_string(message);
+
+    LanceDataset *source = lance_dataset_open(uri, NULL, 0);
+    ASSERT(source != NULL, "clone source open failed");
+    CHECK_OK();
+    const uint64_t source_version = lance_dataset_version(source);
+    CHECK_OK();
+    ASSERT(source_version == 3, "unexpected clone fixture version");
+    ASSERT(lance_dataset_count_rows(source) == 6,
+           "unexpected clone fixture row count");
+    CHECK_OK();
+
+    bool stable_row_ids = false;
+    ASSERT(lance_dataset_has_stable_row_ids(source, &stable_row_ids) == 0,
+           "clone source stable-row-ID inspection failed");
+    CHECK_OK();
+    ASSERT(stable_row_ids, "clone fixture must use stable row IDs");
+
+    uint64_t fragments[2] = {0, 0};
+    ASSERT(lance_dataset_fragment_ids(source, fragments) == 0,
+           "clone source fragment enumeration failed");
+    CHECK_OK();
+    ASSERT(fragments[0] != fragments[1],
+           "clone fixture must have two fragments");
+
+    LanceDataset *clone = lance_dataset_clone_handle(source);
+    ASSERT(clone != NULL, "clone_handle failed");
+    CHECK_OK();
+    ASSERT(clone != source, "clone_handle must return a distinct handle");
+    ASSERT(lance_dataset_version(clone) == source_version,
+           "clone must start at the source version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(clone) == 6,
+           "clone must start with the source rows");
+    CHECK_OK();
+
+    struct ArrowSchema schema = {0};
+    ASSERT(lance_dataset_schema(source, &schema) == 0,
+           "clone source schema export failed");
+    CHECK_OK();
+    ASSERT(schema.n_children == 3, "unexpected clone fixture schema");
+    schema.release(&schema);
+
+    uint64_t deleted = 0;
+    ASSERT(lance_dataset_delete(clone, "id = 2", &deleted) == 0,
+           "clone delete failed");
+    CHECK_OK();
+    ASSERT(deleted == 1, "clone delete must remove one row");
+    const uint64_t clone_version = source_version + 1;
+    ASSERT(lance_dataset_version(clone) == clone_version,
+           "clone must advance its own version");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(clone) == 5,
+           "clone must reflect its mutation");
+    CHECK_OK();
+
+    ASSERT(lance_dataset_version(source) == source_version,
+           "source version must not follow the clone");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(source) == 6,
+           "source row count must not follow the clone");
+    CHECK_OK();
+
+    const uint64_t all_indices[] = {0, 1, 2, 3, 4, 5};
+    const int32_t expected_source[] = {0, 2, 3, 10, 11, 13};
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_dataset_take(source, all_indices, 6, NULL, &stream) == 0,
+           "source take after clone mutation failed");
+    CHECK_OK();
+    check_fragment_take_ids(
+        &stream, "source rows and schema after clone mutation",
+        expected_source, 6, 0);
+
+    memset(&schema, 0, sizeof(schema));
+    ASSERT(lance_dataset_schema(source, &schema) == 0,
+           "source schema after clone mutation failed");
+    CHECK_OK();
+    ASSERT(schema.n_children == 3,
+           "source schema must not follow the clone");
+    schema.release(&schema);
+
+    const uint64_t clone_indices[] = {0, 1, 2, 3, 4};
+    const int32_t expected_clone[] = {0, 3, 10, 11, 13};
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_take(clone, clone_indices, 5, NULL, &stream) == 0,
+           "clone take after delete failed");
+    CHECK_OK();
+    check_fragment_take_ids(
+        &stream, "clone rows after delete", expected_clone, 5, 0);
+
+    /* Closing the source first must leave the clone fully usable. */
+    lance_dataset_close(source);
+    ASSERT(lance_dataset_version(clone) == clone_version,
+           "clone version after source close");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(clone) == 5,
+           "clone rows after source close");
+    CHECK_OK();
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_dataset_take(clone, clone_indices, 5, NULL, &stream) == 0,
+           "clone take after source close failed");
+    CHECK_OK();
+    check_fragment_take_ids(
+        &stream, "clone data after source close", expected_clone, 5, 0);
+    lance_dataset_close(clone);
+
+    /* Closing the clone first must leave a reopened source fully usable. */
+    source = lance_dataset_open(uri, NULL, 0);
+    ASSERT(source != NULL, "clone source reopen failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(source) == clone_version,
+           "reopened source must observe the committed clone mutation");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(source) == 5,
+           "reopened source row count after clone mutation");
+    CHECK_OK();
+
+    clone = lance_dataset_clone_handle(source);
+    ASSERT(clone != NULL, "second clone_handle failed");
+    CHECK_OK();
+    lance_dataset_close(clone);
+    ASSERT(lance_dataset_version(source) == clone_version,
+           "source version after clone close");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(source) == 5,
+           "source rows after clone close");
+    CHECK_OK();
+    lance_dataset_close(source);
+    lance_dataset_close(NULL);
+
+    printf("OK\n");
+}
+
+static void test_diagnostics(const char *uri) {
+    printf("test_diagnostics... ");
+
+    const char *text = "the Cats and Dogs";
+    LanceFtsTokenList *tokens =
+        lance_fts_tokenize(text, strlen(text), NULL);
+    ASSERT(tokens != NULL, "default tokenize should succeed");
+    ASSERT(lance_fts_token_list_count(tokens) == 2,
+           "default tokenizer should keep cat and dog");
+    LanceFtsTokenView view = {NULL, 0, 0};
+    ASSERT(lance_fts_token_list_get(tokens, 0, &view) == 0,
+           "first token should exist");
+    ASSERT(view.text_len == 3 && memcmp(view.text, "cat", 3) == 0,
+           "first token should be cat");
+    ASSERT(view.position == 0, "cat position should be 0");
+    ASSERT(lance_fts_token_list_get(tokens, 1, &view) == 0,
+           "second token should exist");
+    ASSERT(view.text_len == 3 && memcmp(view.text, "dog", 3) == 0,
+           "second token should be dog");
+    ASSERT(view.position == 2, "dog position should be 2");
+    view.text = (const char *)0x1;
+    view.text_len = 99;
+    view.position = 99;
+    ASSERT(lance_fts_token_list_get(tokens, 2, &view) != 0,
+           "out-of-range token should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "out-of-range token should be invalid argument");
+    ASSERT(view.text == (const char *)0x1 && view.text_len == 99 &&
+               view.position == 99,
+           "failed token get must not write the out slot");
+    lance_fts_token_list_close(tokens);
+
+    /* Empty text with a NULL pointer is valid and yields no tokens. */
+    tokens = lance_fts_tokenize(NULL, 0, NULL);
+    ASSERT(tokens != NULL, "NULL/0 text should tokenize as empty");
+    ASSERT(lance_fts_token_list_count(tokens) == 0,
+           "empty text should have no tokens");
+    lance_fts_token_list_close(tokens);
+
+    /* NULL text with a nonzero length and invalid UTF-8 are rejected. */
+    ASSERT(lance_fts_tokenize(NULL, 1, NULL) == NULL,
+           "NULL text with length should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "NULL text with length should be invalid argument");
+    const char invalid_utf8[] = {(char)0xff};
+    ASSERT(lance_fts_tokenize(invalid_utf8, sizeof(invalid_utf8), NULL) ==
+               NULL,
+           "invalid UTF-8 should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid UTF-8 should be invalid argument");
+
+    /* Raw tokenization preserves embedded NUL bytes. */
+    const char raw_text[] = {'a', '\0', 'b'};
+    const char *raw_params = "{\"base_tokenizer\":\"raw\"}";
+    tokens = lance_fts_tokenize(raw_text, sizeof(raw_text), raw_params);
+    ASSERT(tokens != NULL, "raw tokenize should succeed");
+    ASSERT(lance_fts_token_list_count(tokens) == 1,
+           "raw tokenizer should emit one token");
+    memset(&view, 0, sizeof(view));
+    ASSERT(lance_fts_token_list_get(tokens, 0, &view) == 0,
+           "raw token should exist");
+    ASSERT(view.text_len == sizeof(raw_text) &&
+               memcmp(view.text, raw_text, sizeof(raw_text)) == 0,
+           "raw token must preserve embedded NUL");
+    ASSERT(view.position == 0, "raw token position should be 0");
+    lance_fts_token_list_close(tokens);
+
+    /* Native deserialization errors are surfaced, not silently defaulted. */
+    const char *bad_params = "{\"base_tokenizer\":\"code\",\"analyzer\":\"text\"}";
+    ASSERT(lance_fts_tokenize("code", 4, bad_params) == NULL,
+           "invalid tokenizer params should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid tokenizer params should be invalid argument");
+
+    const char *simd = lance_simd_info_json();
+    ASSERT(simd != NULL, "SIMD report should succeed");
+    ASSERT(strstr(simd, "\"tier\"") != NULL, "SIMD report needs tier");
+    ASSERT(strstr(simd, "\"target_arch\"") != NULL,
+           "SIMD report needs target_arch");
+    ASSERT(strstr(simd, "\"host_features\"") != NULL,
+           "SIMD report needs host_features");
+    lance_free_string(simd);
+
+    /* Opening and counting rows performs real object-store reads. */
+    uint64_t iops_before = lance_process_iops_counter();
+    uint64_t bytes_before = lance_process_bytes_read_counter();
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "dataset should open for diagnostics");
+    ASSERT(lance_dataset_count_rows(ds) > 0,
+           "diagnostic dataset should have rows");
+    uint64_t iops_after = lance_process_iops_counter();
+    uint64_t bytes_after = lance_process_bytes_read_counter();
+    ASSERT(iops_after >= iops_before, "process IOPS counter is monotonic");
+    ASSERT(bytes_after >= bytes_before,
+           "process bytes counter is monotonic");
+
+    LanceObjectStoreIoStats snapshot_before = {0, 0, 0, 0};
+    ASSERT(lance_dataset_io_stats_snapshot(ds, &snapshot_before) == 0,
+           "dataset snapshot stats should succeed");
+    LanceObjectStoreIoStats incremental_before = {0, 0, 0, 0};
+    ASSERT(lance_dataset_io_stats_incremental(ds, &incremental_before) == 0,
+           "dataset incremental stats should succeed");
+    ASSERT(incremental_before.read_iops == snapshot_before.read_iops,
+           "first incremental read returns the pre-reset snapshot");
+    ASSERT(incremental_before.read_bytes == snapshot_before.read_bytes,
+           "first incremental bytes return the pre-reset snapshot");
+
+    ASSERT(lance_dataset_count_rows(ds) > 0,
+           "repeat dataset read should succeed");
+    LanceObjectStoreIoStats snapshot_after = {0, 0, 0, 0};
+    ASSERT(lance_dataset_io_stats_snapshot(ds, &snapshot_after) == 0,
+           "dataset snapshot stats after read should succeed");
+    LanceObjectStoreIoStats incremental_after = {0, 0, 0, 0};
+    ASSERT(lance_dataset_io_stats_incremental(ds, &incremental_after) == 0,
+           "dataset incremental stats after read should succeed");
+    ASSERT(snapshot_after.read_iops == incremental_after.read_iops,
+           "snapshot and first incremental read must agree after reset");
+    ASSERT(snapshot_after.read_bytes == incremental_after.read_bytes,
+           "snapshot bytes and first incremental read must agree after reset");
+    lance_dataset_close(ds);
+
+    printf("OK\n");
+}
+
+
+/* Read the sorted `id` column of a dataset through the C stream API. */
+static size_t scan_sorted_ids(const LanceDataset *dataset, int32_t *out,
+                              size_t capacity) {
+    LanceScanner *scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "deep clone scan create failed");
+    struct ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0,
+           "deep clone scan stream failed");
+    size_t count = collect_ordering_ids(&stream, out, capacity);
+    lance_scanner_close(scanner);
+    return count;
+}
+
+static void expect_sorted_ids(const char *label, const LanceDataset *dataset,
+                              const int32_t *expected, size_t expected_count) {
+    int32_t actual[16];
+    size_t count = scan_sorted_ids(dataset, actual, 16);
+    ASSERT(count == expected_count, label);
+    qsort(actual, count, sizeof(int32_t), compare_int32);
+    ASSERT(memcmp(actual, expected, count * sizeof(int32_t)) == 0, label);
+}
+
+/* Build a native clone source from the nested fragment fixture: nullable
+ * struct fields, stable row ids, several fragments, a deletion, config and a
+ * scalar index. Clones then exercise NULL/version/tag/branch references. */
+static void test_dataset_deep_clone(const char *feature_uri) {
+    printf("  test_dataset_deep_clone... ");
+
+    char fixture_uri[2048];
+    char target_a[2048];
+    char target_b[2048];
+    char target_c[2048];
+    char target_d[2048];
+    ASSERT(strlen(feature_uri) + 48 < sizeof(fixture_uri),
+           "deep clone fixture uri is too long");
+    snprintf(fixture_uri, sizeof(fixture_uri), "%s.deep-clone-fixture",
+             feature_uri);
+    snprintf(target_a, sizeof(target_a), "%s.deep-clone-a", feature_uri);
+    snprintf(target_b, sizeof(target_b), "%s.deep-clone-b", feature_uri);
+    snprintf(target_c, sizeof(target_c), "%s.deep-clone-c", feature_uri);
+    snprintf(target_d, sizeof(target_d), "%s.deep-clone-d", feature_uri);
+
+    /* `feature_uri` is the read-only nested fragment fixture: two fragments,
+       six rows (ids 0, 2, 3, 10, 11, 13) after its own deletion, and no test
+       bumps its version. Re-writing it here with stable row ids and small
+       fragments yields an isolated clone source. */
+    LanceDataset *origin = lance_dataset_open(feature_uri, NULL, 0);
+    ASSERT(origin != NULL, "deep clone fixture source open failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(origin) == 6,
+           "deep clone fixture source row count mismatch");
+    LanceScanner *origin_scanner = lance_scanner_new(origin, NULL, NULL);
+    ASSERT(origin_scanner != NULL, "deep clone fixture scan create failed");
+    struct ArrowArrayStream origin_stream;
+    memset(&origin_stream, 0, sizeof(origin_stream));
+    ASSERT(lance_scanner_to_arrow_stream(origin_scanner, &origin_stream) == 0,
+           "deep clone fixture scan stream failed");
+    lance_scanner_close(origin_scanner);
+
+    /* The exported dataset schema normalizes JSON fields to LargeBinary, while
+       the scan stream carries the original Utf8/arrow.json schema. Use the
+       stream's own schema so the native write schema check matches. */
+    struct ArrowSchema origin_schema;
+    memset(&origin_schema, 0, sizeof(origin_schema));
+    ASSERT(origin_stream.get_schema(&origin_stream, &origin_schema) == 0,
+           "deep clone fixture stream schema failed");
+
+    LanceWriteParams params = {0};
+    params.max_rows_per_file = 2;
+    params.max_rows_per_group = 2;
+    params.enable_stable_row_ids = true;
+    LanceDataset *fixture = NULL;
+    CHECK_OK();
+    ASSERT(lance_dataset_write_with_params(
+               fixture_uri, &origin_schema, &origin_stream, LANCE_WRITE_CREATE,
+               &params, NULL, &fixture) == 0,
+           "deep clone fixture write failed");
+    if (origin_schema.release) origin_schema.release(&origin_schema);
+    CHECK_OK();
+    lance_dataset_close(origin);
+    ASSERT(lance_dataset_count_rows(fixture) == 6,
+           "deep clone fixture row count mismatch");
+    bool fixture_stable_ids = false;
+    ASSERT(lance_dataset_has_stable_row_ids(fixture, &fixture_stable_ids) == 0,
+           "deep clone fixture stable-row-ID inspection failed");
+    CHECK_OK();
+    ASSERT(fixture_stable_ids,
+           "deep clone fixture must keep stable row ids");
+
+    uint64_t deleted = 0;
+    ASSERT(lance_dataset_delete(fixture, "id = 0", &deleted) == 0,
+           "deep clone fixture delete failed");
+    CHECK_OK();
+    ASSERT(deleted == 1 && lance_dataset_count_rows(fixture) == 5,
+           "deep clone fixture deletion count mismatch");
+
+    const char *config_keys[1] = {"clone.owner"};
+    const char *config_values[1] = {"native-c"};
+    ASSERT(lance_dataset_update_config(fixture, config_keys, config_values, 1) == 0,
+           "deep clone fixture config update failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_create_scalar_index(fixture, "id", "deep_clone_c_id",
+                                             LANCE_SCALAR_BTREE, NULL,
+                                             false) == 0,
+           "deep clone fixture index creation failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(fixture) == 4,
+           "deep clone fixture version mismatch");
+
+    const uint64_t fixture_version = lance_dataset_version(fixture);
+
+    /* Tag and branch creation commit to the same storage. Use a separate
+       handle so the pinned fixture handle keeps its v4 snapshot. */
+    LanceDataset *ref_source = lance_dataset_open(fixture_uri, NULL, 0);
+    ASSERT(ref_source != NULL, "deep clone ref source open failed");
+    CHECK_OK();
+    LanceRef *v1 = lance_ref_version_number(1);
+    ASSERT(v1 != NULL, "deep clone version ref create failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_tag_create(ref_source, "deep-clone-c-v1", v1) == 0,
+           "deep clone fixture tag create failed");
+    CHECK_OK();
+    LanceRef *tag = lance_ref_tag("deep-clone-c-v1");
+    ASSERT(tag != NULL, "deep clone tag ref create failed");
+    CHECK_OK();
+    LanceDataset *branch =
+        lance_dataset_branch_create(ref_source, "deep-clone-c-branch", v1, NULL);
+    ASSERT(branch != NULL, "deep clone fixture branch create failed");
+    CHECK_OK();
+    lance_dataset_close(branch);
+    lance_dataset_close(ref_source);
+    LanceRef *branch_ref = lance_ref_version("deep-clone-c-branch", false, 0);
+    ASSERT(branch_ref != NULL, "deep clone branch ref create failed");
+    CHECK_OK();
+    const int32_t expected_snapshot[] = {2, 3, 10, 11, 13};
+    const int32_t expected_v1[] = {0, 2, 3, 10, 11, 13};
+
+    LanceStorageOptionsAccessor *accessor =
+        lance_storage_options_accessor_new(NULL, NULL);
+    ASSERT(accessor != NULL, "deep clone accessor create failed");
+    CHECK_OK();
+    LanceDataset *snapshot = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_a, NULL, accessor,
+                                    &snapshot) == 0,
+           "deep clone with NULL ref failed");
+    lance_storage_options_accessor_close(accessor);
+    CHECK_OK();
+    ASSERT(snapshot != NULL, "deep clone did not write the out handle");
+    ASSERT(lance_dataset_version(snapshot) == fixture_version,
+           "deep clone must preserve the cloned snapshot version");
+    ASSERT(lance_dataset_count_rows(snapshot) == 5,
+           "deep clone snapshot row count mismatch");
+    expect_sorted_ids("deep clone snapshot ids changed", snapshot,
+                      expected_snapshot, 5);
+
+    LanceDatasetConfig *config = lance_dataset_config(snapshot);
+    ASSERT(config != NULL, "deep clone target config read failed");
+    /* The legacy C write path adds the auto-cleanup policy, so the clone must
+       preserve every source key instead of a fixed count. */
+    const uint64_t config_count = lance_dataset_config_count(config);
+    ASSERT(config_count >= 1, "deep clone target config is empty");
+    bool found_owner = false;
+    for (uint64_t i = 0; i < config_count; i++) {
+        if (strcmp(lance_dataset_config_key_at(config, i), "clone.owner") == 0) {
+            ASSERT(strcmp(lance_dataset_config_value_at(config, i), "native-c") ==
+                       0,
+                   "deep clone target config value mismatch");
+            found_owner = true;
+        }
+    }
+    ASSERT(found_owner, "deep clone target lost the clone.owner config");
+    lance_dataset_config_close(config);
+    ASSERT(lance_dataset_index_count(snapshot) >= 1,
+           "deep clone target lost the scalar index");
+
+    LanceDataset *from_version = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_b, v1, NULL,
+                                    &from_version) == 0,
+           "deep clone with explicit version ref failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(from_version) == 1,
+           "deep clone version ref target version mismatch");
+    ASSERT(lance_dataset_count_rows(from_version) == 6,
+           "deep clone version ref row count mismatch");
+    expect_sorted_ids("deep clone version ref ids changed", from_version,
+                      expected_v1, 6);
+
+    LanceDataset *from_tag = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_c, tag, NULL, &from_tag) == 0,
+           "deep clone with tag ref failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(from_tag) == 6,
+           "deep clone tag ref row count mismatch");
+    expect_sorted_ids("deep clone tag ref ids changed", from_tag, expected_v1,
+                      6);
+
+    LanceDataset *from_branch = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_d, branch_ref, NULL,
+                                    &from_branch) == 0,
+           "deep clone with branch ref failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_count_rows(from_branch) == 6,
+           "deep clone branch ref row count mismatch");
+    expect_sorted_ids("deep clone branch ref ids changed", from_branch,
+                      expected_v1, 6);
+
+    /* The source handle keeps its pinned v4 snapshot while the dataset head
+       advances from a separate handle. */
+    LanceDataset *advancing = lance_dataset_open(fixture_uri, NULL, 0);
+    ASSERT(advancing != NULL, "deep clone advancing handle open failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(advancing) == fixture_version,
+           "deep clone advancing handle version mismatch");
+    deleted = 0;
+    ASSERT(lance_dataset_delete(advancing, "id = 13", &deleted) == 0,
+           "deep clone fixture second delete failed");
+    CHECK_OK();
+    ASSERT(deleted == 1 && lance_dataset_count_rows(advancing) == 4,
+           "deep clone fixture second delete count mismatch");
+    ASSERT(lance_dataset_version(advancing) == fixture_version + 1,
+           "deep clone fixture head must advance past the pinned snapshot");
+    lance_dataset_close(advancing);
+    ASSERT(lance_dataset_version(fixture) == fixture_version,
+           "deep clone source handle version changed");
+    ASSERT(lance_dataset_count_rows(snapshot) == 5,
+           "deep clone snapshot changed with the source");
+    ASSERT(lance_dataset_count_rows(fixture) == 5,
+           "deep clone source handle rows changed");
+
+    LanceDataset *sentinel = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_a, NULL, NULL, &sentinel) == -1,
+           "deep clone over an existing target must fail");
+    ASSERT(sentinel == NULL, "failed deep clone must not write the out handle");
+    expect_error(LANCE_ERR_DATASET_ALREADY_EXISTS, "deep clone existing target");
+
+    LanceRef *missing = lance_ref_tag("deep-clone-missing-tag");
+    ASSERT(missing != NULL, "deep clone missing tag ref create failed");
+    CHECK_OK();
+    sentinel = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_b, missing, NULL, &sentinel) == -1,
+           "deep clone with a missing tag must fail");
+    ASSERT(sentinel == NULL, "missing tag must not write the out handle");
+    expect_error(LANCE_ERR_NOT_FOUND, "deep clone missing tag");
+    lance_ref_close(missing);
+
+    LanceRef *bad_branch =
+        lance_ref_version("deep-clone-no-branch", false, 0);
+    ASSERT(bad_branch != NULL, "deep clone bad branch ref create failed");
+    CHECK_OK();
+    sentinel = NULL;
+    ASSERT(lance_dataset_deep_clone(fixture, target_b, bad_branch, NULL,
+                                    &sentinel) == -1,
+           "deep clone with an unknown branch must fail");
+    ASSERT(sentinel == NULL, "unknown branch must not write the out handle");
+    expect_error(LANCE_ERR_NOT_FOUND, "deep clone unknown branch");
+    lance_ref_close(bad_branch);
+
+    ASSERT(lance_dataset_deep_clone(NULL, target_b, NULL, NULL, &sentinel) == -1,
+           "deep clone with a NULL dataset must fail");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "deep clone NULL dataset");
+    ASSERT(lance_dataset_deep_clone(fixture, NULL, NULL, NULL, &sentinel) == -1,
+           "deep clone with a NULL target path must fail");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "deep clone NULL target path");
+    ASSERT(lance_dataset_deep_clone(fixture, target_b, NULL, NULL, NULL) == -1,
+           "deep clone with a NULL out slot must fail");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "deep clone NULL out slot");
+
+    lance_dataset_close(snapshot);
+    lance_dataset_close(from_version);
+    lance_dataset_close(from_tag);
+    lance_dataset_close(from_branch);
+    lance_dataset_close(fixture);
+    lance_ref_close(v1);
+    lance_ref_close(tag);
+    lance_ref_close(branch_ref);
+
+    /* Reopen the independent target with a fresh session. */
+    LanceSession *session = lance_session_new(0, 0);
+    ASSERT(session != NULL, "deep clone reopen session create failed");
+    CHECK_OK();
+    LanceDataset *reopened =
+        lance_dataset_open_with_session(target_a, NULL, 0, session);
+    ASSERT(reopened != NULL, "deep clone target reopen failed");
+    CHECK_OK();
+    ASSERT(lance_dataset_version(reopened) == fixture_version,
+           "reopened deep clone target version mismatch");
+    ASSERT(lance_dataset_count_rows(reopened) == 5,
+           "reopened deep clone target row count mismatch");
+    expect_sorted_ids("reopened deep clone target ids changed", reopened,
+                      expected_snapshot, 5);
+    lance_dataset_close(reopened);
+    lance_session_close(session);
+
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -5194,24 +8165,37 @@ int main(int argc, char **argv) {
     test_scanner_substrait_aggregate(ordering_uri, aggregate_plan_path);
     test_fragment_snapshot(fragment_uri);
     test_fragment_read_operations(fragment_read_uri);
+    test_clone_handle(fragment_read_uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_blob_native_read_slice(blob_uri);
+    test_blob_fields_and_descriptors();
+    test_blob_planned_reads(blob_uri);
+    test_managed_blob_descriptor_roundtrip(write_uri);
     test_versions(uri);
     test_native_refs_and_tags(uri);
     test_branch_lifecycle(uri);
     test_restore_to_current(uri);
     test_error_handling();
     test_index_segment_builder(uri);
+    test_create_index_operation(uri);
     test_index_segment_builder_progress(uri);
     test_vector_models_and_reusable_segments(uri);
+    test_vector_index_options_and_rq_model(uri);
     test_commit_index_segments(uri);
     test_native_scalar_indexes(uri);
+    test_index_list_json_escaping(uri);
     test_rtree_scalar_index(rtree_geometry_uri);
     test_minhash_lsh(uri);
     test_dataset_write_roundtrip(uri, write_uri);
+    test_dataset_deep_clone(fragment_uri);
     test_write_options_and_config(uri, write_uri);
+    test_native_write_options(uri, write_uri);
+    test_native_write_base_placement(uri, write_uri);
+    test_native_write_data_options(uri, write_uri);
+    test_native_write_progress_and_owners(uri, write_uri);
     test_data_statistics(write_uri);
+    test_diagnostics(uri);
     test_config_replacement(config_base_uri);
     test_base_paths_and_add(config_base_uri, alternate_base_uri);
     test_file_enumeration(config_base_uri, alternate_base_uri);
@@ -5223,6 +8207,7 @@ int main(int argc, char **argv) {
     test_alter_columns(write_uri);
     test_drop_columns(write_uri);
     test_add_columns(write_uri);
+    test_merge_and_batch_udf(write_uri);
     test_compact_files(write_uri);
     test_delete(write_uri);
 

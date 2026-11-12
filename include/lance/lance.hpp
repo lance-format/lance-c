@@ -18,6 +18,8 @@
 #include "lance/lance.h"
 
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -25,6 +27,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -52,6 +55,16 @@ inline void check_error() {
         if (msg) lance_free_string(msg);
         throw Error(code, std::move(owned));
     }
+}
+
+/// Build a portable IVF_RQ fast-rotation model as native JSON. `num_bits == 0`
+/// selects the native RQ default of 5.
+inline std::string build_rq_model(uint32_t dimension, uint32_t num_bits = 5) {
+    const char* json = lance_index_build_rq_model(dimension, num_bits);
+    if (!json) check_error();
+    std::unique_ptr<const char, void (*)(const char*)> guard(json,
+                                                             lance_free_string);
+    return std::string(json);
 }
 
 /// Release and free a library-allocated ArrowArrayStream returned by
@@ -149,12 +162,59 @@ public:
 // ─── Forward Declarations ────────────────────────────────────────────────────
 
 class Scanner;
+class Dataset;
 class Fragment;
+class FragmentOverlayWriter;
+class FragmentUpdateColumnsResult;
+class LanceSchema;
+class Batch;
+struct Table;
+class ArrowSchemaOwner;
+class ShardWriter;
+class LsmScanner;
+class ExecutionPlan;
 class IndexModel;
 class IndexSegmentBuilder;
 class IndexSegmentMetadata;
+class CompactionOptions;
+class CompactionPlan;
+class CompactionTask;
+class RewriteResult;
+class UpdatedFragmentOffsets;
+class KeyExistenceFilter;
+class RewriteGroup;
+class RewrittenIndex;
+struct UpdateOperationSpec;
+struct CompactedSsTable;
+struct BasePath;
+class OptimizeIndicesOptions;
+class OptimizeIndicesPlan;
+class OptimizeIndexTask;
+class OptimizeIndexMerge;
+class IndexSegmentResult;
+class IvfModel;
 class FtsQueryContext;
 class FtsQuery;
+class Namespace;
+class SqlQueryBuilder;
+class SqlQuery;
+class DatasetDeltaBuilder;
+class DatasetDelta;
+class StorageOptionsAccessor;
+class CommitLock;
+class Session;
+
+/// One native `BasePath` for `Dataset::add_bases` and `Operation`
+/// construction.
+///
+/// `id == 0` requests native allocation. `name == std::nullopt` maps to native
+/// `None`; an engaged empty string is an explicit empty name.
+struct BasePath {
+    uint32_t id = 0;
+    std::string path;
+    std::optional<std::string> name;
+    bool is_dataset_root = false;
+};
 
 // ─── Version history ─────────────────────────────────────────────────────────
 
@@ -487,6 +547,34 @@ struct WriteOptions {
     bool                             skip_auto_cleanup = false;
 };
 
+/// Convert the shared C++ write-option value into the C representation.
+///
+/// `cleanup` must outlive the returned value. Both the legacy write entry
+/// points and the owned native options handle use this mapping so their
+/// defaults cannot drift.
+inline LanceWriteOptions to_c_write_options(
+    const WriteOptions& options,
+    LanceAutoCleanupParams& cleanup) {
+    LanceWriteOptions c_options = {};
+    c_options.params.max_rows_per_file = options.params.max_rows_per_file;
+    c_options.params.max_rows_per_group = options.params.max_rows_per_group;
+    c_options.params.max_bytes_per_file = options.params.max_bytes_per_file;
+    c_options.params.data_storage_version =
+        options.params.data_storage_version
+            ? options.params.data_storage_version->c_str()
+            : nullptr;
+    c_options.params.enable_stable_row_ids =
+        options.params.enable_stable_row_ids;
+    c_options.skip_auto_cleanup = options.skip_auto_cleanup;
+    if (options.auto_cleanup) {
+        cleanup.interval = options.auto_cleanup->interval;
+        cleanup.older_than_seconds = options.auto_cleanup->older_than_seconds;
+        cleanup.older_than_nanos = options.auto_cleanup->older_than_nanos;
+        c_options.auto_cleanup = &cleanup;
+    }
+    return c_options;
+}
+
 /// A native duration expressed as whole seconds plus a subsecond nanosecond
 /// component. Nanoseconds must be less than 1,000,000,000.
 struct CommitDuration {
@@ -527,7 +615,539 @@ struct UncommittedWriteOptions {
         transaction_properties;
 };
 
+enum class ExternalBlobMode : int32_t {
+    Reference = LANCE_EXTERNAL_BLOB_REFERENCE,
+    Ingest    = LANCE_EXTERNAL_BLOB_INGEST,
+};
+
+/// Native current-format file-writer options for a dataset write.
+///
+/// Dataset file-version selection belongs in `WriteParams::data_storage_version`;
+/// the raw-file `version` field is intentionally absent.
+struct DatasetFileWriterOptions {
+    std::optional<uint64_t> data_cache_bytes;
+    std::optional<uint64_t> max_page_bytes;
+    std::optional<bool>     keep_original_array;
+};
+
+/// One per-base native `ObjectStoreParams` value.
+///
+/// `base_path` is the exact key used by native `WriteParams::base_store_params`.
+/// The accessor is borrowed only during `NativeWriteOptions` construction.
+struct DatasetBaseStoreParams {
+    std::string                    base_path;
+    const StorageOptionsAccessor*  storage_options_accessor = nullptr;
+    std::optional<uint64_t>        block_size;
+    std::optional<CommitDuration>  s3_credentials_refresh_offset;
+    std::optional<bool>            use_constant_size_upload_parts;
+    std::optional<bool>            list_is_lexically_ordered;
+};
+
+/// Cumulative native write statistics.
+struct NativeWriteStats {
+    uint64_t bytes_written = 0;
+    uint64_t rows_written = 0;
+    uint32_t files_written = 0;
+};
+
+/// Native fragment progress payload.
+struct FragmentWriteProgressInfo {
+    uint64_t                    fragment_id = 0;
+    std::optional<uint64_t>     physical_rows;
+    uint64_t                    file_count = 0;
+};
+
+/// C++ progress callbacks for a dataset write.
+///
+/// Fragment callbacks may throw `lance::Error` or another exception; the
+/// wrapper converts it to a native callback error. The stats callback has no
+/// native error channel, so exceptions from it are swallowed to keep the C ABI
+/// boundary sound. Callbacks may run concurrently from native worker threads.
+struct NativeWriteProgress {
+    using FragmentCallback =
+        std::function<void(const FragmentWriteProgressInfo&)>;
+    using StatsCallback = std::function<void(const NativeWriteStats&)>;
+
+    FragmentCallback begin_fragment;
+    FragmentCallback complete_fragment;
+    StatsCallback    write_stats;
+};
+
+/// Configuration for an owned `NativeWriteOptions` handle.
+struct NativeWriteOptionsSpec {
+    WriteOptions write;
+    std::optional<std::vector<std::pair<std::string, std::string>>>
+        transaction_properties;
+    std::optional<bool> enable_v2_manifest_paths;
+    std::optional<std::vector<BasePath>> initial_bases;
+    std::optional<std::vector<uint32_t>> target_bases;
+    std::optional<std::vector<std::string>> target_base_names_or_paths;
+    std::optional<bool> target_all_bases;
+    std::optional<std::vector<DatasetBaseStoreParams>> base_store_params;
+    bool allow_external_blob_outside_bases = false;
+    ExternalBlobMode external_blob_mode = ExternalBlobMode::Reference;
+    std::optional<uint64_t> blob_pack_file_size_threshold;
+    std::optional<DatasetFileWriterOptions> file_writer_options;
+    const Session* session = nullptr;
+    const StorageOptionsAccessor* storage_options_accessor = nullptr;
+    const CommitLock* commit_lock = nullptr;
+    NativeWriteProgress progress;
+};
+
+/// Owned native-backed dataset write options. Move-only.
+///
+/// The handle copies or clones every value from `NativeWriteOptionsSpec`.
+/// Source Session, accessor and commit-lock wrappers may be destroyed after
+/// construction. Destroy this object only after all writes that borrowed it
+/// have returned; callback captures are released from the destructor.
+class NativeWriteOptions {
+    Handle<LanceNativeWriteOptions, lance_native_write_options_close> handle_;
+
+public:
+    explicit NativeWriteOptions(const NativeWriteOptionsSpec& spec);
+
+    NativeWriteOptions(NativeWriteOptions&&) noexcept = default;
+    NativeWriteOptions& operator=(NativeWriteOptions&&) noexcept = default;
+    NativeWriteOptions(const NativeWriteOptions&) = delete;
+    NativeWriteOptions& operator=(const NativeWriteOptions&) = delete;
+
+    const LanceNativeWriteOptions* c_handle() const { return handle_.get(); }
+};
+
+/// Options for native fragment creation.
+///
+/// `schema == nullptr` leaves native schema inference in place; in Append mode
+/// native inference may reuse the existing dataset's schema and field IDs. A
+/// non-null schema is borrowed for the call and cloned by the C API before the
+/// asynchronous write starts. `write` maps through the same native option
+/// conversion as `Dataset::write_with_options`, so a default-constructed value
+/// selects native `WriteParams::default()`.
+struct FragmentCreateOptions {
+    const LanceSchema* schema = nullptr;
+    WriteMode          mode = WriteMode::Create;
+    WriteOptions       write;
+};
+
 // ─── Native transactions ─────────────────────────────────────────────────────
+
+/// Owned native `DataFile` metadata snapshot. Move-only.
+class DataFile {
+    Handle<LanceDataFile, lance_data_file_close> handle_;
+
+public:
+    explicit DataFile(LanceDataFile* file) : handle_(file) {}
+
+    DataFile(DataFile&&) noexcept = default;
+    DataFile& operator=(DataFile&&) noexcept = default;
+    DataFile(const DataFile&) = delete;
+    DataFile& operator=(const DataFile&) = delete;
+
+    /// Native data-file path relative to its selected data directory.
+    std::string path() const {
+        const char* path = lance_data_file_path(handle_.get());
+        if (!path) check_error();
+        return path;
+    }
+
+    /// Native field IDs in stored order.
+    std::vector<int32_t> fields() const {
+        size_t count = lance_data_file_field_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<int32_t> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            int32_t field_id = 0;
+            if (lance_data_file_field_id_at(
+                    handle_.get(), i, &field_id) != 0) {
+                check_error();
+            }
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Native column indices in stored order, including the `-1` marker.
+    std::vector<int32_t> column_indices() const {
+        size_t count = lance_data_file_column_index_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<int32_t> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            int32_t column_index = 0;
+            if (lance_data_file_column_index_at(
+                    handle_.get(), i, &column_index) != 0) {
+                check_error();
+            }
+            out.push_back(column_index);
+        }
+        return out;
+    }
+
+    /// Native major/minor data-file format version.
+    std::pair<uint32_t, uint32_t> file_version() const {
+        uint32_t major = 0;
+        uint32_t minor = 0;
+        if (lance_data_file_file_version(
+                handle_.get(), &major, &minor) != 0) {
+            check_error();
+        }
+        return {major, minor};
+    }
+
+    /// Native optional file size in bytes.
+    std::optional<uint64_t> file_size() const {
+        bool present = false;
+        uint64_t size = 0;
+        if (lance_data_file_file_size(
+                handle_.get(), &present, &size) != 0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return size;
+    }
+
+    /// Native optional base path ID.
+    std::optional<uint32_t> base_id() const {
+        bool present = false;
+        uint32_t base_id = 0;
+        if (lance_data_file_base_id(
+                handle_.get(), &present, &base_id) != 0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return base_id;
+    }
+
+    /// Clone this snapshot into an independently owned handle.
+    DataFile clone() const {
+        auto* raw = lance_data_file_clone(handle_.get());
+        if (!raw) check_error();
+        return DataFile(raw);
+    }
+
+    const LanceDataFile* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native `DataReplacementGroup` snapshot. Move-only.
+class DataReplacementGroup {
+    Handle<LanceDataReplacementGroup, lance_data_replacement_group_close>
+        handle_;
+
+public:
+    explicit DataReplacementGroup(LanceDataReplacementGroup* group)
+        : handle_(group) {}
+
+    /// Construct a group by cloning `file` into native metadata.
+    DataReplacementGroup(uint64_t fragment_id, const DataFile& file)
+        : handle_(nullptr) {
+        auto* raw =
+            lance_data_replacement_group_new(fragment_id, file.c_handle());
+        if (!raw) check_error();
+        handle_ =
+            Handle<LanceDataReplacementGroup, lance_data_replacement_group_close>(
+                raw);
+    }
+
+    DataReplacementGroup(DataReplacementGroup&&) noexcept = default;
+    DataReplacementGroup& operator=(DataReplacementGroup&&) noexcept = default;
+    DataReplacementGroup(const DataReplacementGroup&) = delete;
+    DataReplacementGroup& operator=(const DataReplacementGroup&) = delete;
+
+    uint64_t fragment_id() const {
+        uint64_t id = lance_data_replacement_group_fragment_id(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return id;
+    }
+
+    DataFile file() const {
+        LanceDataFile* file = nullptr;
+        if (lance_data_replacement_group_file(handle_.get(), &file) != 0) {
+            check_error();
+        }
+        return DataFile(file);
+    }
+
+    /// Clone this snapshot into an independently owned handle.
+    DataReplacementGroup clone() const {
+        auto* raw = lance_data_replacement_group_clone(handle_.get());
+        if (!raw) check_error();
+        return DataReplacementGroup(raw);
+    }
+
+    const LanceDataReplacementGroup* c_handle() const {
+        return handle_.get();
+    }
+};
+
+/// Owned native `UpdateMap` snapshot. Move-only.
+///
+/// Entries are an ordered list, not a hash map: duplicate keys, order and
+/// absent values are native data. `replace == true` makes native commit code
+/// clear the target and insert only entries with values; `replace == false`
+/// upserts values and removes keys whose value is `std::nullopt`.
+class UpdateMap {
+    Handle<LanceUpdateMap, lance_update_map_close> handle_;
+
+public:
+    explicit UpdateMap(LanceUpdateMap* map) : handle_(map) {}
+
+    /// Construct from parallel key/value lists. Every key is required; a
+    /// `std::nullopt` value is a native `None` entry. Duplicate keys and input
+    /// order are preserved.
+    UpdateMap(const std::vector<std::string>& keys,
+              const std::vector<std::optional<std::string>>& values,
+              bool replace)
+        : handle_(nullptr) {
+        if (keys.size() != values.size()) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "UpdateMap keys and values must have the same length");
+        }
+        std::vector<const char*> key_ptrs;
+        std::vector<const char*> value_ptrs;
+        key_ptrs.reserve(keys.size());
+        value_ptrs.reserve(values.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            key_ptrs.push_back(keys[i].c_str());
+            value_ptrs.push_back(values[i] ? values[i]->c_str() : nullptr);
+        }
+        auto* raw = lance_update_map_new(
+            key_ptrs.empty() ? nullptr : key_ptrs.data(),
+            value_ptrs.empty() ? nullptr : value_ptrs.data(), keys.size(),
+            replace);
+        if (!raw) check_error();
+        handle_ = Handle<LanceUpdateMap, lance_update_map_close>(raw);
+    }
+
+    UpdateMap(UpdateMap&&) noexcept = default;
+    UpdateMap& operator=(UpdateMap&&) noexcept = default;
+    UpdateMap(const UpdateMap&) = delete;
+    UpdateMap& operator=(const UpdateMap&) = delete;
+
+    size_t count() const {
+        size_t count = lance_update_map_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    std::string key_at(size_t index) const {
+        const char* key = lance_update_map_key_at(handle_.get(), index);
+        if (!key) check_error();
+        return std::string(key);
+    }
+
+    std::optional<std::string> value_at(size_t index) const {
+        bool present = false;
+        const char* value = nullptr;
+        if (lance_update_map_value_at(handle_.get(), index, &present, &value) !=
+            0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return std::string(value);
+    }
+
+    bool replace() const {
+        bool replace = lance_update_map_replace(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return replace;
+    }
+
+    /// Clone this snapshot into an independently owned handle.
+    UpdateMap clone() const {
+        auto* raw = lance_update_map_clone(handle_.get());
+        if (!raw) check_error();
+        return UpdateMap(raw);
+    }
+
+    const LanceUpdateMap* c_handle() const { return handle_.get(); }
+};
+
+/// Options for Operation::make_update_config.
+///
+/// A disengaged optional maps to native `None`; an engaged empty `UpdateMap`
+/// maps to native `Some(empty)`. Duplicate field IDs follow native `HashMap`
+/// last-write-wins semantics where the last complete map wins.
+struct UpdateConfigOptions {
+    std::optional<UpdateMap> config_updates;
+    std::optional<UpdateMap> table_metadata_updates;
+    std::optional<UpdateMap> schema_metadata_updates;
+    std::map<int32_t, UpdateMap> field_metadata_updates;
+};
+
+/// Coverage layout of a native data overlay value.
+enum class OverlayCoverageKind : int32_t {
+    Shared = LANCE_DATA_OVERLAY_COVERAGE_SHARED,
+    PerField = LANCE_DATA_OVERLAY_COVERAGE_PER_FIELD,
+};
+
+/// Owned native `DataOverlayFile` snapshot. Move-only.
+///
+/// Coverage is supplied as portable 32-bit Roaring bitmap bytes. Shared
+/// coverage takes exactly one bitmap; per-field coverage takes one bitmap per
+/// `data_file.fields` entry, in order.
+class DataOverlayFile {
+    Handle<LanceDataOverlayFile, lance_data_overlay_file_close> handle_;
+
+public:
+    explicit DataOverlayFile(LanceDataOverlayFile* file) : handle_(file) {}
+
+    DataOverlayFile(const DataFile& data_file,
+                    OverlayCoverageKind coverage_kind,
+                    const std::vector<std::vector<uint8_t>>& bitmaps,
+                    uint64_t committed_version = 0)
+        : handle_(nullptr) {
+        std::vector<const uint8_t*> pointers;
+        std::vector<size_t> lengths;
+        pointers.reserve(bitmaps.size());
+        lengths.reserve(bitmaps.size());
+        for (const auto& bitmap : bitmaps) {
+            pointers.push_back(bitmap.empty() ? nullptr : bitmap.data());
+            lengths.push_back(bitmap.size());
+        }
+        auto* raw = lance_data_overlay_file_new(
+            data_file.c_handle(), static_cast<int32_t>(coverage_kind),
+            pointers.empty() ? nullptr : pointers.data(),
+            lengths.empty() ? nullptr : lengths.data(), bitmaps.size(),
+            committed_version);
+        if (!raw) check_error();
+        handle_ = Handle<LanceDataOverlayFile, lance_data_overlay_file_close>(
+            raw);
+    }
+
+    DataOverlayFile(DataOverlayFile&&) noexcept = default;
+    DataOverlayFile& operator=(DataOverlayFile&&) noexcept = default;
+    DataOverlayFile(const DataOverlayFile&) = delete;
+    DataOverlayFile& operator=(const DataOverlayFile&) = delete;
+
+    /// Complete native data-file metadata owned by the overlay.
+    DataFile data_file() const {
+        LanceDataFile* file = lance_data_overlay_file_data_file(handle_.get());
+        if (!file) check_error();
+        return DataFile(file);
+    }
+
+    OverlayCoverageKind coverage_kind() const {
+        int32_t kind = 0;
+        if (lance_data_overlay_file_coverage_kind(
+                handle_.get(), &kind) != 0) {
+            check_error();
+        }
+        return static_cast<OverlayCoverageKind>(kind);
+    }
+
+    /// Number of coverage bitmaps: 1 for shared, field count for per-field.
+    uint64_t bitmap_count() const {
+        uint64_t count = 0;
+        if (lance_data_overlay_file_bitmap_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Copy one portable Roaring coverage bitmap into owned bytes.
+    std::vector<uint8_t> bitmap_at(size_t index) const {
+        uint8_t* bytes = nullptr;
+        size_t len = 0;
+        if (lance_data_overlay_file_bitmap_at(
+                handle_.get(), index, &bytes, &len) != 0) {
+            check_error();
+        }
+        std::vector<uint8_t> out;
+        if (len != 0) out.assign(bytes, bytes + len);
+        if (bytes) lance_free_bytes(bytes);
+        return out;
+    }
+
+    /// Native committed-version stamp. Zero is the pre-commit placeholder.
+    uint64_t committed_version() const {
+        uint64_t version = 0;
+        if (lance_data_overlay_file_committed_version(
+                handle_.get(), &version) != 0) {
+            check_error();
+        }
+        return version;
+    }
+
+    /// Clone this snapshot into an independently owned handle.
+    DataOverlayFile clone() const {
+        auto* raw = lance_data_overlay_file_clone(handle_.get());
+        if (!raw) check_error();
+        return DataOverlayFile(raw);
+    }
+
+    const LanceDataOverlayFile* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native `DataOverlayGroup` snapshot. Move-only.
+class DataOverlayGroup {
+    Handle<LanceDataOverlayGroup, lance_data_overlay_group_close> handle_;
+
+public:
+    explicit DataOverlayGroup(LanceDataOverlayGroup* group) : handle_(group) {}
+
+    /// Construct a group by cloning the given overlay values in order.
+    DataOverlayGroup(uint64_t fragment_id,
+                     const std::vector<const DataOverlayFile*>& overlays)
+        : handle_(nullptr) {
+        std::vector<const LanceDataOverlayFile*> handles;
+        handles.reserve(overlays.size());
+        for (const auto* overlay : overlays) {
+            if (!overlay) {
+                throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                            "data overlay file must not be null");
+            }
+            handles.push_back(overlay->c_handle());
+        }
+        auto* raw = lance_data_overlay_group_new(
+            fragment_id, handles.empty() ? nullptr : handles.data(),
+            handles.size());
+        if (!raw) check_error();
+        handle_ = Handle<LanceDataOverlayGroup, lance_data_overlay_group_close>(
+            raw);
+    }
+
+    DataOverlayGroup(DataOverlayGroup&&) noexcept = default;
+    DataOverlayGroup& operator=(DataOverlayGroup&&) noexcept = default;
+    DataOverlayGroup(const DataOverlayGroup&) = delete;
+    DataOverlayGroup& operator=(const DataOverlayGroup&) = delete;
+
+    uint64_t fragment_id() const {
+        uint64_t id = 0;
+        if (lance_data_overlay_group_fragment_id(handle_.get(), &id) != 0) {
+            check_error();
+        }
+        return id;
+    }
+
+    uint64_t overlay_count() const {
+        uint64_t count = 0;
+        if (lance_data_overlay_group_overlay_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one overlay into an independent owned value.
+    DataOverlayFile overlay_at(size_t index) const {
+        LanceDataOverlayFile* overlay = nullptr;
+        if (lance_data_overlay_group_overlay_at(
+                handle_.get(), index, &overlay) != 0) {
+            check_error();
+        }
+        return DataOverlayFile(overlay);
+    }
+
+    /// Clone this snapshot into an independently owned handle.
+    DataOverlayGroup clone() const {
+        auto* raw = lance_data_overlay_group_clone(handle_.get());
+        if (!raw) check_error();
+        return DataOverlayGroup(raw);
+    }
+
+    const LanceDataOverlayGroup* c_handle() const { return handle_.get(); }
+};
 
 enum class OperationKind : int32_t {
     Unknown             = LANCE_OPERATION_UNKNOWN,
@@ -547,6 +1167,394 @@ enum class OperationKind : int32_t {
     UpdateMemWalState   = LANCE_OPERATION_UPDATE_MEM_WAL_STATE,
     Clone               = LANCE_OPERATION_CLONE,
     UpdateBases         = LANCE_OPERATION_UPDATE_BASES,
+};
+
+// ─── Native update and rewrite values ───────────────────────────────────────
+
+/// Native update mode of an Update operation.
+enum class UpdateMode : int32_t {
+    RewriteRows    = LANCE_UPDATE_MODE_REWRITE_ROWS,
+    RewriteColumns = LANCE_UPDATE_MODE_REWRITE_COLUMNS,
+};
+
+/// One index file recorded by a rewritten index.
+struct IndexFile {
+    std::string path;
+    uint64_t size_bytes = 0;
+};
+
+/// Bloom-filter parameters of a key-existence filter.
+struct BloomFilterValues {
+    std::vector<uint8_t> bitmap;
+    uint32_t num_bits = 0;
+    uint64_t number_of_items = 0;
+    double probability = 0.0;
+};
+
+/// Owned native `UpdatedFragmentOffsets` value. Move-only.
+///
+/// Native absent, present-but-empty, and populated values are distinct and are
+/// preserved here. Offsets are treated as sets, and a repeated fragment ID in
+/// the constructor input keeps the last entry, matching native `HashMap`
+/// representation.
+class UpdatedFragmentOffsets {
+    Handle<LanceUpdatedFragmentOffsets,
+           lance_updated_fragment_offsets_close>
+        handle_;
+
+public:
+    explicit UpdatedFragmentOffsets(LanceUpdatedFragmentOffsets* offsets)
+        : handle_(offsets) {}
+
+    /// Build from (fragment ID, offsets) entries in input order.
+    explicit UpdatedFragmentOffsets(
+        const std::vector<std::pair<uint64_t, std::vector<uint32_t>>>& entries)
+        : handle_(nullptr) {
+        std::vector<::LanceFragmentOffsetsView> views;
+        views.reserve(entries.size());
+        for (const auto& entry : entries) {
+            ::LanceFragmentOffsetsView view{};
+            view.fragment_id = entry.first;
+            view.offsets = entry.second.empty() ? nullptr
+                                                : entry.second.data();
+            view.offset_count = entry.second.size();
+            views.push_back(view);
+        }
+        auto* raw = lance_updated_fragment_offsets_new(
+            views.empty() ? nullptr : views.data(), views.size());
+        if (!raw) check_error();
+        handle_ =
+            Handle<LanceUpdatedFragmentOffsets,
+                   lance_updated_fragment_offsets_close>(raw);
+    }
+
+    UpdatedFragmentOffsets(UpdatedFragmentOffsets&&) noexcept = default;
+    UpdatedFragmentOffsets& operator=(UpdatedFragmentOffsets&&) noexcept =
+        default;
+    UpdatedFragmentOffsets(const UpdatedFragmentOffsets&) = delete;
+    UpdatedFragmentOffsets& operator=(const UpdatedFragmentOffsets&) = delete;
+
+    /// Number of fragment entries. Entry order is unspecified.
+    size_t size() const {
+        uint64_t count = 0;
+        if (lance_updated_fragment_offsets_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return static_cast<size_t>(count);
+    }
+
+    uint64_t fragment_id_at(size_t index) const {
+        uint64_t id = 0;
+        if (lance_updated_fragment_offsets_fragment_id_at(
+                handle_.get(), index, &id) != 0) {
+            check_error();
+        }
+        return id;
+    }
+
+    size_t offset_count_at(size_t index) const {
+        uint64_t count = 0;
+        if (lance_updated_fragment_offsets_offset_count_at(
+                handle_.get(), index, &count) != 0) {
+            check_error();
+        }
+        return static_cast<size_t>(count);
+    }
+
+    /// Offsets of one entry in ascending native bitmap order, copied in one pass.
+    std::vector<uint32_t> offsets_at(size_t index) const {
+        std::vector<uint32_t> out;
+        const size_t count = offset_count_at(index);
+        if (count > out.max_size()) {
+            throw std::length_error(
+                "updated fragment offset count exceeds vector max_size");
+        }
+        out.resize(count);
+        if (lance_updated_fragment_offsets_copy_at(
+                handle_.get(), index, out.data(), out.size()) != 0) {
+            check_error();
+        }
+        return out;
+    }
+
+    /// Clone into independently owned native storage.
+    UpdatedFragmentOffsets clone() const {
+        auto* raw = lance_updated_fragment_offsets_clone(handle_.get());
+        if (!raw) check_error();
+        return UpdatedFragmentOffsets(raw);
+    }
+
+    const LanceUpdatedFragmentOffsets* c_handle() const {
+        return handle_.get();
+    }
+};
+
+/// Owned native key-existence filter. Move-only.
+///
+/// Values built from explicit protobuf bytes follow the native `TryFrom`
+/// defaults: an absent bloom `number_of_items` becomes 8192, an absent bloom
+/// `probability` becomes 0.00057, and an absent filter body becomes an empty
+/// exact set.
+class KeyExistenceFilter {
+    Handle<LanceKeyExistenceFilter, lance_key_existence_filter_close> handle_;
+
+public:
+    explicit KeyExistenceFilter(LanceKeyExistenceFilter* filter)
+        : handle_(filter) {}
+
+    KeyExistenceFilter(KeyExistenceFilter&&) noexcept = default;
+    KeyExistenceFilter& operator=(KeyExistenceFilter&&) noexcept = default;
+    KeyExistenceFilter(const KeyExistenceFilter&) = delete;
+    KeyExistenceFilter& operator=(const KeyExistenceFilter&) = delete;
+
+    /// Decode one encoded native key-existence-filter message.
+    static KeyExistenceFilter from_proto(const std::vector<uint8_t>& bytes) {
+        LanceKeyExistenceFilter* filter = nullptr;
+        if (lance_key_existence_filter_from_proto(
+                bytes.empty() ? nullptr : bytes.data(), bytes.size(),
+                &filter) != 0) {
+            check_error();
+        }
+        return KeyExistenceFilter(filter);
+    }
+
+    LanceKeyExistenceFilterKind kind() const {
+        LanceKeyExistenceFilterKind kind = LANCE_KEY_EXISTENCE_FILTER_EXACT;
+        if (lance_key_existence_filter_kind(handle_.get(), &kind) != 0) {
+            check_error();
+        }
+        return kind;
+    }
+
+    std::vector<int32_t> field_ids() const {
+        uint64_t count = 0;
+        if (lance_key_existence_filter_field_id_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::vector<int32_t> out;
+        out.reserve(static_cast<size_t>(count));
+        for (size_t index = 0; index < count; ++index) {
+            int32_t field_id = 0;
+            if (lance_key_existence_filter_field_id_at(
+                    handle_.get(), index, &field_id) != 0) {
+                check_error();
+            }
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Keys of an exact-set filter in ascending order. Throws
+    /// LANCE_ERR_NOT_SUPPORTED for a bloom filter.
+    std::vector<uint64_t> exact_keys() const {
+        uint64_t count = 0;
+        if (lance_key_existence_filter_exact_count(handle_.get(), &count) !=
+            0) {
+            check_error();
+        }
+        std::vector<uint64_t> out;
+        out.reserve(static_cast<size_t>(count));
+        for (size_t index = 0; index < count; ++index) {
+            uint64_t key = 0;
+            if (lance_key_existence_filter_exact_key_at(
+                    handle_.get(), index, &key) != 0) {
+                check_error();
+            }
+            out.push_back(key);
+        }
+        return out;
+    }
+
+    /// Bloom parameters. Throws LANCE_ERR_NOT_SUPPORTED for an exact set.
+    BloomFilterValues bloom() const {
+        uint8_t* bitmap = nullptr;
+        size_t bitmap_len = 0;
+        BloomFilterValues out;
+        if (lance_key_existence_filter_bloom(
+                handle_.get(), &bitmap, &bitmap_len, &out.num_bits,
+                &out.number_of_items, &out.probability) != 0) {
+            check_error();
+        }
+        if (bitmap) {
+            out.bitmap.assign(bitmap, bitmap + bitmap_len);
+            lance_free_bytes(bitmap);
+        }
+        return out;
+    }
+
+    /// Encode with the native protobuf conversion used by persisted Update
+    /// operations.
+    std::vector<uint8_t> to_proto() const {
+        uint8_t* bytes = nullptr;
+        size_t len = 0;
+        if (lance_key_existence_filter_to_proto(
+                handle_.get(), &bytes, &len) != 0) {
+            check_error();
+        }
+        std::vector<uint8_t> out;
+        if (bytes) {
+            out.assign(bytes, bytes + len);
+            lance_free_bytes(bytes);
+        }
+        return out;
+    }
+
+    /// Clone into independently owned native storage.
+    KeyExistenceFilter clone() const {
+        auto* raw = lance_key_existence_filter_clone(handle_.get());
+        if (!raw) check_error();
+        return KeyExistenceFilter(raw);
+    }
+
+    const LanceKeyExistenceFilter* c_handle() const {
+        return handle_.get();
+    }
+};
+
+/// Owned native `RewriteGroup`. Move-only.
+///
+/// Native equality treats both fragment lists as unordered; this wrapper keeps
+/// the stored order unchanged.
+class RewriteGroup {
+    Handle<LanceRewriteGroup, lance_rewrite_group_close> handle_;
+
+public:
+    explicit RewriteGroup(LanceRewriteGroup* group) : handle_(group) {}
+
+    /// Build from borrowed fragment handles. Complete native fragment metadata
+    /// is copied.
+    RewriteGroup(const std::vector<const Fragment*>& old_fragments,
+                 const std::vector<const Fragment*>& new_fragments);
+
+    RewriteGroup(RewriteGroup&&) noexcept = default;
+    RewriteGroup& operator=(RewriteGroup&&) noexcept = default;
+    RewriteGroup(const RewriteGroup&) = delete;
+    RewriteGroup& operator=(const RewriteGroup&) = delete;
+
+    size_t old_fragment_count() const;
+    Fragment old_fragment_at(size_t index) const;
+    std::vector<Fragment> old_fragments() const;
+    size_t new_fragment_count() const;
+    Fragment new_fragment_at(size_t index) const;
+    std::vector<Fragment> new_fragments() const;
+
+    /// Clone into independently owned native storage.
+    RewriteGroup clone() const {
+        auto* raw = lance_rewrite_group_clone(handle_.get());
+        if (!raw) check_error();
+        return RewriteGroup(raw);
+    }
+
+    const LanceRewriteGroup* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native `RewrittenIndex`. Move-only.
+class RewrittenIndex {
+    Handle<LanceRewrittenIndex, lance_rewritten_index_close> handle_;
+
+public:
+    explicit RewrittenIndex(LanceRewrittenIndex* index) : handle_(index) {}
+
+    /// Build one rewritten-index record. `index_files == std::nullopt` maps to
+    /// native None, while an engaged empty vector is the distinct
+    /// `Some(empty)` state older writers persisted.
+    RewrittenIndex(const std::array<uint8_t, 16>& old_id,
+                   const std::array<uint8_t, 16>& new_id,
+                   std::string_view details_type_url,
+                   const std::vector<uint8_t>& details_value,
+                   uint32_t index_version,
+                   std::optional<std::vector<IndexFile>> index_files);
+
+    RewrittenIndex(RewrittenIndex&&) noexcept = default;
+    RewrittenIndex& operator=(RewrittenIndex&&) noexcept = default;
+    RewrittenIndex(const RewrittenIndex&) = delete;
+    RewrittenIndex& operator=(const RewrittenIndex&) = delete;
+
+    std::array<uint8_t, 16> old_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_rewritten_index_old_id(handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    std::array<uint8_t, 16> new_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_rewritten_index_new_id(handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    std::string details_type_url() const {
+        const char* raw = lance_rewritten_index_details_type_url(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    std::vector<uint8_t> details_value() const {
+        uint8_t* bytes = nullptr;
+        size_t len = 0;
+        if (lance_rewritten_index_details_value(
+                handle_.get(), &bytes, &len) != 0) {
+            check_error();
+        }
+        std::vector<uint8_t> out;
+        if (bytes) {
+            out.assign(bytes, bytes + len);
+            lance_free_bytes(bytes);
+        }
+        return out;
+    }
+
+    uint32_t version() const {
+        uint32_t version = 0;
+        if (lance_rewritten_index_version(handle_.get(), &version) != 0)
+            check_error();
+        return version;
+    }
+
+    bool has_files() const {
+        bool present = false;
+        if (lance_rewritten_index_has_files(handle_.get(), &present) != 0)
+            check_error();
+        return present;
+    }
+
+    /// Index files. Returns an empty vector both for native None and
+    /// Some(empty); use has_files() to tell them apart.
+    std::vector<IndexFile> files() const {
+        uint64_t count = 0;
+        if (lance_rewritten_index_file_count(handle_.get(), &count) != 0)
+            check_error();
+        std::vector<IndexFile> out;
+        out.reserve(static_cast<size_t>(count));
+        for (size_t index = 0; index < count; ++index) {
+            const char* path =
+                lance_rewritten_index_file_path_at(handle_.get(), index);
+            if (!path) check_error();
+            IndexFile file;
+            file.path.assign(path);
+            lance_free_string(path);
+            if (lance_rewritten_index_file_size_at(
+                    handle_.get(), index, &file.size_bytes) != 0) {
+                check_error();
+            }
+            out.push_back(std::move(file));
+        }
+        return out;
+    }
+
+    /// Clone into independently owned native storage.
+    RewrittenIndex clone() const {
+        auto* raw = lance_rewritten_index_clone(handle_.get());
+        if (!raw) check_error();
+        return RewrittenIndex(raw);
+    }
+
+    const LanceRewrittenIndex* c_handle() const { return handle_.get(); }
 };
 
 /// Owned native Operation snapshot. Move-only; closing the source Transaction
@@ -578,6 +1586,366 @@ public:
         return count;
     }
 
+    /// Native `preserves_nullability` assertion from a Merge or Project
+    /// operation. Other kinds throw LANCE_ERR_NOT_SUPPORTED.
+    bool preserves_nullability() const {
+        bool value = false;
+        if (lance_operation_preserves_nullability(
+                handle_.get(), &value) != 0) {
+            check_error();
+        }
+        return value;
+    }
+
+    /// Number of fragments in an Append operation.
+    uint64_t append_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_append_fragment_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one Append fragment as an independent detached fragment.
+    Fragment append_fragment_at(size_t index) const;
+
+    /// Target version of a Restore operation.
+    uint64_t restore_version() const {
+        uint64_t version = 0;
+        if (lance_operation_restore_version(handle_.get(), &version) != 0) {
+            check_error();
+        }
+        return version;
+    }
+
+    /// Reserved fragment count of a ReserveFragments operation.
+    uint32_t reserve_fragments_count() const {
+        uint32_t count = 0;
+        if (lance_operation_reserve_fragments_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Number of new base paths in an UpdateBases operation.
+    uint64_t update_bases_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_bases_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Borrowed new base path from an UpdateBases operation. The strings
+    /// remain valid until this operation handle is closed.
+    LanceBasePathView update_bases_at(size_t index) const {
+        LanceBasePathView base{};
+        if (lance_operation_update_bases_at(handle_.get(), index, &base) != 0) {
+            check_error();
+        }
+        return base;
+    }
+
+    /// New base paths cloned from an UpdateBases operation.
+    std::vector<BasePath> update_bases() const;
+
+    /// Number of fragments in an Overwrite operation.
+    uint64_t overwrite_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_overwrite_fragment_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one Overwrite fragment as an independent detached fragment.
+    Fragment overwrite_fragment_at(size_t index) const;
+
+    /// Clone the in-memory schema of an Overwrite operation.
+    LanceSchema overwrite_schema() const;
+
+    /// Whether the Overwrite operation carries native `Some` config upserts.
+    /// `Some(empty)` is distinct from `None`.
+    bool has_config_upsert_values() const {
+        bool present = false;
+        if (lance_operation_overwrite_has_config_upsert_values(
+                handle_.get(), &present) != 0) {
+            check_error();
+        }
+        return present;
+    }
+
+    /// Number of config upsert entries. Native `None` reports 0.
+    uint64_t config_upsert_count() const {
+        uint64_t count = 0;
+        if (lance_operation_overwrite_config_upsert_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Borrowed config upsert key by native iteration position.
+    std::string config_upsert_key_at(size_t index) const {
+        const char* key = lance_operation_overwrite_config_upsert_key_at(
+            handle_.get(), index);
+        if (!key) check_error();
+        return std::string(key);
+    }
+
+    /// Borrowed config upsert value by native iteration position.
+    std::string config_upsert_value_at(size_t index) const {
+        const char* value = lance_operation_overwrite_config_upsert_value_at(
+            handle_.get(), index);
+        if (!value) check_error();
+        return std::string(value);
+    }
+
+    /// Whether the Overwrite operation carries native `Some` initial bases.
+    /// `Some(empty)` is distinct from `None`.
+    bool has_initial_bases() const {
+        bool present = false;
+        if (lance_operation_overwrite_has_initial_bases(
+                handle_.get(), &present) != 0) {
+            check_error();
+        }
+        return present;
+    }
+
+    /// Number of initial base paths. Native `None` reports 0.
+    uint64_t initial_base_count() const {
+        uint64_t count = 0;
+        if (lance_operation_overwrite_initial_base_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Borrowed initial base path from an Overwrite operation. The strings
+    /// remain valid until this operation handle is closed.
+    LanceBasePathView initial_base_at(size_t index) const {
+        LanceBasePathView base{};
+        if (lance_operation_overwrite_initial_base_at(
+                handle_.get(), index, &base) != 0) {
+            check_error();
+        }
+        return base;
+    }
+
+    /// Initial base paths cloned from an Overwrite operation.
+    std::vector<BasePath> initial_bases() const {
+        std::vector<BasePath> out;
+        const uint64_t count = initial_base_count();
+        out.reserve(static_cast<size_t>(count));
+        for (uint64_t i = 0; i < count; ++i) {
+            LanceBasePathView view = initial_base_at(static_cast<size_t>(i));
+            BasePath base;
+            base.id = view.id;
+            base.path = view.path ? view.path : "";
+            base.name = view.name ? std::optional<std::string>(view.name)
+                                  : std::nullopt;
+            base.is_dataset_root = view.is_dataset_root;
+            out.push_back(std::move(base));
+        }
+        return out;
+    }
+
+    /// Number of fragments in a Merge operation.
+    uint64_t merge_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_merge_fragment_count(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one Merge fragment as an independent detached fragment.
+    Fragment merge_fragment_at(size_t index) const;
+
+    /// Clone the in-memory schema of a Merge operation.
+    LanceSchema merge_schema() const;
+
+    /// Native `preserves_nullability` assertion from a Merge operation.
+    bool merge_preserves_nullability() const {
+        bool value = false;
+        if (lance_operation_merge_preserves_nullability(
+                handle_.get(), &value) != 0) {
+            check_error();
+        }
+        return value;
+    }
+
+    /// Clone the in-memory schema of a Project operation.
+    LanceSchema project_schema() const;
+
+    /// Shallow-clone flag of a Clone operation.
+    bool clone_is_shallow() const {
+        bool value = false;
+        if (lance_operation_clone_is_shallow(handle_.get(), &value) != 0) {
+            check_error();
+        }
+        return value;
+    }
+
+    /// Optional native reference name of a Clone operation.
+    std::optional<std::string> clone_ref_name() const {
+        bool present = false;
+        const char* value = nullptr;
+        if (lance_operation_clone_ref_name(
+                handle_.get(), &present, &value) != 0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return std::string(value);
+    }
+
+    /// Native reference version of a Clone operation.
+    uint64_t clone_ref_version() const {
+        uint64_t version = 0;
+        if (lance_operation_clone_ref_version(handle_.get(), &version) != 0) {
+            check_error();
+        }
+        return version;
+    }
+
+    /// Borrowed native reference path of a Clone operation.
+    std::string clone_ref_path() const {
+        const char* path = lance_operation_clone_ref_path(handle_.get());
+        if (!path) check_error();
+        return std::string(path);
+    }
+
+    /// Optional native branch name of a Clone operation.
+    std::optional<std::string> clone_branch_name() const {
+        bool present = false;
+        const char* value = nullptr;
+        if (lance_operation_clone_branch_name(
+                handle_.get(), &present, &value) != 0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return std::string(value);
+    }
+
+    /// Optional native config updates map from an UpdateConfig operation.
+    std::optional<UpdateMap> config_updates() const {
+        LanceUpdateMap* map = nullptr;
+        if (lance_operation_update_config_config_updates(
+                handle_.get(), &map) != 0) {
+            check_error();
+        }
+        if (!map) return std::nullopt;
+        return UpdateMap(map);
+    }
+
+    /// Optional native table metadata updates map.
+    std::optional<UpdateMap> table_metadata_updates() const {
+        LanceUpdateMap* map = nullptr;
+        if (lance_operation_update_config_table_metadata_updates(
+                handle_.get(), &map) != 0) {
+            check_error();
+        }
+        if (!map) return std::nullopt;
+        return UpdateMap(map);
+    }
+
+    /// Optional native schema metadata updates map.
+    std::optional<UpdateMap> schema_metadata_updates() const {
+        LanceUpdateMap* map = nullptr;
+        if (lance_operation_update_config_schema_metadata_updates(
+                handle_.get(), &map) != 0) {
+            check_error();
+        }
+        if (!map) return std::nullopt;
+        return UpdateMap(map);
+    }
+
+    /// Per-field native metadata update maps keyed by field ID.
+    std::map<int32_t, UpdateMap> field_metadata_updates() const {
+        uint64_t count = 0;
+        if (lance_operation_update_config_field_metadata_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::map<int32_t, UpdateMap> out;
+        for (uint64_t i = 0; i < count; ++i) {
+            int32_t field_id = 0;
+            LanceUpdateMap* map = nullptr;
+            if (lance_operation_update_config_field_metadata_at(
+                    handle_.get(), static_cast<size_t>(i), &field_id, &map) !=
+                0) {
+                check_error();
+            }
+            if (!map) {
+                throw Error(LANCE_ERR_INTERNAL,
+                            "UpdateConfig field metadata returned a null map");
+            }
+            out.emplace(field_id, UpdateMap(map));
+        }
+        return out;
+    }
+
+    /// Construct an owned native Overwrite operation from a native schema and
+    /// borrowed fragment handles. Fragment metadata is copied. Native commit
+    /// assigns fresh fragment IDs and rejects fragments with deletion files.
+    /// `config_upsert_values == std::nullopt` maps to native `None`; an
+    /// engaged empty vector maps to `Some(empty)`. `initial_bases` follows the
+    /// same presence mapping.
+    static Operation make_overwrite(
+        const LanceSchema& schema,
+        const std::vector<const Fragment*>& fragments,
+        std::optional<std::vector<std::pair<std::string, std::string>>>
+            config_upsert_values = std::nullopt,
+        std::optional<std::vector<BasePath>> initial_bases = std::nullopt);
+
+    /// Construct an owned native Merge operation. `fragments` is the final
+    /// native fragment list. `preserves_nullability` is stored unchanged as
+    /// the caller's assertion; native commit owns schema-change and conflict
+    /// validation.
+    static Operation make_merge(
+        const LanceSchema& schema,
+        const std::vector<const Fragment*>& fragments,
+        bool preserves_nullability = false);
+
+    /// Construct an owned native Clone operation. `ref_name == std::nullopt`
+    /// maps to native `None`; an engaged empty string is `Some("")`.
+    /// `branch_name` follows the same mapping. Native commit owns shallow
+    /// publication and deep-clone rejection.
+    static Operation make_clone(
+        bool is_shallow,
+        std::optional<std::string> ref_name,
+        uint64_t ref_version,
+        std::string ref_path,
+        std::optional<std::string> branch_name);
+
+    /// Construct an owned native UpdateConfig operation. Every map is cloned;
+    /// native commit applies replacement and incremental semantics.
+    static Operation make_update_config(const UpdateConfigOptions& options);
+
+    /// Construct an owned native Append operation. Fragment handles are
+    /// borrowed and their complete native metadata is copied.
+    static Operation make_append(const std::vector<const Fragment*>& fragments);
+
+    /// Construct an owned native Restore operation.
+    static Operation make_restore(uint64_t version) {
+        auto* operation = lance_operation_restore_new(version);
+        if (!operation) check_error();
+        return Operation(operation);
+    }
+
+    /// Construct an owned native ReserveFragments operation.
+    static Operation make_reserve_fragments(uint32_t num_fragments) {
+        auto* operation = lance_operation_reserve_fragments_new(num_fragments);
+        if (!operation) check_error();
+        return Operation(operation);
+    }
+
+    /// Construct an owned native UpdateBases operation. Native commit
+    /// validation owns conflict detection and zero-ID allocation.
+    static Operation make_update_bases(const std::vector<BasePath>& new_bases);
+
     /// Construct an owned native Delete operation. The fragment handles are
     /// borrowed and their complete native metadata is copied. Deleted IDs and
     /// the predicate are copied. Native commit validation remains authoritative.
@@ -585,6 +1953,79 @@ public:
         const std::vector<const Fragment*>& updated_fragments,
         const std::vector<uint64_t>& deleted_fragment_ids,
         const std::string& predicate);
+
+    /// Construct an owned native CreateIndex operation. Metadata handles are
+    /// borrowed and their complete native values are copied. Native
+    /// `Operation::CreateIndex` owns replacement, name and coverage semantics.
+    static Operation make_create_index(
+        const std::vector<const IndexSegmentMetadata*>& new_indices,
+        const std::vector<const IndexSegmentMetadata*>& removed_indices);
+
+    /// Construct an owned native DataReplacement operation. Group handles are
+    /// borrowed and copied in input order. Native commit validation remains
+    /// authoritative.
+    static Operation make_data_replacement(
+        const std::vector<const DataReplacementGroup*>& replacements);
+
+    /// Construct an owned native DataOverlay operation. Group handles are
+    /// borrowed and cloned in input order. Native commit validation remains
+    /// authoritative for fragment existence, coverage and layout.
+    static Operation make_data_overlay(
+        const std::vector<const DataOverlayGroup*>& groups);
+
+    /// Construct an owned native Project operation from a native schema.
+    /// `preserves_nullability` is stored unchanged as the caller's explicit
+    /// assertion that the projection does not tighten nullability; conflict
+    /// and rebase semantics belong to Lance core. The schema is cloned.
+    static Operation make_project(const LanceSchema& schema,
+                                  bool preserves_nullability = false);
+
+    /// New-index metadata cloned from a CreateIndex operation. Each returned
+    /// value is independent of this operation handle.
+    std::vector<IndexSegmentMetadata> create_index_new() const;
+
+    /// Removed-index metadata cloned from a CreateIndex operation.
+    std::vector<IndexSegmentMetadata> create_index_removed() const;
+
+    /// Number of data replacement groups.
+    uint64_t data_replacement_count() const {
+        uint64_t count = 0;
+        if (lance_operation_data_replacement_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one data replacement group.
+    DataReplacementGroup data_replacement_at(size_t index) const {
+        LanceDataReplacementGroup* group = nullptr;
+        if (lance_operation_data_replacement_at(
+                handle_.get(), index, &group) != 0) {
+            check_error();
+        }
+        return DataReplacementGroup(group);
+    }
+
+    /// Number of data overlay groups.
+    uint64_t data_overlay_group_count() const {
+        uint64_t count = 0;
+        if (lance_operation_data_overlay_group_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one data overlay group.
+    DataOverlayGroup data_overlay_group_at(size_t index) const {
+        LanceDataOverlayGroup* group = nullptr;
+        if (lance_operation_data_overlay_group_at(
+                handle_.get(), index, &group) != 0) {
+            check_error();
+        }
+        return DataOverlayGroup(group);
+    }
 
     /// Number of updated fragments in a Delete operation.
     uint64_t delete_updated_fragment_count() const {
@@ -634,6 +2075,195 @@ public:
         lance_free_string(raw);
         return out;
     }
+
+    /// Construct an owned native Update operation. Fragment handles are
+    /// borrowed and their complete native metadata is copied. Native commit
+    /// validation owns schema coverage, conflict detection and row-version
+    /// behavior; no policy is applied here.
+    static Operation make_update(const UpdateOperationSpec& spec);
+
+    /// Construct an owned native Rewrite operation. Groups and rewritten
+    /// indices are cloned from their handles. `frag_reuse_index` may be null
+    /// for native None. It is in-memory only, so an explicit protobuf round
+    /// trip drops it.
+    static Operation make_rewrite(
+        const std::vector<const RewriteGroup*>& groups,
+        const std::vector<const RewrittenIndex*>& rewritten_indices,
+        const IndexSegmentMetadata* frag_reuse_index = nullptr);
+
+    /// Construct an owned native UpdateMemWalState operation from flushed
+    /// generation markers. Native merge-insert validation owns shard
+    /// existence, generation ordering and atomicity.
+    static Operation make_update_mem_wal_state(
+        const std::vector<CompactedSsTable>& compacted_sstables);
+
+    // Update inspection. Inspecting a different operation kind throws
+    // LANCE_ERR_NOT_SUPPORTED; every getter below reports native fields
+    // unchanged.
+
+    /// Number of removed fragment IDs in an Update operation.
+    uint64_t removed_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_removed_fragment_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// One removed fragment ID by position.
+    uint64_t removed_fragment_id(size_t index) const {
+        uint64_t id = 0;
+        if (lance_operation_update_removed_fragment_id_at(
+                handle_.get(), index, &id) != 0) {
+            check_error();
+        }
+        return id;
+    }
+
+    /// Number of updated fragments in an Update operation.
+    uint64_t updated_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_updated_fragment_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one updated fragment as an independent snapshot.
+    Fragment updated_fragment_at(size_t index) const;
+
+    /// Number of new fragments in an Update operation.
+    uint64_t new_fragment_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_new_fragment_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one new fragment as an independent snapshot.
+    Fragment new_fragment_at(size_t index) const;
+
+    /// Number of modified field IDs in an Update operation.
+    uint64_t fields_modified_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_fields_modified_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// One modified field ID by position.
+    uint32_t fields_modified(size_t index) const {
+        uint32_t field_id = 0;
+        if (lance_operation_update_fields_modified_at(
+                handle_.get(), index, &field_id) != 0) {
+            check_error();
+        }
+        return field_id;
+    }
+
+    /// Number of compacted SSTable entries in an Update operation.
+    uint64_t compacted_sstable_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_compacted_sstable_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// One compacted SSTable entry by position.
+    CompactedSsTable compacted_sstable_at(size_t index) const;
+
+    /// Number of preserved-fragment-bitmap field IDs in an Update operation.
+    uint64_t fields_for_preserving_frag_bitmap_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_fields_for_preserving_frag_bitmap_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// One preserved-fragment-bitmap field ID by position.
+    uint32_t fields_for_preserving_frag_bitmap(size_t index) const {
+        uint32_t field_id = 0;
+        if (lance_operation_update_fields_for_preserving_frag_bitmap_at(
+                handle_.get(), index, &field_id) != 0) {
+            check_error();
+        }
+        return field_id;
+    }
+
+    /// Native update mode, distinguishing absent from both variants.
+    std::optional<UpdateMode> update_mode() const {
+        bool present = false;
+        int32_t mode = 0;
+        if (lance_operation_update_mode(
+                handle_.get(), &present, &mode) != 0) {
+            check_error();
+        }
+        if (!present) return std::nullopt;
+        return static_cast<UpdateMode>(mode);
+    }
+
+    /// Cloned inserted-rows filter, or nullopt for native None.
+    std::optional<KeyExistenceFilter> inserted_rows_filter() const;
+
+    /// Cloned updated-fragment offsets, or nullopt for native None. A present
+    /// but empty value is preserved.
+    std::optional<UpdatedFragmentOffsets> updated_fragment_offsets() const;
+
+    /// Number of groups in a Rewrite operation.
+    uint64_t rewrite_group_count() const {
+        uint64_t count = 0;
+        if (lance_operation_rewrite_group_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one Rewrite group by position.
+    RewriteGroup rewrite_group_at(size_t index) const;
+
+    /// Number of rewritten indices in a Rewrite operation.
+    uint64_t rewritten_index_count() const {
+        uint64_t count = 0;
+        if (lance_operation_rewrite_rewritten_index_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Clone one rewritten index by position.
+    RewrittenIndex rewritten_index_at(size_t index) const;
+
+    /// Cloned in-memory fragment-reuse index, or nullopt for native None.
+    std::optional<IndexSegmentMetadata> frag_reuse_index() const;
+
+    // UpdateMemWalState inspection. Inspecting a different operation kind
+    // throws LANCE_ERR_NOT_SUPPORTED.
+
+    /// Number of flushed generation markers in an UpdateMemWalState operation.
+    uint64_t update_mem_wal_state_compacted_sstable_count() const {
+        uint64_t count = 0;
+        if (lance_operation_update_mem_wal_state_compacted_sstable_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    /// Copy one flushed generation marker by position.
+    CompactedSsTable update_mem_wal_state_compacted_sstable_at(
+        size_t index) const;
 
     const LanceOperation* c_handle() const { return handle_.get(); }
 };
@@ -808,17 +2438,6 @@ public:
 /// the key; otherwise the value is upserted.
 using ConfigUpdate = std::pair<std::string, std::optional<std::string>>;
 
-/// One native `BasePath` for `Dataset::add_bases`.
-///
-/// `id == 0` requests native allocation. `name == std::nullopt` maps to native
-/// `None`; an engaged empty string is an explicit empty name.
-struct BasePath {
-    uint32_t id = 0;
-    std::string path;
-    std::optional<std::string> name;
-    bool is_dataset_root = false;
-};
-
 /// Optional native transaction properties for one base registration.
 ///
 /// `std::nullopt` maps to native `None`; an engaged empty vector maps to
@@ -858,6 +2477,660 @@ struct ColumnAlteration {
 struct SqlColumn {
     std::string name;
     std::string expression;
+};
+
+// ─── Schema-evolution callbacks ─────────────────────────────────────────────
+
+/// Native checkpoint batch identity. Mapper and checkpoint callbacks receive a
+/// borrowed value.
+struct BatchUDFInfo {
+    uint32_t fragment_id = 0;
+    std::size_t batch_index = 0;
+};
+
+/// Mapper callback. The input Arrow values are borrowed; `output` is an
+/// uninitialized ArrowArray that the callback must initialize with owned data
+/// under the declared BatchUDF output schema. Throw to fail.
+using BatchUDFMapper = std::function<void(
+    const ArrowArray& input,
+    const ArrowSchema& input_schema,
+    ArrowArray& output)>;
+
+/// Optional native UDF checkpoint store.
+///
+/// `get_batch` returns true on a hit, false on a miss, and throws on error.
+/// `insert_batch` receives mutable owned Arrow values: it may move both structs
+/// into its storage and clear the source release callbacks. The library
+/// releases any ownership left in those arguments after the callback returns.
+/// `get_fragment` returns opaque native Fragment JSON or std::nullopt on a
+/// miss. `insert_fragment` receives the native u64 Fragment ID and borrowed
+/// JSON. All four callbacks are required when the store is engaged.
+struct UDFCheckpointStore {
+    std::function<bool(
+        const BatchUDFInfo&,
+        ArrowArray&)> get_batch;
+
+    std::function<void(
+        const BatchUDFInfo&,
+        ArrowArray&,
+        ArrowSchema&)> insert_batch;
+
+    std::function<std::optional<std::string>(uint32_t)> get_fragment;
+
+    std::function<void(uint64_t, const std::string&)> insert_fragment;
+};
+
+/// Native BatchUDF declaration. `output_schema` is the complete schema of every
+/// returned batch and remains borrowed for the enclosing add-columns call.
+struct BatchUDF {
+    BatchUDFMapper mapper;
+    const ArrowSchema* output_schema = nullptr;
+    std::optional<UDFCheckpointStore> checkpoint_store;
+};
+
+namespace callback_detail {
+
+inline void release_owned_string(LanceOwnedString* value) noexcept {
+    if (value == nullptr) return;
+    std::free(value->data);
+    value->data = nullptr;
+    value->release = nullptr;
+}
+
+inline void set_callback_error(
+    LanceCallbackError* target,
+    int32_t code,
+    const char* message) noexcept {
+    if (target == nullptr) return;
+    target->code = code;
+    target->message.data = nullptr;
+    target->message.release = nullptr;
+    if (message == nullptr) return;
+
+    const std::size_t len = std::strlen(message);
+    char* copy = static_cast<char*>(std::malloc(len + 1));
+    if (copy == nullptr) {
+        return;
+    }
+    std::memcpy(copy, message, len + 1);
+    target->message.data = copy;
+    target->message.release = &release_owned_string;
+}
+
+inline void release_array_after_exception(ArrowArray* value) noexcept {
+    if (value != nullptr && value->release != nullptr) {
+        value->release(value);
+    }
+}
+
+struct MapperContext {
+    const BatchUDF* udf;
+};
+
+struct CheckpointContext {
+    const UDFCheckpointStore* store;
+};
+
+inline int32_t mapper_trampoline(
+    void* callback_ctx,
+    const ArrowArray* input,
+    const ArrowSchema* input_schema,
+    ArrowArray* output,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<MapperContext*>(callback_ctx);
+        context->udf->mapper(*input, *input_schema, *output);
+        return 0;
+    } catch (const lance::Error& exception) {
+        release_array_after_exception(output);
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        release_array_after_exception(output);
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        release_array_after_exception(output);
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+inline int32_t get_batch_trampoline(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* raw_info,
+    ArrowArray* output,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        BatchUDFInfo info{raw_info->fragment_id, raw_info->batch_index};
+        return context->store->get_batch(info, *output) ? 1 : 0;
+    } catch (const lance::Error& exception) {
+        release_array_after_exception(output);
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        release_array_after_exception(output);
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        release_array_after_exception(output);
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+inline int32_t insert_batch_trampoline(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* raw_info,
+    ArrowArray* batch,
+    ArrowSchema* batch_schema,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        BatchUDFInfo info{raw_info->fragment_id, raw_info->batch_index};
+        context->store->insert_batch(info, *batch, *batch_schema);
+        return 0;
+    } catch (const lance::Error& exception) {
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+inline int32_t get_fragment_trampoline(
+    void* callback_ctx,
+    uint32_t fragment_id,
+    LanceOwnedString* out_json,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        auto json = context->store->get_fragment(fragment_id);
+        if (!json) return 0;
+
+        char* copy = static_cast<char*>(std::malloc(json->size() + 1));
+        if (copy == nullptr) {
+            set_callback_error(
+                error, LANCE_ERR_INTERNAL, "failed to allocate callback JSON");
+            return -1;
+        }
+        std::memcpy(copy, json->data(), json->size());
+        copy[json->size()] = '\0';
+        out_json->data = copy;
+        out_json->release = &release_owned_string;
+        return 1;
+    } catch (const lance::Error& exception) {
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+inline int32_t insert_fragment_trampoline(
+    void* callback_ctx,
+    uint64_t fragment_id,
+    const char* fragment_json,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        context->store->insert_fragment(
+            fragment_id, std::string(fragment_json == nullptr ? "" : fragment_json));
+        return 0;
+    } catch (const lance::Error& exception) {
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+/// Complete call-scoped state for one native BatchUDF invocation.
+///
+/// The raw callback table points only into this object. Keep it on the stack
+/// for the duration of the synchronous add-columns call; it is neither movable
+/// nor copyable.
+struct BatchUDFCall {
+    std::optional<std::vector<std::string>> read_columns;
+    std::vector<const char*> read_column_ptrs;
+    uint32_t batch_size_value = 0;
+    const char* const* read_columns_ptr = nullptr;
+    const uint32_t* batch_size_ptr = nullptr;
+    MapperContext mapper_context{};
+    CheckpointContext checkpoint_context{};
+    LanceUDFCheckpointStore raw_store{};
+    LanceBatchUDF raw{};
+
+    BatchUDFCall(const BatchUDF& udf,
+                 std::optional<std::vector<std::string>> columns,
+                 std::optional<uint32_t> batch_size)
+        : read_columns(std::move(columns)) {
+        if (!udf.mapper) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT, "BatchUDF mapper must not be empty");
+        }
+        if (udf.output_schema == nullptr) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "BatchUDF output_schema must not be null");
+        }
+
+        const UDFCheckpointStore* store = nullptr;
+        if (udf.checkpoint_store) {
+            store = &*udf.checkpoint_store;
+            if (!store->get_batch || !store->insert_batch ||
+                !store->get_fragment || !store->insert_fragment) {
+                throw Error(
+                    LANCE_ERR_INVALID_ARGUMENT,
+                    "UDFCheckpointStore must provide all four callbacks");
+            }
+            checkpoint_context.store = store;
+            raw_store.get_batch = &get_batch_trampoline;
+            raw_store.insert_batch = &insert_batch_trampoline;
+            raw_store.get_fragment = &get_fragment_trampoline;
+            raw_store.insert_fragment = &insert_fragment_trampoline;
+            raw_store.callback_ctx = &checkpoint_context;
+        }
+
+        mapper_context.udf = &udf;
+        raw.mapper = &mapper_trampoline;
+        raw.mapper_ctx = &mapper_context;
+        raw.output_schema = udf.output_schema;
+        raw.checkpoint_store = store == nullptr ? nullptr : &raw_store;
+
+        if (read_columns) {
+            read_column_ptrs.reserve(read_columns->size() + 1);
+            for (const auto& column : *read_columns) {
+                read_column_ptrs.push_back(column.c_str());
+            }
+            read_column_ptrs.push_back(nullptr);
+            read_columns_ptr = read_column_ptrs.data();
+        }
+        if (batch_size) {
+            batch_size_value = *batch_size;
+            batch_size_ptr = &batch_size_value;
+        }
+    }
+
+    BatchUDFCall(const BatchUDFCall&) = delete;
+    BatchUDFCall& operator=(const BatchUDFCall&) = delete;
+    BatchUDFCall(BatchUDFCall&&) = delete;
+    BatchUDFCall& operator=(BatchUDFCall&&) = delete;
+};
+
+}  // namespace callback_detail
+
+// ─── Commit lock ─────────────────────────────────────────────────────────────
+
+/// One acquired commit lease.
+///
+/// `release` mirrors native `CommitLease::release`: `success` is true after the
+/// manifest is published and false when the attempt is abandoned. It may be
+/// called more than once and must be idempotent. Throw `lance::Error` to report
+/// a specific code; any other exception maps to LANCE_ERR_INTERNAL. The object
+/// is destroyed exactly once, after the final release callback.
+class CommitLease {
+public:
+    virtual ~CommitLease() noexcept = default;
+    virtual void release(bool success) = 0;
+};
+
+namespace commit_lock_detail {
+struct State;
+}  // namespace commit_lock_detail
+
+class CommitLock {
+    Handle<LanceCommitLock, lance_commit_lock_close> handle_;
+    std::unique_ptr<commit_lock_detail::State> state_;
+
+public:
+    /// Acquire a lease for a manifest base version. Returning `nullptr` is a
+    /// stateless lock. Throw `lance::Error` to report a specific code.
+    using Acquire = std::function<std::unique_ptr<CommitLease>(uint64_t)>;
+
+    explicit CommitLock(Acquire acquire);
+    ~CommitLock();
+
+    CommitLock(CommitLock&&) noexcept;
+    CommitLock& operator=(CommitLock&&) noexcept;
+    CommitLock(const CommitLock&) = delete;
+    CommitLock& operator=(const CommitLock&) = delete;
+
+    const LanceCommitLock* c_handle() const { return handle_.get(); }
+};
+
+namespace commit_lock_detail {
+
+struct State {
+    CommitLock::Acquire acquire;
+};
+
+struct LeaseHolder {
+    std::unique_ptr<CommitLease> lease;
+};
+
+extern "C" inline int32_t acquire_trampoline(
+    void* callback_ctx,
+    uint64_t version,
+    void** out_lease,
+    LanceCallbackError* error) noexcept {
+    if (out_lease == nullptr) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INVALID_ARGUMENT, "out_lease must not be null");
+        return -1;
+    }
+    *out_lease = nullptr;
+    auto* state = static_cast<State*>(callback_ctx);
+    try {
+        auto lease = state->acquire(version);
+        if (lease) {
+            *out_lease = new LeaseHolder{std::move(lease)};
+        }
+        return 0;
+    } catch (const lance::Error& exception) {
+        callback_detail::set_callback_error(
+            error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+extern "C" inline int32_t release_trampoline(
+    void*,
+    void* lease,
+    bool success,
+    LanceCallbackError* error) noexcept {
+    if (lease == nullptr) {
+        return 0;
+    }
+    auto* holder = static_cast<LeaseHolder*>(lease);
+    try {
+        holder->lease->release(success);
+        return 0;
+    } catch (const lance::Error& exception) {
+        callback_detail::set_callback_error(
+            error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+extern "C" inline void destroy_lease_trampoline(void*, void* lease) noexcept {
+    delete static_cast<LeaseHolder*>(lease);
+}
+
+extern "C" inline void release_context_trampoline(void* callback_ctx) noexcept {
+    delete static_cast<State*>(callback_ctx);
+}
+
+}  // namespace commit_lock_detail
+
+inline CommitLock::CommitLock(Acquire acquire)
+    : handle_(nullptr),
+      state_(new commit_lock_detail::State{std::move(acquire)}) {
+    LanceCommitLockCallbacks callbacks = {};
+    callbacks.lock = &commit_lock_detail::acquire_trampoline;
+    callbacks.release = &commit_lock_detail::release_trampoline;
+    callbacks.destroy_lease = &commit_lock_detail::destroy_lease_trampoline;
+    callbacks.callback_ctx = state_.get();
+    callbacks.release_context = &commit_lock_detail::release_context_trampoline;
+
+    auto* raw = lance_commit_lock_new(&callbacks);
+    // On failure the library never takes context ownership, so `state_`
+    // remains local and is destroyed here.
+    if (raw == nullptr) check_error();
+    handle_ = Handle<LanceCommitLock, lance_commit_lock_close>(raw);
+    // On success the native context owns the state and releases it exactly
+    // once when the last owner drops.
+    (void)state_.release();
+}
+
+inline CommitLock::~CommitLock() = default;
+
+inline CommitLock::CommitLock(CommitLock&&) noexcept = default;
+
+inline CommitLock& CommitLock::operator=(CommitLock&&) noexcept = default;
+
+// ─── Storage options ─────────────────────────────────────────────────────────
+
+using StorageOptions = std::map<std::string, std::string>;
+
+class StorageOptionsProvider {
+    Handle<LanceStorageOptionsProvider, lance_storage_options_provider_close> handle_;
+
+public:
+    using Fetch = std::function<std::optional<StorageOptions>()>;
+
+    StorageOptionsProvider(
+        std::string provider_id,
+        Fetch fetch,
+        Fetch force_fetch = {});
+
+    const LanceStorageOptionsProvider* c_handle() const { return handle_.get(); }
+
+    std::string provider_id() const {
+        char* value = lance_storage_options_provider_id(handle_.get());
+        if (value == nullptr) check_error();
+        std::string out(value);
+        lance_free_string(value);
+        return out;
+    }
+};
+
+namespace storage_options_detail {
+
+struct FetchSnapshot {
+    std::vector<std::string> strings;
+    std::vector<const char*> keys;
+    std::vector<const char*> values;
+};
+
+inline void release_fetch_snapshot(void* raw) noexcept {
+    delete static_cast<FetchSnapshot*>(raw);
+}
+
+inline int32_t fetch_impl(
+    const StorageOptionsProvider::Fetch& fetch,
+    LanceStorageOptionsFetchResult* out,
+    LanceCallbackError* error,
+    const char* context) noexcept {
+    (void)context;
+    try {
+        auto options = fetch();
+        if (!options) {
+            out->has_options = 0;
+            return 0;
+        }
+
+        std::unique_ptr<FetchSnapshot> snapshot(new FetchSnapshot());
+        snapshot->strings.reserve(options->size() * 2);
+        snapshot->keys.reserve(options->size());
+        snapshot->values.reserve(options->size());
+        for (const auto& [key, value] : *options) {
+            snapshot->strings.push_back(key);
+            snapshot->strings.push_back(value);
+        }
+        for (std::size_t index = 0; index < options->size(); index++) {
+            snapshot->keys.push_back(snapshot->strings[index * 2].c_str());
+            snapshot->values.push_back(snapshot->strings[index * 2 + 1].c_str());
+        }
+        out->has_options = 1;
+        out->keys = snapshot->keys.data();
+        out->values = snapshot->values.data();
+        out->count = snapshot->keys.size();
+        out->snapshot_ctx = snapshot.release();
+        out->release_snapshot = &release_fetch_snapshot;
+        return 0;
+    } catch (const lance::Error& exception) {
+        callback_detail::set_callback_error(
+            error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        callback_detail::set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, "unknown C++ exception in storage options fetch");
+        return -1;
+    }
+}
+
+struct ProviderContext {
+    StorageOptionsProvider::Fetch fetch;
+    StorageOptionsProvider::Fetch force_fetch;
+};
+
+inline int32_t fetch_callback(
+    void* callback_ctx,
+    LanceStorageOptionsFetchResult* out,
+    LanceCallbackError* error) noexcept {
+    auto* context = static_cast<ProviderContext*>(callback_ctx);
+    return fetch_impl(context->fetch, out, error, "storage options fetch");
+}
+
+inline int32_t force_fetch_callback(
+    void* callback_ctx,
+    LanceStorageOptionsFetchResult* out,
+    LanceCallbackError* error) noexcept {
+    auto* context = static_cast<ProviderContext*>(callback_ctx);
+    return fetch_impl(
+        context->force_fetch, out, error, "storage options force fetch");
+}
+
+inline void provider_release(void* callback_ctx) noexcept {
+    delete static_cast<ProviderContext*>(callback_ctx);
+}
+
+inline LanceStorageOptionsProvider* create_provider(
+    const std::string& provider_id,
+    StorageOptionsProvider::Fetch fetch,
+    StorageOptionsProvider::Fetch force_fetch) {
+    auto* context = new ProviderContext{
+        std::move(fetch), std::move(force_fetch)};
+    LanceStorageOptionsProviderSpec spec{};
+    spec.fetch = &fetch_callback;
+    spec.force_fetch =
+        context->force_fetch ? &force_fetch_callback : nullptr;
+    spec.release = &provider_release;
+    spec.provider_ctx = context;
+    spec.provider_id = provider_id.c_str();
+    auto* provider = lance_storage_options_provider_new(&spec);
+    if (provider == nullptr) {
+        // Ownership transfers only on success.
+        delete context;
+    }
+    return provider;
+}
+
+}  // namespace storage_options_detail
+
+inline StorageOptionsProvider::StorageOptionsProvider(
+    std::string provider_id,
+    Fetch fetch,
+    Fetch force_fetch)
+    : handle_(storage_options_detail::create_provider(
+          provider_id, std::move(fetch), std::move(force_fetch))) {
+    if (!handle_) check_error();
+}
+
+class StorageOptionsAccessor {
+    Handle<LanceStorageOptionsAccessor, lance_storage_options_accessor_close> handle_;
+
+public:
+    /// NULL optional means native None; an engaged empty map means Some(empty).
+    explicit StorageOptionsAccessor(
+        std::optional<StorageOptions> initial = std::nullopt,
+        const StorageOptionsProvider* provider = nullptr)
+        : handle_(nullptr) {
+        std::vector<const char*> keys;
+        std::vector<const char*> values;
+        LanceStorageOptionsInput input{};
+        const LanceStorageOptionsInput* input_ptr = nullptr;
+        if (initial) {
+            keys.reserve(initial->size());
+            values.reserve(initial->size());
+            for (const auto& [key, value] : *initial) {
+                keys.push_back(key.c_str());
+                values.push_back(value.c_str());
+            }
+            input.keys = keys.data();
+            input.values = values.data();
+            input.count = keys.size();
+            input_ptr = &input;
+        }
+        auto* raw = lance_storage_options_accessor_new(
+            input_ptr, provider ? provider->c_handle() : nullptr);
+        if (raw == nullptr) check_error();
+        handle_ = Handle<LanceStorageOptionsAccessor,
+                         lance_storage_options_accessor_close>(raw);
+    }
+
+    /// Resolve with native cache and expiration behavior.
+    std::optional<StorageOptions> snapshot() const {
+        auto* raw = lance_storage_options_accessor_snapshot(handle_.get());
+        if (raw == nullptr) check_error();
+        Handle<LanceStorageOptionsSnapshot,
+               lance_storage_options_snapshot_close>
+            snapshot(raw);
+        int32_t has_options =
+            lance_storage_options_snapshot_has_options(snapshot.get());
+        if (has_options < 0) check_error();
+        if (has_options == 0) return std::nullopt;
+        StorageOptions options;
+        uint64_t count =
+            lance_storage_options_snapshot_count(snapshot.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        for (uint64_t index = 0; index < count; index++) {
+            const char* key = lance_storage_options_snapshot_key_at(
+                snapshot.get(), static_cast<std::size_t>(index));
+            if (!key) check_error();
+            const char* value = lance_storage_options_snapshot_value_at(
+                snapshot.get(), static_cast<std::size_t>(index));
+            if (!value) check_error();
+            options.emplace(key, value);
+        }
+        return options;
+    }
+
+    const LanceStorageOptionsAccessor* c_handle() const { return handle_.get(); }
+};
+
+/// Additive options for `Dataset::open_with_options`.
+///
+/// Zero-initialization opens the latest version with native storage defaults.
+/// A NULL accessor selects native defaults; a non-NULL accessor is retained by
+/// the native dataset and later I/O uses its provider, refresh and error
+/// behavior. Static options belong in the accessor's initial options.
+struct DatasetOpenOptions {
+    uint64_t version = 0;
+    const StorageOptionsAccessor* storage_options_accessor = nullptr;
 };
 
 // ─── Shared Session ──────────────────────────────────────────────────────────
@@ -995,6 +3268,331 @@ public:
 
     const LanceSession* c_handle() const { return handle_.get(); }
 };
+
+// ─── Owned native dataset-write options ─────────────────────────────────────
+
+namespace native_write_options_detail {
+
+struct ProgressContext {
+    NativeWriteProgress progress;
+};
+
+inline int32_t invoke_fragment(
+    const NativeWriteProgress::FragmentCallback& callback,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error,
+    const char* context) noexcept {
+    try {
+        FragmentWriteProgressInfo progress{};
+        if (info != nullptr) {
+            progress.fragment_id = info->fragment_id;
+            if (info->has_physical_rows != 0) {
+                progress.physical_rows = info->physical_rows;
+            }
+            progress.file_count = info->file_count;
+        }
+        callback(progress);
+        return 0;
+    } catch (const lance::Error& exception) {
+        callback_detail::set_callback_error(
+            error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        callback_detail::set_callback_error(
+            error, LANCE_ERR_INTERNAL, context);
+        return -1;
+    }
+}
+
+extern "C" inline int32_t begin_fragment_trampoline(
+    void* callback_ctx,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error) noexcept {
+    auto* context = static_cast<ProgressContext*>(callback_ctx);
+    return invoke_fragment(
+        context->progress.begin_fragment,
+        info,
+        error,
+        "unknown C++ exception in write fragment begin callback");
+}
+
+extern "C" inline int32_t complete_fragment_trampoline(
+    void* callback_ctx,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error) noexcept {
+    auto* context = static_cast<ProgressContext*>(callback_ctx);
+    return invoke_fragment(
+        context->progress.complete_fragment,
+        info,
+        error,
+        "unknown C++ exception in write fragment complete callback");
+}
+
+extern "C" inline void write_stats_trampoline(
+    void* callback_ctx,
+    const LanceWriteStats* stats) noexcept {
+    auto* context = static_cast<ProgressContext*>(callback_ctx);
+    try {
+        NativeWriteStats value{};
+        if (stats != nullptr) {
+            value.bytes_written = stats->bytes_written;
+            value.rows_written = stats->rows_written;
+            value.files_written = stats->files_written;
+        }
+        context->progress.write_stats(value);
+    } catch (...) {
+        // Native write progress has no error channel. Swallowing keeps the C
+        // ABI boundary sound; use fragment callbacks for fallible progress.
+    }
+}
+
+extern "C" inline void release_progress_context(void* callback_ctx) noexcept {
+    delete static_cast<ProgressContext*>(callback_ctx);
+}
+
+struct BuildState {
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions write{};
+
+    bool has_transaction_properties = false;
+    std::vector<const char*> property_keys;
+    std::vector<const char*> property_values;
+    LanceTransactionProperties properties{};
+
+    std::vector<std::string> base_paths;
+    std::vector<std::optional<std::string>> base_names;
+    std::vector<LanceBasePath> base_views;
+    LanceBasePath empty_base{};
+    LanceBasePathList base_list{};
+
+    std::vector<uint32_t> target_ids;
+    LanceUInt32List target_list{};
+
+    std::vector<std::string> target_names;
+    std::vector<const char*> target_name_ptrs;
+    LanceStringList target_name_list{};
+
+    std::vector<std::string> base_store_paths;
+    std::vector<LanceBaseStoreParams> base_store_views;
+    LanceBaseStoreParamsList base_store_list{};
+
+    LanceFileWriterOptions file_options{};
+
+    std::unique_ptr<ProgressContext> progress_ctx;
+    LanceNativeWriteProgress progress{};
+};
+
+inline void build_initial_bases(
+    const std::optional<std::vector<BasePath>>& initial_bases,
+    BuildState& state) {
+    if (!initial_bases) return;
+    state.base_paths.reserve(initial_bases->size());
+    state.base_names.reserve(initial_bases->size());
+    state.base_views.reserve(initial_bases->size());
+    for (const auto& base : *initial_bases) {
+        state.base_paths.push_back(base.path);
+        state.base_names.push_back(base.name);
+    }
+    for (std::size_t index = 0; index < state.base_paths.size(); ++index) {
+        LanceBasePath view{};
+        view.id = (*initial_bases)[index].id;
+        view.path = state.base_paths[index].c_str();
+        view.name = state.base_names[index]
+                        ? state.base_names[index]->c_str()
+                        : nullptr;
+        view.is_dataset_root = (*initial_bases)[index].is_dataset_root;
+        state.base_views.push_back(view);
+    }
+    state.base_list.items =
+        state.base_views.empty() ? &state.empty_base : state.base_views.data();
+    state.base_list.count = state.base_views.size();
+}
+
+inline void build_base_store_params(
+    const std::optional<std::vector<DatasetBaseStoreParams>>& base_store_params,
+    BuildState& state) {
+    if (!base_store_params) return;
+    state.base_store_paths.reserve(base_store_params->size());
+    state.base_store_views.reserve(base_store_params->size());
+    for (const auto& entry : *base_store_params) {
+        state.base_store_paths.push_back(entry.base_path);
+    }
+    for (std::size_t index = 0; index < base_store_params->size(); ++index) {
+        const auto& entry = (*base_store_params)[index];
+        LanceBaseStoreParams view{};
+        view.base_path = state.base_store_paths[index].c_str();
+        view.storage_options_accessor =
+            entry.storage_options_accessor
+                ? entry.storage_options_accessor->c_handle()
+                : nullptr;
+        if (entry.block_size) {
+            view.has_block_size = 1;
+            view.block_size = *entry.block_size;
+        }
+        if (entry.s3_credentials_refresh_offset) {
+            view.has_s3_credentials_refresh_offset = 1;
+            view.s3_credentials_refresh_seconds =
+                entry.s3_credentials_refresh_offset->seconds;
+            view.s3_credentials_refresh_nanos =
+                entry.s3_credentials_refresh_offset->nanos;
+        }
+        if (entry.use_constant_size_upload_parts) {
+            view.has_use_constant_size_upload_parts = 1;
+            view.use_constant_size_upload_parts =
+                *entry.use_constant_size_upload_parts;
+        }
+        if (entry.list_is_lexically_ordered) {
+            view.has_list_is_lexically_ordered = 1;
+            view.list_is_lexically_ordered =
+                *entry.list_is_lexically_ordered;
+        }
+        state.base_store_views.push_back(view);
+    }
+    state.base_store_list.items = state.base_store_views.empty()
+                                      ? nullptr
+                                      : state.base_store_views.data();
+    state.base_store_list.count = state.base_store_views.size();
+}
+
+}  // namespace native_write_options_detail
+
+inline NativeWriteOptions::NativeWriteOptions(
+    const NativeWriteOptionsSpec& spec)
+    : handle_(nullptr) {
+    using namespace native_write_options_detail;
+
+    BuildState state;
+    state.write = lance::to_c_write_options(spec.write, state.cleanup);
+
+    if (spec.transaction_properties) {
+        state.has_transaction_properties = true;
+        state.property_keys.reserve(spec.transaction_properties->size());
+        state.property_values.reserve(spec.transaction_properties->size());
+        for (const auto& [key, value] : *spec.transaction_properties) {
+            state.property_keys.push_back(key.c_str());
+            state.property_values.push_back(value.c_str());
+        }
+        state.properties.keys = state.property_keys.empty()
+                                    ? nullptr
+                                    : state.property_keys.data();
+        state.properties.values = state.property_values.empty()
+                                      ? nullptr
+                                      : state.property_values.data();
+        state.properties.count = spec.transaction_properties->size();
+    }
+
+    build_initial_bases(spec.initial_bases, state);
+
+    if (spec.target_bases) {
+        state.target_ids = *spec.target_bases;
+        state.target_list.items = state.target_ids.empty()
+                                      ? nullptr
+                                      : state.target_ids.data();
+        state.target_list.count = state.target_ids.size();
+    }
+
+    if (spec.target_base_names_or_paths) {
+        state.target_names = *spec.target_base_names_or_paths;
+        state.target_name_ptrs.reserve(state.target_names.size());
+        for (const auto& value : state.target_names) {
+            state.target_name_ptrs.push_back(value.c_str());
+        }
+        state.target_name_list.items = state.target_name_ptrs.empty()
+                                           ? nullptr
+                                           : state.target_name_ptrs.data();
+        state.target_name_list.count = state.target_name_ptrs.size();
+    }
+
+    build_base_store_params(spec.base_store_params, state);
+
+    if (spec.file_writer_options) {
+        if (spec.file_writer_options->data_cache_bytes) {
+            state.file_options.has_data_cache_bytes = 1;
+            state.file_options.data_cache_bytes =
+                *spec.file_writer_options->data_cache_bytes;
+        }
+        if (spec.file_writer_options->max_page_bytes) {
+            state.file_options.has_max_page_bytes = 1;
+            state.file_options.max_page_bytes =
+                *spec.file_writer_options->max_page_bytes;
+        }
+        if (spec.file_writer_options->keep_original_array) {
+            state.file_options.has_keep_original_array = 1;
+            state.file_options.keep_original_array =
+                *spec.file_writer_options->keep_original_array ? 1 : 0;
+        }
+    }
+
+    const bool has_progress =
+        static_cast<bool>(spec.progress.begin_fragment) ||
+        static_cast<bool>(spec.progress.complete_fragment) ||
+        static_cast<bool>(spec.progress.write_stats);
+    if (has_progress) {
+        state.progress_ctx = std::make_unique<ProgressContext>();
+        state.progress_ctx->progress = spec.progress;
+        if (spec.progress.begin_fragment) {
+            state.progress.begin_fragment = &begin_fragment_trampoline;
+        }
+        if (spec.progress.complete_fragment) {
+            state.progress.complete_fragment = &complete_fragment_trampoline;
+        }
+        if (spec.progress.write_stats) {
+            state.progress.write_stats = &write_stats_trampoline;
+        }
+        state.progress.release = &release_progress_context;
+        state.progress.callback_ctx = state.progress_ctx.get();
+    }
+
+    LanceNativeWriteOptionsSpec c_spec{};
+    c_spec.write_options = &state.write;
+    c_spec.transaction_properties =
+        state.has_transaction_properties ? &state.properties : nullptr;
+    c_spec.has_enable_v2_manifest_paths =
+        spec.enable_v2_manifest_paths ? 1 : 0;
+    c_spec.enable_v2_manifest_paths =
+        spec.enable_v2_manifest_paths.value_or(false);
+    c_spec.initial_bases =
+        spec.initial_bases ? &state.base_list : nullptr;
+    c_spec.target_bases =
+        spec.target_bases ? &state.target_list : nullptr;
+    c_spec.target_base_names_or_paths =
+        spec.target_base_names_or_paths ? &state.target_name_list : nullptr;
+    c_spec.has_target_all_bases = spec.target_all_bases ? 1 : 0;
+    c_spec.target_all_bases = spec.target_all_bases.value_or(false);
+    c_spec.base_store_params =
+        spec.base_store_params ? &state.base_store_list : nullptr;
+    c_spec.allow_external_blob_outside_bases =
+        spec.allow_external_blob_outside_bases;
+    c_spec.external_blob_mode =
+        static_cast<int32_t>(spec.external_blob_mode);
+    c_spec.has_blob_pack_file_size_threshold =
+        spec.blob_pack_file_size_threshold ? 1 : 0;
+    c_spec.blob_pack_file_size_threshold =
+        spec.blob_pack_file_size_threshold.value_or(0);
+    c_spec.file_writer_options =
+        spec.file_writer_options ? &state.file_options : nullptr;
+    c_spec.session = spec.session ? spec.session->c_handle() : nullptr;
+    c_spec.storage_options_accessor =
+        spec.storage_options_accessor
+            ? spec.storage_options_accessor->c_handle()
+            : nullptr;
+    c_spec.commit_lock =
+        spec.commit_lock ? spec.commit_lock->c_handle() : nullptr;
+    c_spec.progress = has_progress ? &state.progress : nullptr;
+
+    auto* raw = lance_native_write_options_new(&c_spec);
+    if (raw == nullptr) {
+        // Ownership of the progress context transfers only on success.
+        check_error();
+    }
+    handle_ = Handle<LanceNativeWriteOptions, lance_native_write_options_close>(
+        raw);
+    (void)state.progress_ctx.release();
+}
 
 // ─── Process-local FTS query context ────────────────────────────────────────
 
@@ -1169,12 +3767,418 @@ public:
     const LanceFtsQuery* c_handle() const { return handle_.get(); }
 };
 
+// ─── Native tokenization and process diagnostics ────────────────────────────
+
+/// One token produced by the native Lance analyzer chain.
+struct FtsToken {
+    std::string text;
+    uint32_t position = 0;
+};
+
+/// Owned token list produced by `FtsTokenList::tokenize`.
+///
+/// The list owns every token string. `at()` copies one token into a value, so
+/// the value remains usable after the list is destroyed.
+class FtsTokenList {
+    Handle<LanceFtsTokenList, lance_fts_token_list_close> handle_;
+
+    explicit FtsTokenList(LanceFtsTokenList* tokens) : handle_(tokens) {}
+
+public:
+    FtsTokenList(FtsTokenList&&) noexcept = default;
+    FtsTokenList& operator=(FtsTokenList&&) noexcept = default;
+    FtsTokenList(const FtsTokenList&) = delete;
+    FtsTokenList& operator=(const FtsTokenList&) = delete;
+
+    /// Tokenize an explicit UTF-8 byte range with native defaults or native
+    /// `InvertedIndexParams` JSON. Embedded NUL bytes are preserved. A null
+    /// `params_json` selects native defaults.
+    static FtsTokenList tokenize(
+        std::string_view text,
+        std::optional<std::string> params_json = std::nullopt) {
+        auto* tokens = lance_fts_tokenize(
+            text.data(), text.size(),
+            params_json ? params_json->c_str() : nullptr);
+        if (!tokens) check_error();
+        return FtsTokenList(tokens);
+    }
+
+    /// Number of tokens. Throws on a NULL handle.
+    size_t size() const {
+        uint64_t count = lance_fts_token_list_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return static_cast<size_t>(count);
+    }
+
+    bool empty() const { return size() == 0; }
+
+    /// Copy token `index`. Throws on an out-of-range index.
+    FtsToken at(size_t index) const {
+        LanceFtsTokenView view{};
+        if (lance_fts_token_list_get(handle_.get(), index, &view) != 0)
+            check_error();
+        if (view.text == nullptr && view.text_len != 0)
+            throw std::runtime_error(
+                "native token view has NULL text with a nonzero length");
+        return FtsToken{
+            std::string(view.text_len == 0 ? "" : view.text, view.text_len),
+            view.position};
+    }
+
+    /// Copy all tokens in native order.
+    std::vector<FtsToken> tokens() const {
+        std::vector<FtsToken> out;
+        size_t count = size();
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) out.push_back(at(i));
+        return out;
+    }
+
+    const LanceFtsTokenList* c_handle() const { return handle_.get(); }
+};
+
+/// Native process-wide object-store IOPS counter, with no reset semantics.
+inline uint64_t process_iops_counter() {
+    uint64_t value = lance_process_iops_counter();
+    if (lance_last_error_code() != LANCE_OK) check_error();
+    return value;
+}
+
+/// Native process-wide object-store bytes-read counter, with no reset
+/// semantics.
+inline uint64_t process_bytes_read_counter() {
+    uint64_t value = lance_process_bytes_read_counter();
+    if (lance_last_error_code() != LANCE_OK) check_error();
+    return value;
+}
+
+/// One read of both native process counters.
+struct ProcessIoCounters {
+    uint64_t iops = 0;
+    uint64_t bytes_read = 0;
+};
+
+inline ProcessIoCounters process_io_counters() {
+    ProcessIoCounters counters;
+    counters.iops = lance_process_iops_counter();
+    if (lance_last_error_code() != LANCE_OK) check_error();
+    counters.bytes_read = lance_process_bytes_read_counter();
+    if (lance_last_error_code() != LANCE_OK) check_error();
+    return counters;
+}
+
+/// Native SIMD report as the exact JSON object produced by
+/// `lance_simd_info_json()`: `tier`, `target_arch`, and `host_features`.
+inline std::string simd_info_json() {
+    const char* raw = lance_simd_info_json();
+    if (!raw) check_error();
+    std::unique_ptr<const char, void (*)(const char*)> guard(
+        raw, lance_free_string);
+    return std::string(raw);
+}
+
 // ─── Blob file ───────────────────────────────────────────────────────────────
 
 /// One blob-relative byte range for `BlobFile::read_ranges()`.
 struct BlobRange {
     uint64_t offset;
     uint64_t length;
+};
+
+/// Native storage thresholds for `blob_field`.
+///
+/// An engaged inline threshold of zero is valid. An engaged dedicated
+/// threshold must be non-zero. Values not representable by `size_t` are
+/// rejected by the C boundary.
+struct BlobFieldOptions {
+    std::optional<size_t> inline_size_threshold;
+    std::optional<size_t> dedicated_size_threshold;
+};
+
+/// Export the native blob v2 field with default storage thresholds.
+///
+/// `out` is caller-owned and must be released exactly once. It is written only
+/// on success.
+inline void blob_field(
+    const std::string& name,
+    bool nullable,
+    ArrowSchema* out) {
+    if (lance_blob_field(name.c_str(), nullable, out) != 0) check_error();
+}
+
+/// Export the native blob v2 field with explicit storage thresholds.
+///
+/// `out` is caller-owned and must be released exactly once. It is written only
+/// on success.
+inline void blob_field_with_options(
+    const std::string& name,
+    bool nullable,
+    const BlobFieldOptions& options,
+    ArrowSchema* out) {
+    LanceBlobFieldOptions raw{};
+    if (options.inline_size_threshold) {
+        raw.has_inline_size_threshold = true;
+        raw.inline_size_threshold =
+            static_cast<uint64_t>(*options.inline_size_threshold);
+    }
+    if (options.dedicated_size_threshold) {
+        raw.has_dedicated_size_threshold = true;
+        raw.dedicated_size_threshold =
+            static_cast<uint64_t>(*options.dedicated_size_threshold);
+    }
+    if (lance_blob_field_with_options(name.c_str(), nullable, &raw, out) != 0)
+        check_error();
+}
+
+/// RAII owner of a native writer-prepared blob descriptor array builder.
+///
+/// This produces the prepared Arrow field/array consumed by dataset writes.
+/// `finish()` consumes the native builder; `field()` remains available
+/// afterwards, while later appends throw. The wrapper does not write payload
+/// objects or commit data.
+class BlobDescriptorArrayBuilder {
+    Handle<LanceBlobDescriptorArrayBuilder,
+           lance_blob_descriptor_array_builder_close>
+        handle_;
+
+public:
+    explicit BlobDescriptorArrayBuilder(const std::string& column)
+        : handle_(lance_blob_descriptor_array_builder_new(column.c_str())) {
+        if (!handle_) check_error();
+    }
+
+    void append_inline(const uint8_t* data, size_t len) {
+        if (lance_blob_descriptor_array_builder_append_inline(
+                handle_.get(), data, len) != 0) {
+            check_error();
+        }
+    }
+
+    void append_inline(const std::vector<uint8_t>& data) {
+        append_inline(data.empty() ? nullptr : data.data(), data.size());
+    }
+
+    void append_null() {
+        if (lance_blob_descriptor_array_builder_append_null(handle_.get()) != 0)
+            check_error();
+    }
+
+    void append_packed(uint32_t blob_id, uint64_t offset, uint64_t length) {
+        if (lance_blob_descriptor_array_builder_append_packed(
+                handle_.get(), blob_id, offset, length) != 0) {
+            check_error();
+        }
+    }
+
+    void append_packed(uint32_t blob_id, const BlobRange& range) {
+        append_packed(blob_id, range.offset, range.length);
+    }
+
+    void extend_packed(uint32_t blob_id,
+                       const std::vector<BlobRange>& ranges) {
+        std::vector<LanceBlobRange> raw;
+        raw.reserve(ranges.size());
+        for (const auto& range : ranges) {
+            raw.push_back({range.offset, range.length});
+        }
+        if (lance_blob_descriptor_array_builder_extend_packed(
+                handle_.get(), blob_id, raw.data(), raw.size()) != 0) {
+            check_error();
+        }
+    }
+
+    void append_dedicated(uint32_t blob_id, uint64_t length) {
+        if (lance_blob_descriptor_array_builder_append_dedicated(
+                handle_.get(), blob_id, length) != 0) {
+            check_error();
+        }
+    }
+
+    void append_managed(
+        const std::string& uri,
+        uint64_t offset,
+        uint64_t length,
+        std::optional<uint32_t> base_id = std::nullopt) {
+        if (lance_blob_descriptor_array_builder_append_managed(
+                handle_.get(), uri.c_str(), offset, length, base_id.has_value(),
+                base_id.value_or(0)) != 0) {
+            check_error();
+        }
+    }
+
+    void append_external(uint32_t base_id,
+                         const std::string& uri,
+                         uint64_t offset,
+                         uint64_t length) {
+        if (lance_blob_descriptor_array_builder_append_external(
+                handle_.get(), base_id, uri.c_str(), offset, length) != 0) {
+            check_error();
+        }
+    }
+
+    void push_external(const std::string& uri,
+                       std::optional<BlobRange> range = std::nullopt) {
+        if (lance_blob_descriptor_array_builder_push_external(
+                handle_.get(), uri.c_str(), range.has_value(),
+                range ? range->offset : 0, range ? range->length : 0) != 0) {
+            check_error();
+        }
+    }
+
+    /// Export the prepared field. `out` is caller-owned and must be released.
+    void field(ArrowSchema* out) const {
+        if (lance_blob_descriptor_array_builder_field(handle_.get(), out) != 0)
+            check_error();
+    }
+
+    /// Consume the native builder and export its prepared array and field.
+    /// Both outputs are caller-owned and must each be released exactly once.
+    void finish(ArrowArray* out_array, ArrowSchema* out_schema) {
+        if (lance_blob_descriptor_array_builder_finish(
+                handle_.get(), out_array, out_schema) != 0) {
+            check_error();
+        }
+    }
+};
+
+/// Move-only owner of a native packed blob writer.
+///
+/// The destructor frees the C allocation without finishing. `finish_array()`
+/// consumes the native writer but leaves this object allocation valid, so
+/// later calls throw `LANCE_ERR_INVALID_ARGUMENT`.
+class PackedBlobWriter {
+    Handle<LancePackedBlobWriter, lance_packed_blob_writer_close> handle_;
+
+public:
+    explicit PackedBlobWriter(LancePackedBlobWriter* writer) : handle_(writer) {}
+
+    PackedBlobWriter(PackedBlobWriter&&) noexcept = default;
+    PackedBlobWriter& operator=(PackedBlobWriter&&) noexcept = default;
+    PackedBlobWriter(const PackedBlobWriter&) = delete;
+    PackedBlobWriter& operator=(const PackedBlobWriter&) = delete;
+
+    /// Native blob ID. Throws when the writer is NULL or finished.
+    uint32_t blob_id() const {
+        uint32_t value = lance_packed_blob_writer_blob_id(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Native sidecar path. Throws when the writer is NULL or finished.
+    std::string path() const {
+        const char* raw = lance_packed_blob_writer_path(handle_.get());
+        if (!raw) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            raw, lance_free_string);
+        return std::string(raw);
+    }
+
+    /// Append one payload. A null pointer with zero length is valid.
+    void write_blob(const uint8_t* data, size_t len) {
+        if (lance_packed_blob_writer_write_blob(handle_.get(), data, len) != 0)
+            check_error();
+    }
+
+    void write_blob(const std::vector<uint8_t>& data) {
+        write_blob(data.empty() ? nullptr : data.data(), data.size());
+    }
+
+    /// Move one binary ArrowArray into the writer; `schema` is borrowed.
+    void write_blobs(ArrowArray* payloads, const ArrowSchema* schema) {
+        if (lance_packed_blob_writer_write_blobs(
+                handle_.get(), payloads, schema) != 0) {
+            check_error();
+        }
+    }
+
+    /// Consume the native writer and export caller-owned prepared parts.
+    void finish_array(
+        const std::string& field_name,
+        ArrowArray* out_array,
+        ArrowSchema* out_schema) {
+        if (lance_packed_blob_writer_finish_array(
+                handle_.get(), field_name.c_str(), out_array, out_schema) != 0) {
+            check_error();
+        }
+    }
+};
+
+/// Move-only owner of a native dedicated blob writer.
+///
+/// Repeated writes concatenate into one sidecar. The destructor frees the C
+/// allocation without finishing.
+class DedicatedBlobWriter {
+    Handle<LanceDedicatedBlobWriter, lance_dedicated_blob_writer_close> handle_;
+
+public:
+    explicit DedicatedBlobWriter(LanceDedicatedBlobWriter* writer)
+        : handle_(writer) {}
+
+    DedicatedBlobWriter(DedicatedBlobWriter&&) noexcept = default;
+    DedicatedBlobWriter& operator=(DedicatedBlobWriter&&) noexcept = default;
+    DedicatedBlobWriter(const DedicatedBlobWriter&) = delete;
+    DedicatedBlobWriter& operator=(const DedicatedBlobWriter&) = delete;
+
+    /// Native blob ID. Throws when the writer is NULL or finished.
+    uint32_t blob_id() const {
+        uint32_t value = lance_dedicated_blob_writer_blob_id(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Native sidecar path. Throws when the writer is NULL or finished.
+    std::string path() const {
+        const char* raw = lance_dedicated_blob_writer_path(handle_.get());
+        if (!raw) check_error();
+        std::unique_ptr<const char, void (*)(const char*)> guard(
+            raw, lance_free_string);
+        return std::string(raw);
+    }
+
+    /// Append bytes. Repeated calls concatenate.
+    void write(const uint8_t* data, size_t len) {
+        if (lance_dedicated_blob_writer_write(handle_.get(), data, len) != 0)
+            check_error();
+    }
+
+    void write(const std::vector<uint8_t>& data) {
+        write(data.empty() ? nullptr : data.data(), data.size());
+    }
+
+    /// Consume the native writer and export caller-owned prepared parts.
+    void finish_array(
+        const std::string& field_name,
+        ArrowArray* out_array,
+        ArrowSchema* out_schema) {
+        if (lance_dedicated_blob_writer_finish_array(
+                handle_.get(), field_name.c_str(), out_array, out_schema) != 0) {
+            check_error();
+        }
+    }
+};
+
+/// Row selector for planned whole-blob and range reads.
+enum class BlobRowSelector : int32_t {
+    None      = LANCE_BLOB_ROWS_NONE,
+    Ids       = LANCE_BLOB_ROWS_IDS,
+    Addresses = LANCE_BLOB_ROWS_ADDRESSES,
+    Indices   = LANCE_BLOB_ROWS_INDICES,
+};
+
+/// Options for `Dataset::read_blobs()` and `Dataset::read_blob_ranges()`.
+///
+/// `io_buffer_size` defaults to native `None`; an engaged zero is forwarded to
+/// native and rejected there.
+struct BlobReadOptions {
+    std::optional<uint64_t> io_buffer_size;
+    bool preserve_order = true;
+};
+
+/// One row-specific blob-range request for `Dataset::read_blob_ranges()`.
+struct BlobRangeRequest {
+    uint64_t row = 0;
+    uint64_t offset = 0;
+    uint64_t length = 0;
 };
 
 /// RAII handle over one value of a Blob v2 column, from `Dataset::take_blobs()`,
@@ -1306,12 +4310,13 @@ public:
     }
 };
 
-// ─── Read-only fragment snapshot ─────────────────────────────────────────────
+// ─── Fragment handles ────────────────────────────────────────────────────────
 
-/// RAII handle over one fragment from a dataset snapshot. Native
-/// `FileFragment` owns an `Arc<Dataset>`, so this handle remains valid and
-/// keeps reading the same dataset version after the source Dataset is closed
-/// or mutated. Methods expose only read-only metadata and row counts.
+/// RAII handle over a dataset-bound or independently constructed fragment.
+/// Native `FileFragment` owns an `Arc<Dataset>`, so bound handles remain valid
+/// and keep reading the same dataset version after the source Dataset is closed
+/// or mutated. Detached handles own copied native metadata and support
+/// operation construction without dataset access.
 class Fragment {
     Handle<LanceFragment, lance_fragment_close> handle_;
 
@@ -1323,6 +4328,18 @@ public:
     Fragment& operator=(Fragment&&) noexcept = default;
     Fragment(const Fragment&) = delete;
     Fragment& operator=(const Fragment&) = delete;
+
+    /// Construct detached native Fragment metadata from borrowed data files.
+    ///
+    /// The data files are cloned in input order. `physical_rows ==
+    /// std::nullopt` maps to native `None`; all other metadata retains native
+    /// `Fragment::new` defaults. A fragment ID of zero requests native
+    /// commit-time allocation. Schema coverage and `physical_rows` are caller
+    /// metadata; this constructor does not infer or revalidate them.
+    static Fragment from_data_files(
+        uint64_t fragment_id,
+        const std::vector<const DataFile*>& data_files,
+        std::optional<uint64_t> physical_rows = std::nullopt);
 
     /// Native fragment ID.
     uint64_t id() const {
@@ -1336,6 +4353,37 @@ public:
         uint64_t value = lance_fragment_data_file_count(handle_.get());
         if (lance_last_error_code() != LANCE_OK) check_error();
         return value;
+    }
+
+    /// Whether this handle retains a dataset-bound native fragment.
+    bool is_bound() const {
+        bool value = false;
+        if (lance_fragment_is_bound(handle_.get(), &value) != 0) check_error();
+        return value;
+    }
+
+    /// Clone one native base data file from owned fragment metadata.
+    DataFile data_file_at(size_t index) const {
+        LanceDataFile* raw = nullptr;
+        if (lance_fragment_data_file_at(handle_.get(), index, &raw) != 0)
+            check_error();
+        if (!raw) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_fragment_data_file_at returned success with "
+                        "null data file");
+        }
+        return DataFile(raw);
+    }
+
+    /// Find the native base data file that stores a field ID. Missing fields
+    /// return std::nullopt; a negative field ID is an invalid argument.
+    std::optional<DataFile> data_file_for_field(int32_t field_id) const {
+        LanceDataFile* raw = nullptr;
+        if (lance_fragment_data_file_for_field(
+                handle_.get(), field_id, &raw) != 0)
+            check_error();
+        if (!raw) return std::nullopt;
+        return DataFile(raw);
     }
 
     /// Native `Fragment` metadata serialized as JSON. Includes base data
@@ -1354,6 +4402,9 @@ public:
     void schema(ArrowSchema* out) const {
         if (lance_fragment_schema(handle_.get(), out) != 0) check_error();
     }
+
+    /// Clone the fragment's native schema from its staged dataset snapshot.
+    LanceSchema native_schema() const;
 
     /// Physical row count, including deleted rows. May perform data-file I/O.
     uint64_t physical_rows() const {
@@ -1375,6 +4426,14 @@ public:
     uint64_t logical_rows() const {
         uint64_t value = 0;
         if (lance_fragment_logical_rows(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    /// Dataset read version captured by this bound fragment.
+    uint64_t read_version() const {
+        uint64_t value = 0;
+        if (lance_fragment_read_version(handle_.get(), &value) != 0)
             check_error();
         return value;
     }
@@ -1411,8 +4470,137 @@ public:
     /// deletion returns `std::nullopt`.
     std::optional<Fragment> delete_if(const std::string& predicate) const;
 
+    /// Add SQL-derived columns to this bound fragment.
+    ///
+    /// `batch_size == std::nullopt` maps to native `None`; an engaged zero is
+    /// forwarded as `Some(0)`. Returns detached fragment metadata and the
+    /// complete native final schema for a later Merge operation.
+    std::pair<Fragment, LanceSchema> add_columns_sql(
+        const std::vector<SqlColumn>& columns,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
+    /// Add all-null columns described by a borrowed Arrow schema.
+    std::pair<Fragment, LanceSchema> add_columns_nulls(
+        const ArrowSchema* columns) const;
+
+    /// Add columns from a consumed Arrow stream using Native Reader semantics.
+    std::pair<Fragment, LanceSchema> add_columns_reader(
+        ArrowArrayStream* stream,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
+    /// Add columns through the shared BatchUDF callback adapter.
+    std::pair<Fragment, LanceSchema> add_columns_batch_udf(
+        const BatchUDF& udf,
+        std::optional<std::vector<std::string>> read_columns = std::nullopt,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
+    /// Merge a consumed right-hand Arrow stream into this bound fragment.
+    std::pair<Fragment, LanceSchema> merge_columns(
+        ArrowArrayStream* stream,
+        const std::string& left_on,
+        const std::string& right_on) const;
+
+    /// Rewrite existing columns through a native join and return matched
+    /// physical offsets with the updated metadata.
+    FragmentUpdateColumnsResult update_columns(
+        ArrowArrayStream* stream,
+        const std::string& left_on,
+        const std::string& right_on) const;
+
+    /// Stage a replacement data file using the manifest's default version.
+    DataReplacementGroup write_columns(
+        const LanceSchema& schema,
+        ArrowArrayStream* stream) const;
+
+    /// Stage a replacement data file using an explicit native file version.
+    DataReplacementGroup write_column_with_version(
+        const LanceSchema& schema,
+        ArrowArrayStream* stream,
+        LanceFileFormatVersion file_version) const;
+
+    /// Add physical row offsets to a clone and return updated bound metadata.
+    /// A full deletion returns `std::nullopt`.
+    std::optional<Fragment> delete_rows(
+        const std::vector<uint32_t>& offsets) const;
+
+    /// Open an overlay writer for this bound fragment. The schema may be a
+    /// compatible subset of the fragment schema. Commit the resulting overlay
+    /// with the dataset read version used to open the writer.
+    /// Native overlays are experimental. For release builds, set
+    /// `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads
+    /// or modifies an overlay dataset, including before publication.
+    FragmentOverlayWriter write_overlay(const LanceSchema& schema) const;
+
+    /// Create one fragment without publishing a version.
+    ///
+    /// Maps to native `FragmentCreateBuilder::write(source, Some(fragment_id))`.
+    /// Native owns schema inference and compatibility, file format, physical row
+    /// counts and error semantics; an empty input fails with the native "Input
+    /// data was empty." error. The stream is consumed on every return path,
+    /// including a null stream pointer (which is rejected unconsumed) and local
+    /// conversion failures. A null `options.schema` keeps native inference.
+    ///
+    /// Returns independently owned detached metadata that stays valid after the
+    /// source dataset, schema and session are closed. Closing it never deletes
+    /// the written data file; publish the fragment with an Append transaction.
+    static Fragment create(
+        const std::string& dataset_uri,
+        ArrowArrayStream* stream,
+        uint64_t fragment_id,
+        const FragmentCreateOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
+
+    /// Create zero or more fragments without publishing a version.
+    ///
+    /// Maps to native `FragmentCreateBuilder::write_fragments`, so
+    /// `options.write.params.max_rows_per_file` splitting and fragment ID
+    /// assignment stay native. The stream follows the same consumption contract
+    /// as `create`; an empty input returns an empty vector.
+    static std::vector<Fragment> create_many(
+        const std::string& dataset_uri,
+        ArrowArrayStream* stream,
+        const FragmentCreateOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
+
+    /// Create one fragment from an existing Lance data file in `dataset`'s data
+    /// directory.
+    ///
+    /// Maps to native `FileFragment::create_from_file`. `filename` is relative
+    /// to the dataset's data directory. `physical_rows == std::nullopt` maps to
+    /// native `None`; an engaged value maps to `Some(value)`. Native owns file
+    /// version, schema compatibility and physical-row validation. The dataset
+    /// supplies the target snapshot and is not modified. A file whose stored
+    /// schema native cannot project to the dataset schema is rejected, as with
+    /// Blob v2 data files.
+    static Fragment create_from_file(
+        const Dataset& dataset,
+        const std::string& filename,
+        uint64_t fragment_id,
+        std::optional<uint64_t> physical_rows = std::nullopt);
+
     const LanceFragment* c_handle() const { return handle_.get(); }
 };
+
+inline Fragment Fragment::from_data_files(
+    uint64_t fragment_id,
+    const std::vector<const DataFile*>& data_files,
+    std::optional<uint64_t> physical_rows) {
+    std::vector<const LanceDataFile*> handles;
+    handles.reserve(data_files.size());
+    for (const auto* file : data_files) {
+        handles.push_back(file ? file->c_handle() : nullptr);
+    }
+    uint64_t rows = physical_rows.value_or(0);
+    auto* fragment = lance_fragment_new(
+        fragment_id,
+        handles.empty() ? nullptr : handles.data(),
+        handles.size(),
+        physical_rows ? &rows : nullptr);
+    if (!fragment) check_error();
+    return Fragment(fragment);
+}
 
 inline std::optional<Fragment> Fragment::delete_if(
     const std::string& predicate) const {
@@ -1423,6 +4611,630 @@ inline std::optional<Fragment> Fragment::delete_if(
     }
     if (!raw) return std::nullopt;
     return Fragment(raw);
+}
+
+/// Move-only owner of a native `FragmentUpdateColumnsResult`.
+class FragmentUpdateColumnsResult {
+    Handle<LanceFragmentUpdateColumnsResult,
+           lance_fragment_update_columns_result_close>
+        handle_;
+
+public:
+    explicit FragmentUpdateColumnsResult(LanceFragmentUpdateColumnsResult* result)
+        : handle_(result) {
+        if (!handle_) check_error();
+    }
+
+    FragmentUpdateColumnsResult(FragmentUpdateColumnsResult&&) noexcept = default;
+    FragmentUpdateColumnsResult& operator=(
+        FragmentUpdateColumnsResult&&) noexcept = default;
+    FragmentUpdateColumnsResult(const FragmentUpdateColumnsResult&) = delete;
+    FragmentUpdateColumnsResult& operator=(
+        const FragmentUpdateColumnsResult&) = delete;
+
+    /// Independent detached fragment metadata.
+    Fragment fragment() const {
+        LanceFragment* raw = nullptr;
+        if (lance_fragment_update_columns_result_fragment(
+                handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        if (!raw) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "update-columns result fragment getter returned null");
+        }
+        return Fragment(raw);
+    }
+
+    /// Native modified field IDs in result order.
+    std::vector<uint32_t> fields_modified() const {
+        uint64_t count = 0;
+        if (lance_fragment_update_columns_result_fields_modified_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::vector<uint32_t> out;
+        out.reserve(static_cast<std::size_t>(count));
+        for (uint64_t i = 0; i < count; ++i) {
+            uint32_t field_id = 0;
+            if (lance_fragment_update_columns_result_fields_modified_at(
+                    handle_.get(), static_cast<std::size_t>(i),
+                    &field_id) != 0) {
+                check_error();
+            }
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Matched physical row offsets in their native u32 domain, copied in one pass.
+    std::vector<uint32_t> matched_offsets() const {
+        uint64_t count = 0;
+        if (lance_fragment_update_columns_result_matched_offset_count(
+                handle_.get(), &count) != 0) {
+            check_error();
+        }
+        std::vector<uint32_t> out;
+        if (count > out.max_size()) {
+            throw std::length_error("matched offset count exceeds vector max_size");
+        }
+        out.resize(static_cast<std::size_t>(count));
+        if (lance_fragment_update_columns_result_matched_offsets(
+                handle_.get(), out.data(), out.size()) != 0) {
+            check_error();
+        }
+        return out;
+    }
+
+    /// Portable Roaring interoperability export. Normal Update construction
+    /// should use matched_offsets() directly.
+    std::vector<uint8_t> matched_offsets_serialized() const {
+        uint8_t* bytes = nullptr;
+        std::size_t len = 0;
+        if (lance_fragment_update_columns_result_matched_offsets_serialize(
+                handle_.get(), &bytes, &len) != 0) {
+            check_error();
+        }
+        std::unique_ptr<uint8_t, void (*)(uint8_t*)> guard(
+            bytes, lance_free_bytes);
+        if (bytes == nullptr) return {};
+        return std::vector<uint8_t>(bytes, bytes + len);
+    }
+
+    const LanceFragmentUpdateColumnsResult* c_handle() const {
+        return handle_.get();
+    }
+};
+
+/// Move-only owner of a native Lance schema.
+///
+/// Unlike the Arrow export, a native schema preserves field and parent IDs,
+/// logical types, encodings, dictionary values, nested metadata, field order
+/// and nullability. A clone remains valid after the dataset, fragment or
+/// operation that produced it is closed.
+class LanceSchema {
+    Handle<::LanceSchema, lance_schema_close> handle_;
+
+public:
+    explicit LanceSchema(::LanceSchema* schema) : handle_(schema) {
+        if (!handle_) check_error();
+    }
+
+    LanceSchema(LanceSchema&&) noexcept = default;
+    LanceSchema& operator=(LanceSchema&&) noexcept = default;
+    LanceSchema(const LanceSchema&) = delete;
+    LanceSchema& operator=(const LanceSchema&) = delete;
+
+    /// Independently owned native clone.
+    LanceSchema clone() const {
+        ::LanceSchema* raw = lance_schema_clone(handle_.get());
+        if (!raw) check_error();
+        return LanceSchema(raw);
+    }
+
+    /// Clone the current snapshot schema of a dataset.
+    static LanceSchema from_dataset(const Dataset& dataset);
+
+    /// Clone the staged snapshot schema of a fragment.
+    static LanceSchema from_fragment(const Fragment& fragment);
+
+    /// Clone the in-memory schema of an Overwrite, Merge or Project operation.
+    /// Other kinds throw LANCE_ERR_NOT_SUPPORTED.
+    static LanceSchema from_operation(const Operation& operation);
+
+    /// Project onto ordered native column paths. Paths, order, unknown-column
+    /// errors and empty-selection behavior are native `Schema::project`.
+    static LanceSchema project(const LanceSchema& schema,
+                               const std::vector<std::string>& columns) {
+        std::vector<const char*> paths;
+        paths.reserve(columns.size());
+        for (const auto& column : columns) paths.push_back(column.c_str());
+        ::LanceSchema* raw = nullptr;
+        if (lance_schema_project(
+                schema.c_handle(), paths.empty() ? nullptr : paths.data(),
+                paths.size(), &raw) != 0) {
+            check_error();
+        }
+        return LanceSchema(raw);
+    }
+
+    /// Native Lance field ID for a column path. Throws when the path does not
+    /// resolve.
+    int32_t field_id(const std::string& column) const {
+        int32_t id = 0;
+        if (lance_schema_field_id(
+                handle_.get(), column.c_str(), &id) != 0) {
+            check_error();
+        }
+        return id;
+    }
+
+    /// Build a native schema from a borrowed Arrow schema. Fields without a
+    /// `lance:field_id` metadata entry receive fresh native IDs; existing
+    /// IDs, dictionaries, and metadata are preserved. Throws on native
+    /// validation failure.
+    static LanceSchema from_arrow(const ArrowSchema* schema);
+
+    /// Export an Arrow interoperability view. `out` is caller-owned and must
+    /// be released exactly once. Arrow cannot represent every native detail.
+    void to_arrow(ArrowSchema* out) const {
+        if (lance_schema_to_arrow(handle_.get(), out) != 0) check_error();
+    }
+
+    const ::LanceSchema* c_handle() const { return handle_.get(); }
+};
+
+inline LanceSchema Fragment::native_schema() const {
+    return LanceSchema::from_fragment(*this);
+}
+
+namespace fragment_mutation_detail {
+
+inline std::pair<Fragment, LanceSchema> take_fragment_schema_pair(
+    ::LanceFragment* fragment, ::LanceSchema* schema) {
+    if (!fragment || !schema) {
+        if (fragment) lance_fragment_close(fragment);
+        if (schema) lance_schema_close(schema);
+        throw Error(LANCE_ERR_INTERNAL,
+                    "fragment mutation returned a null success output");
+    }
+    return std::pair<Fragment, LanceSchema>(
+        Fragment(fragment), LanceSchema(schema));
+}
+
+inline DataReplacementGroup take_replacement_group(
+    LanceDataReplacementGroup* group) {
+    if (!group) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "fragment write_columns returned a null group");
+    }
+    return DataReplacementGroup(group);
+}
+
+}  // namespace fragment_mutation_detail
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_sql(
+    const std::vector<SqlColumn>& columns,
+    std::optional<uint32_t> batch_size) const {
+    std::vector<LanceSqlColumn> raw;
+    raw.reserve(columns.size());
+    for (const auto& column : columns) {
+        LanceSqlColumn entry{};
+        entry.name = column.name.c_str();
+        entry.expression = column.expression.c_str();
+        raw.push_back(entry);
+    }
+    const uint32_t batch_size_value = batch_size.value_or(0);
+    const uint32_t* batch_size_ptr = batch_size ? &batch_size_value : nullptr;
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_sql(
+            handle_.get(), raw.empty() ? nullptr : raw.data(), raw.size(),
+            batch_size_ptr, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_nulls(
+    const ArrowSchema* columns) const {
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_nulls(
+            handle_.get(), columns, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_reader(
+    ArrowArrayStream* stream, std::optional<uint32_t> batch_size) const {
+    const uint32_t batch_size_value = batch_size.value_or(0);
+    const uint32_t* batch_size_ptr = batch_size ? &batch_size_value : nullptr;
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_stream(
+            handle_.get(), stream, batch_size_ptr, &out_fragment,
+            &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_batch_udf(
+    const BatchUDF& udf,
+    std::optional<std::vector<std::string>> read_columns,
+    std::optional<uint32_t> batch_size) const {
+    callback_detail::BatchUDFCall call(
+        udf, std::move(read_columns), batch_size);
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_batch_udf(
+            handle_.get(), &call.raw, call.read_columns_ptr,
+            call.batch_size_ptr, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::merge_columns(
+    ArrowArrayStream* stream,
+    const std::string& left_on,
+    const std::string& right_on) const {
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_merge_columns(
+            handle_.get(), stream, left_on.c_str(), right_on.c_str(),
+            &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline FragmentUpdateColumnsResult Fragment::update_columns(
+    ArrowArrayStream* stream,
+    const std::string& left_on,
+    const std::string& right_on) const {
+    LanceFragmentUpdateColumnsResult* result = nullptr;
+    if (lance_fragment_update_columns(
+            handle_.get(), stream, left_on.c_str(), right_on.c_str(),
+            &result) != 0) {
+        check_error();
+    }
+    if (!result) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "fragment update_columns returned a null result");
+    }
+    return FragmentUpdateColumnsResult(result);
+}
+
+inline DataReplacementGroup Fragment::write_columns(
+    const LanceSchema& schema, ArrowArrayStream* stream) const {
+    LanceDataReplacementGroup* group = nullptr;
+    if (lance_fragment_write_columns(
+            handle_.get(), schema.c_handle(), stream, &group) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_replacement_group(group);
+}
+
+inline DataReplacementGroup Fragment::write_column_with_version(
+    const LanceSchema& schema,
+    ArrowArrayStream* stream,
+    LanceFileFormatVersion file_version) const {
+    LanceDataReplacementGroup* group = nullptr;
+    if (lance_fragment_write_column_with_version(
+            handle_.get(), schema.c_handle(), stream,
+            static_cast<int32_t>(file_version), &group) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_replacement_group(group);
+}
+
+inline std::optional<Fragment> Fragment::delete_rows(
+    const std::vector<uint32_t>& offsets) const {
+    LanceFragment* raw = nullptr;
+    if (lance_fragment_delete_rows(
+            handle_.get(), offsets.empty() ? nullptr : offsets.data(),
+            offsets.size(), &raw) != 0) {
+        check_error();
+    }
+    if (!raw) return std::nullopt;
+    return Fragment(raw);
+}
+
+inline LanceSchema LanceSchema::from_fragment(const Fragment& fragment) {
+    ::LanceSchema* raw = nullptr;
+    if (lance_fragment_schema_clone(fragment.c_handle(), &raw) != 0) {
+        check_error();
+    }
+    return LanceSchema(raw);
+}
+
+inline LanceSchema LanceSchema::from_operation(const Operation& operation) {
+    ::LanceSchema* raw = nullptr;
+    if (lance_operation_schema_clone(operation.c_handle(), &raw) != 0) {
+        check_error();
+    }
+    return LanceSchema(raw);
+}
+
+inline Operation Operation::make_project(
+    const LanceSchema& schema, bool preserves_nullability) {
+    LanceOperation* raw = nullptr;
+    if (lance_operation_project_new(
+            schema.c_handle(), preserves_nullability, &raw) != 0) {
+        check_error();
+    }
+    return Operation(raw);
+}
+
+inline Fragment Operation::append_fragment_at(size_t index) const {
+    LanceFragment* raw = nullptr;
+    if (lance_operation_append_fragment_at(handle_.get(), index, &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_append_fragment_at returned success "
+                    "with null fragment");
+    }
+    return Fragment(raw);
+}
+
+inline std::vector<BasePath> Operation::update_bases() const {
+    uint64_t count = 0;
+    if (lance_operation_update_bases_count(handle_.get(), &count) != 0)
+        check_error();
+
+    std::vector<BasePath> out;
+    out.reserve(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        LanceBasePathView view{};
+        if (lance_operation_update_bases_at(
+                handle_.get(), static_cast<size_t>(i), &view) != 0)
+            check_error();
+        BasePath base;
+        base.id = view.id;
+        base.path = view.path ? view.path : "";
+        base.name = view.name ? std::optional<std::string>(view.name)
+                              : std::nullopt;
+        base.is_dataset_root = view.is_dataset_root;
+        out.push_back(std::move(base));
+    }
+    return out;
+}
+
+inline Fragment Operation::overwrite_fragment_at(size_t index) const {
+    LanceFragment* raw = nullptr;
+    if (lance_operation_overwrite_fragment_at(handle_.get(), index, &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_overwrite_fragment_at returned success "
+                    "with null fragment");
+    }
+    return Fragment(raw);
+}
+
+inline LanceSchema Operation::overwrite_schema() const {
+    ::LanceSchema* raw = nullptr;
+    if (lance_operation_overwrite_schema_clone(handle_.get(), &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_overwrite_schema_clone returned success "
+                    "with null schema");
+    }
+    return LanceSchema(raw);
+}
+
+inline Fragment Operation::merge_fragment_at(size_t index) const {
+    LanceFragment* raw = nullptr;
+    if (lance_operation_merge_fragment_at(handle_.get(), index, &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_merge_fragment_at returned success "
+                    "with null fragment");
+    }
+    return Fragment(raw);
+}
+
+inline LanceSchema Operation::merge_schema() const {
+    ::LanceSchema* raw = nullptr;
+    if (lance_operation_merge_schema_clone(handle_.get(), &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_merge_schema_clone returned success "
+                    "with null schema");
+    }
+    return LanceSchema(raw);
+}
+
+inline LanceSchema Operation::project_schema() const {
+    ::LanceSchema* raw = nullptr;
+    if (lance_operation_project_schema_clone(handle_.get(), &raw) != 0)
+        check_error();
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_operation_project_schema_clone returned success "
+                    "with null schema");
+    }
+    return LanceSchema(raw);
+}
+
+inline Operation Operation::make_overwrite(
+    const LanceSchema& schema,
+    const std::vector<const Fragment*>& fragments,
+    std::optional<std::vector<std::pair<std::string, std::string>>>
+        config_upsert_values,
+    std::optional<std::vector<BasePath>> initial_bases) {
+    std::vector<const LanceFragment*> fragment_handles;
+    fragment_handles.reserve(fragments.size());
+    for (const Fragment* fragment : fragments) {
+        if (!fragment) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "Operation::make_overwrite received a null fragment");
+        }
+        fragment_handles.push_back(fragment->c_handle());
+    }
+
+    // The native constructor copies all strings before returning.
+    std::vector<std::string> config_keys;
+    std::vector<std::string> config_values;
+    std::vector<const char*> config_key_ptrs;
+    std::vector<const char*> config_value_ptrs;
+    LanceStringMap config_storage{};
+    const LanceStringMap* config_map = nullptr;
+    if (config_upsert_values) {
+        config_keys.reserve(config_upsert_values->size());
+        config_values.reserve(config_upsert_values->size());
+        for (const auto& [key, value] : *config_upsert_values) {
+            config_keys.push_back(key);
+            config_values.push_back(value);
+        }
+        for (size_t i = 0; i < config_keys.size(); ++i) {
+            config_key_ptrs.push_back(config_keys[i].c_str());
+            config_value_ptrs.push_back(config_values[i].c_str());
+        }
+        config_storage.keys =
+            config_key_ptrs.empty() ? nullptr : config_key_ptrs.data();
+        config_storage.values =
+            config_value_ptrs.empty() ? nullptr : config_value_ptrs.data();
+        config_storage.count = config_key_ptrs.size();
+        config_map = &config_storage;
+    }
+
+    std::vector<LanceBasePath> base_views;
+    LanceBasePath empty_base{};
+    LanceBasePathList base_list{};
+    const LanceBasePathList* initial_base_list = nullptr;
+    if (initial_bases) {
+        base_views.reserve(initial_bases->size());
+        for (const BasePath& base : *initial_bases) {
+            LanceBasePath view{};
+            view.id = base.id;
+            view.path = base.path.c_str();
+            view.name = base.name ? base.name->c_str() : nullptr;
+            view.is_dataset_root = base.is_dataset_root;
+            base_views.push_back(view);
+        }
+        base_list.items =
+            base_views.empty() ? &empty_base : base_views.data();
+        base_list.count = base_views.size();
+        initial_base_list = &base_list;
+    }
+
+    auto* raw = lance_operation_overwrite_new(
+        schema.c_handle(),
+        fragment_handles.empty() ? nullptr : fragment_handles.data(),
+        fragment_handles.size(), config_map, initial_base_list);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_merge(
+    const LanceSchema& schema,
+    const std::vector<const Fragment*>& fragments,
+    bool preserves_nullability) {
+    std::vector<const LanceFragment*> fragment_handles;
+    fragment_handles.reserve(fragments.size());
+    for (const Fragment* fragment : fragments) {
+        if (!fragment) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "Operation::make_merge received a null fragment");
+        }
+        fragment_handles.push_back(fragment->c_handle());
+    }
+    auto* raw = lance_operation_merge_new(
+        schema.c_handle(),
+        fragment_handles.empty() ? nullptr : fragment_handles.data(),
+        fragment_handles.size(), preserves_nullability);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_clone(
+    bool is_shallow, std::optional<std::string> ref_name,
+    uint64_t ref_version, std::string ref_path,
+    std::optional<std::string> branch_name) {
+    auto* raw = lance_operation_clone_new(
+        is_shallow, ref_name ? ref_name->c_str() : nullptr, ref_version,
+        ref_path.c_str(), branch_name ? branch_name->c_str() : nullptr);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_update_config(
+    const UpdateConfigOptions& options) {
+    std::vector<LanceFieldMetadataUpdateMap> field_updates;
+    field_updates.reserve(options.field_metadata_updates.size());
+    for (const auto& [field_id, updates] : options.field_metadata_updates) {
+        LanceFieldMetadataUpdateMap entry{};
+        entry.field_id = field_id;
+        entry.updates = updates.c_handle();
+        field_updates.push_back(entry);
+    }
+
+    LanceUpdateConfigOperationOptions c_options{};
+    c_options.config_updates =
+        options.config_updates ? options.config_updates->c_handle() : nullptr;
+    c_options.table_metadata_updates =
+        options.table_metadata_updates
+            ? options.table_metadata_updates->c_handle()
+            : nullptr;
+    c_options.schema_metadata_updates =
+        options.schema_metadata_updates
+            ? options.schema_metadata_updates->c_handle()
+            : nullptr;
+    c_options.field_metadata_updates =
+        field_updates.empty() ? nullptr : field_updates.data();
+    c_options.field_metadata_update_count = field_updates.size();
+
+    auto* raw = lance_operation_update_config_new(&c_options);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_append(
+    const std::vector<const Fragment*>& fragments) {
+    std::vector<const LanceFragment*> handles;
+    handles.reserve(fragments.size());
+    for (const auto* fragment : fragments) {
+        if (!fragment) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "append fragment must not be null");
+        }
+        handles.push_back(fragment->c_handle());
+    }
+    auto* operation = lance_operation_append_new(
+        handles.empty() ? nullptr : handles.data(), handles.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline Operation Operation::make_update_bases(
+    const std::vector<BasePath>& new_bases) {
+    std::vector<LanceBasePath> raw;
+    raw.reserve(new_bases.size());
+    for (const auto& base : new_bases) {
+        LanceBasePath entry{};
+        entry.id = base.id;
+        entry.path = base.path.c_str();
+        entry.name = base.name ? base.name->c_str() : nullptr;
+        entry.is_dataset_root = base.is_dataset_root;
+        raw.push_back(entry);
+    }
+    auto* operation = lance_operation_update_bases_new(
+        raw.empty() ? nullptr : raw.data(), raw.size());
+    if (!operation) check_error();
+    return Operation(operation);
 }
 
 inline Operation Operation::make_delete(
@@ -1445,6 +5257,1745 @@ inline Operation Operation::make_delete(
     if (!operation) check_error();
     return Operation(operation);
 }
+
+inline Operation Operation::make_data_replacement(
+    const std::vector<const DataReplacementGroup*>& replacements) {
+    std::vector<const LanceDataReplacementGroup*> handles;
+    handles.reserve(replacements.size());
+    for (const auto* replacement : replacements) {
+        if (!replacement) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "data replacement group must not be null");
+        }
+        handles.push_back(replacement->c_handle());
+    }
+    auto* operation = lance_operation_data_replacement_new(
+        handles.empty() ? nullptr : handles.data(), handles.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline Operation Operation::make_data_overlay(
+    const std::vector<const DataOverlayGroup*>& groups) {
+    std::vector<const LanceDataOverlayGroup*> handles;
+    handles.reserve(groups.size());
+    for (const auto* group : groups) {
+        if (!group) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "data overlay group must not be null");
+        }
+        handles.push_back(group->c_handle());
+    }
+    auto* operation = lance_operation_data_overlay_new(
+        handles.empty() ? nullptr : handles.data(), handles.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+/// Additive native vector-build options.
+///
+/// A default-constructed value leaves every optional native field absent.
+/// `train == std::nullopt` retains the native train=true default. Arrow models
+/// are borrowed for the call; `IndexModel` values must outlive the call or
+/// builder-creation call that receives them.
+struct VectorIndexOptions {
+    LanceVectorIndexType index_type = LANCE_INDEX_IVF_FLAT;
+    LanceMetricType metric = LANCE_METRIC_L2;
+
+    std::optional<uint64_t> num_partitions;
+    std::optional<uint64_t> target_partition_size;
+    std::optional<uint64_t> max_iters;
+    std::optional<uint64_t> sample_rate;
+    std::optional<uint64_t> streaming_sample_rate;
+    std::optional<uint64_t> streaming_coreset_rate;
+    uint64_t streaming_refine_passes = 0;
+
+    std::optional<std::string> precomputed_partitions_file;
+    std::optional<std::pair<std::string, std::vector<std::string>>>
+        precomputed_shuffle_buffers;
+    std::optional<uint64_t> shuffle_partition_batches;
+    std::optional<uint64_t> shuffle_partition_concurrency;
+    std::optional<std::map<std::string, std::string>> storage_options;
+
+    std::optional<uint64_t> num_sub_vectors;
+    std::optional<uint64_t> num_bits;
+    IndexModel* ivf_centroids = nullptr;
+    IndexModel* pq_codebook = nullptr;
+    std::optional<std::string> rabitq_model_json;
+
+    std::optional<uint64_t> hnsw_max_level;
+    std::optional<uint64_t> hnsw_m;
+    std::optional<uint64_t> hnsw_ef_construction;
+
+    LanceIndexFileVersion index_file_version = LANCE_INDEX_FILE_VERSION_V3;
+    bool skip_transpose = false;
+    std::map<std::string, std::string> runtime_hints;
+    std::optional<bool> train;
+
+    /// Record a caller-provided accelerator hint. This does not enable C-side
+    /// accelerator execution.
+    VectorIndexOptions& accelerator(std::string device) {
+        runtime_hints["lancedb.accelerator"] = std::move(device);
+        return *this;
+    }
+};
+
+// ─── Native maintenance options and plans ───────────────────────────────────
+
+/// Presence-preserving owner of native `CompactionOptions`.
+class CompactionOptions {
+    Handle<LanceCompactionOptionsV2, lance_compaction_options_v2_free> handle_;
+
+public:
+    CompactionOptions() : handle_(lance_compaction_options_v2_new()) {
+        if (!handle_) check_error();
+    }
+
+    explicit CompactionOptions(LanceCompactionOptionsV2* options)
+        : handle_(options) {}
+
+    CompactionOptions(CompactionOptions&&) noexcept = default;
+    CompactionOptions& operator=(CompactionOptions&&) noexcept = default;
+    CompactionOptions(const CompactionOptions&) = delete;
+    CompactionOptions& operator=(const CompactionOptions&) = delete;
+
+    /// Native `CompactionOptions::from_dataset_config(dataset.config())`.
+    static CompactionOptions from_dataset(const Dataset& dataset);
+
+    CompactionOptions& set_target_rows_per_fragment(uint64_t value) {
+        if (lance_compaction_options_v2_set_target_rows_per_fragment(
+                handle_.get(), value) != 0) check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_rows_per_group(uint64_t value) {
+        if (lance_compaction_options_v2_set_max_rows_per_group(
+                handle_.get(), value) != 0) check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_bytes_per_file(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_max_bytes_per_file(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_materialize_deletions(bool value) {
+        if (lance_compaction_options_v2_set_materialize_deletions(
+                handle_.get(), value) != 0) check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_materialize_deletions_threshold(float value) {
+        if (lance_compaction_options_v2_set_materialize_deletions_threshold(
+                handle_.get(), value) != 0) check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_num_threads(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_num_threads(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_batch_size(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_batch_size(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_io_buffer_size(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_io_buffer_size(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_defer_index_remap(bool value) {
+        if (lance_compaction_options_v2_set_defer_index_remap(
+                handle_.get(), value) != 0) check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_index_remap_mode(LanceIndexRemapMode value) {
+        if (lance_compaction_options_v2_set_index_remap_mode(
+                handle_.get(), static_cast<int32_t>(value)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_compaction_mode(
+        std::optional<LanceCompactionMode> value) {
+        int32_t raw = value ? static_cast<int32_t>(*value) : 0;
+        if (lance_compaction_options_v2_set_compaction_mode(
+                handle_.get(), value.has_value(), raw) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_binary_copy_read_batch_bytes(
+        std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_binary_copy_read_batch_bytes(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_source_fragments(
+        std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_max_source_fragments(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_source_rows(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_max_source_rows(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_source_bytes(std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_max_source_bytes(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_excluded_fragment_ids(
+        const std::vector<uint32_t>& fragment_ids) {
+        if (lance_compaction_options_v2_set_excluded_fragment_ids(
+                handle_.get(),
+                fragment_ids.empty() ? nullptr : fragment_ids.data(),
+                fragment_ids.size()) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_max_overlays_per_fragment(
+        std::optional<uint64_t> value) {
+        if (lance_compaction_options_v2_set_max_overlays_per_fragment(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_data_storage_version(
+        std::optional<std::string> selector) {
+        if (lance_compaction_options_v2_set_data_storage_version(
+                handle_.get(), selector ? selector->c_str() : nullptr) != 0)
+            check_error();
+        return *this;
+    }
+
+    CompactionOptions& set_transaction_properties(
+        std::optional<std::vector<std::pair<std::string, std::string>>> value =
+            std::nullopt) {
+        std::vector<const char*> keys;
+        std::vector<const char*> values;
+        LanceTransactionProperties properties{};
+        const LanceTransactionProperties* properties_ptr = nullptr;
+        if (value) {
+            keys.reserve(value->size());
+            values.reserve(value->size());
+            for (const auto& [key, property_value] : *value) {
+                keys.push_back(key.c_str());
+                values.push_back(property_value.c_str());
+            }
+            properties.keys = keys.empty() ? nullptr : keys.data();
+            properties.values = values.empty() ? nullptr : values.data();
+            properties.count = value->size();
+            properties_ptr = &properties;
+        }
+        if (lance_compaction_options_v2_set_transaction_properties(
+                handle_.get(), properties_ptr) != 0)
+            check_error();
+        return *this;
+    }
+
+    const LanceCompactionOptionsV2* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native compaction rewrite result.
+class RewriteResult {
+    Handle<LanceRewriteResult, lance_rewrite_result_close> handle_;
+
+public:
+    explicit RewriteResult(LanceRewriteResult* result) : handle_(result) {}
+
+    RewriteResult(RewriteResult&&) noexcept = default;
+    RewriteResult& operator=(RewriteResult&&) noexcept = default;
+    RewriteResult(const RewriteResult&) = delete;
+    RewriteResult& operator=(const RewriteResult&) = delete;
+
+    uint64_t read_version() const {
+        uint64_t value = lance_rewrite_result_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    LanceCompactionMetrics metrics() const {
+        LanceCompactionMetrics value{};
+        if (lance_rewrite_result_metrics(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    size_t original_fragment_count() const {
+        size_t count =
+            lance_rewrite_result_original_fragment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    size_t new_fragment_count() const {
+        size_t count = lance_rewrite_result_new_fragment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    std::string original_fragment_metadata_json(size_t index) const {
+        const char* json =
+            lance_rewrite_result_original_fragment_metadata_json_at(
+                handle_.get(), index);
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
+    }
+
+    std::string new_fragment_metadata_json(size_t index) const {
+        const char* json =
+            lance_rewrite_result_new_fragment_metadata_json_at(
+                handle_.get(), index);
+        if (!json) check_error();
+        std::string out(json);
+        lance_free_string(json);
+        return out;
+    }
+
+    /// Clone one original fragment as an owned native snapshot. The handle
+    /// stays valid after this rewrite result is closed.
+    Fragment original_fragment_at(size_t index) const;
+
+    /// Clone one new (staged) fragment native compaction produced. Such a
+    /// fragment can seed a `RewriteGroup`.
+    Fragment new_fragment_at(size_t index) const;
+
+    std::string json() const {
+        const char* raw = lance_rewrite_result_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static RewriteResult from_json(std::string_view json) {
+        std::string owned(json);
+        auto* result = lance_rewrite_result_from_json(owned.c_str());
+        if (!result) check_error();
+        return RewriteResult(result);
+    }
+
+    const LanceRewriteResult* c_handle() const { return handle_.get(); }
+};
+
+/// Owned snapshot of one native compaction task.
+class CompactionTask {
+    Handle<LanceCompactionTask, lance_compaction_task_close> handle_;
+
+public:
+    explicit CompactionTask(LanceCompactionTask* task) : handle_(task) {}
+
+    CompactionTask(CompactionTask&&) noexcept = default;
+    CompactionTask& operator=(CompactionTask&&) noexcept = default;
+    CompactionTask(const CompactionTask&) = delete;
+    CompactionTask& operator=(const CompactionTask&) = delete;
+
+    uint64_t read_version() const {
+        uint64_t value = lance_compaction_task_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    size_t fragment_count() const {
+        size_t count = lance_compaction_task_fragment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    std::string fragment_metadata_json(size_t index) const {
+        const char* raw =
+            lance_compaction_task_fragment_metadata_json_at(
+                handle_.get(), index);
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    std::vector<std::string> fragment_metadata_json() const {
+        std::vector<std::string> out;
+        out.reserve(fragment_count());
+        for (size_t index = 0; index < fragment_count(); ++index)
+            out.push_back(fragment_metadata_json(index));
+        return out;
+    }
+
+    CompactionOptions options() const {
+        auto* options =
+            lance_compaction_task_options_clone(handle_.get());
+        if (!options) check_error();
+        return CompactionOptions(options);
+    }
+
+    RewriteResult execute(const Dataset& dataset) const;
+
+    std::string json() const {
+        const char* raw = lance_compaction_task_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static CompactionTask from_json(std::string_view json) {
+        std::string owned(json);
+        auto* task = lance_compaction_task_from_json(owned.c_str());
+        if (!task) check_error();
+        return CompactionTask(task);
+    }
+
+    const LanceCompactionTask* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native compaction plan.
+class CompactionPlan {
+    Handle<LanceCompactionPlan, lance_compaction_plan_close> handle_;
+
+public:
+    explicit CompactionPlan(LanceCompactionPlan* plan) : handle_(plan) {}
+
+    CompactionPlan(CompactionPlan&&) noexcept = default;
+    CompactionPlan& operator=(CompactionPlan&&) noexcept = default;
+    CompactionPlan(const CompactionPlan&) = delete;
+    CompactionPlan& operator=(const CompactionPlan&) = delete;
+
+    uint64_t read_version() const {
+        uint64_t value = lance_compaction_plan_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    size_t num_tasks() const {
+        size_t count = lance_compaction_plan_task_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    CompactionTask task(size_t index) const {
+        auto* task = lance_compaction_plan_task_at(handle_.get(), index);
+        if (!task) check_error();
+        return CompactionTask(task);
+    }
+
+    CompactionOptions options() const {
+        auto* options =
+            lance_compaction_plan_options_clone(handle_.get());
+        if (!options) check_error();
+        return CompactionOptions(options);
+    }
+
+    std::string json() const {
+        const char* raw = lance_compaction_plan_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static CompactionPlan from_json(std::string_view json) {
+        std::string owned(json);
+        auto* plan = lance_compaction_plan_from_json(owned.c_str());
+        if (!plan) check_error();
+        return CompactionPlan(plan);
+    }
+
+    const LanceCompactionPlan* c_handle() const { return handle_.get(); }
+};
+
+/// Presence-preserving owner of native `OptimizeOptions`.
+class OptimizeIndicesOptions {
+    Handle<LanceOptimizeIndicesOptions, lance_optimize_indices_options_free>
+        handle_;
+
+public:
+    OptimizeIndicesOptions() : handle_(lance_optimize_indices_options_new()) {
+        if (!handle_) check_error();
+    }
+
+    explicit OptimizeIndicesOptions(LanceOptimizeIndicesOptions* options)
+        : handle_(options) {}
+
+    OptimizeIndicesOptions(OptimizeIndicesOptions&&) noexcept = default;
+    OptimizeIndicesOptions& operator=(OptimizeIndicesOptions&&) noexcept =
+        default;
+    OptimizeIndicesOptions(const OptimizeIndicesOptions&) = delete;
+    OptimizeIndicesOptions& operator=(const OptimizeIndicesOptions&) = delete;
+
+    OptimizeIndicesOptions& set_num_indices_to_merge(
+        std::optional<uint64_t> value) {
+        if (lance_optimize_indices_options_set_num_indices_to_merge(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_enable_partition_rebalancing(bool value) {
+        if (lance_optimize_indices_options_set_enable_partition_rebalancing(
+                handle_.get(), value) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_index_names(
+        std::optional<std::vector<std::string>> names) {
+        std::vector<const char*> raw;
+        if (names) {
+            raw.reserve(names->size());
+            for (const auto& name : *names) raw.push_back(name.c_str());
+        }
+        if (lance_optimize_indices_options_set_index_names(
+                handle_.get(),
+                names.has_value(),
+                raw.empty() ? nullptr : raw.data(),
+                raw.size()) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_retrain(bool value) {
+        if (lance_optimize_indices_options_set_retrain(
+                handle_.get(), value) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_transaction_properties(
+        std::optional<std::vector<std::pair<std::string, std::string>>> value =
+            std::nullopt) {
+        std::vector<const char*> keys;
+        std::vector<const char*> values;
+        LanceTransactionProperties properties{};
+        const LanceTransactionProperties* properties_ptr = nullptr;
+        if (value) {
+            keys.reserve(value->size());
+            values.reserve(value->size());
+            for (const auto& [key, property_value] : *value) {
+                keys.push_back(key.c_str());
+                values.push_back(property_value.c_str());
+            }
+            properties.keys = keys.empty() ? nullptr : keys.data();
+            properties.values = values.empty() ? nullptr : values.data();
+            properties.count = value->size();
+            properties_ptr = &properties;
+        }
+        if (lance_optimize_indices_options_set_transaction_properties(
+                handle_.get(), properties_ptr) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_max_rows_per_task(
+        std::optional<uint64_t> value) {
+        if (lance_optimize_indices_options_set_max_rows_per_task(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    OptimizeIndicesOptions& set_max_rows_per_segment(
+        std::optional<uint64_t> value) {
+        if (lance_optimize_indices_options_set_max_rows_per_segment(
+                handle_.get(), value.has_value(), value.value_or(0)) != 0)
+            check_error();
+        return *this;
+    }
+
+    const LanceOptimizeIndicesOptions* c_handle() const {
+        return handle_.get();
+    }
+};
+
+/// Owned native optimized index segment result.
+class IndexSegmentResult {
+    Handle<LanceIndexSegmentResult, lance_index_segment_result_close> handle_;
+
+public:
+    explicit IndexSegmentResult(LanceIndexSegmentResult* result)
+        : handle_(result) {}
+
+    IndexSegmentResult(IndexSegmentResult&&) noexcept = default;
+    IndexSegmentResult& operator=(IndexSegmentResult&&) noexcept = default;
+    IndexSegmentResult(const IndexSegmentResult&) = delete;
+    IndexSegmentResult& operator=(const IndexSegmentResult&) = delete;
+
+    std::array<uint8_t, 16> plan_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_index_segment_result_plan_id(
+                handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    uint64_t read_version() const {
+        uint64_t value = lance_index_segment_result_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    uint32_t group() const {
+        uint32_t value = lance_index_segment_result_group(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    IndexSegmentMetadata segment() const;
+
+    size_t replace_count() const {
+        size_t count = lance_index_segment_result_replace_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    std::array<uint8_t, 16> replace_uuid(size_t index) const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_index_segment_result_replace_uuid_at(
+                handle_.get(), index, out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    std::string json() const {
+        const char* raw = lance_index_segment_result_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static IndexSegmentResult from_json(std::string_view json) {
+        std::string owned(json);
+        auto* result = lance_index_segment_result_from_json(owned.c_str());
+        if (!result) check_error();
+        return IndexSegmentResult(result);
+    }
+
+    const LanceIndexSegmentResult* c_handle() const { return handle_.get(); }
+};
+
+/// Owned snapshot of one native distributed index build task.
+class OptimizeIndexTask {
+    Handle<LanceOptimizeIndexTask, lance_optimize_index_task_close> handle_;
+
+public:
+    explicit OptimizeIndexTask(LanceOptimizeIndexTask* task) : handle_(task) {}
+
+    OptimizeIndexTask(OptimizeIndexTask&&) noexcept = default;
+    OptimizeIndexTask& operator=(OptimizeIndexTask&&) noexcept = default;
+    OptimizeIndexTask(const OptimizeIndexTask&) = delete;
+    OptimizeIndexTask& operator=(const OptimizeIndexTask&) = delete;
+
+    std::array<uint8_t, 16> plan_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_optimize_index_task_plan_id(
+                handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    uint64_t read_version() const {
+        uint64_t value = lance_optimize_index_task_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    uint32_t group() const {
+        uint32_t value = lance_optimize_index_task_group(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    size_t fragment_count() const {
+        size_t count = lance_optimize_index_task_fragment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    uint32_t fragment_id(size_t index) const {
+        uint32_t value = 0;
+        if (lance_optimize_index_task_fragment_id_at(
+                handle_.get(), index, &value) != 0)
+            check_error();
+        return value;
+    }
+
+    std::vector<uint32_t> fragment_ids() const {
+        std::vector<uint32_t> out;
+        out.reserve(fragment_count());
+        for (size_t index = 0; index < fragment_count(); ++index)
+            out.push_back(fragment_id(index));
+        return out;
+    }
+
+    IndexSegmentMetadata reference() const;
+
+    size_t old_segment_count() const {
+        size_t count =
+            lance_optimize_index_task_old_segment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    IndexSegmentMetadata old_segment(size_t index) const;
+
+    std::optional<uint64_t> num_indices_to_merge() const {
+        bool has_value = false;
+        uint64_t value = 0;
+        if (lance_optimize_index_task_num_indices_to_merge(
+                handle_.get(), &has_value, &value) != 0)
+            check_error();
+        return has_value ? std::optional<uint64_t>(value) : std::nullopt;
+    }
+
+    bool enable_partition_rebalancing() const {
+        bool value = false;
+        if (lance_optimize_index_task_enable_partition_rebalancing(
+                handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    bool retrain() const {
+        bool value = false;
+        if (lance_optimize_index_task_retrain(handle_.get(), &value) != 0)
+            check_error();
+        return value;
+    }
+
+    std::optional<IndexSegmentResult> execute(const Dataset& dataset) const;
+
+    std::string json() const {
+        const char* raw = lance_optimize_index_task_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static OptimizeIndexTask from_json(std::string_view json) {
+        std::string owned(json);
+        auto* task = lance_optimize_index_task_from_json(owned.c_str());
+        if (!task) check_error();
+        return OptimizeIndexTask(task);
+    }
+
+    const LanceOptimizeIndexTask* c_handle() const { return handle_.get(); }
+};
+
+/// Owned snapshot of one native distributed index merge.
+class OptimizeIndexMerge {
+    Handle<LanceOptimizeIndexMerge, lance_optimize_index_merge_close> handle_;
+
+public:
+    explicit OptimizeIndexMerge(LanceOptimizeIndexMerge* merge)
+        : handle_(merge) {}
+
+    OptimizeIndexMerge(OptimizeIndexMerge&&) noexcept = default;
+    OptimizeIndexMerge& operator=(OptimizeIndexMerge&&) noexcept = default;
+    OptimizeIndexMerge(const OptimizeIndexMerge&) = delete;
+    OptimizeIndexMerge& operator=(const OptimizeIndexMerge&) = delete;
+
+    std::array<uint8_t, 16> plan_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_optimize_index_merge_plan_id(
+                handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    uint64_t read_version() const {
+        uint64_t value = lance_optimize_index_merge_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    uint32_t group() const {
+        uint32_t value = lance_optimize_index_merge_group(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    size_t old_segment_count() const {
+        size_t count =
+            lance_optimize_index_merge_old_segment_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    IndexSegmentMetadata old_segment(size_t index) const;
+
+    size_t replace_count() const {
+        size_t count = lance_optimize_index_merge_replace_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    std::array<uint8_t, 16> replace_uuid(size_t index) const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_optimize_index_merge_replace_uuid_at(
+                handle_.get(), index, out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    std::optional<IndexSegmentResult> execute(
+        const Dataset& dataset,
+        const std::vector<IndexSegmentResult>& task_results) const;
+
+    std::string json() const {
+        const char* raw = lance_optimize_index_merge_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static OptimizeIndexMerge from_json(std::string_view json) {
+        std::string owned(json);
+        auto* merge = lance_optimize_index_merge_from_json(owned.c_str());
+        if (!merge) check_error();
+        return OptimizeIndexMerge(merge);
+    }
+
+    const LanceOptimizeIndexMerge* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native distributed index optimization plan.
+class OptimizeIndicesPlan {
+    Handle<LanceOptimizeIndicesPlan, lance_optimize_indices_plan_close>
+        handle_;
+
+public:
+    explicit OptimizeIndicesPlan(LanceOptimizeIndicesPlan* plan)
+        : handle_(plan) {}
+
+    OptimizeIndicesPlan(OptimizeIndicesPlan&&) noexcept = default;
+    OptimizeIndicesPlan& operator=(OptimizeIndicesPlan&&) noexcept = default;
+    OptimizeIndicesPlan(const OptimizeIndicesPlan&) = delete;
+    OptimizeIndicesPlan& operator=(const OptimizeIndicesPlan&) = delete;
+
+    std::array<uint8_t, 16> plan_id() const {
+        std::array<uint8_t, 16> out = {};
+        if (lance_optimize_indices_plan_id(
+                handle_.get(), out.data()) != 0)
+            check_error();
+        return out;
+    }
+
+    uint64_t read_version() const {
+        uint64_t value =
+            lance_optimize_indices_plan_read_version(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    size_t num_tasks() const {
+        size_t count = lance_optimize_indices_plan_task_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    size_t num_merges() const {
+        size_t count = lance_optimize_indices_plan_merge_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return count;
+    }
+
+    OptimizeIndexTask task(size_t index) const {
+        auto* task = lance_optimize_indices_plan_task_at(handle_.get(), index);
+        if (!task) check_error();
+        return OptimizeIndexTask(task);
+    }
+
+    OptimizeIndexMerge merge(size_t index) const {
+        auto* merge =
+            lance_optimize_indices_plan_merge_at(handle_.get(), index);
+        if (!merge) check_error();
+        return OptimizeIndexMerge(merge);
+    }
+
+    std::string json() const {
+        const char* raw = lance_optimize_indices_plan_json(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    static OptimizeIndicesPlan from_json(std::string_view json) {
+        std::string owned(json);
+        auto* plan = lance_optimize_indices_plan_from_json(owned.c_str());
+        if (!plan) check_error();
+        return OptimizeIndicesPlan(plan);
+    }
+
+    const LanceOptimizeIndicesPlan* c_handle() const { return handle_.get(); }
+};
+
+/// Additive standalone IVF/PQ trainer controls.
+struct IndexTrainerOptions {
+    std::optional<uint64_t> sample_rate;
+    std::optional<uint64_t> max_iters;
+};
+
+/// Additive scalar-index build controls.
+struct ScalarIndexOptions {
+    std::optional<bool> train;
+};
+
+/// Prewarm controls. An engaged empty segment list maps to Some(empty) and
+/// performs no segment work.
+struct IndexPrewarmOptions {
+    bool with_position = false;
+    std::optional<std::vector<std::array<uint8_t, 16>>> index_segments;
+};
+
+// ─── MemWAL / LSM ───────────────────────────────────────────────────────────
+
+/// Native distance metric for MemWAL vector search.
+enum class MemWalDistanceType : int32_t {
+    L2 = LANCE_MEM_WAL_DISTANCE_L2,
+    Cosine = LANCE_MEM_WAL_DISTANCE_COSINE,
+    Dot = LANCE_MEM_WAL_DISTANCE_DOT,
+    Hamming = LANCE_MEM_WAL_DISTANCE_HAMMING,
+};
+
+/// A compacted SSTable marker advanced atomically with a merge-insert commit.
+struct CompactedSsTable {
+    std::array<uint8_t, 16> shard_id{};
+    uint64_t generation = 0;
+
+    static CompactedSsTable from_uuid(const std::string& shard_id,
+                                      uint64_t generation) {
+        ::LanceCompactedSsTable raw{};
+        if (lance_mem_wal_compacted_sstable_new(shard_id.c_str(), generation,
+                                                &raw) != 0) {
+            check_error();
+        }
+        CompactedSsTable value;
+        std::memcpy(value.shard_id.data(), raw.shard_id,
+                    value.shard_id.size());
+        value.generation = raw.generation;
+        return value;
+    }
+
+    ::LanceCompactedSsTable to_c() const {
+        ::LanceCompactedSsTable raw{};
+        std::memcpy(raw.shard_id, shard_id.data(), shard_id.size());
+        raw.generation = generation;
+        return raw;
+    }
+};
+
+/// Complete input for Operation::make_update().
+///
+/// Every member maps to one native field unchanged. Native commit validation
+/// owns schema coverage, conflicts and row-version behavior, so no default is
+/// applied: an engaged empty vector means the caller supplied no entries.
+/// `update_mode == std::nullopt`, a null `inserted_rows_filter` and a null
+/// `updated_fragment_offsets` map to native `None`, which is distinct from
+/// empty populated values.
+struct UpdateOperationSpec {
+    std::vector<uint64_t> removed_fragment_ids;
+    std::vector<const Fragment*> updated_fragments;
+    std::vector<const Fragment*> new_fragments;
+    std::vector<uint32_t> fields_modified;
+    std::vector<CompactedSsTable> compacted_sstables;
+    std::vector<uint32_t> fields_for_preserving_frag_bitmap;
+    std::optional<UpdateMode> update_mode;
+    std::optional<KeyExistenceFilter> inserted_rows_filter;
+    std::optional<UpdatedFragmentOffsets> updated_fragment_offsets;
+};
+
+/// One SSTable referenced by a shard snapshot.
+struct SsTable {
+    uint64_t generation = 0;
+    std::string path;
+};
+
+/// Per-index HNSW build controls.
+struct HnswParams {
+    std::string index_name;
+    std::optional<uint32_t> num_edges;
+    std::optional<uint32_t> ef_construction;
+    std::optional<uint32_t> max_level;
+};
+
+/// Snapshot of native shard-writer counters.
+struct ShardWriterStats {
+    uint64_t put_count = 0;
+    uint64_t put_time_nanos = 0;
+    uint64_t wal_flush_count = 0;
+    uint64_t wal_flush_time_nanos = 0;
+    uint64_t wal_flush_bytes = 0;
+    uint64_t wal_io_time_nanos = 0;
+    uint64_t wal_io_count = 0;
+    uint64_t index_update_time_nanos = 0;
+    uint64_t index_update_count = 0;
+    uint64_t index_update_rows = 0;
+    uint64_t memtable_flush_count = 0;
+    uint64_t memtable_flush_time_nanos = 0;
+    uint64_t memtable_flush_rows = 0;
+    uint64_t memtable_flush_failures = 0;
+};
+
+/// Snapshot of live MemTable and memory statistics.
+struct ShardMemTableStats {
+    bool is_live = false;
+    uint64_t row_count = 0;
+    uint64_t batch_count = 0;
+    uint64_t estimated_size_bytes = 0;
+    uint64_t index_bytes = 0;
+    uint64_t frozen_bytes = 0;
+    uint64_t grace_bytes = 0;
+    uint64_t retained_bytes = 0;
+    uint64_t generation = 0;
+    std::optional<uint64_t> max_buffered_batch_position;
+    uint64_t durable_batch_count = 0;
+    uint64_t global_offset = 0;
+    std::optional<uint64_t> pending_wal_start_batch_position;
+    std::optional<uint64_t> pending_wal_end_batch_position;
+    uint64_t pending_wal_batch_count = 0;
+    uint64_t pending_wal_row_count = 0;
+    uint64_t pending_wal_estimated_bytes = 0;
+    uint64_t frozen_count = 0;
+};
+
+/// Native put/delete batch-position range.
+struct ShardWriteResult {
+    uint64_t batch_position_begin = 0;
+    uint64_t batch_position_end = 0;
+};
+
+/// Optional overrides for a native `ShardWriterConfig`. Unset fields keep the
+/// native defaults. `hnsw_params` entries replace same-named native defaults.
+class ShardWriterConfig {
+public:
+    std::optional<bool> durable_write;
+    std::optional<uint64_t> max_wal_buffer_size;
+    std::optional<uint64_t> max_wal_flush_interval_ms;
+    std::optional<uint64_t> max_memtable_size;
+    std::optional<uint64_t> max_memtable_rows;
+    std::optional<uint64_t> max_memtable_batches;
+    std::optional<uint64_t> max_unflushed_memtable_bytes;
+    std::optional<uint64_t> manifest_scan_batch_size;
+    std::optional<uint64_t> backpressure_log_interval_ms;
+    std::optional<uint64_t> stats_log_interval_ms;
+    std::vector<HnswParams> hnsw_params;
+
+    ShardWriterConfig& set_durable_write(bool value) { durable_write = value; return *this; }
+    ShardWriterConfig& set_max_wal_buffer_size(uint64_t value) { max_wal_buffer_size = value; return *this; }
+    ShardWriterConfig& set_max_wal_flush_interval_ms(uint64_t value) { max_wal_flush_interval_ms = value; return *this; }
+    ShardWriterConfig& set_max_memtable_size(uint64_t value) { max_memtable_size = value; return *this; }
+    ShardWriterConfig& set_max_memtable_rows(uint64_t value) { max_memtable_rows = value; return *this; }
+    ShardWriterConfig& set_max_memtable_batches(uint64_t value) { max_memtable_batches = value; return *this; }
+    ShardWriterConfig& set_max_unflushed_memtable_bytes(uint64_t value) { max_unflushed_memtable_bytes = value; return *this; }
+    ShardWriterConfig& set_manifest_scan_batch_size(uint64_t value) { manifest_scan_batch_size = value; return *this; }
+    ShardWriterConfig& set_backpressure_log_interval_ms(uint64_t value) { backpressure_log_interval_ms = value; return *this; }
+    ShardWriterConfig& set_stats_log_interval_ms(uint64_t value) { stats_log_interval_ms = value; return *this; }
+    ShardWriterConfig& add_hnsw_params(HnswParams value) { hnsw_params.push_back(std::move(value)); return *this; }
+
+    LanceShardWriterConfig to_c(std::vector<std::string>& names,
+                                std::vector<::LanceMemWalHnswParams>& params) const {
+        LanceShardWriterConfig raw{};
+        if (durable_write) {
+            raw.has_durable_write = 1;
+            raw.durable_write = *durable_write ? 1 : 0;
+        }
+        auto set_u64 = [](std::optional<uint64_t> value, int32_t& has, uint64_t& out) {
+            if (value) { has = 1; out = *value; }
+        };
+        set_u64(max_wal_buffer_size, raw.has_max_wal_buffer_size, raw.max_wal_buffer_size);
+        set_u64(max_wal_flush_interval_ms, raw.has_max_wal_flush_interval_ms,
+                raw.max_wal_flush_interval_ms);
+        set_u64(max_memtable_size, raw.has_max_memtable_size, raw.max_memtable_size);
+        set_u64(max_memtable_rows, raw.has_max_memtable_rows, raw.max_memtable_rows);
+        set_u64(max_memtable_batches, raw.has_max_memtable_batches, raw.max_memtable_batches);
+        set_u64(max_unflushed_memtable_bytes, raw.has_max_unflushed_memtable_bytes,
+                raw.max_unflushed_memtable_bytes);
+        set_u64(manifest_scan_batch_size, raw.has_manifest_scan_batch_size,
+                raw.manifest_scan_batch_size);
+        set_u64(backpressure_log_interval_ms, raw.has_backpressure_log_interval_ms,
+                raw.backpressure_log_interval_ms);
+        set_u64(stats_log_interval_ms, raw.has_stats_log_interval_ms,
+                raw.stats_log_interval_ms);
+        names.clear();
+        names.reserve(hnsw_params.size());
+        for (const auto& entry : hnsw_params) names.push_back(entry.index_name);
+        params.clear();
+        params.reserve(hnsw_params.size());
+        for (size_t i = 0; i < hnsw_params.size(); ++i) {
+            const auto& entry = hnsw_params[i];
+            ::LanceMemWalHnswParams raw_entry{};
+            raw_entry.index_name = names[i].c_str();
+            if (entry.num_edges) {
+                raw_entry.has_num_edges = 1;
+                raw_entry.num_edges = *entry.num_edges;
+            }
+            if (entry.ef_construction) {
+                raw_entry.has_ef_construction = 1;
+                raw_entry.ef_construction = *entry.ef_construction;
+            }
+            if (entry.max_level) {
+                raw_entry.has_max_level = 1;
+                raw_entry.max_level = *entry.max_level;
+            }
+            params.push_back(raw_entry);
+        }
+        raw.hnsw_params = params.empty() ? nullptr : params.data();
+        raw.num_hnsw_params = params.size();
+        return raw;
+    }
+};
+
+/// Options for `Dataset::initialize_mem_wal`.
+struct MemWalInitOptions {
+    ::LanceMemWalShardingMode mode = LANCE_MEM_WAL_SHARDING_MANUAL;
+    std::optional<std::string> column;
+    uint32_t num_buckets = 0;
+    /// Unset keeps native maintain-all behavior; an empty engaged vector
+    /// maintains no indexes.
+    std::optional<std::vector<std::string>> maintained_indexes;
+    std::optional<ShardWriterConfig> writer_config;
+};
+
+/// Owned native sharding field.
+class ShardingField {
+    Handle<::LanceMemWalShardingField, lance_mem_wal_sharding_field_free> handle_;
+
+public:
+    explicit ShardingField(::LanceMemWalShardingField* field) : handle_(field) {
+        if (!handle_) check_error();
+    }
+
+    ShardingField(ShardingField&&) noexcept = default;
+    ShardingField& operator=(ShardingField&&) noexcept = default;
+    ShardingField(const ShardingField&) = delete;
+    ShardingField& operator=(const ShardingField&) = delete;
+
+    static ShardingField create(
+        std::string field_id,
+        std::vector<int32_t> source_ids,
+        std::optional<std::string> transform,
+        std::optional<std::string> expression,
+        std::string result_type,
+        std::map<std::string, std::string> parameters = {}) {
+        std::vector<const char*> keys;
+        std::vector<const char*> values;
+        keys.reserve(parameters.size());
+        values.reserve(parameters.size());
+        for (const auto& [key, value] : parameters) {
+            keys.push_back(key.c_str());
+            values.push_back(value.c_str());
+        }
+        ::LanceMemWalShardingField* raw = nullptr;
+        if (lance_mem_wal_sharding_field_new(
+                field_id.c_str(),
+                source_ids.empty() ? nullptr : source_ids.data(),
+                source_ids.size(),
+                transform ? transform->c_str() : nullptr,
+                expression ? expression->c_str() : nullptr,
+                result_type.c_str(),
+                keys.empty() ? nullptr : keys.data(),
+                values.empty() ? nullptr : values.data(),
+                keys.size(),
+                &raw) != 0) {
+            check_error();
+        }
+        return ShardingField(raw);
+    }
+
+    ShardingField clone() const {
+        ::LanceMemWalShardingField* raw = nullptr;
+        if (lance_mem_wal_sharding_field_clone(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ShardingField(raw);
+    }
+
+    std::string id() const {
+        const char* value = lance_mem_wal_sharding_field_id(handle_.get());
+        if (!value) check_error();
+        return value;
+    }
+
+    std::vector<int32_t> source_ids() const {
+        size_t count = 0;
+        const int32_t* values = lance_mem_wal_sharding_field_source_ids(handle_.get(), &count);
+        if (!values && count != 0) check_error();
+        return values ? std::vector<int32_t>(values, values + count)
+                      : std::vector<int32_t>{};
+    }
+
+    std::optional<std::string> transform() const {
+        const char* value = lance_mem_wal_sharding_field_transform(handle_.get());
+        if (value) return std::string(value);
+        return std::nullopt;
+    }
+
+    std::optional<std::string> expression() const {
+        const char* value = lance_mem_wal_sharding_field_expression(handle_.get());
+        if (value) return std::string(value);
+        return std::nullopt;
+    }
+
+    std::string result_type() const {
+        const char* value = lance_mem_wal_sharding_field_result_type(handle_.get());
+        if (!value) check_error();
+        return value;
+    }
+
+    std::map<std::string, std::string> parameters() const {
+        std::map<std::string, std::string> result;
+        const size_t count = lance_mem_wal_sharding_field_parameter_count(handle_.get());
+        for (size_t i = 0; i < count; ++i) {
+            const char* key = nullptr;
+            const char* value = nullptr;
+            if (lance_mem_wal_sharding_field_parameter_at(
+                    handle_.get(), i, &key, &value) != 0) {
+                check_error();
+            }
+            if (!key || !value) check_error();
+            result.emplace(key, value);
+        }
+        return result;
+    }
+
+    std::optional<std::string> parameter(const std::string& key) const {
+        auto all = parameters();
+        auto it = all.find(key);
+        if (it == all.end()) return std::nullopt;
+        return it->second;
+    }
+
+    const ::LanceMemWalShardingField* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native sharding spec.
+class ShardingSpec {
+    Handle<::LanceMemWalShardingSpec, lance_mem_wal_sharding_spec_free> handle_;
+
+public:
+    explicit ShardingSpec(::LanceMemWalShardingSpec* spec) : handle_(spec) {
+        if (!handle_) check_error();
+    }
+
+    ShardingSpec(ShardingSpec&&) noexcept = default;
+    ShardingSpec& operator=(ShardingSpec&&) noexcept = default;
+    ShardingSpec(const ShardingSpec&) = delete;
+    ShardingSpec& operator=(const ShardingSpec&) = delete;
+
+    static ShardingSpec create(uint32_t spec_id,
+                               std::vector<ShardingField> fields) {
+        std::vector<const ::LanceMemWalShardingField*> raw;
+        raw.reserve(fields.size());
+        for (const auto& field : fields) raw.push_back(field.c_handle());
+        ::LanceMemWalShardingSpec* spec = nullptr;
+        if (lance_mem_wal_sharding_spec_new(
+                spec_id, raw.empty() ? nullptr : raw.data(), raw.size(), &spec) != 0) {
+            check_error();
+        }
+        return ShardingSpec(spec);
+    }
+
+    ShardingSpec clone() const {
+        ::LanceMemWalShardingSpec* raw = nullptr;
+        if (lance_mem_wal_sharding_spec_clone(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ShardingSpec(raw);
+    }
+
+    uint32_t id() const {
+        return lance_mem_wal_sharding_spec_id(handle_.get());
+    }
+
+    size_t field_count() const {
+        return lance_mem_wal_sharding_spec_field_count(handle_.get());
+    }
+
+    ShardingField field_at(size_t index) const {
+        ::LanceMemWalShardingField* raw = nullptr;
+        if (lance_mem_wal_sharding_spec_field_at(handle_.get(), index, &raw) != 0) {
+            check_error();
+        }
+        return ShardingField(raw);
+    }
+
+    std::vector<ShardingField> fields() const {
+        std::vector<ShardingField> result;
+        const size_t count = field_count();
+        result.reserve(count);
+        for (size_t i = 0; i < count; ++i) result.push_back(field_at(i));
+        return result;
+    }
+
+    void add_field(ShardingField field) {
+        auto current = fields();
+        current.push_back(std::move(field));
+        auto next = ShardingSpec::create(id(), std::move(current));
+        handle_ = std::move(next.handle_);
+    }
+
+    const ::LanceMemWalShardingSpec* c_handle() const { return handle_.get(); }
+
+private:
+    friend class Dataset;
+};
+
+/// Owned native shard snapshot.
+class ShardSnapshot {
+    Handle<::LanceMemWalShardSnapshot, lance_mem_wal_shard_snapshot_free> handle_;
+
+public:
+    explicit ShardSnapshot(::LanceMemWalShardSnapshot* snapshot) : handle_(snapshot) {
+        if (!handle_) check_error();
+    }
+
+    ShardSnapshot(ShardSnapshot&&) noexcept = default;
+    ShardSnapshot& operator=(ShardSnapshot&&) noexcept = default;
+    ShardSnapshot(const ShardSnapshot&) = delete;
+    ShardSnapshot& operator=(const ShardSnapshot&) = delete;
+
+    static ShardSnapshot create(const std::string& shard_id) {
+        ::LanceMemWalShardSnapshot* raw = nullptr;
+        if (lance_mem_wal_shard_snapshot_new(shard_id.c_str(), &raw) != 0) {
+            check_error();
+        }
+        return ShardSnapshot(raw);
+    }
+
+    ShardSnapshot clone() const {
+        ::LanceMemWalShardSnapshot* raw = nullptr;
+        if (lance_mem_wal_shard_snapshot_clone(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ShardSnapshot(raw);
+    }
+
+    std::string shard_id() const {
+        const char* value = lance_mem_wal_shard_snapshot_shard_id(handle_.get());
+        if (!value) check_error();
+        return value;
+    }
+
+    uint32_t spec_id() const {
+        return lance_mem_wal_shard_snapshot_spec_id(handle_.get());
+    }
+
+    ShardSnapshot& set_spec_id(uint32_t value) {
+        if (lance_mem_wal_shard_snapshot_with_spec_id(handle_.get(), value) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    uint64_t current_generation() const {
+        return lance_mem_wal_shard_snapshot_current_generation(handle_.get());
+    }
+
+    ShardSnapshot& set_current_generation(uint64_t value) {
+        if (lance_mem_wal_shard_snapshot_with_current_generation(
+                handle_.get(), value) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    ShardSnapshot& add_sstable(uint64_t generation, const std::string& path) {
+        if (lance_mem_wal_shard_snapshot_with_sstable(
+                handle_.get(), generation, path.c_str()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    std::vector<SsTable> sstables() const {
+        std::vector<SsTable> result;
+        const size_t count = lance_mem_wal_shard_snapshot_sstable_count(handle_.get());
+        result.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            uint64_t generation = 0;
+            const char* path = nullptr;
+            if (lance_mem_wal_shard_snapshot_sstable_at(
+                    handle_.get(), i, &generation, &path) != 0) {
+                check_error();
+            }
+            if (!path) check_error();
+            result.push_back(SsTable{generation, path});
+        }
+        return result;
+    }
+
+    const ::LanceMemWalShardSnapshot* c_handle() const { return handle_.get(); }
+};
+
+/// Owned copy of native MemWAL index details.
+class MemWalIndexDetails {
+    uint32_t num_shards_ = 0;
+    bool maintain_all_ = false;
+    std::vector<std::string> maintained_;
+    std::vector<ShardingSpec> specs_;
+    std::map<std::string, std::string> defaults_;
+
+public:
+    MemWalIndexDetails(uint32_t num_shards,
+                       bool maintain_all,
+                       std::vector<std::string> maintained,
+                       std::vector<ShardingSpec> specs,
+                       std::map<std::string, std::string> defaults)
+        : num_shards_(num_shards),
+          maintain_all_(maintain_all),
+          maintained_(std::move(maintained)),
+          specs_(std::move(specs)),
+          defaults_(std::move(defaults)) {}
+
+    MemWalIndexDetails(MemWalIndexDetails&&) noexcept = default;
+    MemWalIndexDetails& operator=(MemWalIndexDetails&&) noexcept = default;
+    MemWalIndexDetails(const MemWalIndexDetails&) = delete;
+    MemWalIndexDetails& operator=(const MemWalIndexDetails&) = delete;
+
+    uint32_t num_shards() const { return num_shards_; }
+    bool maintain_all_indexes() const { return maintain_all_; }
+    const std::vector<std::string>& maintained_indexes() const { return maintained_; }
+    const std::map<std::string, std::string>& writer_config_defaults() const {
+        return defaults_;
+    }
+    size_t sharding_spec_count() const { return specs_.size(); }
+    ShardingSpec sharding_spec_at(size_t index) const {
+        if (index >= specs_.size()) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "sharding spec index out of range");
+        }
+        return specs_[index].clone();
+    }
+    std::vector<ShardingSpec> sharding_specs() const {
+        std::vector<ShardingSpec> result;
+        result.reserve(specs_.size());
+        for (const auto& spec : specs_) result.push_back(spec.clone());
+        return result;
+    }
+};
+
+/// Owned native shard writer.
+class ShardWriter {
+    Handle<::LanceShardWriter, lance_shard_writer_free> handle_;
+
+public:
+    explicit ShardWriter(::LanceShardWriter* writer) : handle_(writer) {
+        if (!handle_) check_error();
+    }
+
+    ~ShardWriter() = default;
+    ShardWriter(ShardWriter&&) noexcept = default;
+    ShardWriter& operator=(ShardWriter&&) noexcept = default;
+    ShardWriter(const ShardWriter&) = delete;
+    ShardWriter& operator=(const ShardWriter&) = delete;
+
+    /// Open a native writer for one shard. The dataset handle is borrowed.
+    static ShardWriter open(const Dataset& dataset,
+                            const std::string& shard_id,
+                            const ShardWriterConfig& config = {});
+
+    std::string shard_id() const {
+        const char* value = lance_shard_writer_shard_id(handle_.get());
+        if (!value) check_error();
+        return value;
+    }
+
+    ShardWriteResult put(ArrowArrayStream* stream) {
+        ::LanceShardWriteResult raw{};
+        if (lance_shard_writer_put(handle_.get(), stream, &raw) != 0) {
+            check_error();
+        }
+        return ShardWriteResult{raw.batch_position_begin,
+                                raw.batch_position_end};
+    }
+
+    ShardWriteResult delete_rows(ArrowArrayStream* stream) {
+        ::LanceShardWriteResult raw{};
+        if (lance_shard_writer_delete(handle_.get(), stream, &raw) != 0) {
+            check_error();
+        }
+        return ShardWriteResult{raw.batch_position_begin,
+                                raw.batch_position_end};
+    }
+
+    ShardWriterStats stats() const {
+        ::LanceShardWriterStats raw{};
+        if (lance_shard_writer_stats(handle_.get(), &raw) != 0) check_error();
+        return ShardWriterStats{
+            raw.put_count, raw.put_time_nanos,
+            raw.wal_flush_count, raw.wal_flush_time_nanos, raw.wal_flush_bytes,
+            raw.wal_io_time_nanos, raw.wal_io_count,
+            raw.index_update_time_nanos, raw.index_update_count,
+            raw.index_update_rows,
+            raw.memtable_flush_count, raw.memtable_flush_time_nanos,
+            raw.memtable_flush_rows, raw.memtable_flush_failures};
+    }
+
+    ShardMemTableStats memtable_stats() const {
+        ::LanceShardMemTableStats raw{};
+        if (lance_shard_writer_memtable_stats(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        ShardMemTableStats stats;
+        stats.is_live = raw.is_live != 0;
+        stats.row_count = raw.row_count;
+        stats.batch_count = raw.batch_count;
+        stats.estimated_size_bytes = raw.estimated_size_bytes;
+        stats.index_bytes = raw.index_bytes;
+        stats.frozen_bytes = raw.frozen_bytes;
+        stats.grace_bytes = raw.grace_bytes;
+        stats.retained_bytes = raw.retained_bytes;
+        stats.generation = raw.generation;
+        if (raw.has_max_buffered_batch_position) {
+            stats.max_buffered_batch_position = raw.max_buffered_batch_position;
+        }
+        stats.durable_batch_count = raw.durable_batch_count;
+        stats.global_offset = raw.global_offset;
+        if (raw.has_pending_wal_start_batch_position) {
+            stats.pending_wal_start_batch_position =
+                raw.pending_wal_start_batch_position;
+        }
+        if (raw.has_pending_wal_end_batch_position) {
+            stats.pending_wal_end_batch_position =
+                raw.pending_wal_end_batch_position;
+        }
+        stats.pending_wal_batch_count = raw.pending_wal_batch_count;
+        stats.pending_wal_row_count = raw.pending_wal_row_count;
+        stats.pending_wal_estimated_bytes = raw.pending_wal_estimated_bytes;
+        stats.frozen_count = raw.frozen_count;
+        return stats;
+    }
+
+    /// Snapshot the writer's latest manifest. Returns nullopt when the writer
+    /// has not committed yet; an uncommitted shard is composed by the caller's
+    /// scanner using a default snapshot.
+    std::optional<ShardSnapshot> snapshot() const {
+        ::LanceMemWalShardSnapshot* raw = nullptr;
+        if (lance_shard_writer_snapshot(handle_.get(), &raw) != 0) check_error();
+        if (!raw) return std::nullopt;
+        return ShardSnapshot(raw);
+    }
+
+    LsmScanner lsm_scanner(std::vector<ShardSnapshot> snapshots);
+
+    void close() {
+        if (lance_shard_writer_close(handle_.get()) != 0) check_error();
+    }
+
+    const ::LanceShardWriter* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native LSM scanner.
+class LsmScanner {
+    Handle<::LanceLsmScanner, lance_lsm_scanner_free> handle_;
+
+public:
+    explicit LsmScanner(::LanceLsmScanner* scanner) : handle_(scanner) {
+        if (!handle_) check_error();
+    }
+    ~LsmScanner() = default;
+    LsmScanner(LsmScanner&&) noexcept = default;
+    LsmScanner& operator=(LsmScanner&&) noexcept = default;
+    LsmScanner(const LsmScanner&) = delete;
+    LsmScanner& operator=(const LsmScanner&) = delete;
+
+    static LsmScanner from_snapshots(const Dataset& dataset,
+                                     std::vector<ShardSnapshot> snapshots);
+
+    LsmScanner& project(const std::vector<std::string>& columns) {
+        std::vector<const char*> raw;
+        raw.reserve(columns.size());
+        for (const auto& column : columns) raw.push_back(column.c_str());
+        if (lance_lsm_scanner_project(
+                handle_.get(), raw.empty() ? nullptr : raw.data(),
+                raw.size()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    LsmScanner& filter(const std::string& expression) {
+        if (lance_lsm_scanner_filter(handle_.get(), expression.c_str()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    LsmScanner& limit(std::optional<int64_t> limit,
+                      std::optional<int64_t> offset = std::nullopt) {
+        if (lance_lsm_scanner_limit(
+                handle_.get(), limit.value_or(0), limit.has_value(),
+                offset.value_or(0), offset.has_value()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    LsmScanner& with_row_address() {
+        if (lance_lsm_scanner_with_row_address(handle_.get()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    LsmScanner& with_memtable_gen() {
+        if (lance_lsm_scanner_with_memtable_gen(handle_.get()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    Batch to_batch() const;
+    std::vector<Batch> to_batches() const;
+    Table to_table() const;
+    uint64_t count_rows() const {
+        uint64_t count = 0;
+        if (lance_lsm_scanner_count_rows(handle_.get(), &count) != 0) {
+            check_error();
+        }
+        return count;
+    }
+
+    ArrowStream to_reader() const {
+        ArrowArrayStream raw{};
+        if (lance_lsm_scanner_to_arrow_stream(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ArrowStream(raw);
+    }
+
+    const ::LanceLsmScanner* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native execution plan.
+class ExecutionPlan {
+    Handle<::LanceMemWalPlan, lance_mem_wal_plan_free> handle_;
+
+public:
+    explicit ExecutionPlan(::LanceMemWalPlan* plan) : handle_(plan) {
+        if (!handle_) check_error();
+    }
+    ~ExecutionPlan() = default;
+    ExecutionPlan(ExecutionPlan&&) noexcept = default;
+    ExecutionPlan& operator=(ExecutionPlan&&) noexcept = default;
+    ExecutionPlan(const ExecutionPlan&) = delete;
+    ExecutionPlan& operator=(const ExecutionPlan&) = delete;
+
+    ArrowSchemaOwner schema() const;
+    ArrowSchemaOwner dataset_schema() const;
+
+    std::string explain() const {
+        char* text = nullptr;
+        if (lance_mem_wal_plan_explain(handle_.get(), &text) != 0) {
+            check_error();
+        }
+        std::unique_ptr<char, decltype(&lance_free_string)> guard(text, lance_free_string);
+        return std::string(text);
+    }
+
+    Batch to_batch() const;
+    std::vector<Batch> to_batches() const;
+    Table to_table() const;
+
+    ArrowStream to_reader() const {
+        ArrowArrayStream raw{};
+        if (lance_mem_wal_plan_to_arrow_stream(handle_.get(), &raw) != 0) {
+            check_error();
+        }
+        return ArrowStream(raw);
+    }
+
+    const ::LanceMemWalPlan* c_handle() const { return handle_.get(); }
+};
+
+/// Owned native point-lookup planner.
+class LsmPointLookupPlanner {
+    Handle<::LanceLsmPointLookupPlanner, lance_lsm_point_lookup_planner_free> handle_;
+
+public:
+    LsmPointLookupPlanner(const Dataset& dataset,
+                          std::vector<ShardSnapshot> snapshots,
+                          std::optional<std::vector<std::string>> pk_columns = std::nullopt);
+
+    ~LsmPointLookupPlanner() = default;
+    LsmPointLookupPlanner(LsmPointLookupPlanner&&) noexcept = default;
+    LsmPointLookupPlanner& operator=(LsmPointLookupPlanner&&) noexcept = default;
+    LsmPointLookupPlanner(const LsmPointLookupPlanner&) = delete;
+    LsmPointLookupPlanner& operator=(const LsmPointLookupPlanner&) = delete;
+
+    ExecutionPlan plan_lookup(
+        const Batch& pk_value,
+        std::optional<std::vector<std::string>> columns = std::nullopt) const;
+
+private:
+    explicit LsmPointLookupPlanner(::LanceLsmPointLookupPlanner* planner)
+        : handle_(planner) {
+        if (!handle_) check_error();
+    }
+    friend class Dataset;
+};
+
+/// Owned native vector-search planner.
+class LsmVectorSearchPlanner {
+    Handle<::LanceLsmVectorSearchPlanner, lance_lsm_vector_search_planner_free> handle_;
+
+public:
+    LsmVectorSearchPlanner(const Dataset& dataset,
+                           std::vector<ShardSnapshot> snapshots,
+                           std::string vector_column,
+                           std::optional<std::vector<std::string>> pk_columns = std::nullopt,
+                           MemWalDistanceType distance_type = MemWalDistanceType::L2,
+                           std::optional<std::string> filter = std::nullopt);
+
+    ~LsmVectorSearchPlanner() = default;
+    LsmVectorSearchPlanner(LsmVectorSearchPlanner&&) noexcept = default;
+    LsmVectorSearchPlanner& operator=(LsmVectorSearchPlanner&&) noexcept = default;
+    LsmVectorSearchPlanner(const LsmVectorSearchPlanner&) = delete;
+    LsmVectorSearchPlanner& operator=(const LsmVectorSearchPlanner&) = delete;
+
+    ExecutionPlan plan_search(
+        const std::vector<float>& query,
+        uint64_t k = 10,
+        uint64_t nprobes = 20,
+        std::optional<std::vector<std::string>> columns = std::nullopt,
+        bool refine_base_table = false,
+        double overfetch_factor = 1.0) const;
+
+private:
+    explicit LsmVectorSearchPlanner(::LanceLsmVectorSearchPlanner* planner)
+        : handle_(planner) {
+        if (!handle_) check_error();
+    }
+    friend class Dataset;
+};
 
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
@@ -1517,24 +7068,27 @@ class Dataset {
     static LanceWriteOptions to_c_write_options(
         const WriteOptions& options,
         LanceAutoCleanupParams& cleanup) {
-        LanceWriteOptions c_options = {};
-        c_options.params.max_rows_per_file = options.params.max_rows_per_file;
-        c_options.params.max_rows_per_group = options.params.max_rows_per_group;
-        c_options.params.max_bytes_per_file = options.params.max_bytes_per_file;
-        c_options.params.data_storage_version =
-            options.params.data_storage_version
-                ? options.params.data_storage_version->c_str()
-                : nullptr;
-        c_options.params.enable_stable_row_ids =
-            options.params.enable_stable_row_ids;
-        c_options.skip_auto_cleanup = options.skip_auto_cleanup;
-        if (options.auto_cleanup) {
-            cleanup.interval = options.auto_cleanup->interval;
-            cleanup.older_than_seconds =
-                options.auto_cleanup->older_than_seconds;
-            cleanup.older_than_nanos = options.auto_cleanup->older_than_nanos;
-            c_options.auto_cleanup = &cleanup;
+        return lance::to_c_write_options(options, cleanup);
+    }
+
+    static LanceUncommittedWriteOptions to_c_uncommitted_write_options(
+        const UncommittedWriteOptions& options,
+        LanceAutoCleanupParams& cleanup,
+        std::vector<const char*>& properties) {
+
+        LanceWriteOptions c_write = to_c_write_options(options.write, cleanup);
+        if (options.transaction_properties) {
+            properties.reserve(options.transaction_properties->size() * 2 + 1);
+            for (const auto& [key, value] : *options.transaction_properties) {
+                properties.push_back(key.c_str());
+                properties.push_back(value.c_str());
+            }
+            properties.push_back(nullptr);
         }
+        LanceUncommittedWriteOptions c_options = {};
+        c_options.write = c_write;
+        c_options.transaction_properties =
+            options.transaction_properties ? properties.data() : nullptr;
         return c_options;
     }
 
@@ -1914,7 +7468,8 @@ class Dataset {
         WriteMode mode,
         const LanceWriteParams* legacy_params,
         const LanceWriteOptions* native_options,
-        const std::vector<std::pair<std::string, std::string>>& storage_opts) {
+        const std::vector<std::pair<std::string, std::string>>& storage_opts,
+        const StorageOptionsAccessor* storage_options_accessor = nullptr) {
 
         ArrowStreamInput input(stream);
         const ArrowSchema* schema = input.read_schema();
@@ -1934,7 +7489,35 @@ class Dataset {
         LanceDataset* out = nullptr;
         int32_t rc;
         const char* entry_point;
-        if (native_options) {
+        if (storage_options_accessor) {
+            if (!storage_opts.empty()) {
+                throw Error(
+                    LANCE_ERR_INVALID_ARGUMENT,
+                    "storage_opts must be empty when a storage options "
+                    "accessor is provided");
+            }
+            if (native_options) {
+                entry_point = "lance_dataset_write_with_options_and_accessor";
+                rc = lance_dataset_write_with_options_and_accessor(
+                    uri.c_str(),
+                    schema,
+                    owned_stream,
+                    static_cast<int32_t>(mode),
+                    native_options,
+                    storage_options_accessor->c_handle(),
+                    &out);
+            } else {
+                entry_point = "lance_dataset_write_with_params_and_accessor";
+                rc = lance_dataset_write_with_params_and_accessor(
+                    uri.c_str(),
+                    schema,
+                    owned_stream,
+                    static_cast<int32_t>(mode),
+                    legacy_params,
+                    storage_options_accessor->c_handle(),
+                    &out);
+            }
+        } else if (native_options) {
             entry_point = "lance_dataset_write_with_options";
             rc = lance_dataset_write_with_options(
                 uri.c_str(),
@@ -2005,6 +7588,60 @@ public:
         return Dataset(ds);
     }
 
+    /// Open a dataset with additive options and an optional shared session.
+    ///
+    /// A NULL `storage_options_accessor` selects native storage defaults. A
+    /// non-NULL accessor is retained by the returned dataset, so the C++
+    /// wrapper may be destroyed immediately after this call; later I/O uses
+    /// the native provider refresh, error and cache policy.
+    static Dataset open_with_options(
+        const std::string& uri,
+        const DatasetOpenOptions& options = {},
+        const Session* session = nullptr) {
+
+        LanceDatasetOpenOptions c_options = {};
+        c_options.version = options.version;
+        c_options.storage_options_accessor =
+            options.storage_options_accessor
+                ? options.storage_options_accessor->c_handle()
+                : nullptr;
+        auto* ds = lance_dataset_open_with_options(
+            uri.c_str(),
+            &c_options,
+            session ? session->c_handle() : nullptr);
+        if (!ds) check_error();
+        return Dataset(ds);
+    }
+
+    /// Open through a foreign commit lock and optional dynamic storage accessor.
+    ///
+    /// The returned dataset retains the native handler and accessor owners, so
+    /// destroying either input afterwards does not invalidate this dataset,
+    /// its scanners, or later commits. NULL pointers keep native defaults.
+    static Dataset open_with_commit_lock(
+        const std::string& uri,
+        const StorageOptionsAccessor* storage_accessor,
+        uint64_t version,
+        const Session* session,
+        const CommitLock* commit_lock) {
+
+        LanceDataset* ds = nullptr;
+        int32_t rc = lance_dataset_open_with_commit_lock(
+            uri.c_str(),
+            storage_accessor ? storage_accessor->c_handle() : nullptr,
+            version,
+            session ? session->c_handle() : nullptr,
+            commit_lock ? commit_lock->c_handle() : nullptr,
+            &ds);
+        if (rc != 0) check_error();
+        if (ds == nullptr) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_dataset_open_with_commit_lock returned success "
+                        "with a null dataset");
+        }
+        return Dataset(ds);
+    }
+
     /// Write an Arrow record batch stream to a Lance dataset and return the
     /// open dataset at the committed version.
     ///
@@ -2066,6 +7703,223 @@ public:
             uri, stream, mode, nullptr, &c_options, storage_opts);
     }
 
+    /// Write with a retained native dynamic storage-options accessor. This
+    /// keeps the legacy 20/14 auto-cleanup policy. The returned dataset retains
+    /// the accessor and provider for later I/O.
+    static Dataset write_with_accessor(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const StorageOptionsAccessor& storage_options_accessor) {
+
+        return write_impl(
+            uri,
+            stream,
+            mode,
+            nullptr,
+            nullptr,
+            {},
+            &storage_options_accessor);
+    }
+
+    /// Write with explicit legacy `WriteParams` and a retained native dynamic
+    /// storage-options accessor.
+    static Dataset write_with_params_and_accessor(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteParams& params,
+        const StorageOptionsAccessor& storage_options_accessor) {
+
+        LanceWriteParams c_params = {};
+        c_params.max_rows_per_file = params.max_rows_per_file;
+        c_params.max_rows_per_group = params.max_rows_per_group;
+        c_params.max_bytes_per_file = params.max_bytes_per_file;
+        c_params.data_storage_version =
+            params.data_storage_version ? params.data_storage_version->c_str()
+                                        : nullptr;
+        c_params.enable_stable_row_ids = params.enable_stable_row_ids;
+
+        return write_impl(
+            uri,
+            stream,
+            mode,
+            &c_params,
+            nullptr,
+            {},
+            &storage_options_accessor);
+    }
+
+    /// Write with native `WriteParams::default()` semantics and a retained
+    /// native dynamic storage-options accessor.
+    static Dataset write_with_options_and_accessor(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteOptions& options,
+        const StorageOptionsAccessor& storage_options_accessor) {
+
+        LanceAutoCleanupParams c_cleanup = {};
+        LanceWriteOptions c_options = to_c_write_options(options, c_cleanup);
+
+        return write_impl(
+            uri,
+            stream,
+            mode,
+            nullptr,
+            &c_options,
+            {},
+            &storage_options_accessor);
+    }
+
+    /// Write using native defaults through a foreign commit lock and optional
+    /// dynamic storage accessor.
+    ///
+    /// The accessor and lock owners are retained by the committed dataset.
+    /// NULL pointers keep native defaults. The stream is consumed on every
+    /// return path. Throws `lance::Error` on failure.
+    static Dataset write_with_options_with_commit_lock(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteOptions& options,
+        const StorageOptionsAccessor* storage_accessor,
+        const Session* session,
+        const CommitLock* commit_lock) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+
+        LanceAutoCleanupParams c_cleanup = {};
+        LanceWriteOptions c_options = to_c_write_options(options, c_cleanup);
+
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceDataset* out = nullptr;
+        if (lance_dataset_write_with_options_with_commit_lock(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                &c_options,
+                storage_accessor ? storage_accessor->c_handle() : nullptr,
+                session ? session->c_handle() : nullptr,
+                commit_lock ? commit_lock->c_handle() : nullptr,
+                &out) != 0) {
+            check_error();
+        }
+        if (!out) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_with_options_with_commit_lock returned "
+                "success with null out_dataset");
+        }
+        return Dataset(out);
+    }
+
+    /// Write with an owned native-backed options handle.
+    ///
+    /// The handle supplies native write defaults plus the session, storage
+    /// accessor, commit lock, base placement, blob policy, file-writer options
+    /// and progress callbacks. The handle is borrowed only for this call. The
+    /// stream is consumed on every return path. Throws `lance::Error` on
+    /// failure.
+    static Dataset write_with_native_options(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const NativeWriteOptions& options) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceDataset* out = nullptr;
+        if (lance_dataset_write_with_native_options(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                options.c_handle(),
+                &out) != 0) {
+            check_error();
+        }
+        if (!out) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_with_native_options returned success "
+                "with null out_dataset");
+        }
+        return Dataset(out);
+    }
+
+    /// Stage an Arrow stream with an owned native-backed options handle.
+    ///
+    /// The returned transaction owns uncommitted data-file metadata and does
+    /// not retain the options handle. Publication naming remains controlled by
+    /// `Dataset::commit` / `Transaction` commit options. The stream is consumed
+    /// on every return path. Throws `lance::Error` on failure; a failed stage
+    /// does not publish a version.
+    static Transaction write_uncommitted_with_native_options(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const NativeWriteOptions& options) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceTransaction* transaction = nullptr;
+        if (lance_dataset_write_uncommitted_stream_with_native_options(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                options.c_handle(),
+                &transaction) != 0) {
+            check_error();
+        }
+        if (!transaction) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_uncommitted_stream_with_native_options "
+                "returned success with null out_transaction");
+        }
+        return Transaction(transaction);
+    }
+
+    /// Open through a native namespace. Namespace location/storage options and
+    /// managed-version behavior follow `DatasetBuilder::from_namespace`.
+    static Dataset open_namespace(
+        const Namespace& ns,
+        const std::vector<std::string>& table_id,
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        uint64_t version = 0,
+        const Session* session = nullptr);
+
+    /// Write into a namespace-managed table. CREATE uses native declare_table;
+    /// APPEND/OVERWRITE use native describe/commit-handler behavior. A
+    /// non-empty branch selects native write_into_namespace_on_branch. Native
+    /// write defaults apply (the legacy 20/14 cleanup policy is not added).
+    static Dataset write_namespace(
+        const Namespace& ns,
+        const std::vector<std::string>& table_id,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const WriteOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const std::optional<std::string>& branch = std::nullopt,
+        const Session* session = nullptr);
+
+    /// Commit a transaction through a namespace-managed table URI using the
+    /// native external manifest store and existing CommitBuilder semantics.
+    static Dataset commit_namespace_uri(
+        const Namespace& ns,
+        const std::vector<std::string>& table_id,
+        const std::string& uri,
+        const Transaction& transaction,
+        const CommitOptions& options = {},
+        const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
+        const Session* session = nullptr);
+
     /// Write an Arrow stream without committing, returning the owned native
     /// transaction for later publication with `Dataset::commit`.
     ///
@@ -2085,22 +7939,9 @@ public:
         const ArrowSchema* schema = input.read_schema();
 
         LanceAutoCleanupParams cleanup = {};
-        LanceWriteOptions c_write = to_c_write_options(options.write, cleanup);
-
         std::vector<const char*> properties;
-        if (options.transaction_properties) {
-            properties.reserve(options.transaction_properties->size() * 2 + 1);
-            for (const auto& [key, value] : *options.transaction_properties) {
-                properties.push_back(key.c_str());
-                properties.push_back(value.c_str());
-            }
-            properties.push_back(nullptr);
-        }
-
-        LanceUncommittedWriteOptions c_options = {};
-        c_options.write = c_write;
-        c_options.transaction_properties =
-            options.transaction_properties ? properties.data() : nullptr;
+        LanceUncommittedWriteOptions c_options =
+            to_c_uncommitted_write_options(options, cleanup, properties);
 
         auto storage_kv = to_c_key_values(storage_opts);
         const char* const* storage_ptr =
@@ -2124,6 +7965,112 @@ public:
                 LANCE_ERR_INTERNAL,
                 "lance_dataset_write_uncommitted_stream returned success with "
                 "null out_transaction");
+        }
+        return Transaction(transaction);
+    }
+
+    /// Write uncommitted data with a native dynamic accessor for data-file
+    /// writes performed by this call.
+    ///
+    /// The returned transaction carries transaction metadata only and does not
+    /// retain the accessor; pass it again to `commit_with_accessor` when commit
+    /// I/O needs dynamic storage options. All other stream and transaction
+    /// semantics match `write_uncommitted`.
+    static Transaction write_uncommitted_with_accessor(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const StorageOptionsAccessor& storage_options_accessor,
+        const UncommittedWriteOptions& options = {},
+        const Session* session = nullptr) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+
+        LanceAutoCleanupParams cleanup = {};
+        LanceWriteOptions c_write = to_c_write_options(options.write, cleanup);
+
+        std::vector<const char*> properties;
+        if (options.transaction_properties) {
+            properties.reserve(options.transaction_properties->size() * 2 + 1);
+            for (const auto& [key, value] : *options.transaction_properties) {
+                properties.push_back(key.c_str());
+                properties.push_back(value.c_str());
+            }
+            properties.push_back(nullptr);
+        }
+
+        LanceUncommittedWriteOptions c_options = {};
+        c_options.write = c_write;
+        c_options.transaction_properties =
+            options.transaction_properties ? properties.data() : nullptr;
+
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceTransaction* transaction = nullptr;
+        if (lance_dataset_write_uncommitted_stream_with_accessor(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                &c_options,
+                storage_options_accessor.c_handle(),
+                session ? session->c_handle() : nullptr,
+                &transaction) != 0) {
+            check_error();
+        }
+        if (!transaction) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_uncommitted_stream_with_accessor "
+                "returned success with null out_transaction");
+        }
+        return Transaction(transaction);
+    }
+
+    /// Stage an Arrow stream through a foreign commit lock and optional
+    /// dynamic storage accessor.
+    ///
+    /// Staging uses the accessor and session exactly like `write_uncommitted`.
+    /// The lock is retained for this call. Keep its handle alive and pass it
+    /// to the matching commit method when publishing the returned transaction.
+    /// NULL pointers keep native defaults. The stream is consumed on every
+    /// return path.
+    static Transaction write_uncommitted_with_commit_lock(
+        const std::string& uri,
+        ArrowArrayStream* stream,
+        WriteMode mode,
+        const UncommittedWriteOptions& options,
+        const StorageOptionsAccessor* storage_accessor,
+        const Session* session,
+        const CommitLock* commit_lock) {
+
+        ArrowStreamInput input(stream);
+        const ArrowSchema* schema = input.read_schema();
+
+        LanceAutoCleanupParams cleanup = {};
+        std::vector<const char*> properties;
+        LanceUncommittedWriteOptions c_options =
+            to_c_uncommitted_write_options(options, cleanup, properties);
+
+        ArrowArrayStream* owned_stream = input.consume();
+        LanceTransaction* transaction = nullptr;
+        if (lance_dataset_write_uncommitted_stream_with_commit_lock(
+                uri.c_str(),
+                schema,
+                owned_stream,
+                static_cast<int32_t>(mode),
+                &c_options,
+                storage_accessor ? storage_accessor->c_handle() : nullptr,
+                session ? session->c_handle() : nullptr,
+                commit_lock ? commit_lock->c_handle() : nullptr,
+                &transaction) != 0) {
+            check_error();
+        }
+        if (!transaction) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_dataset_write_uncommitted_stream_with_commit_lock "
+                "returned success with null out_transaction");
         }
         return Transaction(transaction);
     }
@@ -2160,6 +8107,70 @@ public:
         return Dataset(dataset);
     }
 
+    /// Publish one native transaction with a retained dynamic storage-options
+    /// accessor. The returned dataset retains the accessor and provider.
+    static Dataset commit_with_accessor(
+        const std::string& uri,
+        const Transaction& transaction,
+        const StorageOptionsAccessor& storage_options_accessor,
+        const CommitOptions& options = {},
+        const Session* session = nullptr) {
+
+        LanceCommitOptions c_options = to_c_commit_options(options);
+        LanceDataset* dataset = nullptr;
+        if (lance_transaction_commit_with_accessor(
+                uri.c_str(),
+                transaction.c_handle(),
+                &c_options,
+                storage_options_accessor.c_handle(),
+                session ? session->c_handle() : nullptr,
+                &dataset) != 0) {
+            check_error();
+        }
+        if (!dataset) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_transaction_commit_with_accessor returned success with "
+                "null out_dataset");
+        }
+        return Dataset(dataset);
+    }
+
+    /// Publish one native transaction through a foreign commit lock and
+    /// optional dynamic storage accessor.
+    ///
+    /// Conflict handling, retries, manifest construction, cancellation and the
+    /// final version stay native. NULL pointers keep native defaults. The
+    /// transaction handle remains valid.
+    static Dataset commit_with_commit_lock(
+        const std::string& uri,
+        const Transaction& transaction,
+        const CommitOptions& options,
+        const StorageOptionsAccessor* storage_accessor,
+        const Session* session,
+        const CommitLock* commit_lock) {
+
+        LanceCommitOptions c_options = to_c_commit_options(options);
+        LanceDataset* dataset = nullptr;
+        if (lance_transaction_commit_with_commit_lock(
+                uri.c_str(),
+                transaction.c_handle(),
+                &c_options,
+                storage_accessor ? storage_accessor->c_handle() : nullptr,
+                session ? session->c_handle() : nullptr,
+                commit_lock ? commit_lock->c_handle() : nullptr,
+                &dataset) != 0) {
+            check_error();
+        }
+        if (!dataset) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_transaction_commit_with_commit_lock returned success "
+                "with null out_dataset");
+        }
+        return Dataset(dataset);
+    }
+
     /// Commit native append transactions as one version. Native eligibility and
     /// merge semantics apply; non-append batches throw LANCE_ERR_NOT_SUPPORTED.
     static BatchCommitResult commit_batch(
@@ -2168,6 +8179,43 @@ public:
         const CommitOptions& options = {},
         const std::vector<std::pair<std::string, std::string>>& storage_opts = {},
         const Session* session = nullptr);
+
+    /// Commit append transactions as one version with a retained dynamic
+    /// storage-options accessor. The returned dataset retains the accessor and
+    /// provider; the merged transaction carries transaction metadata only.
+    static BatchCommitResult commit_batch_with_accessor(
+        const std::string& uri,
+        const std::vector<std::reference_wrapper<const Transaction>>& transactions,
+        const StorageOptionsAccessor& storage_options_accessor,
+        const CommitOptions& options = {},
+        const Session* session = nullptr);
+
+    /// Commit native append transactions as one version through a foreign
+    /// commit lock and optional dynamic storage accessor.
+    static BatchCommitResult commit_batch_with_commit_lock(
+        const std::string& uri,
+        const std::vector<std::reference_wrapper<const Transaction>>& transactions,
+        const CommitOptions& options,
+        const StorageOptionsAccessor* storage_accessor,
+        const Session* session,
+        const CommitLock* commit_lock);
+
+    /// Clone this handle as an independent in-memory snapshot.
+    ///
+    /// The returned handle shares this dataset's native snapshot and
+    /// Arc-backed session, object-store registry, caches, and commit handler,
+    /// but has its own lock. Cloning performs no storage I/O. Mutating either
+    /// handle does not change the other's version, schema, or rows, and does
+    /// not hold the other's lock. Source and clone may be destroyed in either
+    /// order.
+    ///
+    /// This duplicates an in-memory handle; it is not Lance's on-disk shallow
+    /// or deep clone operation. Throws lance::Error on failure.
+    Dataset clone_handle() const {
+        auto* ds = lance_dataset_clone_handle(handle_.get());
+        if (!ds) check_error();
+        return Dataset(ds);
+    }
 
     /// Number of rows in the dataset.
     uint64_t count_rows() const {
@@ -2325,6 +8373,27 @@ public:
             out.push_back(info);
         }
         return out;
+    }
+
+    /// Snapshot the dataset's native object-store I/O counters without
+    /// resetting them. The counters are the current native accumulator for the
+    /// store returned by `Dataset::object_store(None)`; a preceding incremental
+    /// call resets that accumulator.
+    LanceObjectStoreIoStats io_stats_snapshot() const {
+        LanceObjectStoreIoStats stats{};
+        if (lance_dataset_io_stats_snapshot(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+
+    /// Return dataset object-store counters accumulated since the previous
+    /// incremental call and reset the native accumulator. No binding-side
+    /// baseline is kept.
+    LanceObjectStoreIoStats io_stats_incremental() const {
+        LanceObjectStoreIoStats stats{};
+        if (lance_dataset_io_stats_incremental(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
     }
 
     /// Snapshot the dataset's manifest config map.
@@ -2566,6 +8635,40 @@ public:
         auto* out = lance_dataset_checkout_ref(
             handle_.get(), reference.c_handle());
         if (!out) check_error();
+        return Dataset(out);
+    }
+
+    /// Deep clone this handle's snapshot into `target_path`.
+    ///
+    /// `reference == nullptr` clones the handle's current snapshot (branch and
+    /// version id pinned); it does not select the latest head. Pass
+    /// `Ref::version(std::nullopt, std::nullopt)` to clone the current head of
+    /// the default branch. `storage_options == nullptr` passes native None;
+    /// otherwise the accessor's native Arc is forwarded as-is when it holds
+    /// static options or a provider (an accessor with neither passes None),
+    /// without resolving or copying credentials. The returned dataset keeps
+    /// the cloned snapshot's version id (native clone commit semantics), so
+    /// `version()` is not necessarily 1. Copy or commit errors can leave the
+    /// target's publication state uncertain; reopen it to check its state.
+    /// Partial objects may remain under `target_path` and are not rolled back.
+    /// The target URI must use a scheme known to the default object-store
+    /// registry, because native clone commits resolve it there.
+    /// For datasets with additional base paths, native deep clone reads them
+    /// through the source dataset's object store; per-base distinct source
+    /// credentials are not supported.
+    Dataset deep_clone(
+        const std::string& target_path,
+        const Ref* reference = nullptr,
+        const StorageOptionsAccessor* storage_options = nullptr) const {
+        LanceDataset* out = nullptr;
+        if (lance_dataset_deep_clone(
+                handle_.get(),
+                target_path.c_str(),
+                reference ? reference->c_handle() : nullptr,
+                storage_options ? storage_options->c_handle() : nullptr,
+                &out) != 0) {
+            check_error();
+        }
         return Dataset(out);
     }
 
@@ -2840,10 +8943,10 @@ public:
         return count;
     }
 
-    /// Commit a new manifest that aliases `version` as the latest. The
-    /// returned Dataset points at the target version; this handle is
-    /// unchanged. If `version` is already the latest, no new manifest is
-    /// written. Throws lance::Error on failure.
+    /// Commit a new manifest carrying the fragments of `version`, even when
+    /// `version` is already the latest. The returned Dataset points at the
+    /// newly committed version; this handle is unchanged.
+    /// Throws lance::Error on failure.
     Dataset restore(uint64_t version) const {
         auto* out = lance_dataset_restore(handle_.get(), version);
         if (!out) check_error();
@@ -2898,6 +9001,31 @@ public:
         return num_updated;
     }
 
+    /// One-shot native `Dataset::merge` left join. The two-argument overload
+    /// maps an omitted `right_on` to `left_on`.
+    ///
+    /// A non-null `source` is consumed on return or throw; a null source is
+    /// rejected without consumption. Native owns matching, schema union, and
+    /// commit behavior. Existing scanners and independently opened handles
+    /// retain their previous snapshots. Throws lance::Error on failure.
+    void merge(ArrowArrayStream* source, const std::string& left_on) {
+        merge(source, left_on, left_on);
+    }
+
+    /// One-shot native `Dataset::merge` left join with distinct keys.
+    ///
+    /// Empty key strings are forwarded to native validation. Throws
+    /// lance::Error on failure.
+    void merge(
+        ArrowArrayStream* source,
+        const std::string& left_on,
+        const std::string& right_on) {
+        if (lance_dataset_merge(
+                handle_.get(), left_on.c_str(), right_on.c_str(), source) != 0) {
+            check_error();
+        }
+    }
+
     /// Merge `source` into this dataset keyed on `on_columns`, committing a
     /// new manifest. Defaults to find-or-create semantics (insert rows that
     /// do not match an existing key). Returns the per-call insert / update /
@@ -2940,6 +9068,53 @@ public:
         return merge_insert(on_columns, source, &params);
     }
 
+    // ─── MemWAL / LSM ────────────────────────────────────────────────────────
+
+    /// Initialize native MemWAL on this dataset. The handle is updated in
+    /// place; existing scanners keep their previous snapshot. Sharding mode,
+    /// column, bucket bounds, maintained index names, and writer defaults are
+    /// validated by native code.
+    void initialize_mem_wal(const MemWalInitOptions& options);
+
+    /// Read native MemWAL index details. Returns nullopt when MemWAL is not
+    /// initialized on the current snapshot.
+    std::optional<MemWalIndexDetails> mem_wal_index_details() const;
+
+    /// Open a native shard writer. The supplied shard ID must be a UUID;
+    /// `config` overrides native defaults for this writer only.
+    ShardWriter mem_wal_writer(const std::string& shard_id,
+                               const ShardWriterConfig& config = {}) const;
+
+    /// Merge `source` and atomically advance MemWAL compaction progress.
+    /// `source` is consumed on return or throw. An empty list is a plain merge.
+    LanceMergeInsertResult merge_insert_with_compaction(
+        const std::vector<std::string>& on_columns,
+        ArrowArrayStream* source,
+        const LanceMergeInsertParams* params,
+        const std::vector<CompactedSsTable>& compacted_sstables) {
+        std::vector<const char*> col_ptrs;
+        col_ptrs.reserve(on_columns.size());
+        for (const auto& column : on_columns) col_ptrs.push_back(column.c_str());
+        std::vector<::LanceCompactedSsTable> raw_compacted;
+        raw_compacted.reserve(compacted_sstables.size());
+        for (const auto& entry : compacted_sstables) {
+            raw_compacted.push_back(entry.to_c());
+        }
+        LanceMergeInsertResult result{};
+        if (lance_dataset_merge_insert_with_compaction(
+                handle_.get(),
+                col_ptrs.empty() ? nullptr : col_ptrs.data(),
+                col_ptrs.size(),
+                source,
+                params,
+                raw_compacted.empty() ? nullptr : raw_compacted.data(),
+                raw_compacted.size(),
+                &result) != 0) {
+            check_error();
+        }
+        return result;
+    }
+
     /// Compact small or deleted-heavy fragments into larger ones, committing
     /// a new manifest. A clean dataset is a no-op — all-zero metrics and the
     /// version is unchanged. Pass `nullptr` for upstream defaults.
@@ -2951,6 +9126,90 @@ public:
             check_error();
         }
         return metrics;
+    }
+
+    /// Compact using the complete native options surface. NULL selects
+    /// `CompactionOptions::from_dataset_config`.
+    LanceCompactionMetrics compact_files_with_options(
+        const CompactionOptions* options = nullptr) {
+        LanceCompactionMetrics metrics{};
+        if (lance_dataset_compact_files_v2(
+                handle_.get(),
+                options ? options->c_handle() : nullptr,
+                &metrics) != 0)
+            check_error();
+        return metrics;
+    }
+
+    /// Plan native compaction. NULL options select dataset config.
+    CompactionPlan plan_compaction(
+        const CompactionOptions* options = nullptr) const {
+        auto* plan = lance_dataset_plan_compaction(
+            handle_.get(), options ? options->c_handle() : nullptr);
+        if (!plan) check_error();
+        return CompactionPlan(plan);
+    }
+
+    /// Commit native rewrite results. NULL options select native defaults.
+    LanceCompactionMetrics commit_compaction(
+        const std::vector<RewriteResult>& results,
+        const CompactionOptions* options = nullptr) {
+        std::vector<const LanceRewriteResult*> raw;
+        raw.reserve(results.size());
+        for (const auto& result : results) raw.push_back(result.c_handle());
+        LanceCompactionMetrics metrics{};
+        if (lance_dataset_commit_compaction(
+                handle_.get(),
+                raw.empty() ? nullptr : raw.data(),
+                raw.size(),
+                options ? options->c_handle() : nullptr,
+                &metrics) != 0)
+            check_error();
+        return metrics;
+    }
+
+    /// Run native single-process index optimization. NULL uses native defaults.
+    void optimize_indices(
+        const OptimizeIndicesOptions* options = nullptr) {
+        if (lance_dataset_optimize_indices(
+                handle_.get(),
+                options ? options->c_handle() : nullptr) != 0)
+            check_error();
+    }
+
+    /// Plan the native distributed index optimization workflow.
+    OptimizeIndicesPlan plan_optimize_indices(
+        const OptimizeIndicesOptions* options = nullptr) const {
+        auto* plan = lance_dataset_plan_optimize_indices(
+            handle_.get(), options ? options->c_handle() : nullptr);
+        if (!plan) check_error();
+        return OptimizeIndicesPlan(plan);
+    }
+
+    /// Commit merged native index segments.
+    void commit_optimize_indices(
+        const std::vector<IndexSegmentResult>& results,
+        const OptimizeIndicesOptions* options = nullptr) {
+        std::vector<const LanceIndexSegmentResult*> raw;
+        raw.reserve(results.size());
+        for (const auto& result : results) raw.push_back(result.c_handle());
+        if (lance_dataset_commit_optimize_indices(
+                handle_.get(),
+                raw.empty() ? nullptr : raw.data(),
+                raw.size(),
+                options ? options->c_handle() : nullptr) != 0)
+            check_error();
+    }
+
+    /// Migrate manifest paths to native v2 naming through core.
+    void migrate_manifest_paths_v2() {
+        if (lance_dataset_migrate_manifest_paths_v2(handle_.get()) != 0)
+            check_error();
+    }
+
+    /// Delete every row through native `Dataset::truncate_table`.
+    void truncate_table() {
+        if (lance_dataset_truncate_table(handle_.get()) != 0) check_error();
     }
 
     /// Drop columns from the dataset's schema and commit a new manifest.
@@ -3044,6 +9303,34 @@ public:
         }
     }
 
+    /// Add columns through native `NewColumnTransform::BatchUDF`.
+    ///
+    /// `udf.output_schema` is the complete schema of every returned batch and
+    /// must remain valid for the call. An engaged checkpoint store requires all
+    /// four callbacks. `std::nullopt` read columns maps to native `None`; an
+    /// engaged empty vector maps to `Some(empty)`. `std::nullopt` batch size
+    /// maps to `None`; `std::optional<uint32_t>(0)` is forwarded as explicit
+    /// zero, leaving validation to native.
+    ///
+    /// Callbacks execute synchronously under this handle's exclusive mutation
+    /// lock. They must not re-enter the same handle; use an independent handle
+    /// or an existing fragment/scanner snapshot for callback reads. C++
+    /// exceptions are contained and converted to native callback errors.
+    /// Throws lance::Error on failure.
+    void add_columns_batch_udf(
+        const BatchUDF& udf,
+        std::optional<std::vector<std::string>> read_columns = std::nullopt,
+        std::optional<uint32_t> batch_size = std::nullopt) {
+        callback_detail::BatchUDFCall call(
+            udf, std::move(read_columns), batch_size);
+
+        if (lance_dataset_add_columns_batch_udf(
+                handle_.get(), &call.raw, call.read_columns_ptr,
+                call.batch_size_ptr) != 0) {
+            check_error();
+        }
+    }
+
     /// Add all-null columns described by an Arrow schema, committing a new
     /// manifest. Metadata-only on non-legacy datasets. Every field in `schema`
     /// must be nullable. The caller owns `schema` and must keep it alive for
@@ -3088,6 +9375,29 @@ public:
             check_error();
         }
     }
+
+    /// Create native data-file metadata from an existing Lance file.
+    ///
+    /// `path` is relative to the selected native data directory.
+    /// `base_id == std::nullopt` maps to native `None`; an engaged value maps
+    /// to native `Some`, including zero. Empty paths, missing or malformed
+    /// files, schema mismatches and unregistered base IDs retain native error
+    /// timing. The returned snapshot remains valid after this dataset is
+    /// destroyed.
+    DataFile create_data_file(
+        const std::string& path,
+        std::optional<uint32_t> base_id = std::nullopt) const {
+        LanceDataFile* file = nullptr;
+        const uint32_t* base_id_ptr = base_id ? &*base_id : nullptr;
+        if (lance_dataset_create_data_file(
+                handle_.get(), path.c_str(), base_id_ptr, &file) != 0) {
+            check_error();
+        }
+        return DataFile(file);
+    }
+
+    /// Clone the current snapshot schema as an owned native value.
+    LanceSchema native_schema() const;
 
     /// Take rows by indices. `out` is caller-owned and its non-null `release`
     /// must be called exactly once. Deferred iteration/cleanup panics are
@@ -3200,6 +9510,74 @@ public:
         return blobs;
     }
 
+    /// Plan and stream whole-blob reads. Returns the existing move-only
+    /// ArrowStream. Each stream record contains `row_address` and nullable
+    /// LargeBinary `data`; native order, duplicates and NULL-versus-empty
+    /// values are preserved. The stream remains valid after this Dataset is
+    /// destroyed. Native payload bytes are retained directly in Arrow buffers
+    /// without a payload copy; exported batches remain valid after the stream
+    /// is released.
+    ArrowStream read_blobs(
+        const std::string& column,
+        BlobRowSelector selector,
+        const std::vector<uint64_t>& rows,
+        const BlobReadOptions& options = {}) const {
+        LanceBlobReadOptions raw{};
+        if (options.io_buffer_size) {
+            raw.has_io_buffer_size = true;
+            raw.io_buffer_size = *options.io_buffer_size;
+        }
+        raw.order = options.preserve_order
+            ? LANCE_BLOB_READ_PRESERVE_ORDER
+            : LANCE_BLOB_READ_UNORDERED;
+        const uint64_t* rows_ptr =
+            selector == BlobRowSelector::None ? nullptr : rows.data();
+        ArrowArrayStream stream{};
+        if (lance_dataset_read_blobs(
+                handle_.get(), column.c_str(), static_cast<int32_t>(selector),
+                rows_ptr, rows.size(), &raw, &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    /// Plan and stream one blob-local range read per request. Returns the
+    /// existing move-only ArrowStream. Each record contains `request_index`,
+    /// `row_address`, `offset`, `length` and nullable LargeBinary `data`.
+    /// `request_index` identifies duplicate/unordered requests. The stream
+    /// remains valid after this Dataset is destroyed. Native payload bytes are
+    /// retained directly in Arrow buffers without a payload copy; exported
+    /// batches remain valid after the stream is released.
+    ArrowStream read_blob_ranges(
+        const std::string& column,
+        BlobRowSelector selector,
+        const std::vector<BlobRangeRequest>& requests,
+        const BlobReadOptions& options = {}) const {
+        std::vector<LanceBlobRangeRequest> raw_requests;
+        raw_requests.reserve(requests.size());
+        for (const auto& request : requests) {
+            raw_requests.push_back(
+                {request.row, request.offset, request.length});
+        }
+        LanceBlobReadOptions raw{};
+        if (options.io_buffer_size) {
+            raw.has_io_buffer_size = true;
+            raw.io_buffer_size = *options.io_buffer_size;
+        }
+        raw.order = options.preserve_order
+            ? LANCE_BLOB_READ_PRESERVE_ORDER
+            : LANCE_BLOB_READ_UNORDERED;
+        const LanceBlobRangeRequest* requests_ptr =
+            selector == BlobRowSelector::None ? nullptr : raw_requests.data();
+        ArrowArrayStream stream{};
+        if (lance_dataset_read_blob_ranges(
+                handle_.get(), column.c_str(), static_cast<int32_t>(selector),
+                requests_ptr, raw_requests.size(), &raw, &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
     /// Create a Scanner builder for this dataset.
     Scanner scan() const;
 
@@ -3213,6 +9591,20 @@ public:
     /// Create a Scanner builder for all columns, with an optional SQL filter.
     Scanner scan(std::nullopt_t,
                  const std::optional<std::string>& filter = std::nullopt) const;
+
+    /// Plan a SQL query over this dataset with the native `dataset::sql`
+    /// planner. `sql` is copied; the returned builder owns its own dataset
+    /// snapshot, so this dataset handle may close first. System-column
+    /// injection, batch limits and blob handling are configured on the
+    /// builder; the native planner owns their semantics.
+    SqlQueryBuilder sql(const std::string& sql) const;
+
+    /// Explore row changes between dataset versions with the native
+    /// `dataset::delta` support. The returned builder owns its own dataset
+    /// snapshot. Version and date ranges are validated synchronously on
+    /// build; transaction listing and the four row-change streams are
+    /// native.
+    DatasetDeltaBuilder delta() const;
 
     /// Compatibility wrapper for an OR Match query.
     [[deprecated("Use prepare_fts_match_query() to select the Match operator")]]
@@ -3296,6 +9688,52 @@ public:
             check_error();
     }
 
+    /// Create a vector index from legacy parameters with optional progress.
+    ///
+    /// A null callback disables observation. A non-null callback may run
+    /// concurrently on internal runtime worker threads while this call holds
+    /// the dataset mutation lock; it must be thread-safe, non-blocking, and
+    /// must not access this dataset, call runtime-backed lance_* entry points,
+    /// or start a nested runtime. Non-runtime leaf utilities are unaffected. The
+    /// callback and context are borrowed only through this synchronous call
+    /// and are retired before it returns. Native publication/reload errors can
+    /// leave the returned state uncertain; reopen to inspect the version.
+    void create_vector_index_with_progress(
+        const std::string& column,
+        const LanceVectorIndexParams& params,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
+        const std::string& name = "",
+        bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        if (lance_dataset_create_vector_index_with_progress(
+                handle_.get(), column.c_str(), name_c, &params, callback,
+                callback_ctx, replace) != 0)
+            check_error();
+    }
+
+    /// Create a vector index from additive native options.
+    ///
+    /// Native Lance performs the commit before reloading index metadata. An
+    /// exception can therefore be thrown after the dataset version was
+    /// published; reopen the dataset to determine its current version.
+    void create_vector_index_with_options(
+        const std::string& column,
+        const VectorIndexOptions& options,
+        const std::string& name = "",
+        bool replace = false);
+
+    /// Create a vector index from additive native options with optional
+    /// progress. See create_vector_index_with_progress for the callback and
+    /// publication-error contract.
+    void create_vector_index_with_options_and_progress(
+        const std::string& column,
+        const VectorIndexOptions& options,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
+        const std::string& name = "",
+        bool replace = false);
+
     /// Create a scalar index on a column.
     void create_scalar_index(const std::string& column,
                              LanceScalarIndexType index_type,
@@ -3310,6 +9748,72 @@ public:
             check_error();
     }
 
+    /// Create a scalar index with optional progress. A null callback disables
+    /// observation; a non-null callback has the same synchronous lifetime and
+    /// non-reentrancy rules as create_vector_index_with_progress.
+    void create_scalar_index_with_progress(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
+        const std::string& name = "",
+        const std::string& params_json = "",
+        bool replace = false) {
+        const char* name_c = name.empty() ? nullptr : name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        if (lance_dataset_create_scalar_index_with_progress(
+                handle_.get(), column.c_str(), name_c, index_type, json_c,
+                callback, callback_ctx, replace) != 0)
+            check_error();
+    }
+
+    /// Create a scalar index with the additive native train control.
+    void create_scalar_index_with_options(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        const ScalarIndexOptions& options,
+        const std::string& index_name = "",
+        const std::string& params_json = "",
+        bool replace = false) {
+        const char* name_c = index_name.empty() ? nullptr : index_name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        LanceScalarIndexOptions scalar_options{};
+        if (options.train) {
+            scalar_options.has_train = true;
+            scalar_options.train = *options.train;
+        }
+        if (lance_dataset_create_scalar_index_with_options(
+                handle_.get(), column.c_str(), name_c, index_type, json_c,
+                &scalar_options, replace) != 0)
+            check_error();
+    }
+
+    /// Create a scalar index with native train controls and optional progress.
+    /// A null callback disables observation. The callback follows the same
+    /// synchronous lifetime and non-reentrancy rules as
+    /// create_vector_index_with_progress.
+    void create_scalar_index_with_options_and_progress(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        const ScalarIndexOptions& options,
+        LanceIndexBuildProgressCallback callback,
+        void* callback_ctx,
+        const std::string& index_name = "",
+        const std::string& params_json = "",
+        bool replace = false) {
+        const char* name_c = index_name.empty() ? nullptr : index_name.c_str();
+        const char* json_c = params_json.empty() ? nullptr : params_json.c_str();
+        LanceScalarIndexOptions scalar_options{};
+        if (options.train) {
+            scalar_options.has_train = true;
+            scalar_options.train = *options.train;
+        }
+        if (lance_dataset_create_scalar_index_with_options_and_progress(
+                handle_.get(), column.c_str(), name_c, index_type, json_c,
+                &scalar_options, callback, callback_ctx, replace) != 0)
+            check_error();
+    }
+
     /// Create a single-use builder for an uncommitted scalar index segment.
     /// The builder owns a snapshot, so it remains valid independently of this
     /// Dataset object's lifetime.
@@ -3320,12 +9824,32 @@ public:
         const std::string& params_json = "",
         const LanceIndexSegmentBuildOptions* options = nullptr) const;
 
+    /// Create a scalar segment builder with the additive native train control.
+    IndexSegmentBuilder new_scalar_index_segment_builder_with_options(
+        const std::string& column,
+        LanceScalarIndexType index_type,
+        const ScalarIndexOptions& options,
+        const std::string& index_name = "",
+        const std::string& params_json = "",
+        const LanceIndexSegmentBuildOptions* build_options = nullptr) const;
+
     /// Create a single-use builder for an uncommitted vector index segment.
     IndexSegmentBuilder new_vector_index_segment_builder(
         const std::string& column,
         const LanceVectorIndexParams& params,
         const std::string& index_name = "",
         const LanceIndexSegmentBuildOptions* options = nullptr) const;
+
+    /// Create a single-use vector segment builder from additive native options.
+    /// `fragment_ids == std::nullopt` preserves native None; an engaged empty
+    /// vector preserves Some(empty). Native validation decides duplicate and
+    /// missing-ID behavior and timing.
+    IndexSegmentBuilder new_vector_index_segment_builder_with_options(
+        const std::string& column,
+        const VectorIndexOptions& options,
+        const std::string& index_name = "",
+        std::optional<std::vector<uint32_t>> fragment_ids = std::nullopt,
+        const std::array<uint8_t, 16>* index_uuid = nullptr) const;
 
     /// Train shared IVF centroids as an Arrow C Data Interface array/schema.
     IndexModel train_ivf_model(
@@ -3344,6 +9868,43 @@ public:
         IndexModel& ivf_centroids,
         const std::vector<uint32_t>& fragment_ids = {}) const;
 
+    /// Train IVF centroids with native sample-rate and iteration controls.
+    IndexModel train_ivf_model_with_options(
+        const std::string& column,
+        uint32_t num_partitions,
+        LanceMetricType metric,
+        const IndexTrainerOptions& options = {},
+        const std::vector<uint32_t>& fragment_ids = {}) const;
+
+    /// Train a PQ codebook with native trainer controls.
+    IndexModel train_pq_model_with_options(
+        const std::string& column,
+        uint32_t num_sub_vectors,
+        uint32_t num_bits,
+        LanceMetricType metric,
+        IndexModel& ivf_centroids,
+        const IndexTrainerOptions& options = {},
+        const std::vector<uint32_t>& fragment_ids = {}) const;
+
+    /// JSON array of every native index description, including system indexes.
+    std::string describe_indices_json() const;
+
+    /// Native index-family-specific statistics JSON. May publish a native
+    /// migration version for old corrupt fragment coverage.
+    std::string index_statistics_json(const std::string& index_name);
+
+    /// Owned IVF model snapshot for the first physical vector segment.
+    IvfModel get_ivf_model(const std::string& index_name) const;
+
+    /// Centroids from get_ivf_model(index_name), or nullopt when absent.
+    std::optional<IndexModel> centroids(const std::string& index_name) const;
+
+    /// Read one logical IVF partition; the stream owns its native snapshot.
+    ArrowStream read_index_partition(
+        const std::string& index_name,
+        uint64_t partition_id,
+        bool with_vector = false) const;
+
     /// Drop an index by name.
     void drop_index(const std::string& name) {
         if (lance_dataset_drop_index(handle_.get(), name.c_str()) != 0)
@@ -3355,6 +9916,25 @@ public:
     /// Throws lance::Error on failure, including an absent or empty index name.
     void prewarm_index(const std::string& index_name) const {
         if (lance_dataset_prewarm_index(handle_.get(), index_name.c_str()) != 0)
+            check_error();
+    }
+
+    /// Prewarm selected segments with native FTS position controls.
+    void prewarm_index_with_options(
+        const std::string& index_name,
+        const IndexPrewarmOptions& options = {}) const {
+        LanceIndexPrewarmOptions prewarm{};
+        prewarm.with_position = options.with_position;
+        if (options.index_segments) {
+            prewarm.has_segment_selection = true;
+            prewarm.segment_count = options.index_segments->size();
+            if (!options.index_segments->empty()) {
+                prewarm.segment_uuids = reinterpret_cast<const uint8_t*>(
+                    options.index_segments->data());
+            }
+        }
+        if (lance_dataset_prewarm_index_with_options(
+                handle_.get(), index_name.c_str(), &prewarm) != 0)
             check_error();
     }
 
@@ -3385,6 +9965,50 @@ public:
         std::string out(json);
         lance_free_string(json);
         return out;
+    }
+
+    /// Merge distributed Inverted index files. Files only; does not commit.
+    void merge_index_metadata(
+        const std::array<uint8_t, 16>& index_uuid,
+        const std::string& index_type,
+        std::optional<size_t> batch_readhead = std::nullopt,
+        LanceIndexBuildProgressCallback callback = nullptr,
+        void* callback_ctx = nullptr) const {
+        if (lance_dataset_merge_index_metadata(
+                handle_.get(), index_uuid.data(), index_type.c_str(),
+                batch_readhead.has_value(), batch_readhead.value_or(0), callback,
+                callback_ctx) != 0)
+            check_error();
+    }
+
+    /// Merge existing uncommitted segments into one uncommitted segment.
+    std::vector<uint8_t> merge_index_segments(
+        const std::vector<std::vector<uint8_t>>& segment_metadata) const {
+        std::vector<const uint8_t*> bytes;
+        std::vector<size_t> lens;
+        bytes.reserve(segment_metadata.size());
+        lens.reserve(segment_metadata.size());
+        for (const auto& metadata : segment_metadata) {
+            bytes.push_back(metadata.data());
+            lens.push_back(metadata.size());
+        }
+        uint8_t* output = nullptr;
+        size_t output_len = 0;
+        struct BytesGuard {
+            uint8_t* bytes = nullptr;
+            ~BytesGuard() { lance_free_bytes(bytes); }
+        } guard;
+        if (lance_dataset_merge_index_segments(
+                handle_.get(), bytes.empty() ? nullptr : bytes.data(),
+                lens.empty() ? nullptr : lens.data(), bytes.size(), &output,
+                &output_len) != 0)
+            check_error();
+        guard.bytes = output;
+        if (!output || output_len == 0) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_dataset_merge_index_segments returned empty metadata");
+        }
+        return std::vector<uint8_t>(output, output + output_len);
     }
 
     /// Number of segments that make up a logical vector index.
@@ -3450,9 +10074,355 @@ public:
     /// Access the underlying C handle (does not transfer ownership).
     const LanceDataset* c_handle() const { return handle_.get(); }
 
+    friend class Fragment;
+
 private:
     explicit Dataset(LanceDataset* ptr) : handle_(ptr) {}
 };
+
+// ─── Dataset SQL ─────────────────────────────────────────────────────────────
+
+/// Planned native SQL query result. Created by SqlQueryBuilder::build();
+/// `into_stream` moves the query's native stream into a caller-owned
+/// ArrowStream and consumes this object, so it must not be used afterwards.
+class SqlQuery {
+    Handle<LanceSqlQuery, lance_sql_query_close> handle_;
+
+public:
+    explicit SqlQuery(LanceSqlQuery* query) : handle_(query) {}
+
+    SqlQuery(SqlQuery&&) noexcept = default;
+    SqlQuery& operator=(SqlQuery&&) noexcept = default;
+    SqlQuery(const SqlQuery&) = delete;
+    SqlQuery& operator=(const SqlQuery&) = delete;
+
+    /// Move the query's native stream into a returned `ArrowStream`,
+    /// consuming this query: the C entry point frees the query allocation on
+    /// every return path, including errors, so the handle is released before
+    /// the call and never closed again. The returned stream is owned by the
+    /// caller and released exactly once. On error this object is already
+    /// consumed; do not reuse it.
+    ArrowStream into_stream() {
+        auto* raw = handle_.release();
+        ArrowArrayStream stream{};
+        if (lance_sql_query_into_stream(raw, &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+};
+
+/// Builder mirroring the native `dataset::sql::SqlQueryBuilder`. All setters
+/// return `*this`; a setter that fails (foreign conversion errors) preserves
+/// the builder's prior state. `build` plans the query and consumes this
+/// builder, so it must not be used afterwards.
+class SqlQueryBuilder {
+    Handle<LanceSqlQueryBuilder, lance_sql_query_builder_close> handle_;
+
+public:
+    explicit SqlQueryBuilder(LanceSqlQueryBuilder* builder) : handle_(builder) {}
+
+    SqlQueryBuilder(SqlQueryBuilder&&) noexcept = default;
+    SqlQueryBuilder& operator=(SqlQueryBuilder&&) noexcept = default;
+    SqlQueryBuilder(const SqlQueryBuilder&) = delete;
+    SqlQueryBuilder& operator=(const SqlQueryBuilder&) = delete;
+
+    /// Name the table in the SELECT statement. The string is copied; an
+    /// empty name is passed to native unchanged. The native default is
+    /// "dataset".
+    SqlQueryBuilder& table_name(const std::string& name) {
+        if (lance_sql_query_builder_set_table_name(handle_.get(),
+                                                    name.c_str()) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Ask the native planner to inject the `_rowid` system column where
+    /// safe.
+    SqlQueryBuilder& with_row_id(bool enabled = true) {
+        if (lance_sql_query_builder_set_with_row_id(handle_.get(), enabled) !=
+            0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Ask the native planner to inject the `_rowaddr` system column
+    /// where safe.
+    SqlQueryBuilder& with_row_addr(bool enabled = true) {
+        if (lance_sql_query_builder_set_with_row_addr(handle_.get(), enabled) !=
+            0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set how blob columns are materialized (LanceBlobHandling).
+    SqlQueryBuilder& blob_handling(LanceBlobHandling handling) {
+        if (lance_sql_query_builder_set_blob_handling(handle_.get(),
+                                                       handling) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the native target output batch size (rows). The native builder
+    /// validates the value's range on build.
+    SqlQueryBuilder& batch_size(uint64_t rows) {
+        if (lance_sql_query_builder_set_batch_size(handle_.get(), rows) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the native target output batch size in bytes.
+    SqlQueryBuilder& batch_size_bytes(uint64_t bytes) {
+        if (lance_sql_query_builder_set_batch_size_bytes(handle_.get(),
+                                                         bytes) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Plan the query and consume this builder: the C entry point frees the
+    /// builder on every return path, including errors, so the handle is
+    /// released before the call and never closed again.
+    SqlQuery build() {
+        auto* raw = handle_.release();
+        LanceSqlQuery* query = nullptr;
+        if (lance_sql_query_builder_build(raw, &query) != 0) {
+            check_error();
+        }
+        return SqlQuery(query);
+    }
+};
+
+// ─── Dataset delta ───────────────────────────────────────────────────────────
+
+/// Native version-diff handle. Reusable: `list_transactions` and every
+/// `get_*` stream may be called repeatedly and in any order; each returned
+/// stream owns its state after this (and the dataset) handle closes.
+class DatasetDelta {
+    Handle<LanceDatasetDelta, lance_dataset_delta_close> handle_;
+
+public:
+    explicit DatasetDelta(LanceDatasetDelta* delta) : handle_(delta) {}
+
+    DatasetDelta(DatasetDelta&&) noexcept = default;
+    DatasetDelta& operator=(DatasetDelta&&) noexcept = default;
+    DatasetDelta(const DatasetDelta&) = delete;
+    DatasetDelta& operator=(const DatasetDelta&) = delete;
+
+    /// List the transactions committed between the delta's begin and end
+    /// versions. Each element is an independently owned Transaction. Every
+    /// element is adopted before the shared array guard releases the
+    /// untouched remainder, so a mid-loop exception frees the rest exactly
+    /// once.
+    std::vector<Transaction> list_transactions() const {
+        LanceTransaction** transactions = nullptr;
+        size_t count = 0;
+        if (lance_dataset_delta_list_transactions(handle_.get(), &transactions,
+                                                   &count) != 0) {
+            check_error();
+        }
+        auto free_transactions = [count](LanceTransaction** items) {
+            lance_transaction_array_free(items, count);
+        };
+        std::unique_ptr<LanceTransaction*, decltype(free_transactions)>
+            guard(transactions, free_transactions);
+        std::vector<Transaction> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            LanceTransaction* item = transactions[i];
+            transactions[i] = nullptr;
+            out.push_back(Transaction(item));
+        }
+        return out;
+    }
+
+    /// Stream the rows inserted across the delta's range into a returned
+    /// `ArrowStream`. The stream owns the native state it needs, so it stays
+    /// valid after this delta (and its dataset) handle closes. On error
+    /// nothing is returned and this delta remains usable.
+    ArrowStream get_inserted_rows() const {
+        ArrowArrayStream stream{};
+        if (lance_dataset_delta_get_inserted_rows(handle_.get(), &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    /// Stream the rows updated across the delta's range into a returned
+    /// `ArrowStream`. The stream owns its native state and stays valid after
+    /// this delta (and its dataset) handle closes. On error nothing is
+    /// returned and this delta remains usable.
+    ArrowStream get_updated_rows() const {
+        ArrowArrayStream stream{};
+        if (lance_dataset_delta_get_updated_rows(handle_.get(), &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    /// Stream the rows upserted across the delta's range into a returned
+    /// `ArrowStream`. The stream owns its native state and stays valid after
+    /// this delta (and its dataset) handle closes. On error nothing is
+    /// returned and this delta remains usable.
+    ArrowStream get_upserted_rows() const {
+        ArrowArrayStream stream{};
+        if (lance_dataset_delta_get_upserted_rows(handle_.get(), &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    /// Stream the deleted row ids across the delta's range into a returned
+    /// `ArrowStream`. The single column is the native stable row-id; native
+    /// resolution, version-zero behavior and error stages are authoritative.
+    /// The stream stays valid after this delta (and its dataset) handle
+    /// closes. On error nothing is returned and this delta remains usable.
+    ArrowStream get_deleted_row_ids() const {
+        ArrowArrayStream stream{};
+        if (lance_dataset_delta_get_deleted_row_ids(handle_.get(), &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+};
+
+/// Builder mirroring the native `dataset::delta::DatasetDeltaBuilder`. Range
+/// combinations are validated synchronously on build. `build` consumes this
+/// builder, so it must not be used afterwards.
+class DatasetDeltaBuilder {
+    Handle<LanceDatasetDeltaBuilder, lance_dataset_delta_builder_close> handle_;
+
+public:
+    explicit DatasetDeltaBuilder(LanceDatasetDeltaBuilder* builder)
+        : handle_(builder) {}
+
+    DatasetDeltaBuilder(DatasetDeltaBuilder&&) noexcept = default;
+    DatasetDeltaBuilder& operator=(DatasetDeltaBuilder&&) noexcept = default;
+    DatasetDeltaBuilder(const DatasetDeltaBuilder&) = delete;
+    DatasetDeltaBuilder& operator=(const DatasetDeltaBuilder&) = delete;
+
+    /// Compare against the named version. Native build rejects combining
+    /// this with any explicit begin/end version or date.
+    DatasetDeltaBuilder& compared_against_version(uint64_t version) {
+        if (lance_dataset_delta_builder_set_compared_against_version(
+                handle_.get(), version) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the explicit begin version. Native build requires both begin and
+    /// end versions, or a compared-against version.
+    DatasetDeltaBuilder& begin_version(uint64_t version) {
+        if (lance_dataset_delta_builder_set_begin_version(handle_.get(),
+                                                           version) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the explicit end version.
+    DatasetDeltaBuilder& end_version(uint64_t version) {
+        if (lance_dataset_delta_builder_set_end_version(handle_.get(),
+                                                         version) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the begin date for date-mode ranges. Native build requires a
+    /// begin date when an end date is provided. A timestamp the native
+    /// chrono constructor cannot represent is rejected by this setter.
+    DatasetDeltaBuilder& begin_timestamp(const LanceDeltaTimestamp& timestamp) {
+        if (lance_dataset_delta_builder_set_begin_timestamp(handle_.get(),
+                                                             &timestamp) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Set the end date for date-mode ranges.
+    DatasetDeltaBuilder& end_timestamp(const LanceDeltaTimestamp& timestamp) {
+        if (lance_dataset_delta_builder_set_end_timestamp(handle_.get(),
+                                                           &timestamp) != 0) {
+            check_error();
+        }
+        return *this;
+    }
+
+    /// Build the delta and consume this builder: the C entry point frees the
+    /// builder on every return path, including errors, so the handle is
+    /// released before the call and never closed again. Native build is
+    /// synchronous and validates the configured range combination.
+    DatasetDelta build() {
+        auto* raw = handle_.release();
+        LanceDatasetDelta* delta = nullptr;
+        if (lance_dataset_delta_builder_build(raw, &delta) != 0) {
+            check_error();
+        }
+        return DatasetDelta(delta);
+    }
+};
+
+inline LanceSchema Dataset::native_schema() const {
+    return LanceSchema::from_dataset(*this);
+}
+
+inline LanceSchema LanceSchema::from_dataset(const Dataset& dataset) {
+    ::LanceSchema* raw = nullptr;
+    if (lance_dataset_schema_clone(dataset.c_handle(), &raw) != 0) {
+        check_error();
+    }
+    return LanceSchema(raw);
+}
+
+inline CompactionOptions CompactionOptions::from_dataset(
+    const Dataset& dataset) {
+    auto* options =
+        lance_compaction_options_v2_from_dataset(dataset.c_handle());
+    if (!options) check_error();
+    return CompactionOptions(options);
+}
+
+inline RewriteResult CompactionTask::execute(const Dataset& dataset) const {
+    auto* result =
+        lance_compaction_task_execute(dataset.c_handle(), handle_.get());
+    if (!result) check_error();
+    return RewriteResult(result);
+}
+
+inline std::optional<IndexSegmentResult> OptimizeIndexTask::execute(
+    const Dataset& dataset) const {
+    LanceIndexSegmentResult* result = nullptr;
+    if (lance_optimize_index_task_execute(
+            dataset.c_handle(), handle_.get(), &result) != 0)
+        check_error();
+    if (!result) return std::nullopt;
+    return IndexSegmentResult(result);
+}
+
+inline std::optional<IndexSegmentResult> OptimizeIndexMerge::execute(
+    const Dataset& dataset,
+    const std::vector<IndexSegmentResult>& task_results) const {
+    std::vector<const LanceIndexSegmentResult*> raw;
+    raw.reserve(task_results.size());
+    for (const auto& result : task_results) raw.push_back(result.c_handle());
+    LanceIndexSegmentResult* result = nullptr;
+    if (lance_optimize_index_merge_execute(
+            dataset.c_handle(),
+            handle_.get(),
+            raw.empty() ? nullptr : raw.data(),
+            raw.size(),
+            &result) != 0)
+        check_error();
+    if (!result) return std::nullopt;
+    return IndexSegmentResult(result);
+}
 
 /// Result of Dataset::commit_batch. The dataset and the actual native merged
 /// transaction are independently owned.
@@ -3511,6 +10481,84 @@ inline BatchCommitResult Dataset::commit_batch(
     return BatchCommitResult(Dataset(dataset), Transaction(merged));
 }
 
+inline BatchCommitResult Dataset::commit_batch_with_accessor(
+    const std::string& uri,
+    const std::vector<std::reference_wrapper<const Transaction>>& transactions,
+    const StorageOptionsAccessor& storage_options_accessor,
+    const CommitOptions& options,
+    const Session* session) {
+
+    std::vector<const LanceTransaction*> raw;
+    raw.reserve(transactions.size());
+    for (const auto& transaction : transactions) {
+        raw.push_back(transaction.get().c_handle());
+    }
+
+    LanceCommitOptions c_options = to_c_commit_options(options);
+    LanceDataset* dataset = nullptr;
+    LanceTransaction* merged = nullptr;
+    if (lance_transaction_commit_batch_with_accessor(
+            uri.c_str(),
+            raw.data(),
+            raw.size(),
+            &c_options,
+            storage_options_accessor.c_handle(),
+            session ? session->c_handle() : nullptr,
+            &dataset,
+            &merged) != 0) {
+        check_error();
+    }
+    if (!dataset || !merged) {
+        if (dataset) lance_dataset_close(dataset);
+        if (merged) lance_transaction_close(merged);
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_transaction_commit_batch_with_accessor returned success "
+            "with null output");
+    }
+    return BatchCommitResult(Dataset(dataset), Transaction(merged));
+}
+
+inline BatchCommitResult Dataset::commit_batch_with_commit_lock(
+    const std::string& uri,
+    const std::vector<std::reference_wrapper<const Transaction>>& transactions,
+    const CommitOptions& options,
+    const StorageOptionsAccessor* storage_accessor,
+    const Session* session,
+    const CommitLock* commit_lock) {
+
+    std::vector<const LanceTransaction*> raw;
+    raw.reserve(transactions.size());
+    for (const auto& transaction : transactions) {
+        raw.push_back(transaction.get().c_handle());
+    }
+
+    LanceCommitOptions c_options = to_c_commit_options(options);
+    LanceDataset* dataset = nullptr;
+    LanceTransaction* merged = nullptr;
+    if (lance_transaction_commit_batch_with_commit_lock(
+            uri.c_str(),
+            raw.data(),
+            raw.size(),
+            &c_options,
+            storage_accessor ? storage_accessor->c_handle() : nullptr,
+            session ? session->c_handle() : nullptr,
+            commit_lock ? commit_lock->c_handle() : nullptr,
+            &dataset,
+            &merged) != 0) {
+        check_error();
+    }
+    if (!dataset || !merged) {
+        if (dataset) lance_dataset_close(dataset);
+        if (merged) lance_transaction_close(merged);
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_transaction_commit_batch_with_commit_lock returned success "
+            "with null output");
+    }
+    return BatchCommitResult(Dataset(dataset), Transaction(merged));
+}
+
 // ─── Uncommitted index segments ──────────────────────────────────────────────
 
 /// Move-only owner of an Arrow C Data Interface model array and schema.
@@ -3524,11 +10572,36 @@ class IndexModel {
     }
 
     friend class Dataset;
+    friend class IvfModel;
+
+    IndexModel() noexcept = default;
 
     IndexModel(ArrowArray array, ArrowSchema schema) noexcept
         : array_(array), schema_(schema) {}
 
 public:
+    /// Adopt caller-produced native Arrow model structs, transferring their
+    /// release responsibility to this object. Both inputs are required and are
+    /// cleared to an empty state only after a complete transfer. This allows
+    /// arbitrary native model dtypes and shapes to be passed to
+    /// VectorIndexOptions.
+    static IndexModel adopt(ArrowArray* array, ArrowSchema* schema) {
+        if (!array || !schema) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "IndexModel::adopt requires non-null ArrowArray and ArrowSchema");
+        }
+        if (!array->release || !schema->release) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "IndexModel::adopt requires initialized Arrow structures");
+        }
+        IndexModel model;
+        model.array_ = *array;
+        model.schema_ = *schema;
+        *array = {};
+        *schema = {};
+        return model;
+    }
+
     ~IndexModel() { reset(); }
 
     IndexModel(IndexModel&& other) noexcept
@@ -3551,6 +10624,188 @@ public:
 
     ArrowArray* array() noexcept { return &array_; }
     const ArrowSchema* schema() const noexcept { return &schema_; }
+};
+
+/// Move-only owner of a cloned native IVF model.
+class IvfModel {
+    Handle<LanceIvfModel, lance_ivf_model_free> handle_;
+
+    explicit IvfModel(LanceIvfModel* model) : handle_(model) {}
+    friend class Dataset;
+
+public:
+    IvfModel(IvfModel&&) noexcept = default;
+    IvfModel& operator=(IvfModel&&) noexcept = default;
+    IvfModel(const IvfModel&) = delete;
+    IvfModel& operator=(const IvfModel&) = delete;
+
+    bool has_centroids() const {
+        bool value = lance_ivf_model_has_centroids(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Owned Arrow centroids, or nullopt when the model has none.
+    std::optional<IndexModel> centroids() const {
+        if (!has_centroids()) return std::nullopt;
+        ArrowArray array = {};
+        ArrowSchema schema = {};
+        if (lance_ivf_model_export_centroids(handle_.get(), &array, &schema) != 0)
+            check_error();
+        return IndexModel(array, schema);
+    }
+
+    uint64_t num_partitions() const {
+        uint64_t value = lance_ivf_model_num_partitions(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    uint64_t dimension() const {
+        uint64_t value = lance_ivf_model_dimension(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    /// Native partition size. An absent partition returns 0.
+    uint64_t partition_size(uint64_t partition_id) const {
+        uint64_t value =
+            lance_ivf_model_partition_size(handle_.get(), partition_id);
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return value;
+    }
+
+    const LanceIvfModel* c_handle() const { return handle_.get(); }
+};
+
+namespace detail {
+
+/// Stable C views over one VectorIndexOptions value. The source options and
+/// IndexModel objects must outlive this storage and the C call that uses it.
+class VectorIndexOptionsStorage {
+    LanceVectorIndexOptions options_{};
+    std::vector<const char*> storage_keys_;
+    std::vector<const char*> storage_values_;
+    LanceStringMap storage_{};
+    std::vector<const char*> runtime_keys_;
+    std::vector<const char*> runtime_values_;
+    LanceStringMap runtime_{};
+    std::vector<const char*> shuffle_buffers_;
+    LancePrecomputedShuffleBuffers shuffle_{};
+
+    static void set_optional(LanceOptionalU64& out,
+                             const std::optional<uint64_t>& value) {
+        out = {};
+        if (value) {
+            out.value = *value;
+            out.is_set = true;
+        }
+    }
+
+    static void set_map(const std::map<std::string, std::string>& source,
+                        std::vector<const char*>& keys,
+                        std::vector<const char*>& values,
+                        LanceStringMap& out) {
+        for (const auto& [key, value] : source) {
+            keys.push_back(key.c_str());
+            values.push_back(value.c_str());
+        }
+        out.keys = keys.empty() ? nullptr : keys.data();
+        out.values = values.empty() ? nullptr : values.data();
+        out.count = keys.size();
+    }
+
+public:
+    explicit VectorIndexOptionsStorage(const VectorIndexOptions& options) {
+        options_.index_type = static_cast<int32_t>(options.index_type);
+        options_.metric = static_cast<int32_t>(options.metric);
+        set_optional(options_.num_partitions, options.num_partitions);
+        set_optional(options_.target_partition_size, options.target_partition_size);
+        set_optional(options_.max_iters, options.max_iters);
+        set_optional(options_.sample_rate, options.sample_rate);
+        set_optional(options_.streaming_sample_rate,
+                     options.streaming_sample_rate);
+        set_optional(options_.streaming_coreset_rate,
+                     options.streaming_coreset_rate);
+        options_.streaming_refine_passes = options.streaming_refine_passes;
+        options_.precomputed_partitions_file =
+            options.precomputed_partitions_file
+                ? options.precomputed_partitions_file->c_str()
+                : nullptr;
+        if (options.precomputed_shuffle_buffers) {
+            shuffle_.path = options.precomputed_shuffle_buffers->first.c_str();
+            for (const auto& buffer : options.precomputed_shuffle_buffers->second) {
+                shuffle_buffers_.push_back(buffer.c_str());
+            }
+            shuffle_.buffers =
+                shuffle_buffers_.empty() ? nullptr : shuffle_buffers_.data();
+            shuffle_.buffer_count = shuffle_buffers_.size();
+            options_.precomputed_shuffle_buffers = &shuffle_;
+        }
+        set_optional(options_.shuffle_partition_batches,
+                     options.shuffle_partition_batches);
+        set_optional(options_.shuffle_partition_concurrency,
+                     options.shuffle_partition_concurrency);
+        if (options.storage_options) {
+            set_map(*options.storage_options, storage_keys_, storage_values_,
+                    storage_);
+            options_.storage_options = &storage_;
+        }
+        set_optional(options_.num_sub_vectors, options.num_sub_vectors);
+        set_optional(options_.num_bits, options.num_bits);
+        if (options.ivf_centroids) {
+            options_.ivf_centroids = options.ivf_centroids->array();
+            options_.ivf_centroids_schema = options.ivf_centroids->schema();
+        }
+        if (options.pq_codebook) {
+            options_.pq_codebook = options.pq_codebook->array();
+            options_.pq_codebook_schema = options.pq_codebook->schema();
+        }
+        options_.rabitq_model_json = options.rabitq_model_json
+                                         ? options.rabitq_model_json->c_str()
+                                         : nullptr;
+        set_optional(options_.hnsw_max_level, options.hnsw_max_level);
+        set_optional(options_.hnsw_m, options.hnsw_m);
+        set_optional(options_.hnsw_ef_construction,
+                     options.hnsw_ef_construction);
+        options_.index_file_version =
+            static_cast<int32_t>(options.index_file_version);
+        options_.skip_transpose = options.skip_transpose;
+        set_map(options.runtime_hints, runtime_keys_, runtime_values_, runtime_);
+        options_.runtime_hints = &runtime_;
+        if (options.train) {
+            options_.has_train = true;
+            options_.train = *options.train;
+        }
+    }
+
+    VectorIndexOptionsStorage(const VectorIndexOptionsStorage&) = delete;
+    VectorIndexOptionsStorage& operator=(const VectorIndexOptionsStorage&) =
+        delete;
+
+    const LanceVectorIndexOptions* get() const { return &options_; }
+};
+
+}  // namespace detail
+
+/// One file recorded in an index segment's native metadata.
+struct IndexSegmentFile {
+    std::string path;
+    uint64_t size_bytes = 0;
+
+    bool operator==(const IndexSegmentFile& other) const {
+        return path == other.path && size_bytes == other.size_bytes;
+    }
+
+    bool operator!=(const IndexSegmentFile& other) const {
+        return !(*this == other);
+    }
+};
+
+/// Whole seconds plus nanoseconds since the Unix epoch.
+struct IndexTimestamp {
+    int64_t unix_seconds = 0;
+    uint32_t nanos = 0;
 };
 
 /// Parsed metadata for one physical index segment.
@@ -3650,8 +10905,226 @@ public:
         return out;
     }
 
+    /// Clone the complete in-memory native metadata value.
+    IndexSegmentMetadata clone() const {
+        LanceIndexSegmentMetadata* raw =
+            lance_index_segment_metadata_clone(handle_.get());
+        if (!raw) check_error();
+        return IndexSegmentMetadata(raw);
+    }
+
+    /// Clone with caller-supplied coverage. `std::nullopt` copies the source
+    /// fragment-coverage option unchanged; an empty vector selects
+    /// present-empty coverage. Every other native field is copied.
+    IndexSegmentMetadata clone_with_fragment_ids(
+        std::optional<std::vector<uint32_t>> fragment_ids) const {
+        LanceIndexSegmentMetadata* raw = nullptr;
+        if (fragment_ids.has_value()) {
+            raw = lance_index_segment_metadata_clone_with_fragment_ids(
+                handle_.get(), true, fragment_ids->data(),
+                fragment_ids->size());
+        } else {
+            raw = lance_index_segment_metadata_clone_with_fragment_ids(
+                handle_.get(), false, nullptr, 0);
+        }
+        if (!raw) check_error();
+        return IndexSegmentMetadata(raw);
+    }
+
+    /// Encode the complete in-memory metadata as protobuf-encoded
+    /// IndexMetadata bytes. The returned vector owns its storage.
+    std::vector<uint8_t> encode() const {
+        struct BytesGuard {
+            uint8_t* bytes = nullptr;
+            ~BytesGuard() noexcept { lance_free_bytes(bytes); }
+
+            BytesGuard() = default;
+            BytesGuard(const BytesGuard&) = delete;
+            BytesGuard& operator=(const BytesGuard&) = delete;
+        } guard;
+
+        size_t len = 0;
+        if (lance_index_segment_metadata_encode(handle_.get(), &guard.bytes,
+                                                &len) != 0)
+            check_error();
+        if (!guard.bytes || len == 0) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_index_segment_metadata_encode returned empty metadata");
+        }
+        return std::vector<uint8_t>(guard.bytes, guard.bytes + len);
+    }
+
+    std::vector<int32_t> covering_field_ids() const {
+        size_t count =
+            lance_index_segment_metadata_covering_field_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+
+        std::vector<int32_t> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            int32_t field_id = 0;
+            if (lance_index_segment_metadata_covering_field_id_at(
+                    handle_.get(), i, &field_id) != 0)
+                check_error();
+            out.push_back(field_id);
+        }
+        return out;
+    }
+
+    /// Native `index_details.value` bytes. Empty when the present Any value is
+    /// empty; throws when `index_details` is absent.
+    std::vector<uint8_t> index_details_value() const {
+        size_t len = 0;
+        const uint8_t* bytes =
+            lance_index_segment_metadata_index_details_value(handle_.get(),
+                                                              &len);
+        if (!bytes) check_error();
+        if (len == 0) return {};
+        return std::vector<uint8_t>(bytes, bytes + len);
+    }
+
+    std::vector<IndexSegmentFile> files() const {
+        size_t count = lance_index_segment_metadata_file_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+
+        std::vector<IndexSegmentFile> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            const char* path =
+                lance_index_segment_metadata_file_path_at(handle_.get(), i);
+            if (!path) check_error();
+            uint64_t size = 0;
+            if (lance_index_segment_metadata_file_size_at(
+                    handle_.get(), i, &size) != 0)
+                check_error();
+            out.push_back(IndexSegmentFile{path, size});
+        }
+        return out;
+    }
+
+    std::optional<IndexTimestamp> created_at() const {
+        LanceOptionalTimestamp timestamp{};
+        if (lance_index_segment_metadata_created_at(handle_.get(),
+                                                    &timestamp) != 0)
+            check_error();
+        if (!timestamp.is_set) return std::nullopt;
+        return IndexTimestamp{timestamp.unix_seconds, timestamp.nanos};
+    }
+
+    std::optional<uint32_t> base_id() const {
+        bool is_set = false;
+        uint32_t base_id = 0;
+        if (lance_index_segment_metadata_base_id(handle_.get(), &is_set,
+                                                 &base_id) != 0)
+            check_error();
+        if (!is_set) return std::nullopt;
+        return base_id;
+    }
+
     const LanceIndexSegmentMetadata* c_handle() const { return handle_.get(); }
 };
+
+inline IndexSegmentMetadata IndexSegmentResult::segment() const {
+    auto* metadata = lance_index_segment_result_segment(handle_.get());
+    if (!metadata) check_error();
+    return IndexSegmentMetadata(metadata);
+}
+
+inline IndexSegmentMetadata OptimizeIndexTask::reference() const {
+    auto* metadata = lance_optimize_index_task_reference(handle_.get());
+    if (!metadata) check_error();
+    return IndexSegmentMetadata(metadata);
+}
+
+inline IndexSegmentMetadata OptimizeIndexTask::old_segment(
+    size_t index) const {
+    auto* metadata =
+        lance_optimize_index_task_old_segment_at(handle_.get(), index);
+    if (!metadata) check_error();
+    return IndexSegmentMetadata(metadata);
+}
+
+inline IndexSegmentMetadata OptimizeIndexMerge::old_segment(
+    size_t index) const {
+    auto* metadata =
+        lance_optimize_index_merge_old_segment_at(handle_.get(), index);
+    if (!metadata) check_error();
+    return IndexSegmentMetadata(metadata);
+}
+
+inline Operation Operation::make_create_index(
+    const std::vector<const IndexSegmentMetadata*>& new_indices,
+    const std::vector<const IndexSegmentMetadata*>& removed_indices) {
+    std::vector<const LanceIndexSegmentMetadata*> new_raw;
+    new_raw.reserve(new_indices.size());
+    for (const auto* metadata : new_indices) {
+        if (!metadata) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "new index metadata entries must not be null");
+        }
+        new_raw.push_back(metadata->c_handle());
+    }
+    std::vector<const LanceIndexSegmentMetadata*> removed_raw;
+    removed_raw.reserve(removed_indices.size());
+    for (const auto* metadata : removed_indices) {
+        if (!metadata) {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "removed index metadata entries must not be null");
+        }
+        removed_raw.push_back(metadata->c_handle());
+    }
+
+    LanceOperation* operation = lance_operation_create_index_new(
+        new_raw.data(), new_raw.size(), removed_raw.data(), removed_raw.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline std::vector<IndexSegmentMetadata> Operation::create_index_new() const {
+    uint64_t count = 0;
+    if (lance_operation_create_index_new_count(handle_.get(), &count) != 0)
+        check_error();
+
+    std::vector<IndexSegmentMetadata> out;
+    out.reserve(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        LanceIndexSegmentMetadata* metadata = nullptr;
+        if (lance_operation_create_index_new_at(
+                handle_.get(), static_cast<size_t>(i), &metadata) != 0)
+            check_error();
+        if (!metadata) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_operation_create_index_new_at returned success "
+                        "with null metadata");
+        }
+        out.emplace_back(IndexSegmentMetadata(metadata));
+    }
+    return out;
+}
+
+inline std::vector<IndexSegmentMetadata> Operation::create_index_removed() const {
+    uint64_t count = 0;
+    if (lance_operation_create_index_removed_count(handle_.get(), &count) != 0)
+        check_error();
+
+    std::vector<IndexSegmentMetadata> out;
+    out.reserve(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        LanceIndexSegmentMetadata* metadata = nullptr;
+        if (lance_operation_create_index_removed_at(
+                handle_.get(), static_cast<size_t>(i), &metadata) != 0)
+            check_error();
+        if (!metadata) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "lance_operation_create_index_removed_at returned "
+                        "success with null metadata");
+        }
+        out.emplace_back(IndexSegmentMetadata(metadata));
+    }
+    return out;
+
+}
 
 /// Move-only builder for one uncommitted physical index segment.
 class IndexSegmentBuilder {
@@ -3695,8 +11168,9 @@ public:
     /// before execute_uncommitted; the builder is single-use. The callback is
     /// invoked from internal worker threads and may be called concurrently
     /// from parallel worker tasks, so it must be thread-safe, non-blocking,
-    /// and must not re-enter any lance_* function. It must return normally;
-    /// unwinding or throwing across this boundary can abort the host process.
+    /// and must not access the indexed dataset or call runtime-backed lance_*
+    /// entry points. Non-runtime leaf utilities are unaffected. Callbacks must
+    /// return normally: unwinding or throwing can abort the host process.
     /// Invocations occur only while execute_uncommitted runs, and this is
     /// enforced: lance-c disables the callback and drains in-flight
     /// invocations before that call returns, including on error, so a worker
@@ -3730,6 +11204,28 @@ inline IndexSegmentBuilder Dataset::new_scalar_index_segment_builder(
     return IndexSegmentBuilder(builder);
 }
 
+inline IndexSegmentBuilder Dataset::new_scalar_index_segment_builder_with_options(
+    const std::string& column,
+    LanceScalarIndexType index_type,
+    const ScalarIndexOptions& options,
+    const std::string& index_name,
+    const std::string& params_json,
+    const LanceIndexSegmentBuildOptions* build_options) const {
+    const char* index_name_c = index_name.empty() ? nullptr : index_name.c_str();
+    const char* params_json_c = params_json.empty() ? nullptr : params_json.c_str();
+    LanceScalarIndexOptions scalar_options{};
+    if (options.train) {
+        scalar_options.has_train = true;
+        scalar_options.train = *options.train;
+    }
+    auto* builder = lance_index_segment_builder_new_scalar_with_options(
+        handle_.get(), column.c_str(), index_name_c,
+        static_cast<int32_t>(index_type), params_json_c, &scalar_options,
+        build_options);
+    if (!builder) check_error();
+    return IndexSegmentBuilder(builder);
+}
+
 inline IndexSegmentBuilder Dataset::new_vector_index_segment_builder(
     const std::string& column,
     const LanceVectorIndexParams& params,
@@ -3749,6 +11245,62 @@ inline IndexSegmentBuilder Dataset::new_vector_index_segment_builder(
     };
     auto* builder = lance_index_segment_builder_new_vector(
         handle_.get(), column.c_str(), index_name_c, &segment_params, options);
+    if (!builder) check_error();
+    return IndexSegmentBuilder(builder);
+}
+
+inline void Dataset::create_vector_index_with_options(
+    const std::string& column,
+    const VectorIndexOptions& options,
+    const std::string& name,
+    bool replace) {
+    detail::VectorIndexOptionsStorage storage(options);
+    const char* name_c = name.empty() ? nullptr : name.c_str();
+    if (lance_dataset_create_vector_index_with_options(
+            handle_.get(), column.c_str(), name_c, storage.get(), replace) != 0) {
+        check_error();
+    }
+}
+
+inline void Dataset::create_vector_index_with_options_and_progress(
+    const std::string& column,
+    const VectorIndexOptions& options,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
+    const std::string& name,
+    bool replace) {
+    detail::VectorIndexOptionsStorage storage(options);
+    const char* name_c = name.empty() ? nullptr : name.c_str();
+    if (lance_dataset_create_vector_index_with_options_and_progress(
+            handle_.get(), column.c_str(), name_c, storage.get(), callback,
+            callback_ctx, replace) != 0) {
+        check_error();
+    }
+}
+
+inline IndexSegmentBuilder Dataset::new_vector_index_segment_builder_with_options(
+    const std::string& column,
+    const VectorIndexOptions& options,
+    const std::string& index_name,
+    std::optional<std::vector<uint32_t>> fragment_ids,
+    const std::array<uint8_t, 16>* index_uuid) const {
+    detail::VectorIndexOptionsStorage storage(options);
+    const char* index_name_c = index_name.empty() ? nullptr : index_name.c_str();
+    static const uint32_t empty_fragment_id = 0;
+    LanceVectorIndexSegmentScope scope{};
+    if (fragment_ids) {
+        scope.fragment_ids = fragment_ids->empty()
+                                 ? &empty_fragment_id
+                                 : fragment_ids->data();
+        scope.fragment_count = fragment_ids->size();
+    }
+    if (index_uuid) {
+        scope.index_uuid = index_uuid->data();
+    }
+    const LanceVectorIndexSegmentScope* scope_ptr =
+        (fragment_ids || index_uuid) ? &scope : nullptr;
+    auto* builder = lance_index_segment_builder_new_vector_with_options(
+        handle_.get(), column.c_str(), index_name_c, storage.get(), scope_ptr);
     if (!builder) check_error();
     return IndexSegmentBuilder(builder);
 }
@@ -3785,6 +11337,107 @@ inline IndexModel Dataset::train_pq_model(
             ivf_centroids.array(), ivf_centroids.schema(), &array, &schema) != 0)
         check_error();
     return IndexModel(array, schema);
+}
+
+inline IndexModel Dataset::train_ivf_model_with_options(
+    const std::string& column,
+    uint32_t num_partitions,
+    LanceMetricType metric,
+    const IndexTrainerOptions& options,
+    const std::vector<uint32_t>& fragment_ids) const {
+    ArrowArray array = {};
+    ArrowSchema schema = {};
+    LanceIndexTrainerOptions trainer{};
+    if (options.sample_rate) {
+        trainer.sample_rate.value = *options.sample_rate;
+        trainer.sample_rate.is_set = true;
+    }
+    if (options.max_iters) {
+        trainer.max_iters.value = *options.max_iters;
+        trainer.max_iters.is_set = true;
+    }
+    const uint32_t* ids = fragment_ids.empty() ? nullptr : fragment_ids.data();
+    if (lance_index_train_ivf_model_with_options(
+            handle_.get(), column.c_str(), num_partitions,
+            static_cast<int32_t>(metric), ids, fragment_ids.size(), &trainer,
+            &array, &schema) != 0)
+        check_error();
+    return IndexModel(array, schema);
+}
+
+inline IndexModel Dataset::train_pq_model_with_options(
+    const std::string& column,
+    uint32_t num_sub_vectors,
+    uint32_t num_bits,
+    LanceMetricType metric,
+    IndexModel& ivf_centroids,
+    const IndexTrainerOptions& options,
+    const std::vector<uint32_t>& fragment_ids) const {
+    ArrowArray array = {};
+    ArrowSchema schema = {};
+    LanceIndexTrainerOptions trainer{};
+    if (options.sample_rate) {
+        trainer.sample_rate.value = *options.sample_rate;
+        trainer.sample_rate.is_set = true;
+    }
+    if (options.max_iters) {
+        trainer.max_iters.value = *options.max_iters;
+        trainer.max_iters.is_set = true;
+    }
+    const uint32_t* ids = fragment_ids.empty() ? nullptr : fragment_ids.data();
+    if (lance_index_train_pq_model_with_options(
+            handle_.get(), column.c_str(), num_sub_vectors, num_bits,
+            static_cast<int32_t>(metric), ids, fragment_ids.size(),
+            ivf_centroids.array(), ivf_centroids.schema(), &trainer, &array,
+            &schema) != 0)
+        check_error();
+    return IndexModel(array, schema);
+}
+
+inline std::string Dataset::describe_indices_json() const {
+    const char* json = lance_dataset_describe_indices_json(handle_.get());
+    if (!json) check_error();
+    std::unique_ptr<const char, void (*)(const char*)> guard(json,
+                                                             lance_free_string);
+    return std::string(json);
+}
+
+inline std::string Dataset::index_statistics_json(
+    const std::string& index_name) {
+    const char* json = lance_dataset_index_statistics_json(
+        handle_.get(), index_name.c_str());
+    if (!json) check_error();
+    std::unique_ptr<const char, void (*)(const char*)> guard(json,
+                                                             lance_free_string);
+    return std::string(json);
+}
+
+inline IvfModel Dataset::get_ivf_model(const std::string& index_name) const {
+    auto* model =
+        lance_dataset_get_ivf_model(handle_.get(), index_name.c_str());
+    if (!model) check_error();
+    return IvfModel(model);
+}
+
+inline std::optional<IndexModel> Dataset::centroids(
+    const std::string& index_name) const {
+    return get_ivf_model(index_name).centroids();
+}
+
+inline ArrowStream Dataset::read_index_partition(
+    const std::string& index_name,
+    uint64_t partition_id,
+    bool with_vector) const {
+    ArrowArrayStream stream = {};
+    if (lance_dataset_read_index_partition(
+            handle_.get(), index_name.c_str(), partition_id, with_vector,
+            &stream) != 0)
+        check_error();
+    if (!stream.release) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_dataset_read_index_partition returned an empty stream");
+    }
+    return ArrowStream(stream);
 }
 
 // ─── Scanner ─────────────────────────────────────────────────────────────────
@@ -4281,6 +11934,12 @@ public:
         if (lance_scanner_set_maximum_nprobes(handle_.get(), maximum_nprobes) != 0) check_error();
         return *this;
     }
+    /// Set native continuous IVF search effort. Any explicit value, including
+    /// 0.5, ignores fixed nprobes while explicit minimum/maximum remain.
+    Scanner& search_effort(double effort) {
+        if (lance_scanner_set_search_effort(handle_.get(), effort) != 0) check_error();
+        return *this;
+    }
     Scanner& approx_mode(LanceApproxMode approx_mode) {
         if (lance_scanner_set_approx_mode(handle_.get(), approx_mode) != 0) check_error();
         return *this;
@@ -4420,6 +12079,120 @@ inline void Fragment::take(
     }
 }
 
+inline Fragment Fragment::create(
+    const std::string& dataset_uri,
+    ArrowArrayStream* stream,
+    uint64_t fragment_id,
+    const FragmentCreateOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+    // Native reads the stream schema itself, so this guard deliberately skips
+    // `read_schema()` and only owns the stream until the C call takes it.
+    Dataset::ArrowStreamInput input(stream);
+
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions c_write =
+        Dataset::to_c_write_options(options.write, cleanup);
+    auto kv = Dataset::to_c_key_values(storage_opts);
+    LanceFragmentCreateOptions c_options{};
+    c_options.schema = options.schema ? options.schema->c_handle() : nullptr;
+    c_options.mode = static_cast<int32_t>(options.mode);
+    c_options.write = &c_write;
+    c_options.storage_opts = storage_opts.empty() ? nullptr : kv.data();
+    c_options.session = session ? session->c_handle() : nullptr;
+
+    LanceFragment* out = nullptr;
+    auto* owned_stream = input.consume();
+    if (lance_fragment_create(
+            dataset_uri.c_str(), fragment_id, &c_options, owned_stream,
+            &out) != 0) {
+        check_error();
+    }
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_fragment_create returned success with null out_fragment");
+    }
+    return Fragment(out);
+}
+
+inline std::vector<Fragment> Fragment::create_many(
+    const std::string& dataset_uri,
+    ArrowArrayStream* stream,
+    const FragmentCreateOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+    Dataset::ArrowStreamInput input(stream);
+
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions c_write =
+        Dataset::to_c_write_options(options.write, cleanup);
+    auto kv = Dataset::to_c_key_values(storage_opts);
+    LanceFragmentCreateOptions c_options{};
+    c_options.schema = options.schema ? options.schema->c_handle() : nullptr;
+    c_options.mode = static_cast<int32_t>(options.mode);
+    c_options.write = &c_write;
+    c_options.storage_opts = storage_opts.empty() ? nullptr : kv.data();
+    c_options.session = session ? session->c_handle() : nullptr;
+
+    LanceFragment** raw = nullptr;
+    size_t count = 0;
+    auto* owned_stream = input.consume();
+    if (lance_fragment_create_many(
+            dataset_uri.c_str(), &c_options, owned_stream, &raw, &count) !=
+        0) {
+        check_error();
+    }
+    if (count > 0 && !raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "lance_fragment_create_many returned success with a null "
+                    "fragment array");
+    }
+
+    std::vector<Fragment> fragments;
+    try {
+        // Reserve before adopting: `Fragment` only moves a pointer, so once
+        // the capacity exists `emplace_back` cannot reallocate. Each slot is
+        // cleared right after adoption, which leaves `raw` holding exactly the
+        // handles this vector does not own.
+        fragments.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            fragments.emplace_back(raw[i]);
+            raw[i] = nullptr;
+        }
+    } catch (...) {
+        // Frees every slot that was not adopted; adopted slots are null.
+        lance_fragment_array_free(raw, count);
+        throw;
+    }
+    lance_fragment_array_free(raw, count);
+    return fragments;
+}
+
+inline Fragment Fragment::create_from_file(
+    const Dataset& dataset,
+    const std::string& filename,
+    uint64_t fragment_id,
+    std::optional<uint64_t> physical_rows) {
+    uint64_t rows = physical_rows.value_or(0);
+    LanceFragment* out = nullptr;
+    if (lance_fragment_create_from_file(
+            dataset.c_handle(),
+            filename.c_str(),
+            fragment_id,
+            physical_rows ? &rows : nullptr,
+            &out) != 0) {
+        check_error();
+    }
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_fragment_create_from_file returned success with null "
+            "out_fragment");
+    }
+    return Fragment(out);
+}
+
 inline Scanner Dataset::scan() const {
     return scan(std::nullopt);
 }
@@ -4447,6 +12220,18 @@ inline Scanner Dataset::scan(std::nullopt_t,
     return Scanner(s);
 }
 
+inline SqlQueryBuilder Dataset::sql(const std::string& sql) const {
+    auto* builder = lance_dataset_sql_builder_new(c_handle(), sql.c_str());
+    if (!builder) check_error();
+    return SqlQueryBuilder(builder);
+}
+
+inline DatasetDeltaBuilder Dataset::delta() const {
+    auto* builder = lance_dataset_delta_builder_new(c_handle());
+    if (!builder) check_error();
+    return DatasetDeltaBuilder(builder);
+}
+
 // ─── Batch ───────────────────────────────────────────────────────────────────
 
 class Batch {
@@ -4455,12 +12240,871 @@ class Batch {
 public:
     explicit Batch(LanceBatch* b) : handle_(b) {}
 
-    /// Export as Arrow C Data Interface structs.
+    /// Adopt a non-NULL Arrow array. `schema` is borrowed and must outlive the
+    /// call. The C API consumes the array on every return; on failure the
+    /// source array is already released and this method throws.
+    static Batch from_arrow(ArrowArray* array, const ArrowSchema* schema) {
+        LanceBatch* raw = nullptr;
+        if (lance_batch_from_arrow(array, schema, &raw) != 0) {
+            check_error();
+        }
+        return Batch(raw);
+    }
+
+    /// Export the complete record-batch schema and top-level struct array.
     void to_arrow(ArrowArray* out_array, ArrowSchema* out_schema) const {
         if (lance_batch_to_arrow(handle_.get(), out_array, out_schema) != 0)
             check_error();
     }
+
+    const LanceBatch* c_handle() const { return handle_.get(); }
 };
+
+/// Move-only owner of a staged fragment overlay writer.
+///
+/// A live writer is closed without finishing on destruction. `finish()` and
+/// `abort()` release the C allocation before invoking consuming native calls.
+class FragmentOverlayWriter {
+    Handle<LanceFragmentOverlayWriter, lance_fragment_overlay_writer_close>
+        handle_;
+
+public:
+    explicit FragmentOverlayWriter(LanceFragmentOverlayWriter* writer)
+        : handle_(writer) {}
+
+    FragmentOverlayWriter(FragmentOverlayWriter&&) noexcept = default;
+    FragmentOverlayWriter& operator=(FragmentOverlayWriter&&) noexcept =
+        default;
+    FragmentOverlayWriter(const FragmentOverlayWriter&) = delete;
+    FragmentOverlayWriter& operator=(const FragmentOverlayWriter&) = delete;
+
+    /// Write one borrowed batch of overlay values.
+    void write_batch(const Batch& batch) {
+        if (lance_fragment_overlay_writer_write_batch(
+                handle_.get(), batch.c_handle()) != 0) {
+            check_error();
+        }
+    }
+
+    /// Finish the staged overlay. Returns `std::nullopt` when the native
+    /// coverage was empty. The writer is consumed on every return.
+    std::optional<DataOverlayGroup> finish() {
+        auto* raw = handle_.release();
+        LanceDataOverlayGroup* group = nullptr;
+        if (lance_fragment_overlay_writer_finish(raw, &group) != 0) {
+            check_error();
+        }
+        if (!group) return std::nullopt;
+        return DataOverlayGroup(group);
+    }
+
+    /// Discard staged data best-effort. The writer is consumed.
+    void abort() {
+        auto* raw = handle_.release();
+        if (raw) lance_fragment_overlay_writer_abort(raw);
+    }
+
+    const LanceFragmentOverlayWriter* c_handle() const {
+        return handle_.get();
+    }
+};
+
+inline FragmentOverlayWriter Fragment::write_overlay(
+    const LanceSchema& schema) const {
+    LanceFragmentOverlayWriter* raw = nullptr;
+    if (lance_fragment_overlay_writer_new(
+            handle_.get(), schema.c_handle(), &raw) != 0) {
+        check_error();
+    }
+    if (!raw) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "native overlay writer returned NULL on success");
+    }
+    return FragmentOverlayWriter(raw);
+}
+
+// ─── Raw file ownership and snapshots ───────────────────────────────────────
+
+/// Move-only owner of an Arrow C Data Interface schema.
+class ArrowSchemaOwner {
+    ArrowSchema schema_{};
+    bool active_ = false;
+
+public:
+    ArrowSchemaOwner() noexcept = default;
+    explicit ArrowSchemaOwner(ArrowSchema schema) noexcept
+        : schema_(schema), active_(schema.release != nullptr) {}
+    ~ArrowSchemaOwner() { reset(); }
+
+    ArrowSchemaOwner(const ArrowSchemaOwner&) = delete;
+    ArrowSchemaOwner& operator=(const ArrowSchemaOwner&) = delete;
+
+    ArrowSchemaOwner(ArrowSchemaOwner&& other) noexcept
+        : schema_(other.schema_), active_(other.active_) {
+        other.schema_ = {};
+        other.active_ = false;
+    }
+
+    ArrowSchemaOwner& operator=(ArrowSchemaOwner&& other) noexcept {
+        if (this != &other) {
+            reset();
+            schema_ = other.schema_;
+            active_ = other.active_;
+            other.schema_ = {};
+            other.active_ = false;
+        }
+        return *this;
+    }
+
+    void reset() noexcept {
+        if (active_ && schema_.release) schema_.release(&schema_);
+        schema_ = {};
+        active_ = false;
+    }
+
+    ArrowSchema* get() noexcept { return &schema_; }
+    const ArrowSchema* get() const noexcept { return &schema_; }
+    explicit operator bool() const noexcept { return active_; }
+};
+
+enum class FileCacheMode : int32_t {
+    None = LANCE_FILE_CACHE_NONE,
+    Session = LANCE_FILE_CACHE_SESSION,
+};
+
+enum class FileFormatVersion : int32_t {
+    V1 = LANCE_FILE_FORMAT_V1,
+    V2_0 = LANCE_FILE_FORMAT_V2_0,
+    V2_1 = LANCE_FILE_FORMAT_V2_1,
+    V2_2 = LANCE_FILE_FORMAT_V2_2,
+    V2_3 = LANCE_FILE_FORMAT_V2_3,
+};
+
+enum class FileEncodingKind : int32_t {
+    Absent = LANCE_FILE_ENCODING_ABSENT,
+    None = LANCE_FILE_ENCODING_NONE,
+    Direct = LANCE_FILE_ENCODING_DIRECT,
+    Indirect = LANCE_FILE_ENCODING_INDIRECT,
+};
+
+struct FileSchedulerConfig {
+    uint64_t io_buffer_size_bytes = 0;
+    LanceSchedulerLiteMode use_lite_scheduler = LANCE_SCHEDULER_LITE_AUTO;
+};
+
+struct FileReaderOptions {
+    std::optional<std::vector<std::string>> columns;
+    FileCacheMode cache_mode = FileCacheMode::None;
+    std::optional<uint64_t> read_chunk_size;
+    std::optional<uint64_t> batch_size_bytes;
+    std::optional<bool> cache_repetition_index;
+    std::optional<bool> validate_on_decode;
+    std::optional<bool> inline_scheduling;
+};
+
+struct FileWriterOptions {
+    std::optional<uint64_t> data_cache_bytes;
+    std::optional<uint64_t> max_page_bytes;
+    std::optional<bool> keep_original_array;
+    std::optional<std::string> version;
+};
+
+struct FileWriteSummary {
+    uint64_t num_rows = 0;
+    uint64_t size_bytes = 0;
+};
+
+struct FileMetadataInfo {
+    FileFormatVersion format_version = FileFormatVersion::V1;
+    uint16_t major_version = 0;
+    uint16_t minor_version = 0;
+    uint64_t num_rows = 0;
+    uint64_t num_data_bytes = 0;
+    uint64_t num_column_metadata_bytes = 0;
+    uint64_t num_global_buffer_bytes = 0;
+    uint64_t num_footer_bytes = 0;
+    uint64_t file_size_bytes = 0;
+    std::size_t num_columns = 0;
+    std::size_t num_physical_columns = 0;
+    std::size_t num_global_buffers = 0;
+};
+
+struct FileBufferDescriptor {
+    uint64_t position = 0;
+    uint64_t size = 0;
+};
+
+struct FileEncodingDescriptor {
+    FileEncodingKind kind = FileEncodingKind::Absent;
+    uint64_t buffer_location = 0;
+    uint64_t buffer_length = 0;
+    std::vector<uint8_t> direct_bytes;
+};
+
+struct FilePageMetadata {
+    std::vector<FileBufferDescriptor> buffers;
+    uint64_t num_rows = 0;
+    uint64_t priority = 0;
+    FileEncodingDescriptor encoding;
+    std::string encoding_description;
+};
+
+struct FileColumnMetadata {
+    std::vector<FileBufferDescriptor> column_buffers;
+    std::vector<FilePageMetadata> pages;
+    FileEncodingDescriptor encoding;
+};
+
+struct FileColumnStatistics {
+    std::size_t num_pages = 0;
+    uint64_t size_bytes = 0;
+};
+
+struct FileStoreInfo {
+    uint64_t block_size = 0;
+    uint64_t max_iop_size = 0;
+    uint64_t io_parallelism = 0;
+    bool is_local = false;
+    bool is_cloud = false;
+    bool prefers_lite_scheduler = false;
+};
+
+namespace file_detail {
+
+inline std::string take_string(const char* value) {
+    if (!value) check_error();
+    std::string output(value);
+    lance_free_string(value);
+    return output;
+}
+
+inline FileBufferDescriptor buffer_descriptor(
+    const LanceBufferDescriptor& descriptor) {
+    return FileBufferDescriptor{descriptor.position, descriptor.size};
+}
+
+inline FileEncodingDescriptor encoding_descriptor(
+    const LanceEncodingDescriptor& descriptor) {
+    FileEncodingDescriptor output;
+    output.kind = static_cast<FileEncodingKind>(descriptor.kind);
+    output.buffer_location = descriptor.buffer_location;
+    output.buffer_length = descriptor.buffer_length;
+    if (descriptor.direct_bytes_len != 0) {
+        if (!descriptor.direct_bytes) check_error();
+        output.direct_bytes.assign(
+            descriptor.direct_bytes,
+            descriptor.direct_bytes + descriptor.direct_bytes_len);
+    }
+    return output;
+}
+
+inline LanceFileReaderOptions reader_options(
+    const FileReaderOptions& options,
+    std::vector<const char*>& columns) {
+    LanceFileReaderOptions raw{};
+    if (options.columns) {
+        columns.reserve(options.columns->size());
+        for (const auto& column : *options.columns) {
+            columns.push_back(column.c_str());
+        }
+        raw.has_columns = 1;
+        raw.columns = columns.data();
+        raw.column_count = columns.size();
+    }
+    raw.cache_mode = static_cast<int32_t>(options.cache_mode);
+    if (options.read_chunk_size) {
+        raw.has_read_chunk_size = 1;
+        raw.read_chunk_size = *options.read_chunk_size;
+    }
+    if (options.batch_size_bytes) {
+        raw.has_batch_size_bytes = 1;
+        raw.batch_size_bytes = *options.batch_size_bytes;
+    }
+    if (options.cache_repetition_index) {
+        raw.has_cache_repetition_index = 1;
+        raw.cache_repetition_index = *options.cache_repetition_index ? 1 : 0;
+    }
+    if (options.validate_on_decode) {
+        raw.has_validate_on_decode = 1;
+        raw.validate_on_decode = *options.validate_on_decode ? 1 : 0;
+    }
+    if (options.inline_scheduling) {
+        raw.has_inline_scheduling = 1;
+        raw.inline_scheduling = *options.inline_scheduling ? 1 : 0;
+    }
+    return raw;
+}
+
+inline LanceFileWriterOptions writer_options(
+    const FileWriterOptions& options) {
+    LanceFileWriterOptions raw{};
+    if (options.data_cache_bytes) {
+        raw.has_data_cache_bytes = 1;
+        raw.data_cache_bytes = *options.data_cache_bytes;
+    }
+    if (options.max_page_bytes) {
+        raw.has_max_page_bytes = 1;
+        raw.max_page_bytes = *options.max_page_bytes;
+    }
+    if (options.keep_original_array) {
+        raw.has_keep_original_array = 1;
+        raw.keep_original_array = *options.keep_original_array ? 1 : 0;
+    }
+    if (options.version) raw.version = options.version->c_str();
+    return raw;
+}
+
+}  // namespace file_detail
+
+class FileMetadata {
+    Handle<LanceFileMetadata, lance_file_metadata_close> handle_;
+
+public:
+    explicit FileMetadata(LanceFileMetadata* metadata) : handle_(metadata) {}
+
+    FileMetadataInfo info() const {
+        LanceFileMetadataInfo raw{};
+        if (lance_file_metadata_get_info(handle_.get(), &raw) != 0)
+            check_error();
+        return FileMetadataInfo{
+            static_cast<FileFormatVersion>(raw.format_version),
+            raw.major_version,
+            raw.minor_version,
+            raw.num_rows,
+            raw.num_data_bytes,
+            raw.num_column_metadata_bytes,
+            raw.num_global_buffer_bytes,
+            raw.num_footer_bytes,
+            raw.file_size_bytes,
+            raw.num_columns,
+            raw.num_physical_columns,
+            raw.num_global_buffers,
+        };
+    }
+
+    ArrowSchemaOwner schema() const {
+        ArrowSchema raw{};
+        if (lance_file_metadata_get_schema(handle_.get(), &raw) != 0)
+            check_error();
+        return ArrowSchemaOwner(raw);
+    }
+
+    std::vector<FileBufferDescriptor> global_buffers() const {
+        const LanceBufferDescriptor* descriptors = nullptr;
+        std::size_t count = 0;
+        if (lance_file_metadata_get_global_buffers(
+                handle_.get(), &descriptors, &count) != 0) {
+            check_error();
+        }
+        std::vector<FileBufferDescriptor> output;
+        output.reserve(count);
+        for (std::size_t index = 0; index < count; index++) {
+            output.push_back(
+                file_detail::buffer_descriptor(descriptors[index]));
+        }
+        return output;
+    }
+
+    std::vector<FileColumnMetadata> columns() const {
+        const LanceColumnMetadata* columns = nullptr;
+        std::size_t count = 0;
+        if (lance_file_metadata_get_columns(
+                handle_.get(), &columns, &count) != 0) {
+            check_error();
+        }
+        std::vector<FileColumnMetadata> output;
+        output.reserve(count);
+        for (std::size_t index = 0; index < count; index++) {
+            const auto& raw_column = columns[index];
+            FileColumnMetadata column;
+            column.column_buffers.reserve(raw_column.column_buffer_count);
+            for (std::size_t buffer = 0;
+                 buffer < raw_column.column_buffer_count;
+                 buffer++) {
+                column.column_buffers.push_back(
+                    file_detail::buffer_descriptor(
+                        raw_column.column_buffers[buffer]));
+            }
+            column.encoding =
+                file_detail::encoding_descriptor(raw_column.encoding);
+            column.pages.reserve(raw_column.page_count);
+            for (std::size_t page = 0; page < raw_column.page_count; page++) {
+                const auto& raw_page = raw_column.pages[page];
+                FilePageMetadata output_page;
+                output_page.num_rows = raw_page.num_rows;
+                output_page.priority = raw_page.priority;
+                output_page.encoding =
+                    file_detail::encoding_descriptor(raw_page.encoding);
+                if (raw_page.encoding_description) {
+                    output_page.encoding_description =
+                        raw_page.encoding_description;
+                }
+                output_page.buffers.reserve(raw_page.buffer_count);
+                for (std::size_t buffer = 0;
+                     buffer < raw_page.buffer_count;
+                     buffer++) {
+                    output_page.buffers.push_back(
+                        file_detail::buffer_descriptor(
+                            raw_page.buffers[buffer]));
+                }
+                column.pages.push_back(std::move(output_page));
+            }
+            output.push_back(std::move(column));
+        }
+        return output;
+    }
+};
+
+class FileStatistics {
+    Handle<LanceFileStatistics, lance_file_statistics_close> handle_;
+
+public:
+    explicit FileStatistics(LanceFileStatistics* statistics)
+        : handle_(statistics) {}
+
+    std::vector<FileColumnStatistics> columns() const {
+        const LanceColumnStatistics* columns = nullptr;
+        std::size_t count = 0;
+        if (lance_file_statistics_get_columns(
+                handle_.get(), &columns, &count) != 0) {
+            check_error();
+        }
+        std::vector<FileColumnStatistics> output;
+        output.reserve(count);
+        for (std::size_t index = 0; index < count; index++) {
+            output.push_back(
+                FileColumnStatistics{columns[index].num_pages,
+                                     columns[index].size_bytes});
+        }
+        return output;
+    }
+};
+
+class ByteBuffer {
+    Handle<LanceByteBuffer, lance_byte_buffer_close> handle_;
+
+public:
+    explicit ByteBuffer(LanceByteBuffer* buffer) : handle_(buffer) {}
+
+    std::vector<uint8_t> bytes() const {
+        std::size_t length = lance_byte_buffer_len(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (length == 0) return {};
+        const uint8_t* data = lance_byte_buffer_data(handle_.get());
+        if (!data) check_error();
+        return std::vector<uint8_t>(data, data + length);
+    }
+};
+
+class PathList {
+    Handle<LancePathList, lance_path_list_close> handle_;
+
+public:
+    explicit PathList(LancePathList* list) : handle_(list) {}
+
+    std::vector<std::string> paths() const {
+        uint64_t count = lance_path_list_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<std::string> output;
+        output.reserve(static_cast<std::size_t>(count));
+        for (uint64_t index = 0; index < count; index++) {
+            const char* path = lance_path_list_at(
+                handle_.get(), static_cast<std::size_t>(index));
+            if (!path) check_error();
+            output.emplace_back(path);
+        }
+        return output;
+    }
+};
+
+class DelimitedList {
+    Handle<LanceDelimitedList, lance_delimited_list_close> handle_;
+
+public:
+    explicit DelimitedList(LanceDelimitedList* list) : handle_(list) {}
+
+    std::vector<std::string> common_prefixes() const {
+        uint64_t count =
+            lance_delimited_list_common_prefix_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<std::string> output;
+        output.reserve(static_cast<std::size_t>(count));
+        for (uint64_t index = 0; index < count; index++) {
+            const char* path = lance_delimited_list_common_prefix_at(
+                handle_.get(), static_cast<std::size_t>(index));
+            if (!path) check_error();
+            output.emplace_back(path);
+        }
+        return output;
+    }
+
+    std::vector<std::string> objects() const {
+        uint64_t count = lance_delimited_list_object_count(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        std::vector<std::string> output;
+        output.reserve(static_cast<std::size_t>(count));
+        for (uint64_t index = 0; index < count; index++) {
+            const char* path = lance_delimited_list_object_at(
+                handle_.get(), static_cast<std::size_t>(index));
+            if (!path) check_error();
+            output.emplace_back(path);
+        }
+        return output;
+    }
+};
+
+class FileReader;
+class FileWriter;
+
+class FileSession {
+    Handle<LanceFileSession, lance_file_session_close> handle_;
+
+public:
+    FileSession(
+        const std::string& base_uri,
+        const StorageOptionsAccessor* storage_options = nullptr,
+        const Session* session = nullptr,
+        std::optional<FileSchedulerConfig> scheduler_config = std::nullopt)
+        : handle_(nullptr) {
+        LanceSchedulerConfig raw_config{};
+        const LanceSchedulerConfig* config_ptr = nullptr;
+        if (scheduler_config) {
+            raw_config.io_buffer_size_bytes =
+                scheduler_config->io_buffer_size_bytes;
+            raw_config.use_lite_scheduler =
+                static_cast<int32_t>(scheduler_config->use_lite_scheduler);
+            config_ptr = &raw_config;
+        }
+        auto* raw = lance_file_session_new(
+            base_uri.c_str(),
+            storage_options ? storage_options->c_handle() : nullptr,
+            session ? session->c_handle() : nullptr,
+            config_ptr);
+        if (!raw) check_error();
+        handle_ = Handle<LanceFileSession, lance_file_session_close>(raw);
+    }
+
+    FileSession(FileSession&&) noexcept = default;
+    FileSession& operator=(FileSession&&) noexcept = default;
+    FileSession(const FileSession&) = delete;
+    FileSession& operator=(const FileSession&) = delete;
+
+    void reset() noexcept {
+        handle_ = Handle<LanceFileSession, lance_file_session_close>();
+    }
+    explicit operator bool() const noexcept { return bool(handle_); }
+
+    std::string base_path() const {
+        return file_detail::take_string(
+            lance_file_session_base_path(handle_.get()));
+    }
+
+    FileReader open_reader(
+        const std::string& relative_path,
+        const FileReaderOptions& options = {}) const;
+    FileWriter open_writer(
+        const std::string& relative_path,
+        const ArrowSchema* schema,
+        const FileWriterOptions& options = {}) const;
+
+    PackedBlobWriter open_packed_blob_writer(
+        const std::string& data_file_path,
+        uint32_t blob_id) const {
+        auto* raw = lance_file_session_open_packed_blob_writer(
+            handle_.get(), data_file_path.c_str(), blob_id);
+        if (!raw) check_error();
+        return PackedBlobWriter(raw);
+    }
+
+    DedicatedBlobWriter open_dedicated_blob_writer(
+        const std::string& data_file_path,
+        uint32_t blob_id) const {
+        auto* raw = lance_file_session_open_dedicated_blob_writer(
+            handle_.get(), data_file_path.c_str(), blob_id);
+        if (!raw) check_error();
+        return DedicatedBlobWriter(raw);
+    }
+
+    bool contains(const std::string& relative_path) const {
+        int32_t exists = 0;
+        if (lance_file_session_contains(
+                handle_.get(), relative_path.c_str(), &exists) != 0) {
+            check_error();
+        }
+        return exists != 0;
+    }
+
+    PathList list(std::optional<std::string> relative_path = std::nullopt) const {
+        auto* raw = lance_file_session_list(
+            handle_.get(),
+            relative_path ? relative_path->c_str() : nullptr);
+        if (!raw) check_error();
+        return PathList(raw);
+    }
+
+    DelimitedList list_with_delimiter(
+        std::optional<std::string> relative_path = std::nullopt) const {
+        auto* raw = lance_file_session_list_with_delimiter(
+            handle_.get(),
+            relative_path ? relative_path->c_str() : nullptr);
+        if (!raw) check_error();
+        return DelimitedList(raw);
+    }
+
+    ByteBuffer read_range(
+        const std::string& relative_path,
+        uint64_t offset,
+        uint64_t length) const {
+        auto* raw = lance_file_session_read_range(
+            handle_.get(), relative_path.c_str(), offset, length);
+        if (!raw) check_error();
+        return ByteBuffer(raw);
+    }
+
+    void delete_file(const std::string& relative_path) const {
+        if (lance_file_session_delete_file(
+                handle_.get(), relative_path.c_str()) != 0) {
+            check_error();
+        }
+    }
+
+    void upload_file(
+        const std::string& local_path,
+        const std::string& relative_remote_path) const {
+        if (lance_file_session_upload_file(
+                handle_.get(),
+                local_path.c_str(),
+                relative_remote_path.c_str()) != 0) {
+            check_error();
+        }
+    }
+
+    void download_file(
+        const std::string& relative_remote_path,
+        const std::string& local_path) const {
+        if (lance_file_session_download_file(
+                handle_.get(),
+                relative_remote_path.c_str(),
+                local_path.c_str()) != 0) {
+            check_error();
+        }
+    }
+
+    LanceScanStats scheduler_stats() const {
+        LanceScanStats stats{};
+        if (lance_file_session_get_scheduler_stats(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+
+    LanceObjectStoreRegistryStats registry_stats() const {
+        LanceObjectStoreRegistryStats stats{};
+        if (lance_file_session_get_registry_stats(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+
+    FileStoreInfo store_info() const {
+        LanceObjectStoreInfo info{};
+        if (lance_file_session_get_store_info(handle_.get(), &info) != 0)
+            check_error();
+        return FileStoreInfo{
+            info.block_size,
+            info.max_iop_size,
+            info.io_parallelism,
+            info.is_local != 0,
+            info.is_cloud != 0,
+            info.prefers_lite_scheduler != 0,
+        };
+    }
+
+    LanceObjectStoreIoStats store_io_stats() const {
+        LanceObjectStoreIoStats stats{};
+        if (lance_file_session_get_store_io_stats(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+};
+
+class FileReader {
+    Handle<LanceFileReader, lance_file_reader_close> handle_;
+
+public:
+    explicit FileReader(LanceFileReader* reader) : handle_(reader) {}
+    FileReader(FileReader&&) noexcept = default;
+    FileReader& operator=(FileReader&&) noexcept = default;
+    FileReader(const FileReader&) = delete;
+    FileReader& operator=(const FileReader&) = delete;
+
+    void reset() noexcept {
+        handle_ = Handle<LanceFileReader, lance_file_reader_close>();
+    }
+    explicit operator bool() const noexcept { return bool(handle_); }
+
+    uint64_t num_rows() const {
+        uint64_t rows = 0;
+        if (lance_file_reader_num_rows(handle_.get(), &rows) != 0)
+            check_error();
+        return rows;
+    }
+
+    FileMetadata metadata() const {
+        LanceFileMetadata* metadata = nullptr;
+        if (lance_file_reader_get_metadata(handle_.get(), &metadata) != 0)
+            check_error();
+        return FileMetadata(metadata);
+    }
+
+    FileStatistics statistics() const {
+        LanceFileStatistics* statistics = nullptr;
+        if (lance_file_reader_get_statistics(handle_.get(), &statistics) != 0)
+            check_error();
+        return FileStatistics(statistics);
+    }
+
+    ByteBuffer read_global_buffer(uint32_t index) const {
+        LanceByteBuffer* buffer = nullptr;
+        if (lance_file_reader_read_global_buffer(
+                handle_.get(), index, &buffer) != 0) {
+            check_error();
+        }
+        return ByteBuffer(buffer);
+    }
+
+    /// `batch_size` and `batch_readahead` must be greater than zero. A zero
+    /// value throws `lance::Error` with LANCE_ERR_INVALID_ARGUMENT.
+    ArrowStream read_all(
+        uint32_t batch_size = 1024,
+        uint32_t batch_readahead = 4) const {
+        ArrowArrayStream stream{};
+        if (lance_file_reader_read_all(
+                handle_.get(), batch_size, batch_readahead, &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    /// `batch_size` and `batch_readahead` must be greater than zero. A zero
+    /// value throws `lance::Error` with LANCE_ERR_INVALID_ARGUMENT.
+    ArrowStream read_range(
+        uint64_t offset,
+        uint64_t num_rows,
+        uint32_t batch_size = 1024,
+        uint32_t batch_readahead = 4) const {
+        ArrowArrayStream stream{};
+        if (lance_file_reader_read_range(
+                handle_.get(),
+                offset,
+                num_rows,
+                batch_size,
+                batch_readahead,
+                &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    /// `batch_size` and `batch_readahead` must be greater than zero. A zero
+    /// value throws `lance::Error` with LANCE_ERR_INVALID_ARGUMENT.
+    ArrowStream read_indices(
+        const std::vector<uint32_t>& indices,
+        uint32_t batch_size = 1024,
+        uint32_t batch_readahead = 4) const {
+        ArrowArrayStream stream{};
+        if (lance_file_reader_read_indices(
+                handle_.get(),
+                indices.empty() ? nullptr : indices.data(),
+                indices.size(),
+                batch_size,
+                batch_readahead,
+                &stream) != 0) {
+            check_error();
+        }
+        return ArrowStream(stream);
+    }
+
+    LanceScanStats io_stats() const {
+        LanceScanStats stats{};
+        if (lance_file_reader_get_io_stats(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+};
+
+class FileWriter {
+    Handle<LanceFileWriter, lance_file_writer_close> handle_;
+
+public:
+    explicit FileWriter(LanceFileWriter* writer) : handle_(writer) {}
+    FileWriter(FileWriter&&) noexcept = default;
+    FileWriter& operator=(FileWriter&&) noexcept = default;
+    FileWriter(const FileWriter&) = delete;
+    FileWriter& operator=(const FileWriter&) = delete;
+
+    void reset() noexcept {
+        handle_ = Handle<LanceFileWriter, lance_file_writer_close>();
+    }
+    explicit operator bool() const noexcept { return bool(handle_); }
+
+    void write_batch(const Batch& batch) {
+        if (lance_file_writer_write_batch(handle_.get(), batch.c_handle()) != 0)
+            check_error();
+    }
+
+    void add_schema_metadata(
+        const std::string& key,
+        const std::string& value) {
+        if (lance_file_writer_add_schema_metadata(
+                handle_.get(), key.c_str(), value.c_str()) != 0) {
+            check_error();
+        }
+    }
+
+    uint32_t add_global_buffer(const std::vector<uint8_t>& bytes) {
+        uint32_t index = 0;
+        if (lance_file_writer_add_global_buffer(
+                handle_.get(),
+                bytes.empty() ? nullptr : bytes.data(),
+                bytes.size(),
+                &index) != 0) {
+            check_error();
+        }
+        return index;
+    }
+
+    FileWriteSummary finish() {
+        LanceFileWriteSummary summary{};
+        if (lance_file_writer_finish(handle_.get(), &summary) != 0)
+            check_error();
+        return FileWriteSummary{summary.num_rows, summary.size_bytes};
+    }
+
+    void abort() {
+        if (lance_file_writer_abort(handle_.get()) != 0) check_error();
+    }
+};
+
+inline FileReader FileSession::open_reader(
+    const std::string& relative_path,
+    const FileReaderOptions& options) const {
+    std::vector<const char*> columns;
+    auto raw_options = file_detail::reader_options(options, columns);
+    auto* raw = lance_file_session_open_reader(
+        handle_.get(), relative_path.c_str(), &raw_options);
+    if (!raw) check_error();
+    return FileReader(raw);
+}
+
+inline FileWriter FileSession::open_writer(
+    const std::string& relative_path,
+    const ArrowSchema* schema,
+    const FileWriterOptions& options) const {
+    auto raw_options = file_detail::writer_options(options);
+    auto* raw = lance_file_session_open_writer(
+        handle_.get(), relative_path.c_str(), schema, &raw_options);
+    if (!raw) check_error();
+    return FileWriter(raw);
+}
 
 } // namespace lance
 
@@ -4498,6 +13142,1272 @@ inline void write_fragments(
     if (lance_write_fragments(uri.c_str(), schema, stream, opts_ptr) != 0) {
         check_error();
     }
+}
+
+// ─── Native namespaces ───────────────────────────────────────────────────────
+
+namespace namespace_detail {
+
+inline std::string json_escape(std::string_view value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    for (unsigned char c : value) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            default:
+                if (c < 0x20) {
+                    static const char hex[] = "0123456789abcdef";
+                    out += "\\u00";
+                    out += hex[(c >> 4) & 0xF];
+                    out += hex[c & 0xF];
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+inline std::string json_string(std::string_view value) {
+    return std::string("\"") + json_escape(value) + "\"";
+}
+
+inline std::string json_string_array(const std::vector<std::string>& values) {
+    std::string out = "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) out += ",";
+        out += json_string(values[i]);
+    }
+    out += "]";
+    return out;
+}
+
+inline std::string json_string_object(
+    const std::vector<std::pair<std::string, std::string>>& entries) {
+    std::string out = "{";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i != 0) out += ",";
+        out += json_string(entries[i].first);
+        out += ":";
+        out += json_string(entries[i].second);
+    }
+    out += "}";
+    return out;
+}
+
+inline void free_owned_string(LanceOwnedString* value) noexcept {
+    delete[] value->data;
+    value->data = nullptr;
+    value->release = nullptr;
+}
+
+inline void set_owned_string(LanceOwnedString* out, std::string value) {
+    auto* data = new char[value.size() + 1];
+    std::memcpy(data, value.data(), value.size());
+    data[value.size()] = '\0';
+    out->data = data;
+    out->release = &free_owned_string;
+}
+
+inline void set_callback_error(
+    LanceCallbackError* error, int32_t code, const std::string& message) noexcept {
+    error->code = code;
+    try {
+        set_owned_string(&error->message, message);
+    } catch (...) {
+        error->message.data = nullptr;
+        error->message.release = nullptr;
+    }
+}
+
+} // namespace namespace_detail
+
+/// Namespace operation error that preserves both the generic C error class and
+/// the native NamespaceError code/message.
+class NamespaceError : public Error {
+public:
+    bool has_native_code;
+    uint32_t native_code;
+    std::string native_message;
+
+    NamespaceError(
+        LanceErrorCode code,
+        std::string message,
+        uint32_t native_code,
+        std::string native_message)
+        : Error(code, std::move(message)),
+          has_native_code(true),
+          native_code(native_code),
+          native_message(std::move(native_message)) {}
+};
+
+/// Owning copy of one native namespace call result. The C result is released
+/// before this object is returned, so no native resources outlive it.
+class NamespaceResult {
+    std::optional<std::string> json_;
+    std::vector<uint8_t> bytes_;
+
+    friend class Namespace;
+
+    NamespaceResult(std::optional<std::string> json, std::vector<uint8_t> bytes)
+        : json_(std::move(json)), bytes_(std::move(bytes)) {}
+
+public:
+    NamespaceResult() = default;
+    NamespaceResult(NamespaceResult&&) noexcept = default;
+    NamespaceResult& operator=(NamespaceResult&&) noexcept = default;
+    NamespaceResult(const NamespaceResult&) = delete;
+    NamespaceResult& operator=(const NamespaceResult&) = delete;
+
+    bool has_json() const noexcept { return json_.has_value(); }
+    const std::optional<std::string>& json() const noexcept { return json_; }
+    const std::vector<uint8_t>& bytes() const noexcept { return bytes_; }
+};
+
+/// Synchronous, infallible dynamic context provider. C++ exceptions are
+/// converted to a callback error; the native client logs it and sends an empty
+/// map. The callback receives the native operation name and object id.
+class DynamicContextProvider {
+public:
+    using Callback = std::function<std::map<std::string, std::string>(
+        const std::string&, const std::string&)>;
+
+private:
+    Callback callback_;
+
+public:
+    explicit DynamicContextProvider(Callback callback)
+        : callback_(std::move(callback)) {}
+    const Callback& callback() const noexcept { return callback_; }
+};
+
+/// Move-only namespace handle with native concrete-implementation retention.
+class Namespace {
+    Handle<LanceNamespace, lance_namespace_close> handle_;
+
+    struct ContextProviderContext {
+        std::function<std::map<std::string, std::string>(
+            const std::string&, const std::string&)> callback;
+    };
+
+    struct CustomClientContext {
+        std::function<std::string(const std::string&)> describe_table;
+        std::function<std::string(const std::string&)> describe_table_version;
+        std::function<std::string(const std::string&)> create_table_version;
+        std::function<std::string(const std::string&)> list_table_versions;
+    };
+
+    struct CustomDispatchContext {
+        std::function<std::string(const std::string&, const std::string&)> dispatch;
+    };
+
+    static void context_provider_release(void* ctx) noexcept {
+        delete static_cast<ContextProviderContext*>(ctx);
+    }
+
+    static void custom_client_release(void* ctx) noexcept {
+        delete static_cast<CustomClientContext*>(ctx);
+    }
+
+    static void custom_dispatch_release(void* ctx) noexcept {
+        delete static_cast<CustomDispatchContext*>(ctx);
+    }
+
+    static int32_t context_provider_call(
+        void* raw_ctx,
+        const char* operation,
+        const char* object_id,
+        LanceOwnedString* out_json,
+        LanceCallbackError* out_error) noexcept {
+        auto* ctx = static_cast<ContextProviderContext*>(raw_ctx);
+        try {
+            std::map<std::string, std::string> context = ctx->callback(
+                operation ? operation : "", object_id ? object_id : "");
+            std::string json = "{";
+            bool first = true;
+            for (const auto& [key, value] : context) {
+                if (!first) json += ",";
+                first = false;
+                json += namespace_detail::json_string(key);
+                json += ":";
+                json += namespace_detail::json_string(value);
+            }
+            json += "}";
+            namespace_detail::set_owned_string(out_json, std::move(json));
+            return 0;
+        } catch (const lance::Error& error) {
+            namespace_detail::set_callback_error(
+                out_error, static_cast<int32_t>(error.code), error.what());
+        } catch (const std::exception& error) {
+            namespace_detail::set_callback_error(
+                out_error, static_cast<int32_t>(LANCE_ERR_INTERNAL), error.what());
+        } catch (...) {
+            namespace_detail::set_callback_error(
+                out_error,
+                static_cast<int32_t>(LANCE_ERR_INTERNAL),
+                "unknown C++ exception in namespace context provider");
+        }
+        return 1;
+    }
+
+    template <typename Callback>
+    static int32_t invoke_custom(
+        Callback&& callback,
+        const char* request_json,
+        LanceOwnedString* out_json,
+        LanceCallbackError* out_error) noexcept {
+        try {
+            std::string response = callback(request_json ? request_json : "{}");
+            namespace_detail::set_owned_string(out_json, std::move(response));
+            return 0;
+        } catch (const lance::Error& error) {
+            namespace_detail::set_callback_error(
+                out_error, static_cast<int32_t>(error.code), error.what());
+        } catch (const std::exception& error) {
+            namespace_detail::set_callback_error(
+                out_error, static_cast<int32_t>(LANCE_ERR_INTERNAL), error.what());
+        } catch (...) {
+            namespace_detail::set_callback_error(
+                out_error,
+                static_cast<int32_t>(LANCE_ERR_INTERNAL),
+                "unknown C++ exception in namespace callback");
+        }
+        return 1;
+    }
+
+    static int32_t custom_describe_table(
+        void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomClientContext*>(ctx);
+        return invoke_custom([client](const char* request) {
+            return client->describe_table(request);
+        }, req, out, err);
+    }
+    static int32_t custom_describe_table_version(
+        void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomClientContext*>(ctx);
+        return invoke_custom([client](const char* request) {
+            return client->describe_table_version(request);
+        }, req, out, err);
+    }
+    static int32_t custom_create_table_version(
+        void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomClientContext*>(ctx);
+        return invoke_custom([client](const char* request) {
+            return client->create_table_version(request);
+        }, req, out, err);
+    }
+    static int32_t custom_list_table_versions(
+        void* ctx, const char* req, LanceOwnedString* out, LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomClientContext*>(ctx);
+        return invoke_custom([client](const char* request) {
+            return client->list_table_versions(request);
+        }, req, out, err);
+    }
+    static int32_t custom_dispatch_call(
+        void* ctx,
+        const char* operation,
+        const char* req,
+        LanceOwnedString* out,
+        LanceCallbackError* err) noexcept {
+        auto* client = static_cast<CustomDispatchContext*>(ctx);
+        return invoke_custom([client, operation](const char* request) {
+            return client->dispatch(operation ? operation : "", request);
+        }, req, out, err);
+    }
+
+    static LanceNamespaceContextProviderSpec make_context_spec(
+        const DynamicContextProvider* provider) {
+        LanceNamespaceContextProviderSpec spec{};
+        if (provider) {
+            auto* ctx = new ContextProviderContext{provider->callback()};
+            spec.provide_context = &context_provider_call;
+            spec.release = &context_provider_release;
+            spec.provider_ctx = ctx;
+        }
+        return spec;
+    }
+
+    explicit Namespace(LanceNamespace* handle) : handle_(handle) {}
+
+public:
+    /// Foreign client for the four Python-compatible managed-version
+    /// callbacks. Each callback receives native request JSON and returns
+    /// native response JSON. Other operations keep native Unsupported.
+    struct CustomClientSpec {
+        std::function<std::string(const std::string&)> describe_table;
+        std::function<std::string(const std::string&)> describe_table_version;
+        std::function<std::string(const std::string&)> create_table_version;
+        std::function<std::string(const std::string&)> list_table_versions;
+        /// Empty assigns a unique identity stable for this client's lifetime.
+        std::string namespace_id;
+    };
+
+    /// Foreign client using one callback for the same four managed-version
+    /// operations. The callback receives the exact native snake_case operation
+    /// name and native request JSON; both strings are borrowed for the call
+    /// only. Other operations keep native Unsupported.
+    struct CustomDispatchSpec {
+        std::function<std::string(const std::string&, const std::string&)> dispatch;
+        /// Empty assigns a unique identity stable for this client's lifetime.
+        std::string namespace_id;
+    };
+
+    Namespace(Namespace&&) noexcept = default;
+    Namespace& operator=(Namespace&&) noexcept = default;
+    Namespace(const Namespace&) = delete;
+    Namespace& operator=(const Namespace&) = delete;
+
+    static Namespace directory(
+        const std::vector<std::pair<std::string, std::string>>& properties = {},
+        const Session* session = nullptr,
+        const DynamicContextProvider* context_provider = nullptr) {
+        auto json = namespace_detail::json_string_object(properties);
+        auto spec = make_context_spec(context_provider);
+        auto* spec_ptr = context_provider ? &spec : nullptr;
+        auto* raw = lance_namespace_directory_new(
+            json.c_str(), session ? session->c_handle() : nullptr, spec_ptr);
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    static Namespace rest(
+        const std::vector<std::pair<std::string, std::string>>& properties,
+        const DynamicContextProvider* context_provider = nullptr) {
+        auto json = namespace_detail::json_string_object(properties);
+        auto spec = make_context_spec(context_provider);
+        auto* spec_ptr = context_provider ? &spec : nullptr;
+        auto* raw = lance_namespace_rest_new(json.c_str(), spec_ptr);
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    static Namespace connect(
+        const std::string& impl_name,
+        const std::vector<std::pair<std::string, std::string>>& properties = {},
+        const Session* session = nullptr,
+        const DynamicContextProvider* context_provider = nullptr) {
+        auto json = namespace_detail::json_string_object(properties);
+        auto spec = make_context_spec(context_provider);
+        auto* spec_ptr = context_provider ? &spec : nullptr;
+        auto* raw = lance_namespace_connect_new(
+            impl_name.c_str(),
+            json.c_str(),
+            session ? session->c_handle() : nullptr,
+            spec_ptr);
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    static Namespace custom(const CustomClientSpec& spec) {
+        if (!spec.describe_table || !spec.describe_table_version ||
+            !spec.create_table_version || !spec.list_table_versions) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "custom namespace requires all four managed-version callbacks");
+        }
+        auto* ctx = new CustomClientContext{
+            spec.describe_table,
+            spec.describe_table_version,
+            spec.create_table_version,
+            spec.list_table_versions};
+        std::unique_ptr<CustomClientContext> guard(ctx);
+        LanceNamespaceCustomClientSpec c_spec{};
+        c_spec.describe_table = &custom_describe_table;
+        c_spec.describe_table_version = &custom_describe_table_version;
+        c_spec.create_table_version = &custom_create_table_version;
+        c_spec.list_table_versions = &custom_list_table_versions;
+        c_spec.release = &custom_client_release;
+        c_spec.client_ctx = ctx;
+        c_spec.namespace_id = spec.namespace_id.c_str();
+        auto* raw = lance_namespace_custom_new(&c_spec);
+        // The C constructor consumes the context on every invocation.
+        guard.release();
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    static Namespace custom_dispatch(const CustomDispatchSpec& spec) {
+        if (!spec.dispatch) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "custom dispatch namespace requires a dispatch callback");
+        }
+        auto* ctx = new CustomDispatchContext{spec.dispatch};
+        std::unique_ptr<CustomDispatchContext> guard(ctx);
+        LanceNamespaceCustomClientDispatchSpec c_spec{};
+        c_spec.dispatch = &custom_dispatch_call;
+        c_spec.release = &custom_dispatch_release;
+        c_spec.client_ctx = ctx;
+        c_spec.namespace_id = spec.namespace_id.c_str();
+        auto* raw = lance_namespace_custom_dispatch_new(&c_spec);
+        // The C constructor consumes the context on every invocation.
+        guard.release();
+        if (!raw) check_error();
+        return Namespace(raw);
+    }
+
+    std::string id() const {
+        const char* raw = lance_namespace_id(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    std::string ops_metrics_json() const {
+        const char* raw = lance_namespace_retrieve_ops_metrics(handle_.get());
+        if (!raw) check_error();
+        std::string out(raw);
+        lance_free_string(raw);
+        return out;
+    }
+
+    void reset_ops_metrics() {
+        if (lance_namespace_reset_ops_metrics(handle_.get()) != 0) check_error();
+    }
+
+    NamespaceResult call(
+        const std::string& operation,
+        const std::string& request_json = "{}",
+        const uint8_t* request_bytes = nullptr,
+        size_t request_bytes_len = 0) const {
+        LanceNamespaceResult raw{};
+        struct ResultGuard {
+            LanceNamespaceResult* result;
+            ~ResultGuard() { if (result) lance_namespace_result_close(result); }
+        } guard{&raw};
+        int32_t rc = lance_namespace_call(
+            handle_.get(),
+            operation.c_str(),
+            request_json.c_str(),
+            request_bytes,
+            request_bytes_len,
+            &raw);
+        std::optional<std::string> json;
+        std::vector<uint8_t> bytes;
+        if (raw.result_json) json = std::string(raw.result_json);
+        if (raw.result_bytes && raw.result_bytes_len != 0) {
+            bytes.assign(raw.result_bytes, raw.result_bytes + raw.result_bytes_len);
+        }
+        bool has_native = raw.has_namespace_error != 0;
+        uint32_t native_code = raw.namespace_error_code;
+        std::string native_message =
+            raw.namespace_error_message ? raw.namespace_error_message : "";
+        lance_namespace_result_close(&raw);
+        guard.result = nullptr;
+        if (rc != 0) {
+            LanceErrorCode code = lance_last_error_code();
+            const char* message = lance_last_error_message();
+            std::string owned(message ? message : "Unknown error");
+            if (message) lance_free_string(message);
+            if (has_native) {
+                throw NamespaceError(
+                    code, std::move(owned), native_code, std::move(native_message));
+            }
+            throw Error(code, std::move(owned));
+        }
+        return NamespaceResult(std::move(json), std::move(bytes));
+    }
+
+    NamespaceResult call(
+        const std::string& operation,
+        const std::string& request_json,
+        const std::vector<uint8_t>& request_bytes) const {
+        return call(
+            operation,
+            request_json,
+            request_bytes.empty() ? nullptr : request_bytes.data(),
+            request_bytes.size());
+    }
+
+    const LanceNamespace* c_handle() const noexcept { return handle_.get(); }
+};
+
+/// Move-only owner of a running native REST adapter.
+class RestAdapter {
+    Handle<LanceRestAdapter, lance_rest_adapter_close> handle_;
+    uint16_t port_ = 0;
+
+    explicit RestAdapter(LanceRestAdapter* raw) : handle_(raw) {}
+
+public:
+    RestAdapter(RestAdapter&& other) noexcept
+        : handle_(std::move(other.handle_)), port_(other.port_) {
+        other.port_ = 0;
+    }
+    RestAdapter& operator=(RestAdapter&& other) noexcept {
+        if (this != &other) {
+            handle_ = std::move(other.handle_);
+            port_ = other.port_;
+            other.port_ = 0;
+        }
+        return *this;
+    }
+    RestAdapter(const RestAdapter&) = delete;
+    RestAdapter& operator=(const RestAdapter&) = delete;
+
+    static RestAdapter start(
+        const Namespace& backend,
+        const std::string& host = "127.0.0.1",
+        uint16_t port = 0) {
+        LanceRestAdapter* raw = nullptr;
+        if (lance_rest_adapter_start(
+                backend.c_handle(), host.c_str(), port, &raw) != 0) {
+            check_error();
+        }
+        if (!raw) {
+            throw Error(
+                LANCE_ERR_INTERNAL,
+                "lance_rest_adapter_start returned success with null adapter");
+        }
+        RestAdapter adapter(raw);
+        adapter.port_ = lance_rest_adapter_port(raw);
+        return adapter;
+    }
+
+    uint16_t port() const noexcept { return port_; }
+
+    void shutdown() {
+        lance_rest_adapter_shutdown(handle_.get());
+        port_ = 0;
+    }
+};
+
+inline Dataset Dataset::open_namespace(
+    const Namespace& ns,
+    const std::vector<std::string>& table_id,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    uint64_t version,
+    const Session* session) {
+    auto table_json = namespace_detail::json_string_array(table_id);
+    auto storage_json = namespace_detail::json_string_object(storage_opts);
+    auto* raw = lance_dataset_open_namespace(
+        ns.c_handle(),
+        table_json.c_str(),
+        storage_json.c_str(),
+        version,
+        session ? session->c_handle() : nullptr);
+    if (!raw) check_error();
+    return Dataset(raw);
+}
+
+inline Dataset Dataset::write_namespace(
+    const Namespace& ns,
+    const std::vector<std::string>& table_id,
+    ArrowArrayStream* stream,
+    WriteMode mode,
+    const WriteOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const std::optional<std::string>& branch,
+    const Session* session) {
+    ArrowStreamInput input(stream);
+    const ArrowSchema* schema = input.read_schema();
+    auto table_json = namespace_detail::json_string_array(table_id);
+    auto storage_json = namespace_detail::json_string_object(storage_opts);
+    LanceAutoCleanupParams cleanup{};
+    LanceWriteOptions c_options = to_c_write_options(options, cleanup);
+    LanceDataset* out = nullptr;
+    auto* owned_stream = input.consume();
+    int32_t rc = lance_dataset_write_namespace(
+        ns.c_handle(),
+        table_json.c_str(),
+        schema,
+        owned_stream,
+        static_cast<int32_t>(mode),
+        nullptr,
+        &c_options,
+        storage_json.c_str(),
+        session ? session->c_handle() : nullptr,
+        branch ? branch->c_str() : nullptr,
+        &out);
+    if (rc != 0) check_error();
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_dataset_write_namespace returned success with null out_dataset");
+    }
+    return Dataset(out);
+}
+
+inline Dataset Dataset::commit_namespace_uri(
+    const Namespace& ns,
+    const std::vector<std::string>& table_id,
+    const std::string& uri,
+    const Transaction& transaction,
+    const CommitOptions& options,
+    const std::vector<std::pair<std::string, std::string>>& storage_opts,
+    const Session* session) {
+    auto table_json = namespace_detail::json_string_array(table_id);
+    auto kv = to_c_key_values(storage_opts);
+    const char* const* opts_ptr = storage_opts.empty() ? nullptr : kv.data();
+    LanceCommitOptions c_options = to_c_commit_options(options);
+    LanceDataset* out = nullptr;
+    int32_t rc = lance_transaction_commit_namespace_uri(
+        ns.c_handle(),
+        table_json.c_str(),
+        uri.c_str(),
+        transaction.c_handle(),
+        &c_options,
+        opts_ptr,
+        session ? session->c_handle() : nullptr,
+        &out);
+    if (rc != 0) check_error();
+    if (!out) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance_transaction_commit_namespace_uri returned success with null out_dataset");
+    }
+    return Dataset(out);
+}
+
+
+// ─── MemWAL out-of-line definitions ──────────────────────────────────────────
+
+/// One Arrow schema plus a materialized batch list.
+struct Table {
+    ArrowSchemaOwner schema;
+    std::vector<Batch> batches;
+};
+
+inline LanceSchema LanceSchema::from_arrow(const ArrowSchema* schema) {
+    ::LanceSchema* raw = nullptr;
+    if (lance_schema_from_arrow(schema, &raw) != 0) check_error();
+    return LanceSchema(raw);
+}
+
+inline void Dataset::initialize_mem_wal(const MemWalInitOptions& options) {
+    std::vector<const char*> maintained;
+    maintained.reserve(options.maintained_indexes.value_or(
+        std::vector<std::string>{}).size());
+    if (options.maintained_indexes) {
+        for (const auto& name : *options.maintained_indexes) {
+            maintained.push_back(name.c_str());
+        }
+    }
+    std::vector<std::string> names;
+    std::vector<::LanceMemWalHnswParams> hnsw;
+    ::LanceShardWriterConfig config{};
+    const ::LanceShardWriterConfig* config_ptr = nullptr;
+    if (options.writer_config) {
+        config = options.writer_config->to_c(names, hnsw);
+        config_ptr = &config;
+    }
+    if (lance_mem_wal_initialize(
+            const_cast<::LanceDataset*>(handle_.get()), options.mode,
+            options.column ? options.column->c_str() : nullptr,
+            options.num_buckets,
+            options.maintained_indexes.has_value() ? 1 : 0,
+            maintained.empty() ? nullptr : maintained.data(), maintained.size(),
+            config_ptr) != 0) {
+        check_error();
+    }
+}
+
+inline std::optional<MemWalIndexDetails> Dataset::mem_wal_index_details() const {
+    ::LanceMemWalIndexDetails* raw = nullptr;
+    if (lance_mem_wal_index_details(
+            const_cast<::LanceDataset*>(handle_.get()), &raw) != 0) {
+        check_error();
+    }
+    if (!raw) return std::nullopt;
+    Handle<::LanceMemWalIndexDetails, lance_mem_wal_index_details_free> details(raw);
+
+    std::vector<std::string> maintained;
+    const size_t maintained_count =
+        lance_mem_wal_index_details_maintained_index_count(details.get());
+    maintained.reserve(maintained_count);
+    for (size_t i = 0; i < maintained_count; ++i) {
+        const char* name = nullptr;
+        if (lance_mem_wal_index_details_maintained_index_at(
+                details.get(), i, &name) != 0) {
+            check_error();
+        }
+        maintained.emplace_back(name);
+    }
+
+    std::vector<ShardingSpec> specs;
+    const size_t spec_count =
+        lance_mem_wal_index_details_sharding_spec_count(details.get());
+    specs.reserve(spec_count);
+    for (size_t i = 0; i < spec_count; ++i) {
+        ::LanceMemWalShardingSpec* spec = nullptr;
+        if (lance_mem_wal_index_details_sharding_spec_at(
+                details.get(), i, &spec) != 0) {
+            check_error();
+        }
+        specs.emplace_back(spec);
+    }
+
+    std::map<std::string, std::string> defaults;
+    const size_t default_count =
+        lance_mem_wal_index_details_writer_config_default_count(details.get());
+    for (size_t i = 0; i < default_count; ++i) {
+        const char* key = nullptr;
+        const char* value = nullptr;
+        if (lance_mem_wal_index_details_writer_config_default_at(
+                details.get(), i, &key, &value) != 0) {
+            check_error();
+        }
+        defaults.emplace(key, value);
+    }
+
+    const uint32_t num_shards =
+        lance_mem_wal_index_details_num_shards(details.get());
+    const int32_t maintain_all =
+        lance_mem_wal_index_details_maintain_all_indexes(details.get());
+    return MemWalIndexDetails(num_shards, maintain_all != 0,
+                              std::move(maintained), std::move(specs),
+                              std::move(defaults));
+}
+
+inline ShardWriter Dataset::mem_wal_writer(
+    const std::string& shard_id, const ShardWriterConfig& config) const {
+    std::vector<std::string> names;
+    std::vector<::LanceMemWalHnswParams> hnsw;
+    auto raw_config = config.to_c(names, hnsw);
+    ::LanceShardWriter* raw = nullptr;
+    if (lance_shard_writer_open(
+            const_cast<::LanceDataset*>(handle_.get()), shard_id.c_str(),
+            &raw_config, &raw) != 0) {
+        check_error();
+    }
+    return ShardWriter(raw);
+}
+
+inline ShardWriter ShardWriter::open(const Dataset& dataset,
+                                     const std::string& shard_id,
+                                     const ShardWriterConfig& config) {
+    return dataset.mem_wal_writer(shard_id, config);
+}
+
+inline LsmScanner ShardWriter::lsm_scanner(
+    std::vector<ShardSnapshot> snapshots) {
+    std::vector<const ::LanceMemWalShardSnapshot*> raw;
+    raw.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) raw.push_back(snapshot.c_handle());
+    ::LanceLsmScanner* scanner = nullptr;
+    if (lance_shard_writer_lsm_scanner(
+            handle_.get(), raw.empty() ? nullptr : raw.data(), raw.size(),
+            &scanner) != 0) {
+        check_error();
+    }
+    return LsmScanner(scanner);
+}
+
+inline LsmScanner LsmScanner::from_snapshots(
+    const Dataset& dataset, std::vector<ShardSnapshot> snapshots) {
+    std::vector<const ::LanceMemWalShardSnapshot*> raw;
+    raw.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) raw.push_back(snapshot.c_handle());
+    ::LanceLsmScanner* scanner = nullptr;
+    if (lance_lsm_scanner_from_snapshots(
+            const_cast<::LanceDataset*>(dataset.c_handle()),
+            raw.empty() ? nullptr : raw.data(), raw.size(), &scanner) != 0) {
+        check_error();
+    }
+    return LsmScanner(scanner);
+}
+
+inline Batch LsmScanner::to_batch() const {
+    ::LanceBatch* raw = nullptr;
+    if (lance_lsm_scanner_to_batch(handle_.get(), &raw) != 0) check_error();
+    return Batch(raw);
+}
+
+inline std::vector<Batch> LsmScanner::to_batches() const {
+    std::vector<Batch> batches;
+    batches.push_back(to_batch());
+    return batches;
+}
+
+inline Table LsmScanner::to_table() const {
+    Table table;
+    ArrowSchema raw{};
+    if (lance_lsm_scanner_schema(handle_.get(), &raw) != 0) {
+        check_error();
+    }
+    table.schema = ArrowSchemaOwner(raw);
+    table.batches = to_batches();
+    return table;
+}
+
+inline ArrowSchemaOwner ExecutionPlan::schema() const {
+    ArrowSchema raw{};
+    if (lance_mem_wal_plan_schema(handle_.get(), &raw) != 0) {
+        check_error();
+    }
+    return ArrowSchemaOwner(raw);
+}
+
+inline ArrowSchemaOwner ExecutionPlan::dataset_schema() const {
+    ArrowSchema raw{};
+    if (lance_mem_wal_plan_dataset_schema(handle_.get(), &raw) != 0) {
+        check_error();
+    }
+    return ArrowSchemaOwner(raw);
+}
+
+inline Batch ExecutionPlan::to_batch() const {
+    ::LanceBatch* raw = nullptr;
+    if (lance_mem_wal_plan_to_batch(handle_.get(), &raw) != 0) check_error();
+    return Batch(raw);
+}
+
+inline std::vector<Batch> ExecutionPlan::to_batches() const {
+    std::vector<Batch> batches;
+    batches.push_back(to_batch());
+    return batches;
+}
+
+inline Table ExecutionPlan::to_table() const {
+    Table table;
+    table.schema = schema();
+    table.batches = to_batches();
+    return table;
+}
+
+inline LsmPointLookupPlanner::LsmPointLookupPlanner(
+    const Dataset& dataset, std::vector<ShardSnapshot> snapshots,
+    std::optional<std::vector<std::string>> pk_columns) {
+    std::vector<const ::LanceMemWalShardSnapshot*> raw;
+    raw.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) raw.push_back(snapshot.c_handle());
+    std::vector<const char*> columns;
+    if (pk_columns) {
+        columns.reserve(pk_columns->size());
+        for (const auto& column : *pk_columns) columns.push_back(column.c_str());
+    }
+    ::LanceLsmPointLookupPlanner* planner = nullptr;
+    if (lance_lsm_point_lookup_planner_new(
+            const_cast<::LanceDataset*>(dataset.c_handle()),
+            raw.empty() ? nullptr : raw.data(), raw.size(),
+            pk_columns.has_value() ? 1 : 0,
+            columns.empty() ? nullptr : columns.data(), columns.size(),
+            &planner) != 0) {
+        check_error();
+    }
+    handle_ = Handle<::LanceLsmPointLookupPlanner,
+                     lance_lsm_point_lookup_planner_free>(planner);
+}
+
+inline ExecutionPlan LsmPointLookupPlanner::plan_lookup(
+    const Batch& pk_value,
+    std::optional<std::vector<std::string>> columns) const {
+    std::vector<const char*> raw_columns;
+    if (columns) {
+        raw_columns.reserve(columns->size());
+        for (const auto& column : *columns) raw_columns.push_back(column.c_str());
+    }
+    ::LanceMemWalPlan* plan = nullptr;
+    if (lance_lsm_point_lookup_planner_plan(
+            handle_.get(), pk_value.c_handle(),
+            columns.has_value() ? 1 : 0,
+            raw_columns.empty() ? nullptr : raw_columns.data(),
+            raw_columns.size(), &plan) != 0) {
+        check_error();
+    }
+    return ExecutionPlan(plan);
+}
+
+inline LsmVectorSearchPlanner::LsmVectorSearchPlanner(
+    const Dataset& dataset, std::vector<ShardSnapshot> snapshots,
+    std::string vector_column,
+    std::optional<std::vector<std::string>> pk_columns,
+    MemWalDistanceType distance_type, std::optional<std::string> filter) {
+    std::vector<const ::LanceMemWalShardSnapshot*> raw;
+    raw.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) raw.push_back(snapshot.c_handle());
+    std::vector<const char*> columns;
+    if (pk_columns) {
+        columns.reserve(pk_columns->size());
+        for (const auto& column : *pk_columns) columns.push_back(column.c_str());
+    }
+    ::LanceLsmVectorSearchPlanner* planner = nullptr;
+    if (lance_lsm_vector_search_planner_new(
+            const_cast<::LanceDataset*>(dataset.c_handle()),
+            raw.empty() ? nullptr : raw.data(), raw.size(),
+            vector_column.c_str(), pk_columns.has_value() ? 1 : 0,
+            columns.empty() ? nullptr : columns.data(), columns.size(),
+            static_cast<::LanceMemWalDistanceType>(distance_type),
+            filter ? filter->c_str() : nullptr, &planner) != 0) {
+        check_error();
+    }
+    handle_ = Handle<::LanceLsmVectorSearchPlanner,
+                     lance_lsm_vector_search_planner_free>(planner);
+}
+
+inline ExecutionPlan LsmVectorSearchPlanner::plan_search(
+    const std::vector<float>& query, uint64_t k, uint64_t nprobes,
+    std::optional<std::vector<std::string>> columns, bool refine_base_table,
+    double overfetch_factor) const {
+    std::vector<const char*> raw_columns;
+    if (columns) {
+        raw_columns.reserve(columns->size());
+        for (const auto& column : *columns) raw_columns.push_back(column.c_str());
+    }
+    ::LanceMemWalPlan* plan = nullptr;
+    if (lance_lsm_vector_search_planner_plan(
+            handle_.get(), query.empty() ? nullptr : query.data(), query.size(),
+            k, nprobes, columns.has_value() ? 1 : 0,
+            raw_columns.empty() ? nullptr : raw_columns.data(),
+            raw_columns.size(), refine_base_table ? 1 : 0, overfetch_factor,
+            &plan) != 0) {
+        check_error();
+    }
+    return ExecutionPlan(plan);
+}
+
+
+// ─── Native update and rewrite value definitions ────────────────────────────
+
+inline RewriteGroup::RewriteGroup(
+    const std::vector<const Fragment*>& old_fragments,
+    const std::vector<const Fragment*>& new_fragments) {
+    std::vector<const ::LanceFragment*> old_raw;
+    old_raw.reserve(old_fragments.size());
+    for (const auto* fragment : old_fragments) {
+        old_raw.push_back(fragment->c_handle());
+    }
+    std::vector<const ::LanceFragment*> new_raw;
+    new_raw.reserve(new_fragments.size());
+    for (const auto* fragment : new_fragments) {
+        new_raw.push_back(fragment->c_handle());
+    }
+    auto* raw = lance_rewrite_group_new(
+        old_raw.empty() ? nullptr : old_raw.data(), old_raw.size(),
+        new_raw.empty() ? nullptr : new_raw.data(), new_raw.size());
+    if (!raw) check_error();
+    handle_ = Handle<LanceRewriteGroup, lance_rewrite_group_close>(raw);
+}
+
+inline size_t RewriteGroup::old_fragment_count() const {
+    uint64_t count = 0;
+    if (lance_rewrite_group_old_fragment_count(handle_.get(), &count) != 0)
+        check_error();
+    return static_cast<size_t>(count);
+}
+
+inline Fragment RewriteGroup::old_fragment_at(size_t index) const {
+    LanceFragment* fragment = nullptr;
+    if (lance_rewrite_group_old_fragment_at(
+            handle_.get(), index, &fragment) != 0) {
+        check_error();
+    }
+    return Fragment(fragment);
+}
+
+inline std::vector<Fragment> RewriteGroup::old_fragments() const {
+    std::vector<Fragment> out;
+    size_t count = old_fragment_count();
+    out.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        out.push_back(old_fragment_at(index));
+    }
+    return out;
+}
+
+inline size_t RewriteGroup::new_fragment_count() const {
+    uint64_t count = 0;
+    if (lance_rewrite_group_new_fragment_count(handle_.get(), &count) != 0)
+        check_error();
+    return static_cast<size_t>(count);
+}
+
+inline Fragment RewriteGroup::new_fragment_at(size_t index) const {
+    LanceFragment* fragment = nullptr;
+    if (lance_rewrite_group_new_fragment_at(
+            handle_.get(), index, &fragment) != 0) {
+        check_error();
+    }
+    return Fragment(fragment);
+}
+
+inline std::vector<Fragment> RewriteGroup::new_fragments() const {
+    std::vector<Fragment> out;
+    size_t count = new_fragment_count();
+    out.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        out.push_back(new_fragment_at(index));
+    }
+    return out;
+}
+
+inline RewrittenIndex::RewrittenIndex(
+    const std::array<uint8_t, 16>& old_id,
+    const std::array<uint8_t, 16>& new_id,
+    std::string_view details_type_url,
+    const std::vector<uint8_t>& details_value,
+    uint32_t index_version,
+    std::optional<std::vector<IndexFile>> index_files)
+    : handle_(nullptr) {
+    std::string owned_type_url(details_type_url);
+    std::vector<::LanceIndexFile> raw_files;
+    if (index_files) {
+        raw_files.reserve(index_files->size());
+        for (const auto& file : *index_files) {
+            ::LanceIndexFile raw{};
+            raw.path = file.path.c_str();
+            raw.size_bytes = file.size_bytes;
+            raw_files.push_back(raw);
+        }
+    }
+    auto* raw = lance_rewritten_index_new(
+        old_id.data(), new_id.data(), owned_type_url.c_str(),
+        details_value.empty() ? nullptr : details_value.data(),
+        details_value.size(), index_version, index_files.has_value(),
+        raw_files.empty() ? nullptr : raw_files.data(), raw_files.size());
+    if (!raw) check_error();
+    handle_ = Handle<LanceRewrittenIndex, lance_rewritten_index_close>(raw);
+}
+
+inline Fragment Operation::updated_fragment_at(size_t index) const {
+    LanceFragment* fragment = nullptr;
+    if (lance_operation_update_updated_fragment_at(
+            handle_.get(), index, &fragment) != 0) {
+        check_error();
+    }
+    return Fragment(fragment);
+}
+
+inline Fragment Operation::new_fragment_at(size_t index) const {
+    LanceFragment* fragment = nullptr;
+    if (lance_operation_update_new_fragment_at(
+            handle_.get(), index, &fragment) != 0) {
+        check_error();
+    }
+    return Fragment(fragment);
+}
+
+inline CompactedSsTable Operation::compacted_sstable_at(size_t index) const {
+    ::LanceCompactedSsTable raw{};
+    if (lance_operation_update_compacted_sstable_at(
+            handle_.get(), index, &raw) != 0) {
+        check_error();
+    }
+    CompactedSsTable value;
+    std::memcpy(value.shard_id.data(), raw.shard_id, value.shard_id.size());
+    value.generation = raw.generation;
+    return value;
+}
+
+inline CompactedSsTable Operation::update_mem_wal_state_compacted_sstable_at(
+    size_t index) const {
+    ::LanceCompactedSsTable raw{};
+    if (lance_operation_update_mem_wal_state_compacted_sstable_at(
+            handle_.get(), index, &raw) != 0) {
+        check_error();
+    }
+    CompactedSsTable value;
+    std::memcpy(value.shard_id.data(), raw.shard_id, value.shard_id.size());
+    value.generation = raw.generation;
+    return value;
+}
+
+inline std::optional<KeyExistenceFilter> Operation::inserted_rows_filter()
+    const {
+    bool present = false;
+    LanceKeyExistenceFilter* filter = nullptr;
+    if (lance_operation_update_inserted_rows_filter(
+            handle_.get(), &present, &filter) != 0) {
+        check_error();
+    }
+    if (!present) {
+        if (filter) {
+            lance_key_existence_filter_close(filter);
+            throw Error(LANCE_ERR_INTERNAL,
+                        "Update inserted-rows filter reported absent with a "
+                        "non-null handle");
+        }
+        return std::nullopt;
+    }
+    if (!filter) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "Update inserted-rows filter reported present with a "
+                    "null handle");
+    }
+    return KeyExistenceFilter(filter);
+}
+
+inline std::optional<UpdatedFragmentOffsets>
+Operation::updated_fragment_offsets() const {
+    bool present = false;
+    LanceUpdatedFragmentOffsets* offsets = nullptr;
+    if (lance_operation_update_updated_fragment_offsets(
+            handle_.get(), &present, &offsets) != 0) {
+        check_error();
+    }
+    if (!present) {
+        if (offsets) {
+            lance_updated_fragment_offsets_close(offsets);
+            throw Error(LANCE_ERR_INTERNAL,
+                        "Update fragment offsets reported absent with a "
+                        "non-null handle");
+        }
+        return std::nullopt;
+    }
+    if (!offsets) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "Update fragment offsets reported present with a null "
+                    "handle");
+    }
+    return UpdatedFragmentOffsets(offsets);
+}
+
+inline RewriteGroup Operation::rewrite_group_at(size_t index) const {
+    LanceRewriteGroup* group = nullptr;
+    if (lance_operation_rewrite_group_at(handle_.get(), index, &group) != 0) {
+        check_error();
+    }
+    return RewriteGroup(group);
+}
+
+inline RewrittenIndex Operation::rewritten_index_at(size_t index) const {
+    LanceRewrittenIndex* rewritten = nullptr;
+    if (lance_operation_rewrite_rewritten_index_at(
+            handle_.get(), index, &rewritten) != 0) {
+        check_error();
+    }
+    return RewrittenIndex(rewritten);
+}
+
+inline std::optional<IndexSegmentMetadata> Operation::frag_reuse_index()
+    const {
+    bool present = false;
+    LanceIndexSegmentMetadata* metadata = nullptr;
+    if (lance_operation_rewrite_frag_reuse_index(
+            handle_.get(), &present, &metadata) != 0) {
+        check_error();
+    }
+    if (!present) {
+        if (metadata) {
+            lance_index_segment_metadata_free(metadata);
+            throw Error(LANCE_ERR_INTERNAL,
+                        "Rewrite fragment-reuse index reported absent with a "
+                        "non-null handle");
+        }
+        return std::nullopt;
+    }
+    if (!metadata) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "Rewrite fragment-reuse index reported present with a "
+                    "null handle");
+    }
+    return IndexSegmentMetadata(metadata);
+}
+
+inline Operation Operation::make_update(const UpdateOperationSpec& spec) {
+    std::vector<const ::LanceFragment*> updated;
+    updated.reserve(spec.updated_fragments.size());
+    for (const auto* fragment : spec.updated_fragments) {
+        updated.push_back(fragment->c_handle());
+    }
+    std::vector<const ::LanceFragment*> inserted;
+    inserted.reserve(spec.new_fragments.size());
+    for (const auto* fragment : spec.new_fragments) {
+        inserted.push_back(fragment->c_handle());
+    }
+    std::vector<::LanceCompactedSsTable> compacted;
+    compacted.reserve(spec.compacted_sstables.size());
+    for (const auto& sstable : spec.compacted_sstables) {
+        compacted.push_back(sstable.to_c());
+    }
+    int32_t update_mode = 0;
+    if (spec.update_mode) {
+        if (*spec.update_mode == UpdateMode::RewriteRows) {
+            update_mode = LANCE_UPDATE_MODE_REWRITE_ROWS;
+        } else if (*spec.update_mode == UpdateMode::RewriteColumns) {
+            update_mode = LANCE_UPDATE_MODE_REWRITE_COLUMNS;
+        } else {
+            throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                        "update_mode is not a LanceUpdateMode value");
+        }
+    }
+
+    ::LanceUpdateOperationOptions options{};
+    options.removed_fragment_ids = spec.removed_fragment_ids.empty()
+                                       ? nullptr
+                                       : spec.removed_fragment_ids.data();
+    options.removed_fragment_count = spec.removed_fragment_ids.size();
+    options.updated_fragments = updated.empty() ? nullptr : updated.data();
+    options.updated_fragment_count = updated.size();
+    options.new_fragments = inserted.empty() ? nullptr : inserted.data();
+    options.new_fragment_count = inserted.size();
+    options.fields_modified =
+        spec.fields_modified.empty() ? nullptr : spec.fields_modified.data();
+    options.fields_modified_count = spec.fields_modified.size();
+    options.compacted_sstables = compacted.empty() ? nullptr : compacted.data();
+    options.compacted_sstable_count = compacted.size();
+    options.fields_for_preserving_frag_bitmap =
+        spec.fields_for_preserving_frag_bitmap.empty()
+            ? nullptr
+            : spec.fields_for_preserving_frag_bitmap.data();
+    options.fields_for_preserving_frag_bitmap_count =
+        spec.fields_for_preserving_frag_bitmap.size();
+    options.has_update_mode = spec.update_mode.has_value();
+    options.update_mode = update_mode;
+    options.inserted_rows_filter = spec.inserted_rows_filter
+                                       ? spec.inserted_rows_filter->c_handle()
+                                       : nullptr;
+    options.updated_fragment_offsets =
+        spec.updated_fragment_offsets
+            ? spec.updated_fragment_offsets->c_handle()
+            : nullptr;
+
+    auto* raw = lance_operation_update_new(&options);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_rewrite(
+    const std::vector<const RewriteGroup*>& groups,
+    const std::vector<const RewrittenIndex*>& rewritten_indices,
+    const IndexSegmentMetadata* frag_reuse_index) {
+    std::vector<const ::LanceRewriteGroup*> raw_groups;
+    raw_groups.reserve(groups.size());
+    for (const auto* group : groups) raw_groups.push_back(group->c_handle());
+    std::vector<const ::LanceRewrittenIndex*> raw_indices;
+    raw_indices.reserve(rewritten_indices.size());
+    for (const auto* index : rewritten_indices) {
+        raw_indices.push_back(index->c_handle());
+    }
+    auto* raw = lance_operation_rewrite_new(
+        raw_groups.empty() ? nullptr : raw_groups.data(), raw_groups.size(),
+        raw_indices.empty() ? nullptr : raw_indices.data(), raw_indices.size(),
+        frag_reuse_index ? frag_reuse_index->c_handle() : nullptr);
+    if (!raw) check_error();
+    return Operation(raw);
+}
+
+inline Operation Operation::make_update_mem_wal_state(
+    const std::vector<CompactedSsTable>& compacted_sstables) {
+    std::vector<::LanceCompactedSsTable> raw;
+    raw.reserve(compacted_sstables.size());
+    for (const auto& sstable : compacted_sstables) {
+        raw.push_back(sstable.to_c());
+    }
+    auto* operation = lance_operation_update_mem_wal_state_new(
+        raw.empty() ? nullptr : raw.data(), raw.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline Fragment RewriteResult::original_fragment_at(size_t index) const {
+    auto* raw =
+        lance_rewrite_result_original_fragment_at(handle_.get(), index);
+    if (!raw) check_error();
+    return Fragment(raw);
+}
+
+inline Fragment RewriteResult::new_fragment_at(size_t index) const {
+    auto* raw = lance_rewrite_result_new_fragment_at(handle_.get(), index);
+    if (!raw) check_error();
+    return Fragment(raw);
 }
 
 } // namespace lance

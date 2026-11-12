@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
 name: Release
 on:
   push:
@@ -24,7 +27,7 @@ jobs:
       # directly on the runner. A literal `image: ''` fails schema validation,
       # but an expression does not, which is what makes this pattern work.
       image: ${{ matrix.container }}
-    timeout-minutes: 90
+    timeout-minutes: ${{ matrix.timeout_minutes || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -53,25 +56,34 @@ jobs:
             os_label: linux
             container: "debian:12"
             artifact_suffix: "-debian12"
-          # x86_64-apple-darwin temporarily disabled: GitHub is deprecating
-          # macos-13 runners and jobs queue 24h+ before timing out. Restore
-          # this row once a macos-* Intel runner is reliably available again.
+          # macos-15-intel is GitHub's current standard x64 macOS runner.
+          # Keep this row native so both libraries and the consumer exercise
+          # Intel execution rather than a cross-build or arm64 translation.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            timeout_minutes: 180
+            os_label: macos
+            container: ""
+            artifact_suffix: ""
+            architecture: x86_64
           - target: aarch64-apple-darwin
             runner: macos-15
             os_label: macos
             container: ""
             artifact_suffix: ""
+            architecture: arm64
     env:
       CC: clang
       CXX: clang++
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       # Runs before checkout so git is present for the clone and for the
       # Corrosion FetchContent. The image has no sudo and runs as root.
-      # xz-utils backs `tar -cJf` and perl provides `shasum`; neither is in
-      # the base image. libprotobuf-dev supplies the well-known .proto files
-      # under /usr/include/google/protobuf/, which lance-encoding's build
-      # script imports; protobuf-compiler only Recommends it, so
-      # --no-install-recommends drops it and protoc fails to resolve
+      # xz-utils backs `tar -cJf`, zstd backs `rust-cache`, and perl provides
+      # `shasum`; none is in the base image. libprotobuf-dev supplies the
+      # well-known .proto files under /usr/include/google/protobuf/, which
+      # lance-encoding's build script imports; protobuf-compiler only Recommends
+      # it, so --no-install-recommends drops it and protoc fails to resolve
       # google/protobuf/empty.proto.
       - name: Install build dependencies (container)
         if: matrix.container != ''
@@ -85,20 +97,26 @@ jobs:
             curl \
             git \
             libprotobuf-dev \
-            libssl-dev \
             perl \
             pkg-config \
             protobuf-compiler \
-            xz-utils
+            xz-utils \
+            zstd
+          # TLS stays on rustls; Cargo.lock has no openssl-sys or native-tls.
+          # openssl-probe only discovers certificate locations; it does not
+          # link OpenSSL.
+          # libssl-dev must not be installed here: an accidental libssl or
+          # libcrypto DT_NEEDED breaks dlopen in minimal Linux images.
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git (container)
         if: matrix.container != ''
         run: git config --global --add safe.directory '*'
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: ". -> build/cargo/build"
           # Suffix keeps the container and host builds of the same triple from
           # sharing a cache — they link against different glibc versions.
           key: ${{ matrix.target }}${{ matrix.artifact_suffix }}
@@ -108,6 +126,18 @@ jobs:
       - name: Install protobuf (macOS)
         if: matrix.os_label == 'macos'
         run: brew install protobuf
+      - name: Record macOS host and toolchain
+        if: matrix.os_label == 'macos'
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          "$CC" --version
+          rustc -vV
+          cargo --version
+          cmake --version
+          git rev-parse HEAD
       - name: Resolve version
         id: ver
         run: |
@@ -122,11 +152,26 @@ jobs:
           cmake --build build --parallel
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
+      - name: Strip release shared library
+        run: bash .github/scripts/strip-release-shared.sh stage ${{ matrix.os_label }}
+      - name: Verify Linux shared-library exports
+        if: matrix.os_label == 'linux'
+        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.so stage/include/lance/lance.h linux
+      - name: Verify macOS shared-library exports
+        if: matrix.os_label == 'macos'
+        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.dylib stage/include/lance/lance.h macos
+      - name: Verify Linux staged runtime dependencies
+        if: matrix.os_label == 'linux'
+        run: bash .github/scripts/verify-linux-staging.sh stage ${{ matrix.target }}
       - name: Verify macOS staged libraries
         if: matrix.os_label == 'macos'
-        run: bash .github/scripts/verify-macos-staging.sh stage arm64
+        run: bash .github/scripts/verify-macos-staging.sh stage ${{ matrix.architecture }}
+      - name: Smoke-test staged package with CMake consumer
+        run: bash .github/scripts/verify-cmake-consumer.sh --from-install-prefix stage
       - name: Tar
         id: pack
+        env:
+          XZ_OPT: -T0
         run: |
           VERSION=${{ steps.ver.outputs.version }}
           TARGET=${{ matrix.target }}
@@ -147,9 +192,117 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-windows:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            generator: Visual Studio 17 2022
+            architecture: x64
+            toolset: ""
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            generator: Visual Studio 18 2026
+            architecture: ARM64
+            toolset: ClangCL
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Corrosion writes dependencies under the CMake build tree.
+          workspaces: |
+            . -> target
+            . -> build/${{ matrix.architecture }}/Release/cargo/build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Assert native Windows ARM64 toolchain
+        if: matrix.architecture == 'ARM64'
+        shell: pwsh
+        run: pwsh -File .github/scripts/assert-windows-arm64-host.ps1
+      - name: Record Windows runtime baseline
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            Format-List
+          rustc --version --verbose
+          cargo --version
+          cmake --version
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          $version = '29.3'
+          $archive = "protoc-$version-win64.zip"
+          Invoke-WebRequest `
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$version/$archive" `
+            -OutFile "$env:RUNNER_TEMP\$archive"
+          Expand-Archive "$env:RUNNER_TEMP\$archive" `
+            -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
+          "$env:RUNNER_TEMP\protoc\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
+      - name: Configure
+        run: >
+          cmake -S . -B build -G "${{ matrix.generator }}"
+          -A ${{ matrix.architecture }}
+          ${{ matrix.toolset != '' && format('-T {0}', matrix.toolset) || '' }}
+          -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Install to staging prefix
+        run: cmake --install build --prefix stage --config Release
+      - name: Verify staged package and installed consumers
+        run: >
+          pwsh -File .github/scripts/verify-windows-staging.ps1
+          -Prefix stage -SourceRoot .
+          -WorkDir "$env:RUNNER_TEMP\lance-c-windows-${{ matrix.architecture }}-acceptance"
+          -Architecture ${{ matrix.architecture }}
+          -CMakeGenerator "${{ matrix.generator }}"
+          -CMakeToolset "${{ matrix.toolset }}"
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.version }}"
+          } else {
+            $version = "${{ github.ref_name }}".TrimStart('v')
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Tar
+        id: pack
+        shell: bash
+        env:
+          XZ_OPT: -T0
+        run: |
+          VERSION=${{ steps.ver.outputs.version }}
+          TARGET=${{ matrix.target }}
+          ARCHIVE="lance-c-v${VERSION}-${TARGET}.tar.xz"
+          tar -C stage -cJf "${ARCHIVE}" .
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          sha512sum "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          echo "archive=${ARCHIVE}" >>"$GITHUB_OUTPUT"
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.pack.outputs.archive }}
+            ${{ steps.pack.outputs.archive }}.sha256
+            ${{ steps.pack.outputs.archive }}.sha512
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/v')
     steps:

@@ -69,6 +69,35 @@ pub fn set_last_error(code: LanceErrorCode, message: impl AsRef<str>) {
 /// Map a `lance_core::Error` to an `LanceErrorCode`.
 pub fn error_code_from_lance(err: &lance_core::Error) -> LanceErrorCode {
     use lance_core::Error;
+    use lance_namespace::{ErrorCode as NamespaceErrorCode, NamespaceError};
+
+    if let Error::Namespace { source, .. } = err
+        && let Some(namespace_error) = source.downcast_ref::<NamespaceError>()
+    {
+        return match namespace_error.code() {
+            NamespaceErrorCode::Unsupported => LanceErrorCode::NotSupported,
+            NamespaceErrorCode::NamespaceNotFound
+            | NamespaceErrorCode::TableNotFound
+            | NamespaceErrorCode::TableIndexNotFound
+            | NamespaceErrorCode::TableTagNotFound
+            | NamespaceErrorCode::TransactionNotFound
+            | NamespaceErrorCode::TableVersionNotFound
+            | NamespaceErrorCode::TableColumnNotFound
+            | NamespaceErrorCode::TableBranchNotFound => LanceErrorCode::NotFound,
+            NamespaceErrorCode::NamespaceAlreadyExists
+            | NamespaceErrorCode::TableAlreadyExists
+            | NamespaceErrorCode::TableIndexAlreadyExists
+            | NamespaceErrorCode::TableTagAlreadyExists
+            | NamespaceErrorCode::TableBranchAlreadyExists => LanceErrorCode::DatasetAlreadyExists,
+            NamespaceErrorCode::InvalidInput
+            | NamespaceErrorCode::InvalidTableState
+            | NamespaceErrorCode::TableSchemaValidationError
+            | NamespaceErrorCode::NamespaceNotEmpty => LanceErrorCode::InvalidArgument,
+            NamespaceErrorCode::ConcurrentModification => LanceErrorCode::CommitConflict,
+            _ => LanceErrorCode::Internal,
+        };
+    }
+
     match err {
         Error::InvalidInput { .. } | Error::InvalidRef { .. } => LanceErrorCode::InvalidArgument,
         Error::DatasetAlreadyExists { .. } => LanceErrorCode::DatasetAlreadyExists,

@@ -16,8 +16,10 @@ use arrow_schema::{DataType, Field};
 use chrono::{DateTime, Utc};
 use lance::Dataset;
 use lance::index::DatasetIndexExt;
+use lance::index::vector::{StageParams, VectorIndexParams as LanceCoreVectorIndexParams};
 use lance_core::{Error, Result};
-use lance_index::progress::IndexBuildProgress;
+use lance_index::IndexType;
+use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::scalar::ScalarIndexParams;
 use lance_table::format::{IndexMetadata, pb};
 use prost::Message;
@@ -27,8 +29,9 @@ use crate::dataset::LanceDataset;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::helpers;
 use crate::index::{
-    LanceMetricType, LanceScalarIndexType, LanceVectorIndexParams, LanceVectorIndexType,
-    build_vector_params_with_models,
+    LanceMetricType, LanceScalarIndexOptions, LanceScalarIndexType, LanceVectorIndexOptions,
+    LanceVectorIndexParams, LanceVectorIndexType, build_vector_params_with_models,
+    prepare_vector_build, scalar_train,
 };
 use crate::runtime::block_on;
 
@@ -127,12 +130,23 @@ enum SegmentKind {
     Scalar {
         scalar_type: LanceScalarIndexType,
         params_json: Option<String>,
+        train: bool,
     },
     Vector {
-        params: LanceVectorIndexParams,
-        centroids: Option<Arc<FixedSizeListArray>>,
-        codebook: Option<ArrayRef>,
+        params: LanceCoreVectorIndexParams,
+        train: bool,
     },
+}
+
+/// Fragment selection and optional UUID for the additive vector segment
+/// builder. A NULL optional pointer preserves native `None`; a non-NULL scope
+/// with `fragment_count == 0` represents an explicit empty selection.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceVectorIndexSegmentScope {
+    pub fragment_ids: *const u32,
+    pub fragment_count: usize,
+    pub index_uuid: *const u8,
 }
 
 /// Event code delivered to `LanceIndexBuildProgressCallback`; mirrors
@@ -172,7 +186,7 @@ pub type LanceIndexBuildProgressCallback = Option<
 /// retirement from a documentation contract into an enforced boundary: once
 /// `retire` returns, no callback invocation is in flight and every later
 /// entry becomes a no-op, so a detached clone can never touch the raw
-/// `callback`/`ctx` after the owning `execute_uncommitted` call has returned.
+/// `callback`/`ctx` after the owning blocking build call has returned.
 #[derive(Debug, Default)]
 struct ProgressCallbackGate {
     /// Set by `retire`; entries that observe it become no-ops.
@@ -223,6 +237,41 @@ impl Drop for ProgressRetireGuard {
     }
 }
 
+/// Callback bridge that retires when the blocking native call returns.
+pub(crate) struct ProgressCallbackBridge {
+    callback: Arc<SendIndexBuildProgressCallback>,
+    _retire: ProgressRetireGuard,
+}
+
+impl ProgressCallbackBridge {
+    pub(crate) fn new(
+        callback: unsafe extern "C" fn(
+            callback_ctx: *mut c_void,
+            event: i32,
+            stage: *const c_char,
+            total: u64,
+            unit: *const c_char,
+            completed: u64,
+        ),
+        ctx: *mut c_void,
+    ) -> Self {
+        let callback = Arc::new(SendIndexBuildProgressCallback {
+            callback,
+            ctx,
+            gate: Arc::new(ProgressCallbackGate::default()),
+        });
+        let retire = ProgressRetireGuard(Arc::clone(&callback.gate));
+        Self {
+            callback,
+            _retire: retire,
+        }
+    }
+
+    pub(crate) fn progress(&self) -> Arc<dyn IndexBuildProgress> {
+        self.callback.clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SendIndexBuildProgressCallback {
     callback: unsafe extern "C" fn(
@@ -240,12 +289,12 @@ struct SendIndexBuildProgressCallback {
 }
 
 // SAFETY: The C API requires the callback and its context to remain valid and
-// safe to invoke until `execute_uncommitted` returns, and the shared gate
-// guarantees no invocation is in flight — and no new one can start — once
-// that boundary is reached, so no invocation can touch the raw context after
-// retirement. Certain build stages report progress concurrently from parallel
-// worker tasks, so the callback may be invoked concurrently; the C contract
-// requires it to be thread-safe.
+// safe to invoke until the owning blocking build call returns, and the shared
+// gate guarantees no invocation is in flight — and no new one can start —
+// once that boundary is reached, so no invocation can touch the raw context
+// after retirement. Certain build stages report progress concurrently from
+// parallel worker tasks, so the callback may be invoked concurrently; the C
+// contract requires it to be thread-safe.
 unsafe impl Send for SendIndexBuildProgressCallback {}
 unsafe impl Sync for SendIndexBuildProgressCallback {}
 
@@ -329,12 +378,66 @@ impl IndexBuildProgress for SendIndexBuildProgressCallback {
     }
 }
 
+/// Presence-aware timestamp split into whole Unix seconds and nanoseconds.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LanceOptionalTimestamp {
+    pub is_set: bool,
+    pub unix_seconds: i64,
+    pub nanos: u32,
+}
+
 /// Opaque parsed index segment metadata.
 pub struct LanceIndexSegmentMetadata {
     metadata: IndexMetadata,
     name: CString,
     index_details_type_url: Option<CString>,
     fragment_ids: Vec<u32>,
+    file_paths: Vec<CString>,
+}
+
+impl LanceIndexSegmentMetadata {
+    pub(crate) fn native_metadata(&self) -> &IndexMetadata {
+        &self.metadata
+    }
+}
+
+pub(crate) fn metadata_handle(metadata: IndexMetadata) -> Result<*mut LanceIndexSegmentMetadata> {
+    let name = CString::new(metadata.name.as_str())
+        .map_err(|_| invalid_input("index metadata name contains an embedded NUL byte"))?;
+    let index_details_type_url = metadata
+        .index_details
+        .as_ref()
+        .map(|details| CString::new(details.type_url.as_str()))
+        .transpose()
+        .map_err(|_| invalid_input("index details type_url contains an embedded NUL byte"))?;
+    let fragment_ids = metadata
+        .fragment_bitmap
+        .as_ref()
+        .map(|bitmap| bitmap.iter().collect())
+        .unwrap_or_default();
+    let file_paths = metadata
+        .files
+        .as_ref()
+        .map(|files| {
+            files
+                .iter()
+                .map(|file| {
+                    CString::new(file.path.as_str()).map_err(|_| {
+                        invalid_input("index metadata file path contains an embedded NUL byte")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Box::into_raw(Box::new(LanceIndexSegmentMetadata {
+        metadata,
+        name,
+        index_details_type_url,
+        fragment_ids,
+        file_paths,
+    })))
 }
 
 fn invalid_input(message: impl Into<String>) -> Error {
@@ -360,7 +463,7 @@ pub(crate) struct ModelProvenance {
 
 unsafe fn parse_options(
     options: *const LanceIndexSegmentBuildOptions,
-    dataset: &Dataset,
+    _dataset: &Dataset,
     scalar: bool,
 ) -> Result<ParsedBuildOptions> {
     if options.is_null() {
@@ -379,40 +482,14 @@ unsafe fn parse_options(
                 "fragment_ids is NULL but fragment_count is {count}"
             )));
         }
-        (false, 0) => {
-            return Err(invalid_input(
-                "fragment_ids is non-NULL but fragment_count is 0",
-            ));
-        }
+        (false, 0) => Some(Vec::new()),
         (false, count) => {
             if count > isize::MAX as usize / std::mem::size_of::<u32>() {
                 return Err(invalid_input(format!(
                     "fragment_count {count} exceeds the maximum addressable u32 slice length"
                 )));
             }
-            let ids = unsafe { slice::from_raw_parts(options.fragment_ids, count) }.to_vec();
-            let mut unique = HashSet::with_capacity(ids.len());
-            for (position, fragment_id) in ids.iter().copied().enumerate() {
-                if !unique.insert(fragment_id) {
-                    return Err(invalid_input(format!(
-                        "fragment_ids[{position}] is duplicate fragment id {fragment_id}"
-                    )));
-                }
-            }
-            let existing: HashSet<u32> = dataset
-                .get_fragments()
-                .iter()
-                .filter_map(|fragment| u32::try_from(fragment.id()).ok())
-                .collect();
-            for (position, fragment_id) in ids.iter().copied().enumerate() {
-                if !existing.contains(&fragment_id) {
-                    return Err(invalid_input(format!(
-                        "fragment_ids[{position}]={fragment_id} does not exist in dataset version {}",
-                        dataset.version().version
-                    )));
-                }
-            }
-            Some(ids)
+            Some(unsafe { slice::from_raw_parts(options.fragment_ids, count) }.to_vec())
         }
     };
 
@@ -476,6 +553,7 @@ pub unsafe extern "C" fn lance_index_segment_builder_new_scalar(
                 index_type,
                 params_json,
                 options,
+                true,
             )
         },
         null
@@ -489,6 +567,7 @@ unsafe fn new_scalar_builder_inner(
     index_type: i32,
     params_json: *const c_char,
     options: *const LanceIndexSegmentBuildOptions,
+    train: bool,
 ) -> Result<*mut LanceIndexSegmentBuilder> {
     if dataset.is_null() || column.is_null() {
         return Err(invalid_input("dataset and column must not be NULL"));
@@ -511,12 +590,64 @@ unsafe fn new_scalar_builder_inner(
         kind: SegmentKind::Scalar {
             scalar_type,
             params_json,
+            train,
         },
         fragment_ids: parsed.fragment_ids,
         index_uuid: parsed.index_uuid,
         progress: None,
         executed: false,
     })))
+}
+
+/// Create a scalar index segment builder with native train control.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_builder_new_scalar_with_options(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    index_type: i32,
+    params_json: *const c_char,
+    scalar_options: *const LanceScalarIndexOptions,
+    options: *const LanceIndexSegmentBuildOptions,
+) -> *mut LanceIndexSegmentBuilder {
+    ffi_try!(
+        unsafe {
+            new_scalar_builder_with_options_inner(
+                dataset,
+                column,
+                index_name,
+                index_type,
+                params_json,
+                scalar_options,
+                options,
+            )
+        },
+        ptr::null_mut()
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn new_scalar_builder_with_options_inner(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    index_type: i32,
+    params_json: *const c_char,
+    scalar_options: *const LanceScalarIndexOptions,
+    options: *const LanceIndexSegmentBuildOptions,
+) -> Result<*mut LanceIndexSegmentBuilder> {
+    let train = scalar_train(scalar_options)?;
+    unsafe {
+        new_scalar_builder_inner(
+            dataset,
+            column,
+            index_name,
+            index_type,
+            params_json,
+            options,
+            train,
+        )
+    }
 }
 
 /// Create a vector index segment builder bound to the dataset's current snapshot.
@@ -700,15 +831,15 @@ pub(crate) unsafe fn borrow_model_array(
         return Err(invalid_input(format!("{name} must not be NULL")));
     }
     let field = unsafe { validate_model_schema(schema, name)? };
-    let DataType::FixedSizeList(child_field, list_size) = field.data_type() else {
+    let DataType::FixedSizeList(_, list_size) = field.data_type() else {
         return Err(invalid_input(format!(
             "{name}_schema must describe FixedSizeList, got {:?}",
             field.data_type()
         )));
     };
-    if *list_size <= 0 || child_field.data_type() != &DataType::Float32 {
+    if *list_size <= 0 {
         return Err(invalid_input(format!(
-            "{name}_schema must describe FixedSizeList<Float32> with positive list_size, got {:?}",
+            "{name}_schema must describe FixedSizeList with positive list_size, got {:?}",
             field.data_type()
         )));
     }
@@ -776,7 +907,7 @@ pub(crate) unsafe fn borrow_model_array(
     validate_common(child, &format!("{name}.children[0]"))?;
     if child.n_buffers != 2 || child.buffers.is_null() {
         return Err(invalid_input(format!(
-            "{name}.children[0] Float32 must have two buffers and a non-NULL buffers pointer; n_buffers={}",
+            "{name}.children[0] primitive values must have two buffers and a non-NULL buffers pointer; n_buffers={}",
             child.n_buffers
         )));
     }
@@ -837,7 +968,7 @@ pub(crate) fn fixed_size_list_model(array: ArrayRef, name: &str) -> Result<Fixed
         .cloned()
         .ok_or_else(|| {
             invalid_input(format!(
-                "{name} must be FixedSizeList<Float32>, got {:?}",
+                "{name} must be FixedSizeList, got {:?}",
                 array.data_type()
             ))
         })?;
@@ -1081,25 +1212,44 @@ unsafe fn new_vector_builder_inner(
     };
 
     let centroids = centroids.map(Arc::new);
-    // Construct now so all parameter/model mismatches fail at the FFI boundary.
-    let _ = build_vector_params_with_models(&params, centroids.clone(), codebook.clone())?;
+    // Construct now so all supported parameter/model mismatches fail while
+    // creating the builder. Fragment validation itself stays in Lance core.
+    let core_params = build_vector_params_with_models(&params, centroids, codebook)?;
 
-    // TODO(upstream-lance): Remove this fail-fast once Lance's distributed
-    // vector-index path reconstructs a supplied PQ codebook with an L2
-    // ProductQuantizer, matching the ordinary full-dataset path. Pinned Lance
-    // revision ab6b5bbe rewraps supplied codebooks with DistanceType::Dot in
-    // `make_global_pq`, which silently switches PQ code assignment away from
-    // the L2 contract shared by full-dataset builds and index readers.
-    if matches!(
-        params.index_type,
-        LanceVectorIndexType::IvfPq | LanceVectorIndexType::IvfHnswPq
-    ) && params.metric == LanceMetricType::Dot
-        && codebook.is_some()
-        && let Some(fragment_ids) = parsed.fragment_ids.as_ref()
+    validate_precomputed_pq_fragment_scope(&dataset, &core_params, parsed.fragment_ids.as_deref())?;
+
+    Ok(Box::into_raw(Box::new(LanceIndexSegmentBuilder {
+        dataset,
+        column,
+        index_name,
+        kind: SegmentKind::Vector {
+            params: core_params,
+            train: true,
+        },
+        fragment_ids: parsed.fragment_ids,
+        index_uuid: parsed.index_uuid,
+        progress: None,
+        executed: false,
+    })))
+}
+
+// The selected core's distributed path reconstructs supplied PQ codebooks with
+// the query metric. Index readers and ordinary builds use L2 PQ assignment,
+// so preserve the existing restriction for DOT models on fragment subsets
+// until the core's make_global_pq uses the same assignment metric.
+fn validate_precomputed_pq_fragment_scope(
+    dataset: &Dataset,
+    params: &LanceCoreVectorIndexParams,
+    fragment_ids: Option<&[u32]>,
+) -> Result<()> {
+    let has_codebook = params
+        .stages
+        .iter()
+        .any(|stage| matches!(stage, StageParams::PQ(pq) if pq.codebook.is_some()));
+    if params.metric_type == LanceMetricType::Dot.to_distance()
+        && has_codebook
+        && let Some(fragment_ids) = fragment_ids
     {
-        // `fragment_ids` are unique and known to exist (checked in
-        // `parse_options`), so set inequality here is exactly an effective
-        // strict subset, mirroring core `effective_vector_fragments`.
         let all_fragment_ids: HashSet<u32> = dataset
             .get_fragments()
             .iter()
@@ -1108,13 +1258,98 @@ unsafe fn new_vector_builder_inner(
         let selected_fragment_ids: HashSet<u32> = fragment_ids.iter().copied().collect();
         if selected_fragment_ids != all_fragment_ids {
             return Err(invalid_input(format!(
-                "pq_codebook is supplied for metric=DOT, index_type={:?}, mode={:?}, and an effective strict fragment subset ({} of {} fragments): pinned Lance revision ab6b5bbe reconstructs the supplied codebook with a DOT ProductQuantizer in the distributed build path (make_global_pq), silently breaking the L2 PQ-assignment contract; cover the full dataset in one segment (pass NULL fragment_ids or list every fragment) or wait for upstream Lance DOT support",
-                params.index_type,
-                parsed.mode,
+                "pq_codebook with metric=DOT and an effective strict fragment subset ({} of {} fragments) is unsupported on Lance revision 40f15ed1. Its distributed make_global_pq path reconstructs the supplied codebook with a DOT ProductQuantizer, breaking the L2 PQ-assignment contract. Cover the full dataset in one segment by passing NULL fragment_ids or every fragment.",
                 selected_fragment_ids.len(),
                 all_fragment_ids.len()
             )));
         }
+    }
+    Ok(())
+}
+
+unsafe fn parse_vector_segment_scope(
+    scope: *const LanceVectorIndexSegmentScope,
+) -> Result<(Option<Vec<u32>>, Option<Uuid>)> {
+    if scope.is_null() {
+        return Ok((None, None));
+    }
+    let scope = unsafe { &*scope };
+    let fragment_ids = match (scope.fragment_ids.is_null(), scope.fragment_count) {
+        (true, 0) => None,
+        (true, count) => {
+            return Err(invalid_input(format!(
+                "scope.fragment_ids is NULL but scope.fragment_count is {count}"
+            )));
+        }
+        (false, 0) => Some(Vec::new()),
+        (false, count) => {
+            if count > isize::MAX as usize / std::mem::size_of::<u32>() {
+                return Err(invalid_input(format!(
+                    "scope.fragment_count {count} exceeds the maximum addressable u32 slice length"
+                )));
+            }
+            Some(unsafe { slice::from_raw_parts(scope.fragment_ids, count) }.to_vec())
+        }
+    };
+    let index_uuid = if scope.index_uuid.is_null() {
+        None
+    } else {
+        let bytes: [u8; 16] = unsafe { slice::from_raw_parts(scope.index_uuid, 16) }
+            .try_into()
+            .expect("slice has a fixed length of 16");
+        Some(Uuid::from_bytes(bytes))
+    };
+    Ok((fragment_ids, index_uuid))
+}
+
+/// Create a vector segment builder from additive native options.
+///
+/// The builder copies strings, maps, paths, fragment IDs and UUIDs at creation.
+/// Arrow models are borrowed synchronously and leave a live caller-owned
+/// equivalent in place. The dataset is snapshotted and need not outlive the
+/// builder.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_builder_new_vector_with_options(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    options: *const LanceVectorIndexOptions,
+    scope: *const LanceVectorIndexSegmentScope,
+) -> *mut LanceIndexSegmentBuilder {
+    ffi_try!(
+        unsafe {
+            new_vector_builder_with_options_inner(dataset, column, index_name, options, scope)
+        },
+        null
+    )
+}
+
+unsafe fn new_vector_builder_with_options_inner(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    index_name: *const c_char,
+    options: *const LanceVectorIndexOptions,
+    scope: *const LanceVectorIndexSegmentScope,
+) -> Result<*mut LanceIndexSegmentBuilder> {
+    if dataset.is_null() || column.is_null() || options.is_null() {
+        return Err(invalid_input(
+            "dataset, column, and options must not be NULL",
+        ));
+    }
+    let column = unsafe { helpers::parse_c_string(column)? }
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_input("column must not be NULL or empty"))?
+        .to_string();
+    let index_name = unsafe { helpers::parse_c_string(index_name)? }.map(str::to_string);
+    let prepared = unsafe { prepare_vector_build(options)? };
+    let (fragment_ids, index_uuid) = unsafe { parse_vector_segment_scope(scope)? };
+    let dataset = unsafe { &*dataset }.snapshot().as_ref().clone();
+    if prepared.train {
+        validate_precomputed_pq_fragment_scope(
+            &dataset,
+            &prepared.params,
+            fragment_ids.as_deref(),
+        )?;
     }
 
     Ok(Box::into_raw(Box::new(LanceIndexSegmentBuilder {
@@ -1122,12 +1357,11 @@ unsafe fn new_vector_builder_inner(
         column,
         index_name,
         kind: SegmentKind::Vector {
-            params,
-            centroids,
-            codebook,
+            params: prepared.params,
+            train: prepared.train,
         },
-        fragment_ids: parsed.fragment_ids,
-        index_uuid: parsed.index_uuid,
+        fragment_ids,
+        index_uuid,
         progress: None,
         executed: false,
     })))
@@ -1177,6 +1411,7 @@ unsafe fn execute_uncommitted_inner(
         SegmentKind::Scalar {
             scalar_type,
             params_json,
+            train,
         } => {
             let mut params = ScalarIndexParams::for_builtin(scalar_type.to_builtin());
             params.params.clone_from(params_json);
@@ -1197,19 +1432,13 @@ unsafe fn execute_uncommitted_inner(
             if let Some(progress) = builder.progress.clone() {
                 core_builder = core_builder.progress(Arc::new(progress));
             }
-            block_on(core_builder.execute_uncommitted())
+            block_on(core_builder.train(*train).execute_uncommitted())
         }
-        SegmentKind::Vector {
-            params,
-            centroids,
-            codebook,
-        } => {
-            let core_params =
-                build_vector_params_with_models(params, centroids.clone(), codebook.clone())?;
+        SegmentKind::Vector { params, train } => {
             let mut core_builder = builder.dataset.create_index_builder(
                 &columns,
                 lance_index::IndexType::Vector,
-                &core_params,
+                params,
             );
             if let Some(name) = builder.index_name.clone() {
                 core_builder = core_builder.name(name);
@@ -1223,13 +1452,20 @@ unsafe fn execute_uncommitted_inner(
             if let Some(progress) = builder.progress.clone() {
                 core_builder = core_builder.progress(Arc::new(progress));
             }
-            // Core's train=false means "create an empty index".  Model presence
-            // itself controls whether IVF/PQ training is skipped.
-            block_on(core_builder.train(true).execute_uncommitted())
+            block_on(core_builder.train(*train).execute_uncommitted())
         }
     };
     let metadata = result?;
-    let bytes = pb::IndexMetadata::from(&metadata).encode_to_vec();
+    unsafe { export_index_metadata(&metadata, out_bytes, out_len)? };
+    Ok(0)
+}
+
+unsafe fn export_index_metadata(
+    metadata: &IndexMetadata,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> Result<()> {
+    let bytes = pb::IndexMetadata::from(metadata).encode_to_vec();
     let allocation = unsafe { libc::malloc(bytes.len()) }.cast::<u8>();
     if allocation.is_null() {
         return Err(Error::internal(format!(
@@ -1242,7 +1478,7 @@ unsafe fn execute_uncommitted_inner(
         ptr::write(out_bytes, allocation);
         ptr::write(out_len, bytes.len());
     }
-    Ok(0)
+    Ok(())
 }
 
 /// Install (or replace) the index-build progress callback for a segment
@@ -1408,6 +1644,154 @@ unsafe fn commit_index_segments_inner(
     Ok(0)
 }
 
+/// Merge distributed Inverted index files into a single root artifact.
+///
+/// This writes and merges index files only. It does not commit a dataset
+/// version; publication requires the separate native CreateIndex operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_merge_index_metadata(
+    dataset: *const LanceDataset,
+    index_uuid: *const u8,
+    index_type: *const c_char,
+    has_batch_readhead: bool,
+    batch_readhead: usize,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            merge_index_metadata_inner(
+                dataset,
+                index_uuid,
+                index_type,
+                has_batch_readhead,
+                batch_readhead,
+                callback,
+                callback_ctx,
+            )
+        },
+        neg
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn merge_index_metadata_inner(
+    dataset: *const LanceDataset,
+    index_uuid: *const u8,
+    index_type: *const c_char,
+    has_batch_readhead: bool,
+    batch_readhead: usize,
+    callback: LanceIndexBuildProgressCallback,
+    callback_ctx: *mut c_void,
+) -> Result<i32> {
+    if dataset.is_null() || index_uuid.is_null() {
+        return Err(invalid_input("dataset and index_uuid must not be NULL"));
+    }
+    let index_type = unsafe { helpers::parse_c_string(index_type)? }
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_input("index_type must not be NULL or empty"))?;
+    let index_type = IndexType::try_from(index_type)?;
+    let uuid = Uuid::from_bytes(
+        unsafe { slice::from_raw_parts(index_uuid, 16) }
+            .try_into()
+            .expect("fixed-length UUID slice"),
+    );
+    let snapshot = unsafe { &*dataset }.snapshot();
+    let bridge = callback.map(|callback| ProgressCallbackBridge::new(callback, callback_ctx));
+    let progress = bridge
+        .as_ref()
+        .map(ProgressCallbackBridge::progress)
+        .unwrap_or_else(noop_progress);
+    block_on(snapshot.merge_index_metadata(
+        &uuid,
+        index_type,
+        has_batch_readhead.then_some(batch_readhead),
+        progress,
+    ))?;
+    Ok(0)
+}
+
+/// Merge existing uncommitted physical segments into one uncommitted segment.
+///
+/// Native Lance validates UUID uniqueness, coverage, type compatibility,
+/// current-snapshot replay and staleness rules. The returned bytes still need
+/// `lance_dataset_commit_index_segments` to publish them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_merge_index_segments(
+    dataset: *const LanceDataset,
+    segment_metadata_bytes: *const *const u8,
+    segment_metadata_lens: *const usize,
+    segment_count: usize,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            merge_index_segments_inner(
+                dataset,
+                segment_metadata_bytes,
+                segment_metadata_lens,
+                segment_count,
+                out_bytes,
+                out_len,
+            )
+        },
+        neg
+    )
+}
+
+unsafe fn merge_index_segments_inner(
+    dataset: *const LanceDataset,
+    segment_metadata_bytes: *const *const u8,
+    segment_metadata_lens: *const usize,
+    segment_count: usize,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> Result<i32> {
+    if dataset.is_null() || out_bytes.is_null() || out_len.is_null() {
+        return Err(invalid_input(
+            "dataset, out_bytes, and out_len must not be NULL",
+        ));
+    }
+    let mut segments = Vec::new();
+    if segment_count > 0 {
+        if segment_metadata_bytes.is_null() || segment_metadata_lens.is_null() {
+            return Err(invalid_input(format!(
+                "segment_metadata_bytes and segment_metadata_lens must not be NULL when segment_count is {segment_count}"
+            )));
+        }
+        if segment_count > isize::MAX as usize / std::mem::size_of::<*const u8>() {
+            return Err(invalid_input(format!(
+                "segment_count {segment_count} exceeds the maximum addressable pointer slice length"
+            )));
+        }
+        let byte_ptrs = unsafe { slice::from_raw_parts(segment_metadata_bytes, segment_count) };
+        let lens = unsafe { slice::from_raw_parts(segment_metadata_lens, segment_count) };
+        for (position, (&bytes, &len)) in byte_ptrs.iter().zip(lens.iter()).enumerate() {
+            if bytes.is_null() || len == 0 {
+                return Err(invalid_input(format!(
+                    "segment_metadata_bytes[{position}] must be non-NULL and segment_metadata_lens[{position}] must be > 0; bytes={bytes:p}, len={len}"
+                )));
+            }
+            if len > isize::MAX as usize {
+                return Err(invalid_input(format!(
+                    "segment_metadata_lens[{position}]={len} exceeds the maximum addressable byte slice length"
+                )));
+            }
+            segments.push(
+                decode_segment_metadata(unsafe { slice::from_raw_parts(bytes, len) }).map_err(
+                    |error| invalid_input(format!("segment_metadata_bytes[{position}]: {error}")),
+                )?,
+            );
+        }
+    }
+
+    let snapshot = unsafe { &*dataset }.snapshot();
+    let merged = block_on(snapshot.merge_existing_index_segments(segments))?;
+    unsafe { export_index_metadata(&merged, out_bytes, out_len)? };
+    Ok(0)
+}
+
 /// Parse a protobuf-encoded Lance `IndexMetadata` value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_index_segment_metadata_parse(
@@ -1473,26 +1857,8 @@ unsafe fn parse_metadata_inner(
         )));
     }
     let metadata = decode_segment_metadata(unsafe { slice::from_raw_parts(bytes, len) })?;
-    let name = CString::new(metadata.name.as_str())
-        .map_err(|_| invalid_input("index metadata name contains an embedded NUL byte"))?;
-    let index_details_type_url = metadata
-        .index_details
-        .as_ref()
-        .map(|details| CString::new(details.type_url.as_str()))
-        .transpose()
-        .map_err(|_| invalid_input("index details type_url contains an embedded NUL byte"))?;
-    let fragment_ids = metadata
-        .fragment_bitmap
-        .as_ref()
-        .map(|bitmap| bitmap.iter().collect())
-        .unwrap_or_default();
-    let handle = LanceIndexSegmentMetadata {
-        metadata,
-        name,
-        index_details_type_url,
-        fragment_ids,
-    };
-    unsafe { ptr::write(out_metadata, Box::into_raw(Box::new(handle))) };
+    let handle = metadata_handle(metadata)?;
+    unsafe { ptr::write(out_metadata, handle) };
     Ok(0)
 }
 
@@ -1599,11 +1965,12 @@ unsafe fn metadata_index_type_inner(metadata: *const LanceIndexSegmentMetadata) 
             (false, None | Some(Compression::Flat(_))) => Ok(101),
             (false, Some(Compression::Sq(_))) => Ok(102),
             (false, Some(Compression::Pq(_))) => Ok(103),
+            (false, Some(Compression::Rq(_))) => Ok(107),
             (true, Some(Compression::Sq(_))) => Ok(104),
             (true, Some(Compression::Pq(_))) => Ok(105),
             (true, None | Some(Compression::Flat(_))) => Ok(106),
-            (_, Some(Compression::Rq(_))) => Err(Error::not_supported(
-                "Rabit-quantized vector metadata has no LanceVectorIndexType value",
+            (true, Some(Compression::Rq(_))) => Err(Error::not_supported(
+                "IVF_HNSW_RQ vector metadata is not supported by the C index type enum",
             )),
         };
     }
@@ -1753,6 +2120,338 @@ unsafe fn metadata_fragment_ids_inner(
     Ok(0)
 }
 
+/// Clone parsed index metadata into an independent handle.
+///
+/// The clone copies the complete in-memory native value, including optional
+/// `index_details`, `fragment_bitmap`, `created_at`, `base_id`, and `files`.
+/// It does not re-encode through protobuf. Safe to call with NULL; that returns
+/// NULL with an error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_clone(
+    metadata: *const LanceIndexSegmentMetadata,
+) -> *mut LanceIndexSegmentMetadata {
+    ffi_try!(
+        (|| -> Result<*mut LanceIndexSegmentMetadata> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata must not be NULL"));
+            }
+            metadata_handle(unsafe { (*metadata).metadata.clone() })
+        })(),
+        ptr::null_mut()
+    )
+}
+
+/// Clone parsed index metadata with caller-supplied fragment coverage.
+///
+/// When `has_fragment_ids` is false, the source `fragment_bitmap` option is
+/// copied unchanged and `fragment_ids`/`fragment_count` are ignored. When true,
+/// the clone's coverage becomes `Some` of the caller's IDs; a zero count maps
+/// to `Some(empty)`, and a positive count requires a non-NULL pointer. The
+/// native bitmap sorts the IDs and treats them as a set. Every other field is
+/// copied exactly, including in-memory optionals; no coverage, overlap, or
+/// index-family validation is performed here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_clone_with_fragment_ids(
+    metadata: *const LanceIndexSegmentMetadata,
+    has_fragment_ids: bool,
+    fragment_ids: *const u32,
+    fragment_count: usize,
+) -> *mut LanceIndexSegmentMetadata {
+    ffi_try!(
+        (|| -> Result<*mut LanceIndexSegmentMetadata> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata must not be NULL"));
+            }
+            let mut cloned = unsafe { (*metadata).metadata.clone() };
+            if has_fragment_ids {
+                if fragment_count > isize::MAX as usize / std::mem::size_of::<u32>() {
+                    return Err(invalid_input(format!(
+                        "fragment_count {fragment_count} exceeds the maximum addressable uint32_t slice length"
+                    )));
+                }
+                if fragment_count > 0 && fragment_ids.is_null() {
+                    return Err(invalid_input(format!(
+                        "fragment_ids must not be NULL when fragment_count is {fragment_count}"
+                    )));
+                }
+                let ids = if fragment_count == 0 {
+                    Vec::new()
+                } else {
+                    unsafe { slice::from_raw_parts(fragment_ids, fragment_count) }.to_vec()
+                };
+                cloned.fragment_bitmap = Some(ids.into_iter().collect());
+            }
+            metadata_handle(cloned)
+        })(),
+        ptr::null_mut()
+    )
+}
+
+/// Encode parsed index metadata as protobuf-encoded `IndexMetadata` bytes.
+///
+/// Encoding is an explicit request to serialize through the native protobuf
+/// representation. Successful output is library-owned and must be released
+/// with `lance_free_bytes`; `out_bytes` and `out_len` are success-only and
+/// remain unchanged on error. The protobuf format cannot distinguish some
+/// in-memory optionals, so encoding may normalize them (for example
+/// `Some(empty)` files decode as absent). Cloning does not normalize them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_encode(
+    metadata: *const LanceIndexSegmentMetadata,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    ffi_try!(
+        unsafe { metadata_encode_inner(metadata, out_bytes, out_len) },
+        neg
+    )
+}
+
+unsafe fn metadata_encode_inner(
+    metadata: *const LanceIndexSegmentMetadata,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> Result<i32> {
+    if metadata.is_null() {
+        return Err(invalid_input("metadata must not be NULL"));
+    }
+    if out_bytes.is_null() || out_len.is_null() {
+        return Err(invalid_input("out_bytes and out_len must not be NULL"));
+    }
+    unsafe { export_index_metadata((*metadata).native_metadata(), out_bytes, out_len)? };
+    Ok(0)
+}
+
+/// Return the number of covering field IDs. Returns 0 on error; zero is also a
+/// valid count, so check lance_last_error_code().
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_covering_field_count(
+    metadata: *const LanceIndexSegmentMetadata,
+) -> usize {
+    ffi_try!(
+        (|| -> Result<usize> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            Ok(unsafe { (*metadata).metadata.covering_fields.len() })
+        })(),
+        0
+    )
+}
+
+/// Copy one covering field ID in metadata order. Output is success-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_covering_field_id_at(
+    metadata: *const LanceIndexSegmentMetadata,
+    index: usize,
+    out_field_id: *mut i32,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_field_id.is_null() {
+                return Err(invalid_input("out_field_id must not be NULL"));
+            }
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let covering_fields = unsafe { &(*metadata).metadata.covering_fields };
+            let field_id = covering_fields.get(index).ok_or_else(|| {
+                invalid_input(format!(
+                    "covering field index {index} is out of range for {} covering fields",
+                    covering_fields.len()
+                ))
+            })?;
+            unsafe { ptr::write(out_field_id, *field_id) };
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Return the borrowed `index_details.value` bytes.
+///
+/// The pointer remains valid until the metadata handle is freed. A present but
+/// empty value returns a non-NULL pointer and writes `*out_len = 0`. Absent
+/// `index_details` returns NULL with LANCE_ERR_NOT_FOUND. `*out_len` is
+/// unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_index_details_value(
+    metadata: *const LanceIndexSegmentMetadata,
+    out_len: *mut usize,
+) -> *const u8 {
+    ffi_try!(
+        (|| -> Result<*const u8> {
+            if out_len.is_null() {
+                return Err(invalid_input("out_len must not be NULL"));
+            }
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let details = unsafe { &(*metadata).metadata }
+                .index_details
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::index_not_found("index metadata does not contain index_details")
+                })?;
+            unsafe { ptr::write(out_len, details.value.len()) };
+            Ok(details.value.as_ptr())
+        })(),
+        ptr::null()
+    )
+}
+
+/// Return the number of recorded files. Returns 0 on error or when the native
+/// `files` option is absent; check lance_last_error_code() to distinguish.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_file_count(
+    metadata: *const LanceIndexSegmentMetadata,
+) -> usize {
+    ffi_try!(
+        (|| -> Result<usize> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            Ok(unsafe { &(*metadata).metadata }
+                .files
+                .as_ref()
+                .map(|files| files.len())
+                .unwrap_or(0))
+        })(),
+        0
+    )
+}
+
+/// Return one file path, borrowed until the metadata handle is freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_file_path_at(
+    metadata: *const LanceIndexSegmentMetadata,
+    index: usize,
+) -> *const c_char {
+    ffi_try!(
+        (|| -> Result<*const c_char> {
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let metadata = unsafe { &*metadata };
+            let files = metadata.metadata.files.as_ref().ok_or_else(|| {
+                invalid_input(format!(
+                    "index metadata file index {index} is out of range because files are absent"
+                ))
+            })?;
+            let path = metadata.file_paths.get(index).ok_or_else(|| {
+                invalid_input(format!(
+                    "index metadata file index {index} is out of range for {} files",
+                    files.len()
+                ))
+            })?;
+            Ok(path.as_ptr())
+        })(),
+        ptr::null()
+    )
+}
+
+/// Copy one recorded file size. Output is success-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_file_size_at(
+    metadata: *const LanceIndexSegmentMetadata,
+    index: usize,
+    out_size: *mut u64,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_size.is_null() {
+                return Err(invalid_input("out_size must not be NULL"));
+            }
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let files = unsafe { &(*metadata).metadata }
+                .files
+                .as_ref()
+                .ok_or_else(|| {
+                    invalid_input(format!(
+                        "index metadata file index {index} is out of range because files are absent"
+                    ))
+                })?;
+            let file = files.get(index).ok_or_else(|| {
+                invalid_input(format!(
+                    "index metadata file index {index} is out of range for {} files",
+                    files.len()
+                ))
+            })?;
+            unsafe { ptr::write(out_size, file.size_bytes) };
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Read the optional native `created_at` timestamp.
+///
+/// On success, absent is reported with `is_set == false` and zeroed fields;
+/// present is reported with `is_set == true`. The output is unchanged on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_created_at(
+    metadata: *const LanceIndexSegmentMetadata,
+    out_timestamp: *mut LanceOptionalTimestamp,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_timestamp.is_null() {
+                return Err(invalid_input("out_timestamp must not be NULL"));
+            }
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let timestamp = unsafe { &mut *out_timestamp };
+            match unsafe { (*metadata).metadata.created_at } {
+                Some(created_at) => {
+                    timestamp.is_set = true;
+                    timestamp.unix_seconds = created_at.timestamp();
+                    timestamp.nanos = created_at.timestamp_subsec_nanos();
+                }
+                None => {
+                    timestamp.is_set = false;
+                    timestamp.unix_seconds = 0;
+                    timestamp.nanos = 0;
+                }
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Read the optional native `base_id`.
+///
+/// On success, absent is reported with `is_set == false` and `base_id == 0`;
+/// present is reported with `is_set == true`. Both outputs are unchanged on
+/// error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_segment_metadata_base_id(
+    metadata: *const LanceIndexSegmentMetadata,
+    out_is_set: *mut bool,
+    out_base_id: *mut u32,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_is_set.is_null() || out_base_id.is_null() {
+                return Err(invalid_input("out_is_set and out_base_id must not be NULL"));
+            }
+            if metadata.is_null() {
+                return Err(invalid_input("metadata is NULL"));
+            }
+            let base_id = unsafe { (*metadata).metadata.base_id };
+            unsafe {
+                ptr::write(out_is_set, base_id.is_some());
+                ptr::write(out_base_id, base_id.unwrap_or(0));
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
 /// Free parsed index metadata. Safe to call with NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_index_segment_metadata_free(
@@ -1770,6 +2469,279 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn metadata_clone_preserves_in_memory_optionals_without_protobuf() {
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "optional_presence".to_string(),
+            fields: vec![3, 7],
+            covering_fields: vec![7],
+            dataset_version: 42,
+            fragment_bitmap: Some([1, 4, 9].into_iter().collect()),
+            index_details: None,
+            index_version: 5,
+            created_at: None,
+            base_id: Some(13),
+            files: Some(Vec::new()),
+        };
+        let original = metadata_handle(metadata.clone()).unwrap();
+        let cloned = unsafe { lance_index_segment_metadata_clone(original) };
+        assert!(!cloned.is_null());
+        assert_eq!(unsafe { (*cloned).native_metadata() }, &metadata);
+        assert_eq!(
+            unsafe { (*cloned).native_metadata().files.as_ref() }.map(Vec::len),
+            Some(0),
+            "an in-memory Some(empty) files value must not normalize to None"
+        );
+
+        unsafe {
+            lance_index_segment_metadata_free(cloned);
+            lance_index_segment_metadata_free(original);
+        }
+    }
+
+    fn complete_metadata() -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::from_u128(0x00112233445566778899aabbccddeeff),
+            name: "complete_metadata".to_string(),
+            fields: vec![3, 7],
+            covering_fields: vec![7],
+            dataset_version: 42,
+            fragment_bitmap: Some([1, 4, 9].into_iter().collect()),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "/lance.table.InvertedIndexDetails".to_string(),
+                value: b"native details".to_vec(),
+            })),
+            index_version: 5,
+            created_at: DateTime::<Utc>::from_timestamp_millis(1_700_000_123_456),
+            base_id: Some(13),
+            files: Some(vec![
+                lance_table::format::IndexFile {
+                    path: "index.idx".to_string(),
+                    size_bytes: 11,
+                },
+                lance_table::format::IndexFile {
+                    path: "metadata.idx".to_string(),
+                    size_bytes: 22,
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn metadata_clone_with_fragment_ids_preserves_complete_value() {
+        let source_value = complete_metadata();
+        let source = metadata_handle(source_value.clone()).unwrap();
+        let replacement = [8_u32, 2, 8, 4];
+        let cloned = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(
+                source,
+                true,
+                replacement.as_ptr(),
+                replacement.len(),
+            )
+        };
+        assert!(!cloned.is_null());
+        let expected = IndexMetadata {
+            fragment_bitmap: Some([2_u32, 4, 8].into_iter().collect()),
+            ..source_value.clone()
+        };
+        assert_eq!(unsafe { (*cloned).native_metadata() }, &expected);
+        assert_eq!(unsafe { (*source).native_metadata() }, &source_value);
+
+        let unchanged = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(
+                source,
+                false,
+                std::ptr::NonNull::<u32>::dangling().as_ptr(),
+                usize::MAX,
+            )
+        };
+        assert!(!unchanged.is_null());
+        assert_eq!(unsafe { (*unchanged).native_metadata() }, &source_value);
+
+        let empty = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(source, true, ptr::null(), 0)
+        };
+        assert!(!empty.is_null());
+        assert_eq!(
+            unsafe { (*empty).native_metadata().fragment_bitmap.as_ref() }
+                .map(|bitmap| bitmap.iter().collect::<Vec<_>>()),
+            Some(Vec::<u32>::new())
+        );
+
+        let mut encoded = ptr::null_mut();
+        let mut encoded_len = 0_usize;
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_encode(source, &mut encoded, &mut encoded_len) },
+            0
+        );
+        assert!(!encoded.is_null() && encoded_len > 0);
+        unsafe {
+            lance_free_bytes(encoded);
+            lance_index_segment_metadata_free(empty);
+            lance_index_segment_metadata_free(unchanged);
+            lance_index_segment_metadata_free(cloned);
+            lance_index_segment_metadata_free(source);
+        }
+    }
+
+    #[test]
+    fn metadata_encode_round_trips_complete_value_and_normalizes_empty_options() {
+        let source_value = complete_metadata();
+        let source = metadata_handle(source_value.clone()).unwrap();
+        let replacement = [1_u32, 3];
+        let cloned = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(
+                source,
+                true,
+                replacement.as_ptr(),
+                replacement.len(),
+            )
+        };
+        assert!(!cloned.is_null());
+        let expected = IndexMetadata {
+            fragment_bitmap: Some([1_u32, 3].into_iter().collect()),
+            ..source_value.clone()
+        };
+        assert_eq!(unsafe { (*cloned).native_metadata() }, &expected);
+
+        let mut encoded = ptr::null_mut();
+        let mut encoded_len = 0_usize;
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_encode(cloned, &mut encoded, &mut encoded_len) },
+            0
+        );
+        let decoded =
+            decode_segment_metadata(unsafe { slice::from_raw_parts(encoded, encoded_len) })
+                .unwrap();
+        assert_eq!(decoded, expected);
+
+        let empty_value = IndexMetadata {
+            uuid: Uuid::from_u128(7),
+            name: "empty_optionals".to_string(),
+            fields: vec![2],
+            covering_fields: Vec::new(),
+            dataset_version: 1,
+            fragment_bitmap: Some(Default::default()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: Some(Vec::new()),
+        };
+        let empty_source = metadata_handle(empty_value.clone()).unwrap();
+        let empty_copy = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(
+                empty_source,
+                false,
+                ptr::null(),
+                0,
+            )
+        };
+        assert!(!empty_copy.is_null());
+        assert_eq!(unsafe { (*empty_copy).native_metadata() }, &empty_value);
+
+        let mut empty_encoded = ptr::null_mut();
+        let mut empty_encoded_len = 0_usize;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_metadata_encode(
+                    empty_copy,
+                    &mut empty_encoded,
+                    &mut empty_encoded_len,
+                )
+            },
+            0
+        );
+        let empty_decoded = decode_segment_metadata(unsafe {
+            slice::from_raw_parts(empty_encoded, empty_encoded_len)
+        })
+        .unwrap();
+        assert_eq!(
+            empty_decoded.fragment_bitmap,
+            Some(Default::default()),
+            "an empty roaring bitmap has a non-empty protobuf encoding"
+        );
+        assert_eq!(empty_decoded.files, None);
+
+        unsafe {
+            lance_free_bytes(empty_encoded);
+            lance_free_bytes(encoded);
+            lance_index_segment_metadata_free(empty_copy);
+            lance_index_segment_metadata_free(empty_source);
+            lance_index_segment_metadata_free(cloned);
+            lance_index_segment_metadata_free(source);
+        }
+    }
+
+    #[test]
+    fn metadata_clone_with_fragment_ids_and_encode_validate_foreign_inputs() {
+        assert!(
+            unsafe {
+                lance_index_segment_metadata_clone_with_fragment_ids(
+                    ptr::null(),
+                    false,
+                    ptr::null(),
+                    0,
+                )
+            }
+            .is_null()
+        );
+
+        let source = metadata_handle(complete_metadata()).unwrap();
+        let oversized = isize::MAX as usize / std::mem::size_of::<u32>() + 1;
+        assert!(
+            unsafe {
+                lance_index_segment_metadata_clone_with_fragment_ids(
+                    source,
+                    true,
+                    std::ptr::NonNull::<u32>::dangling().as_ptr(),
+                    oversized,
+                )
+            }
+            .is_null()
+        );
+        let unchanged = unsafe {
+            lance_index_segment_metadata_clone_with_fragment_ids(
+                source,
+                false,
+                std::ptr::NonNull::<u32>::dangling().as_ptr(),
+                usize::MAX,
+            )
+        };
+        assert!(!unchanged.is_null());
+
+        let sentinel = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        let mut out_bytes = sentinel;
+        let mut out_len = usize::MAX;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_metadata_encode(ptr::null(), &mut out_bytes, &mut out_len)
+            },
+            -1
+        );
+        assert_eq!(out_bytes, sentinel);
+        assert_eq!(out_len, usize::MAX);
+
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_encode(source, ptr::null_mut(), &mut out_len) },
+            -1
+        );
+        assert_eq!(out_len, usize::MAX);
+
+        assert_eq!(
+            unsafe { lance_index_segment_metadata_encode(source, &mut out_bytes, ptr::null_mut()) },
+            -1
+        );
+        assert_eq!(out_bytes, sentinel);
+
+        unsafe {
+            lance_index_segment_metadata_free(unchanged);
+            lance_index_segment_metadata_free(source);
+        }
+    }
 
     struct LateCallState {
         entered_after_retire: AtomicBool,

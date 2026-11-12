@@ -14,6 +14,9 @@ keywords = ["lance", "ffi", "c", "cpp", "arrow"]
 categories = ["database-implementations", "external-ffi-bindings"]
 rust-version = "1.94.0"
 
+[build-dependencies]
+cc = "1"
+
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
@@ -22,13 +25,21 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # `lance_index::progress::IndexBuildProgress`; already in the graph
 # transitively via lance-index.
 async-trait = "0.1"
+bytes = "1"
 # Keep every Lance crate on the upstream v14.0.2 release commit.
 lance = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
+# Direct to reuse the native Binary/LargeBinary/BinaryView/FixedSizeBinary iterator.
+lance-arrow = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-core = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-encoding = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-file = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-index = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-io = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
 lance-linalg = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+# Native namespace trait, models, directory/REST implementations and REST adapter.
+# Same upstream pin as every other Lance crate; credential-vendor features stay off.
+lance-namespace = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-namespace-impls = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["rest", "rest-adapter", "dir-goosefs"] }
 # Direct to name `NullableIndexExprResult` in the segment-scoped
 # `ScalarIndexLoader` adapter; already in the graph transitively via lance-index.
 lance-select = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
@@ -41,17 +52,24 @@ arrow-schema = "58.0.0"
 # Direct to name `chrono::TimeDelta` (the field type of lance's public
 # `AutoCleanupParams`) and `chrono::DateTime`/`Utc` (index metadata
 # timestamps); already in the graph transitively via lance.
-chrono = { version = "0.4", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 half = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "io-util"] }
 futures = "0.3"
 log = "0.4"
 libc = "0.2"
+# Direct for native object-store paths and raw-file sessions.
+object_store = "=0.14.2"
 # Explicitly install the HTTP transport when embedded in a static C/C++ executable.
 opendal = { version = "=0.59.2", default-features = false, features = ["http-transport-reqwest"] }
 pin-project = "1.0"
 prost = "0.14"
-# Direct for escaping index and column names in the segment-listing JSON.
+# Direct for native Rewrite index details and key-existence filter transport.
+prost-types = "0.14"
+# Direct for portable overlay coverage and native UpdatedFragmentOffsets.
+roaring = "0.11"
+# Direct JSON transport for native maintenance plan/task/result values.
+serde = "1"
 serde_json = "1"
 snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }

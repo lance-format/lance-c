@@ -8,8 +8,9 @@
 //! optional transaction properties; ID allocation, conflict validation,
 //! persistence and path resolution remain in Lance core.
 
-use std::collections::{BTreeMap, HashMap};
-use std::ffi::c_char;
+use std::collections::BTreeMap;
+use std::ffi::{CString, c_char};
+use std::ptr;
 use std::sync::Arc;
 
 use lance_core::Result;
@@ -21,6 +22,7 @@ use crate::error::ffi_try;
 use crate::helpers;
 use crate::metadata::owned_c_string;
 use crate::runtime::block_on;
+use crate::transaction_properties::{LanceTransactionProperties, parse_transaction_properties};
 
 /// One native `BasePath` field set for registration.
 ///
@@ -36,18 +38,142 @@ pub struct LanceBasePath {
     pub is_dataset_root: bool,
 }
 
-/// Optional transaction properties for one native `add_bases` commit.
+/// Borrowed native `BasePath` fields owned by another handle.
 ///
-/// A NULL pointer passed to `lance_dataset_add_bases` maps to native `None`.
-/// A non-NULL pointer with `count == 0` maps to `Some(empty map)`. `keys` and
-/// `values` are parallel arrays of length `count`; every key and value must be
-/// non-NULL. Duplicate keys follow native `HashMap` last-write-wins behavior.
+/// `path` and `name` point into the owning operation's storage and remain
+/// valid until that handle is closed. `name == NULL` represents native `None`;
+/// an empty string is an explicit empty name.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct LanceTransactionProperties {
-    pub keys: *const *const c_char,
-    pub values: *const *const c_char,
+pub struct LanceBasePathView {
+    pub id: u32,
+    pub path: *const c_char,
+    pub name: *const c_char,
+    pub is_dataset_root: bool,
+}
+
+/// Owned C-string storage for one native `BasePath`.
+///
+/// The owning operation keeps these values alive while it exposes borrowed
+/// [`LanceBasePathView`] pointers. Only a successful conversion creates one, so
+/// every exposed `path` is non-NULL and every exposed `name` distinguishes
+/// native `None` from an explicit empty string.
+pub(crate) struct OwnedBasePath {
+    id: u32,
+    path: CString,
+    name: Option<CString>,
+    is_dataset_root: bool,
+}
+
+impl OwnedBasePath {
+    fn from_native(base: &BasePath) -> Result<Self> {
+        let path = CString::new(base.path.as_str()).map_err(|_| {
+            lance_core::Error::internal(format!(
+                "base path {:?} contains an embedded NUL byte",
+                base.path
+            ))
+        })?;
+        let name = match &base.name {
+            Some(name) => Some(CString::new(name.as_str()).map_err(|_| {
+                lance_core::Error::internal(format!(
+                    "base path name {name:?} contains an embedded NUL byte"
+                ))
+            })?),
+            None => None,
+        };
+        Ok(Self {
+            id: base.id,
+            path,
+            name,
+            is_dataset_root: base.is_dataset_root,
+        })
+    }
+
+    pub(crate) fn view(&self) -> LanceBasePathView {
+        LanceBasePathView {
+            id: self.id,
+            path: self.path.as_ptr(),
+            name: self.name.as_ref().map_or(ptr::null(), |name| name.as_ptr()),
+            is_dataset_root: self.is_dataset_root,
+        }
+    }
+}
+
+/// Retain each view conversion independently. Native metadata can contain NUL
+/// bytes even though a borrowed C-string view cannot represent them.
+pub(crate) fn own_base_paths(bases: &[BasePath]) -> Vec<Result<OwnedBasePath>> {
+    bases.iter().map(OwnedBasePath::from_native).collect()
+}
+
+/// Parse a borrowed C `LanceBasePath` array into native values.
+///
+/// A NULL array is valid only with a zero count. Each entry's path is required
+/// and its name is optional. Native ID allocation and conflict rules are not
+/// applied here; they remain in the committing transaction.
+pub(crate) unsafe fn parse_base_paths(
+    bases: *const LanceBasePath,
+    base_count: usize,
+) -> Result<Vec<BasePath>> {
+    if base_count > 0 && bases.is_null() {
+        return Err(lance_core::Error::invalid_input(format!(
+            "bases must not be NULL when base_count = {base_count}"
+        )));
+    }
+    if base_count > isize::MAX as usize / std::mem::size_of::<LanceBasePath>() {
+        return Err(lance_core::Error::invalid_input(format!(
+            "base_count {base_count} exceeds the maximum addressable LanceBasePath slice length"
+        )));
+    }
+
+    let mut parsed_bases = Vec::with_capacity(base_count);
+    for index in 0..base_count {
+        let base = unsafe { &*bases.add(index) };
+        let path = unsafe { helpers::parse_c_string(base.path) }
+            .map_err(|error| {
+                lance_core::Error::invalid_input(format!("bases[{index}].path: {error}"))
+            })?
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input(format!("bases[{index}].path must not be NULL"))
+            })?;
+        let name = unsafe { helpers::parse_c_string(base.name) }
+            .map_err(|error| {
+                lance_core::Error::invalid_input(format!("bases[{index}].name: {error}"))
+            })?
+            .map(str::to_owned);
+        parsed_bases.push(BasePath::new(
+            base.id,
+            path.to_owned(),
+            name,
+            base.is_dataset_root,
+        ));
+    }
+    Ok(parsed_bases)
+}
+
+/// Borrowed native base-path list with explicit presence.
+///
+/// A NULL pointer maps to native `None`, including for Overwrite. A non-NULL
+/// pointer with `count == 0` maps to native `Some(empty list)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LanceBasePathList {
+    pub items: *const LanceBasePath,
     pub count: usize,
+}
+
+/// Parse a borrowed `LanceBasePathList` pointer as an optional native list.
+///
+/// The entries are copied into native `BasePath` values. Native commit code
+/// owns ID allocation, path/name conflicts and replacement semantics.
+pub(crate) unsafe fn parse_base_path_list(
+    list: *const LanceBasePathList,
+) -> Result<Option<Vec<BasePath>>> {
+    if list.is_null() {
+        return Ok(None);
+    }
+    let list = unsafe { &*list };
+    let bases = unsafe { parse_base_paths(list.items, list.count) }?;
+    Ok(Some(bases))
 }
 
 /// Return the current snapshot's native base-path registry as a JSON object
@@ -127,34 +253,7 @@ unsafe fn add_bases_inner(
     if dataset.is_null() {
         return Err(lance_core::Error::invalid_input("dataset must not be NULL"));
     }
-    if base_count > 0 && bases.is_null() {
-        return Err(lance_core::Error::invalid_input(format!(
-            "bases must not be NULL when base_count = {base_count}"
-        )));
-    }
-
-    let mut parsed_bases = Vec::with_capacity(base_count);
-    for index in 0..base_count {
-        let base = unsafe { &*bases.add(index) };
-        let path = unsafe { helpers::parse_c_string(base.path) }
-            .map_err(|error| {
-                lance_core::Error::invalid_input(format!("bases[{index}].path: {error}"))
-            })?
-            .ok_or_else(|| {
-                lance_core::Error::invalid_input(format!("bases[{index}].path must not be NULL"))
-            })?;
-        let name = unsafe { helpers::parse_c_string(base.name) }
-            .map_err(|error| {
-                lance_core::Error::invalid_input(format!("bases[{index}].name: {error}"))
-            })?
-            .map(str::to_owned);
-        parsed_bases.push(BasePath::new(
-            base.id,
-            path.to_owned(),
-            name,
-            base.is_dataset_root,
-        ));
-    }
+    let parsed_bases = unsafe { parse_base_paths(bases, base_count) }?;
 
     let properties = if transaction_properties.is_null() {
         None
@@ -170,51 +269,4 @@ unsafe fn add_bases_inner(
         Ok(())
     })?;
     Ok(0)
-}
-
-unsafe fn parse_transaction_properties(
-    properties: &LanceTransactionProperties,
-) -> Result<HashMap<String, String>> {
-    if properties.count > 0 && properties.keys.is_null() {
-        return Err(lance_core::Error::invalid_input(format!(
-            "transaction_properties.keys must not be NULL when count = {}",
-            properties.count
-        )));
-    }
-    if properties.count > 0 && properties.values.is_null() {
-        return Err(lance_core::Error::invalid_input(format!(
-            "transaction_properties.values must not be NULL when count = {}",
-            properties.count
-        )));
-    }
-
-    let mut parsed = HashMap::with_capacity(properties.count);
-    for index in 0..properties.count {
-        let key = unsafe { *properties.keys.add(index) };
-        let key = unsafe { helpers::parse_c_string(key) }
-            .map_err(|error| {
-                lance_core::Error::invalid_input(format!(
-                    "transaction_properties.keys[{index}]: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                lance_core::Error::invalid_input(format!(
-                    "transaction_properties.keys[{index}] must not be NULL"
-                ))
-            })?;
-        let value = unsafe { *properties.values.add(index) };
-        let value = unsafe { helpers::parse_c_string(value) }
-            .map_err(|error| {
-                lance_core::Error::invalid_input(format!(
-                    "transaction_properties.values[{index}]: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                lance_core::Error::invalid_input(format!(
-                    "transaction_properties.values[{index}] must not be NULL"
-                ))
-            })?;
-        parsed.insert(key.to_owned(), value.to_owned());
-    }
-    Ok(parsed)
 }

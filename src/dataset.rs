@@ -5,6 +5,7 @@
 
 use std::ffi::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::ptr;
 use std::sync::{Arc, RwLock};
 
 use arrow::ffi::FFI_ArrowSchema;
@@ -14,10 +15,14 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance_core::Result;
 
+use crate::commit_lock::{LanceCommitLock, commit_handler_from_ffi, storage_accessor_from_ffi};
+use crate::data_file::LanceDataFile;
 use crate::error::{ffi_try, swallow_unwind};
+use crate::file_session::LanceObjectStoreIoStats;
 use crate::helpers;
 use crate::runtime::block_on;
 use crate::session::LanceSession;
+use crate::storage_options::{LanceStorageOptionsAccessor, storage_options_accessor_from_ffi};
 use crate::stream_guard::guarded_ffi_stream_from_reader;
 
 /// Opaque handle representing an opened Lance dataset.
@@ -107,6 +112,40 @@ fn projection_from_columns(
 // Dataset lifecycle
 // ---------------------------------------------------------------------------
 
+/// Optional settings for `lance_dataset_open_with_options`.
+///
+/// Zero-initialization opens the latest version with native storage defaults.
+/// A NULL `storage_options_accessor` uses native defaults; a non-NULL accessor
+/// is retained by the returned dataset and by later native owners. Static
+/// storage options belong in the accessor's initial options.
+#[repr(C)]
+pub struct LanceDatasetOpenOptions {
+    /// Dataset version to open. Pass 0 for latest.
+    pub version: u64,
+    /// Native dynamic storage-options accessor, or NULL for native defaults.
+    pub storage_options_accessor: *const LanceStorageOptionsAccessor,
+}
+
+/// Open a Lance dataset at the given URI using additive options.
+///
+/// `options` may be NULL for latest version and native storage defaults.
+/// `session` may be NULL for the default session; a non-NULL session is
+/// retained through shared ownership exactly like
+/// `lance_dataset_open_with_session`. A non-NULL accessor is cloned and
+/// retained by the native dataset; closing the C accessor does not invalidate
+/// the dataset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_open_with_options(
+    uri: *const c_char,
+    options: *const LanceDatasetOpenOptions,
+    session: *const LanceSession,
+) -> *mut LanceDataset {
+    ffi_try!(
+        unsafe { open_dataset_with_options_inner(uri, options, session) },
+        null
+    )
+}
+
 /// Open a Lance dataset at the given URI.
 ///
 /// - `uri`: Dataset path (file://, s3://, az://, gs://, memory://)
@@ -122,7 +161,7 @@ pub unsafe extern "C" fn lance_dataset_open(
     version: u64,
 ) -> *mut LanceDataset {
     ffi_try!(
-        unsafe { open_dataset_inner(uri, storage_options, version, None) },
+        unsafe { open_dataset_inner(uri, storage_options, version, None, ptr::null()) },
         null
     )
 }
@@ -156,7 +195,107 @@ unsafe fn open_dataset_with_session_inner(
         ));
     }
     let session = unsafe { &*session };
-    unsafe { open_dataset_inner(uri, storage_options, version, Some(session)) }
+    unsafe { open_dataset_inner(uri, storage_options, version, Some(session), ptr::null()) }
+}
+
+unsafe fn open_dataset_with_options_inner(
+    uri: *const c_char,
+    options: *const LanceDatasetOpenOptions,
+    session: *const LanceSession,
+) -> Result<*mut LanceDataset> {
+    let (version, accessor) = if options.is_null() {
+        (0, ptr::null())
+    } else {
+        // SAFETY: the caller guarantees a non-NULL options pointer is valid
+        // for the duration of this call.
+        let options = unsafe { &*options };
+        (options.version, options.storage_options_accessor)
+    };
+    let session = if session.is_null() {
+        None
+    } else {
+        // SAFETY: non-NULL session points to a live handle for this call.
+        Some(unsafe { &*session })
+    };
+    unsafe { open_dataset_inner(uri, ptr::null(), version, session, accessor) }
+}
+
+/// Open a dataset through a foreign commit lock and optional dynamic storage
+/// options.
+///
+/// The dataset retains the native handler and accessor owners. Closing
+/// `commit_lock` or `storage_accessor` after this call does not invalidate the
+/// returned dataset or its later commits. A NULL lock selects the native
+/// default handler. `session` is optional.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_open_with_commit_lock(
+    uri: *const c_char,
+    storage_accessor: *const crate::storage_options::LanceStorageOptionsAccessor,
+    version: u64,
+    session: *const LanceSession,
+    commit_lock: *const LanceCommitLock,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            open_dataset_with_commit_lock_inner(
+                uri,
+                storage_accessor,
+                version,
+                session,
+                commit_lock,
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn open_dataset_with_commit_lock_inner(
+    uri: *const c_char,
+    storage_accessor: *const crate::storage_options::LanceStorageOptionsAccessor,
+    version: u64,
+    session: *const LanceSession,
+    commit_lock: *const LanceCommitLock,
+    out_dataset: *mut *mut LanceDataset,
+) -> Result<i32> {
+    if out_dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_dataset must not be NULL".into(),
+        ));
+    }
+
+    let uri_str = unsafe { helpers::parse_c_string(uri)? }
+        .ok_or_else(|| lance_core::Error::invalid_input_source("uri must not be NULL".into()))?;
+
+    let storage_accessor = unsafe { storage_accessor_from_ffi(storage_accessor) };
+    let commit_handler = commit_handler_from_ffi(commit_lock);
+
+    let mut builder = DatasetBuilder::from_uri(uri_str);
+    if let Some(accessor) = storage_accessor {
+        builder = builder.with_storage_options_accessor(accessor);
+    }
+    if version != 0 {
+        builder = builder.with_version(version);
+    }
+    if !session.is_null() {
+        // SAFETY: a non-NULL session is caller-owned and valid for this call.
+        let session = unsafe { &*session };
+        builder = builder.with_session(session.inner.clone());
+    }
+    if let Some(handler) = commit_handler {
+        builder = builder.with_commit_handler(handler);
+    }
+
+    let dataset = block_on(builder.load())?;
+    let handle = LanceDataset {
+        inner: RwLock::new(Arc::new(dataset)),
+    };
+    // SAFETY: `out_dataset` is non-NULL and writable; the output is written
+    // only on success.
+    unsafe { *out_dataset = Box::into_raw(Box::new(handle)) };
+    Ok(0)
 }
 
 unsafe fn open_dataset_inner(
@@ -164,14 +303,23 @@ unsafe fn open_dataset_inner(
     storage_options: *const *const c_char,
     version: u64,
     session: Option<&LanceSession>,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
 ) -> Result<*mut LanceDataset> {
     let uri_str = unsafe { helpers::parse_c_string(uri)? }
         .ok_or_else(|| lance_core::Error::invalid_input_source("uri must not be NULL".into()))?;
 
     let opts = unsafe { helpers::parse_storage_options(storage_options)? };
+    let accessor = unsafe { storage_options_accessor_from_ffi(storage_options_accessor)? };
+    if accessor.is_some() && !opts.is_empty() {
+        return Err(lance_core::Error::invalid_input_source(
+            "storage_options must be NULL when a storage options accessor is provided".into(),
+        ));
+    }
 
     let mut builder = DatasetBuilder::from_uri(uri_str);
-    if !opts.is_empty() {
+    if let Some(accessor) = accessor {
+        builder = builder.with_storage_options_accessor(accessor);
+    } else if !opts.is_empty() {
         builder = builder.with_storage_options(opts);
     }
     if version != 0 {
@@ -184,6 +332,40 @@ unsafe fn open_dataset_inner(
     let dataset = block_on(builder.load())?;
     let handle = LanceDataset {
         inner: RwLock::new(Arc::new(dataset)),
+    };
+    Ok(Box::into_raw(Box::new(handle)))
+}
+
+/// Clone a dataset handle as an independent in-memory snapshot.
+///
+/// The returned handle is backed by the same `Arc<Dataset>` snapshot as
+/// `dataset`, but has its own lock. Mutating either handle therefore does not
+/// change the other's version, schema, or rows, and does not hold the other
+/// handle's lock. Cloning performs no storage I/O and does not create a new
+/// session, object-store registry, or cache.
+///
+/// This is in-memory handle duplication, not Lance's on-disk shallow or deep
+/// clone. Close the returned handle with `lance_dataset_close`; the source and
+/// clone may be closed in either order.
+///
+/// Returns NULL with `LANCE_ERR_INVALID_ARGUMENT` when `dataset` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_clone_handle(
+    dataset: *const LanceDataset,
+) -> *mut LanceDataset {
+    ffi_try!(unsafe { dataset_clone_handle_inner(dataset) }, null)
+}
+
+unsafe fn dataset_clone_handle_inner(dataset: *const LanceDataset) -> Result<*mut LanceDataset> {
+    if dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
+    }
+    let dataset = unsafe { &*dataset };
+    let snapshot = dataset.snapshot();
+    let handle = LanceDataset {
+        inner: RwLock::new(snapshot),
     };
     Ok(Box::into_raw(Box::new(handle)))
 }
@@ -333,6 +515,47 @@ unsafe fn dataset_num_small_files_inner(
     Ok(0)
 }
 
+/// Migrate this dataset's manifest paths to the v2 naming scheme.
+///
+/// The rename is performed by native `Dataset::migrate_manifest_paths_v2`;
+/// the dataset handle is replaced with the reopened native snapshot on
+/// success. Storage renames can persist if a later native step fails, so the
+/// binding makes no rollback or added-atomicity claim.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_migrate_manifest_paths_v2(
+    dataset: *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if dataset.is_null() {
+                return Err(lance_core::Error::invalid_input("dataset must not be NULL"));
+            }
+            unsafe { &*dataset }
+                .with_mut(|dataset| block_on(dataset.migrate_manifest_paths_v2()))?;
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
+/// Delete every row through native `Dataset::truncate_table`.
+///
+/// A new dataset version is committed on success; schema and configuration
+/// stay unchanged. Native commit and storage failure behavior is preserved.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_truncate_table(dataset: *mut LanceDataset) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if dataset.is_null() {
+                return Err(lance_core::Error::invalid_input("dataset must not be NULL"));
+            }
+            unsafe { &*dataset }.with_mut(|dataset| block_on(dataset.truncate_table()))?;
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
 /// Count rows matching an optional SQL filter.
 ///
 /// `filter == NULL` maps to native `Dataset::count_rows(None)` and uses the
@@ -381,6 +604,76 @@ unsafe fn dataset_latest_version_inner(dataset: *const LanceDataset) -> Result<u
     block_on(ds.snapshot().latest_version_id())
 }
 
+/// Snapshot the dataset's native object-store I/O counters.
+///
+/// The counters are the current native accumulator and are not reset by this
+/// call. They come from the same native store tracker used by
+/// `Dataset::object_store(None)`, so the semantics match the native Python
+/// `io_stats_snapshot` binding. A preceding incremental call resets the
+/// accumulator. Returns 0 on
+/// success or -1 on a NULL handle/out pointer or native failure. `out_stats` is
+/// written only on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_io_stats_snapshot(
+    dataset: *const LanceDataset,
+    out_stats: *mut LanceObjectStoreIoStats,
+) -> i32 {
+    ffi_try!(
+        unsafe { dataset_io_stats_inner(dataset, out_stats, false) },
+        neg
+    )
+}
+
+/// Return the dataset's native object-store I/O counters accumulated since the
+/// previous incremental call, then reset that accumulator to zero.
+///
+/// The reset is owned by the native store tracker. This binding keeps no
+/// baseline or cached counters. Returns 0 on success or -1 on a NULL
+/// handle/out pointer or native failure. `out_stats` is written only on
+/// success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_io_stats_incremental(
+    dataset: *const LanceDataset,
+    out_stats: *mut LanceObjectStoreIoStats,
+) -> i32 {
+    ffi_try!(
+        unsafe { dataset_io_stats_inner(dataset, out_stats, true) },
+        neg
+    )
+}
+
+unsafe fn dataset_io_stats_inner(
+    dataset: *const LanceDataset,
+    out_stats: *mut LanceObjectStoreIoStats,
+    incremental: bool,
+) -> Result<i32> {
+    if dataset.is_null() || out_stats.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset and out_stats must not be NULL".into(),
+        ));
+    }
+    let ds = unsafe { &*dataset };
+    let snapshot = ds.snapshot();
+    let store = block_on(snapshot.object_store(None))?;
+    let stats = if incremental {
+        store.io_stats_incremental()
+    } else {
+        store.io_stats_snapshot()
+    };
+    unsafe {
+        ptr::write(
+            out_stats,
+            LanceObjectStoreIoStats {
+                read_iops: stats.read_iops,
+                read_bytes: stats.read_bytes,
+                write_iops: stats.write_iops,
+                written_bytes: stats.written_bytes,
+            },
+        );
+    }
+    Ok(0)
+}
+
 // ---------------------------------------------------------------------------
 // Schema (Arrow C Data Interface)
 // ---------------------------------------------------------------------------
@@ -413,6 +706,64 @@ unsafe fn dataset_schema_inner(
     let ffi_schema = FFI_ArrowSchema::try_from(&arrow_schema)?;
     unsafe {
         std::ptr::write_unaligned(out, ffi_schema);
+    }
+    Ok(0)
+}
+
+/// Create native data-file metadata from an existing Lance file.
+///
+/// Maps directly to `Dataset::create_data_file(path, base_id)`. `path` is
+/// relative to the selected data directory and must be non-NULL UTF-8.
+/// `base_id == NULL` selects native `None`; a non-NULL pointer selects native
+/// `Some`, including `Some(0)`. Empty paths, missing files, malformed Lance
+/// files, schema mismatches and unregistered base IDs retain native validation
+/// and error timing.
+///
+/// On success `*out_file` receives an independently owned snapshot that
+/// remains valid after the dataset is closed. The output is written only on
+/// success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_create_data_file(
+    dataset: *const LanceDataset,
+    path: *const c_char,
+    base_id: *const u32,
+    out_file: *mut *mut LanceDataFile,
+) -> i32 {
+    ffi_try!(
+        unsafe { dataset_create_data_file_inner(dataset, path, base_id, out_file) },
+        neg
+    )
+}
+
+unsafe fn dataset_create_data_file_inner(
+    dataset: *const LanceDataset,
+    path: *const c_char,
+    base_id: *const u32,
+    out_file: *mut *mut LanceDataFile,
+) -> Result<i32> {
+    if dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
+    }
+    if out_file.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out_file must not be NULL".into(),
+        ));
+    }
+    let path = unsafe { helpers::parse_c_string(path)? }
+        .ok_or_else(|| lance_core::Error::invalid_input_source("path must not be NULL".into()))?;
+    let base_id = if base_id.is_null() {
+        None
+    } else {
+        Some(unsafe { ptr::read(base_id) })
+    };
+
+    let snapshot = unsafe { &*dataset }.snapshot();
+    let file = block_on(snapshot.create_data_file(path, base_id))?;
+    let file = Box::new(LanceDataFile::from_native(file)?);
+    unsafe {
+        ptr::write(out_file, Box::into_raw(file));
     }
     Ok(0)
 }
@@ -609,8 +960,21 @@ unsafe fn dataset_fragment_ids_inner(
 mod tests {
     use super::*;
 
+    use std::sync::mpsc;
+    use std::thread;
+
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+
+    /// Unblock a scoped writer even if an assertion panics before the test
+    /// reaches its explicit release point.
+    struct ReleaseOnDrop(mpsc::Sender<()>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
 
     /// Build a real 3-row dataset in a tempdir and wrap it in a handle.
     /// (The default panic hook prints to stderr during the panic test; that
@@ -655,6 +1019,64 @@ mod tests {
         let snap = handle.snapshot();
         assert_eq!(snap.version().version, 2);
         assert_eq!(block_on(snap.count_rows(None)).unwrap(), 2);
+    }
+
+    #[test]
+    fn clone_handle_shares_snapshot_without_sharing_lock() {
+        let (_tmp, handle) = create_test_handle();
+        let source_snapshot = handle.snapshot();
+
+        let clone_ptr = unsafe { lance_dataset_clone_handle(&handle) };
+        assert!(!clone_ptr.is_null());
+        assert!(!std::ptr::eq(
+            clone_ptr as *const LanceDataset,
+            &handle as *const LanceDataset
+        ));
+        let cloned = unsafe { &*clone_ptr };
+
+        // The clone must reuse the exact native snapshot instead of reopening
+        // the dataset (which would create a new Arc and perform storage I/O).
+        let cloned_snapshot = cloned.snapshot();
+        assert!(Arc::ptr_eq(&source_snapshot, &cloned_snapshot));
+        assert_eq!(
+            cloned_snapshot.version().version,
+            source_snapshot.version().version
+        );
+
+        // Hold the clone's exclusive mutation lock at a controlled point, then
+        // prove the source handle can still be read. try_read is deterministic:
+        // a shared lock fails immediately instead of hanging the test.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                cloned.with_mut(|ds| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    block_on(ds.delete("id = 1")).unwrap()
+                })
+            });
+
+            let release = ReleaseOnDrop(release_tx);
+            entered_rx.recv().unwrap();
+            let source_guard = handle
+                .inner
+                .try_read()
+                .expect("source read must not wait for a cloned handle mutation");
+            assert_eq!(source_guard.version().version, 1);
+            assert_eq!(block_on(source_guard.count_rows(None)).unwrap(), 3);
+            drop(source_guard);
+
+            drop(release);
+            assert_eq!(writer.join().unwrap().num_deleted_rows, 1);
+        });
+
+        // The clone advanced independently; the source snapshot did not.
+        assert_eq!(cloned.snapshot().version().version, 2);
+        assert_eq!(handle.snapshot().version().version, 1);
+        assert_eq!(block_on(handle.snapshot().count_rows(None)).unwrap(), 3);
+
+        unsafe { lance_dataset_close(clone_ptr) };
     }
 
     #[test]

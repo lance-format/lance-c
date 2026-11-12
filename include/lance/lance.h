@@ -29,6 +29,10 @@
 extern "C" {
 #endif
 
+/* Opaque native dynamic storage-options handles. The accessor is declared
+   early because dataset open and write options attach it. */
+typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
+
 /* ─── Arrow C Data Interface forward declarations ─── */
 /* These match the canonical Arrow spec structs. If you already include
    arrow/c/abi.h, guard with ARROW_C_DATA_INTERFACE. */
@@ -132,6 +136,7 @@ typedef enum {
     LANCE_INDEX_IVF_HNSW_SQ   = 104,
     LANCE_INDEX_IVF_HNSW_PQ   = 105,
     LANCE_INDEX_IVF_HNSW_FLAT = 106,
+    LANCE_INDEX_IVF_RQ        = 107,
 } LanceVectorIndexType;
 
 typedef enum {
@@ -168,6 +173,12 @@ typedef enum {
     LANCE_DTYPE_INT8    = 4,
 } LanceDataType;
 
+/**
+ * Legacy vector parameters. Values 101-106 retain their existing defaults and
+ * required-field rules. IVF_RQ (107) uses num_partitions and num_bits where
+ * num_bits 0 selects the native RQ default of 5; RQ rotation JSON and richer
+ * absent-versus-zero controls require the additive options entry points.
+ */
 typedef struct {
     LanceVectorIndexType index_type;
     LanceMetricType      metric;
@@ -179,6 +190,139 @@ typedef struct {
     uint32_t hnsw_ef_construction;  /* HNSW; 0 = default */
     uint32_t sample_rate;           /* IVF; 0 = 256 */
 } LanceVectorIndexParams;
+
+typedef enum {
+    LANCE_INDEX_FILE_VERSION_V3 = 0,
+    LANCE_INDEX_FILE_VERSION_LEGACY = 1,
+} LanceIndexFileVersion;
+
+/**
+ * Presence-aware unsigned option. When `is_set` is false the native option is
+ * absent and `value` is ignored. When true, `value` is forwarded verbatim,
+ * including zero. This keeps native automatic sizing and explicit-zero
+ * validation distinguishable.
+ */
+typedef struct {
+    uint64_t value;
+    bool is_set;
+} LanceOptionalU64;
+
+/**
+ * Presence-aware timestamp split into whole Unix seconds and nanoseconds.
+ * When `is_set` is false the native option is absent and the other fields are
+ * zero.
+ */
+typedef struct {
+    bool is_set;
+    int64_t unix_seconds;
+    uint32_t nanos; /* 0..999999999 */
+} LanceOptionalTimestamp;
+
+/**
+ * Borrowed UTF-8 key/value arrays with `count` entries. Keys and values may
+ * not be NULL when count is non-zero. Duplicate keys use Rust HashMap
+ * last-write-wins semantics; the last value for a key is retained.
+ */
+typedef struct {
+    const char* const* keys;
+    const char* const* values;
+    size_t count;
+} LanceStringMap;
+
+/**
+ * Precomputed shuffle input. `path` is required. A non-NULL struct with
+ * `buffer_count == 0` represents an explicitly empty buffer list.
+ */
+typedef struct {
+    const char* path;
+    const char* const* buffers;
+    size_t buffer_count;
+} LancePrecomputedShuffleBuffers;
+
+/**
+ * Additive native vector-build options. Zero-initialize this structure.
+ *
+ * Optional numeric fields distinguish absent (`is_set == false`) from an
+ * explicit value, including zero. Native Lance code owns defaults, validation
+ * timing and execution semantics. `num_bits` applies to IVF_PQ and IVF_RQ;
+ * absent PQ bits use the native default and an absent RQ value uses the native
+ * default of 5. `num_partitions` and `target_partition_size` may be absent for
+ * native automatic sizing.
+ *
+ * `ivf_centroids` and `pq_codebook` are native Arrow C Data Interface
+ * FixedSizeList values. The whole options object is borrowed only for this
+ * call. A non-NULL ArrowArray may be replaced while a live caller-owned
+ * equivalent is left in place; the schema remains caller-owned. Both members
+ * of each pair must be NULL or non-NULL. Native model shape and dtype
+ * acceptance is not narrowed here.
+ *
+ * `rabitq_model_json` is the native RabitQuantizationMetadata JSON accepted by
+ * IVF_RQ. Use lance_index_build_rq_model() to mint a portable fast rotation.
+ * `runtime_hints` may contain arbitrary UTF-8 keys and values and does not
+ * enable any accelerator execution in this binding.
+ *
+ * `has_train == false` retains the native default train=true.
+ */
+typedef struct LanceVectorIndexOptions {
+    int32_t index_type;   /* LanceVectorIndexType */
+    int32_t metric;       /* LanceMetricType */
+
+    LanceOptionalU64 num_partitions;
+    LanceOptionalU64 target_partition_size;
+    LanceOptionalU64 max_iters;
+    LanceOptionalU64 sample_rate;
+    LanceOptionalU64 streaming_sample_rate;
+    LanceOptionalU64 streaming_coreset_rate;
+    uint64_t streaming_refine_passes;
+
+    const char* precomputed_partitions_file;
+    const LancePrecomputedShuffleBuffers* precomputed_shuffle_buffers;
+    LanceOptionalU64 shuffle_partition_batches;
+    LanceOptionalU64 shuffle_partition_concurrency;
+    const LanceStringMap* storage_options;
+
+    LanceOptionalU64 num_sub_vectors;
+    LanceOptionalU64 num_bits;
+
+    struct ArrowArray* ivf_centroids;
+    const struct ArrowSchema* ivf_centroids_schema;
+    struct ArrowArray* pq_codebook;
+    const struct ArrowSchema* pq_codebook_schema;
+    const char* rabitq_model_json;
+
+    LanceOptionalU64 hnsw_max_level;
+    LanceOptionalU64 hnsw_m;
+    LanceOptionalU64 hnsw_ef_construction;
+
+    int32_t index_file_version; /* LanceIndexFileVersion */
+    bool skip_transpose;
+    const LanceStringMap* runtime_hints;
+    bool has_train;
+    bool train;
+} LanceVectorIndexOptions;
+
+/**
+ * Additive standalone IVF/PQ trainer controls. Zero-initialize this structure.
+ *
+ * An absent field preserves the native trainer default. A present value is
+ * forwarded verbatim, including zero, and native validation and failure
+ * behavior apply.
+ */
+typedef struct LanceIndexTrainerOptions {
+    LanceOptionalU64 sample_rate;
+    LanceOptionalU64 max_iters;
+} LanceIndexTrainerOptions;
+
+/**
+ * Additive scalar-index build controls.
+ *
+ * `has_train == false` preserves the native default (`train=true`). When true,
+ * `train` is forwarded exactly to the native `CreateIndexBuilder`.
+ */
+typedef struct LanceScalarIndexOptions {
+    bool has_train;
+    bool train;
+} LanceScalarIndexOptions;
 
 /** Return the error code from the last failed operation on this thread. */
 LanceErrorCode lance_last_error_code(void);
@@ -204,14 +348,47 @@ typedef struct LanceTags     LanceTags;
 typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceCleanupExplanation LanceCleanupExplanation;
 typedef struct LanceDatasetConfig LanceDatasetConfig;
+typedef struct LanceDatasetDeltaBuilder LanceDatasetDeltaBuilder;
+typedef struct LanceDatasetDelta LanceDatasetDelta;
+typedef struct LanceSqlQueryBuilder LanceSqlQueryBuilder;
+typedef struct LanceSqlQuery LanceSqlQuery;
+typedef struct LanceCompactionOptionsV2 LanceCompactionOptionsV2;
+typedef struct LanceCompactionPlan LanceCompactionPlan;
+typedef struct LanceCompactionTask LanceCompactionTask;
+typedef struct LanceRewriteResult LanceRewriteResult;
+typedef struct LanceOptimizeIndicesOptions LanceOptimizeIndicesOptions;
+typedef struct LanceOptimizeIndicesPlan LanceOptimizeIndicesPlan;
+typedef struct LanceOptimizeIndexTask LanceOptimizeIndexTask;
+typedef struct LanceOptimizeIndexMerge LanceOptimizeIndexMerge;
+typedef struct LanceIndexSegmentResult LanceIndexSegmentResult;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
 typedef struct LanceFtsQuery LanceFtsQuery;
+typedef struct LanceFtsTokenList LanceFtsTokenList;
 typedef struct LanceBlobFile LanceBlobFile;
+typedef struct LanceBlobDescriptorArrayBuilder LanceBlobDescriptorArrayBuilder;
+typedef struct LanceDataFile LanceDataFile;
+typedef struct LanceDataReplacementGroup LanceDataReplacementGroup;
 typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
+typedef struct LanceUpdateMap LanceUpdateMap;
+typedef struct LanceDataOverlayFile LanceDataOverlayFile;
+typedef struct LanceDataOverlayGroup LanceDataOverlayGroup;
+typedef struct LanceFragmentOverlayWriter LanceFragmentOverlayWriter;
+typedef struct LanceFragmentUpdateColumnsResult LanceFragmentUpdateColumnsResult;
+typedef struct LanceUpdatedFragmentOffsets LanceUpdatedFragmentOffsets;
+typedef struct LanceKeyExistenceFilter LanceKeyExistenceFilter;
+typedef struct LanceRewriteGroup LanceRewriteGroup;
+typedef struct LanceRewrittenIndex LanceRewrittenIndex;
+typedef struct LanceCompactedSsTable LanceCompactedSsTable;
+typedef struct LanceIvfModel LanceIvfModel;
+typedef struct LanceSchema LanceSchema;
+typedef struct LanceNamespace LanceNamespace;
+typedef struct LanceRestAdapter LanceRestAdapter;
+typedef struct LanceCommitLock LanceCommitLock;
+typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
 
 /* ─── Shared session ─── */
 
@@ -400,8 +577,87 @@ LanceDataset* lance_dataset_open_with_session(
     const LanceSession* session
 );
 
+/**
+ * Additive options for lance_dataset_open_with_options.
+ *
+ * Zero-initialize to open the latest version with native storage defaults.
+ * `storage_options_accessor` may be NULL for native defaults or point to a
+ * native dynamic accessor. The native dataset retains the accessor (and its
+ * provider/cache) after this call, so closing the C accessor does not
+ * invalidate later dataset I/O. Static options belong in the accessor's
+ * initial options. `version == 0` opens the latest version.
+ */
+typedef struct LanceDatasetOpenOptions {
+    uint64_t version;
+    const LanceStorageOptionsAccessor* storage_options_accessor;
+} LanceDatasetOpenOptions;
+
+/**
+ * Open a dataset with additive options and an optional shared session.
+ *
+ * `options` may be NULL, which is equivalent to a zero-initialized struct.
+ * `session` may be NULL for the default session. A non-NULL session is
+ * retained through shared ownership, exactly like
+ * lance_dataset_open_with_session.
+ *
+ * The returned dataset retains the native accessor and its provider. Later
+ * dataset I/O uses the native provider refresh, error and cache policy; the
+ * binding adds no second credential cache. Passing NULL for the accessor
+ * preserves the existing native default behavior.
+ *
+ * @return Dataset handle, or NULL on error.
+ */
+LanceDataset* lance_dataset_open_with_options(
+    const char* uri,
+    const LanceDatasetOpenOptions* options,
+    const LanceSession* session
+);
+
+/**
+ * Open a Lance dataset through a foreign commit lock and an optional dynamic
+ * storage-options accessor.
+ *
+ * A non-NULL `storage_accessor` forwards its native accessor owner; NULL, or
+ * an accessor constructed without an inner owner, selects native omission.
+ * `commit_lock` may be NULL to keep the URI-derived native handler. `session`
+ * may be NULL. `version == 0` opens the latest version.
+ *
+ * The returned dataset retains the native handler and accessor owners, so
+ * closing either input handle afterwards does not invalidate this dataset,
+ * its scanners, or later commits performed through it.
+ *
+ * @param out_dataset receives the dataset handle on success; must not be NULL
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_open_with_commit_lock(
+    const char* uri,
+    const LanceStorageOptionsAccessor* storage_accessor,
+    uint64_t version,
+    const LanceSession* session,
+    const LanceCommitLock* commit_lock,
+    LanceDataset** out_dataset
+);
+
 /** Close and free a dataset handle. Safe to call with NULL. */
 void lance_dataset_close(LanceDataset* dataset);
+
+/**
+ * Clone a dataset handle as an independent in-memory snapshot.
+ *
+ * The returned handle shares the source's native Dataset snapshot and its
+ * Arc-backed state (session, object-store registry, caches, commit handler),
+ * but has its own lock. Cloning performs no storage I/O. Mutating either
+ * handle does not change the other handle's version, schema, or rows, and
+ * does not hold the other handle's lock. Close the returned handle with
+ * `lance_dataset_close`; source and clone may be closed in either order.
+ *
+ * This duplicates an in-memory handle; it is not Lance's on-disk shallow or
+ * deep clone operation.
+ *
+ * @param dataset Source handle; must not be NULL
+ * @return New independent handle, or NULL on error
+ */
+LanceDataset* lance_dataset_clone_handle(const LanceDataset* dataset);
 
 /* ─── Dataset metadata (sync, in-memory) ─── */
 
@@ -1114,6 +1370,67 @@ LanceDataset* lance_dataset_checkout_ref(
     const LanceRef* reference
 );
 
+/**
+ * Deep clone a dataset snapshot into a new dataset at `target_path`.
+ *
+ * The whole operation is performed by Lance's native
+ * `Dataset::deep_clone` on a private clone of the source handle's snapshot.
+ * The source handle is not modified and no source write lock is held while
+ * files are copied.
+ *
+ * `reference == NULL` clones the source handle's current snapshot: its branch
+ * and version id are pinned into `Ref::Version(branch, Some(version))`. Treat
+ * it as "clone this exact snapshot", not "clone the latest head". Pass an
+ * explicit `LanceRef` from `lance_ref_version(NULL, false, 0)` to clone the
+ * current head of the default branch.
+ *
+ * `target_storage_options` is an existing storage-options accessor, or NULL.
+ * Its native accessor Arc is forwarded into `ObjectStoreParams` without
+ * resolving, snapshotting, or copying credentials, so a dynamic provider keeps
+ * its refresh behavior. NULL passes native `None`; a non-NULL accessor that
+ * holds static options and/or a provider contributes its native `Arc`, while
+ * an accessor created with neither contributes native `None`.
+ *
+ * Files are copied and the target dataset is published by native Lance. The
+ * out handle is written only on success. On failure the out parameter is
+ * untouched. A copy or commit error does not guarantee that the target remains
+ * unpublished. Object-store copies are not transactional: partial objects may
+ * remain under `target_path` and are not rolled back. Reopen the target to
+ * check its state after an error. A target that already contains a published
+ * dataset is rejected by the native preflight before any copy.
+ *
+ * The returned dataset is a normal LanceDataset whose manifest keeps the
+ * cloned snapshot's version id (native clone commit semantics), so its
+ * `lance_dataset_version` is the cloned version rather than always 1.
+ *
+ * Native clone commits resolve the target URI through the default object-store
+ * registry, so `target_path` must use a scheme that registry knows (for
+ * example `file`, `memory`, `s3`, `gs`, `az`, or another built-in). A scheme
+ * registered only on a custom session registry is not visible to the clone
+ * commit. Use `lance_dataset_write`/`lance_dataset_branch_create` with an
+ * explicit session for those schemes.
+ *
+ * For datasets with additional base paths, native deep clone reads every
+ * collected file through the source dataset's object store; per-base distinct
+ * source credentials are not supported. This call does not create extra
+ * providers, caches, registries, or per-base credential sets.
+ *
+ * Caller closes the returned handle with lance_dataset_close().
+ * @param dataset source dataset handle (must not be NULL)
+ * @param target_path UTF-8 target dataset URI (must not be NULL)
+ * @param reference snapshot ref, or NULL for the source handle's snapshot
+ * @param target_storage_options target accessor, or NULL for native None
+ * @param out receives the new dataset handle on success (must not be NULL)
+ * @return 0 on success, -1 on error; the out handle is not written on error
+ */
+int32_t lance_dataset_deep_clone(
+    const LanceDataset* dataset,
+    const char* target_path,
+    const LanceRef* reference,
+    const LanceStorageOptionsAccessor* target_storage_options,
+    LanceDataset** out
+);
+
 /* ─── Branches ─── */
 
 /**
@@ -1548,6 +1865,33 @@ typedef struct LanceBasePath {
 } LanceBasePath;
 
 /**
+ * Borrowed native `BasePath` fields owned by an operation handle.
+ *
+ * `path` and `name` point into the operation's storage and remain valid until
+ * `lance_operation_close()` is called on that handle. `name == NULL` represents
+ * native `None`; a non-NULL pointer, including an empty string, represents
+ * `Some(name)`.
+ */
+typedef struct LanceBasePathView {
+    uint32_t id;
+    const char* path;
+    const char* name;
+    bool is_dataset_root;
+} LanceBasePathView;
+
+/**
+ * Borrowed native base-path list with explicit presence.
+ *
+ * `items == NULL` maps to native `None`, including for Overwrite. A non-NULL
+ * pointer with `count == 0` maps to native `Some(empty list)`. Every entry is
+ * parsed with the `LanceBasePath` rules above.
+ */
+typedef struct LanceBasePathList {
+    const LanceBasePath* items;
+    size_t count;
+} LanceBasePathList;
+
+/**
  * Optional transaction properties for one native `add_bases` commit.
  *
  * `keys` and `values` are parallel arrays of length `count`; every key and
@@ -1678,15 +2022,15 @@ int32_t lance_dataset_all_files_stream(
 );
 
 /**
- * Restore the dataset to an older version by committing a new manifest that
- * carries the fragments of `version`. If `version` is already the latest,
- * succeeds as a no-op without writing a new manifest.
+ * Restore the dataset by committing a new manifest that carries the fragments
+ * of `version`. A new version is committed even when `version` is already the
+ * latest. The input dataset handle remains unchanged.
  *
  * @param dataset  Open dataset (not consumed). Must not be NULL.
  * @param version  Target version id (>= 1). `0` is rejected since it is the
  *                 "latest" sentinel used by lance_dataset_open.
- * @return Fresh LanceDataset* positioned at the target version (caller closes
- *         with lance_dataset_close), or NULL on error. Possible error codes
+ * @return Fresh LanceDataset* positioned at the newly committed version
+ *         (caller closes with lance_dataset_close), or NULL on error. Error codes
  *         include LANCE_ERR_INVALID_ARGUMENT (NULL handle or version == 0),
  *         LANCE_ERR_NOT_FOUND (unknown version),
  *         LANCE_ERR_COMMIT_CONFLICT (concurrent writer).
@@ -1862,6 +2206,314 @@ int32_t lance_dataset_merge_insert(
     LanceMergeInsertResult* out_result
 );
 
+/* ─── lance_dataset_merge ─────────────────────────────────────────────────── */
+
+/**
+ * Left-join precomputed columns from `source` into `dataset` and commit one
+ * native `Dataset::merge` operation.
+ *
+ * `left_on` may name an existing dataset column, `_rowid`, or `_rowaddr`.
+ * `right_on` names a field in the source schema. Field lookup is exact and
+ * case-sensitive. Empty key strings are forwarded to native validation.
+ *
+ * The source field named by `right_on` is the join key and is not appended.
+ * Every other top-level RHS field must be new to the dataset. Native owns key
+ * matching, duplicate and NULL semantics, schema compatibility, field IDs,
+ * physical writes, and commit conflicts.
+ *
+ * The non-NULL `source` stream is consumed on every return path, including
+ * invalid dataset/key arguments and native failures. After this call the
+ * caller must not read, move, or release the stream again. A NULL `source` is
+ * rejected without consuming anything.
+ *
+ * On success the same dataset handle points at the newly committed version.
+ * Existing scanners, fragment snapshots, and independently opened handles
+ * retain their previous snapshot. On error the handle keeps its prior
+ * in-memory snapshot unless the native commit outcome is uncertain; reopen
+ * the URI to establish the actual committed state in that case.
+ *
+ * Native may leave uncommitted data files after a failed merge. The binding
+ * does not delete or roll them back; dataset cleanup/GC owns their
+ * disposition.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_merge(
+    LanceDataset* dataset,
+    const char* left_on,
+    const char* right_on,
+    struct ArrowArrayStream* source
+);
+
+/* ─── BatchUDF callbacks ─────────────────────────────────────────────────── */
+
+/**
+ * Owned, optional NUL-terminated UTF-8 string returned by a foreign callback.
+ *
+ * When `data` is non-NULL, `release` must be non-NULL. The library copies the
+ * string before invoking `release`, then calls `release` exactly once. The
+ * release callback must free the storage behind `data` and return normally.
+ */
+typedef struct LanceOwnedString {
+    char* data;
+    void (*release)(struct LanceOwnedString* self);
+} LanceOwnedString;
+
+/**
+ * Error returned by a BatchUDF mapper or checkpoint callback.
+ *
+ * The library zero-initializes this structure before every invocation. On
+ * success the callback leaves it zeroed. On failure `code` is nonzero:
+ * INVALID_ARGUMENT, IO, NOT_FOUND, NOT_SUPPORTED, and INTERNAL map to their
+ * native variants; other values are treated as INTERNAL.
+ *
+ * `message` is copied into a Rust-owned error before `message.release` is
+ * called exactly once. A callback must not report failure through
+ * lance_last_error_*: callbacks may run on a different thread.
+ */
+typedef struct LanceCallbackError {
+    int32_t code;
+    LanceOwnedString message;
+} LanceCallbackError;
+
+/**
+ * Native BatchInfo passed to checkpoint callbacks. The pointer is borrowed for
+ * the callback only. `batch_index` is size_t to match native usize.
+ */
+typedef struct LanceUDFBatchInfo {
+    uint32_t fragment_id;
+    size_t batch_index;
+} LanceUDFBatchInfo;
+
+/**
+ * Map one input RecordBatch to an owned output ArrowArray.
+ *
+ * Input values are borrowed for the callback only. The input ArrowArray is the
+ * top-level struct array and `input_schema` is its complete schema. On success
+ * initialize `output` with an owned ArrowArray whose struct children match the
+ * declared `LanceBatchUDF.output_schema`, then return 0. Native owns the output
+ * and its release callback after a successful return. Zero-column batches
+ * retain their row count through the top-level array length.
+ *
+ * On failure return nonzero, fill `error`, and leave any initialized output
+ * for the library to release. The callback may run on a native runtime thread
+ * and must be thread-safe and non-unwinding.
+ */
+typedef int32_t (*LanceBatchUDFMapper)(
+    void* callback_ctx,
+    const struct ArrowArray* input,
+    const struct ArrowSchema* input_schema,
+    struct ArrowArray* output,
+    LanceCallbackError* error
+);
+
+/**
+ * Retrieve a checkpointed output batch.
+ *
+ * Return 1 with `output` initialized to an owned ArrowArray, 0 with `output`
+ * left zero-initialized, or -1 with `error` initialized.
+ */
+typedef int32_t (*LanceUDFCheckpointGetBatch)(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* info,
+    struct ArrowArray* output,
+    LanceCallbackError* error
+);
+
+/**
+ * Retain a checkpoint batch.
+ *
+ * `batch` and `batch_schema` are owned, movable Arrow C Data Interface values.
+ * The callback may move both structs into its storage and clear the source
+ * `release` fields. The library releases any ownership left in these argument
+ * slots after the callback returns, so a retained value can outlive the call
+ * and dataset close. Return 0 on success or -1 with `error`.
+ */
+typedef int32_t (*LanceUDFCheckpointInsertBatch)(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* info,
+    struct ArrowArray* batch,
+    struct ArrowSchema* batch_schema,
+    LanceCallbackError* error
+);
+
+/**
+ * Retrieve native Fragment JSON for a fragment checkpoint hit.
+ *
+ * Return 1 with `out_json` initialized, 0 for a miss, or -1 with `error`.
+ * The library copies the JSON before calling `out_json->release` exactly once.
+ */
+typedef int32_t (*LanceUDFCheckpointGetFragment)(
+    void* callback_ctx,
+    uint32_t fragment_id,
+    LanceOwnedString* out_json,
+    LanceCallbackError* error
+);
+
+/**
+ * Persist native Fragment JSON and its native u64 Fragment ID.
+ *
+ * `fragment_json` is borrowed for the callback only. Return 0 on success or
+ * -1 with `error`.
+ */
+typedef int32_t (*LanceUDFCheckpointInsertFragment)(
+    void* callback_ctx,
+    uint64_t fragment_id,
+    const char* fragment_json,
+    LanceCallbackError* error
+);
+
+/**
+ * Foreign UDFCheckpointStore adapter.
+ *
+ * All four callbacks are required. `callback_ctx` is a call-scoped borrow and
+ * may be NULL for stateless callbacks. The library neither retains nor
+ * releases it.
+ */
+typedef struct LanceUDFCheckpointStore {
+    LanceUDFCheckpointGetBatch get_batch;
+    LanceUDFCheckpointInsertBatch insert_batch;
+    LanceUDFCheckpointGetFragment get_fragment;
+    LanceUDFCheckpointInsertFragment insert_fragment;
+    void* callback_ctx;
+} LanceUDFCheckpointStore;
+
+/**
+ * Foreign BatchUDF declaration.
+ *
+ * `output_schema` is the complete schema of every mapper and get-batch output
+ * batch and is borrowed for this call. `checkpoint_store` may be NULL.
+ * Mapper and checkpoint contexts are call-scoped and must remain valid until
+ * the enclosing function returns.
+ */
+typedef struct LanceBatchUDF {
+    LanceBatchUDFMapper mapper;
+    void* mapper_ctx;
+    const struct ArrowSchema* output_schema;
+    const LanceUDFCheckpointStore* checkpoint_store;
+} LanceBatchUDF;
+
+/**
+ * Add columns through native `NewColumnTransform::BatchUDF`.
+ *
+ * `read_columns` NULL maps to native None. A non-NULL NULL-terminated array
+ * maps to native Some; an immediately terminated array maps to Some(empty).
+ * `batch_size` NULL maps to None. A non-NULL pointer maps to Some(*batch_size),
+ * including explicit zero; native owns validation of zero.
+ *
+ * Native owns output schema compatibility, row alignment, checkpoint ordering,
+ * file cleanup, publication, and commit conflicts. Mapper and store callbacks
+ * execute synchronously under the dataset handle's exclusive mutation lock.
+ * They must not re-enter the same handle; use an independent handle or an
+ * existing fragment/scanner snapshot for reads.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_add_columns_batch_udf(
+    LanceDataset* dataset,
+    const LanceBatchUDF* udf,
+    const char* const* read_columns,
+    const uint32_t* batch_size
+);
+
+/* ─── Commit lock ─────────────────────────────────────────────────────────── */
+
+/**
+ * Acquire the lock for a manifest base version.
+ *
+ * On success return 0 and either store an owned opaque token in `*out_lease`
+ * or leave it NULL for a stateless lock. On failure return nonzero, fill
+ * `error`, and leave `*out_lease` NULL. A non-NULL partial token left on a
+ * failed acquire is destroyed exactly once and never released.
+ *
+ * The callback runs synchronously on a native runtime thread, may perform
+ * blocking I/O through an independent dataset or scanner handle, and must be
+ * thread-safe and non-unwinding. It must not re-enter the dataset handle that
+ * is currently committing.
+ */
+typedef int32_t (*LanceCommitLockAcquire)(
+    void* callback_ctx,
+    uint64_t version,
+    void** out_lease,
+    LanceCallbackError* error
+);
+
+/**
+ * Report whether the commit that acquired a lease succeeded.
+ *
+ * `success` is true after the manifest is published and false when native
+ * conflict handling or cancellation abandons the attempt. Release may be
+ * called more than once for one token and must be idempotent. It does not
+ * destroy the token. On failure return nonzero and fill `error`; the token
+ * stays owned by the library until `destroy_lease`.
+ */
+typedef int32_t (*LanceCommitLockRelease)(
+    void* callback_ctx,
+    void* lease,
+    bool success,
+    LanceCallbackError* error
+);
+
+/**
+ * Destroy one lease token. Called exactly once per acquired lease, after any
+ * final release callback, including for a NULL stateless token. Must not
+ * throw and must not call back into Lance.
+ */
+typedef void (*LanceCommitLeaseDestroy)(
+    void* callback_ctx,
+    void* lease
+);
+
+/**
+ * Release the lock context exactly once, when the last native owner drops.
+ * Optional; absent means the caller keeps ownership of `callback_ctx`. Must
+ * not throw.
+ */
+typedef void (*LanceCommitLockContextRelease)(
+    void* callback_ctx
+);
+
+/**
+ * Foreign commit lock.
+ *
+ * `lock` and `release` are required; `destroy_lease` and `release_context` are
+ * optional. The table is copied by `lance_commit_lock_new`. `callback_ctx` is
+ * borrowed by every callback and may be NULL. Context ownership transfers
+ * only when construction succeeds: on failure `release_context` is never
+ * called.
+ *
+ * Datasets, scanners and in-flight native jobs retain their own native context
+ * owner. Closing a `LanceCommitLock` handle only drops that handle's owner;
+ * retained datasets keep working. Keep the lock handle alive when staging a
+ * transaction and pass it to the matching commit entry point.
+ */
+typedef struct LanceCommitLockCallbacks {
+    LanceCommitLockAcquire lock;
+    LanceCommitLockRelease release;
+    LanceCommitLeaseDestroy destroy_lease;
+    void* callback_ctx;
+    LanceCommitLockContextRelease release_context;
+} LanceCommitLockCallbacks;
+
+/**
+ * Construct a foreign commit lock from a callback table.
+ *
+ * `callbacks` and its `lock`/`release` entries must be non-NULL.
+ * `destroy_lease` and `release_context` may be NULL.
+ *
+ * @return Owned lock handle, or NULL on error
+ */
+LanceCommitLock* lance_commit_lock_new(
+    const LanceCommitLockCallbacks* callbacks
+);
+
+/**
+ * Close a commit-lock handle. Safe to call with NULL.
+ *
+ * Retained datasets and leases keep their native context owner.
+ */
+void lance_commit_lock_close(LanceCommitLock* lock);
+
 /* ─── lance_dataset_compact_files ─────────────────────────────────────────── */
 
 /**
@@ -1869,6 +2521,10 @@ int32_t lance_dataset_merge_insert(
  * upstream defaults. Each numeric field uses 0 as a "keep upstream default"
  * sentinel; non-zero values are forwarded after a usize range check so the
  * API does not silently truncate on 32-bit hosts.
+ *
+ * This five-field layout is frozen. New callers should use
+ * LanceCompactionOptionsV2, which preserves native None/Some(0)/Some(empty)
+ * choices and exposes every native compaction option.
  */
 typedef struct LanceCompactionOptions {
     /* Target row count per output fragment. Fragments below this size are
@@ -1923,6 +2579,446 @@ int32_t lance_dataset_compact_files(
     LanceDataset* dataset,
     const LanceCompactionOptions* options,
     LanceCompactionMetrics* out_metrics
+);
+
+/* ─── Native maintenance lifecycle ────────────────────────────────────────── */
+
+/** Migrate this dataset's manifest paths to v2 naming. Native rename behavior. */
+int32_t lance_dataset_migrate_manifest_paths_v2(LanceDataset* dataset);
+
+/** Delete all rows through native Dataset::truncate_table. */
+int32_t lance_dataset_truncate_table(LanceDataset* dataset);
+
+/* ─── Native compaction options V2 ────────────────────────────────────────── */
+
+/** Controls how data is rewritten during compaction. */
+typedef enum LanceCompactionMode {
+    LANCE_COMPACTION_REENCODE          = 0,
+    LANCE_COMPACTION_TRY_BINARY_COPY   = 1,
+    LANCE_COMPACTION_FORCE_BINARY_COPY = 2
+} LanceCompactionMode;
+
+/** Controls how the old-to-new row-address mapping is represented. */
+typedef enum LanceIndexRemapMode {
+    LANCE_INDEX_REMAP_COMPACT = 0,
+    LANCE_INDEX_REMAP_DIRECT  = 1
+} LanceIndexRemapMode;
+
+/** Create options from native CompactionOptions::default(). */
+LanceCompactionOptionsV2* lance_compaction_options_v2_new(void);
+
+/** Create options from native CompactionOptions::from_dataset_config(). */
+LanceCompactionOptionsV2* lance_compaction_options_v2_from_dataset(
+    const LanceDataset* dataset
+);
+
+/** Clone an owned native options value. */
+LanceCompactionOptionsV2* lance_compaction_options_v2_clone(
+    const LanceCompactionOptionsV2* options
+);
+
+/** Free options. NULL-safe. */
+void lance_compaction_options_v2_free(LanceCompactionOptionsV2* options);
+
+int32_t lance_compaction_options_v2_set_target_rows_per_fragment(
+    LanceCompactionOptionsV2* options,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_max_rows_per_group(
+    LanceCompactionOptionsV2* options,
+    uint64_t value
+);
+/** `has_value == false` selects native None; true preserves zero. */
+int32_t lance_compaction_options_v2_set_max_bytes_per_file(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_materialize_deletions(
+    LanceCompactionOptionsV2* options,
+    bool value
+);
+int32_t lance_compaction_options_v2_set_materialize_deletions_threshold(
+    LanceCompactionOptionsV2* options,
+    float value
+);
+int32_t lance_compaction_options_v2_set_num_threads(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_batch_size(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_io_buffer_size(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_defer_index_remap(
+    LanceCompactionOptionsV2* options,
+    bool value
+);
+int32_t lance_compaction_options_v2_set_index_remap_mode(
+    LanceCompactionOptionsV2* options,
+    int32_t mode
+);
+/** `has_value == false` selects native None; true selects the given mode. */
+int32_t lance_compaction_options_v2_set_compaction_mode(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    int32_t mode
+);
+int32_t lance_compaction_options_v2_set_binary_copy_read_batch_bytes(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_max_source_fragments(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_max_source_rows(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_compaction_options_v2_set_max_source_bytes(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+/** Replace excluded IDs. NULL with count=0 is the empty list. */
+int32_t lance_compaction_options_v2_set_excluded_fragment_ids(
+    LanceCompactionOptionsV2* options,
+    const uint32_t* fragment_ids,
+    size_t count
+);
+int32_t lance_compaction_options_v2_set_max_overlays_per_fragment(
+    LanceCompactionOptionsV2* options,
+    bool has_value,
+    uint64_t value
+);
+/** Parse the selector with native LanceFileVersion::from_str(). NULL = None. */
+int32_t lance_compaction_options_v2_set_data_storage_version(
+    LanceCompactionOptionsV2* options,
+    const char* selector
+);
+/** NULL = native None; non-NULL with count=0 = Some(empty map). */
+int32_t lance_compaction_options_v2_set_transaction_properties(
+    LanceCompactionOptionsV2* options,
+    const LanceTransactionProperties* properties
+);
+
+/**
+ * Compact using native CompactionOptions.
+ * NULL options select from_dataset_config. Metrics are written only on
+ * success.
+ */
+int32_t lance_dataset_compact_files_v2(
+    LanceDataset* dataset,
+    const LanceCompactionOptionsV2* options,
+    LanceCompactionMetrics* out_metrics
+);
+
+/** Plan compaction. NULL options select from_dataset_config. */
+LanceCompactionPlan* lance_dataset_plan_compaction(
+    const LanceDataset* dataset,
+    const LanceCompactionOptionsV2* options
+);
+
+uint64_t lance_compaction_plan_read_version(const LanceCompactionPlan* plan);
+size_t lance_compaction_plan_task_count(const LanceCompactionPlan* plan);
+
+/** Owned task snapshot; free with lance_compaction_task_close(). */
+LanceCompactionTask* lance_compaction_plan_task_at(
+    const LanceCompactionPlan* plan,
+    size_t index
+);
+
+/** Clone effective plan options, including the resolved exact storage version. */
+LanceCompactionOptionsV2* lance_compaction_plan_options_clone(
+    const LanceCompactionPlan* plan
+);
+
+/** Native serde transport. Free strings with lance_free_string(). */
+const char* lance_compaction_plan_json(const LanceCompactionPlan* plan);
+LanceCompactionPlan* lance_compaction_plan_from_json(const char* json);
+void lance_compaction_plan_close(LanceCompactionPlan* plan);
+
+uint64_t lance_compaction_task_read_version(const LanceCompactionTask* task);
+size_t lance_compaction_task_fragment_count(const LanceCompactionTask* task);
+const char* lance_compaction_task_fragment_metadata_json_at(
+    const LanceCompactionTask* task,
+    size_t index
+);
+LanceCompactionOptionsV2* lance_compaction_task_options_clone(
+    const LanceCompactionTask* task
+);
+
+/** Execute against the dataset at the task's planned read version. */
+LanceRewriteResult* lance_compaction_task_execute(
+    const LanceDataset* dataset,
+    const LanceCompactionTask* task
+);
+
+const char* lance_compaction_task_json(const LanceCompactionTask* task);
+LanceCompactionTask* lance_compaction_task_from_json(const char* json);
+void lance_compaction_task_close(LanceCompactionTask* task);
+
+uint64_t lance_rewrite_result_read_version(const LanceRewriteResult* result);
+int32_t lance_rewrite_result_metrics(
+    const LanceRewriteResult* result,
+    LanceCompactionMetrics* out_metrics
+);
+size_t lance_rewrite_result_original_fragment_count(
+    const LanceRewriteResult* result
+);
+size_t lance_rewrite_result_new_fragment_count(
+    const LanceRewriteResult* result
+);
+const char* lance_rewrite_result_original_fragment_metadata_json_at(
+    const LanceRewriteResult* result,
+    size_t index
+);
+const char* lance_rewrite_result_new_fragment_metadata_json_at(
+    const LanceRewriteResult* result,
+    size_t index
+);
+const char* lance_rewrite_result_json(const LanceRewriteResult* result);
+LanceRewriteResult* lance_rewrite_result_from_json(const char* json);
+void lance_rewrite_result_close(LanceRewriteResult* result);
+
+/**
+ * Commit rewrite results through native commit_compaction.
+ * NULL options select CompactionOptions::default(). Metrics are written only
+ * on success.
+ */
+int32_t lance_dataset_commit_compaction(
+    LanceDataset* dataset,
+    const LanceRewriteResult* const* results,
+    size_t result_count,
+    const LanceCompactionOptionsV2* options,
+    LanceCompactionMetrics* out_metrics
+);
+
+/* ─── Native index optimization ───────────────────────────────────────────── */
+
+/** Create options from native OptimizeOptions::default(). */
+LanceOptimizeIndicesOptions* lance_optimize_indices_options_new(void);
+LanceOptimizeIndicesOptions* lance_optimize_indices_options_clone(
+    const LanceOptimizeIndicesOptions* options
+);
+void lance_optimize_indices_options_free(LanceOptimizeIndicesOptions* options);
+
+int32_t lance_optimize_indices_options_set_num_indices_to_merge(
+    LanceOptimizeIndicesOptions* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_optimize_indices_options_set_enable_partition_rebalancing(
+    LanceOptimizeIndicesOptions* options,
+    bool value
+);
+/** false = native None; true + count=0 = native Some(empty). */
+int32_t lance_optimize_indices_options_set_index_names(
+    LanceOptimizeIndicesOptions* options,
+    bool has_value,
+    const char* const* names,
+    size_t count
+);
+int32_t lance_optimize_indices_options_set_retrain(
+    LanceOptimizeIndicesOptions* options,
+    bool value
+);
+int32_t lance_optimize_indices_options_set_transaction_properties(
+    LanceOptimizeIndicesOptions* options,
+    const LanceTransactionProperties* properties
+);
+int32_t lance_optimize_indices_options_set_max_rows_per_task(
+    LanceOptimizeIndicesOptions* options,
+    bool has_value,
+    uint64_t value
+);
+int32_t lance_optimize_indices_options_set_max_rows_per_segment(
+    LanceOptimizeIndicesOptions* options,
+    bool has_value,
+    uint64_t value
+);
+
+/** Single-process native optimize_indices. NULL options use defaults. */
+int32_t lance_dataset_optimize_indices(
+    LanceDataset* dataset,
+    const LanceOptimizeIndicesOptions* options
+);
+
+/** Plan the native distributed optimize workflow. */
+LanceOptimizeIndicesPlan* lance_dataset_plan_optimize_indices(
+    const LanceDataset* dataset,
+    const LanceOptimizeIndicesOptions* options
+);
+
+/** Copy a native UUID as 16 raw RFC 4122 bytes. */
+int32_t lance_optimize_indices_plan_id(
+    const LanceOptimizeIndicesPlan* plan,
+    uint8_t out_uuid[16]
+);
+uint64_t lance_optimize_indices_plan_read_version(
+    const LanceOptimizeIndicesPlan* plan
+);
+size_t lance_optimize_indices_plan_task_count(
+    const LanceOptimizeIndicesPlan* plan
+);
+size_t lance_optimize_indices_plan_merge_count(
+    const LanceOptimizeIndicesPlan* plan
+);
+LanceOptimizeIndexTask* lance_optimize_indices_plan_task_at(
+    const LanceOptimizeIndicesPlan* plan,
+    size_t index
+);
+LanceOptimizeIndexMerge* lance_optimize_indices_plan_merge_at(
+    const LanceOptimizeIndicesPlan* plan,
+    size_t index
+);
+const char* lance_optimize_indices_plan_json(
+    const LanceOptimizeIndicesPlan* plan
+);
+LanceOptimizeIndicesPlan* lance_optimize_indices_plan_from_json(
+    const char* json
+);
+void lance_optimize_indices_plan_close(LanceOptimizeIndicesPlan* plan);
+
+int32_t lance_optimize_index_task_plan_id(
+    const LanceOptimizeIndexTask* task,
+    uint8_t out_uuid[16]
+);
+uint64_t lance_optimize_index_task_read_version(
+    const LanceOptimizeIndexTask* task
+);
+uint32_t lance_optimize_index_task_group(
+    const LanceOptimizeIndexTask* task
+);
+size_t lance_optimize_index_task_fragment_count(
+    const LanceOptimizeIndexTask* task
+);
+int32_t lance_optimize_index_task_fragment_id_at(
+    const LanceOptimizeIndexTask* task,
+    size_t index,
+    uint32_t* out_id
+);
+/** Owned LanceIndexSegmentMetadata; free with its existing free function. */
+LanceIndexSegmentMetadata* lance_optimize_index_task_reference(
+    const LanceOptimizeIndexTask* task
+);
+size_t lance_optimize_index_task_old_segment_count(
+    const LanceOptimizeIndexTask* task
+);
+LanceIndexSegmentMetadata* lance_optimize_index_task_old_segment_at(
+    const LanceOptimizeIndexTask* task,
+    size_t index
+);
+int32_t lance_optimize_index_task_num_indices_to_merge(
+    const LanceOptimizeIndexTask* task,
+    bool* out_has_value,
+    uint64_t* out_value
+);
+int32_t lance_optimize_index_task_enable_partition_rebalancing(
+    const LanceOptimizeIndexTask* task,
+    bool* out_value
+);
+int32_t lance_optimize_index_task_retrain(
+    const LanceOptimizeIndexTask* task,
+    bool* out_value
+);
+
+/** `*out_result` receives NULL when native returns None; untouched on error. */
+int32_t lance_optimize_index_task_execute(
+    const LanceDataset* dataset,
+    const LanceOptimizeIndexTask* task,
+    LanceIndexSegmentResult** out_result
+);
+
+const char* lance_optimize_index_task_json(
+    const LanceOptimizeIndexTask* task
+);
+LanceOptimizeIndexTask* lance_optimize_index_task_from_json(const char* json);
+void lance_optimize_index_task_close(LanceOptimizeIndexTask* task);
+
+int32_t lance_optimize_index_merge_plan_id(
+    const LanceOptimizeIndexMerge* merge,
+    uint8_t out_uuid[16]
+);
+uint64_t lance_optimize_index_merge_read_version(
+    const LanceOptimizeIndexMerge* merge
+);
+uint32_t lance_optimize_index_merge_group(
+    const LanceOptimizeIndexMerge* merge
+);
+size_t lance_optimize_index_merge_old_segment_count(
+    const LanceOptimizeIndexMerge* merge
+);
+LanceIndexSegmentMetadata* lance_optimize_index_merge_old_segment_at(
+    const LanceOptimizeIndexMerge* merge,
+    size_t index
+);
+size_t lance_optimize_index_merge_replace_count(
+    const LanceOptimizeIndexMerge* merge
+);
+int32_t lance_optimize_index_merge_replace_uuid_at(
+    const LanceOptimizeIndexMerge* merge,
+    size_t index,
+    uint8_t out_uuid[16]
+);
+/** Native plan/group/version checks remain authoritative. */
+int32_t lance_optimize_index_merge_execute(
+    const LanceDataset* dataset,
+    const LanceOptimizeIndexMerge* merge,
+    const LanceIndexSegmentResult* const* task_results,
+    size_t task_result_count,
+    LanceIndexSegmentResult** out_result
+);
+const char* lance_optimize_index_merge_json(
+    const LanceOptimizeIndexMerge* merge
+);
+LanceOptimizeIndexMerge* lance_optimize_index_merge_from_json(const char* json);
+void lance_optimize_index_merge_close(LanceOptimizeIndexMerge* merge);
+
+int32_t lance_index_segment_result_plan_id(
+    const LanceIndexSegmentResult* result,
+    uint8_t out_uuid[16]
+);
+uint64_t lance_index_segment_result_read_version(
+    const LanceIndexSegmentResult* result
+);
+uint32_t lance_index_segment_result_group(
+    const LanceIndexSegmentResult* result
+);
+LanceIndexSegmentMetadata* lance_index_segment_result_segment(
+    const LanceIndexSegmentResult* result
+);
+size_t lance_index_segment_result_replace_count(
+    const LanceIndexSegmentResult* result
+);
+int32_t lance_index_segment_result_replace_uuid_at(
+    const LanceIndexSegmentResult* result,
+    size_t index,
+    uint8_t out_uuid[16]
+);
+const char* lance_index_segment_result_json(
+    const LanceIndexSegmentResult* result
+);
+LanceIndexSegmentResult* lance_index_segment_result_from_json(const char* json);
+void lance_index_segment_result_close(LanceIndexSegmentResult* result);
+
+/** Commit merged results. Empty results retain native no-op/MemWAL behavior. */
+int32_t lance_dataset_commit_optimize_indices(
+    LanceDataset* dataset,
+    const LanceIndexSegmentResult* const* results,
+    size_t result_count,
+    const LanceOptimizeIndicesOptions* options
 );
 
 /* ─── lance_dataset_drop_columns ──────────────────────────────────────────── */
@@ -2148,6 +3244,115 @@ int32_t lance_dataset_schema(
     struct ArrowSchema* out
 );
 
+/**
+ * Clone the dataset's current native schema into an independently owned
+ * handle.
+ *
+ * The clone preserves field and parent IDs, logical types, encodings,
+ * dictionary values, nested metadata, field order, and nullability. It does
+ * not pass through Arrow. The handle remains valid after the dataset is
+ * closed.
+ *
+ * @param dataset     Open dataset snapshot. Must not be NULL.
+ * @param out_schema  Receives the owned schema on success; unchanged on error.
+ * @return 0 on success, -1 on error. Close the result with
+ *         lance_schema_close().
+ */
+int32_t lance_dataset_schema_clone(
+    const LanceDataset* dataset,
+    LanceSchema** out_schema
+);
+
+/* ─── Native schema values ─── */
+
+/**
+ * Close and free a native schema handle. Safe to call with NULL.
+ *
+ * Closing the dataset, fragment, or operation that produced the schema does
+ * not invalidate an independently cloned handle.
+ */
+void lance_schema_close(LanceSchema* schema);
+
+/**
+ * Clone a native schema handle into an independently owned handle.
+ *
+ * The clone preserves the complete native schema value, including field IDs,
+ * nested metadata, encodings, and dictionary values. It does not pass through
+ * Arrow. Returns NULL on error.
+ */
+LanceSchema* lance_schema_clone(const LanceSchema* schema);
+
+/**
+ * Create a native schema from an Arrow C Data Interface schema.
+ *
+ * The input schema is borrowed and not consumed. Native conversion preserves
+ * `lance:field_id` metadata when present and assigns fresh consecutive field
+ * IDs to fields without one, starting at one greater than the highest existing
+ * field ID (0 when none), following native `Schema::try_from`. The resulting
+ * schema is validated for duplicate and unknown field IDs, encodings, and
+ * primary-key metadata.
+ *
+ * On success writes an independently owned handle to `*out_schema` and
+ * returns 0. On error the output slot is untouched.
+ */
+int32_t lance_schema_from_arrow(
+    const struct ArrowSchema* schema,
+    LanceSchema** out_schema
+);
+
+/**
+ * Export a native schema as an Arrow C Data Interface view.
+ *
+ * This is an interoperability view only: Arrow does not represent every native
+ * detail, including Lance field IDs and encodings. Use lance_schema_clone() or
+ * the dataset/fragment/operation schema-clone functions when the native value
+ * must be preserved. `out` is caller-allocated and remains caller-owned;
+ * invoke its non-NULL release callback exactly once.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_schema_to_arrow(
+    const LanceSchema* schema,
+    struct ArrowSchema* out
+);
+
+/**
+ * Project a native schema onto an ordered list of column paths.
+ *
+ * Field paths, ordering, unknown-column errors, nested projection, and empty
+ * selection all follow native `Schema::project`. A NULL `columns` array is
+ * accepted only when `num_columns == 0`. Every non-NULL entry must be UTF-8.
+ * This function does not rebuild the schema through Arrow.
+ *
+ * On success writes an independently owned handle to `*out_schema` and
+ * returns 0. On error the output slot is untouched.
+ *
+ * @param schema       Native schema handle. Must not be NULL.
+ * @param columns      Array of column paths, or NULL when num_columns is 0.
+ * @param num_columns  Number of entries in `columns`.
+ * @param out_schema   Receives the projected handle on success.
+ * @return 0 on success, -1 on error. Close the result with
+ *         lance_schema_close().
+ */
+int32_t lance_schema_project(
+    const LanceSchema* schema,
+    const char* const* columns,
+    size_t num_columns,
+    LanceSchema** out_schema
+);
+
+/**
+ * Resolve a column path to its native Lance field ID.
+ *
+ * Nested paths use native field-path syntax. On success writes
+ * `*out_field_id` and returns 0. On error the output slot is untouched.
+ */
+int32_t lance_schema_field_id(
+    const LanceSchema* schema,
+    const char* column,
+    int32_t* out_field_id
+);
+
 /* ─── Fragment enumeration ─── */
 
 /**
@@ -2163,7 +3368,7 @@ uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
  */
 int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_ids);
 
-/* ─── Read-only fragment snapshots ─── */
+/* ─── Fragment handles ─── */
 
 /**
  * Resolve a fragment by ID from this dataset snapshot.
@@ -2183,6 +3388,34 @@ LanceFragment* lance_dataset_open_fragment(
     uint64_t fragment_id
 );
 
+/**
+ * Construct detached native Fragment metadata.
+ *
+ * Starts from native `Fragment::new(fragment_id)`, clones each borrowed
+ * `LanceDataFile` in input order, and optionally sets the native
+ * `physical_rows` value. Deletion-file, overlay, row-ID and row-version
+ * metadata retain their native `Fragment::new` defaults. The binding does not
+ * infer or independently validate schema coverage or row counts; native
+ * commit remains authoritative for publication.
+ *
+ * `data_files` may be NULL only when `data_file_count == 0`. A non-NULL array
+ * must contain only non-NULL handles. `physical_rows` is optional: NULL maps
+ * to native `None`, while a non-NULL value must fit the platform `usize`.
+ * A fragment_id of zero requests native commit-time allocation, matching the
+ * native Append contract.
+ *
+ * The returned detached handle retains independent copies of the data-file
+ * metadata and may outlive those handles. It supports metadata inspection and
+ * operation construction but rejects dataset-bound reads. On success the
+ * caller closes it with `lance_fragment_close()`. Returns NULL on error.
+ */
+LanceFragment* lance_fragment_new(
+    uint64_t fragment_id,
+    const LanceDataFile* const* data_files,
+    size_t data_file_count,
+    const uint64_t* physical_rows
+);
+
 /** Close and free a fragment handle. Safe to call with NULL. */
 void lance_fragment_close(LanceFragment* fragment);
 
@@ -2198,6 +3431,68 @@ uint64_t lance_fragment_id(const LanceFragment* fragment);
  * NULL handle.
  */
 uint64_t lance_fragment_data_file_count(const LanceFragment* fragment);
+
+/**
+ * Return whether this handle retains a dataset-bound native fragment.
+ *
+ * Detached handles own only cloned native metadata, load no data files, and
+ * reject dataset-dependent reads with LANCE_ERR_NOT_SUPPORTED. The output slot
+ * is written only on success.
+ *
+ * @return 0 on success, -1 on error (including NULL fragment/out_is_bound).
+ */
+int32_t lance_fragment_is_bound(
+    const LanceFragment* fragment,
+    bool* out_is_bound
+);
+
+/**
+ * Return the dataset read version captured by a bound fragment.
+ *
+ * This is the native snapshot version carried by the fragment's
+ * `FileFragment`. Pass it as the read version when committing fragment
+ * mutations through the generic transaction API. A detached metadata-only
+ * handle has no dataset snapshot and returns LANCE_ERR_NOT_SUPPORTED. The
+ * output slot is written only on success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_read_version(
+    const LanceFragment* fragment,
+    uint64_t* out_version
+);
+
+/**
+ * Clone one native base data file from the fragment metadata.
+ *
+ * `index` addresses the native `Fragment::files` array. The returned handle
+ * owns an independent copy and must be closed with `lance_data_file_close()`.
+ *
+ * @return 0 on success, -1 on error. A missing index sets
+ *         LANCE_ERR_INVALID_ARGUMENT; `*out_file` is unchanged on error.
+ */
+int32_t lance_fragment_data_file_at(
+    const LanceFragment* fragment,
+    size_t index,
+    LanceDataFile** out_file
+);
+
+/**
+ * Find the native base data file that stores a field ID.
+ *
+ * Bound handles use Native `FileFragment::data_file_for_field`; detached
+ * handles use the same `fields` membership rule on owned metadata. A missing
+ * field succeeds with `*out_file == NULL`; a negative field ID or NULL output
+ * slot is an invalid argument. The returned handle is independent and must be
+ * closed with `lance_data_file_close()`.
+ *
+ * @return 0 on success, -1 on error; the output slot is unchanged on error.
+ */
+int32_t lance_fragment_data_file_for_field(
+    const LanceFragment* fragment,
+    int32_t field_id,
+    LanceDataFile** out_file
+);
 
 /**
  * Serialize the Native fragment metadata as JSON.
@@ -2225,6 +3520,22 @@ const char* lance_fragment_metadata_json(const LanceFragment* fragment);
 int32_t lance_fragment_schema(
     const LanceFragment* fragment,
     struct ArrowSchema* out
+);
+
+/**
+ * Clone the fragment's native logical dataset schema.
+ *
+ * This is `FileFragment::schema()` from the fragment's staged snapshot, not a
+ * physical file schema. The clone preserves native field identities and
+ * metadata without an Arrow round trip and remains valid after the fragment is
+ * closed.
+ *
+ * On success writes `*out_schema` and returns 0; on error the output slot is
+ * untouched.
+ */
+int32_t lance_fragment_schema_clone(
+    const LanceFragment* fragment,
+    LanceSchema** out_schema
 );
 
 /**
@@ -2326,6 +3637,83 @@ int32_t lance_fragment_take(
 );
 
 /**
+ * Open an overlay writer for a bound fragment.
+ *
+ * The fragment must belong to a dataset (a detached fragment returns
+ * LANCE_ERR_NOT_SUPPORTED). The writer captures the fragment's current native
+ * snapshot and the supplied schema. The schema may be a subset of the dataset
+ * schema; native code owns field compatibility, row layout, type, nullability
+ * and range checks. Commit the resulting overlay with the dataset read version
+ * used to open this writer.
+ *
+ * Native overlays are experimental. For release builds, set
+ * `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads or
+ * modifies an overlay dataset. Enable it before publication so all readers
+ * recognize the manifest feature.
+ *
+ * @param fragment    Bound fragment snapshot. Must not be NULL.
+ * @param schema      Native fragment schema, or a compatible subset.
+ * @param out_writer  Receives the writer on success; unchanged on failure.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_overlay_writer_new(
+    const LanceFragment* fragment,
+    const LanceSchema* schema,
+    LanceFragmentOverlayWriter** out_writer
+);
+
+/**
+ * Write one batch of overlay values to a writer.
+ *
+ * The batch is borrowed for the duration of the call and may be closed
+ * afterwards. Rows are keyed by `_rowaddr`; each covered cell supplies a dense
+ * value in ascending fragment-offset order. Native validation owns missing or
+ * nullable `_rowaddr`, repeated or descending offsets, wrong fragment, wrong
+ * types and out-of-range offsets.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_fragment_overlay_writer_write_batch(
+    LanceFragmentOverlayWriter* writer,
+    const LanceBatch* batch
+);
+
+/**
+ * Finish an overlay writer.
+ *
+ * Consumes the writer allocation on every return, including errors. On success
+ * `out_group` receives an owned group, or NULL when the staged coverage was
+ * empty (native `None`). `out_group` is written only on success and a non-NULL
+ * result must be closed with `lance_data_overlay_group_close`. Returns 0 on
+ * success, -1 on error.
+ */
+int32_t lance_fragment_overlay_writer_finish(
+    LanceFragmentOverlayWriter* writer,
+    LanceDataOverlayGroup** out_group
+);
+
+/**
+ * Abort an overlay writer.
+ *
+ * Consumes the writer allocation and discards staged data best-effort. This is
+ * the native abort path, not a finish or publication. NULL-safe. No error is
+ * reported.
+ */
+void lance_fragment_overlay_writer_abort(
+    LanceFragmentOverlayWriter* writer
+);
+
+/**
+ * Close an overlay writer without finishing or publishing it.
+ *
+ * Consumes the writer allocation and drops the native writer, matching ordinary
+ * Rust drop. NULL-safe.
+ */
+void lance_fragment_overlay_writer_close(
+    LanceFragmentOverlayWriter* writer
+);
+
+/**
  * Count this fragment's rows, optionally applying a native SQL filter.
  *
  * NULL calls Native `FileFragment::count_rows(None)`. A non-NULL string,
@@ -2374,6 +3762,295 @@ int32_t lance_fragment_delete(
     const LanceFragment* fragment,
     const char* predicate,
     LanceFragment** out_fragment
+);
+
+/* ─── Fragment mutation and staging ─── */
+
+/**
+ * Add columns computed from SQL expressions to one bound fragment.
+ *
+ * This calls Native `FileFragment::add_columns` with
+ * `NewColumnTransform::SqlExpressions`. `columns` is borrowed and copied;
+ * a NULL array is accepted only when `column_count == 0`. Native validates the
+ * expressions, names, schema and row alignment.
+ *
+ * `batch_size == NULL` maps to native `None`; a non-NULL pointer is forwarded
+ * as `Some(value)`, including zero.
+ *
+ * On success both outputs are written and own detached fragment metadata plus
+ * the complete native final schema. A detached input fragment returns
+ * LANCE_ERR_NOT_SUPPORTED. Both output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_sql(
+    const LanceFragment* fragment,
+    const LanceSqlColumn* columns,
+    size_t column_count,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add all-null columns described by a borrowed Arrow schema.
+ *
+ * This maps to `NewColumnTransform::AllNulls`. The Arrow schema supplies the
+ * logical new-column definitions; Native allocates new field identities and
+ * returns the complete final native schema. The schema is borrowed and its
+ * release callback is never called.
+ *
+ * On success both outputs are written and own detached fragment metadata plus
+ * the complete native final schema. Both output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_nulls(
+    const LanceFragment* fragment,
+    const struct ArrowSchema* columns,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add columns read from an Arrow stream with Native `Reader` semantics.
+ *
+ * This follows Python's fragment `add_columns_from_reader` mapping: the native
+ * `read_columns` argument is `None`. A non-NULL stream is consumed exactly once
+ * on every return path after ownership transfer. `batch_size == NULL` maps to
+ * native `None`; a non-NULL pointer is forwarded as `Some(value)`, including
+ * zero. Both outputs are success-only and contain detached fragment metadata
+ * plus the complete native final schema.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_stream(
+    const LanceFragment* fragment,
+    struct ArrowArrayStream* stream,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add columns through a borrowed BatchUDF declaration.
+ *
+ * The mapper, all four checkpoint callbacks, output-schema ownership and
+ * `block_in_place` behavior are shared with the dataset add-columns path.
+ * `read_columns == NULL` maps to native `None`; a non-NULL NULL-terminated
+ * array maps to `Some`, including an immediately terminated empty array.
+ * `batch_size == NULL` maps to `None`; zero remains `Some(0)`.
+ *
+ * Callback contexts remain borrowed until this synchronous call returns.
+ * Callbacks may read through independent dataset handles or existing snapshots;
+ * they must not use a closed handle. Both outputs are success-only.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_batch_udf(
+    const LanceFragment* fragment,
+    const LanceBatchUDF* udf,
+    const char* const* read_columns,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Merge a right-hand Arrow stream into one bound fragment with a native join.
+ *
+ * The bound fragment is cloned before Native `FileFragment::merge_columns`.
+ * Native owns left/right column validation, the left join, schema merge,
+ * nullability behavior and final field identities. A non-NULL stream is
+ * consumed exactly once.
+ *
+ * On success both outputs are written and own detached fragment metadata plus
+ * the complete native final schema. Both output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_merge_columns(
+    const LanceFragment* fragment,
+    struct ArrowArrayStream* stream,
+    const char* left_on,
+    const char* right_on,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Rewrite existing columns in one bound fragment through a native join.
+ *
+ * This calls Native `FileFragment::update_columns_with_offsets` on a cloned
+ * bound fragment. The result owns complete updated fragment metadata, the
+ * native modified field IDs and the native RoaringBitmap of matched physical
+ * row offsets. A non-NULL stream is consumed exactly once.
+ *
+ * On success `*out_result` receives an independently owned result. Close it
+ * with `lance_fragment_update_columns_result_close`. The output slot is
+ * unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns(
+    const LanceFragment* fragment,
+    struct ArrowArrayStream* stream,
+    const char* left_on,
+    const char* right_on,
+    LanceFragmentUpdateColumnsResult** out_result
+);
+
+/**
+ * Stage a replacement data file for existing fragment columns.
+ *
+ * The native schema is borrowed and forwarded unchanged. The consumed Arrow
+ * stream must produce the fragment's physical rows, including deleted slots.
+ * Native owns file-version, schema/layout, Blob preparation, row-alignment and
+ * failure-cleanup behavior. On success `*out_group` receives an independently
+ * owned `DataReplacementGroup`; the output slot is unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_write_columns(
+    const LanceFragment* fragment,
+    const LanceSchema* schema,
+    struct ArrowArrayStream* stream,
+    LanceDataReplacementGroup** out_group
+);
+
+/**
+ * Stage a replacement data file using an explicit file-format version.
+ *
+ * `file_version` uses the `LanceFileFormatVersion` discriminants:
+ * V1=0, V2_0=1, V2_1=2, V2_2=3, V2_3=4. Native `write_column_with_version`
+ * owns V1 rejection, V2 compatibility and all layout checks. Stream ownership
+ * and output behavior match `lance_fragment_write_columns`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_write_column_with_version(
+    const LanceFragment* fragment,
+    const LanceSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t file_version,
+    LanceDataReplacementGroup** out_group
+);
+
+/**
+ * Add physical row offsets to a clone of one bound fragment.
+ *
+ * Offsets are forwarded unchanged to Native `FileFragment::extend_deletions`.
+ * No binding-side range, sort, duplicate or full-deletion policy is added.
+ * The source handle remains usable. On success a partial deletion returns an
+ * independently owned bound fragment and a full deletion returns NULL. The
+ * output slot is unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_delete_rows(
+    const LanceFragment* fragment,
+    const uint32_t* offsets,
+    size_t offset_count,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Close an update-columns result. NULL-safe.
+ */
+void lance_fragment_update_columns_result_close(
+    LanceFragmentUpdateColumnsResult* result
+);
+
+/**
+ * Clone the updated fragment metadata into an independent handle.
+ *
+ * The returned handle is detached and owns complete metadata. The output slot
+ * is written only on success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_fragment(
+    const LanceFragmentUpdateColumnsResult* result,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the number of modified field IDs.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_fields_modified_count(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint64_t* out_count
+);
+
+/**
+ * Read one modified field ID in native result order.
+ *
+ * @return 0 on success, -1 on error. The output is unchanged on error.
+ */
+int32_t lance_fragment_update_columns_result_fields_modified_at(
+    const LanceFragmentUpdateColumnsResult* result,
+    size_t index,
+    uint32_t* out_field_id
+);
+
+/**
+ * Read the number of matched physical row offsets.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offset_count(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint64_t* out_count
+);
+
+/**
+ * Read one matched physical row offset in stable bitmap order.
+ *
+ * Values remain in their native u32 domain. For all offsets, prefer
+ * lance_fragment_update_columns_result_matched_offsets() to avoid restarting
+ * the bitmap traversal for each index.
+ *
+ * @return 0 on success, -1 on error. The output is unchanged on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offset_at(
+    const LanceFragmentUpdateColumnsResult* result,
+    size_t index,
+    uint32_t* out_offset
+);
+
+/**
+ * Serialize the matched offsets with the portable Roaring format.
+ *
+ * This optional interoperability export is separate from typed Update
+ * construction. The malloc-compatible buffer is allocated on success and must
+ * be released with `lance_free_bytes`; a zero-length encoding yields NULL.
+ * Both outputs are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offsets_serialize(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Copy all matched physical row offsets in one native bitmap traversal.
+ *
+ * The caller owns out_offsets, with count writable uint32_t elements. count
+ * must equal the value written by
+ * lance_fragment_update_columns_result_matched_offset_count().
+ * NULL out_offsets is valid for an empty result with count == 0. Values retain
+ * native bitmap order and remain valid after the result handle is closed.
+ *
+ * @return 0 on success, -1 on error. The output buffer is unchanged on error.
+ */
+int32_t lance_fragment_update_columns_result_matched_offsets(
+    const LanceFragmentUpdateColumnsResult* result,
+    uint32_t* out_offsets,
+    size_t count
 );
 
 /* ─── Random access ─── */
@@ -2743,6 +4420,373 @@ int32_t lance_blob_file_is_closed(
  * @param blob  Blob handle, or NULL.
  */
 void lance_blob_file_close(LanceBlobFile* blob);
+
+/* ─── Blob v2 fields and prepared descriptor arrays ─── */
+
+/**
+ * Native storage thresholds for a blob v2 field.
+ *
+ * Each optional threshold is selected by its `has_*` flag. An enabled inline
+ * threshold of zero is valid. An enabled dedicated threshold must be non-zero
+ * because native `NonZeroUsize` cannot represent zero. Values wider than the
+ * platform `size_t` are rejected rather than truncated. A zero-initialized
+ * struct selects native defaults (both thresholds absent).
+ */
+typedef struct LanceBlobFieldOptions {
+    bool has_inline_size_threshold;
+    uint64_t inline_size_threshold;
+    bool has_dedicated_size_threshold;
+    uint64_t dedicated_size_threshold;
+} LanceBlobFieldOptions;
+
+/**
+ * Export the native blob v2 field with default storage thresholds.
+ *
+ * The exported field is the complete native `lance::blob_field` result:
+ * `Struct<data: LargeBinary?, uri: Utf8?>`, extension name
+ * `lance.blob.v2`, and its native field metadata. The caller owns `out` and
+ * must invoke its non-NULL release callback exactly once. `out` is written
+ * only on success.
+ *
+ * @param name      Field name. May be empty but must not be NULL.
+ * @param nullable  Native field nullability.
+ * @param out       Caller-owned ArrowSchema. Must not be NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_field(
+    const char* name,
+    bool nullable,
+    struct ArrowSchema* out
+);
+
+/**
+ * Export the native blob v2 field with explicit storage thresholds.
+ *
+ * `options == NULL` selects native defaults. Threshold conversion follows
+ * LanceBlobFieldOptions. The result is otherwise identical to
+ * lance_blob_field().
+ *
+ * @param name      Field name. May be empty but must not be NULL.
+ * @param nullable  Native field nullability.
+ * @param options   Optional threshold options, or NULL for defaults.
+ * @param out       Caller-owned ArrowSchema. Must not be NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_field_with_options(
+    const char* name,
+    bool nullable,
+    const LanceBlobFieldOptions* options,
+    struct ArrowSchema* out
+);
+
+/**
+ * Create a native writer-prepared blob descriptor array builder.
+ *
+ * This wraps `lance::BlobDescriptorArrayBuilder`. It builds the prepared
+ * struct representation consumed by dataset writes; it does not allocate blob
+ * IDs, write payload objects, choose sidecar paths, or commit data.
+ *
+ * @param column  Blob column name. Must not be NULL.
+ * @return Builder handle, or NULL on error.
+ */
+LanceBlobDescriptorArrayBuilder* lance_blob_descriptor_array_builder_new(
+    const char* column
+);
+
+/**
+ * Export the complete native prepared field for this column.
+ *
+ * The field remains exportable after a successful or failed finish. `out` is
+ * caller-owned and is written only on success.
+ *
+ * @param builder  Builder handle. Must not be NULL.
+ * @param out      Caller-owned ArrowSchema. Must not be NULL.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_field(
+    const LanceBlobDescriptorArrayBuilder* builder,
+    struct ArrowSchema* out
+);
+
+/**
+ * Append an inline payload.
+ *
+ * `data == NULL && len == 0` is a valid empty inline blob. A NULL data pointer
+ * with non-zero len is an error. Foreign bytes are copied before the call
+ * returns.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_inline(
+    LanceBlobDescriptorArrayBuilder* builder,
+    const uint8_t* data,
+    size_t len
+);
+
+/**
+ * Append a null blob descriptor.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_null(
+    LanceBlobDescriptorArrayBuilder* builder
+);
+
+/**
+ * Append one packed descriptor for `offset..offset + length`.
+ *
+ * `length` maps to native `BlobRange.size`. Native validates the blob ID and
+ * the 64-bit range before appending.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_packed(
+    LanceBlobDescriptorArrayBuilder* builder,
+    uint32_t blob_id,
+    uint64_t offset,
+    uint64_t length
+);
+
+/**
+ * Append one packed descriptor per range in input order.
+ *
+ * Native pushes one range at a time. If a later range is invalid, all ranges
+ * before it remain appended and the error is returned. `ranges` may be NULL
+ * only when `num_ranges == 0`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_extend_packed(
+    LanceBlobDescriptorArrayBuilder* builder,
+    uint32_t blob_id,
+    const LanceBlobRange* ranges,
+    size_t num_ranges
+);
+
+/**
+ * Append one dedicated descriptor. Native validates the blob ID.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_dedicated(
+    LanceBlobDescriptorArrayBuilder* builder,
+    uint32_t blob_id,
+    uint64_t length
+);
+
+/**
+ * Append one Managed descriptor.
+ *
+ * `has_base_id == false` maps to native `base_id: None`; true maps to
+ * `Some(base_id)`, including explicit base ID 0. Native validates that `uri`
+ * is a canonical relative object path and that `offset + length` does not
+ * overflow. Whether the base is registered and whether the dataset schema opts
+ * in through `lance.blob.managed=true` are validated by the native dataset
+ * write path, not by this builder.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_managed(
+    LanceBlobDescriptorArrayBuilder* builder,
+    const char* uri,
+    uint64_t offset,
+    uint64_t length,
+    bool has_base_id,
+    uint32_t base_id
+);
+
+/**
+ * Append one External descriptor with an explicit native base ID.
+ *
+ * Native rejects an empty URI and an overflowing `offset + length`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_append_external(
+    LanceBlobDescriptorArrayBuilder* builder,
+    uint32_t base_id,
+    const char* uri,
+    uint64_t offset,
+    uint64_t length
+);
+
+/**
+ * Append an External descriptor through native `push_external`.
+ *
+ * This convenience sets native `base_id = 0`. When `has_range` is false,
+ * native receives `None` and stores offset 0, length 0. When true, the range is
+ * passed through, including an explicit 0/0 range. `offset` and `length` are
+ * ignored when `has_range` is false.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_push_external(
+    LanceBlobDescriptorArrayBuilder* builder,
+    const char* uri,
+    bool has_range,
+    uint64_t offset,
+    uint64_t length
+);
+
+/**
+ * Finish the native prepared descriptor column and export both parts.
+ *
+ * This consumes the native builder. On every return path, later append calls
+ * report that the builder is finished; `field` remains available. On success
+ * `out_array` receives an owned ArrowArray and `out_schema` receives the
+ * complete native prepared field (including extension and threshold
+ * metadata). The caller must release each non-NULL output exactly once.
+ *
+ * Both outputs are written only after the complete native finish and both FFI
+ * conversions succeed. On error neither output is modified.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_blob_descriptor_array_builder_finish(
+    LanceBlobDescriptorArrayBuilder* builder,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Free a descriptor builder handle. NULL is a no-op. An unfinished native
+ * builder is dropped without sidecar rollback or publication.
+ */
+void lance_blob_descriptor_array_builder_close(
+    LanceBlobDescriptorArrayBuilder* builder
+);
+
+/* ─── Planned whole-blob and blob-range reads ─── */
+
+/**
+ * Row selector for planned blob reads. The C ABI passes this as an int32_t,
+ * so callers built with non-default enum sizing cannot mismatch the Rust ABI.
+ *
+ * NONE leaves the native builder without a selection and therefore preserves
+ * the native "requires a row selection" error. IDS, ADDRESSES and INDICES with
+ * a zero count are explicit empty selections and produce an empty stream.
+ */
+typedef enum {
+    LANCE_BLOB_ROWS_NONE      = 0,
+    LANCE_BLOB_ROWS_IDS       = 1,
+    LANCE_BLOB_ROWS_ADDRESSES = 2,
+    LANCE_BLOB_ROWS_INDICES   = 3,
+} LanceBlobRowSelector;
+
+/**
+ * Result ordering for planned blob reads.
+ */
+typedef enum {
+    LANCE_BLOB_READ_PRESERVE_ORDER = 0,
+    LANCE_BLOB_READ_UNORDERED      = 1,
+} LanceBlobReadOrder;
+
+/**
+ * Optional controls for planned blob reads.
+ *
+ * A NULL options pointer means `io_buffer_size = None` and native
+ * `preserve_order = true`. `has_io_buffer_size = true` forwards the value
+ * verbatim; zero is an explicit native value and is rejected by the native
+ * builder rather than replaced with a default. `order` is a
+ * LanceBlobReadOrder value.
+ */
+typedef struct LanceBlobReadOptions {
+    bool has_io_buffer_size;
+    uint64_t io_buffer_size;
+    int32_t order;
+} LanceBlobReadOptions;
+
+/**
+ * One row-specific blob-range request.
+ *
+ * `row` has the meaning selected by LanceBlobRowSelector. `offset` and
+ * `length` are blob-local bytes and map directly to native
+ * `BlobReadRange.offset/length`.
+ */
+typedef struct LanceBlobRangeRequest {
+    uint64_t row;
+    uint64_t offset;
+    uint64_t length;
+} LanceBlobRangeRequest;
+
+/**
+ * Plan and export whole-blob reads.
+ *
+ * The returned Arrow stream schema is, in order:
+ * 1. `row_address: UInt64`, non-null
+ * 2. `data: LargeBinary`, nullable
+ *
+ * Exactly one Arrow record follows each native `ReadBlob` result. NULL blob
+ * values have a null `data` entry; valid empty blobs have a non-null empty
+ * buffer. Native ordering, duplicate selection and payload bytes are
+ * preserved. Selected input rows are copied before native state retains them.
+ * Native payload `Bytes` are retained directly by the Arrow buffers; payload
+ * bytes are not copied when an Arrow record is assembled.
+ *
+ * Column lookup and read planning run in this factory and their errors are
+ * returned before any output stream exists. Payload I/O errors happen while
+ * consuming the stream and use the ArrowArrayStream error contract
+ * (`get_next` nonzero plus `get_last_error`). Closing the dataset handle does
+ * not invalidate a successfully created stream. Exported batches own their
+ * buffers and remain valid after the stream is released.
+ *
+ * `out` is written only after successful native planning and Arrow stream
+ * export, and must then be released exactly once. On error it is untouched.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_read_blobs(
+    const LanceDataset* dataset,
+    const char* column,
+    int32_t selector,
+    const uint64_t* rows,
+    size_t num_rows,
+    const LanceBlobReadOptions* options,
+    struct ArrowArrayStream* out
+);
+
+/**
+ * Plan and export one blob-local range read per request.
+ *
+ * The returned Arrow stream schema is, in order:
+ * 1. `request_index: UInt64`, non-null
+ * 2. `row_address: UInt64`, non-null
+ * 3. `offset: UInt64`, non-null
+ * 4. `length: UInt64`, non-null
+ * 5. `data: LargeBinary`, nullable
+ *
+ * Exactly one Arrow record follows each native `ReadBlobRange`. `request_index`
+ * is the zero-based input position and remains present for duplicate and
+ * unordered requests. NULL blobs have null `data`; a non-null blob with an
+ * empty range has a non-null empty buffer.
+ * Native payload `Bytes` are retained directly by the Arrow buffers; payload
+ * bytes are not copied when an Arrow record is assembled.
+ *
+ * Native validation stages are retained. Request offset-plus-length overflow,
+ * scheduler buffer validation and physical range planning happen in the
+ * factory. Native null-blob requests skip logical bounds checks. Payload I/O
+ * errors happen while consuming the stream and use the ArrowArrayStream error
+ * contract. Exported batches own their buffers and remain valid after the
+ * stream is released.
+ *
+ * Planning retains O(request_count) metadata. `io_buffer_size` bounds each
+ * scheduler-visible physical batch after range coalescing, except that one
+ * request larger than the buffer is materialized by itself. The scheduler
+ * separately applies byte backpressure to physical I/O; this is not a hard cap
+ * on all process memory.
+ *
+ * `out` is written only after successful native planning and Arrow stream
+ * export, and must then be released exactly once. On error it is untouched.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_read_blob_ranges(
+    const LanceDataset* dataset,
+    const char* column,
+    int32_t selector,
+    const LanceBlobRangeRequest* requests,
+    size_t num_requests,
+    const LanceBlobReadOptions* options,
+    struct ArrowArrayStream* out
+);
 
 /* ─── Scanner builder ─── */
 
@@ -3580,6 +5624,25 @@ int32_t lance_batch_to_arrow(
     struct ArrowSchema* out_schema
 );
 
+/**
+ * Import one Arrow record batch.
+ *
+ * A non-NULL `array` is consumed on every return, including validation and
+ * conversion failures. The source slot is left in its canonical released
+ * state. `schema` is borrowed and is never released or modified. `out` is
+ * written only on success and is unchanged on failure.
+ *
+ * The complete schema is retained, including schema metadata, field metadata,
+ * and extension metadata. A zero-column batch retains its row count.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_batch_from_arrow(
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    LanceBatch** out
+);
+
 /** Free a batch handle. */
 void lance_batch_free(LanceBatch* batch);
 
@@ -3612,6 +5675,70 @@ int32_t lance_write_fragments(
     const char* const* storage_opts
 );
 
+/**
+ * Event codes for LanceIndexBuildProgressCallback, passed as the `event`
+ * argument. Exactly one stage is active at a time: a stage's
+ * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE is always delivered before the
+ * next stage's LANCE_INDEX_BUILD_PROGRESS_STAGE_START.
+ */
+typedef enum {
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_START = 0,
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS = 1,
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE = 2,
+} LanceIndexBuildProgressEvent;
+
+/**
+ * Receives progress from an ordinary index creation or an uncommitted segment
+ * build.
+ *
+ * `stage` is non-NULL, NUL-terminated, and borrowed: it is valid only for the
+ * duration of this call. `unit` is non-NULL and NUL-terminated, but is the
+ * empty string ("") for LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS and
+ * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE. The parameter mapping is:
+ *
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_START: `stage` is the stage name,
+ *    `total` is the number of work units (0 = unknown), `unit` describes what
+ *    is being counted (e.g. "partitions", "batches", "rows"; "" = unknown),
+ *    and `completed` is 0.
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS: `total` is 0, `unit` is "",
+ *    and `completed` is the number of units completed so far.
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE: `total` is 0, `unit` is "",
+ *    and `completed` is 0.
+ *
+ * Stage names are index-type-specific (for example "train_ivf", "shuffle",
+ * "merge_partitions" and "load_data") and are diagnostic-only: they are not a
+ * stable cross-version contract, so consumers must treat them as opaque
+ * strings.
+ *
+ * The callback is invoked from lance-c's internal tokio runtime worker
+ * threads. Certain stages report progress concurrently from parallel worker
+ * tasks, so the callback MUST be thread-safe. It must be non-blocking and must
+ * not call runtime-backed `lance_*` entry points or access the dataset handle
+ * being indexed. An ordinary build holds that dataset's mutation lock for the
+ * duration of the call, so the callback must not synchronously re-enter the
+ * same handle or start or block on a nested runtime.
+ * Non-runtime leaf utilities such as `lance_free_string` are unaffected.
+ *
+ * `callback_ctx` is opaque and may be NULL. The callback and context must
+ * remain valid until the blocking call that installed them returns. lance-c
+ * disables the callback and drains in-flight invocations through a retirement
+ * gate before returning, including on error, so no invocation remains after
+ * that boundary. Progress reporting is advisory and cannot affect the build
+ * outcome or cancel the build.
+ *
+ * The callback is invoked without a panic guard: it must return normally,
+ * because unwinding or throwing across this boundary can abort the host
+ * process.
+ */
+typedef void (*LanceIndexBuildProgressCallback)(
+    void* callback_ctx,
+    int32_t event,
+    const char* stage,
+    uint64_t total,
+    const char* unit,
+    uint64_t completed
+);
+
 /* ─── Index lifecycle (Phase 2) ─── */
 
 /**
@@ -3628,6 +5755,79 @@ int32_t lance_dataset_create_vector_index(
     const char* column,
     const char* index_name,
     const LanceVectorIndexParams* params,
+    bool replace
+);
+
+/**
+ * Create a vector index from legacy parameters with optional progress.
+ *
+ * This is the legacy `LanceVectorIndexParams` entry point plus an observer.
+ * A NULL `callback` disables observation and preserves the legacy behavior;
+ * a non-NULL callback follows LanceIndexBuildProgressCallback's contract and
+ * is retired before this blocking call returns. Parameters, name generation,
+ * replacement and native errors are the same as
+ * lance_dataset_create_vector_index().
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_vector_index_with_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexParams* params,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
+    bool replace
+);
+
+/**
+ * Create a vector index from additive native options.
+ *
+ * The native builder commits the index and then reloads committed metadata.
+ * An error can therefore be returned after the dataset version has already
+ * been published. Reopen the dataset to determine its current version; the
+ * binding does not claim storage rollback.
+ *
+ * `options` is borrowed for the call and must not be NULL.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_vector_index_with_options(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexOptions* options,
+    bool replace
+);
+
+/**
+ * Create a vector index from additive native options with optional progress.
+ *
+ * This is lance_dataset_create_vector_index_with_options() plus an observer.
+ * A NULL `callback` disables observation and preserves the legacy behavior;
+ * a non-NULL callback follows LanceIndexBuildProgressCallback's contract and
+ * is retired before this blocking call returns. All option forms, train
+ * controls, name generation, replacement and native errors are unchanged.
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_vector_index_with_options_and_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexOptions* options,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
     bool replace
 );
 
@@ -3651,13 +5851,87 @@ int32_t lance_dataset_create_scalar_index(
     bool replace
 );
 
+/**
+ * Create a scalar index with optional ordinary native build progress.
+ *
+ * This is the legacy scalar entry point plus an observer. A NULL `callback`
+ * disables observation and preserves the legacy behavior; a non-NULL callback
+ * follows LanceIndexBuildProgressCallback's contract and is retired before
+ * this blocking call returns. `params_json`, name generation, replacement and
+ * native errors are unchanged.
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_scalar_index_with_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    LanceScalarIndexType index_type,
+    const char* params_json,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
+    bool replace
+);
+
+/**
+ * Create a scalar index with the additive native train control.
+ *
+ * `options == NULL` or `options->has_train == false` preserves the native
+ * default. `params_json` remains the native plugin parameter object.
+ */
+int32_t lance_dataset_create_scalar_index_with_options(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    LanceScalarIndexType index_type,
+    const char* params_json,
+    const LanceScalarIndexOptions* options,
+    bool replace
+);
+
+/**
+ * Create a scalar index with native train controls and optional progress.
+ *
+ * This is lance_dataset_create_scalar_index_with_options() plus an observer.
+ * A NULL `callback` disables observation and preserves the legacy behavior;
+ * a non-NULL callback follows LanceIndexBuildProgressCallback's contract and
+ * is retired before this blocking call returns. `options == NULL` or
+ * `options->has_train == false` still preserves the native train default.
+ *
+ * Native Lance commits before reloading index metadata, so an error can be
+ * returned after a dataset version was published. This call does not claim
+ * rollback on every nonzero return; reopen the dataset to inspect its current
+ * version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_scalar_index_with_options_and_progress(
+    LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    LanceScalarIndexType index_type,
+    const char* params_json,
+    const LanceScalarIndexOptions* options,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx,
+    bool replace
+);
+
 /* ─── Uncommitted index segment build ─── */
 
 /**
  * Options for an uncommitted index segment build.
  *
- * `fragment_ids == NULL && fragment_count == 0` selects the whole dataset.
- * Any non-empty fragment list is copied when the builder is created.
+ * `fragment_ids == NULL && fragment_count == 0` preserves native None and
+ * selects the whole dataset. A non-NULL pointer with `fragment_count == 0`
+ * preserves native Some(empty). Any non-empty list is copied when the builder
+ * is created. Duplicate and missing-ID handling follows the native
+ * CreateIndexBuilder at build time.
  * `index_uuid`, when non-NULL, points to exactly 16 RFC 4122 bytes and is also
  * copied during builder creation. Lance does not support an assigned UUID for
  * fragment-scoped BTree builds; leave it NULL for that combination.
@@ -3723,6 +5997,21 @@ typedef struct LanceVectorIndexSegmentParams {
 } LanceVectorIndexSegmentParams;
 
 /**
+ * Fragment selection and optional segment UUID for the additive vector builder.
+ *
+ * A NULL scope preserves both native selections as None. Within a non-NULL
+ * scope, a NULL `fragment_ids` with count 0 is None, while a non-NULL pointer
+ * with count 0 is Some(empty). IDs and a non-NULL UUID are copied at builder
+ * creation; native Lance code decides duplicate/missing validation and timing.
+ * `index_uuid`, when non-NULL, points to exactly 16 RFC 4122 bytes.
+ */
+typedef struct LanceVectorIndexSegmentScope {
+    const uint32_t* fragment_ids;
+    size_t fragment_count;
+    const uint8_t* index_uuid;
+} LanceVectorIndexSegmentScope;
+
+/**
  * Create a single-use scalar index segment builder bound to the dataset's
  * current snapshot. The dataset handle is not consumed and need not outlive
  * the returned builder.
@@ -3744,6 +6033,20 @@ LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar(
 );
 
 /**
+ * Create a scalar segment builder with the additive native train control.
+ * `scalar_options == NULL` or an unset `has_train` preserves native defaults.
+ */
+LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar_with_options(
+    const LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    int32_t index_type,
+    const char* params_json,
+    const LanceScalarIndexOptions* scalar_options,
+    const LanceIndexSegmentBuildOptions* options
+);
+
+/**
  * Create a single-use vector index segment builder. Model arrays and schemas
  * are borrowed synchronously; arrays may be replaced but remain live and
  * caller-owned. When no model set is supplied, AUTO trains locally. PQ
@@ -3758,6 +6061,27 @@ LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector(
 );
 
 /**
+ * Create a single-use vector segment builder from additive native options.
+ * The builder owns a dataset snapshot. Strings, maps, paths, fragment IDs and
+ * UUID are copied; Arrow models are borrowed synchronously as described by
+ * LanceVectorIndexOptions. The dataset handle need not outlive the builder.
+ *
+ * `scope` may be NULL for whole-dataset/no-UUID semantics. `train` follows
+ * the native builder default unless `options->has_train` is true.
+ * Training with supplied PQ codebooks and DOT requires full dataset coverage
+ * on the selected core. A strict subset returns LANCE_ERR_INVALID_ARGUMENT,
+ * preserving the legacy protection against incompatible PQ assignment.
+ * Definition-only builds with `train` set to false accept fragment subsets.
+ */
+LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector_with_options(
+    const LanceDataset* dataset,
+    const char* column,
+    const char* index_name,
+    const LanceVectorIndexOptions* options,
+    const LanceVectorIndexSegmentScope* scope
+);
+
+/**
  * Train IVF centroids, exporting FixedSizeList<Float32>[vector_dimension].
  * The output structs must be zero-initialized; the caller owns and releases
  * both Arrow C Data Interface outputs after success.
@@ -3769,6 +6093,23 @@ int32_t lance_index_train_ivf_model(
     int32_t metric,
     const uint32_t* fragment_ids,
     size_t fragment_count,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Train IVF centroids with native sample-rate and iteration controls.
+ * `options == NULL` is equivalent to both fields absent. A present zero is
+ * forwarded to Lance; this binding does not add a zero-value policy.
+ */
+int32_t lance_index_train_ivf_model_with_options(
+    const LanceDataset* dataset,
+    const char* column,
+    uint32_t num_partitions,
+    int32_t metric,
+    const uint32_t* fragment_ids,
+    size_t fragment_count,
+    const LanceIndexTrainerOptions* options,
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema
 );
@@ -3798,6 +6139,98 @@ int32_t lance_index_train_pq_model(
 );
 
 /**
+ * Train a PQ codebook with native sample-rate and iteration controls.
+ * The IVF centroids and Arrow output otherwise follow
+ * lance_index_train_pq_model.
+ */
+int32_t lance_index_train_pq_model_with_options(
+    const LanceDataset* dataset,
+    const char* column,
+    uint32_t num_sub_vectors,
+    uint32_t num_bits,
+    int32_t metric,
+    const uint32_t* fragment_ids,
+    size_t fragment_count,
+    struct ArrowArray* ivf_centroids,
+    const struct ArrowSchema* ivf_centroids_schema,
+    const LanceIndexTrainerOptions* options,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Open the first physical vector segment named `index_name` and return an
+ * owned clone of its IVF model. The handle does not borrow the dataset.
+ *
+ * Returns NULL on error. `index_name` must be non-NULL and non-empty.
+ */
+LanceIvfModel* lance_dataset_get_ivf_model(
+    const LanceDataset* dataset,
+    const char* index_name
+);
+
+/** Free an IVF model. NULL-safe. */
+void lance_ivf_model_free(LanceIvfModel* model);
+
+/** Whether the model contains centroids. NULL sets INVALID_ARGUMENT. */
+bool lance_ivf_model_has_centroids(const LanceIvfModel* model);
+
+/**
+ * Export an owned Arrow copy of the centroids. Both output structs must be
+ * zero-initialized and are unchanged on error. A model without centroids
+ * returns LANCE_ERR_NOT_FOUND.
+ */
+int32_t lance_ivf_model_export_centroids(
+    const LanceIvfModel* model,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Native partition count, dimension, and per-partition row count.
+ *
+ * These return 0 on an error sentinel; check lance_last_error_code(). An
+ * absent partition also returns 0 from lance_ivf_model_partition_size(),
+ * preserving IvfModel::partition_size for every representable usize.
+ */
+uint64_t lance_ivf_model_num_partitions(const LanceIvfModel* model);
+uint64_t lance_ivf_model_dimension(const LanceIvfModel* model);
+uint64_t lance_ivf_model_partition_size(
+    const LanceIvfModel* model,
+    uint64_t partition_id
+);
+
+/**
+ * Read one logical IVF partition across every physical segment.
+ *
+ * The returned ArrowArrayStream owns its native snapshot and remains valid
+ * after the source dataset is closed. The caller releases it once with its
+ * Arrow release callback.
+ */
+int32_t lance_dataset_read_index_partition(
+    const LanceDataset* dataset,
+    const char* index_name,
+    uint64_t partition_id,
+    bool with_vector,
+    struct ArrowArrayStream* out_stream
+);
+
+/**
+ * Build a portable IVF_RQ fast-rotation model as native
+ * RabitQuantizationMetadata JSON.
+ *
+ * `dimension` must be positive and divisible by 8. `num_bits == 0` selects the
+ * native RQ default of 5. The returned JSON can be shared across fragment
+ * builds through LanceVectorIndexOptions.rabitq_model_json. Matrix rotations
+ * are not emitted because their dense matrix is skipped by the native JSON
+ * representation.
+ *
+ * Returns a library-owned NUL-terminated string on success, or NULL on error.
+ * Free a successful result with lance_free_string().
+ */
+const char* lance_index_build_rq_model(uint32_t dimension, uint32_t num_bits);
+
+/**
  * Build segment artifacts without committing them to the dataset manifest.
  * The builder is single-use, including when execution fails.
  *
@@ -3811,61 +6244,6 @@ int32_t lance_index_segment_builder_execute_uncommitted(
     LanceIndexSegmentBuilder* builder,
     uint8_t** out_bytes,
     size_t* out_len
-);
-
-/**
- * Event codes for LanceIndexBuildProgressCallback, passed as the `event`
- * argument. Exactly one stage is active at a time: a stage's
- * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE is always delivered before the
- * next stage's LANCE_INDEX_BUILD_PROGRESS_STAGE_START.
- */
-typedef enum {
-    LANCE_INDEX_BUILD_PROGRESS_STAGE_START = 0,
-    LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS = 1,
-    LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE = 2,
-} LanceIndexBuildProgressEvent;
-
-/**
- * Receives index build progress events while
- * lance_index_segment_builder_execute_uncommitted runs.
- *
- * `stage` is non-NULL, NUL-terminated, and borrowed: it is valid only for the
- * duration of this call. `unit` is non-NULL and NUL-terminated, but is the
- * empty string ("") for LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS and
- * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE. The parameter mapping is:
- *
- *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_START: `stage` is the stage name,
- *    `total` is the number of work units (0 = unknown), `unit` describes what
- *    is being counted (e.g. "partitions", "batches", "rows"; "" = unknown),
- *    and `completed` is 0.
- *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS: `total` is 0, `unit` is "",
- *    and `completed` is the number of units completed so far.
- *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE: `total` is 0, `unit` is "",
- *    and `completed` is 0.
- *
- * Stage names are index-type-specific (e.g. "train_ivf", "shuffle",
- * "merge_partitions" for vector indices; "load_data" for scalar indices) and
- * are diagnostic-only: they are not a stable cross-version contract, so
- * consumers must treat them as opaque strings.
- *
- * The callback is invoked from lance-c's internal tokio runtime worker
- * threads. Certain stages report progress concurrently from parallel worker
- * tasks, so the callback MUST be thread-safe and reentrant. It must be
- * non-blocking and must not call back into any `lance_*` function (no
- * reentrancy).
- *
- * The callback is invoked without a panic guard: it must return normally,
- * because unwinding or throwing across this boundary can abort the host
- * process. The callback cannot abort the build; progress reporting is
- * advisory and diagnostic and cannot affect the build outcome.
- */
-typedef void (*LanceIndexBuildProgressCallback)(
-    void* callback_ctx,
-    int32_t event,
-    const char* stage,
-    uint64_t total,
-    const char* unit,
-    uint64_t completed
 );
 
 /**
@@ -3885,12 +6263,39 @@ typedef void (*LanceIndexBuildProgressCallback)(
  * afterwards. `callback` and `callback_ctx` must therefore remain valid and
  * safe to invoke until lance_index_segment_builder_execute_uncommitted
  * returns. See LanceIndexBuildProgressCallback for the full threading and
- * reentrancy contract.
+ * lifetime contract.
  *
  * @return 0 on success, -1 on error.
  */
 int32_t lance_index_segment_builder_set_progress_callback(
     LanceIndexSegmentBuilder* builder,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx
+);
+
+/**
+ * Merge distributed Inverted index files for `index_uuid` into one root
+ * artifact. This call writes/merges files only: it does not commit a dataset
+ * version or return metadata. On error, partial files may remain.
+ *
+ * `index_uuid` points to 16 RFC 4122 bytes. `index_type` is parsed by native
+ * Lance; at this pin only "Inverted" is supported by this merge path. Other
+ * native index types return their native errors. `has_batch_readhead` absent
+ * maps to None; true forwards Some(batch_readhead), including zero. The
+ * selected core currently ignores this parameter.
+ *
+ * A non-NULL callback follows LanceIndexBuildProgressCallback's threading and
+ * lifetime contract. Callback retirement is enforced before this blocking
+ * call returns.
+ *
+ * Complete publication requires a separate CreateIndex operation.
+ */
+int32_t lance_dataset_merge_index_metadata(
+    const LanceDataset* dataset,
+    const uint8_t index_uuid[16],
+    const char* index_type,
+    bool has_batch_readhead,
+    size_t batch_readhead,
     LanceIndexBuildProgressCallback callback,
     void* callback_ctx
 );
@@ -3993,6 +6398,147 @@ int32_t lance_index_segment_metadata_fragment_ids(
     size_t* out_count
 );
 
+/**
+ * Clone parsed index metadata into an independent handle.
+ *
+ * The clone copies the complete in-memory native value, including optional
+ * index details, fragment bitmap, created_at, base_id and files. It does not
+ * re-encode through protobuf, so an in-memory Some(empty) files vector remains
+ * distinct from None even though the protobuf decoder normalizes it.
+ * Returns NULL on error.
+ */
+LanceIndexSegmentMetadata* lance_index_segment_metadata_clone(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/**
+ * Clone parsed index metadata with caller-supplied fragment coverage.
+ *
+ * When `has_fragment_ids` is false, the native `fragment_bitmap` option is
+ * copied unchanged and `fragment_ids` / `fragment_count` are ignored. When
+ * true, the clone's coverage becomes some of the caller's IDs: `fragment_count
+ * == 0` maps to present-empty coverage, and a positive count requires
+ * `fragment_ids` to point at that many `uint32_t` values. IDs are copied into
+ * the native bitmap, which sorts them and treats them as a set.
+ *
+ * Every other native field is copied exactly, including name, field and
+ * covering declarations, dataset/index versions, index details, created_at,
+ * base_id, and files, together with their in-memory option presence. This call
+ * performs no coverage, overlap, staleness, index-family, or file validation;
+ * those rules remain with the native commit path. The source handle is
+ * unchanged and remains usable.
+ *
+ * Returns an independently owned handle, or NULL on error.
+ */
+LanceIndexSegmentMetadata* lance_index_segment_metadata_clone_with_fragment_ids(
+    const LanceIndexSegmentMetadata* metadata,
+    bool has_fragment_ids,
+    const uint32_t* fragment_ids,
+    size_t fragment_count
+);
+
+/**
+ * Encode parsed index metadata as protobuf-encoded Lance `IndexMetadata`.
+ *
+ * This explicitly serializes the complete in-memory native value. On success,
+ * `*out_bytes` receives a library-owned buffer of `*out_len` bytes that the
+ * caller frees with lance_free_bytes(). Both output slots are success-only and
+ * remain unchanged on error. Protobuf cannot distinguish some in-memory
+ * optionals, so encoding may normalize them (for example present-empty files
+ * decode as absent); cloning does not perform that normalization.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_index_segment_metadata_encode(
+    const LanceIndexSegmentMetadata* metadata,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Return the number of covering field IDs. Returns 0 on error; zero is also a
+ * valid count, so check lance_last_error_code().
+ */
+size_t lance_index_segment_metadata_covering_field_count(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/**
+ * Copy one covering field ID in metadata order.
+ * Returns 0 on success, -1 on error; `*out_field_id` is unchanged on error.
+ */
+int32_t lance_index_segment_metadata_covering_field_id_at(
+    const LanceIndexSegmentMetadata* metadata,
+    size_t index,
+    int32_t* out_field_id
+);
+
+/**
+ * Return the borrowed native `index_details.value` bytes.
+ *
+ * The pointer remains valid until the metadata handle is freed. A present but
+ * empty value returns a non-NULL pointer and writes `*out_len = 0`. Absent
+ * index details return NULL with LANCE_ERR_NOT_FOUND. `*out_len` is unchanged
+ * on error.
+ */
+const uint8_t* lance_index_segment_metadata_index_details_value(
+    const LanceIndexSegmentMetadata* metadata,
+    size_t* out_len
+);
+
+/**
+ * Return the number of files recorded in the metadata. Returns 0 on error or
+ * when the native `files` option is absent; check lance_last_error_code() to
+ * distinguish.
+ */
+size_t lance_index_segment_metadata_file_count(
+    const LanceIndexSegmentMetadata* metadata
+);
+
+/**
+ * Return one recorded file path, borrowed from the metadata handle. Returns
+ * NULL on error, including an out-of-range index.
+ */
+const char* lance_index_segment_metadata_file_path_at(
+    const LanceIndexSegmentMetadata* metadata,
+    size_t index
+);
+
+/**
+ * Copy one recorded file size. Returns 0 on success, -1 on error; `*out_size`
+ * is unchanged on error.
+ */
+int32_t lance_index_segment_metadata_file_size_at(
+    const LanceIndexSegmentMetadata* metadata,
+    size_t index,
+    uint64_t* out_size
+);
+
+/**
+ * Read the optional native `created_at` timestamp.
+ *
+ * On success, absent is reported with `is_set == false` and zeroed fields;
+ * present is reported with `is_set == true`. The output is unchanged on error.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_index_segment_metadata_created_at(
+    const LanceIndexSegmentMetadata* metadata,
+    LanceOptionalTimestamp* out_timestamp
+);
+
+/**
+ * Read the optional native `base_id`.
+ *
+ * On success, absent is reported with `is_set == false` and `base_id == 0`;
+ * present is reported with `is_set == true`. Both outputs are unchanged on
+ * error. Returns 0 on success, -1 on error.
+ */
+int32_t lance_index_segment_metadata_base_id(
+    const LanceIndexSegmentMetadata* metadata,
+    bool* out_is_set,
+    uint32_t* out_base_id
+);
+
 /** Free parsed segment metadata. NULL-safe. */
 void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
 
@@ -4049,6 +6595,54 @@ int32_t lance_dataset_commit_index_segments(
 );
 
 /**
+ * Merge existing uncommitted physical segments into one uncommitted segment.
+ *
+ * Every input is a protobuf-encoded native IndexMetadata. Native Lance owns
+ * all compatibility, replay, stale-fragment, coverage and type-family rules.
+ * An empty set is passed to native validation. On success, `*out_bytes` and
+ * `*out_len` receive a library-owned metadata buffer to free with
+ * lance_free_bytes(); publication still requires
+ * lance_dataset_commit_index_segments(). This call does not commit or mutate
+ * the in-memory dataset snapshot.
+ */
+int32_t lance_dataset_merge_index_segments(
+    const LanceDataset* dataset,
+    const uint8_t* const* segment_metadata_bytes,
+    const size_t* segment_metadata_lens,
+    size_t segment_count,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Native prewarm controls.
+ *
+ * When `has_segment_selection` is false, the UUID pointer and count are
+ * ignored and map to native None. When true, count 0 maps to Some(empty) and
+ * performs no segment work; a positive count requires `segment_uuids` to point
+ * at `segment_count * 16` bytes of concatenated RFC 4122 UUIDs. Unknown
+ * segment UUIDs return LANCE_ERR_NOT_FOUND.
+ */
+typedef struct LanceIndexPrewarmOptions {
+    bool with_position;
+    bool has_segment_selection;
+    const uint8_t* segment_uuids;
+    size_t segment_count;
+} LanceIndexPrewarmOptions;
+
+/**
+ * Synchronously prewarm selected physical segments with native FTS position
+ * controls. `options == NULL` preserves the legacy all-segment behavior.
+ * Existing index-name/schema-column collision handling applies. Cache entries
+ * remain evictable; no residency or latency guarantee is made.
+ */
+int32_t lance_dataset_prewarm_index_with_options(
+    const LanceDataset* dataset,
+    const char* index_name,
+    const LanceIndexPrewarmOptions* options
+);
+
+/**
  * Synchronously prewarm a logical index in the dataset's session index cache.
  *
  * Delegates to the Rust SDK's prewarm_index for all segments with index_name
@@ -4084,6 +6678,34 @@ uint64_t lance_dataset_index_count(const LanceDataset* dataset);
  * Returns NULL on error.
  */
 const char* lance_dataset_index_list_json(const LanceDataset* dataset);
+
+/**
+ * JSON array of every native IndexDescription, including system indexes.
+ *
+ * Each entry carries the native name/type URL/index type, keyed field IDs,
+ * resolved field paths, approximate indexed-row count, native details JSON,
+ * total size (null when any segment lacks file sizes), and segment metadata.
+ * Native details conversion and field-path errors are returned as errors; the
+ * binding does not substitute `{}` or fabricated field paths. For each
+ * segment, fragment_ids is null for unknown coverage and [] for known-empty
+ * coverage. An empty dataset returns [].
+ *
+ * Caller must free the returned string with lance_free_string().
+ */
+const char* lance_dataset_describe_indices_json(const LanceDataset* dataset);
+
+/**
+ * Return the native index-family-specific statistics JSON unchanged.
+ *
+ * An absent index or empty name returns LANCE_ERR_NOT_FOUND. On old corrupt
+ * fragment coverage the native path may publish a migration version before
+ * returning; this handle is not automatically refreshed. Caller must free the
+ * returned string with lance_free_string().
+ */
+const char* lance_dataset_index_statistics_json(
+    LanceDataset* dataset,
+    const char* index_name
+);
 
 /**
  * JSON array describing non-system physical index segments visible to the
@@ -4241,8 +6863,10 @@ int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t nprobes);
 /**
  * Set the minimum number of vector-index partitions to search.
  * This replaces only the minimum bound; the current maximum is preserved.
- * Must be greater than zero and no greater than `maximum_nprobes` when set.
- * An invalid resulting range is rejected without changing either bound.
+ * Must be greater than zero and no greater than an explicitly configured
+ * `maximum_nprobes`. A conflict with only a fixed `nprobes` value is reported
+ * when the nearest scan is prepared. An invalid explicit range is rejected
+ * without changing either bound.
  * Must be set before scanning starts.
  */
 int32_t lance_scanner_set_minimum_nprobes(
@@ -4253,14 +6877,30 @@ int32_t lance_scanner_set_minimum_nprobes(
 /**
  * Set the maximum number of vector-index partitions to search.
  * This replaces only the maximum bound; the current minimum is preserved.
- * Must be greater than zero and no less than `minimum_nprobes` when set.
+ * Must be greater than zero and no less than an explicitly configured
+ * `minimum_nprobes`. A conflict with only a fixed `nprobes` value is reported
+ * when the nearest scan is prepared.
  * This only affects prefiltered searches that need more candidates.
- * An invalid resulting range is rejected without changing either bound.
+ * An invalid explicit range is rejected without changing either bound.
  * Must be set before scanning starts.
  */
 int32_t lance_scanner_set_maximum_nprobes(
     LanceScanner* scanner,
     uint32_t maximum_nprobes
+);
+
+/**
+ * Set the native continuous IVF search effort.
+ *
+ * The value must be finite and in [0, 1]. Any explicit value, including 0.5,
+ * ignores a fixed nprobes count while explicit minimum and maximum bounds
+ * remain effective, regardless of setter order. Invalid values are rejected
+ * without changing the previous configuration. Must be set before scanning.
+ * A scanner without nearest() fails when materialized.
+ */
+int32_t lance_scanner_set_search_effort(
+    LanceScanner* scanner,
+    double effort
 );
 
 /**
@@ -4992,13 +7632,714 @@ int32_t lance_dataset_write_with_options(
     LanceDataset** out_dataset
 );
 
-/* ─── Native transactions ─── */
+/**
+ * Same as lance_dataset_write but attaches a native dynamic storage-options
+ * accessor instead of static storage_opts. The returned dataset retains the
+ * accessor and provider; later I/O follows native refresh, error and cache
+ * semantics. A NULL accessor uses native defaults. Static options belong in
+ * the accessor's initial options. This entry point keeps the legacy
+ * 20-version / 14-day auto-cleanup policy.
+ */
+int32_t lance_dataset_write_with_accessor(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Same as lance_dataset_write_with_params but attaches a native dynamic
+ * storage-options accessor instead of static storage_opts. The accessor is
+ * retained by the returned dataset. A NULL accessor uses native defaults.
+ * This entry point keeps the legacy 20/14 auto-cleanup policy.
+ */
+int32_t lance_dataset_write_with_params_and_accessor(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceWriteParams* params,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Same as lance_dataset_write_with_options but attaches a native dynamic
+ * storage-options accessor instead of static storage_opts. The accessor is
+ * retained by the returned dataset. A NULL accessor uses native defaults.
+ * `options` may be NULL to select native WriteParams::default().
+ */
+int32_t lance_dataset_write_with_options_and_accessor(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceWriteOptions* options,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Same as lance_dataset_write_with_options but composes with a foreign commit
+ * lock and an optional dynamic storage-options accessor.
+ *
+ * A non-NULL `storage_accessor` forwards its native accessor owner; NULL, or
+ * an accessor without an inner owner, selects native omission. A non-NULL
+ * `commit_lock` replaces the URI-derived handler; NULL keeps the native
+ * default. `session` may be NULL. The committed dataset retains both owners
+ * after this call returns.
+ *
+ * The stream is consumed on every return path except a NULL `stream`.
+ * `out_dataset` follows the same success-only contract as
+ * lance_dataset_write_with_options.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_write_with_options_with_commit_lock(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceWriteOptions* options,
+    const LanceStorageOptionsAccessor* storage_accessor,
+    const LanceSession* session,
+    const LanceCommitLock* commit_lock,
+    LanceDataset** out_dataset
+);
+
+/* ─── Owned native dataset-write options ─── */
+
+/**
+ * Opaque owner of one native `WriteParams` plus retained native owners.
+ *
+ * The handle is immutable after construction. It may be used by concurrent
+ * write calls, but `lance_native_write_options_close` must not run while any
+ * call that borrows the handle is still in flight.
+ */
+typedef struct LanceNativeWriteOptions LanceNativeWriteOptions;
+
+/**
+ * Native external blob handling for a dataset write.
+ *
+ * The FFI field is a fixed-width `int32_t`; out-of-range values are rejected
+ * with `LANCE_ERR_INVALID_ARGUMENT`.
+ */
+typedef enum {
+    LANCE_EXTERNAL_BLOB_REFERENCE = 0,
+    LANCE_EXTERNAL_BLOB_INGEST    = 1,
+} LanceExternalBlobMode;
+
+/**
+ * Borrowed list of native `u32` values.
+ *
+ * A NULL pointer maps to native `None`. A non-NULL pointer with `count == 0`
+ * maps to native `Some(empty)`. Values are copied by
+ * `lance_native_write_options_new`.
+ */
+typedef struct LanceUInt32List {
+    const uint32_t* items;
+    size_t          count;
+} LanceUInt32List;
+
+/**
+ * Borrowed list of NUL-terminated UTF-8 strings.
+ *
+ * A NULL pointer maps to native `None`. A non-NULL pointer with `count == 0`
+ * maps to native `Some(empty)`. Values are copied by
+ * `lance_native_write_options_new`.
+ */
+typedef struct LanceStringList {
+    const char* const* items;
+    size_t             count;
+} LanceStringList;
+
+/**
+ * One native `ObjectStoreParams` value for `WriteParams::base_store_params`.
+ *
+ * `base_path` is the exact map key. `storage_options_accessor` is cloned into
+ * the native params; a NULL handle or an accessor without an inner owner
+ * selects native `None`. Scalar fields use `has_*` flags so omitted values
+ * keep the native `ObjectStoreParams` defaults.
+ *
+ * Native object-store and wrapper trait hooks (`object_store`,
+ * `object_store_wrapper`) and feature-gated AWS credential providers have no
+ * C representation here. Use a `StorageOptionsAccessor` for static or
+ * provider-backed storage options.
+ */
+typedef struct LanceBaseStoreParams {
+    const char* base_path;
+    const LanceStorageOptionsAccessor* storage_options_accessor;
+    int32_t     has_block_size;
+    uint64_t    block_size;
+    int32_t     has_s3_credentials_refresh_offset;
+    uint64_t    s3_credentials_refresh_seconds;
+    uint32_t    s3_credentials_refresh_nanos;
+    int32_t     has_use_constant_size_upload_parts;
+    bool        use_constant_size_upload_parts;
+    int32_t     has_list_is_lexically_ordered;
+    bool        list_is_lexically_ordered;
+} LanceBaseStoreParams;
+
+/**
+ * Borrowed per-base storage parameter list.
+ *
+ * A NULL pointer maps to native `None`. A non-NULL pointer with `count == 0`
+ * maps to native `Some(empty)`. Duplicate `base_path` keys use native
+ * `HashMap` last-write-wins semantics.
+ */
+typedef struct LanceBaseStoreParamsList {
+    const LanceBaseStoreParams* items;
+    size_t                      count;
+} LanceBaseStoreParamsList;
+
+/**
+ * Native cumulative `WriteStats` passed to the write-stats callback.
+ *
+ * `bytes_written` and `rows_written` are cumulative. `files_written` counts
+ * completed native data files/fragments. Values describe actual native
+ * progress, not wrapper estimates.
+ */
+typedef struct LanceWriteStats {
+    uint64_t bytes_written;
+    uint64_t rows_written;
+    uint32_t files_written;
+} LanceWriteStats;
+
+/**
+ * Native fragment progress payload, borrowed for one callback invocation.
+ *
+ * `physical_rows` is present for complete-fragment events and normally absent
+ * for begin-fragment events, matching the native fragment state at each call.
+ */
+typedef struct LanceWriteFragmentProgressInfo {
+    uint64_t fragment_id;
+    int32_t  has_physical_rows;
+    uint64_t physical_rows;
+    uint64_t file_count;
+} LanceWriteFragmentProgressInfo;
+
+/**
+ * Report native begin/complete fragment progress.
+ *
+ * Return 0 on success. A nonzero status reports failure through `error`; the
+ * write then follows native cleanup and no-commit behavior. Callbacks may run
+ * concurrently from native worker threads and must be thread-safe. `info` is
+ * borrowed and must not be retained. `error` is zero-initialized before every
+ * invocation; `LanceCallbackError` uses the same code/message ownership rules
+ * as other callback APIs.
+ */
+typedef int32_t (*LanceWriteFragmentProgressCallback)(
+    void* callback_ctx,
+    const LanceWriteFragmentProgressInfo* info,
+    LanceCallbackError* error
+);
+
+/**
+ * Receive cumulative native `WriteStats`.
+ *
+ * Native write progress has no error channel. The callback must be cheap,
+ * non-blocking, thread-safe and must not unwind.
+ */
+typedef void (*LanceWriteStatsCallback)(
+    void* callback_ctx,
+    const LanceWriteStats* stats
+);
+
+/**
+ * Release a progress callback context exactly once.
+ *
+ * The final native progress owner invokes this callback, which may happen
+ * after the write entry point returns or while the options handle is closed.
+ * It may run on a native worker thread and must not unwind.
+ */
+typedef void (*LanceNativeWriteProgressRelease)(void* callback_ctx);
+
+/**
+ * Foreign dataset-write progress callbacks and their owned context.
+ *
+ * Ownership of `callback_ctx` transfers only when
+ * `lance_native_write_options_new` succeeds. `release` is required whenever
+ * this descriptor is supplied. Omitted callbacks leave the corresponding
+ * native progress hook at its default.
+ */
+typedef struct LanceNativeWriteProgress {
+    LanceWriteFragmentProgressCallback begin_fragment;
+    LanceWriteFragmentProgressCallback complete_fragment;
+    LanceWriteStatsCallback            write_stats;
+    LanceNativeWriteProgressRelease    release;
+    void*                              callback_ctx;
+} LanceNativeWriteProgress;
+
+/**
+ * Borrowed configuration for `lance_native_write_options_new`.
+ *
+ * Every pointer is read only during that constructor call. Values, strings,
+ * native owners and callback contexts are copied or cloned into the returned
+ * handle. Presence flags preserve native `None` versus `Some(empty)` and
+ * explicit `false` values.
+ *
+ * Field mapping to native `WriteParams`:
+ * - `write_options` supplies max rows/bytes, data storage version,
+ *   `enable_stable_row_ids`, auto-cleanup and `skip_auto_cleanup`.
+ * - `transaction_properties` maps to native `None`/`Some(map)` directly.
+ * - `enable_v2_manifest_paths` maps to the create-time native field; omitted
+ *   keeps the native default. Native ignores it for existing datasets.
+ * - `initial_bases`, `target_bases`, `target_base_names_or_paths` and
+ *   `target_all_bases` map directly, including primary-base ID 0 and
+ *   dataset-URI references. Empty explicit target lists remain `Some(empty)`
+ *   and are rejected by native resolution, not by this binding.
+ * - `base_store_params` maps exact base-path keys to native
+ *   `ObjectStoreParams` using the representable fields above. The primary
+ *   base is not a registered `BasePath`, so its storage comes from the
+ *   write-level accessor; native target resolution owns that rule.
+ * - `allow_external_blob_outside_bases`, `external_blob_mode` and
+ *   `blob_pack_file_size_threshold` map directly. Native validates
+ *   incompatible combinations such as ingest plus allow-outside-bases.
+ * - `file_writer_options` maps to native `FileWriterOptions`; its raw-file
+ *   `version` field must be NULL because dataset file-version selection
+ *   belongs in `write_options.params.data_storage_version`.
+ * - `session`, `storage_options_accessor` and `commit_lock` are cloned into
+ *   the handle. The caller may close the source handles after construction.
+ * - `progress` maps to native `WriteParams::progress` and `write_progress`.
+ *   No wrapper-generated events are emitted.
+ */
+typedef struct LanceNativeWriteOptionsSpec {
+    const LanceWriteOptions*             write_options;
+    const LanceTransactionProperties*    transaction_properties;
+    int32_t                              has_enable_v2_manifest_paths;
+    bool                                 enable_v2_manifest_paths;
+    const LanceBasePathList*             initial_bases;
+    const LanceUInt32List*               target_bases;
+    const LanceStringList*               target_base_names_or_paths;
+    int32_t                              has_target_all_bases;
+    bool                                 target_all_bases;
+    const LanceBaseStoreParamsList*      base_store_params;
+    bool                                 allow_external_blob_outside_bases;
+    int32_t                              external_blob_mode;
+    int32_t                              has_blob_pack_file_size_threshold;
+    uint64_t                             blob_pack_file_size_threshold;
+    const struct LanceFileWriterOptions* file_writer_options;
+    const LanceSession*                  session;
+    const LanceStorageOptionsAccessor*   storage_options_accessor;
+    const LanceCommitLock*               commit_lock;
+    const LanceNativeWriteProgress*      progress;
+} LanceNativeWriteOptionsSpec;
+
+/**
+ * Create an owned native-backed dataset write-options handle.
+ *
+ * `spec == NULL` selects native `WriteParams::default()`. The write mode is
+ * supplied by the later entry point, not by this handle.
+ *
+ * Ownership of `spec->progress->callback_ctx` transfers only on success. On
+ * failure the caller retains it and `release` is not called. On success the
+ * callback context is released exactly once when the final native owner drops;
+ * this may happen inside `lance_native_write_options_close` or later on a
+ * native worker thread.
+ *
+ * Native validation of option combinations remains authoritative. This
+ * constructor rejects only values that cannot be parsed or represented at the
+ * C boundary. Returns NULL on error.
+ */
+LanceNativeWriteOptions* lance_native_write_options_new(
+    const LanceNativeWriteOptionsSpec* spec
+);
+
+/**
+ * Close an owned native write-options handle.
+ *
+ * Native writes clone the values they need. Close the handle only after all
+ * calls that borrowed it have returned. Closing drops the retained session,
+ * storage accessors, commit lock and progress context; the progress release
+ * callback may run from this call. NULL-safe.
+ */
+void lance_native_write_options_close(LanceNativeWriteOptions* options);
+
+/**
+ * Write with an owned native-backed options handle.
+ *
+ * `options == NULL` selects native `WriteParams::default()`. The handle
+ * supplies every native dataset-write option, including session, storage
+ * accessor, commit lock, base placement, blob policy, file-writer options and
+ * progress callbacks. The stream is consumed on every return path except a
+ * NULL `stream`. `out_dataset` follows the same success-only contract as
+ * `lance_dataset_write`. Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_write_with_native_options(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceNativeWriteOptions* options,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Stage an Arrow stream with an owned native-backed options handle.
+ *
+ * `options == NULL` selects native `WriteParams::default()`. The handle
+ * supplies session, storage accessor, commit lock, base placement, blob
+ * policy, file-writer options and progress callbacks. The stream is consumed
+ * on every return path except a NULL `stream`.
+ *
+ * The returned transaction owns metadata and uncommitted data-file
+ * references. It does not retain the options handle, its session, accessor or
+ * commit lock; pass those to the later commit entry point when commit I/O
+ * needs them.
+ * Publication naming remains controlled by the commit entry point's
+ * `LanceCommitOptions`. Returns 0 on success, -1 on error; a failed stage is
+ * guaranteed not to publish a version.
+ */
+int32_t lance_dataset_write_uncommitted_stream_with_native_options(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceNativeWriteOptions* options,
+    LanceTransaction** out_transaction
+);
+
+/* ─── Native fragment creation ─── */
+
+/**
+ * Options for the native fragment creation entry points.
+ *
+ * `schema == NULL` leaves native schema inference in place. In APPEND mode
+ * native inference may use the existing dataset's schema, including its field
+ * IDs. A non-NULL schema is borrowed for the call and cloned before the write
+ * starts, so closing the handle during the call is not allowed.
+ *
+ * `mode` is a `LanceWriteMode` value. `write == NULL` selects the native
+ * `WriteParams::default()` writer options. `storage_opts == NULL` and
+ * `session == NULL` keep the native defaults.
+ */
+typedef struct LanceFragmentCreateOptions {
+    /* Native schema to write with. NULL uses native inference. */
+    const LanceSchema*      schema;
+    /* LanceWriteMode: LANCE_WRITE_CREATE, LANCE_WRITE_APPEND or
+     * LANCE_WRITE_OVERWRITE. */
+    int32_t                 mode;
+    /* Native write options. NULL uses native defaults. */
+    const LanceWriteOptions* write;
+    /* NULL-terminated [key, value, ..., NULL] storage options. */
+    const char* const*      storage_opts;
+    /* Shared session for caches and store configuration. NULL means default. */
+    const LanceSession*     session;
+} LanceFragmentCreateOptions;
+
+/**
+ * Create one fragment at `dataset_uri` without publishing a version.
+ *
+ * Maps to native `FragmentCreateBuilder::write(source, Some(fragment_id))`.
+ * Native code owns schema inference and compatibility, file format selection,
+ * the physical row count and all error semantics. A non-empty input is
+ * required; an empty stream fails with the native "Input data was empty."
+ * error. The native API accepts any `fragment_id`, including IDs already used
+ * by existing metadata; duplicate detection happens at commit time.
+ * Non-NULL URI strings, including empty strings, are interpreted by native
+ * code. Native schema validation precedes target storage creation.
+ *
+ * The stream is consumed on every return path except a NULL `stream` pointer,
+ * including validation failures and a NULL output slot. Passing a NULL stream
+ * is an invalid argument and leaves it untouched.
+ *
+ * On success `*out_fragment` receives an independently owned detached
+ * metadata handle that remains valid after the dataset, schema and session
+ * handles are closed. Closing the handle never deletes the written data file.
+ * The output is written only on success.
+ *
+ * @return 0 on success, -1 on error. Errors include
+ *         LANCE_ERR_INVALID_ARGUMENT (NULL stream/uri/output, invalid mode,
+ *         empty input), native schema mismatches, storage errors and
+ *         commit-less I/O failures.
+ */
+int32_t lance_fragment_create(
+    const char* dataset_uri,
+    uint64_t fragment_id,
+    const LanceFragmentCreateOptions* options,
+    struct ArrowArrayStream* stream,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Create zero or more fragments without publishing a version.
+ *
+ * Maps to native `FragmentCreateBuilder::write_fragments`. Native
+ * `max_rows_per_file` splitting, fragment ID assignment, file format and
+ * schema handling apply; the binding implements no splitting of its own.
+ *
+ * The stream follows the same consumption contract as `lance_fragment_create`,
+ * and both output slots are written only on success. On success `*out_fragments`
+ * is a library-allocated array of `*out_count` independently owned detached
+ * handles. Release it with `lance_fragment_array_free(*out_fragments,
+ * *out_count)`, which closes every remaining non-NULL element. A successful
+ * empty result writes NULL and 0.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_create_many(
+    const char* dataset_uri,
+    const LanceFragmentCreateOptions* options,
+    struct ArrowArrayStream* stream,
+    LanceFragment*** out_fragments,
+    size_t* out_count
+);
+
+/**
+ * Close every non-NULL fragment in an array from `lance_fragment_create_many`,
+ * then release the array allocation. NULL-safe. `count` must be the count
+ * returned by `create_many`; slots already cleared by a wrapper are skipped.
+ */
+void lance_fragment_array_free(LanceFragment** fragments, size_t count);
+
+/**
+ * Create one fragment from an existing Lance data file.
+ *
+ * Maps to native `FileFragment::create_from_file(filename, dataset_snapshot,
+ * fragment_id as usize, physical_rows)`. `filename` is relative to the
+ * dataset's data directory and keeps native file-version, schema
+ * compatibility and physical-row validation. Non-NULL filenames, including
+ * empty strings, are passed through unchanged. `physical_rows == NULL` maps to
+ * native `None`; a pointer to zero maps to `Some(0)`, which the current native
+ * format may ignore. Values that do not fit the native `usize` are rejected.
+ *
+ * Native validates the file schema against the dataset snapshot, so a file
+ * whose stored schema is a physical representation that the native version
+ * cannot project to the dataset schema is rejected. Blob v2 data files are
+ * one such case: they store descriptor columns where the dataset schema has
+ * `blob.uri` and `blob.data`, and both the native and the C entry points
+ * report the same schema-mismatch error for them.
+ *
+ * The dataset handle supplies the target snapshot and is not modified. The
+ * output owns complete detached metadata and remains valid after the dataset
+ * is closed; it is written only on success. Closing the handle never deletes
+ * the file.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_create_from_file(
+    const LanceDataset* dataset,
+    const char* filename,
+    uint64_t fragment_id,
+    const uint64_t* physical_rows,
+    LanceFragment** out_fragment
+);
+
+/* ─── Native data files ─── */
+
+/** Owned native `DataFile` metadata snapshot. */
+
+/**
+ * Create native data-file metadata from an existing Lance file.
+ *
+ * Maps directly to `Dataset::create_data_file`. `path` is relative to the
+ * selected native data directory and must be non-NULL UTF-8. `base_id == NULL`
+ * maps to native `None`; a non-NULL pointer maps to native `Some`, including
+ * zero. Empty paths, missing files, malformed Lance files, schema mismatches
+ * and unregistered base IDs retain native validation and error timing.
+ *
+ * On success `*out_file` receives an independently owned snapshot that remains
+ * valid after the dataset is closed. The output is written only on success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_create_data_file(
+    const LanceDataset* dataset,
+    const char* path,
+    const uint32_t* base_id,
+    LanceDataFile** out_file
+);
+
+/** Close a data-file handle. NULL-safe. Close exactly once. */
+void lance_data_file_close(LanceDataFile* file);
+
+/**
+ * Clone a data-file handle into an independent snapshot.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceDataFile* lance_data_file_clone(const LanceDataFile* file);
+
+/**
+ * Return the native data-file path. The pointer is borrowed from `file` and
+ * remains valid until the handle is closed. Returns NULL on error.
+ */
+const char* lance_data_file_path(const LanceDataFile* file);
+
+/**
+ * Read the number of native field IDs. Returns 0 on error; check
+ * `lance_last_error_code()` to distinguish failure from an empty list.
+ */
+size_t lance_data_file_field_count(const LanceDataFile* file);
+
+/**
+ * Read one native field ID. Returns 0 on success, -1 on error.
+ * `out_field_id` is written only on success.
+ */
+int32_t lance_data_file_field_id_at(
+    const LanceDataFile* file,
+    size_t index,
+    int32_t* out_field_id
+);
+
+/**
+ * Read the number of native column indices. Returns 0 on error; check
+ * `lance_last_error_code()` to distinguish failure from an empty list.
+ */
+size_t lance_data_file_column_index_count(const LanceDataFile* file);
+
+/**
+ * Read one native column index, including the native `-1` marker.
+ * Returns 0 on success, -1 on error. The output is written only on success.
+ */
+int32_t lance_data_file_column_index_at(
+    const LanceDataFile* file,
+    size_t index,
+    int32_t* out_column_index
+);
+
+/**
+ * Read the native data-file format version. Both outputs are required and
+ * written only on success. Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_file_file_version(
+    const LanceDataFile* file,
+    uint32_t* out_major,
+    uint32_t* out_minor
+);
+
+/**
+ * Read the optional native data-file size. On success `*out_is_set` reports
+ * native `Some`/`None`; `out_size` is written only when present.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_file_file_size(
+    const LanceDataFile* file,
+    bool* out_is_set,
+    uint64_t* out_size
+);
+
+/**
+ * Read the optional native base ID. On success `*out_is_set` reports native
+ * `Some`/`None`; `out_base_id` is written only when present.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_file_base_id(
+    const LanceDataFile* file,
+    bool* out_is_set,
+    uint32_t* out_base_id
+);
+
+/* ─── Native update maps ─── */
+
+/**
+ * Owned native `UpdateMap` snapshot.
+ *
+ * A native update map is an ordered list of key edits plus a replacement flag,
+ * not a hash map. Duplicate keys, entry order and absent values are native
+ * data. Native commit code applies entries in order: replacement clears the
+ * target and inserts only entries that carry a value, while incremental mode
+ * upserts values and removes keys whose value is `None`.
+ */
+typedef struct LanceUpdateMap LanceUpdateMap;
+
+/**
+ * One native per-field metadata update for
+ * `lance_operation_update_config_new()`.
+ *
+ * `updates` is borrowed and cloned. Duplicate field IDs follow native
+ * `HashMap` last-write-wins semantics where the last complete map wins.
+ */
+typedef struct LanceFieldMetadataUpdateMap {
+    int32_t field_id;
+    const LanceUpdateMap* updates;
+} LanceFieldMetadataUpdateMap;
+
+/**
+ * Borrowed UpdateConfig operation inputs.
+ *
+ * Each map pointer is optional: NULL maps to native `None` and a non-NULL
+ * handle is cloned, including an explicitly empty map.
+ * `field_metadata_updates` may be NULL only when
+ * `field_metadata_update_count == 0`.
+ */
+typedef struct LanceUpdateConfigOperationOptions {
+    const LanceUpdateMap* config_updates;
+    const LanceUpdateMap* table_metadata_updates;
+    const LanceUpdateMap* schema_metadata_updates;
+    const LanceFieldMetadataUpdateMap* field_metadata_updates;
+    size_t field_metadata_update_count;
+} LanceUpdateConfigOperationOptions;
+
+/**
+ * Construct an owned native update map.
+ *
+ * `keys` and `values` are parallel arrays of length `count`; `count == 0`
+ * accepts a NULL array for either. Every key must be non-NULL UTF-8. A NULL
+ * value entry represents native `None` (remove the key); a non-NULL value,
+ * including an empty string, is native `Some`. Duplicate keys and entry order
+ * are retained; native commit code interprets them.
+ *
+ * Returns an owned map, or NULL on error.
+ */
+LanceUpdateMap* lance_update_map_new(
+    const char* const* keys,
+    const char* const* values,
+    size_t count,
+    bool replace
+);
+
+/**
+ * Clone an update map into an independent snapshot.
+ * The clone stays valid after the source is closed.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceUpdateMap* lance_update_map_clone(const LanceUpdateMap* map);
+
+/** Close an update map handle. NULL-safe. Close exactly once. */
+void lance_update_map_close(LanceUpdateMap* map);
+
+/**
+ * Read the number of native update entries. Returns 0 on error; check
+ * `lance_last_error_code()`. Zero is also a valid entry count.
+ */
+size_t lance_update_map_count(const LanceUpdateMap* map);
+
+/**
+ * Read one borrowed entry key. The pointer remains valid until the map handle
+ * is closed. Returns NULL on error, including a key that is not representable
+ * as a C string.
+ */
+const char* lance_update_map_key_at(const LanceUpdateMap* map, size_t index);
+
+/**
+ * Read one borrowed entry value. Both output pointers are required. On success
+ * `*out_has_value` reports native `Some`/`None`; `*out_value` is a borrowed
+ * pointer when present and NULL otherwise. Both outputs are unchanged on
+ * error. Returns 0 on success, -1 on error.
+ */
+int32_t lance_update_map_value_at(
+    const LanceUpdateMap* map,
+    size_t index,
+    bool* out_has_value,
+    const char** out_value
+);
+
+/**
+ * Read the native replacement flag: true replaces the target map, false
+ * applies entries incrementally. Returns false on error; check
+ * `lance_last_error_code()`.
+ */
+bool lance_update_map_replace(const LanceUpdateMap* map);
 
 /**
  * Native operation variant. Discriminants are ABI-stable.
  *
- * Append and Overwrite are constructed by the native writer, and Delete has a
- * typed operation constructor. The other variants can be read from history and
+ * Append and Overwrite are constructed by the native writer. Overwrite,
+ * Merge, Clone and UpdateConfig have typed native constructors and inspection.
+ * Delete, CreateIndex, DataReplacement and Project have their existing typed
+ * constructors and inspection. The other variants can be read from history and
  * inspected by kind; their constructors and variant-specific mutation helpers
  * remain later issue #112 scope.
  */
@@ -5089,6 +8430,8 @@ typedef struct LanceCommitOptions {
     const char* data_storage_version;
 } LanceCommitOptions;
 
+/* ─── Native transactions ─── */
+
 /**
  * Options for one-shot native transaction construction.
  *
@@ -5144,11 +8487,283 @@ int32_t lance_dataset_write_uncommitted_stream(
     LanceTransaction** out_transaction
 );
 
+/**
+ * Same as lance_dataset_write_uncommitted_stream but attaches a native dynamic
+ * storage-options accessor for data-file writes performed by this call. The
+ * returned transaction carries transaction metadata only and does not retain
+ * the accessor; pass the accessor again to the later commit when commit I/O
+ * needs dynamic storage options. A NULL accessor uses native defaults. All
+ * stream, validation and output semantics match the static-options entry
+ * point.
+ */
+int32_t lance_dataset_write_uncommitted_stream_with_accessor(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceUncommittedWriteOptions* options,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    const LanceSession* session,
+    LanceTransaction** out_transaction
+);
+
+/**
+ * Stage an Arrow stream into uncommitted data files through a foreign commit
+ * lock and an optional dynamic storage-options accessor.
+ *
+ * Staging uses the accessor `Arc` and optional session exactly like
+ * lance_dataset_write_uncommitted_stream. The lock is retained for this call
+ * while native writes data files. The returned transaction carries metadata;
+ * keep the lock handle alive and pass it to the matching commit entry point.
+ * NULL handles keep native defaults.
+ *
+ * Stream consumption, schema matching and `out_transaction` success-only
+ * output match lance_dataset_write_uncommitted_stream.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_write_uncommitted_stream_with_commit_lock(
+    const char* uri,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceUncommittedWriteOptions* options,
+    const LanceStorageOptionsAccessor* storage_accessor,
+    const LanceSession* session,
+    const LanceCommitLock* commit_lock,
+    LanceTransaction** out_transaction
+);
+
 /** Close a transaction handle. NULL-safe. Close exactly once. */
 void lance_transaction_close(LanceTransaction* transaction);
 
 /** Close an operation handle. NULL-safe. Close exactly once. */
 void lance_operation_close(LanceOperation* operation);
+
+/** Owned native `DataReplacementGroup` snapshot. */
+typedef struct LanceDataReplacementGroup LanceDataReplacementGroup;
+
+/** Close a data replacement group. NULL-safe. Close exactly once. */
+void lance_data_replacement_group_close(LanceDataReplacementGroup* group);
+
+/**
+ * Construct a native data replacement group.
+ *
+ * `new_file` is borrowed and its complete native metadata is cloned. The
+ * fragment ID is copied unchanged. No binding-side ordering, uniqueness or
+ * coverage policy is added. Returns NULL on error.
+ */
+LanceDataReplacementGroup* lance_data_replacement_group_new(
+    uint64_t fragment_id,
+    const LanceDataFile* new_file
+);
+
+/**
+ * Clone a data replacement group into an independent snapshot.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceDataReplacementGroup* lance_data_replacement_group_clone(
+    const LanceDataReplacementGroup* group
+);
+
+/**
+ * Read the native fragment ID. Returns 0 on error; check
+ * `lance_last_error_code()`. Fragment ID 0 is a valid native value.
+ */
+uint64_t lance_data_replacement_group_fragment_id(
+    const LanceDataReplacementGroup* group
+);
+
+/**
+ * Clone the data file owned by a data replacement group. The output is written
+ * only on success and must be closed independently.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_replacement_group_file(
+    const LanceDataReplacementGroup* group,
+    LanceDataFile** out_file
+);
+
+/**
+ * Construct an owned native DataReplacement operation.
+ *
+ * Group handles are borrowed and copied in input order. A NULL array is
+ * accepted only with a zero count. Empty replacement lists are retained
+ * because the native operation permits them. No sorting, deduplication,
+ * non-empty, field-ID or coverage policy is added. Returns NULL on error.
+ */
+LanceOperation* lance_operation_data_replacement_new(
+    const LanceDataReplacementGroup* const* replacements,
+    size_t replacement_count
+);
+
+/**
+ * Coverage layout for a data overlay.
+ *
+ * `LANCE_DATA_OVERLAY_COVERAGE_SHARED` stores one bitmap covering every field
+ * in the overlay data file. `LANCE_DATA_OVERLAY_COVERAGE_PER_FIELD` stores one
+ * bitmap per field in `data_file.fields` order. The FFI takes the integer value
+ * so unknown kinds are rejected with a descriptive error.
+ */
+typedef enum LanceDataOverlayCoverageKind {
+    LANCE_DATA_OVERLAY_COVERAGE_SHARED = 0,
+    LANCE_DATA_OVERLAY_COVERAGE_PER_FIELD = 1,
+} LanceDataOverlayCoverageKind;
+
+/**
+ * Create an owned native data overlay value.
+ *
+ * `data_file` is borrowed and its complete native metadata is copied.
+ * `coverage_kind` is 0 (shared, exactly one bitmap) or 1 (per-field, bitmaps in
+ * `data_file.fields` order). Each bitmap is portable 32-bit Roaring
+ * serialization and is borrowed for the duration of the call; empty per-field
+ * coverage is retained. `committed_version` is copied unchanged. Native code
+ * owns field compatibility, coverage validity, row layout and publication
+ * checks; this constructor adds no policy.
+ *
+ * Returns an owned overlay, or NULL on error. Close it exactly once with
+ * `lance_data_overlay_file_close`.
+ */
+LanceDataOverlayFile* lance_data_overlay_file_new(
+    const LanceDataFile* data_file,
+    int32_t coverage_kind,
+    const uint8_t* const* bitmaps,
+    const size_t* bitmap_lens,
+    size_t bitmap_count,
+    uint64_t committed_version
+);
+
+/** Close a data overlay value. NULL-safe. */
+void lance_data_overlay_file_close(LanceDataOverlayFile* file);
+
+/**
+ * Clone a data overlay value into an independent snapshot.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceDataOverlayFile* lance_data_overlay_file_clone(
+    const LanceDataOverlayFile* file
+);
+
+/**
+ * Clone the complete data file metadata owned by the overlay. The output is
+ * written only on success and must be closed independently.
+ * Returns an owned data file, or NULL on error.
+ */
+LanceDataFile* lance_data_overlay_file_data_file(
+    const LanceDataOverlayFile* file
+);
+
+/**
+ * Read the coverage kind (0 shared, 1 per-field). Returns 0 on success, -1 on
+ * error; `out_kind` is unchanged on failure.
+ */
+int32_t lance_data_overlay_file_coverage_kind(
+    const LanceDataOverlayFile* file,
+    int32_t* out_kind
+);
+
+/**
+ * Read the number of coverage bitmaps (1 for shared, field count for
+ * per-field). Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_file_bitmap_count(
+    const LanceDataOverlayFile* file,
+    uint64_t* out_count
+);
+
+/**
+ * Serialize one coverage bitmap to a caller-owned buffer.
+ *
+ * `index` is 0 for shared coverage and the field position for per-field
+ * coverage. On success `out_bytes` receives a `libc::malloc` allocation of
+ * `out_len` bytes; release it exactly once with `lance_free_bytes`. Outputs are
+ * written only on success. Parity is bitmap semantics: the native writer may
+ * re-serialize with a different optimized container layout.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_file_bitmap_at(
+    const LanceDataOverlayFile* file,
+    size_t index,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Read the overlay's committed-version stamp. Returns 0 on success, -1 on
+ * error; zero is a valid pre-commit placeholder.
+ */
+int32_t lance_data_overlay_file_committed_version(
+    const LanceDataOverlayFile* file,
+    uint64_t* out_version
+);
+
+/**
+ * Construct an owned native data overlay group.
+ *
+ * Overlay handles are borrowed and cloned in input order. A NULL array is
+ * accepted only with a zero count. Empty groups are retained because the
+ * native operation permits them. Returns NULL on error.
+ */
+LanceDataOverlayGroup* lance_data_overlay_group_new(
+    uint64_t fragment_id,
+    const LanceDataOverlayFile* const* overlays,
+    size_t overlay_count
+);
+
+/** Close a data overlay group. NULL-safe. */
+void lance_data_overlay_group_close(LanceDataOverlayGroup* group);
+
+/**
+ * Clone a data overlay group into an independent snapshot.
+ * Returns NULL on error; close the result exactly once.
+ */
+LanceDataOverlayGroup* lance_data_overlay_group_clone(
+    const LanceDataOverlayGroup* group
+);
+
+/**
+ * Read the target fragment ID. Returns 0 on success, -1 on error; fragment ID
+ * 0 is valid.
+ */
+int32_t lance_data_overlay_group_fragment_id(
+    const LanceDataOverlayGroup* group,
+    uint64_t* out_fragment_id
+);
+
+/**
+ * Read the number of overlays in the group. Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_group_overlay_count(
+    const LanceDataOverlayGroup* group,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one overlay from the group. The output is written only on success and
+ * must be closed independently. Returns 0 on success, -1 on error.
+ */
+int32_t lance_data_overlay_group_overlay_at(
+    const LanceDataOverlayGroup* group,
+    size_t index,
+    LanceDataOverlayFile** out_overlay
+);
+
+/**
+ * Construct an owned native DataOverlay operation.
+ *
+ * Group handles are borrowed and cloned in input order. A NULL array is
+ * accepted only with a zero count. Empty group lists are retained because the
+ * native operation permits them. Native commit owns fragment existence,
+ * coverage validity, layout and ordering checks. Returns NULL on error.
+ *
+ * Native overlays are experimental. For release builds, set
+ * `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads or
+ * modifies an overlay dataset, including before publication.
+ */
+LanceOperation* lance_operation_data_overlay_new(
+    const LanceDataOverlayGroup* const* groups,
+    size_t group_count
+);
 
 /**
  * Read the native transaction read version.
@@ -5177,6 +8792,156 @@ LanceOperation* lance_operation_delete_new(
     const uint64_t* deleted_fragment_ids,
     size_t deleted_fragment_count,
     const char* predicate
+);
+
+/**
+ * Construct an owned native Append operation.
+ *
+ * `fragments` is an array of borrowed fragment handles; each handle is required
+ * when the count is non-zero and its complete native metadata, including
+ * pre-assigned IDs, row ID metadata and data files, is copied. A NULL array is
+ * valid only with a zero count.
+ *
+ * Native commit validation owns schema coverage, fragment ID assignment and
+ * row-ID assignment. Explicit fields and non-zero reserved IDs pass through
+ * unchanged; this constructor adds no binding-side policy. Returns an owned
+ * operation, or NULL on error.
+ */
+LanceOperation* lance_operation_append_new(
+    const LanceFragment* const* fragments,
+    size_t fragment_count
+);
+
+/**
+ * Construct an owned native Overwrite operation.
+ *
+ * The schema is cloned and every fragment handle is borrowed while its complete
+ * native metadata is copied. A NULL fragment array is accepted only with a zero
+ * count. `config_upsert_values == NULL` maps to native `None`; a non-NULL map
+ * with zero entries maps to native `Some(empty)`. `initial_bases == NULL` maps
+ * to native `None`; a non-NULL list with zero entries maps to native
+ * `Some(empty list)`.
+ *
+ * Native commit code owns fragment ID reassignment, deletion-file rejection,
+ * schema and config replacement. This constructor adds no binding-side policy.
+ * Returns an owned operation, or NULL on error. Close it with
+ * lance_operation_close().
+ */
+LanceOperation* lance_operation_overwrite_new(
+    const LanceSchema* schema,
+    const LanceFragment* const* fragments,
+    size_t fragment_count,
+    const LanceStringMap* config_upsert_values, /* NULL None */
+    const LanceBasePathList* initial_bases          /* NULL None */
+);
+
+/**
+ * Construct an owned native Merge operation.
+ *
+ * The schema is cloned and every fragment handle is borrowed while its complete
+ * native metadata is copied. `fragments` is the complete final fragment list;
+ * dropping a fragment removes it, and adding a fragment adds it. A NULL array
+ * is accepted only with a zero count. `preserves_nullability` is stored
+ * unchanged as the caller's assertion about the merge's schema change.
+ *
+ * Native commit code owns schema-change and concurrent-nullability conflict
+ * validation. Returns an owned operation, or NULL on error.
+ */
+LanceOperation* lance_operation_merge_new(
+    const LanceSchema* schema,
+    const LanceFragment* const* fragments,
+    size_t fragment_count,
+    bool preserves_nullability
+);
+
+/**
+ * Construct an owned native Clone operation.
+ *
+ * `ref_name == NULL` maps to native `None`; a non-NULL pointer, including an
+ * empty string, maps to `Some(name)`. `ref_path` must be non-NULL UTF-8 and is
+ * copied; an empty path is accepted. `branch_name` follows the same NULL/`Some`
+ * mapping as `ref_name`.
+ *
+ * Native commit code owns shallow-clone publication and rejects a deep clone
+ * unless the core copied the source files itself. This constructor adds no
+ * binding-side policy. Returns an owned operation, or NULL on error.
+ */
+LanceOperation* lance_operation_clone_new(
+    bool is_shallow,
+    const char* ref_name,     /* NULL None, empty is Some("") */
+    uint64_t ref_version,
+    const char* ref_path,     /* required */
+    const char* branch_name   /* NULL None, empty is Some("") */
+);
+
+/**
+ * Construct an owned native UpdateConfig operation.
+ *
+ * Each non-NULL map is cloned; NULL maps to native `None` and a non-NULL
+ * handle maps to `Some`, including an explicitly empty map. Field metadata
+ * entries are copied in input order into the native map; duplicate field IDs
+ * keep the last complete map. A NULL field array is accepted only with a zero
+ * count.
+ *
+ * Native commit code owns replacement, incremental and `None`-entry semantics.
+ * Returns an owned operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_config_new(
+    const LanceUpdateConfigOperationOptions* options
+);
+
+/**
+ * Construct an owned native Restore operation.
+ *
+ * `version` passes through unchanged. Native commit validation owns whether the
+ * version exists and is restorable. Returns an owned operation, or NULL on
+ * error.
+ */
+LanceOperation* lance_operation_restore_new(uint64_t version);
+
+/**
+ * Construct an owned native ReserveFragments operation.
+ *
+ * `num_fragments == 0` is a native no-op version; larger values advance the
+ * manifest maximum fragment ID for later native allocation. Returns an owned
+ * operation, or NULL on error.
+ */
+LanceOperation* lance_operation_reserve_fragments_new(uint32_t num_fragments);
+
+/**
+ * Construct an owned native UpdateBases operation.
+ *
+ * Each entry is parsed into native `BasePath` storage owned by the returned
+ * operation. A NULL array is valid only with a zero count; every non-NULL entry
+ * requires a non-NULL UTF-8 path, while `name == NULL` means native `None`.
+ *
+ * Native commit validation owns path/name conflict detection and zero-ID
+ * allocation. This constructor adds no binding-side policy. Returns an owned
+ * operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_bases_new(
+    const LanceBasePath* new_bases,
+    size_t new_base_count
+);
+
+/**
+ * Construct an owned native CreateIndex operation.
+ *
+ * `new_indices` and `removed_indices` are arrays of borrowed metadata handles
+ * whose complete native `IndexMetadata` values are copied. A NULL array is
+ * valid only when its count is zero; a non-NULL array with a zero count is
+ * ignored. Each non-NULL entry is required when the count is non-zero.
+ *
+ * Native `Operation::CreateIndex` owns index replacement, name handling and
+ * coverage validation. This constructor does not add binding-side non-empty,
+ * sorting, de-duplication, name or coverage checks. Returns an owned operation,
+ * or NULL on error.
+ */
+LanceOperation* lance_operation_create_index_new(
+    const LanceIndexSegmentMetadata* const* new_indices,
+    size_t new_index_count,
+    const LanceIndexSegmentMetadata* const* removed_indices,
+    size_t removed_index_count
 );
 
 /**
@@ -5274,11 +9039,322 @@ int32_t lance_operation_kind(
 /**
  * Read the fragment count for an Append or Overwrite operation.
  * Returns 0 on success, -1 on error. Other variants return
- * LANCE_ERR_NOT_SUPPORTED.
+ * LANCE_ERR_NOT_SUPPORTED; use the typed operation getters for other variants.
  */
 int32_t lance_operation_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
+);
+
+/**
+ * Read the number of fragments in an Append operation.
+ * Returns 0 on success, -1 on error; other variants return
+ * LANCE_ERR_NOT_SUPPORTED.
+ */
+int32_t lance_operation_append_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one Append fragment as an independently owned detached handle.
+ *
+ * The clone owns the complete native `Fragment` metadata and remains valid
+ * after the operation and every source dataset are closed. It supports metadata
+ * inspection and operation construction but rejects dataset-dependent reads.
+ * Returns 0 on success, -1 on error; the output slot is unchanged on error.
+ */
+int32_t lance_operation_append_fragment_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the target version of a Restore operation.
+ * Returns 0 on success, -1 on error; other variants return
+ * LANCE_ERR_NOT_SUPPORTED.
+ */
+int32_t lance_operation_restore_version(
+    const LanceOperation* operation,
+    uint64_t* out_version
+);
+
+/**
+ * Read the reserved fragment count of a ReserveFragments operation.
+ * Returns 0 on success, -1 on error; other variants return
+ * LANCE_ERR_NOT_SUPPORTED.
+ */
+int32_t lance_operation_reserve_fragments_count(
+    const LanceOperation* operation,
+    uint32_t* out_count
+);
+
+/**
+ * Read the number of new base paths in an UpdateBases operation.
+ * Returns 0 on success, -1 on error; other variants return
+ * LANCE_ERR_NOT_SUPPORTED.
+ */
+int32_t lance_operation_update_bases_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one borrowed new base path from an UpdateBases operation.
+ *
+ * `path` and `name` point into the operation handle and remain valid until it
+ * is closed. `name == NULL` means native `None`; an empty string is an
+ * explicit empty name. Returns 0 on success, -1 on error; the output slot is
+ * unchanged on error.
+ */
+int32_t lance_operation_update_bases_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceBasePathView* out_base
+);
+
+/**
+ * Read the number of fragments in an Overwrite operation. Other variants
+ * return LANCE_ERR_NOT_SUPPORTED. The generic
+ * lance_operation_fragment_count() keeps its Append/Overwrite behavior.
+ */
+int32_t lance_operation_overwrite_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one Overwrite fragment as an independent detached handle carrying its
+ * complete native metadata. The output slot is unchanged on error.
+ */
+int32_t lance_operation_overwrite_fragment_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/** Clone the in-memory native schema of an Overwrite operation. */
+int32_t lance_operation_overwrite_schema_clone(
+    const LanceOperation* operation,
+    LanceSchema** out_schema
+);
+
+/**
+ * Report whether the Overwrite carries native `Some` config upserts.
+ * `Some(empty)` is distinct from `None`. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_overwrite_has_config_upsert_values(
+    const LanceOperation* operation,
+    bool* out_has
+);
+
+/** Read the number of config upsert entries; native `None` reports 0. */
+int32_t lance_operation_overwrite_config_upsert_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one borrowed config upsert key. The pointer remains valid until the
+ * operation is closed. Returns NULL on error.
+ */
+const char* lance_operation_overwrite_config_upsert_key_at(
+    const LanceOperation* operation,
+    size_t index
+);
+
+/**
+ * Read one borrowed config upsert value. The pointer remains valid until the
+ * operation is closed. Returns NULL on error.
+ */
+const char* lance_operation_overwrite_config_upsert_value_at(
+    const LanceOperation* operation,
+    size_t index
+);
+
+/**
+ * Report whether the Overwrite carries native `Some` initial bases.
+ * `Some(empty)` is distinct from `None`.
+ */
+int32_t lance_operation_overwrite_has_initial_bases(
+    const LanceOperation* operation,
+    bool* out_has
+);
+
+/** Read the number of initial base paths; native `None` reports 0. */
+int32_t lance_operation_overwrite_initial_base_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one borrowed initial base path view. `name == NULL` means native `None`.
+ * The output slot is unchanged on error.
+ */
+int32_t lance_operation_overwrite_initial_base_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceBasePathView* out_base
+);
+
+/** Read the number of fragments in a Merge operation. */
+int32_t lance_operation_merge_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/** Clone one Merge fragment as an independent detached handle. */
+int32_t lance_operation_merge_fragment_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/** Clone the in-memory native schema of a Merge operation. */
+int32_t lance_operation_merge_schema_clone(
+    const LanceOperation* operation,
+    LanceSchema** out_schema
+);
+
+/** Read the native `preserves_nullability` assertion from a Merge operation. */
+int32_t lance_operation_merge_preserves_nullability(
+    const LanceOperation* operation,
+    bool* out_value
+);
+
+/** Clone the in-memory native schema of a Project operation. */
+int32_t lance_operation_project_schema_clone(
+    const LanceOperation* operation,
+    LanceSchema** out_schema
+);
+
+/** Read the native `preserves_nullability` assertion from a Project operation. */
+int32_t lance_operation_project_preserves_nullability(
+    const LanceOperation* operation,
+    bool* out_value
+);
+
+/** Read whether a Clone operation is shallow. */
+int32_t lance_operation_clone_is_shallow(
+    const LanceOperation* operation,
+    bool* out_value
+);
+
+/**
+ * Read the borrowed native `ref_name`. `*out_present` distinguishes `None`
+ * from `Some`, including `Some("")`. Both output slots are unchanged on
+ * error; the pointer remains valid until the operation is closed.
+ */
+int32_t lance_operation_clone_ref_name(
+    const LanceOperation* operation,
+    bool* out_present,
+    const char** out_value
+);
+
+/** Read the native `ref_version` of a Clone operation. */
+int32_t lance_operation_clone_ref_version(
+    const LanceOperation* operation,
+    uint64_t* out_version
+);
+
+/**
+ * Read the borrowed native `ref_path`. The pointer remains valid until the
+ * operation is closed. Returns NULL on error.
+ */
+const char* lance_operation_clone_ref_path(const LanceOperation* operation);
+
+/**
+ * Read the borrowed native `branch_name`. `*out_present` distinguishes `None`
+ * from `Some`, including `Some("")`. Both output slots are unchanged on error.
+ */
+int32_t lance_operation_clone_branch_name(
+    const LanceOperation* operation,
+    bool* out_present,
+    const char** out_value
+);
+
+/**
+ * Clone one UpdateConfig metadata map. On success, a NULL output means native
+ * `None`; an owned handle means `Some`, including `Some(empty)`. Close a
+ * non-NULL result with lance_update_map_close().
+ */
+int32_t lance_operation_update_config_config_updates(
+    const LanceOperation* operation,
+    LanceUpdateMap** out_map
+);
+
+/** Same ownership as config_updates, for table metadata. */
+int32_t lance_operation_update_config_table_metadata_updates(
+    const LanceOperation* operation,
+    LanceUpdateMap** out_map
+);
+
+/** Same ownership as config_updates, for schema metadata. */
+int32_t lance_operation_update_config_schema_metadata_updates(
+    const LanceOperation* operation,
+    LanceUpdateMap** out_map
+);
+
+/** Read the number of per-field UpdateMap entries. */
+int32_t lance_operation_update_config_field_metadata_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one per-field UpdateMap entry. On success both outputs are written; the
+ * map must be closed independently. Both output slots are unchanged on error.
+ */
+int32_t lance_operation_update_config_field_metadata_at(
+    const LanceOperation* operation,
+    size_t index,
+    int32_t* out_field_id,
+    LanceUpdateMap** out_map
+);
+
+/**
+ * Read the number of new metadata entries in a CreateIndex operation.
+ * Returns 0 on success, -1 on error (including a different operation kind).
+ */
+int32_t lance_operation_create_index_new_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one new metadata entry from a CreateIndex operation.
+ *
+ * On success `*out_metadata` receives an independently owned handle that
+ * remains valid after the operation is closed. Returns 0 on success, -1 on
+ * error; the output slot is unchanged on error.
+ */
+int32_t lance_operation_create_index_new_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceIndexSegmentMetadata** out_metadata
+);
+
+/**
+ * Read the number of removed metadata entries in a CreateIndex operation.
+ * Returns 0 on success, -1 on error (including a different operation kind).
+ */
+int32_t lance_operation_create_index_removed_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one removed metadata entry from a CreateIndex operation.
+ *
+ * On success `*out_metadata` receives an independently owned handle that
+ * remains valid after the operation is closed. Returns 0 on success, -1 on
+ * error; the output slot is unchanged on error.
+ */
+int32_t lance_operation_create_index_removed_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceIndexSegmentMetadata** out_metadata
 );
 
 /**
@@ -5330,9 +9406,102 @@ const char* lance_operation_delete_predicate(
 );
 
 /**
- * Export an Overwrite operation's schema as Arrow C Data Interface.
- * The caller owns and releases the output ArrowSchema exactly once.
- * Append has no schema; other variants return LANCE_ERR_NOT_SUPPORTED.
+ * Read the number of data replacement groups. A non-DataReplacement operation
+ * returns LANCE_ERR_NOT_SUPPORTED. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_data_replacement_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one data replacement group. A wrong operation variant returns
+ * LANCE_ERR_NOT_SUPPORTED; an out-of-range index returns
+ * LANCE_ERR_INVALID_ARGUMENT. The output is written only on success and must
+ * be closed independently. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_data_replacement_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceDataReplacementGroup** out_group
+);
+
+/**
+ * Read the number of data overlay groups. A non-DataOverlay operation returns
+ * LANCE_ERR_NOT_SUPPORTED. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_data_overlay_group_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one data overlay group. A wrong operation variant returns
+ * LANCE_ERR_NOT_SUPPORTED; an out-of-range index returns
+ * LANCE_ERR_INVALID_ARGUMENT. The output is written only on success and must
+ * be closed independently. Returns 0 on success, -1 on error.
+ */
+int32_t lance_operation_data_overlay_group_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceDataOverlayGroup** out_group
+);
+
+/**
+ * Clone the in-memory native schema of an Overwrite, Merge, or Project
+ * operation.
+ *
+ * The clone preserves field and parent IDs, nested metadata, encodings,
+ * dictionary values, order, and nullability. It remains valid after the
+ * operation is closed. Other operation kinds return
+ * LANCE_ERR_NOT_SUPPORTED and leave `*out_schema` untouched.
+ *
+ * @return 0 on success, -1 on error. Close the result with
+ *         lance_schema_close().
+ */
+int32_t lance_operation_schema_clone(
+    const LanceOperation* operation,
+    LanceSchema** out_schema
+);
+
+/**
+ * Construct an owned native Project operation from a native schema.
+ *
+ * `preserves_nullability` is the caller's explicit declaration that the
+ * projection does not tighten field nullability. It is stored in the native
+ * operation unchanged; conflict resolution and rebase semantics belong to Lance
+ * core. The schema is cloned, so `schema` may be closed immediately after this
+ * call. No binding-side schema validation is added.
+ *
+ * On success writes `*out_operation` and returns 0. On error the output slot is
+ * untouched. Close the result with lance_operation_close().
+ */
+int32_t lance_operation_project_new(
+    const LanceSchema* schema,
+    bool preserves_nullability,
+    LanceOperation** out_operation
+);
+
+/**
+ * Read the native `preserves_nullability` assertion from a Merge or Project
+ * operation.
+ *
+ * On success writes `*out_preserves_nullability` and returns 0. Other
+ * operation kinds return LANCE_ERR_NOT_SUPPORTED and leave the output
+ * untouched.
+ */
+int32_t lance_operation_preserves_nullability(
+    const LanceOperation* operation,
+    bool* out_preserves_nullability
+);
+
+/**
+ * Export an Overwrite operation's schema as an Arrow C Data Interface view.
+ *
+ * This is the existing lossy interoperability view; use
+ * lance_operation_schema_clone() when native field identities matter. The
+ * caller owns and releases the output ArrowSchema exactly once. Append has no
+ * schema; other variants return LANCE_ERR_NOT_SUPPORTED.
  * Returns 0 on success, -1 on error.
  */
 int32_t lance_operation_schema(
@@ -5405,6 +9574,838 @@ int32_t lance_dataset_read_transaction_by_version(
     LanceTransaction** out_transaction
 );
 
+/* -------------------------------------------------------------------------
+ * Update, Rewrite and UpdateMemWalState operation values
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Native update mode for an Update operation. Values are pinned for the ABI.
+ */
+typedef enum LanceUpdateMode {
+    LANCE_UPDATE_MODE_REWRITE_ROWS    = 0,
+    LANCE_UPDATE_MODE_REWRITE_COLUMNS = 1
+} LanceUpdateMode;
+
+/**
+ * Borrowed row offsets for one fragment in an `UpdatedFragmentOffsets` value.
+ *
+ * `offsets` is read as a set: repeated values collapse. `offsets` may be NULL
+ * only when `offset_count` is 0, which is a real empty bitmap entry rather than
+ * an absent one.
+ */
+typedef struct LanceFragmentOffsetsView {
+    uint64_t       fragment_id;
+    const uint32_t* offsets;
+    size_t         offset_count;
+} LanceFragmentOffsetsView;
+
+/**
+ * Borrowed index-file entry for a `LanceRewrittenIndex`.
+ */
+typedef struct LanceIndexFile {
+    const char* path;
+    uint64_t    size_bytes;
+} LanceIndexFile;
+
+/**
+ * Kind of a native key-existence filter. Values are pinned for the ABI.
+ */
+typedef enum LanceKeyExistenceFilterKind {
+    LANCE_KEY_EXISTENCE_FILTER_EXACT = 0,
+    LANCE_KEY_EXISTENCE_FILTER_BLOOM = 1
+} LanceKeyExistenceFilterKind;
+
+/**
+ * Construct owned native `UpdatedFragmentOffsets` from ordered entries.
+ *
+ * Entries and their offset arrays are copied before this function returns, and
+ * the result does not borrow from them. A repeated `fragment_id` keeps the last
+ * entry, matching the native `HashMap` representation. `Some(empty)` and an
+ * empty bitmap entry are both representable; only an explicit protobuf round
+ * trip normalizes an all-empty value to native `None`.
+ *
+ * @return the new value, or NULL on error.
+ */
+LanceUpdatedFragmentOffsets* lance_updated_fragment_offsets_new(
+    const LanceFragmentOffsetsView* entries,
+    size_t entry_count
+);
+
+/**
+ * Clone an owned `UpdatedFragmentOffsets` into independent native storage.
+ *
+ * @return the new value, or NULL on error.
+ */
+LanceUpdatedFragmentOffsets* lance_updated_fragment_offsets_clone(
+    const LanceUpdatedFragmentOffsets* offsets
+);
+
+/**
+ * Free an `UpdatedFragmentOffsets` value. Safe to call with NULL.
+ */
+void lance_updated_fragment_offsets_close(LanceUpdatedFragmentOffsets* offsets);
+
+/**
+ * Read the number of fragment entries.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_updated_fragment_offsets_count(
+    const LanceUpdatedFragmentOffsets* offsets,
+    uint64_t* out_count
+);
+
+/**
+ * Read one fragment ID by entry index. Entry order is unspecified.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_updated_fragment_offsets_fragment_id_at(
+    const LanceUpdatedFragmentOffsets* offsets,
+    size_t index,
+    uint64_t* out_fragment_id
+);
+
+/**
+ * Read the number of offsets recorded at one entry index.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_updated_fragment_offsets_offset_count_at(
+    const LanceUpdatedFragmentOffsets* offsets,
+    size_t index,
+    uint64_t* out_count
+);
+
+/**
+ * Copy all offsets for one entry in ascending native bitmap order.
+ *
+ * The caller owns out_offsets, with count writable uint32_t elements. count
+ * must equal the value written by
+ * lance_updated_fragment_offsets_offset_count_at() for the same index. NULL
+ * out_offsets is valid for a valid empty entry with count == 0. Repeated input
+ * offsets remain collapsed into the native set, and values remain valid after
+ * the source handle is closed.
+ *
+ * @return 0 on success, -1 on error. The output buffer is unchanged on error.
+ */
+int32_t lance_updated_fragment_offsets_copy_at(
+    const LanceUpdatedFragmentOffsets* offsets,
+    size_t index,
+    uint32_t* out_offsets,
+    size_t count
+);
+
+/**
+ * Read one offset by entry index and ascending offset position.
+ *
+ * Native bitmaps are ordered, so position 0 is the smallest offset of that
+ * fragment entry. For all offsets, prefer lance_updated_fragment_offsets_copy_at()
+ * to avoid restarting the bitmap traversal for each index.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_updated_fragment_offsets_offset_at(
+    const LanceUpdatedFragmentOffsets* offsets,
+    size_t index,
+    size_t position,
+    uint32_t* out_offset
+);
+
+/**
+ * Build an owned native key-existence filter from explicit protobuf bytes.
+ *
+ * `bytes` is one encoded `lance.table.transaction.KeyExistenceFilter` message
+ * and is converted through the native `TryFrom` implementation, so absent bloom
+ * fields take the native defaults (`number_of_items = 8192`,
+ * `probability = 0.00057`) and an absent filter body becomes an empty exact
+ * set. NULL bytes are accepted only with a zero length.
+ *
+ * @return 0 on success and writes `*out_filter`, -1 on error.
+ */
+int32_t lance_key_existence_filter_from_proto(
+    const uint8_t* bytes,
+    size_t len,
+    LanceKeyExistenceFilter** out_filter
+);
+
+/**
+ * Clone a key-existence filter into independent native storage.
+ *
+ * @return the new value, or NULL on error.
+ */
+LanceKeyExistenceFilter* lance_key_existence_filter_clone(
+    const LanceKeyExistenceFilter* filter
+);
+
+/**
+ * Free a key-existence filter. Safe to call with NULL.
+ */
+void lance_key_existence_filter_close(LanceKeyExistenceFilter* filter);
+
+/**
+ * Read the filter kind.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_kind(
+    const LanceKeyExistenceFilter* filter,
+    LanceKeyExistenceFilterKind* out_kind
+);
+
+/**
+ * Read the number of filtered field IDs.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_field_id_count(
+    const LanceKeyExistenceFilter* filter,
+    uint64_t* out_count
+);
+
+/**
+ * Read one filtered field ID by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_field_id_at(
+    const LanceKeyExistenceFilter* filter,
+    size_t index,
+    int32_t* out_field_id
+);
+
+/**
+ * Read the number of keys in an exact-set filter.
+ *
+ * Returns `LANCE_ERR_NOT_SUPPORTED` for a bloom filter.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_exact_count(
+    const LanceKeyExistenceFilter* filter,
+    uint64_t* out_count
+);
+
+/**
+ * Read one exact key by ascending position.
+ *
+ * Native exact sets are unordered, so keys are reported in ascending order to
+ * keep repeated inspections stable. Returns `LANCE_ERR_NOT_SUPPORTED` for a
+ * bloom filter.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_exact_key_at(
+    const LanceKeyExistenceFilter* filter,
+    size_t index,
+    uint64_t* out_key
+);
+
+/**
+ * Copy a bloom filter's bitmap and parameters.
+ *
+ * The bitmap is allocated with `malloc` and must be released with
+ * `lance_free_bytes`; a zero-length bitmap yields a NULL pointer. All output
+ * pointers are required and are written only on success. Returns
+ * `LANCE_ERR_NOT_SUPPORTED` for an exact-set filter.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_bloom(
+    const LanceKeyExistenceFilter* filter,
+    uint8_t** out_bitmap,
+    size_t* out_bitmap_len,
+    uint32_t* out_num_bits,
+    uint64_t* out_number_of_items,
+    double* out_probability
+);
+
+/**
+ * Encode a key-existence filter with the native protobuf conversion.
+ *
+ * This is the same encoding an Update operation persists, so a filter built
+ * with `lance_key_existence_filter_from_proto()` round-trips exactly. The
+ * buffer is allocated with `malloc` and must be released with
+ * `lance_free_bytes`; an empty encoding yields a NULL pointer.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_key_existence_filter_to_proto(
+    const LanceKeyExistenceFilter* filter,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Complete input for `lance_operation_update_new()`.
+ *
+ * Every array is borrowed for the duration of the call and copied into native
+ * owned values. A NULL array is accepted only with a zero count. Native fields
+ * are not defaulted: an empty `fields_modified`, `compacted_sstables`,
+ * `removed_fragment_ids` or `fields_for_preserving_frag_bitmap` means the caller
+ * supplied none.
+ *
+ * A NULL `inserted_rows_filter` or `updated_fragment_offsets` maps to native
+ * `None`, as does `has_update_mode == false`; these are distinct from the
+ * populated and empty-value states. `update_mode` is ignored unless
+ * `has_update_mode` is true and must then be a `LanceUpdateMode` value.
+ *
+ * This struct grows only by appending fields.
+ */
+typedef struct LanceUpdateOperationOptions {
+    const uint64_t* removed_fragment_ids;
+    size_t          removed_fragment_count;
+    const LanceFragment* const* updated_fragments;
+    size_t          updated_fragment_count;
+    const LanceFragment* const* new_fragments;
+    size_t          new_fragment_count;
+    const uint32_t* fields_modified;
+    size_t          fields_modified_count;
+    const LanceCompactedSsTable* compacted_sstables;
+    size_t          compacted_sstable_count;
+    const uint32_t* fields_for_preserving_frag_bitmap;
+    size_t          fields_for_preserving_frag_bitmap_count;
+    bool            has_update_mode;
+    int32_t         update_mode;
+    const LanceKeyExistenceFilter* inserted_rows_filter;
+    const LanceUpdatedFragmentOffsets* updated_fragment_offsets;
+} LanceUpdateOperationOptions;
+
+/**
+ * Construct an owned native Update operation.
+ *
+ * `options` is required. Every fragment handle is borrowed and its complete
+ * native metadata is copied, including pre-assigned IDs, data files and
+ * deletion files. Native commit validation owns schema coverage, conflict
+ * detection and row-version behavior; this function only maps values.
+ *
+ * @return the new operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_new(
+    const LanceUpdateOperationOptions* options
+);
+
+/**
+ * Read the number of removed fragment IDs in an Update operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_removed_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one removed fragment ID by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_removed_fragment_id_at(
+    const LanceOperation* operation,
+    size_t index,
+    uint64_t* out_fragment_id
+);
+
+/**
+ * Read the number of updated fragments in an Update operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_updated_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one updated fragment by position.
+ *
+ * The returned handle owns a complete native fragment snapshot and remains
+ * valid after the operation handle is closed.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_updated_fragment_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the number of new fragments in an Update operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_new_fragment_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one new fragment by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_new_fragment_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the number of modified field IDs in an Update operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_fields_modified_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one modified field ID by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_fields_modified_at(
+    const LanceOperation* operation,
+    size_t index,
+    uint32_t* out_field_id
+);
+
+/**
+ * Read the number of compacted SSTable entries in an Update operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_compacted_sstable_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Copy one compacted SSTable entry by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_compacted_sstable_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceCompactedSsTable* out_sstable
+);
+
+/**
+ * Read the number of preserved-fragment-bitmap field IDs in an Update.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_fields_for_preserving_frag_bitmap_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Read one preserved-fragment-bitmap field ID by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_fields_for_preserving_frag_bitmap_at(
+    const LanceOperation* operation,
+    size_t index,
+    uint32_t* out_field_id
+);
+
+/**
+ * Read the native update mode, distinguishing absent from both variants.
+ *
+ * Writes `*out_present` and, when present, the `LanceUpdateMode` code.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_mode(
+    const LanceOperation* operation,
+    bool* out_present,
+    int32_t* out_mode
+);
+
+/**
+ * Clone the inserted-rows key-existence filter of an Update operation.
+ *
+ * When the native field is `None`, writes `*out_present = false` and a NULL handle.
+ * Otherwise writes 1 and an independently owned filter that the caller closes
+ * with `lance_key_existence_filter_close()`. Both outputs are written only on
+ * success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_inserted_rows_filter(
+    const LanceOperation* operation,
+    bool* out_present,
+    LanceKeyExistenceFilter** out_filter
+);
+
+/**
+ * Clone the updated-fragment offsets of an Update operation.
+ *
+ * When the native field is `None`, writes `*out_present = 0` and a NULL handle;
+ * otherwise writes 1 and an independently owned value, preserving the
+ * `None`/`Some(empty)`/populated distinction. Both outputs are written only on
+ * success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_updated_fragment_offsets(
+    const LanceOperation* operation,
+    bool* out_present,
+    LanceUpdatedFragmentOffsets** out_offsets
+);
+
+/**
+ * Construct an owned native `RewriteGroup` from two fragment arrays.
+ *
+ * Both arrays are borrowed and every fragment's complete native metadata is
+ * copied. NULL arrays are accepted only with a zero count.
+ *
+ * @return the new group, or NULL on error.
+ */
+LanceRewriteGroup* lance_rewrite_group_new(
+    const LanceFragment* const* old_fragments,
+    size_t old_fragment_count,
+    const LanceFragment* const* new_fragments,
+    size_t new_fragment_count
+);
+
+/**
+ * Clone an owned `RewriteGroup` into independent native storage.
+ *
+ * @return the new group, or NULL on error.
+ */
+LanceRewriteGroup* lance_rewrite_group_clone(const LanceRewriteGroup* group);
+
+/**
+ * Free a `RewriteGroup`. Safe to call with NULL.
+ */
+void lance_rewrite_group_close(LanceRewriteGroup* group);
+
+/**
+ * Read the number of replaced fragments in a `RewriteGroup`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewrite_group_old_fragment_count(
+    const LanceRewriteGroup* group,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one replaced fragment of a `RewriteGroup` by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewrite_group_old_fragment_at(
+    const LanceRewriteGroup* group,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Read the number of replacement fragments in a `RewriteGroup`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewrite_group_new_fragment_count(
+    const LanceRewriteGroup* group,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one replacement fragment of a `RewriteGroup` by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewrite_group_new_fragment_at(
+    const LanceRewriteGroup* group,
+    size_t index,
+    LanceFragment** out_fragment
+);
+
+/**
+ * Construct an owned native `RewrittenIndex`.
+ *
+ * `old_id` and `new_id` must each point to 16 canonical UUID bytes.
+ * `details_type_url` is required but may be empty, matching the native
+ * `prost_types::Any` field; `details_value` may be NULL only with a zero
+ * length.
+ *
+ * `has_index_files == false` maps to native `None` and requires a zero count.
+ * `has_index_files == true` with a zero count is the distinct `Some(empty)` state
+ * that older writers persisted, so both must be preserved. Index-file paths are
+ * copied and must be non-NULL and valid UTF-8.
+ *
+ * @return the new value, or NULL on error.
+ */
+LanceRewrittenIndex* lance_rewritten_index_new(
+    const uint8_t* old_id,
+    const uint8_t* new_id,
+    const char* details_type_url,
+    const uint8_t* details_value,
+    size_t details_value_len,
+    uint32_t index_version,
+    bool has_index_files,
+    const LanceIndexFile* index_files,
+    size_t index_file_count
+);
+
+/**
+ * Clone an owned `RewrittenIndex` into independent native storage.
+ *
+ * @return the new value, or NULL on error.
+ */
+LanceRewrittenIndex* lance_rewritten_index_clone(const LanceRewrittenIndex* index);
+
+/**
+ * Free a `RewrittenIndex`. Safe to call with NULL.
+ */
+void lance_rewritten_index_close(LanceRewrittenIndex* index);
+
+/**
+ * Copy the old index UUID as 16 bytes into `out_uuid`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_old_id(
+    const LanceRewrittenIndex* index,
+    uint8_t* out_uuid
+);
+
+/**
+ * Copy the new index UUID as 16 bytes into `out_uuid`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_new_id(
+    const LanceRewrittenIndex* index,
+    uint8_t* out_uuid
+);
+
+/**
+ * Copy the index-details type URL.
+ *
+ * The string is allocated with `malloc` and must be released with
+ * `lance_free_string`. Returns NULL on error or when the URL contains a NUL
+ * byte, which the native string can hold but a C string cannot.
+ */
+const char* lance_rewritten_index_details_type_url(
+    const LanceRewrittenIndex* index
+);
+
+/**
+ * Copy the index-details value bytes.
+ *
+ * The buffer is allocated with `malloc` and must be released with
+ * `lance_free_bytes`; a zero-length value yields a NULL pointer.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_details_value(
+    const LanceRewrittenIndex* index,
+    uint8_t** out_bytes,
+    size_t* out_len
+);
+
+/**
+ * Read the new index version.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_version(
+    const LanceRewrittenIndex* index,
+    uint32_t* out_version
+);
+
+/**
+ * Report whether the rewritten index carries an index-file list.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_has_files(
+    const LanceRewrittenIndex* index,
+    bool* out_present
+);
+
+/**
+ * Read the number of index files; 0 also when the native list is `None`.
+ *
+ * Use `lance_rewritten_index_has_files()` to distinguish `None` from
+ * `Some(empty)`.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_rewritten_index_file_count(
+    const LanceRewrittenIndex* index,
+    uint64_t* out_count
+);
+
+/**
+ * Copy one index-file path.
+ *
+ * The string is allocated with `malloc` and must be released with
+ * `lance_free_string`. Returns NULL on error or when the native list is `None`.
+ */
+const char* lance_rewritten_index_file_path_at(
+    const LanceRewrittenIndex* index,
+    size_t position
+);
+
+/**
+ * Read one index-file size by position.
+ *
+ * @return 0 on success, -1 on error or when the native list is `None`.
+ */
+int32_t lance_rewritten_index_file_size_at(
+    const LanceRewrittenIndex* index,
+    size_t position,
+    uint64_t* out_size
+);
+
+/**
+ * Construct an owned native Rewrite operation.
+ *
+ * Groups and rewritten indices are cloned from their handles. `frag_reuse_index`
+ * may be NULL for native `None`; otherwise its complete native index metadata is
+ * copied.
+ *
+ * The fragment-reuse index is in-memory only. Native serialization never writes
+ * it, so an explicit protobuf round trip yields `None` even when the in-memory
+ * operation carries one.
+ *
+ * @return the new operation, or NULL on error.
+ */
+LanceOperation* lance_operation_rewrite_new(
+    const LanceRewriteGroup* const* groups,
+    size_t group_count,
+    const LanceRewrittenIndex* const* rewritten_indices,
+    size_t rewritten_index_count,
+    const LanceIndexSegmentMetadata* frag_reuse_index
+);
+
+/**
+ * Read the number of groups in a Rewrite operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_rewrite_group_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one Rewrite group by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_rewrite_group_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceRewriteGroup** out_group
+);
+
+/**
+ * Read the number of rewritten indices in a Rewrite operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_rewrite_rewritten_index_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Clone one rewritten index by position.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_rewrite_rewritten_index_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceRewrittenIndex** out_index
+);
+
+/**
+ * Clone the in-memory fragment-reuse index of a Rewrite operation.
+ *
+ * When the native field is `None`, writes `*out_present = false` and a NULL handle.
+ * Otherwise writes 1 and an independently owned metadata snapshot, including
+ * fragment bitmap, index details and files. Both outputs are written only on
+ * success.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_rewrite_frag_reuse_index(
+    const LanceOperation* operation,
+    bool* out_present,
+    LanceIndexSegmentMetadata** out_metadata
+);
+
+/**
+ * Construct an owned native UpdateMemWalState operation.
+ *
+ * `compacted_sstables` uses the shared `LanceCompactedSsTable` value and the
+ * same native conversion as merge-insert compaction, so a caller can record
+ * flushed generations as an explicit operation. Native merge-insert validation
+ * owns shard existence, generation ordering and atomicity. A NULL array is
+ * accepted only with a zero count.
+ *
+ * @return the new operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_mem_wal_state_new(
+    const LanceCompactedSsTable* compacted_sstables,
+    size_t compacted_sstable_count
+);
+
+/**
+ * Read the number of compacted SSTables in an UpdateMemWalState operation.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_mem_wal_state_compacted_sstable_count(
+    const LanceOperation* operation,
+    uint64_t* out_count
+);
+
+/**
+ * Copy one compacted SSTable entry of an UpdateMemWalState operation.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_operation_update_mem_wal_state_compacted_sstable_at(
+    const LanceOperation* operation,
+    size_t index,
+    LanceCompactedSsTable* out_sstable
+);
+
+/**
+ * Clone one original fragment of a rewrite result as an owned native snapshot.
+ *
+ * The handle owns complete native fragment metadata and remains valid after the
+ * rewrite result is closed. Returns NULL on error.
+ */
+LanceFragment* lance_rewrite_result_original_fragment_at(
+    const LanceRewriteResult* result,
+    size_t index
+);
+
+/**
+ * Clone one new fragment of a rewrite result as an owned native snapshot.
+ *
+ * These are the staged fragments native compaction produced, so a caller can
+ * build a Rewrite group from them. The handle owns complete native metadata and
+ * remains valid after the rewrite result is closed. Returns NULL on error.
+ */
+LanceFragment* lance_rewrite_result_new_fragment_at(
+    const LanceRewriteResult* result,
+    size_t index
+);
+
 /**
  * Publish one native transaction through CommitBuilder::execute.
  *
@@ -5434,6 +10435,47 @@ int32_t lance_transaction_commit(
 );
 
 /**
+ * Same as lance_transaction_commit but attaches a native dynamic
+ * storage-options accessor instead of static storage_opts. The returned
+ * dataset retains the accessor and provider; later I/O follows native refresh,
+ * error and cache semantics. A NULL accessor uses native defaults. Static
+ * options belong in the accessor's initial options. Transaction ownership and
+ * failure/rollback behavior match lance_transaction_commit.
+ */
+int32_t lance_transaction_commit_with_accessor(
+    const char* uri,
+    const LanceTransaction* transaction,
+    const LanceCommitOptions* options,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    const LanceSession* session,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Publish one native transaction through a foreign commit lock and an optional
+ * dynamic storage-options accessor.
+ *
+ * Conflict detection, retries, manifest construction, cancellation and the
+ * final version stay native. A NULL lock or a NULL/empty accessor keeps the
+ * corresponding native default. `session` may be NULL.
+ *
+ * Output and failure semantics match lance_transaction_commit: the dataset is
+ * written only on success, and the caller must reopen the URI to establish the
+ * committed state after an I/O failure.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_transaction_commit_with_commit_lock(
+    const char* uri,
+    const LanceTransaction* transaction,
+    const LanceCommitOptions* options,
+    const LanceStorageOptionsAccessor* storage_accessor,
+    const LanceSession* session,
+    const LanceCommitLock* commit_lock,
+    LanceDataset** out_dataset
+);
+
+/**
  * Publish append transactions through CommitBuilder::execute_batch.
  *
  * Each input transaction is borrowed and cloned. Native batch rules determine
@@ -5456,6 +10498,2365 @@ int32_t lance_transaction_commit_batch(
     const LanceSession* session,
     LanceDataset** out_dataset,
     LanceTransaction** out_merged_transaction
+);
+
+/**
+ * Same as lance_transaction_commit_batch but attaches a native dynamic
+ * storage-options accessor instead of static storage_opts. The returned
+ * dataset retains the accessor and provider; the merged transaction carries
+ * transaction metadata only. A NULL accessor uses native defaults. All
+ * eligibility, merge and output rules match lance_transaction_commit_batch.
+ */
+int32_t lance_transaction_commit_batch_with_accessor(
+    const char* uri,
+    const LanceTransaction* const* transactions,
+    size_t transaction_count,
+    const LanceCommitOptions* options,
+    const LanceStorageOptionsAccessor* storage_options_accessor,
+    const LanceSession* session,
+    LanceDataset** out_dataset,
+    LanceTransaction** out_merged_transaction
+);
+
+/**
+ * Publish append transactions through a foreign commit lock and an optional
+ * dynamic storage-options accessor.
+ *
+ * Eligibility, merge order, conflicts, retries and the merged read version
+ * stay native. Both output pointers are required and written only on success.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_transaction_commit_batch_with_commit_lock(
+    const char* uri,
+    const LanceTransaction* const* transactions,
+    size_t transaction_count,
+    const LanceCommitOptions* options,
+    const LanceStorageOptionsAccessor* storage_accessor,
+    const LanceSession* session,
+    const LanceCommitLock* commit_lock,
+    LanceDataset** out_dataset,
+    LanceTransaction** out_merged_transaction
+);
+
+/* ─── Storage options ─────────────────────────────────────────────────────── */
+
+typedef struct LanceStorageOptionsProvider LanceStorageOptionsProvider;
+typedef struct LanceStorageOptionsSnapshot LanceStorageOptionsSnapshot;
+
+/**
+ * Borrowed static storage options.
+ *
+ * A NULL `LanceStorageOptionsInput*` passed to accessor construction means
+ * native None. A non-NULL input, including one with `count == 0`, means native
+ * Some, so an empty map is distinct from no options. Duplicate keys follow the
+ * native map's last-write-wins behavior.
+ */
+typedef struct LanceStorageOptionsInput {
+    const char* const* keys;
+    const char* const* values;
+    size_t count;
+} LanceStorageOptionsInput;
+
+/**
+ * Result of one provider fetch.
+ *
+ * `has_options == 0` means native None. Any nonzero value means native Some;
+ * `count == 0` then means Some(empty). Key and value arrays must contain
+ * exactly `count` entries.
+ *
+ * The library copies the complete map and the callback error message before
+ * calling `release_snapshot`. `release_snapshot`, when non-NULL, is called
+ * exactly once on every path after the result struct was initialized,
+ * including malformed partial results and callback errors. Without a release
+ * callback the map storage is borrowed for the callback only.
+ */
+typedef struct LanceStorageOptionsFetchResult {
+    int32_t has_options;
+    const char* const* keys;
+    const char* const* values;
+    size_t count;
+    void* snapshot_ctx;
+    void (*release_snapshot)(void* snapshot_ctx);
+} LanceStorageOptionsFetchResult;
+
+/**
+ * Fetch storage options.
+ *
+ * Return 0 on success. Return nonzero on failure and initialize `error` with a
+ * typed LanceCallbackError. A callback must not report failure through
+ * lance_last_error_* because it may run on a native worker thread.
+ */
+typedef int32_t (*LanceStorageOptionsFetchFn)(
+    void* provider_ctx,
+    LanceStorageOptionsFetchResult* out,
+    LanceCallbackError* error
+);
+
+/** Release the provider context exactly once. */
+typedef void (*LanceStorageOptionsProviderReleaseFn)(void* provider_ctx);
+
+/**
+ * Foreign storage-options provider declaration.
+ *
+ * `fetch` is required. `force_fetch` is optional; omission follows the native
+ * trait default and calls `fetch`. `provider_id` is copied and must be
+ * non-empty. It preserves native equality and object-store registry cache
+ * identity, so equal IDs may share a native store.
+ *
+ * Ownership of `provider_ctx` and `release` transfers only when
+ * lance_storage_options_provider_new succeeds. The library retains the context
+ * through every native Arc owner, including accessor and registry cache keys,
+ * and calls `release(provider_ctx)` exactly once when the final owner drops.
+ */
+typedef struct LanceStorageOptionsProviderSpec {
+    LanceStorageOptionsFetchFn fetch;
+    LanceStorageOptionsFetchFn force_fetch;
+    LanceStorageOptionsProviderReleaseFn release;
+    void* provider_ctx;
+    const char* provider_id;
+} LanceStorageOptionsProviderSpec;
+
+LanceStorageOptionsProvider* lance_storage_options_provider_new(
+    const LanceStorageOptionsProviderSpec* spec
+);
+void lance_storage_options_provider_close(LanceStorageOptionsProvider* provider);
+
+/**
+ * Return the native provider identity as a copied string.
+ *
+ * Free with `lance_free_string`. Returns NULL on invalid input or allocation
+ * failure.
+ */
+char* lance_storage_options_provider_id(
+    const LanceStorageOptionsProvider* provider);
+
+LanceStorageOptionsAccessor* lance_storage_options_accessor_new(
+    const LanceStorageOptionsInput* initial,
+    const LanceStorageOptionsProvider* provider
+);
+void lance_storage_options_accessor_close(LanceStorageOptionsAccessor* accessor);
+
+/**
+ * Resolve and copy the accessor's current options.
+ *
+ * Native StorageOptionsAccessor owns caching and expiration policy. The
+ * binding keeps no second refresh cache. A NULL accessor or provider error
+ * returns NULL and sets the thread-local error.
+ */
+LanceStorageOptionsSnapshot* lance_storage_options_accessor_snapshot(
+    const LanceStorageOptionsAccessor* accessor
+);
+
+/** 1 = Some, 0 = None, -1 = invalid handle with thread-local error. */
+int32_t lance_storage_options_snapshot_has_options(
+    const LanceStorageOptionsSnapshot* snapshot
+);
+uint64_t lance_storage_options_snapshot_count(
+    const LanceStorageOptionsSnapshot* snapshot
+);
+const char* lance_storage_options_snapshot_key_at(
+    const LanceStorageOptionsSnapshot* snapshot,
+    size_t index
+);
+const char* lance_storage_options_snapshot_value_at(
+    const LanceStorageOptionsSnapshot* snapshot,
+    size_t index
+);
+void lance_storage_options_snapshot_close(
+    LanceStorageOptionsSnapshot* snapshot
+);
+
+/* ─── Native Lance namespaces ─────────────────────────────────────────────── */
+
+/**
+ * Result of one native namespace operation.
+ *
+ * Zero-initialize this structure. Release it exactly once with
+ * lance_namespace_result_close, including after a failed call.
+ *
+ * `result_json` encodes the native response model, except that unit operations
+ * leave it NULL, count_table_rows stores a JSON number, and
+ * explain/analyze_table_query_plan store a JSON string. `query_table` leaves
+ * `result_json` NULL and returns the native Arrow IPC stream in `result_bytes`.
+ *
+ * On failure `has_namespace_error` is nonzero and the native NamespaceError is
+ * preserved separately from the generic C error code. Native Unsupported is
+ * code 0; the generic return value is still a failure and is never LANCE_OK.
+ */
+typedef struct LanceNamespaceResult {
+    char* result_json;
+    uint8_t* result_bytes;
+    size_t result_bytes_len;
+    int32_t has_namespace_error;
+    uint32_t namespace_error_code;
+    char* namespace_error_message;
+} LanceNamespaceResult;
+
+void lance_namespace_result_close(LanceNamespaceResult* result);
+
+/**
+ * Copy the native namespace identifier. Free with lance_free_string().
+ */
+char* lance_namespace_id(const LanceNamespace* ns);
+
+/**
+ * Retrieve native operation counters as a JSON object of integer values.
+ * Free with lance_free_string(). Directory and REST handles use the selected
+ * native implementation's counters. Connected and custom handles return
+ * LANCE_ERR_NOT_SUPPORTED because they have no concrete native counter store.
+ */
+char* lance_namespace_retrieve_ops_metrics(const LanceNamespace* ns);
+
+/** Reset the native operation counters. */
+int32_t lance_namespace_reset_ops_metrics(const LanceNamespace* ns);
+
+/**
+ * Synchronous, infallible dynamic context provider.
+ *
+ * Return a JSON object of string values through `out_result_json`. The native
+ * REST client strips the `headers.` prefix from keys and applies them after
+ * base headers, so they override conflicts. `operation` and `object_id` are
+ * the native OperationInfo values and must not be retained.
+ *
+ * A nonzero status or malformed JSON is logged by the native path and treated
+ * as an empty map; the request continues. Initialize the output and error with
+ * zeroed LanceOwnedString/LanceCallbackError values.
+ */
+typedef int32_t (*LanceNamespaceContextProviderFn)(
+    void* provider_ctx,
+    const char* operation,
+    const char* object_id,
+    LanceOwnedString* out_result_json,
+    LanceCallbackError* out_error
+);
+
+/**
+ * Dynamic context provider declaration.
+ *
+ * Ownership of `provider_ctx` and `release` transfers when this spec is passed
+ * to a namespace constructor, including when construction fails. It is
+ * released exactly once after the final native owner drops.
+ */
+typedef struct LanceNamespaceContextProviderSpec {
+    LanceNamespaceContextProviderFn provide_context;
+    void (*release)(void* provider_ctx);
+    void* provider_ctx;
+} LanceNamespaceContextProviderSpec;
+
+/**
+ * Create a directory namespace from native DirectoryNamespaceBuilder.
+ *
+ * `properties_json` is a JSON object of string values; NULL or an empty string
+ * uses native defaults. `session` may be NULL. Native keys, defaults and
+ * validation follow the selected Lance core. `context_provider` may be NULL.
+ */
+LanceNamespace* lance_namespace_directory_new(
+    const char* properties_json,
+    const LanceSession* session,
+    const LanceNamespaceContextProviderSpec* context_provider
+);
+
+/**
+ * Create a REST namespace from native RestNamespaceBuilder.
+ *
+ * Native properties include uri, delimiter, header.*, tls.* and
+ * ops_metrics_enabled. TLS and validation behavior are native.
+ */
+LanceNamespace* lance_namespace_rest_new(
+    const char* properties_json,
+    const LanceNamespaceContextProviderSpec* context_provider
+);
+
+/**
+ * Connect through native ConnectBuilder, for example impl_name "dir" or
+ * "rest". The selected properties are native impl properties.
+ */
+LanceNamespace* lance_namespace_connect_new(
+    const char* impl_name,
+    const char* properties_json,
+    const LanceSession* session,
+    const LanceNamespaceContextProviderSpec* context_provider
+);
+
+/**
+ * Close a namespace handle. Datasets, storage providers and adapters retain
+ * their own native Arc ownership; foreign contexts are released after the
+ * final native owner drops.
+ */
+void lance_namespace_close(LanceNamespace* ns);
+
+/**
+ * Invoke one of the 54 native namespace trait operations.
+ *
+ * `operation` is the exact native snake_case method name. Requests are JSON
+ * encodings of the native request models; NULL or empty means `{}`.
+ * `request_bytes` is the request body for create_table, insert_into_table and
+ * merge_insert_into_table and is ignored otherwise. `query_table` returns its
+ * native Arrow IPC bytes in the result.
+ *
+ * Successful unit operations leave result_json NULL. Model responses use JSON.
+ * On failure the native NamespaceError code/message are copied into the
+ * result, separately from the returned generic LanceErrorCode.
+ *
+ * @return 0 on success, -1 on failure. `out_result` must not be NULL and must
+ *         not already own resources.
+ */
+int32_t lance_namespace_call(
+    const LanceNamespace* ns,
+    const char* operation,
+    const char* request_json,
+    const uint8_t* request_bytes,
+    size_t request_bytes_len,
+    LanceNamespaceResult* out_result
+);
+
+/**
+ * Native namespace storage-options provider.
+ *
+ * The provider calls describe_table with vend_credentials=true and retains the
+ * namespace. Table identity refreshes and lifetime are native. Close with
+ * lance_storage_options_provider_close. `table_id_json` is a JSON array of
+ * strings.
+ */
+LanceStorageOptionsProvider* lance_namespace_storage_options_provider_new(
+    const LanceNamespace* ns,
+    const char* table_id_json
+);
+
+/**
+ * Open a dataset through native DatasetBuilder::from_namespace.
+ *
+ * Namespace-provided location and storage options use native precedence.
+ * `storage_options_json` entries are merged over namespace initial options and
+ * the native refresh provider stays attached. version 0 selects latest.
+ */
+LanceDataset* lance_dataset_open_namespace(
+    const LanceNamespace* ns,
+    const char* table_id_json,
+    const char* storage_options_json,
+    uint64_t version,
+    const LanceSession* session
+);
+
+/**
+ * Write an Arrow stream into a native namespace-managed table.
+ *
+ * CREATE uses native declare_table. APPEND/OVERWRITE use native describe_table
+ * and the native namespace commit handler. A non-NULL `branch` calls native
+ * write_into_namespace_on_branch; NULL keeps main. `params` and `options` use
+ * the existing write conversion but with native write defaults (legacy
+ * auto-cleanup is not applied). `storage_options_json` is merged by native
+ * namespace write logic. The stream is consumed on every return once it has
+ * been accepted. `out_dataset` may be NULL to discard the result.
+ */
+int32_t lance_dataset_write_namespace(
+    const LanceNamespace* ns,
+    const char* table_id_json,
+    const struct ArrowSchema* schema,
+    struct ArrowArrayStream* stream,
+    int32_t mode,
+    const LanceWriteParams* params,
+    const LanceWriteOptions* options,
+    const char* storage_options_json,
+    const LanceSession* session,
+    const char* branch,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Commit a transaction to a namespace-managed table URI.
+ *
+ * Uses LanceNamespaceExternalManifestStore::for_table_uri and the native
+ * ExternalManifestCommitHandler, then reuses CommitBuilder option conversion,
+ * storage options, session, retries and transaction semantics. Use the
+ * namespace open/write entry points for normal access; a namespace-opened
+ * dataset keeps its native commit handler.
+ */
+int32_t lance_transaction_commit_namespace_uri(
+    const LanceNamespace* ns,
+    const char* table_id_json,
+    const char* uri,
+    const LanceTransaction* transaction,
+    const LanceCommitOptions* options,
+    const char* const* storage_opts,
+    const LanceSession* session,
+    LanceDataset** out_dataset
+);
+
+/**
+ * Start a native REST adapter over an existing namespace backend.
+ *
+ * `host` NULL or empty uses the native default. port 0 binds an ephemeral
+ * port; read it with lance_rest_adapter_port. The native adapter retains the
+ * backend and its server task; close or shutdown releases them.
+ */
+int32_t lance_rest_adapter_start(
+    const LanceNamespace* ns,
+    const char* host,
+    uint16_t port,
+    LanceRestAdapter** out_adapter
+);
+
+/** Bound port, or 0 when the adapter is not running. */
+uint16_t lance_rest_adapter_port(const LanceRestAdapter* adapter);
+
+/** Gracefully stop the server. Idempotent; in-flight requests complete. */
+void lance_rest_adapter_shutdown(LanceRestAdapter* adapter);
+
+/** Stop and destroy the adapter. */
+void lance_rest_adapter_close(LanceRestAdapter* adapter);
+
+/**
+ * Foreign client for the four managed table/version callbacks Python exposes.
+ *
+ * Each callback receives the native request model as JSON and must return the
+ * native response model as JSON. Nonzero status reports failure through
+ * LanceCallbackError; partial output is released exactly once. Generic
+ * callback codes map to native NamespaceError classes (for example
+ * LANCE_ERR_COMMIT_CONFLICT becomes ConcurrentModification). All other
+ * operations keep native Unsupported behavior.
+ *
+ * Callbacks may synchronously call independent C handles. They run in the
+ * established reentrant blocking region and must not assume the same mutating
+ * dataset handle is reentrant.
+ *
+ * Ownership of `client_ctx` and `release` transfers when this function is
+ * called, including on construction failure. The context is released exactly
+ * once after the final native namespace Arc drops.
+ */
+typedef int32_t (*LanceNamespaceOperationFn)(
+    void* client_ctx,
+    const char* request_json,
+    LanceOwnedString* out_response_json,
+    LanceCallbackError* out_error
+);
+
+typedef struct LanceNamespaceCustomClientSpec {
+    LanceNamespaceOperationFn describe_table;
+    LanceNamespaceOperationFn describe_table_version;
+    LanceNamespaceOperationFn create_table_version;
+    LanceNamespaceOperationFn list_table_versions;
+    void (*release)(void* client_ctx);
+    void* client_ctx;
+    /** Copied identity used in native storage-provider cache keys. NULL or
+     * empty assigns a unique identity stable for this client's lifetime.
+     * Clients with the same explicit identity share native provider cache keys
+     * for matching table IDs. */
+    const char* namespace_id;
+} LanceNamespaceCustomClientSpec;
+
+LanceNamespace* lance_namespace_custom_new(
+    const LanceNamespaceCustomClientSpec* spec
+);
+
+/**
+ * Shared dispatch callback for the same four managed table/version operations.
+ *
+ * `operation` is one of the exact native snake_case names
+ * "describe_table", "describe_table_version", "create_table_version", or
+ * "list_table_versions". It is borrowed for this callback only and must not be
+ * retained. `request_json` has the same call-scoped lifetime. Response JSON
+ * ownership, callback errors, reentrant blocking behavior, and unsupported
+ * operations are identical to the per-operation callbacks above.
+ */
+typedef int32_t (*LanceNamespaceCustomDispatchFn)(
+    void* client_ctx,
+    const char* operation,
+    const char* request_json,
+    LanceOwnedString* out_response_json,
+    LanceCallbackError* out_error
+);
+
+/**
+ * Foreign client with one dispatch callback for the four managed
+ * table/version operations.
+ *
+ * Ownership of `client_ctx` and `release` transfers when this spec is passed
+ * to `lance_namespace_custom_dispatch_new`, including on construction failure.
+ * The context is released exactly once after the final native namespace Arc
+ * drops. `namespace_id` follows the same copied identity and cache semantics as
+ * LanceNamespaceCustomClientSpec. All operations other than the four listed
+ * above keep native Unsupported behavior.
+ */
+typedef struct LanceNamespaceCustomClientDispatchSpec {
+    LanceNamespaceCustomDispatchFn dispatch;
+    void (*release)(void* client_ctx);
+    void* client_ctx;
+    /** Copied identity used in native storage-provider cache keys. NULL or
+     * empty assigns a unique identity stable for this client's lifetime. */
+    const char* namespace_id;
+} LanceNamespaceCustomClientDispatchSpec;
+
+LanceNamespace* lance_namespace_custom_dispatch_new(
+    const LanceNamespaceCustomClientDispatchSpec* spec
+);
+
+/* ─── Raw Lance-file session ──────────────────────────────────────────────── */
+
+typedef struct LanceFileSession LanceFileSession;
+typedef struct LanceFileReader LanceFileReader;
+typedef struct LanceFileWriter LanceFileWriter;
+typedef struct LancePackedBlobWriter LancePackedBlobWriter;
+typedef struct LanceDedicatedBlobWriter LanceDedicatedBlobWriter;
+typedef struct LanceFileMetadata LanceFileMetadata;
+typedef struct LanceFileStatistics LanceFileStatistics;
+typedef struct LancePathList LancePathList;
+typedef struct LanceDelimitedList LanceDelimitedList;
+typedef struct LanceByteBuffer LanceByteBuffer;
+
+typedef enum {
+    LANCE_FILE_CACHE_NONE = 0,
+    LANCE_FILE_CACHE_SESSION = 1
+} LanceFileCacheMode;
+
+/**
+ * Reader options.
+ *
+ * `has_columns` nonzero forwards exactly `column_count` names; count zero is
+ * an explicit empty projection and is rejected by native validation. A NULL
+ * options pointer uses native defaults and no projection.
+ *
+ * SESSION cache requires a shared LanceSession and shares its capacity through
+ * a reader-local namespace. Entries can be reused within that reader. Native
+ * file cache keys lack backing-store identity and content versions. Files must
+ * remain immutable while their reader or streams are active. NONE uses native
+ * LanceCache::no_cache and is the default.
+ *
+ * `has_*` fields distinguish None from explicit zero/false. Boolean payloads
+ * must be 0 or 1 when set.
+ */
+typedef struct LanceFileReaderOptions {
+    int32_t has_columns;
+    const char* const* columns;
+    size_t column_count;
+    int32_t cache_mode;
+    int32_t has_read_chunk_size;
+    uint64_t read_chunk_size;
+    int32_t has_batch_size_bytes;
+    uint64_t batch_size_bytes;
+    int32_t has_cache_repetition_index;
+    int32_t cache_repetition_index;
+    int32_t has_validate_on_decode;
+    int32_t validate_on_decode;
+    int32_t has_inline_scheduling;
+    int32_t inline_scheduling;
+} LanceFileReaderOptions;
+
+/**
+ * Writer options. `has_*` fields distinguish None from explicit zero/false.
+ * `version == NULL` uses the native default; otherwise native parsing and
+ * unsupported-version errors are preserved.
+ */
+typedef struct LanceFileWriterOptions {
+    int32_t has_data_cache_bytes;
+    uint64_t data_cache_bytes;
+    int32_t has_max_page_bytes;
+    uint64_t max_page_bytes;
+    int32_t has_keep_original_array;
+    int32_t keep_original_array;
+    const char* version;
+} LanceFileWriterOptions;
+
+typedef struct LanceFileWriteSummary {
+    uint64_t num_rows;
+    uint64_t size_bytes;
+} LanceFileWriteSummary;
+
+typedef enum {
+    LANCE_SCHEDULER_LITE_AUTO = 0,
+    LANCE_SCHEDULER_LITE_STANDARD = 1,
+    LANCE_SCHEDULER_LITE_LITE = 2
+} LanceSchedulerLiteMode;
+
+/**
+ * Native scheduler configuration.
+ *
+ * `use_lite_scheduler` is a LanceSchedulerLiteMode. AUTO delegates to
+ * SchedulerConfig::new and its environment policy, STANDARD maps to
+ * Some(false), and LITE maps to Some(true).
+ */
+typedef struct LanceSchedulerConfig {
+    uint64_t io_buffer_size_bytes;
+    int32_t use_lite_scheduler;
+} LanceSchedulerConfig;
+
+typedef struct LanceScanStats {
+    uint64_t iops;
+    uint64_t requests;
+    uint64_t bytes_read;
+} LanceScanStats;
+
+typedef struct LanceObjectStoreRegistryStats {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t active_stores;
+} LanceObjectStoreRegistryStats;
+
+typedef struct LanceObjectStoreIoStats {
+    uint64_t read_iops;
+    uint64_t read_bytes;
+    uint64_t write_iops;
+    uint64_t written_bytes;
+} LanceObjectStoreIoStats;
+
+typedef struct LanceObjectStoreInfo {
+    uint64_t block_size;
+    uint64_t max_iop_size;
+    uint64_t io_parallelism;
+    int32_t is_local;
+    int32_t is_cloud;
+    int32_t prefers_lite_scheduler;
+} LanceObjectStoreInfo;
+
+/**
+ * Create a raw-file session over `base_uri`.
+ *
+ * `storage_options` may be NULL. `session` may be NULL; otherwise the session's
+ * existing object-store registry is shared. `scheduler_config` may be NULL,
+ * which uses native SchedulerConfig::max_bandwidth for the resolved store.
+ */
+LanceFileSession* lance_file_session_new(
+    const char* base_uri,
+    const LanceStorageOptionsAccessor* storage_options,
+    const LanceSession* session,
+    const LanceSchedulerConfig* scheduler_config
+);
+void lance_file_session_close(LanceFileSession* session);
+
+/** Release the returned string with lance_free_string(). */
+const char* lance_file_session_base_path(const LanceFileSession* session);
+
+LanceFileReader* lance_file_session_open_reader(
+    const LanceFileSession* session,
+    const char* relative_path,
+    const LanceFileReaderOptions* options
+);
+LanceFileWriter* lance_file_session_open_writer(
+    const LanceFileSession* session,
+    const char* relative_path,
+    const struct ArrowSchema* schema,
+    const LanceFileWriterOptions* options
+);
+
+/**
+ * Open a native packed blob writer through an existing raw-file session.
+ *
+ * `data_file_path` is relative to the session base. Native validates the
+ * `.lance` suffix, derives the sidecar path, and rejects blob ID zero. The
+ * writer retains the session's native object store; closing the session,
+ * accessor, or provider does not invalidate the writer.
+ *
+ * Callers choose unique data-file names and blob IDs. No collision check or
+ * ID allocation is added by the binding. Returns NULL on error.
+ */
+LancePackedBlobWriter* lance_file_session_open_packed_blob_writer(
+    const LanceFileSession* session,
+    const char* data_file_path,
+    uint32_t blob_id
+);
+
+/**
+ * Open a native dedicated blob writer through an existing raw-file session.
+ *
+ * Path derivation and ownership match the packed constructor. Returns NULL on
+ * error.
+ */
+LanceDedicatedBlobWriter* lance_file_session_open_dedicated_blob_writer(
+    const LanceFileSession* session,
+    const char* data_file_path,
+    uint32_t blob_id
+);
+
+/**
+ * Return the native packed writer blob ID.
+ *
+ * Returns 0 and sets the thread-local error for a NULL, finished, or otherwise
+ * invalid handle. Blob ID zero is reserved, so 0 is never a success value.
+ */
+uint32_t lance_packed_blob_writer_blob_id(
+    const LancePackedBlobWriter* writer
+);
+
+/**
+ * Return a library-allocated copy of the native packed sidecar path.
+ *
+ * Release the returned string with lance_free_string(). Returns NULL on error.
+ */
+const char* lance_packed_blob_writer_path(
+    const LancePackedBlobWriter* writer
+);
+
+/**
+ * Append one payload to the packed sidecar.
+ *
+ * `data == NULL && len == 0` is a valid empty payload. A NULL data pointer
+ * with non-zero len is rejected before native invocation. Foreign bytes are
+ * copied by the native writer before this call returns.
+ *
+ * Native packed write failures can leave the writer without an active upload.
+ * The binding forwards that state without adding a second poison flag.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_packed_blob_writer_write_blob(
+    LancePackedBlobWriter* writer,
+    const uint8_t* data,
+    size_t len
+);
+
+/**
+ * Append one packed row per payload array element.
+ *
+ * Ownership of a non-NULL `payloads` transfers on every return path, including
+ * writer, schema, type, data, and native-write failures. The source slot is
+ * left in canonical released state. `schema` is borrowed and describes one
+ * Binary, LargeBinary, BinaryView, or FixedSizeBinary field.
+ *
+ * Arrow null rows become native Null descriptors. Empty non-null rows become
+ * zero-size Packed descriptors. Slices, row order, and repeated calls are
+ * preserved. A C ArrowArray represents one chunk; pass chunk arrays in order.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_packed_blob_writer_write_blobs(
+    LancePackedBlobWriter* writer,
+    struct ArrowArray* payloads,
+    const struct ArrowSchema* schema
+);
+
+/**
+ * Consume the native packed writer and export its prepared descriptor parts.
+ *
+ * Preflight requires an active writer, a non-NULL UTF-8 `field_name` (empty is
+ * allowed), and non-NULL output pointers. Preflight failure leaves the writer
+ * active. Once native finish starts, the writer is consumed on every return.
+ *
+ * On error both outputs are unchanged. On success `out_array` is an owned
+ * ArrowArray and `out_schema` is the complete native prepared field. Release
+ * each non-NULL output exactly once. The C writer allocation remains valid
+ * until close; later calls report its finished state.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_packed_blob_writer_finish_array(
+    LancePackedBlobWriter* writer,
+    const char* field_name,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Free a packed writer allocation. NULL is a no-op. Close never calls native
+ * finish; an unfinished writer is dropped with native cleanup semantics.
+ */
+void lance_packed_blob_writer_close(
+    LancePackedBlobWriter* writer
+);
+
+/**
+ * Return the native dedicated writer blob ID.
+ *
+ * Returns 0 and sets the thread-local error for a NULL, finished, or otherwise
+ * invalid handle.
+ */
+uint32_t lance_dedicated_blob_writer_blob_id(
+    const LanceDedicatedBlobWriter* writer
+);
+
+/**
+ * Return a library-allocated copy of the native dedicated sidecar path.
+ *
+ * Release the returned string with lance_free_string(). Returns NULL on error.
+ */
+const char* lance_dedicated_blob_writer_path(
+    const LanceDedicatedBlobWriter* writer
+);
+
+/**
+ * Append bytes to the dedicated sidecar.
+ *
+ * Repeated writes concatenate. `data == NULL && len == 0` is valid; a NULL
+ * data pointer with non-zero len is rejected before native invocation.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dedicated_blob_writer_write(
+    LanceDedicatedBlobWriter* writer,
+    const uint8_t* data,
+    size_t len
+);
+
+/**
+ * Consume the native dedicated writer and export its prepared descriptor parts.
+ *
+ * The success result has exactly one Dedicated row covering the concatenated
+ * payload, including size zero. Preflight, consumption, output ownership, and
+ * error handling match the packed finish.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dedicated_blob_writer_finish_array(
+    LanceDedicatedBlobWriter* writer,
+    const char* field_name,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Free a dedicated writer allocation. NULL is a no-op. Close never calls
+ * native finish.
+ */
+void lance_dedicated_blob_writer_close(
+    LanceDedicatedBlobWriter* writer
+);
+
+int32_t lance_file_session_contains(
+    const LanceFileSession* session,
+    const char* relative_path,
+    int32_t* out_exists
+);
+LancePathList* lance_file_session_list(
+    const LanceFileSession* session,
+    const char* relative_path
+);
+LanceDelimitedList* lance_file_session_list_with_delimiter(
+    const LanceFileSession* session,
+    const char* relative_path
+);
+LanceByteBuffer* lance_file_session_read_range(
+    const LanceFileSession* session,
+    const char* relative_path,
+    uint64_t offset,
+    uint64_t length
+);
+int32_t lance_file_session_delete_file(
+    const LanceFileSession* session,
+    const char* relative_path
+);
+int32_t lance_file_session_upload_file(
+    const LanceFileSession* session,
+    const char* local_path,
+    const char* relative_remote_path
+);
+/**
+ * Download through the native local writer. It publishes the destination only
+ * after the source stream completes, including when both paths alias one file.
+ */
+int32_t lance_file_session_download_file(
+    const LanceFileSession* session,
+    const char* relative_remote_path,
+    const char* local_path
+);
+int32_t lance_file_session_get_scheduler_stats(
+    const LanceFileSession* session,
+    LanceScanStats* out_stats
+);
+int32_t lance_file_session_get_registry_stats(
+    const LanceFileSession* session,
+    LanceObjectStoreRegistryStats* out_stats
+);
+int32_t lance_file_session_get_store_info(
+    const LanceFileSession* session,
+    LanceObjectStoreInfo* out_info
+);
+int32_t lance_file_session_get_store_io_stats(
+    const LanceFileSession* session,
+    LanceObjectStoreIoStats* out_stats
+);
+
+/* ─── Raw Lance-file reader ───────────────────────────────────────────────── */
+
+LanceFileReader* lance_file_reader_open(
+    const char* uri_or_path,
+    const LanceStorageOptionsAccessor* storage_options,
+    const LanceFileReaderOptions* options,
+    const LanceSession* session,
+    const LanceSchedulerConfig* scheduler_config
+);
+
+int32_t lance_file_reader_num_rows(
+    const LanceFileReader* reader,
+    uint64_t* out_rows
+);
+int32_t lance_file_reader_get_metadata(
+    const LanceFileReader* reader,
+    LanceFileMetadata** out_metadata
+);
+int32_t lance_file_reader_get_statistics(
+    const LanceFileReader* reader,
+    LanceFileStatistics** out_statistics
+);
+int32_t lance_file_reader_read_global_buffer(
+    const LanceFileReader* reader,
+    uint32_t index,
+    LanceByteBuffer** out_bytes
+);
+/**
+ * Stream all rows as Arrow C Data.
+ *
+ * `batch_size` and `batch_readahead` must both be greater than zero. A zero
+ * value is rejected with LANCE_ERR_INVALID_ARGUMENT and does not select a
+ * default. On error, `out` is unchanged.
+ */
+int32_t lance_file_reader_read_all(
+    const LanceFileReader* reader,
+    uint32_t batch_size,
+    uint32_t batch_readahead,
+    struct ArrowArrayStream* out
+);
+/**
+ * Stream a checked native row range.
+ *
+ * `batch_size` and `batch_readahead` must both be greater than zero. A zero
+ * value is rejected with LANCE_ERR_INVALID_ARGUMENT and does not select a
+ * default. The range is validated before the stream options. On error, `out`
+ * is unchanged.
+ */
+int32_t lance_file_reader_read_range(
+    const LanceFileReader* reader,
+    uint64_t offset,
+    uint64_t num_rows,
+    uint32_t batch_size,
+    uint32_t batch_readahead,
+    struct ArrowArrayStream* out
+);
+/**
+ * Stream native u32 row indices in the supplied order.
+ *
+ * `indices` may be NULL only when `count` is zero. `batch_size` and
+ * `batch_readahead` must both be greater than zero. A zero value is rejected
+ * with LANCE_ERR_INVALID_ARGUMENT and does not select a default. On error,
+ * `out` is unchanged.
+ */
+int32_t lance_file_reader_read_indices(
+    const LanceFileReader* reader,
+    const uint32_t* indices,
+    size_t count,
+    uint32_t batch_size,
+    uint32_t batch_readahead,
+    struct ArrowArrayStream* out
+);
+int32_t lance_file_reader_get_io_stats(
+    const LanceFileReader* reader,
+    LanceScanStats* out_stats
+);
+void lance_file_reader_close(LanceFileReader* reader);
+
+/* ─── Raw Lance-file metadata snapshots ──────────────────────────────────── */
+
+typedef enum {
+    LANCE_FILE_FORMAT_V1 = 0,
+    LANCE_FILE_FORMAT_V2_0 = 1,
+    LANCE_FILE_FORMAT_V2_1 = 2,
+    LANCE_FILE_FORMAT_V2_2 = 3,
+    LANCE_FILE_FORMAT_V2_3 = 4
+} LanceFileFormatVersion;
+
+typedef struct LanceFileMetadataInfo {
+    int32_t format_version;
+    uint16_t major_version;
+    uint16_t minor_version;
+    uint64_t num_rows;
+    uint64_t num_data_bytes;
+    uint64_t num_column_metadata_bytes;
+    uint64_t num_global_buffer_bytes;
+    uint64_t num_footer_bytes;
+    uint64_t file_size_bytes;
+    size_t num_columns;
+    size_t num_physical_columns;
+    size_t num_global_buffers;
+} LanceFileMetadataInfo;
+
+typedef struct LanceBufferDescriptor {
+    uint64_t position;
+    uint64_t size;
+} LanceBufferDescriptor;
+
+typedef enum {
+    LANCE_FILE_ENCODING_ABSENT = 0,
+    LANCE_FILE_ENCODING_NONE = 1,
+    LANCE_FILE_ENCODING_DIRECT = 2,
+    LANCE_FILE_ENCODING_INDIRECT = 3
+} LanceFileEncodingKind;
+
+typedef struct LanceEncodingDescriptor {
+    int32_t kind;
+    uint64_t buffer_location;
+    uint64_t buffer_length;
+    const uint8_t* direct_bytes;
+    size_t direct_bytes_len;
+} LanceEncodingDescriptor;
+
+typedef struct LancePageMetadata {
+    const LanceBufferDescriptor* buffers;
+    size_t buffer_count;
+    uint64_t num_rows;
+    uint64_t priority;
+    LanceEncodingDescriptor encoding;
+    const char* encoding_description;
+} LancePageMetadata;
+
+typedef struct LanceColumnMetadata {
+    const LanceBufferDescriptor* column_buffers;
+    size_t column_buffer_count;
+    const LancePageMetadata* pages;
+    size_t page_count;
+    LanceEncodingDescriptor encoding;
+} LanceColumnMetadata;
+
+int32_t lance_file_metadata_get_info(
+    const LanceFileMetadata* metadata,
+    LanceFileMetadataInfo* out_info
+);
+int32_t lance_file_metadata_get_schema(
+    const LanceFileMetadata* metadata,
+    struct ArrowSchema* out_schema
+);
+int32_t lance_file_metadata_get_global_buffers(
+    const LanceFileMetadata* metadata,
+    const LanceBufferDescriptor** out_buffers,
+    size_t* out_count
+);
+int32_t lance_file_metadata_get_columns(
+    const LanceFileMetadata* metadata,
+    const LanceColumnMetadata** out_columns,
+    size_t* out_count
+);
+void lance_file_metadata_close(LanceFileMetadata* metadata);
+
+typedef struct LanceColumnStatistics {
+    size_t num_pages;
+    uint64_t size_bytes;
+} LanceColumnStatistics;
+
+int32_t lance_file_statistics_get_columns(
+    const LanceFileStatistics* statistics,
+    const LanceColumnStatistics** out_columns,
+    size_t* out_count
+);
+void lance_file_statistics_close(LanceFileStatistics* statistics);
+
+/* ─── Raw Lance-file writer ───────────────────────────────────────────────── */
+
+LanceFileWriter* lance_file_writer_open(
+    const char* uri_or_path,
+    const struct ArrowSchema* schema,
+    const LanceFileWriterOptions* options,
+    const LanceStorageOptionsAccessor* storage_options,
+    const LanceSession* session
+);
+
+/** Write one borrowed LanceBatch. The writer may clone its Arrow arrays. */
+int32_t lance_file_writer_write_batch(
+    LanceFileWriter* writer,
+    const LanceBatch* batch
+);
+int32_t lance_file_writer_add_schema_metadata(
+    LanceFileWriter* writer,
+    const char* key,
+    const char* value
+);
+int32_t lance_file_writer_add_global_buffer(
+    LanceFileWriter* writer,
+    const uint8_t* data,
+    size_t len,
+    uint32_t* out_index
+);
+
+/**
+ * Finish the file.
+ *
+ * Native mutable state and errors are forwarded directly. Repeated finish,
+ * writes after finish or abort, and failures retain the selected core's
+ * behavior; this binding does not add terminal-state rejection.
+ */
+int32_t lance_file_writer_finish(
+    LanceFileWriter* writer,
+    LanceFileWriteSummary* out_summary
+);
+
+/**
+ * Call native FileWriter::abort.
+ *
+ * Native v2.x abort bodies are currently empty. Allocation close drops the
+ * native writer, which owns remaining object-writer cleanup. This call does not
+ * implicitly destroy the allocation, and repeated calls are forwarded.
+ */
+int32_t lance_file_writer_abort(LanceFileWriter* writer);
+
+/**
+ * Destroy the writer allocation.
+ *
+ * Native drop performs object-writer cleanup. This is not a successful
+ * finalization and does not replace an explicit fallible finish.
+ */
+void lance_file_writer_close(LanceFileWriter* writer);
+
+/* ─── Native diagnostics and FTS tokenization ─────────────────────────────── */
+
+/**
+ * Borrowed view of one token produced by `lance_fts_tokenize`.
+ *
+ * `text` is not NUL-terminated and may contain embedded NUL bytes; read
+ * exactly `text_len` bytes. The pointer remains valid until the owning
+ * `LanceFtsTokenList` is closed. `position` is the native normalized token
+ * position after Lance removes leading gaps.
+ */
+typedef struct LanceFtsTokenView {
+    const char* text;
+    size_t text_len;
+    uint32_t position;
+} LanceFtsTokenView;
+
+/**
+ * Tokenize text with the native Lance inverted-index analyzer.
+ *
+ * `text` is an explicit UTF-8 byte range, not a C string. It may contain
+ * embedded NUL bytes. `text` may be NULL only when `text_len` is 0; NULL with a
+ * nonzero length, invalid UTF-8, or an oversized length is rejected.
+ *
+ * `params_json` is a NULL-terminated JSON document using native
+ * `InvertedIndexParams` fields and defaults. NULL selects the native defaults.
+ * Field presence, optional null values, analyzer selection, validation, and
+ * error messages come from the native deserializer and builder.
+ *
+ * Returns an owned token list, or NULL on error. Free it with
+ * `lance_fts_token_list_close`. Query-token positions match native
+ * `collect_query_tokens`; there is no binding-side tokenizer or position
+ * algorithm.
+ */
+LanceFtsTokenList* lance_fts_tokenize(
+    const char* text, size_t text_len, const char* params_json);
+
+/** Number of tokens in `tokens`. Returns 0 and sets an error for NULL. */
+uint64_t lance_fts_token_list_count(const LanceFtsTokenList* tokens);
+
+/**
+ * Borrow token `index` into `out`. Returns 0 on success or -1 on a NULL
+ * handle/out pointer or an out-of-range index. `out` is written only on
+ * success. The view remains valid until the list is closed.
+ */
+int32_t lance_fts_token_list_get(
+    const LanceFtsTokenList* tokens, size_t index, LanceFtsTokenView* out);
+
+/** Close and free a token list. Safe to call with NULL. */
+void lance_fts_token_list_close(LanceFtsTokenList* tokens);
+
+/**
+ * Return native `lance_core::utils::cpu::simd_info()` as a JSON object with
+ * exactly `tier` (native Display string), `target_arch`, and `host_features`
+ * (native order). No C-side detection or cache is involved. The returned
+ * string is owned by the caller; free it with `lance_free_string()`.
+ */
+const char* lance_simd_info_json(void);
+
+/**
+ * Native process-wide object-store IOPS counter. This reads the same native
+ * counter as `lance::io::iops_counter()` and has no reset semantics.
+ */
+uint64_t lance_process_iops_counter(void);
+
+/**
+ * Native process-wide object-store bytes-read counter. This reads the same
+ * native counter as `lance::io::bytes_read_counter()` and has no reset
+ * semantics.
+ */
+uint64_t lance_process_bytes_read_counter(void);
+
+/**
+ * Snapshot the dataset's native object-store I/O counters without resetting.
+ *
+ * The counters come from `Dataset::object_store(None)` and the native store
+ * accumulator. They are the current accumulator without resetting it; a
+ * preceding incremental call resets those counters to zero. Returns 0 on
+ * success or -1 on a NULL handle/out pointer or native failure. `out_stats`
+ * is written only on success.
+ */
+int32_t lance_dataset_io_stats_snapshot(
+    const LanceDataset* dataset, LanceObjectStoreIoStats* out_stats);
+
+/**
+ * Return dataset object-store counters accumulated since the previous
+ * incremental call and reset the native accumulator. This binding keeps no
+ * delta baseline. Returns 0 on success or -1 on a NULL handle/out pointer or
+ * native failure. `out_stats` is written only on success.
+ */
+int32_t lance_dataset_io_stats_incremental(
+    const LanceDataset* dataset, LanceObjectStoreIoStats* out_stats);
+
+/* ─── Owned raw-file path and byte snapshots ──────────────────────────────── */
+
+uint64_t lance_path_list_count(const LancePathList* list);
+const char* lance_path_list_at(const LancePathList* list, size_t index);
+void lance_path_list_close(LancePathList* list);
+
+uint64_t lance_delimited_list_common_prefix_count(
+    const LanceDelimitedList* list
+);
+const char* lance_delimited_list_common_prefix_at(
+    const LanceDelimitedList* list,
+    size_t index
+);
+uint64_t lance_delimited_list_object_count(
+    const LanceDelimitedList* list
+);
+const char* lance_delimited_list_object_at(
+    const LanceDelimitedList* list,
+    size_t index
+);
+void lance_delimited_list_close(LanceDelimitedList* list);
+
+const uint8_t* lance_byte_buffer_data(const LanceByteBuffer* buffer);
+size_t lance_byte_buffer_len(const LanceByteBuffer* buffer);
+void lance_byte_buffer_close(LanceByteBuffer* buffer);
+
+/* ─── Native dataset SQL ──────────────────────────────────────────────────── */
+
+/**
+ * Moves `sql` into a native `SqlQueryBuilder` owned by the returned handle.
+ * The SQL text is copied when the builder is created; the builder holds its
+ * own dataset snapshot (native Dataset clone), so it stays valid after the
+ * dataset handle closes.
+ *
+ * Returns NULL on error, including a NULL dataset or NULL SQL pointer.
+ */
+LanceSqlQueryBuilder* lance_dataset_sql_builder_new(
+    const LanceDataset* dataset, const char* sql);
+
+/**
+ * Close a SQL builder handle. NULL-safe. Close exactly once.
+ * `lance_sql_query_builder_build` consumes the allocation, so a consumed
+ * builder must not be closed.
+ */
+void lance_sql_query_builder_close(LanceSqlQueryBuilder* builder);
+
+/**
+ * Close a SQL query handle. NULL-safe. Close exactly once.
+ * `lance_sql_query_into_stream` consumes the allocation, so a consumed
+ * query must not be closed.
+ */
+void lance_sql_query_close(LanceSqlQuery* query);
+
+/**
+ * Name the table in the SELECT statement. The string is copied. An empty
+ * name is passed to native unchanged. The native default is "dataset".
+ *
+ * Returns 0 on success, -1 on error. A NULL name is rejected and the builder
+ * keeps its prior table name.
+ */
+int32_t lance_sql_query_builder_set_table_name(
+    LanceSqlQueryBuilder* builder, const char* table_name);
+
+/**
+ * Ask the native planner to inject the `_rowid` system column into the scan
+ * output where it is safe to do so. Passed to the native builder unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_with_row_id(
+    LanceSqlQueryBuilder* builder, bool enabled);
+
+/**
+ * Ask the native planner to inject the `_rowaddr` system column into the
+ * scan output where it is safe to do so. Passed to the native builder
+ * unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_with_row_addr(
+    LanceSqlQueryBuilder* builder, bool enabled);
+
+/**
+ * Set how blob columns are materialized, as a LanceBlobHandling value:
+ * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS (0, the native default), ALL_BINARY
+ * (1) or ALL_DESCRIPTIONS (2). Other values are rejected and the builder
+ * keeps its prior handling. Passed to the native builder unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_blob_handling(
+    LanceSqlQueryBuilder* builder, LanceBlobHandling handling);
+
+/**
+ * Set the native target output batch size (rows). The native builder
+ * validates the value's range when the query is built; a value that does not
+ * fit the native usize is rejected here and the builder keeps its prior
+ * value.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_batch_size(
+    LanceSqlQueryBuilder* builder, uint64_t batch_size);
+
+/**
+ * Set the native target output batch size in bytes. Not set (native None)
+ * until called; the native builder owns the value's interpretation and
+ * validation.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_set_batch_size_bytes(
+    LanceSqlQueryBuilder* builder, uint64_t batch_size_bytes);
+
+/**
+ * Plan the configured query and consume `builder` on every return path,
+ * including foreign-pointer errors and native planning failures. The caller
+ * must not use the builder after this call. On success `*out_query` receives
+ * an independently owned query handle (close it with
+ * `lance_sql_query_close`); on error the slot is left unchanged.
+ *
+ * Native planning classifies malformed SQL as invalid input. Batch-size
+ * validation happens here.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_builder_build(
+    LanceSqlQueryBuilder* builder, LanceSqlQuery** out_query);
+
+/**
+ * Move the query's native stream into `*out_stream`, consuming `query` on
+ * every return path. The caller must not use the query after this call. On
+ * success `*out_stream` is an Arrow C stream owned by the caller (release it
+ * exactly once); it keeps the query's dataset snapshot alive and remains
+ * valid after the query, builder and dataset handles close. On error the
+ * stream slot is left unchanged.
+ *
+ * The stream is not materialized here; batches are produced lazily by the
+ * native execution plan. Malformed queries can also fail at this native
+ * physical-planning stage.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_sql_query_into_stream(
+    LanceSqlQuery* query, struct ArrowArrayStream* out_stream);
+
+/* ─── Native dataset delta ────────────────────────────────────────────────── */
+
+/**
+ * Timestamp for delta date-mode ranges.
+ *
+ * `unix_seconds` is a signed Unix timestamp in whole seconds and `nanos` the
+ * nanosecond component. Native chrono timestamp construction defines
+ * representability, including leap seconds. An unrepresentable value is
+ * rejected by the timestamp setter.
+ */
+typedef struct LanceDeltaTimestamp {
+    int64_t unix_seconds;
+    uint32_t nanos; /* Validated by the native timestamp constructor. */
+} LanceDeltaTimestamp;
+
+/**
+ * Moves a dataset snapshot into a native `DatasetDeltaBuilder` owned by the
+ * returned handle. The builder holds its own dataset clone, so it stays
+ * valid after the dataset handle closes.
+ *
+ * Returns NULL on error, including a NULL dataset pointer.
+ */
+LanceDatasetDeltaBuilder* lance_dataset_delta_builder_new(
+    const LanceDataset* dataset);
+
+/**
+ * Close a delta builder handle. NULL-safe. Close exactly once.
+ * `lance_dataset_delta_builder_build` consumes the allocation, so a consumed
+ * builder must not be closed.
+ */
+void lance_dataset_delta_builder_close(LanceDatasetDeltaBuilder* builder);
+
+/**
+ * Close a delta handle. NULL-safe. Close exactly once.
+ */
+void lance_dataset_delta_close(LanceDatasetDelta* delta);
+
+/**
+ * Compare against the named version. Native build rejects combining this
+ * with any explicit begin/end version or date. Not set (native None) until
+ * called; the compared-against mode normalizes its native versions.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_compared_against_version(
+    LanceDatasetDeltaBuilder* builder, uint64_t version);
+
+/**
+ * Set the explicit begin version. Native build requires both begin and end
+ * versions, or a compared-against version. Not set until called.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_begin_version(
+    LanceDatasetDeltaBuilder* builder, uint64_t version);
+
+/**
+ * Set the explicit end version.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_end_version(
+    LanceDatasetDeltaBuilder* builder, uint64_t version);
+
+/**
+ * Set the begin date for date-mode ranges. Native build requires a begin
+ * date when an end date is provided. The timestamp is copied. A NULL
+ * timestamp is rejected and the builder keeps its prior value; a timestamp
+ * the native chrono constructor cannot represent is rejected the same way.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_begin_timestamp(
+    LanceDatasetDeltaBuilder* builder, const LanceDeltaTimestamp* timestamp);
+
+/**
+ * Set the end date for date-mode ranges (requires a begin date in native
+ * build).
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_set_end_timestamp(
+    LanceDatasetDeltaBuilder* builder, const LanceDeltaTimestamp* timestamp);
+
+/**
+ * Build the delta synchronously and consume `builder` on every return path,
+ * including foreign-pointer errors and native validation failures. The
+ * caller must not use the builder after this call. Native build validates
+ * range combinations (compared-against version conflicts, partial version
+ * and date ranges, missing range) and normalizes the compared-against
+ * mode's versions. On success `*out_delta` receives an independently owned
+ * delta handle (close it with `lance_dataset_delta_close`); on error the
+ * slot is left unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_builder_build(
+    LanceDatasetDeltaBuilder* builder, LanceDatasetDelta** out_delta);
+
+/**
+ * List the transactions committed between the delta's begin and end
+ * versions. Each returned transaction is independently owned; release them
+ * together with `lance_transaction_array_free`. Versions without a
+ * transaction file are skipped natively.
+ *
+ * On success `*out_transactions` receives the array (NULL when the count is
+ * 0) and `*out_count` its length. Both slots are left unchanged on error.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_list_transactions(
+    const LanceDatasetDelta* delta,
+    LanceTransaction*** out_transactions,
+    size_t* out_count);
+
+/**
+ * Free a transaction array produced by `lance_dataset_delta_list_transactions`,
+ * closing each non-NULL transaction handle and the array allocation. NULL
+ * and zero-length arrays are no-ops. Call exactly once with the exact
+ * pointer and count returned by `list_transactions`.
+ */
+void lance_transaction_array_free(
+    LanceTransaction** transactions, size_t count);
+
+/**
+ * Stream the rows inserted across the delta's range. `*out_stream` receives
+ * an Arrow C stream owned by the caller (release it exactly once); it stays
+ * valid after the delta and dataset handles close. On error the stream slot
+ * is left unchanged.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_inserted_rows(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
+
+/**
+ * Stream the rows updated across the delta's range.
+ * See `lance_dataset_delta_get_inserted_rows`.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_updated_rows(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
+
+/**
+ * Stream the rows upserted across the delta's range.
+ * See `lance_dataset_delta_get_inserted_rows`.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_upserted_rows(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
+
+/**
+ * Stream the deleted row ids across the delta's range. The stream's single
+ * column is the native stable row-id column; native resolution and id
+ * normalization are authoritative, and native errors (unsupported versions,
+ * reversed ranges, missing stable row ids) surface as returned errors.
+ * See `lance_dataset_delta_get_inserted_rows`.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int32_t lance_dataset_delta_get_deleted_row_ids(
+    const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
+
+/* ─── MemWAL / LSM public workflow ────────────────────────────────────────── */
+
+/**
+ * How initialize_mem_wal() partitions rows into shards.
+ *
+ * These values are this ABI's stable mapping, not native enum discriminants.
+ * New modes append; existing values never change.
+ */
+typedef enum {
+    LANCE_MEM_WAL_SHARDING_MANUAL    = 0,
+    LANCE_MEM_WAL_SHARDING_UNSHARDED = 1,
+    LANCE_MEM_WAL_SHARDING_BUCKET    = 2,
+    LANCE_MEM_WAL_SHARDING_IDENTITY  = 3,
+} LanceMemWalShardingMode;
+
+/**
+ * Distance metric for a MemWAL vector search plan.
+ *
+ * These values are this ABI's stable mapping, not native enum discriminants.
+ * New metrics append; existing values never change.
+ */
+typedef enum {
+    LANCE_MEM_WAL_DISTANCE_L2      = 0,
+    LANCE_MEM_WAL_DISTANCE_COSINE  = 1,
+    LANCE_MEM_WAL_DISTANCE_DOT     = 2,
+    LANCE_MEM_WAL_DISTANCE_HAMMING = 3,
+} LanceMemWalDistanceType;
+
+/**
+ * A compacted SSTable generation, as a native value type.
+ *
+ * Shared with the write and transaction contract; do not redeclare it
+ * elsewhere. `shard_id` holds the 16 canonical UUID bytes in textual
+ * 8-4-4-4-12 order. The value is passed by pointer to
+ * lance_dataset_merge_insert_with_compaction() and copied by native code.
+ */
+typedef struct LanceCompactedSsTable {
+    uint8_t  shard_id[16];
+    uint64_t generation;
+} LanceCompactedSsTable;
+
+/**
+ * Per-index HNSW build parameters for a shard writer.
+ *
+ * Each `has_*` flag is 0 or 1. A zero flag leaves the native default for that
+ * parameter. `index_name` is required and non-empty. `max_level` must fit in
+ * 16 bits; larger values are rejected instead of truncated. Duplicate
+ * `index_name` entries follow map last-write-wins.
+ */
+typedef struct {
+    const char* index_name;
+    int32_t     has_num_edges;
+    uint32_t    num_edges;
+    int32_t     has_ef_construction;
+    uint32_t    ef_construction;
+    int32_t     has_max_level;
+    uint32_t    max_level;
+} LanceMemWalHnswParams;
+
+/**
+ * Optional overrides for a native ShardWriterConfig.
+ *
+ * A NULL config on lance_shard_writer_open() selects the native default. On
+ * lance_mem_wal_initialize(), a NULL config records no writer-configuration
+ * defaults, while a non-NULL config starts from the native default and records
+ * every resulting default in the MemWAL index. A present field with value 0 is
+ * forwarded to native code except `stats_log_interval_ms`, where 0 disables
+ * periodic logging (native None) and is omitted from the recorded defaults.
+ *
+ * `hnsw_params` is required to be non-NULL when `num_hnsw_params > 0`.
+ */
+typedef struct {
+    int32_t has_durable_write;
+    int32_t durable_write;
+
+    int32_t  has_max_wal_buffer_size;
+    uint64_t max_wal_buffer_size;
+
+    int32_t  has_max_wal_flush_interval_ms;
+    uint64_t max_wal_flush_interval_ms;
+
+    int32_t  has_max_memtable_size;
+    uint64_t max_memtable_size;
+
+    int32_t  has_max_memtable_rows;
+    uint64_t max_memtable_rows;
+
+    int32_t  has_max_memtable_batches;
+    uint64_t max_memtable_batches;
+
+    int32_t  has_max_unflushed_memtable_bytes;
+    uint64_t max_unflushed_memtable_bytes;
+
+    int32_t  has_manifest_scan_batch_size;
+    uint64_t manifest_scan_batch_size;
+
+    int32_t  has_backpressure_log_interval_ms;
+    uint64_t backpressure_log_interval_ms;
+
+    int32_t  has_stats_log_interval_ms;
+    uint64_t stats_log_interval_ms;
+
+    const LanceMemWalHnswParams* hnsw_params;
+    size_t                       num_hnsw_params;
+} LanceShardWriterConfig;
+
+/**
+ * Native write counters captured at the time of the call.
+ *
+ * Durations are nanoseconds and saturate at UINT64_MAX. The counters come from
+ * the native SharedWriteStats owner retained by the writer, so they remain
+ * available after a successful close.
+ */
+typedef struct {
+    uint64_t put_count;
+    uint64_t put_time_nanos;
+    uint64_t wal_flush_count;
+    uint64_t wal_flush_time_nanos;
+    uint64_t wal_flush_bytes;
+    uint64_t wal_io_time_nanos;
+    uint64_t wal_io_count;
+    uint64_t index_update_time_nanos;
+    uint64_t index_update_count;
+    uint64_t index_update_rows;
+    uint64_t memtable_flush_count;
+    uint64_t memtable_flush_time_nanos;
+    uint64_t memtable_flush_rows;
+    uint64_t memtable_flush_failures;
+} LanceShardWriterStats;
+
+/**
+ * Live MemTable and memory statistics for a shard writer.
+ *
+ * Byte totals mirror the Python-public dictionary: `estimated_size_bytes` is
+ * active row data, `index_bytes` is the active in-memory index footprint, and
+ * `retained_bytes` is the whole resident footprint. This call requires a live
+ * native writer; after close it fails with LANCE_ERR_INVALID_ARGUMENT.
+ */
+typedef struct {
+    int32_t  is_live;
+    uint64_t row_count;
+    uint64_t batch_count;
+    uint64_t estimated_size_bytes;
+    uint64_t index_bytes;
+    uint64_t frozen_bytes;
+    uint64_t grace_bytes;
+    uint64_t retained_bytes;
+    uint64_t generation;
+
+    int32_t  has_max_buffered_batch_position;
+    uint64_t max_buffered_batch_position;
+
+    uint64_t durable_batch_count;
+    uint64_t global_offset;
+
+    int32_t  has_pending_wal_start_batch_position;
+    uint64_t pending_wal_start_batch_position;
+    int32_t  has_pending_wal_end_batch_position;
+    uint64_t pending_wal_end_batch_position;
+    uint64_t pending_wal_batch_count;
+    uint64_t pending_wal_row_count;
+    uint64_t pending_wal_estimated_bytes;
+    uint64_t frozen_count;
+} LanceShardMemTableStats;
+
+/**
+ * Writer-global batch positions covered by one put or delete call.
+ *
+ * The range is half-open: `batch_position_begin` is the first covered batch
+ * position and `batch_position_end` is one past the last.
+ */
+typedef struct {
+    uint64_t batch_position_begin;
+    uint64_t batch_position_end;
+} LanceShardWriteResult;
+
+typedef struct LanceMemWalIndexDetails LanceMemWalIndexDetails;
+typedef struct LanceMemWalShardingSpec LanceMemWalShardingSpec;
+typedef struct LanceMemWalShardingField LanceMemWalShardingField;
+typedef struct LanceMemWalShardSnapshot LanceMemWalShardSnapshot;
+typedef struct LanceShardWriter LanceShardWriter;
+typedef struct LanceLsmScanner LanceLsmScanner;
+typedef struct LanceLsmPointLookupPlanner LanceLsmPointLookupPlanner;
+typedef struct LanceLsmVectorSearchPlanner LanceLsmVectorSearchPlanner;
+typedef struct LanceMemWalPlan LanceMemWalPlan;
+
+/**
+ * Initialize MemWAL on a dataset.
+ *
+ * Commits the native MemWAL system index. `mode` selects manual, unsharded,
+ * bucket or identity sharding; bucket ranges and column suitability are
+ * validated by native code. `column` is required for bucket and identity
+ * modes, and must be NULL for manual and unsharded modes. `num_buckets` is
+ * used only for bucket mode and must be 0 otherwise.
+ *
+ * A non-NULL `config` records the resulting native writer defaults in the
+ * MemWAL index; NULL records none. `maintained_indexes` is read only when
+ * `has_maintained_indexes != 0`; zero entries then means "maintain none",
+ * while a zero flag means "maintain every index".
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_mem_wal_initialize(
+    LanceDataset* dataset,
+    LanceMemWalShardingMode mode,
+    const char* column,
+    uint32_t num_buckets,
+    int32_t has_maintained_indexes,
+    const char* const* maintained_indexes,
+    size_t num_maintained_indexes,
+    const LanceShardWriterConfig* config
+);
+
+/**
+ * Read the native MemWAL index details.
+ *
+ * Returns 0 with `*out == NULL` when MemWAL is not initialized on the dataset.
+ * On success with a value, the caller owns `*out` and frees it with
+ * lance_mem_wal_index_details_free().
+ */
+int32_t lance_mem_wal_index_details(
+    LanceDataset* dataset,
+    LanceMemWalIndexDetails** out
+);
+
+/** Free an index-details handle. Safe to call with NULL. */
+void lance_mem_wal_index_details_free(LanceMemWalIndexDetails* details);
+
+/** Number of shards recorded for the MemWAL index. */
+uint32_t lance_mem_wal_index_details_num_shards(
+    const LanceMemWalIndexDetails* details
+);
+
+/** Whether the index maintains every dataset index: 1 or 0. */
+int32_t lance_mem_wal_index_details_maintain_all_indexes(
+    const LanceMemWalIndexDetails* details
+);
+
+/** Count of explicitly maintained index names. */
+size_t lance_mem_wal_index_details_maintained_index_count(
+    const LanceMemWalIndexDetails* details
+);
+
+/**
+ * Borrow one explicitly maintained index name.
+ *
+ * The name remains valid until the details handle is freed. Returns -1 on a
+ * NULL handle or an out-of-range index.
+ */
+int32_t lance_mem_wal_index_details_maintained_index_at(
+    const LanceMemWalIndexDetails* details,
+    size_t index,
+    const char** out_name
+);
+
+/** Count of sharding specs recorded for the index. */
+size_t lance_mem_wal_index_details_sharding_spec_count(
+    const LanceMemWalIndexDetails* details
+);
+
+/**
+ * Clone one sharding spec. The caller owns `*out_spec` and frees it with
+ * lance_mem_wal_sharding_spec_free().
+ */
+int32_t lance_mem_wal_index_details_sharding_spec_at(
+    const LanceMemWalIndexDetails* details,
+    size_t index,
+    LanceMemWalShardingSpec** out_spec
+);
+
+/** Count of recorded writer-configuration defaults. */
+size_t lance_mem_wal_index_details_writer_config_default_count(
+    const LanceMemWalIndexDetails* details
+);
+
+/**
+ * Borrow one recorded writer-configuration default.
+ *
+ * Entries iterate in lexicographic key order. Both strings remain valid until
+ * the details handle is freed.
+ */
+int32_t lance_mem_wal_index_details_writer_config_default_at(
+    const LanceMemWalIndexDetails* details,
+    size_t index,
+    const char** out_key,
+    const char** out_value
+);
+
+/**
+ * Create a sharding field value.
+ *
+ * `field_id`, `result_type` (when non-NULL), parameter keys and parameter
+ * values must be UTF-8. `transform` and `expression` are NULL for native None;
+ * a non-NULL `result_type` is copied, and NULL means the empty string.
+ * Parameters follow map last-write-wins. `source_ids` is required to be
+ * non-NULL when `num_source_ids > 0`.
+ */
+int32_t lance_mem_wal_sharding_field_new(
+    const char* field_id,
+    const int32_t* source_ids,
+    size_t num_source_ids,
+    const char* transform,
+    const char* expression,
+    const char* result_type,
+    const char* const* parameter_keys,
+    const char* const* parameter_values,
+    size_t num_parameters,
+    LanceMemWalShardingField** out
+);
+
+/** Clone a sharding field. The caller owns the result. */
+int32_t lance_mem_wal_sharding_field_clone(
+    const LanceMemWalShardingField* field,
+    LanceMemWalShardingField** out
+);
+
+/** Free a sharding field handle. Safe to call with NULL. */
+void lance_mem_wal_sharding_field_free(LanceMemWalShardingField* field);
+
+/** Borrow the field id. */
+const char* lance_mem_wal_sharding_field_id(
+    const LanceMemWalShardingField* field
+);
+
+/**
+ * Borrow the source field ids. Writes the count to `out_count` and returns
+ * NULL when the count is zero. The pointer remains valid until the handle is
+ * freed.
+ */
+const int32_t* lance_mem_wal_sharding_field_source_ids(
+    const LanceMemWalShardingField* field,
+    size_t* out_count
+);
+
+/** Borrow the transform name, or NULL when native holds None. */
+const char* lance_mem_wal_sharding_field_transform(
+    const LanceMemWalShardingField* field
+);
+
+/** Borrow the transform expression, or NULL when native holds None. */
+const char* lance_mem_wal_sharding_field_expression(
+    const LanceMemWalShardingField* field
+);
+
+/** Borrow the result type; never NULL for a valid handle (may be ""). */
+const char* lance_mem_wal_sharding_field_result_type(
+    const LanceMemWalShardingField* field
+);
+
+/** Count of transform parameters. */
+size_t lance_mem_wal_sharding_field_parameter_count(
+    const LanceMemWalShardingField* field
+);
+
+/**
+ * Borrow one transform parameter in lexicographic key order. Both strings
+ * remain valid until the field handle is freed.
+ */
+int32_t lance_mem_wal_sharding_field_parameter_at(
+    const LanceMemWalShardingField* field,
+    size_t index,
+    const char** out_key,
+    const char** out_value
+);
+
+/**
+ * Create a sharding spec from field handles. Fields are cloned; the caller
+ * keeps ownership of each input handle. `fields` is required to be non-NULL
+ * when `num_fields > 0`.
+ */
+int32_t lance_mem_wal_sharding_spec_new(
+    uint32_t spec_id,
+    const LanceMemWalShardingField* const* fields,
+    size_t num_fields,
+    LanceMemWalShardingSpec** out
+);
+
+/** Clone a sharding spec. The caller owns the result. */
+int32_t lance_mem_wal_sharding_spec_clone(
+    const LanceMemWalShardingSpec* spec,
+    LanceMemWalShardingSpec** out
+);
+
+/** Free a sharding spec handle. Safe to call with NULL. */
+void lance_mem_wal_sharding_spec_free(LanceMemWalShardingSpec* spec);
+
+/** Native spec id. */
+uint32_t lance_mem_wal_sharding_spec_id(
+    const LanceMemWalShardingSpec* spec
+);
+
+/** Count of fields in the spec. */
+size_t lance_mem_wal_sharding_spec_field_count(
+    const LanceMemWalShardingSpec* spec
+);
+
+/**
+ * Clone one field from the spec. The caller owns `*out_field` and frees it
+ * with lance_mem_wal_sharding_field_free().
+ */
+int32_t lance_mem_wal_sharding_spec_field_at(
+    const LanceMemWalShardingSpec* spec,
+    size_t index,
+    LanceMemWalShardingField** out_field
+);
+
+/**
+ * Evaluate a sharding spec against the dataset schema.
+ *
+ * Adds a column named after the spec's `field_id` holding the native shard
+ * value. The caller owns `*out_batch` and closes it with lance_batch_close().
+ */
+int32_t lance_mem_wal_evaluate_sharding_spec(
+    LanceDataset* dataset,
+    const LanceBatch* batch,
+    const LanceMemWalShardingSpec* spec,
+    LanceBatch** out_batch
+);
+
+/**
+ * Evaluate a sharding spec against an explicit native schema.
+ *
+ * Uses the native schema value for field ids and source resolution instead of
+ * the dataset schema. The caller owns `*out_batch`. A NULL schema is invalid.
+ */
+int32_t lance_mem_wal_evaluate_sharding_spec_with_schema(
+    const LanceBatch* batch,
+    const LanceMemWalShardingSpec* spec,
+    const LanceSchema* schema,
+    LanceBatch** out_batch
+);
+
+/**
+ * Create a shard snapshot value.
+ *
+ * `shard_id` is a canonical UUID string. Native starts with spec id 0 and
+ * current generation 1, matching ShardSnapshot::new().
+ */
+int32_t lance_mem_wal_shard_snapshot_new(
+    const char* shard_id,
+    LanceMemWalShardSnapshot** out
+);
+
+/** Clone a shard snapshot. The clone is independently owned. */
+int32_t lance_mem_wal_shard_snapshot_clone(
+    const LanceMemWalShardSnapshot* snapshot,
+    LanceMemWalShardSnapshot** out
+);
+
+/** Free a shard snapshot. Safe to call with NULL. */
+void lance_mem_wal_shard_snapshot_free(LanceMemWalShardSnapshot* snapshot);
+
+/** Borrow the shard UUID string in canonical form. */
+const char* lance_mem_wal_shard_snapshot_shard_id(
+    const LanceMemWalShardSnapshot* snapshot
+);
+
+/** Native spec id. */
+uint32_t lance_mem_wal_shard_snapshot_spec_id(
+    const LanceMemWalShardSnapshot* snapshot
+);
+
+/** Native current generation. */
+uint64_t lance_mem_wal_shard_snapshot_current_generation(
+    const LanceMemWalShardSnapshot* snapshot
+);
+
+/** Set the native spec id. */
+int32_t lance_mem_wal_shard_snapshot_with_spec_id(
+    LanceMemWalShardSnapshot* snapshot,
+    uint32_t spec_id
+);
+
+/** Set the native current generation. */
+int32_t lance_mem_wal_shard_snapshot_with_current_generation(
+    LanceMemWalShardSnapshot* snapshot,
+    uint64_t generation
+);
+
+/**
+ * Append an SSTable reference.
+ *
+ * `path` is copied and is relative to the shard directory. The native optional
+ * measurements are left unmeasured, matching a snapshot built from an external
+ * path. The caller owns the string for the duration of the call.
+ */
+int32_t lance_mem_wal_shard_snapshot_with_sstable(
+    LanceMemWalShardSnapshot* snapshot,
+    uint64_t generation,
+    const char* path
+);
+
+/** Count of referenced SSTables. */
+size_t lance_mem_wal_shard_snapshot_sstable_count(
+    const LanceMemWalShardSnapshot* snapshot
+);
+
+/**
+ * Borrow one SSTable reference: writes its generation and a borrowed path that
+ * remains valid until the snapshot is freed or mutated.
+ */
+int32_t lance_mem_wal_shard_snapshot_sstable_at(
+    const LanceMemWalShardSnapshot* snapshot,
+    size_t index,
+    uint64_t* out_generation,
+    const char** out_path
+);
+
+/**
+ * Create a compacted SSTable value from a UUID string and generation.
+ *
+ * The resulting value is the shared 16-byte UUID plus generation value type.
+ */
+int32_t lance_mem_wal_compacted_sstable_new(
+    const char* shard_id,
+    uint64_t generation,
+    LanceCompactedSsTable* out
+);
+
+/**
+ * Open a native shard writer for one shard.
+ *
+ * Resolves the MemWAL index, sharding spec, maintained index set, store
+ * parameters and session from the dataset. A NULL `config` selects native
+ * ShardWriterConfig::default(). `out` is written only on success; the caller
+ * owns the writer and frees it with lance_shard_writer_free().
+ */
+int32_t lance_shard_writer_open(
+    LanceDataset* dataset,
+    const char* shard_id,
+    const LanceShardWriterConfig* config,
+    LanceShardWriter** out
+);
+
+/** Borrow the writer's canonical shard UUID string. */
+const char* lance_shard_writer_shard_id(
+    const LanceShardWriter* writer
+);
+
+/**
+ * Write batches from an Arrow stream.
+ *
+ * The stream is consumed on every return once `writer` is non-NULL, including
+ * error paths. An empty stream is rejected by native code. `out_result` is
+ * optional; when non-NULL it is written only on success.
+ */
+int32_t lance_shard_writer_put(
+    LanceShardWriter* writer,
+    struct ArrowArrayStream* stream,
+    LanceShardWriteResult* out_result
+);
+
+/**
+ * Delete rows by primary key from an Arrow stream.
+ *
+ * Same stream ownership and result rules as lance_shard_writer_put().
+ */
+int32_t lance_shard_writer_delete(
+    LanceShardWriter* writer,
+    struct ArrowArrayStream* stream,
+    LanceShardWriteResult* out_result
+);
+
+/**
+ * Snapshot native write counters.
+ *
+ * Available after a successful close because the native SharedWriteStats
+ * owner is retained by the handle.
+ */
+int32_t lance_shard_writer_stats(
+    const LanceShardWriter* writer,
+    LanceShardWriterStats* out
+);
+
+/**
+ * Snapshot live MemTable and memory statistics.
+ *
+ * Requires a live native writer; after close this returns
+ * LANCE_ERR_INVALID_ARGUMENT "ShardWriter is already closed". Unsupported in
+ * WAL-only writers, where native returns its own error.
+ */
+int32_t lance_shard_writer_memtable_stats(
+    const LanceShardWriter* writer,
+    LanceShardMemTableStats* out
+);
+
+/**
+ * Build a snapshot from the writer's latest manifest.
+ *
+ * Returns 0 with `*out == NULL` when the shard has no manifest yet. On success
+ * with a value, the caller owns `*out`.
+ */
+int32_t lance_shard_writer_snapshot(
+    const LanceShardWriter* writer,
+    LanceMemWalShardSnapshot** out
+);
+
+/**
+ * Create an LSM scanner over the supplied snapshots plus this writer's latest
+ * manifest, and attach the writer's active plus frozen-awaiting-flush
+ * MemTables. A snapshot with the same shard id is replaced by the writer's
+ * latest state. The scanner retains the captured native owners after the
+ * writer closes.
+ */
+int32_t lance_shard_writer_lsm_scanner(
+    LanceShardWriter* writer,
+    const LanceMemWalShardSnapshot* const* snapshots,
+    size_t num_snapshots,
+    LanceLsmScanner** out
+);
+
+/**
+ * Flush and close the native writer.
+ *
+ * The native writer is consumed on every result. A later close succeeds, even
+ * after an earlier failure; the first call reports its own native error.
+ * Pending WAL and MemTable failures surface from this call. `stats` remains
+ * available afterwards; MemTable-only operations do not.
+ */
+int32_t lance_shard_writer_close(LanceShardWriter* writer);
+
+/**
+ * Stop a live writer's native background tasks and free its allocation.
+ * Waits for in-progress native work to settle. Close first for durability;
+ * free requests native abort without a final flush. NULL-safe.
+ */
+void lance_shard_writer_free(LanceShardWriter* writer);
+
+/**
+ * Create an LSM scanner over a dataset and snapshots, without an active
+ * MemTable. Primary-key columns come from the dataset schema.
+ */
+int32_t lance_lsm_scanner_from_snapshots(
+    LanceDataset* dataset,
+    const LanceMemWalShardSnapshot* const* snapshots,
+    size_t num_snapshots,
+    LanceLsmScanner** out
+);
+
+/**
+ * Project the scan onto ordered column names. An empty list is passed to
+ * native code as an empty projection; `columns` may be NULL only when
+ * `num_columns == 0`. The scanner is updated only on success.
+ */
+int32_t lance_lsm_scanner_project(
+    LanceLsmScanner* scanner,
+    const char* const* columns,
+    size_t num_columns
+);
+
+/** Set a native SQL filter expression. The scanner is updated only on success. */
+int32_t lance_lsm_scanner_filter(
+    LanceLsmScanner* scanner,
+    const char* filter
+);
+
+/**
+ * Limit the scan, optionally with an offset. Each `has_*` flag is 0 or 1 and
+ * a present negative value is rejected. The scanner is updated only on
+ * success.
+ */
+int32_t lance_lsm_scanner_limit(
+    LanceLsmScanner* scanner,
+    int64_t limit,
+    int32_t has_limit,
+    int64_t offset,
+    int32_t has_offset
+);
+
+/** Include the `_rowaddr` internal column. */
+int32_t lance_lsm_scanner_with_row_address(LanceLsmScanner* scanner);
+
+/** Include the `_memtable_gen` internal column. */
+int32_t lance_lsm_scanner_with_memtable_gen(LanceLsmScanner* scanner);
+
+/** Schema produced by the scanner's native composition. */
+int32_t lance_lsm_scanner_schema(
+    const LanceLsmScanner* scanner,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * Execute the scan and return one batch. The caller owns `*out` and closes it
+ * with lance_batch_close().
+ */
+int32_t lance_lsm_scanner_to_batch(
+    const LanceLsmScanner* scanner,
+    LanceBatch** out
+);
+
+/**
+ * Execute the scan and export an Arrow stream. The scanner is not consumed and
+ * its native owners remain alive independently of the scan result.
+ */
+int32_t lance_lsm_scanner_to_arrow_stream(
+    const LanceLsmScanner* scanner,
+    struct ArrowArrayStream* out
+);
+
+/** Count matching rows without materializing them. */
+int32_t lance_lsm_scanner_count_rows(
+    const LanceLsmScanner* scanner,
+    uint64_t* out_count
+);
+
+/** Free an LSM scanner. Safe to call with NULL. */
+void lance_lsm_scanner_free(LanceLsmScanner* scanner);
+
+/**
+ * Create a point-lookup planner.
+ *
+ * `pk_columns` is read only when `has_pk_columns != 0`; otherwise the native
+ * dataset primary key is used and an absent primary key is an error. The
+ * planner captures the snapshots and dataset schema. `out` is written only on
+ * success.
+ */
+int32_t lance_lsm_point_lookup_planner_new(
+    LanceDataset* dataset,
+    const LanceMemWalShardSnapshot* const* snapshots,
+    size_t num_snapshots,
+    int32_t has_pk_columns,
+    const char* const* pk_columns,
+    size_t num_pk_columns,
+    LanceLsmPointLookupPlanner** out
+);
+
+/**
+ * Plan a point lookup for exactly one key row.
+ *
+ * `pk_value` must contain exactly one row. For a single-column primary key it
+ * must have exactly one non-Struct column; for a composite key it must have
+ * exactly one Struct column carrying one field per primary-key column.
+ * `columns` is read only when `has_columns != 0`. The caller owns `*out_plan`.
+ */
+int32_t lance_lsm_point_lookup_planner_plan(
+    LanceLsmPointLookupPlanner* planner,
+    const LanceBatch* pk_value,
+    int32_t has_columns,
+    const char* const* columns,
+    size_t num_columns,
+    LanceMemWalPlan** out
+);
+
+/** Free a point-lookup planner. Safe to call with NULL. */
+void lance_lsm_point_lookup_planner_free(
+    LanceLsmPointLookupPlanner* planner
+);
+
+/**
+ * Create a vector-search planner.
+ *
+ * The vector column must be a native FixedSizeList column. `filter` is an
+ * optional native SQL filter expression. `pk_columns` follows the same rule as
+ * the point-lookup planner. Distance values are this ABI's stable mapping.
+ */
+int32_t lance_lsm_vector_search_planner_new(
+    LanceDataset* dataset,
+    const LanceMemWalShardSnapshot* const* snapshots,
+    size_t num_snapshots,
+    const char* vector_column,
+    int32_t has_pk_columns,
+    const char* const* pk_columns,
+    size_t num_pk_columns,
+    LanceMemWalDistanceType distance_type,
+    const char* filter,
+    LanceLsmVectorSearchPlanner** out
+);
+
+/**
+ * Plan a KNN search over the captured LSM tiers.
+ *
+ * `query` holds exactly `query_len == vector_dimension` float32 values and is
+ * required to be non-NULL when `query_len > 0`. `k`, `nprobes` and
+ * `overfetch_factor` are validated by native code. `columns` is read only when
+ * `has_columns != 0`. The caller owns `*out_plan`.
+ */
+int32_t lance_lsm_vector_search_planner_plan(
+    LanceLsmVectorSearchPlanner* planner,
+    const float* query,
+    size_t query_len,
+    uint64_t k,
+    uint64_t nprobes,
+    int32_t has_columns,
+    const char* const* columns,
+    size_t num_columns,
+    int32_t refine_base_table,
+    double overfetch_factor,
+    LanceMemWalPlan** out
+);
+
+/** Free a vector-search planner. Safe to call with NULL. */
+void lance_lsm_vector_search_planner_free(
+    LanceLsmVectorSearchPlanner* planner
+);
+
+/**
+ * Export the plan's output schema as Arrow. `out` is caller-owned and its
+ * non-NULL release callback must be invoked exactly once.
+ */
+int32_t lance_mem_wal_plan_schema(
+    const LanceMemWalPlan* plan,
+    struct ArrowSchema* out
+);
+
+/**
+ * Export the dataset schema captured by the planner as Arrow. `out` is
+ * caller-owned.
+ */
+int32_t lance_mem_wal_plan_dataset_schema(
+    const LanceMemWalPlan* plan,
+    struct ArrowSchema* out
+);
+
+/**
+ * Format the native DataFusion plan tree without executing it. The returned
+ * string is NUL-terminated, owned by the caller, and must be freed with
+ * lance_free_string(). Returns -1 on error.
+ */
+int32_t lance_mem_wal_plan_explain(
+    const LanceMemWalPlan* plan,
+    char** out
+);
+
+/**
+ * Execute the plan and concatenate its batches into one. The caller owns
+ * `*out` and closes it with lance_batch_close().
+ */
+int32_t lance_mem_wal_plan_to_batch(
+    const LanceMemWalPlan* plan,
+    LanceBatch** out
+);
+
+/**
+ * Execute the plan and export an Arrow stream. Execution errors are reported
+ * with the prefix "Plan execution failed: ". The plan remains valid.
+ */
+int32_t lance_mem_wal_plan_to_arrow_stream(
+    const LanceMemWalPlan* plan,
+    struct ArrowArrayStream* out
+);
+
+/** Free an execution plan. Safe to call with NULL. */
+void lance_mem_wal_plan_free(LanceMemWalPlan* plan);
+
+/**
+ * Merge-insert with atomic MemWAL SSTable compaction progress.
+ *
+ * Behaves like lance_dataset_merge_insert(), then marks `compacted_sstables`
+ * as compacted in the same commit. Call this only on the final data-changing
+ * pass of a multi-pass compaction. `compacted_sstables` is required to be
+ * non-NULL when `num_compacted_sstables > 0`.
+ */
+int32_t lance_dataset_merge_insert_with_compaction(
+    LanceDataset* dataset,
+    const char* const* on_columns,
+    size_t num_on_columns,
+    struct ArrowArrayStream* source,
+    const LanceMergeInsertParams* params,
+    const LanceCompactedSsTable* compacted_sstables,
+    size_t num_compacted_sstables,
+    LanceMergeInsertResult* out_result
 );
 
 #ifdef __cplusplus

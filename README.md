@@ -34,11 +34,11 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Vector search | Nearest-neighbor via scanner with metric/k/nprobes |
 | [x] | Full-text search | FTS queries through scanner interface |
 | [x] | MinHash text search | Native MinHash LSH index and scanner similarity search with `_distance` |
-| [x] | Vector index creation | IVF_PQ, IVF_FLAT, IVF_SQ, HNSW variants |
+| [x] | Vector index creation | IVF_FLAT, IVF_SQ, IVF_PQ, IVF_RQ and HNSW variants, with native build options |
 | [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List, NGram, ZoneMap, BloomFilter, MinHash LSH, RTree indexes |
 | [x] | Index management | List and drop index operations |
-| [x] | Distributed index build | Train shared IVF/PQ models, build uncommitted fragment-scoped segments, and exchange protobuf metadata |
-| [x] | C++ wrappers | `create_vector_index()` and `create_scalar_index()` methods |
+| [x] | Distributed index build | Share IVF/PQ/RQ models, build uncommitted fragment-scoped segments, and exchange protobuf metadata |
+| [x] | C++ wrappers | `create_vector_index[_with_options]()` and `create_scalar_index()` methods |
 
 ### Phase 3: Write Path & Mutations
 
@@ -50,7 +50,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Delete operations | Predicate-based deletion via `lance_dataset_delete()` |
 | [x] | Update operations | Expression-based row updates via `lance_dataset_update()` |
 | [x] | Merge-insert | Upsert via configurable when-matched / when-not-matched policies with `lance_dataset_merge_insert()` |
-| [x] | Schema evolution | Add columns via SQL / all-null / `ArrowArrayStream` with `lance_dataset_add_columns_*()`, drop via `lance_dataset_drop_columns()`, rename / retype / set nullability via `lance_dataset_alter_columns()` |
+| [x] | Schema evolution | Add columns via SQL / all-null / `ArrowArrayStream` / callback `BatchUDF` with native checkpointing, left-join native `Dataset::merge`, drop via `lance_dataset_drop_columns()`, and rename / retype / set nullability via `lance_dataset_alter_columns()` |
 | [x] | Version management | Version details/metadata, lightweight refs, native ref checkout, tag and branch lifecycle, rollback, and numeric-version open |
 
 ### Phase 4: Advanced Features
@@ -536,9 +536,18 @@ three of them:
 | `lance-c-v0.1.9-aarch64-apple-darwin.tar.xz` | vcpkg `arm64-osx`, `arm64-osx-dynamic`, Conan `Macos/armv8` |
 
 Intel macOS (`x86_64-apple-darwin`) uses the `from-source` path for v0.1.9.
+The release workflow now includes an Intel macOS build row for future tags.
+That row has no effect on the published v0.1.9 package set: Intel remains a
+source build until a release containing the new archive is published and the
+recipes are updated with its hash.
+
+Releases cut after the Windows package path was added also publish
+`lance-c-vX.Y.Z-x86_64-pc-windows-msvc.tar.xz` and
+`lance-c-vX.Y.Z-aarch64-pc-windows-msvc.tar.xz`; v0.1.9 predates both.
 The archives contain headers, static and shared libraries,
-CMake package files, pkg-config metadata, and the license. The package recipes
-install only the linkage selected for that package.
+CMake package files, pkg-config metadata, and the license. Windows archives
+also contain `share/doc/lance-c/README.md`. The package recipes install only
+the linkage selected for that package.
 
 Static inspection of the published Linux shared libraries found:
 
@@ -550,20 +559,64 @@ Static inspection of the published Linux shared libraries found:
 | aarch64 Debian 12 | `GLIBC_2.35` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` |
 
 None of the Linux libraries records GLIBCXX or CXXABI version requirements.
-The macOS dylib is a thin `arm64` Mach-O binary with install name
-`@rpath/liblance_c.dylib`, `minos 11.0`, SDK `14.5`, and dependencies on
+The published v0.1.9 macOS dylib is a thin `arm64` Mach-O binary with install
+name `@rpath/liblance_c.dylib`, `minos 11.0`, SDK `14.5`, and dependencies on
 `SystemConfiguration`, `libobjc.A.dylib`, `IOKit`, `CoreFoundation`,
-`Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`.
+`Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`. Its static archive
+is not uniform: 416 of 3,298 Mach-O members declare `minos 14.5`, above the
+dylib's `11.0`, so the archive-level maximum is `14.5`. This split prevents
+treating the dylib value as a whole-package numeric runtime floor, but does
+not by itself prove that a static consumer fails below 14.5. No runtime
+execution of this published archive was retained.
+
+Linux and macOS release builds produced by the current workflow strip the
+staged shared library and restrict its defined dynamic exports to the public
+`lance_*` C ABI. Windows requires both the DLL and import library to expose
+exactly the header-declared symbols, with no additional dependency exports. The static archive is not
+stripped: it keeps the symbol table required for static linking. Archive names and layout above are unchanged, and no
+standalone shared-only artifact is added.
+
+A release-candidate x86_64 Linux build from this change measured:
+
+| Artifact | Bytes |
+| --- | --- |
+| baseline `liblance_c.so` (main `6b5c55f`) | 385,778,240 |
+| candidate `liblance_c.so` before stripping | 385,614,104 |
+| candidate `liblance_c.so` after stripping | 321,793,408 |
+| `liblance_c.a` | 1,073,016,964 |
+
+This is a candidate measurement, not a published release. The stripped
+library exported 846 `lance_*` symbols and no dependency symbols. The
+baseline shared library exported 872 symbols, including 26 `crc_fast_*`
+symbols. The static archive was byte-identical to the baseline. The
+aarch64 and macOS rows use the same policy; their sizes are produced by the
+release matrix and are not claimed by this x86_64 measurement. The v0.1.9
+table and archive labels above are historical.
+
+All Linux rows also verify the staged shared library's direct `DT_NEEDED`
+entries before the consumer and archive steps. Only glibc/toolchain SONAMEs
+(including the legacy `libpthread` and `libdl` names) are accepted;
+`libssl` and `libcrypto` are rejected.
 
 The highest GLIBC symbol reference records a dynamic-loader requirement.
-The Mach-O `minos` field records the binary's declared deployment target.
-Runtime compatibility requires consumer verification on the intended OS.
-Static archive inspection established object architecture. The complete
+Mach-O `minos` values record each dylib's or object's declared target; they
+are build metadata, not a whole-package runtime guarantee. The complete
 binary metadata is recorded in the [artifact
 audit](https://github.com/lance-format/lance-c/blob/2c00796/validation/issue-103/RESULTS.md).
-Runtime consumer evidence covers Linux x86_64 and is recorded in the
+Runtime consumer evidence for Linux x86_64 remains recorded in the
 [issue 100 validation
 record](https://github.com/lance-format/lance-c/blob/5a29b67/validation/issue-100/RESULTS.md).
+Current macOS checks and their limits are:
+
+| Build | Declared macOS metadata | Retained runtime check |
+| --- | --- | --- |
+| [Published v0.1.9 ARM64](https://github.com/lance-format/lance-c/releases/tag/v0.1.9) | Dylib `11.0`; static archive maximum `14.5` (416 of 3,298 members above `11.0`) | None for the published archive; the metadata split alone does not prove failure below 14.5 |
+| [#208 Intel Release candidate](https://github.com/lance-format/lance-c/pull/208) ([job](https://github.com/lance-format/lance-c/actions/runs/43137215582/job/130915319083)) | Dylib and all static archive members `<= 11.0` | macOS 15.7.9: installed static and shared dataset reads and Arrow ownership/lifetime acceptance passed. Candidate archive only, not published recipe availability |
+| [ARM64 current-source Release candidate at `62fbc0f`](https://github.com/lance-format/lance-c/commit/62fbc0fd69d66b184643e47ce93f7f3a6525598b) ([job](https://github.com/lance-format/lance-c/actions/runs/43181220854/job/131057410886)) | Dylib and all 3,855 static archive members: arm64, `minos 11.0` | macOS 15.8.2: installed static and shared dataset reads and Arrow, error and clone ownership acceptance passed. Candidate archive only, not published recipe availability; no older-macOS run |
+
+No numeric minimum macOS version is declared. The macOS 15.x versions above
+are exercised baselines, not a support floor; older macOS versions remain
+unverified, with no implied requirement to test every older release.
 
 ### From source via cargo (Rust developers)
 
@@ -582,6 +635,21 @@ cmake --build build
 cmake --install build --prefix /your/prefix
 ```
 
+On macOS, `MACOSX_DEPLOYMENT_TARGET` must be in the environment that invokes
+the CMake build. With the pinned Corrosion 0.5.1, setting only
+`CMAKE_OSX_DEPLOYMENT_TARGET` does not propagate to Cargo build scripts. To
+set the same deployment target for CMake and Cargo:
+
+```bash
+export MACOSX_DEPLOYMENT_TARGET=11.0
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+cmake --build build
+cmake --install build --prefix /your/prefix
+```
+
+The value selects a build target; it is not a runtime support promise.
+
 Installs headers, both linkages, a `LanceCConfig.cmake` package config, and
 a `lance-c.pc` pkg-config file. Consumers then:
 
@@ -592,6 +660,102 @@ target_link_libraries(myapp PRIVATE LanceC::lance_c)
 
 See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
 working example.
+
+### Windows (x86_64-pc-windows-msvc and aarch64-pc-windows-msvc)
+
+The Windows CMake build links the MSVC C runtime statically by default for
+both the DLL and static archive. Release and Windows CI pass
+`-DLANCE_C_CRT_STATIC=ON` explicitly; a source build can opt into the dynamic
+CRT with `-DLANCE_C_CRT_STATIC=OFF`.
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+  -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
+cmake --build build --config Release
+cmake --install build --prefix C:\path\to\prefix --config Release
+```
+
+For a native ARM64 build, select the Visual Studio 2026 ARM64 platform:
+
+```powershell
+cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL `
+  -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
+cmake --build build --config Release
+cmake --install build --prefix C:\path\to\prefix --config Release
+```
+
+AWS-LC requires clang-cl for its Windows ARM64 assembly sources, so this path
+uses the Visual Studio ClangCL toolset.
+
+The install prefix contains `lib/lance_c.dll`, its import library
+`lib/lance_c.dll.lib`, the static library `lib/lance_c.lib`, and the public
+headers. `find_package(LanceC)` selects the static library by default; set
+`LanceC_LINK=shared` before `find_package` to link through the import library.
+The installed shared consumer must have `lance_c.dll` beside its executable or
+on its DLL search path.
+
+The DLL and archive are built with the static CRT. The DLL therefore has no
+redistributable `VCRUNTIME*`, `MSVCP*`, `MSVCR*`, `CONCRT*`, or `VCOMP*`
+direct or delay-load dependency. It still requires the stated Windows OS
+baseline and loads `lance_c.dll` from the consumer's DLL search path.
+Windows OS components such as `msvcp_win.dll`, `msvcrt.dll`, and `ucrtbase.dll`
+can still appear in the process's loaded modules; they are part of that OS
+baseline, not an additional VC Redistributable prerequisite.
+
+The static archive is a Release `/MT` archive. Its consumer must use the same
+static CRT, and the package config declares
+`set(LanceC_STATIC_CRT ON)` for this build. An imported library cannot
+propagate `CMAKE_MSVC_RUNTIME_LIBRARY`, so each consuming target must select it
+from that metadata:
+
+```cmake
+find_package(LanceC 0.1 REQUIRED)
+if(WIN32 AND LanceC_STATIC_CRT)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
+```
+
+Do not link a `/MD` consumer against this archive. The release archive is not
+a `/MTd` debug library, and mixing `/MTd` with it is not supported. A shared
+consumer may use either CRT; the package's acceptance example also builds the
+shared consumer with `/MT` so its own executables do not depend on a
+redistributable runtime.
+
+The CMake option does not configure a direct Cargo build. For Cargo, select
+the same Rust target feature explicitly for the Windows target:
+
+```powershell
+$env:RUSTFLAGS = '-Ctarget-feature=+crt-static'
+cargo build --release --target x86_64-pc-windows-msvc
+```
+
+Cargo exposes that target feature to build scripts, which lets `cc` and
+AWS-LC's CMake configuration select the static CRT for native dependencies.
+
+When staging existing Windows libraries with `LANCE_C_USE_PREBUILT=ON`, also
+set `LANCE_C_CRT_STATIC=ON` for Release `/MT` inputs or `OFF` for dynamic-CRT
+inputs. This explicit declaration controls the installed package metadata;
+prebuilt mode copies the supplied libraries unchanged and cannot convert their
+CRT. Omitting the declaration in a fresh prebuilt configuration is an error.
+
+The Windows package link is restricted through a wrapper around MSVC
+`link.exe`. Overriding the linker with `lld-link` is not supported for this
+export policy.
+
+Windows CI builds this layout with Rust 1.94.0. The x64 job uses
+`windows-2022`. The ARM64 job uses `windows-11-arm` and asserts that the
+runner, PowerShell process, and Rust host are native ARM64. Each job verifies
+the PE32+ machine, public `lance_*` exports, absence of redistributable CRT
+imports, static archive directives, and installed static/shared C++17
+consumers. The consumers run with `PATH` restricted to the Windows system
+directories and write their loaded-module lists; `LNK4098` and `LNK2038` are
+failures. The hosted images already contain a VC Runtime under `System32`, so
+this is import-table and loaded-module evidence on the named hosted OS, not a
+fresh-machine lab. The Windows 11 ARM64 baseline does not establish Windows 10
+ARM64 or Windows Server ARM64 support.
+
+See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
+for a reproducible native-14 C segment to Java-12 commit/query PoC.
 
 ### vcpkg
 
@@ -668,6 +832,71 @@ ds.scan()
   .to_arrow_stream(&stream);
 // consume stream...
 ```
+
+### Owned native write options
+
+`lance_native_write_options_new` copies one `LanceNativeWriteOptionsSpec` into
+an opaque `LanceNativeWriteOptions` owner. The handle maps the full representable
+native `WriteParams` surface: output shape, auto-cleanup, stable row IDs,
+`data_storage_version`, `enable_v2_manifest_paths`, session, transaction
+properties, base registration and placement, per-base storage params, external
+blob policy, blob pack-file threshold, current-format file-writer options, and
+fragment/cumulative progress callbacks. `lance_dataset_write_with_native_options`
+uses it for a committing write;
+`lance_dataset_write_uncommitted_stream_with_native_options` uses it for a
+staged write that is published through the existing transaction commit APIs.
+
+```c
+LanceWriteOptions write = {0};
+write.params.max_rows_per_file = 1;
+
+LanceNativeWriteOptionsSpec spec = {0};
+spec.write_options = &write;
+spec.has_enable_v2_manifest_paths = 1;
+spec.enable_v2_manifest_paths = false;
+spec.has_target_all_bases = 1;
+spec.target_all_bases = true;
+
+LanceNativeWriteOptions* options = lance_native_write_options_new(&spec);
+LanceDataset* out = NULL;
+if (lance_dataset_write_with_native_options(
+        "data.lance", &schema, &stream, LANCE_WRITE_CREATE, options, &out) != 0) {
+    /* read lance_last_error_* */
+}
+lance_native_write_options_close(options);
+```
+
+The C++ RAII wrapper is `lance::NativeWriteOptions` with
+`lance::NativeWriteOptionsSpec`; use `Dataset::write_with_native_options` and
+`Dataset::write_uncommitted_with_native_options`.
+
+The returned staged transaction owns only uncommitted data-file metadata. It
+does not retain the options handle, session, storage accessor or commit lock;
+pass those owners to the later commit when commit I/O needs them.
+
+Option presence is preserved. A NULL list pointer maps to native `None`; a
+non-NULL list pointer with count zero maps to `Some(empty)`. An explicit empty
+target list and all native target-base conflicts are reported by Lance core,
+not reconstructed here. `target_all_bases` resolves primary storage as ID 0
+and registered bases by ascending ID, with primary first when included.
+
+Progress callbacks receive actual native events. Fragment begin/complete
+callbacks receive a borrowed `LanceWriteFragmentProgressInfo`; the write-stats
+callback receives cumulative native `WriteStats`. Fragment callbacks may report
+an error and may run concurrently on native worker threads. Write-stats has no
+native error channel. Ownership of the progress context transfers only when
+`lance_native_write_options_new` succeeds, and the release callback runs
+exactly once when the final native owner drops. Closing the options handle does
+not invalidate already-committed datasets or returned transactions.
+
+Native trait-object hooks that cannot be represented in C remain explicit gaps:
+custom Rust object stores and store wrappers, custom commit handlers other than
+`LanceCommitLock`, and feature-gated AWS credential providers. Global
+`ObjectStoreParams` scalar fields beyond the storage accessor are also not
+exposed; per-base `ObjectStoreParams` supports the accessor, block size, S3
+credential refresh offset, constant-size upload parts, and lexical ordering.
+Native object-store resolution, validation, defaults and errors remain
+authoritative.
 
 ### Native transactions
 
@@ -823,6 +1052,57 @@ auto approx_items = session.approx_num_items();
 measurement or a configured limit. `approx_num_items()` is explicitly
 approximate and may change as cache maintenance runs.
 
+### Vector index build options
+
+`lance_dataset_create_vector_index` and
+`lance_index_segment_builder_new_vector` retain the original
+`LanceVectorIndexParams` ABI and its zero-as-default rules. IVF_RQ is value 107;
+its legacy `num_bits == 0` selects the native RQ default of 5.
+
+Use `lance_dataset_create_vector_index_with_options` and
+`lance_index_segment_builder_new_vector_with_options` when a build needs native
+presence semantics. `LanceVectorIndexOptions` distinguishes an absent value from
+an explicit zero, supports automatic or explicit IVF sizing, training/sampling
+and streaming controls, precomputed partitions/shuffle inputs, storage and
+runtime hints, PQ parameters/models, native IVF/PQ Arrow model pairs, RQ JSON,
+HNSW tuning, index file version, transpose control, and the native train flag.
+`options->has_train == false` retains the native train=true default.
+
+```c
+LanceVectorIndexOptions options = {0};
+options.index_type = LANCE_INDEX_IVF_RQ;
+options.metric = LANCE_METRIC_L2;
+options.num_partitions = (LanceOptionalU64){256, true}; /* absent: native auto */
+options.num_bits = (LanceOptionalU64){5, true};
+const char* rq_model = lance_index_build_rq_model(128, 0); /* 0 -> native 5 */
+options.rabitq_model_json = rq_model;
+int32_t status = lance_dataset_create_vector_index_with_options(
+    dataset, "embedding", "embedding_idx", &options, false);
+lance_free_string(rq_model);
+```
+
+```cpp
+lance::VectorIndexOptions options;
+options.index_type = LANCE_INDEX_IVF_RQ;
+options.num_partitions = 256;
+options.rabitq_model_json = lance::build_rq_model(128);
+dataset.create_vector_index_with_options("embedding", options);
+```
+
+String maps must contain valid UTF-8. Duplicate keys use Rust HashMap
+last-write-wins semantics. Fragment selection preserves native None versus
+Some(empty); Lance decides duplicate and missing-ID validation at build time.
+Native Arrow model pointers are borrowed synchronously and may be replaced while
+a live caller-owned equivalent remains in place. `IndexModel::adopt` transfers
+caller-produced native Arrow structs and clears the input structs, allowing
+model dtypes beyond the legacy trainer's Float32 representation.
+
+Uncommitted builders copy their dataset snapshot, strings, maps, paths, fragment
+IDs and UUIDs. The committed options entry point follows native publication:
+Lance commits first and then reloads index metadata, so an error can be returned
+after a new dataset version was published. Reopen the dataset to determine its
+current version; the binding does not claim storage rollback on such errors.
+
 ### Prewarm an index synchronously
 
 Prewarm a logical index before serving queries to move cold index reads out of
@@ -934,9 +1214,49 @@ metadata model. The list is an object keyed by branch name; each
 Map enumeration order is unspecified. Branch metadata replacement writes the
 whole native map, so an empty map clears all entries.
 
+### Deep clone a dataset
+
+`lance_dataset_deep_clone` copies one source snapshot into a new target dataset
+using native `Dataset::deep_clone`. A `NULL` reference clones the source
+handle's current snapshot; pass a `LanceRef` to select the current head, a
+version, a tag, or a branch:
+
+```c
+LanceDataset* copy = NULL;
+if (lance_dataset_deep_clone(ds, "copy.lance", NULL, NULL, &copy) != 0) {
+    /* handle error */
+}
+
+LanceRef* ref = lance_ref_version_number(7);
+LanceDataset* at_seven = NULL;
+int32_t rc = lance_dataset_deep_clone(ds, "copy-v7.lance", ref, NULL, &at_seven);
+lance_ref_close(ref);
+```
+
+```cpp
+lance::Dataset copy = ds.deep_clone("copy.lance");
+auto ref = lance::Ref::version_number(7);
+lance::Dataset at_seven = ds.deep_clone("copy-v7.lance", &ref);
+```
+
+The target must not exist yet. The returned handle is a normal dataset whose
+version id is the cloned snapshot's version; the source handle keeps its
+snapshot and no source write lock is held during copying. The optional storage
+options accessor contributes its native `Arc` without resolving or copying
+credentials; NULL, or an accessor created with neither static options nor a
+provider, passes native `None`. For datasets with additional base paths, native
+deep clone reads them through the source dataset's object store; per-base
+distinct source credentials are not supported. Native clone commits resolve the
+target URI through the default object-store registry, so target schemes
+registered only on a custom session are rejected. A copy or commit error does
+not guarantee that the target remains unpublished; reopen the target to check
+its state. Copied objects may remain under the target path and are not rolled
+back.
+
 ## Releasing
 
-Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds five prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, and macOS arm64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. Intel macOS consumers use the source build described above.
+Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds eight prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, macOS arm64 and Intel x86_64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the restored Intel and Windows rows; its published matrix remains the five archives listed above.
+Before the consumer smoke test and archive upload, the Linux and macOS rows strip the staged shared library and verify its exact public exports. Linux rows also verify direct runtime dependencies. Windows verifies PE architecture, exact DLL and import-library export sets, absence of redistributable CRT imports, compatible static-CRT archive and consumer directives, and installed static/shared consumers.
 
 ### Recommended: cut a release via Actions UI
 
@@ -952,7 +1272,7 @@ Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), wh
    - Commits as `github-actions[bot]` with message `chore: bump version to <version>`.
    - Pushes the commit to `main` and pushes the tag.
    - Dispatches `release.yml` at the new tag's ref. (Direct tag push by `GITHUB_TOKEN` does not trigger workflows — GitHub's recursion guard — so we explicitly `gh workflow run` instead.)
-4. `release.yml` builds artifacts. ~20 minutes later the [GitHub Release](https://github.com/lance-format/lance-c/releases) has all published `.tar.xz` artifacts (Linux x86_64/aarch64, their Debian 12 variants, and macOS arm64) plus a `SHA512SUMS` file.
+4. `release.yml` builds artifacts. Once the tag includes all rows, the [GitHub Release](https://github.com/lance-format/lance-c/releases) has `.tar.xz` artifacts for Linux x86_64/aarch64, their Debian 12 variants, macOS arm64/Intel x86_64, and Windows x86_64/aarch64, plus a `SHA512SUMS` file. The v0.1.9 release remains the historical five-asset set above.
 5. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
    - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
    - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
@@ -980,7 +1300,7 @@ If you need to cut a release without the workflow (e.g. local tag with extra com
    git tag v0.2.0
    git push origin v0.2.0
    ```
-5. `release.yml` fires on the tag push and builds the five prebuilt tarballs as above.
+5. `release.yml` fires on the tag push and builds the eight prebuilt tarballs as above.
 
 A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 

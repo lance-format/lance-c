@@ -2,18 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Add columns C API: append new columns to a dataset, committing a new
-//! manifest. Three variants mirror the upstream `NewColumnTransform` cases
-//! that translate cleanly across the C ABI:
+//! manifest. The variants here mirror the upstream `NewColumnTransform` cases
+//! that use Arrow readers; callback-based `BatchUDF` lives in `batch_udf.rs`.
 //!
 //! * `..._sql`    — derive columns from SQL expressions over existing columns.
 //! * `..._nulls`  — add all-null columns described by an Arrow schema; this is
 //!   a metadata-only operation on non-legacy datasets.
 //! * `..._stream` — splice in precomputed column data from an Arrow C stream,
 //!   aligned to the dataset's existing rows in order.
-//!
-//! The upstream `BatchUDF` variant is intentionally omitted: it carries a Rust
-//! closure that cannot cross the C ABI. The `_stream` variant covers the same
-//! "bring your own computed data" use case.
 //!
 //! Each call mutates the dataset in place under an exclusive write lock;
 //! existing scanners that already cloned the inner Arc keep their pre-add view.
@@ -22,7 +18,7 @@ use std::ffi::c_char;
 use std::sync::Arc;
 
 use arrow::ffi::FFI_ArrowSchema;
-use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::NewColumnTransform;
 use lance_core::Result;
@@ -102,20 +98,7 @@ unsafe fn add_columns_sql_inner(
 
     let batch_size = resolve_batch_size(batch_size)?;
 
-    // Materialize the (name, expression) pairs up front so a precise per-index
-    // error fires before the dataset's write lock is taken — matches the
-    // pre-lock validation pattern used by the sibling schema-evolution APIs.
-    let mut pairs: Vec<(String, String)> = Vec::with_capacity(num_columns);
-    for i in 0..num_columns {
-        // SAFETY: `columns` is non-NULL (checked above) and the caller
-        // guarantees the array has at least `num_columns` initialised entries
-        // valid for this call. Each entry's `name` / `expression` pointers are
-        // dereferenced by `parse_required_field` under the same guarantee.
-        let entry = unsafe { &*columns.add(i) };
-        let name = unsafe { parse_required_field(entry.name, i, "name")? };
-        let expression = unsafe { parse_required_field(entry.expression, i, "expression")? };
-        pairs.push((name, expression));
-    }
+    let pairs = unsafe { parse_sql_columns(columns, num_columns) }?;
 
     let transform = NewColumnTransform::SqlExpressions(pairs);
 
@@ -256,78 +239,9 @@ unsafe fn add_columns_stream_inner(
     stream: *mut FFI_ArrowArrayStream,
     batch_size: u64,
 ) -> Result<i32> {
-    // The stream NULL check is the only validation that runs *before* the
-    // stream is consumed. Once `from_raw` succeeds, every later return path
-    // (dataset / batch_size) drops `reader`, which fires the FFI release
-    // callback — so those checks are deliberately deferred to after `from_raw`.
-    // Moving them ahead of `from_raw` would early-return without releasing the
-    // caller's stream, breaking the documented "consumed on every return"
-    // contract. (This NULL-before-`from_raw` ordering matches `merge_insert.rs`;
-    // the callback pre-flight guard below is specific to this function.)
-    if stream.is_null() {
-        return Err(lance_core::Error::invalid_input_source(
-            "stream must not be NULL".into(),
-        ));
-    }
-
-    // Reject a stream missing a mandatory C Data Interface callback *before*
-    // handing it to arrow-rs. `ArrowArrayStreamReader` only guards against a
-    // NULL `release`; a NULL `get_schema` or `get_next` would otherwise reach an
-    // `unwrap()` deep inside arrow-rs and turn predictable invalid input into
-    // LANCE_ERR_PANIC. We do not require `get_last_error` (the spec
-    // marks it optional): requiring it would not close the abort anyway, since a
-    // present callback that *returns* NULL at error time hits the same
-    // `last_error.unwrap()` on arrow-rs's `get_next` error path — a residual
-    // upstream limitation reachable only by a stream that signals an error
-    // without a message, which we cannot guard at intake.
-    //
-    // SAFETY: `stream` is non-NULL (checked above) and the caller guarantees it
-    // points to an initialised, properly-aligned `FFI_ArrowArrayStream`. The
-    // callback slots are `Copy` function pointers; this shared borrow ends
-    // before any ownership transfer below.
-    let (release, has_schema_cb, has_next_cb) = unsafe {
-        let raw = &*stream;
-        (
-            raw.release,
-            raw.get_schema.is_some(),
-            raw.get_next.is_some(),
-        )
-    };
-    if release.is_none() || !has_schema_cb || !has_next_cb {
-        // Preserve the "consumed on every return path" contract: release the
-        // stream ourselves rather than routing the broken struct through
-        // arrow-rs's aborting `from_raw`.
-        if let Some(release_fn) = release {
-            // SAFETY: `release_fn` is the producer's release callback for this
-            // stream. We null the caller's `release` field *first* — the Arrow C
-            // Data Interface "released" sentinel — then invoke the callback once.
-            // Nulling first is the move-semantics convention (the consumer claims
-            // ownership before cleanup) and is robust even against a producer
-            // that frees the struct inside its own callback: we never touch the
-            // struct after `release_fn` returns. `release_fn` reads `private_data`
-            // (untouched), so its cleanup still runs.
-            unsafe {
-                (*stream).release = None;
-                release_fn(stream);
-            }
-        }
-        return Err(lance_core::Error::invalid_input_source(
-            "stream is uninitialised, already released, or missing a \
-                     required get_schema/get_next/release callback"
-                .into(),
-        ));
-    }
-
-    // SAFETY: `stream` is non-NULL (checked above) and the caller guarantees it
-    // points to an initialised, properly-aligned `FFI_ArrowArrayStream` they
-    // own. `from_raw` moves the entire caller struct into Rust (via `ptr::replace`
-    // with an empty, released stream), so the caller's memory cannot be released
-    // twice — on success or on the error path. The pre-flight guard rules out the
-    // `release == NULL` error, but `from_raw` still fails (a live `map_err` path)
-    // if the stream's `get_schema` callback returns an error code or yields a
-    // schema arrow-rs cannot convert; that surfaces as `LANCE_ERR_INVALID_ARGUMENT`.
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream) }
-        .map_err(|e| lance_core::Error::invalid_input_source(e.to_string().into()))?;
+    // A non-NULL stream is consumed on every return path. Validation that does
+    // not need the current reader runs only after ownership has transferred.
+    let reader = unsafe { helpers::take_arrow_array_stream(stream)? };
 
     if dataset.is_null() {
         return Err(lance_core::Error::invalid_input_source(
@@ -360,6 +274,25 @@ unsafe fn parse_required_field(ptr: *const c_char, index: usize, field: &str) ->
             )
         })?;
     Ok(value.to_string())
+}
+
+/// Convert borrowed SQL-column declarations into the native expression list.
+///
+/// This is shared by dataset and fragment add-columns entry points so both
+/// retain the same null, UTF-8 and per-entry validation behavior.
+pub(crate) unsafe fn parse_sql_columns(
+    columns: *const LanceSqlColumn,
+    num_columns: usize,
+) -> Result<Vec<(String, String)>> {
+    let columns =
+        unsafe { helpers::required_slice(columns, num_columns, "columns", "num_columns")? };
+    let mut pairs = Vec::with_capacity(columns.len());
+    for (index, entry) in columns.iter().enumerate() {
+        let name = unsafe { parse_required_field(entry.name, index, "name")? };
+        let expression = unsafe { parse_required_field(entry.expression, index, "expression")? };
+        pairs.push((name, expression));
+    }
+    Ok(pairs)
 }
 
 /// Translate the `0 = upstream default` batch-size sentinel into `Option<u32>`,
