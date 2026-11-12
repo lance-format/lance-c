@@ -81,9 +81,9 @@ function Find-MsvcLinker {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
         $visualStudio = & $vswhere -latest -products * `
-            -requires $component -property installationPath |
-            Select-Object -First 1
+            -requires $component -property installationPath
         if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($visualStudio)) {
+            $visualStudio = $visualStudio | Select-Object -First 1
             $relativePaths = if ($Machine -eq 'ARM64') {
                 @('bin\Hostarm64\arm64\link.exe', 'bin\Hostx64\arm64\link.exe')
             } else {

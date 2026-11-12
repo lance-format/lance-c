@@ -82,8 +82,7 @@ fn write_msvc_export_definition() {
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let definition_path = out_dir.join("lance_c.def");
-    let mut definition =
-        String::from("LIBRARY lance_c\n; lance-c exact public exports\nEXPORTS\n");
+    let mut definition = String::from("LIBRARY lance_c\n; lance-c exact public exports\nEXPORTS\n");
     for export in &exports {
         writeln!(definition, "  {export}").expect("writing a DEF entry to a String cannot fail");
     }

@@ -91,11 +91,11 @@ if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
     throw "vswhere.exe not found at $vswhere"
 }
 $visualStudio = & $vswhere -latest -products * `
-    -requires $msvcComponent -property installationPath |
-    Select-Object -First 1
+    -requires $msvcComponent -property installationPath
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($visualStudio)) {
     throw "no Visual Studio installation with MSVC component $msvcComponent was found"
 }
+$visualStudio = $visualStudio | Select-Object -First 1
 $devShell = Join-Path $visualStudio 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
 Import-Module $devShell
 $devArch = $Architecture.ToLowerInvariant()
