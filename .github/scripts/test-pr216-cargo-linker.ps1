@@ -17,6 +17,10 @@ function Get-DllExports {
     if ($LASTEXITCODE -ne 0) {
         throw "dumpbin failed for $Path`n$text"
     }
+    $name = if ($Path -match '\.lib$') { 'cargo-import.dumpbin.txt' } else {
+        'cargo-dll.dumpbin.txt'
+    }
+    [System.IO.File]::WriteAllText((Join-Path $WorkDir $name), $text)
     return @(
         [regex]::Matches(
             $text, '(?m)^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$') |
@@ -32,6 +36,8 @@ function Get-ImportExports {
     if ($LASTEXITCODE -ne 0) {
         throw "dumpbin failed for $Path`n$text"
     }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $WorkDir 'response-import.dumpbin.txt'), $text)
     $inTable = $false
     $foundTable = $false
     $exports = foreach ($line in ($text -split '\r?\n')) {
