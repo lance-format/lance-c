@@ -14,6 +14,8 @@ import org.apache.arrow.vector.ipc.ArrowReader;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ReadOptions;
+import org.lance.crosssdk.proto.InvertedIndexDetailsProto.InvertedIndexDetails;
+import org.lance.crosssdk.proto.InvertedIndexDetailsProto.InvertedIndexDetails.DocumentGranularity;
 import org.lance.crosssdk.proto.VectorIndexDetailsProto.VectorIndexDetails;
 import org.lance.crosssdk.proto.VectorIndexDetailsProto.VectorMetricType;
 import org.lance.index.DistanceType;
@@ -23,6 +25,7 @@ import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.index.vector.VectorIndexParams;
+import org.lance.ipc.FullTextQuery;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
@@ -60,6 +63,17 @@ public final class CrossSdkAcceptance {
   private static final int VECTOR_K = 4;
   private static final int[] VECTOR_MULTIPLIERS = {3, 5, 7, 11, 13, 17, 19, 23};
   private static final int[] VECTOR_MODULI = {29, 31, 37, 41, 43, 47, 53, 59};
+
+  private static final String FTS_INDEX_NAME = "fts_cross_sdk";
+  private static final String FTS_COLUMN = "text";
+  private static final int FTS_FIELD_ID = 1;
+  private static final int FTS_INDEX_VERSION = 2;
+  private static final int FTS_TOTAL_ROWS = 128;
+  private static final String FTS_PARAMS_JSON =
+      "{\"base_tokenizer\":\"simple\",\"language\":\"English\","
+          + "\"with_position\":true,\"max_token_length\":40,"
+          + "\"lower_case\":true,\"stem\":false,\"remove_stop_words\":false,"
+          + "\"format_version\":2}";
 
   private CrossSdkAcceptance() {}
 
@@ -103,6 +117,28 @@ public final class CrossSdkAcceptance {
     VectorQueryResult(List<Integer> ids, List<Float> distances, ScanStats stats) {
       this.ids = ids;
       this.distances = distances;
+      this.stats = stats;
+    }
+  }
+
+  private static final class FtsQueryCase {
+    final String name;
+    final FullTextQuery query;
+    final List<Integer> expected;
+
+    FtsQueryCase(String name, FullTextQuery query, List<Integer> expected) {
+      this.name = name;
+      this.query = query;
+      this.expected = expected;
+    }
+  }
+
+  private static final class FtsQueryResult {
+    final List<Integer> ids;
+    final ScanStats stats;
+
+    FtsQueryResult(List<Integer> ids, ScanStats stats) {
+      this.ids = ids;
       this.stats = stats;
     }
   }
@@ -518,6 +554,156 @@ public final class CrossSdkAcceptance {
     }
   }
 
+  private static List<Integer> expectedFtsIds(int... residues) {
+    Set<Integer> acceptedResidues = new HashSet<>();
+    for (int residue : residues) {
+      acceptedResidues.add(residue);
+    }
+
+    List<Integer> ids = new ArrayList<>();
+    for (int id = 0; id < FTS_TOTAL_ROWS; ++id) {
+      if (acceptedResidues.contains(id % 4)) {
+        ids.add(id);
+      }
+    }
+    return ids;
+  }
+
+  private static FtsQueryResult runFtsQuery(Dataset dataset, FullTextQuery query) {
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .columns(List.of("id"))
+            .fullTextQuery(query)
+            .batchSize(128)
+            .collectStats(true)
+            .build();
+
+    List<Integer> ids = new ArrayList<>();
+    ScanStats stats;
+    try (LanceScanner scanner = dataset.newScan(options)) {
+      try (ArrowReader reader = scanner.scanBatches()) {
+        while (reader.loadNextBatch()) {
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          IntVector idVector = (IntVector) root.getVector("id");
+          for (int row = 0; row < root.getRowCount(); ++row) {
+            require(!idVector.isNull(row), "FTS fixture id must not contain nulls");
+            ids.add(idVector.get(row));
+          }
+        }
+      }
+      stats =
+          scanner
+              .getStats()
+              .orElseThrow(() -> new IllegalStateException("FTS scan stats were not collected"));
+    } catch (Exception e) {
+      throw new IllegalStateException("FTS scan failed", e);
+    }
+
+    Collections.sort(ids);
+    require(ids.size() == new HashSet<>(ids).size(), "FTS scan returned duplicate row ids");
+
+    long cacheLookups = stats.getIndexCacheHits() + stats.getIndexCacheMisses();
+    long partitionsSearched = stats.getAllCounts().getOrDefault("partitions_searched", 0L);
+    require(
+        stats.getIndicesLoaded() > 0,
+        "FTS query did not load a committed index: " + stats);
+    require(
+        partitionsSearched > 0,
+        "FTS query did not search an inverted-index partition: " + stats);
+    require(cacheLookups > 0, "FTS query performed no inverted-index cache lookups: " + stats);
+    return new FtsQueryResult(ids, stats);
+  }
+
+  private static void runFtsQueries(
+      Dataset crossSdkDataset, Dataset baselineDataset, List<FtsQueryCase> cases) {
+    for (FtsQueryCase query : cases) {
+      FtsQueryResult crossSdk = runFtsQuery(crossSdkDataset, query.query);
+      FtsQueryResult baseline = runFtsQuery(baselineDataset, query.query);
+
+      require(
+          crossSdk.ids.equals(query.expected),
+          "C/Java FTS path returned "
+              + crossSdk.ids
+              + " for "
+              + query.name
+              + ", expected "
+              + query.expected);
+      require(
+          baseline.ids.equals(query.expected),
+          "Java one-shot FTS path returned "
+              + baseline.ids
+              + " for "
+              + query.name
+              + ", expected "
+              + query.expected);
+      require(
+          crossSdk.ids.equals(baseline.ids),
+          "C/Java FTS path differs from Java one-shot for " + query.name);
+
+      System.out.printf(
+          "fts_query name=%s expected=%s cross_sdk=%s baseline=%s "
+              + "cross_indices_loaded=%d cross_parts_loaded=%d "
+              + "cross_index_comparisons=%d cross_index_cache_hits=%d "
+              + "cross_index_cache_misses=%d cross_partitions_searched=%d "
+              + "baseline_indices_loaded=%d baseline_partitions_searched=%d%n",
+          query.name,
+          query.expected,
+          crossSdk.ids,
+          baseline.ids,
+          crossSdk.stats.getIndicesLoaded(),
+          crossSdk.stats.getPartsLoaded(),
+          crossSdk.stats.getIndexComparisons(),
+          crossSdk.stats.getIndexCacheHits(),
+          crossSdk.stats.getIndexCacheMisses(),
+          crossSdk.stats.getAllCounts().getOrDefault("partitions_searched", 0L),
+          baseline.stats.getIndicesLoaded(),
+          baseline.stats.getAllCounts().getOrDefault("partitions_searched", 0L));
+      System.out.println("cross_scan_stats=" + crossSdk.stats);
+      System.out.println("baseline_scan_stats=" + baseline.stats);
+    }
+  }
+
+  private static void decodeFtsDetails(Index index, int segment) throws Exception {
+    Any any = Any.parseFrom(index.indexDetails().orElseThrow());
+    require(
+        any.getTypeUrl().endsWith("InvertedIndexDetails"),
+        "C-produced FTS Any has an unexpected type URL: " + any.getTypeUrl());
+    InvertedIndexDetails details = InvertedIndexDetails.parseFrom(any.getValue());
+    require(
+        details.hasBaseTokenizer() && details.getBaseTokenizer().equals("simple"),
+        "FTS base tokenizer is not simple");
+    require(details.getLanguage().contains("English"), "FTS language is not English");
+    require(details.getWithPosition(), "FTS index did not store token positions");
+    require(
+        details.hasMaxTokenLength() && details.getMaxTokenLength() == 40,
+        "FTS max_token_length changed");
+    require(details.getLowerCase(), "FTS lower_case is false");
+    require(!details.getStem(), "FTS stemming is enabled");
+    require(!details.getRemoveStopWords(), "FTS stop-word removal is enabled");
+    require(details.getAsciiFolding(), "FTS ascii_folding is false");
+    require(
+        details.hasBlockSize() && details.getBlockSize() == 128,
+        "FTS posting block size changed");
+    require(
+        details.getDocumentGranularity() == DocumentGranularity.ROW,
+        "FTS document granularity is not row");
+    require(
+        details.hasPostingFormatVersion() && details.getPostingFormatVersion() == FTS_INDEX_VERSION,
+        "FTS posting format version changed");
+    require(!details.hasCodeConfig(), "FTS index unexpectedly contains code tokenizer config");
+    System.out.printf(
+        "fts_details segment=%d type_url=%s base_tokenizer=%s language=%s "
+            + "positions=%s block_size=%d granularity=%s posting_format_version=%d%n",
+        segment,
+        any.getTypeUrl(),
+        details.getBaseTokenizer(),
+        details.getLanguage(),
+        details.getWithPosition(),
+        details.getBlockSize(),
+        details.getDocumentGranularity(),
+        details.getPostingFormatVersion());
+  }
+
   private static List<Integer> datasetFragments(Dataset dataset) {
     return dataset.getFragments().stream()
         .map(Fragment::getId)
@@ -829,10 +1015,173 @@ public final class CrossSdkAcceptance {
         VECTOR_K);
   }
 
+  private static void runFts(Path crossSdkPath, Path baselinePath, Path metadataPath)
+      throws Exception {
+    List<Integer> fixtureFragments = List.of(0, 1);
+    List<Integer> fixtureFields = List.of(FTS_FIELD_ID);
+    List<Index> produced =
+        decodeSegments(
+            metadataPath,
+            FTS_INDEX_NAME,
+            2,
+            fixtureFragments,
+            fixtureFields,
+            FTS_INDEX_VERSION,
+            "InvertedIndexDetails");
+    for (int segment = 0; segment < produced.size(); ++segment) {
+      decodeFtsDetails(produced.get(segment), segment);
+    }
+    Map<UUID, Index> producedByUuid = byUuid(produced);
+    long beforeVersion;
+    long afterVersion;
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      ReadOptions readOptions = new ReadOptions.Builder().build();
+      try (Dataset dataset = Dataset.open(allocator, crossSdkPath.toString(), readOptions)) {
+        beforeVersion = dataset.version();
+        List<Integer> fragmentIds = datasetFragments(dataset);
+        require(beforeVersion == 2, "FTS fixture must start at dataset version 2");
+        require(
+            fragmentIds.equals(fixtureFragments),
+            "FTS fixture fragment ids differ: " + fragmentIds);
+        validateSegments(
+            produced,
+            FTS_INDEX_NAME,
+            fragmentIds,
+            fixtureFields,
+            beforeVersion,
+            FTS_INDEX_VERSION,
+            IndexType.INVERTED,
+            "InvertedIndexDetails",
+            Map.of(),
+            false);
+
+        List<Index> committed =
+            dataset.commitExistingIndexSegments(FTS_INDEX_NAME, FTS_COLUMN, produced);
+        afterVersion = dataset.version();
+        require(
+            afterVersion == beforeVersion + 1,
+            "Java FTS commit must publish exactly one dataset version");
+        validateSegments(
+            committed,
+            FTS_INDEX_NAME,
+            fragmentIds,
+            fixtureFields,
+            beforeVersion,
+            FTS_INDEX_VERSION,
+            IndexType.INVERTED,
+            "InvertedIndexDetails",
+            producedByUuid,
+            true);
+        System.out.printf(
+            "commit mode=fts status=success before_version=%d after_version=%d segments=%d%n",
+            beforeVersion, afterVersion, committed.size());
+      }
+
+      try (Dataset reopened = Dataset.open(allocator, crossSdkPath.toString(), readOptions)) {
+        require(
+            reopened.version() == afterVersion,
+            "reopened dataset version does not match the FTS commit");
+        require(
+            reopened.listIndexes().contains(FTS_INDEX_NAME),
+            "reopened FTS index name is missing");
+        List<Index> reopenedSegments = namedSegments(reopened, FTS_INDEX_NAME);
+        validateSegments(
+            reopenedSegments,
+            FTS_INDEX_NAME,
+            fixtureFragments,
+            fixtureFields,
+            beforeVersion,
+            FTS_INDEX_VERSION,
+            IndexType.INVERTED,
+            "InvertedIndexDetails",
+            producedByUuid,
+            true);
+        for (int segment = 0; segment < reopenedSegments.size(); ++segment) {
+          decodeFtsDetails(reopenedSegments.get(segment), segment);
+        }
+        System.out.printf(
+            "reopen mode=fts status=success version=%d segments=%d coverage=%s files=%s%n",
+            reopened.version(),
+            reopenedSegments.size(),
+            reopenedSegments.stream()
+                .map(CrossSdkAcceptance::coverage)
+                .collect(Collectors.toList()),
+            reopenedSegments.stream()
+                .map(index -> index.getFiles().orElseThrow().size())
+                .collect(Collectors.toList()));
+
+        try (Dataset baseline = Dataset.open(allocator, baselinePath.toString(), readOptions)) {
+          require(
+              baseline.version() == beforeVersion,
+              "FTS baseline version differs before index build");
+          ScalarIndexParams scalarParams = ScalarIndexParams.create("inverted", FTS_PARAMS_JSON);
+          IndexParams params =
+              IndexParams.builder().setScalarIndexParams(scalarParams).build();
+          IndexOptions options =
+              IndexOptions.builder(List.of(FTS_COLUMN), IndexType.INVERTED, params)
+                  .withIndexName(FTS_INDEX_NAME)
+                  .build();
+          Index created = baseline.createIndex(options);
+          require(
+              baseline.version() == beforeVersion + 1,
+              "Java one-shot FTS build must publish exactly one dataset version");
+          require(
+              created.indexVersion() == FTS_INDEX_VERSION,
+              "Java 12 FTS baseline must use index version " + FTS_INDEX_VERSION);
+          require(
+              baseline.listIndexes().contains(FTS_INDEX_NAME),
+              "baseline FTS index name is missing");
+          System.out.printf(
+              "baseline mode=fts status=success before_version=%d after_version=%d segments=%d%n",
+              beforeVersion,
+              baseline.version(),
+              namedSegments(baseline, FTS_INDEX_NAME).size());
+
+          FullTextQuery.MatchQuery alpha =
+              (FullTextQuery.MatchQuery) FullTextQuery.match("alpha", FTS_COLUMN);
+          FullTextQuery.MatchQuery gamma =
+              (FullTextQuery.MatchQuery) FullTextQuery.match("gamma", FTS_COLUMN);
+          FullTextQuery alphaWithoutGamma =
+              FullTextQuery.booleanQuery(
+                  List.of(
+                      new FullTextQuery.BooleanClause(FullTextQuery.Occur.MUST, alpha),
+                      new FullTextQuery.BooleanClause(FullTextQuery.Occur.MUST_NOT, gamma)));
+          List<FtsQueryCase> cases =
+              List.of(
+                  new FtsQueryCase(
+                      "match-alpha", FullTextQuery.match("alpha", FTS_COLUMN), expectedFtsIds(0, 1)),
+                  new FtsQueryCase(
+                      "phrase-beta-gamma",
+                      FullTextQuery.phrase("beta gamma", FTS_COLUMN, 0),
+                      expectedFtsIds(0, 2)),
+                  new FtsQueryCase(
+                      "boolean-alpha-not-gamma",
+                      alphaWithoutGamma,
+                      expectedFtsIds(1)),
+                  new FtsQueryCase(
+                      "rare-tail-token", FullTextQuery.match("needle", FTS_COLUMN), List.of(127)));
+          runFtsQueries(reopened, baseline, cases);
+        }
+      }
+    }
+
+    System.out.printf(
+        "acceptance mode=fts status=passed producer=native14.0.2@40f15ed "
+            + "consumer=org.lance:lance-core:12.0.0 source=cbeec97 "
+            + "before_version=%d after_version=%d index_version=%d "
+            + "posting_format_version=%d block_size=128 rows_per_fragment=64 "
+            + "fragments=2%n",
+        beforeVersion,
+        afterVersion,
+        FTS_INDEX_VERSION,
+        FTS_INDEX_VERSION);
+  }
+
   public static void main(String[] args) throws Exception {
     if (args.length != 4) {
       throw new IllegalArgumentException(
-          "usage: CrossSdkAcceptance <btree|ivfpq> <cross-sdk-dataset> "
+          "usage: CrossSdkAcceptance <btree|ivfpq|fts> <cross-sdk-dataset> "
               + "<baseline-dataset> <metadata-directory>");
     }
     String mode = args[0];
@@ -846,6 +1195,9 @@ public final class CrossSdkAcceptance {
         break;
       case "ivfpq":
         runVector(crossSdkPath, baselinePath, metadataPath);
+        break;
+      case "fts":
+        runFts(crossSdkPath, baselinePath, metadataPath);
         break;
       default:
         throw new IllegalArgumentException("unknown mode: " + mode);
