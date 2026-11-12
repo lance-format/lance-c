@@ -32,16 +32,24 @@ if ($LASTEXITCODE -ne 0) { throw "build failed for $Consumer" }
 
 $exe = Join-Path $build 'Release\probe.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "missing $exe" }
-$dll = Join-Path $build 'Release\crt_probe.dll'
+$dll = Join-Path $build 'crt_probe.dll'
 if ($Consumer -eq 'shared') {
     if (-not (Test-Path -LiteralPath $dll)) { throw "missing $dll" }
     Copy-Item -LiteralPath $dll -Destination (Split-Path -Parent $exe) -Force
 }
 
-$dumpbin = Get-ChildItem `
-    'C:\Program Files\Microsoft Visual Studio\*\VC\Tools\MSVC\*\bin\Host*\*\dumpbin.exe' `
-    -ErrorAction SilentlyContinue |
-    Sort-Object FullName -Descending |
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$visualStudio = & $vswhere -latest -products * -property installationPath
+$dumpbin = Get-ChildItem -LiteralPath (Join-Path $visualStudio 'VC\Tools\MSVC') `
+    -Directory |
+    Sort-Object Name -Descending |
+    ForEach-Object {
+        @(
+            (Join-Path $_.FullName 'bin\Hostx64\x64\dumpbin.exe'),
+            (Join-Path $_.FullName 'bin\Hostarm64\arm64\dumpbin.exe')
+        )
+    } |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
     Select-Object -First 1
 if (-not $dumpbin) { throw 'dumpbin not found' }
 Write-Host "==> $Consumer executables"
