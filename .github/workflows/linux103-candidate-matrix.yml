@@ -7,9 +7,6 @@
 name: Linux 103 candidate matrix
 
 on:
-  push:
-    branches:
-      - xuanwo/linux-candidate-runtime-evidence
   workflow_dispatch:
 
 permissions:

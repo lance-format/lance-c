@@ -243,6 +243,11 @@ run_container_outer() {
     rc=${PIPESTATUS[0]}
     set -e
 
+    docker run --rm \
+        -v "$WORK:/work" \
+        "$CONTAINER_IMAGE" \
+        chown -R "$(id -u):$(id -g)" /work/container-work || true
+
     if [ "$rc" -ne 0 ]; then
         echo "container candidate run failed with rc=$rc" \
             >"$WORK/container-failure.txt"
@@ -269,6 +274,12 @@ record_environment() {
         echo "os_release_end"
         echo "debian_version=$(cat /etc/debian_version 2>/dev/null || true)"
         echo "libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+        echo "rustup_toolchain=${RUSTUP_TOOLCHAIN-}"
+        echo "cargo_build_jobs=${CARGO_BUILD_JOBS-}"
+        echo "rust_test_threads=${RUST_TEST_THREADS-}"
+        echo "cmake_build_parallel_level=${CMAKE_BUILD_PARALLEL_LEVEL-}"
+        echo "rustc_path=$(command -v rustc)"
+        echo "cargo_path=$(command -v cargo)"
         echo "memory_begin"
         if command -v free >/dev/null 2>&1; then
             free -h
@@ -681,6 +692,10 @@ write_summary() {
         echo "libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
         echo "rustc=$(rustc -V)"
         echo "cargo=$(cargo --version)"
+        echo "rustup_toolchain=${RUSTUP_TOOLCHAIN-}"
+        echo "cargo_build_jobs=${CARGO_BUILD_JOBS-}"
+        echo "rust_test_threads=${RUST_TEST_THREADS-}"
+        echo "cmake_build_parallel_level=${CMAKE_BUILD_PARALLEL_LEVEL-}"
         echo "cmake=$(cmake --version | awk 'NR==1')"
         echo "cc=$("$CC" --version | awk 'NR==1')"
         echo "protoc=$(protoc --version 2>&1)"
