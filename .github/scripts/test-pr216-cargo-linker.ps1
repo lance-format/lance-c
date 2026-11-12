@@ -4,7 +4,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ManifestPath,
-    [Parameter(Mandatory = $true)][string]$WorkDir
+    [Parameter(Mandatory = $true)][string]$WorkDir,
+    [ValidateSet('X64', 'ARM64')][string]$Machine = 'X64'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -115,7 +116,7 @@ $responseLines = @(
     '/DLL',
     '/NOENTRY',
     '/NODEFAULTLIB',
-    '/MACHINE:X64',
+    "/MACHINE:$Machine",
     "/OUT:$responseDll",
     "/IMPLIB:$responseImport",
     "/DEF:$definition",

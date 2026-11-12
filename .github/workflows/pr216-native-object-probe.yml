@@ -56,10 +56,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force `
-            -Path "$env:RUNNER_TEMP\pr216-cargo-probe" | Out-Null
+            -Path "$env:RUNNER_TEMP\pr216 cargo probe" | Out-Null
           pwsh -File .github/scripts/test-pr216-cargo-linker.ps1 `
             -ManifestPath .github/probe/cargo/Cargo.toml `
-            -WorkDir "$env:RUNNER_TEMP\pr216-cargo-probe"
+            -WorkDir "$env:RUNNER_TEMP\pr216 cargo probe"
       - name: Upload cargo probe evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -67,6 +67,45 @@ jobs:
           name: pr216-cargo-linker-probe
           path: |
             .github/probe/cargo/target/release
-            ${{ runner.temp }}/pr216-cargo-probe
+            ${{ runner.temp }}/pr216 cargo probe
             ${{ runner.temp }}/pr216-cargo-link.log
+          if-no-files-found: warn
+  cargo-arm64:
+    runs-on: windows-11-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Build native ARM64 probe through Cargo linker wrapper
+        shell: pwsh
+        env:
+          LANCE_C_WINDOWS_EXPORT_LOG: ${{ runner.temp }}\pr216-cargo-arm64-link.log
+        run: |
+          cargo build -vv --release `
+            --manifest-path .github/probe/cargo/Cargo.toml
+      - name: Load Visual Studio ARM64 tools
+        shell: cmd
+        run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath`) do set "VS=%%i"
+          call "%VS%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=arm64 -host_arch=arm64
+          echo %PATH%>>"%GITHUB_PATH%"
+      - name: Assert native ARM64 Cargo artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force `
+            -Path "$env:RUNNER_TEMP\pr216 arm64 cargo probe" | Out-Null
+          pwsh -File .github/scripts/test-pr216-cargo-linker.ps1 `
+            -ManifestPath .github/probe/cargo/Cargo.toml `
+            -WorkDir "$env:RUNNER_TEMP\pr216 arm64 cargo probe" `
+            -Machine ARM64
+      - name: Upload native ARM64 cargo probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr216-cargo-linker-arm64-probe
+          path: |
+            .github/probe/cargo/target/release
+            ${{ runner.temp }}/pr216 arm64 cargo probe
+            ${{ runner.temp }}/pr216-cargo-arm64-link.log
           if-no-files-found: warn
