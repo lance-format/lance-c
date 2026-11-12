@@ -4,6 +4,17 @@
 name: CRT static product probe
 
 on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Architecture to build
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - x64
+          - arm64
   push:
     branches:
       - xuanwo/crt-static-probe
@@ -18,6 +29,7 @@ permissions:
 
 jobs:
   x64:
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.architecture != 'arm64'
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -56,6 +68,7 @@ jobs:
           -WorkDir "$env:RUNNER_TEMP\lance-c-crt-product-x64"
 
   arm64:
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.architecture != 'x64'
     runs-on: windows-11-arm
     timeout-minutes: 120
     steps:
