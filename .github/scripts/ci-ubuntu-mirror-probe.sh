@@ -68,8 +68,8 @@ run_case() {
     bash -euxo pipefail -c '
       cat /etc/apt/sources.list.d/ubuntu.sources
       cat /etc/apt/apt-mirrors.txt
-      apt-get update
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends protobuf-compiler lld
+      apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=5 -o Acquire::https::Timeout=5 update
+      DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=5 -o Acquire::https::Timeout=5 install -y --no-install-recommends protobuf-compiler lld
       dpkg-query -W protobuf-compiler lld
       protoc --version
       ld.lld --version
