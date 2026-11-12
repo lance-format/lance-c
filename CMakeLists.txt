@@ -20,11 +20,35 @@ include(GNUInstallDirs)
 option(LANCE_C_USE_PREBUILT
     "Skip cargo build and use a prebuilt liblance_c at LANCE_C_PREBUILT_DIR"
     OFF)
+if(WIN32 AND LANCE_C_USE_PREBUILT AND NOT DEFINED LANCE_C_CRT_STATIC)
+    message(FATAL_ERROR
+        "Windows prebuilt CRT must be declared with LANCE_C_CRT_STATIC=ON or OFF. "
+        "Match the input libraries: ON for Release /MT, OFF for dynamic CRT. "
+        "Prebuilt mode copies libraries unchanged; it does not select their CRT.")
+endif()
+set(_lance_c_crt_static_default OFF)
+if(WIN32 AND (MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+    set(_lance_c_crt_static_default ON)
+endif()
+option(LANCE_C_CRT_STATIC
+    "Use the static MSVC CRT (in prebuilt mode, declare the input libraries' CRT)"
+    ${_lance_c_crt_static_default})
+unset(_lance_c_crt_static_default)
 set(LANCE_C_PREBUILT_DIR "" CACHE PATH
     "Directory containing prebuilt liblance_c.{a,so,dylib} (when LANCE_C_USE_PREBUILT=ON)")
 set(LANCE_C_LINK "static" CACHE STRING
     "Default linkage for the LanceC::lance_c alias: static or shared")
 set_property(CACHE LANCE_C_LINK PROPERTY STRINGS static shared)
+
+if(LANCE_C_CRT_STATIC AND NOT WIN32)
+    message(FATAL_ERROR "LANCE_C_CRT_STATIC is only supported on Windows")
+endif()
+if(LANCE_C_CRT_STATIC
+        AND NOT (MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+    message(FATAL_ERROR
+        "LANCE_C_CRT_STATIC requires an MSVC-compatible C/C++ toolchain")
+endif()
+set(LanceC_STATIC_CRT "${LANCE_C_CRT_STATIC}")
 
 # ─── Build via Corrosion (or skip for prebuilt mode) ─────────────────────────
 if(NOT LANCE_C_USE_PREBUILT)
@@ -42,6 +66,35 @@ if(NOT LANCE_C_USE_PREBUILT)
         CRATE_TYPES staticlib cdylib
         PROFILE release
     )
+    if(LANCE_C_CRT_STATIC)
+        if(NOT Rust_CARGO_TARGET_ENV STREQUAL "msvc")
+            message(FATAL_ERROR
+                "LANCE_C_CRT_STATIC is only supported for MSVC Rust targets")
+        endif()
+        # Apply the flag to the whole Rust target graph so build-script
+        # dependencies also observe crt-static in CARGO_CFG_TARGET_FEATURE.
+        corrosion_add_target_rustflags(
+            lance_c
+            "-Ctarget-feature=+crt-static"
+        )
+        # Corrosion discovers native-static-libs without target RUSTFLAGS, so
+        # it exports the dynamic CRT flag even when the archive is built with
+        # crt-static. Remove that stale directive rather than mixing MSVCRT
+        # with the LIBCMT directives in the archive.
+        get_target_property(_lance_c_static_link_options lance_c-static
+            INTERFACE_LINK_OPTIONS)
+        set(_lance_c_original_link_options "${_lance_c_static_link_options}")
+        list(FILTER _lance_c_static_link_options
+            EXCLUDE REGEX "^/defaultlib:[mM][sS][vV][cC][rR][tT][dD]?$")
+        if("${_lance_c_static_link_options}" STREQUAL
+                "${_lance_c_original_link_options}")
+            message(FATAL_ERROR
+                "Corrosion did not expose the expected /defaultlib:msvcrt "
+                "interface on lance_c-static")
+        endif()
+        set_target_properties(lance_c-static PROPERTIES
+            INTERFACE_LINK_OPTIONS "${_lance_c_static_link_options}")
+    endif()
     # FindRust stores an inferred native target only in Corrosion's directory
     # scope. The cache entry is visible here for both inferred and explicit targets.
     if(Rust_CARGO_TARGET_CACHED MATCHES "apple-darwin$")

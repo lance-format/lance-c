@@ -16,3 +16,9 @@ cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/lance-c-install
 cmake --build build
 ./build/consumer /path/to/dataset.lance
 ```
+
+On Windows, the package config reports whether the libraries were built with
+the static MSVC CRT. The example selects `MultiThreaded` when
+`LanceC_STATIC_CRT` is on, because the installed static archive is a Release
+`/MT` library and an imported target cannot propagate the consumer runtime
+setting. The shared DLL does not require a redistributable VC Runtime.

@@ -276,10 +276,15 @@ jobs:
           pwsh -File .github/scripts/test-windows-export-linker.ps1
           -Architecture x64
           -WorkDir "$env:RUNNER_TEMP\windows export linker"
+      - name: Test prebuilt CRT metadata
+        run: >
+          cmake "-DTEST_ROOT=$env:RUNNER_TEMP\prebuilt-crt"
+          "-DTEST_GENERATOR=Visual Studio 17 2022" -DTEST_PLATFORM=x64
+          -P cmake/test_prebuilt_crt.cmake
       - name: Configure
         run: >
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
       - name: Build
         run: cmake --build build --config Release --parallel 4
       - name: Install to staging prefix
@@ -343,10 +348,15 @@ jobs:
           pwsh -File .github/scripts/test-windows-export-linker.ps1
           -Architecture ARM64
           -WorkDir "$env:RUNNER_TEMP\windows arm64 export linker"
+      - name: Test prebuilt CRT metadata
+        run: >
+          cmake "-DTEST_ROOT=$env:RUNNER_TEMP\prebuilt-crt"
+          "-DTEST_GENERATOR=Visual Studio 18 2026" -DTEST_PLATFORM=ARM64
+          -DTEST_TOOLSET=ClangCL -P cmake/test_prebuilt_crt.cmake
       - name: Configure
         run: >
           cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
       - name: Assert ARM64 ClangCL configuration
         shell: pwsh
         run: |

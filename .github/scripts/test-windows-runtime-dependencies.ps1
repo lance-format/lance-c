@@ -40,6 +40,80 @@ try {
         Write-Host "    $($case.Dependency) -> $actual"
     }
 
+    $dumpbinSample = @'
+Image has the following dependencies:
+
+    KERNEL32.dll
+    api-ms-win-core-synch-l1-2-0.dll
+
+Image has the following delay load dependencies:
+
+    USER32.dll
+    VCRUNTIME140.dll
+'@
+    $parsed = Get-PeDependencies -DependentsText $dumpbinSample
+    if ($parsed.Direct.Count -ne 2 -or
+        $parsed.Direct -notcontains 'KERNEL32.dll' -or
+        $parsed.Direct -notcontains 'api-ms-win-core-synch-l1-2-0.dll') {
+        throw "direct dependency parsing failed: $($parsed.Direct -join ', ')"
+    }
+    if ($parsed.Delay.Count -ne 2 -or
+        $parsed.Delay -notcontains 'USER32.dll' -or
+        $parsed.Delay -notcontains 'VCRUNTIME140.dll') {
+        throw "delay dependency parsing failed: $($parsed.Delay -join ', ')"
+    }
+
+    Assert-NoRedistributableRuntimeDependencies `
+        -Dependencies $parsed.Direct `
+        -Description 'direct dependency fixture'
+    Assert-NoRedistributableRuntimeDependencies `
+        -Dependencies @('msvcp_win.dll', 'MSVCP_WIN.DLL', 'msvcrt.dll', 'ucrtbase.dll') `
+        -Description 'Windows OS module fixture'
+    $redistributableNames = @(
+        'VCRUNTIME140.dll',
+        'VCRUNTIME140_1.dll',
+        'VCRUNTIME140D.dll',
+        'MSVCP140.dll',
+        'MSVCP140_ATOMIC_WAIT.dll',
+        'MSVCP140_CODECVT_IDS.dll',
+        'MSVCP140D.dll',
+        'MSVCR120.dll',
+        'CONCRT140.dll',
+        'VCOMP140.dll'
+    )
+    foreach ($name in $redistributableNames) {
+        $rejected = $false
+        try {
+            Assert-NoRedistributableRuntimeDependencies `
+                -Dependencies @($name) `
+                -Description 'redistributable fixture' | Out-Null
+        } catch {
+            $rejected = $true
+            if ($_.Exception.Message -notmatch [regex]::Escape($name)) {
+                throw
+            }
+        }
+        if (-not $rejected) {
+            throw "redistributable runtime $name was not rejected"
+        }
+    }
+
+    $vcxprojFixture = Join-Path $fixture 'acceptance.vcxproj'
+    Set-Content -LiteralPath $vcxprojFixture -Value @'
+<ItemDefinitionGroup>
+  <ClCompile>
+    <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+  </ClCompile>
+</ItemDefinitionGroup>
+'@
+    $runtimeLibraries = @(
+        Get-MsvcRuntimeLibraries -ProjectPath $vcxprojFixture
+    )
+    if ($runtimeLibraries.Count -ne 1 -or
+        $runtimeLibraries[0] -ne 'MultiThreaded') {
+        throw "single MSVC runtime library was not preserved as an array"
+    }
+
     $missing = 'missing-runtime-174.dll'
     $rejected = $false
     try {
