@@ -478,13 +478,30 @@ void test_update_columns(const std::string& uri) {
     CHECK(offsets == std::vector<uint32_t>({0, 2}));
     CHECK(!result.matched_offsets_serialized().empty());
 
+    lance::UpdatedFragmentOffsets typed_offsets(
+        std::vector<std::pair<uint64_t, std::vector<uint32_t>>>{{0, offsets}});
+    CHECK(typed_offsets.size() == 1);
+    CHECK(typed_offsets.fragment_id_at(0) == 0);
+    CHECK(typed_offsets.offset_count_at(0) == offsets.size());
+    CHECK(typed_offsets.offsets_at(0) == offsets);
+    lance::UpdatedFragmentOffsets empty_entry_offsets(
+        std::vector<std::pair<uint64_t, std::vector<uint32_t>>>{{0, {}}});
+    CHECK(empty_entry_offsets.offsets_at(0).empty());
+    auto cloned_typed_offsets = typed_offsets.clone();
+    CHECK(cloned_typed_offsets.offsets_at(0) == offsets);
+    bool missing_entry_rejected = false;
+    try {
+        (void)typed_offsets.offsets_at(typed_offsets.size());
+    } catch (const lance::Error& error) {
+        missing_entry_rejected = error.code == LANCE_ERR_INVALID_ARGUMENT;
+    }
+    CHECK(missing_entry_rejected);
+
     lance::UpdateOperationSpec spec;
     spec.updated_fragments = {&updated};
     spec.fields_modified = fields;
     spec.update_mode = lance::UpdateMode::RewriteColumns;
-    spec.updated_fragment_offsets.emplace(
-        std::vector<std::pair<uint64_t, std::vector<uint32_t>>>{
-            {0, offsets}});
+    spec.updated_fragment_offsets = std::move(typed_offsets);
     auto operation = lance::Operation::make_update(spec);
     commit_operation(uri, read_version, operation);
 
