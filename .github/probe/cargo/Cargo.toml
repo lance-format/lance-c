@@ -9,4 +9,4 @@ name = "lance_c"
 crate-type = ["cdylib"]
 
 [build-dependencies]
-cc = "1"
+cc = "=1.2.57"
