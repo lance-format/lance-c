@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+name: Windows CRT syntax
+
+on:
+  push:
+    branches:
+      - xuanwo/windows-static-crt-release
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -LiteralPath .github/scripts -Filter *.ps1 |
+            ForEach-Object {
+              $tokens = $null
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                $_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+              if ($errors.Count -ne 0) {
+                Write-Host "PowerShell parse errors in $($_.FullName):"
+                $errors | Format-List
+                $failed = $true
+              } else {
+                Write-Host "parsed $($_.Name)"
+              }
+            }
+          if ($failed) { exit 1 }
+      - name: Test dependency guard
+        shell: pwsh
+        run: pwsh -File .github/scripts/test-windows-runtime-dependencies.ps1
+      - name: Check Windows CMake metadata
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path prebuilt | Out-Null
+          cmake -S . -B build-metadata -G "Visual Studio 17 2022" -A x64 `
+            -DLANCE_C_USE_PREBUILT=ON `
+            -DLANCE_C_PREBUILT_DIR="$PWD/prebuilt"
+          if ($LASTEXITCODE -ne 0) { throw 'CMake metadata configure failed' }
+          if (-not (Select-String -LiteralPath build-metadata\CMakeCache.txt `
+              -Pattern '^LANCE_C_CRT_STATIC:BOOL=ON$')) {
+            throw 'Windows MSVC CMake build did not default to static CRT'
+          }
+          if (-not (Select-String -LiteralPath build-metadata\LanceCConfig.cmake `
+              -Pattern '^set\(LanceC_STATIC_CRT ON\)$')) {
+            throw 'Generated package metadata did not declare static CRT'
+          }
