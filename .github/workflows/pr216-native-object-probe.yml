@@ -157,6 +157,7 @@ jobs:
         with:
           ref: ${{ inputs.correction_sha }}
           path: correction
+      - uses: dtolnay/rust-toolchain@1.94.0
       - name: Configure Corrosion export probe
         shell: pwsh
         run: >

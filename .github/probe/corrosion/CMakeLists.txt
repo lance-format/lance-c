@@ -23,21 +23,21 @@ corrosion_import_crate(
 )
 
 if(Rust_CARGO_TARGET MATCHES "x86_64-pc-windows-msvc$")
-    corrosion_set_env_vars(lance_c_probe
+    corrosion_set_env_vars(lance_c
         "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=${LANCE_C_SOURCE_DIR}/.github/scripts/limit-windows-exports.cmd"
         "LANCE_C_WINDOWS_MACHINE=X64")
 elseif(Rust_CARGO_TARGET MATCHES "aarch64-pc-windows-msvc$")
-    corrosion_set_env_vars(lance_c_probe
+    corrosion_set_env_vars(lance_c
         "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=${LANCE_C_SOURCE_DIR}/.github/scripts/limit-windows-exports.cmd"
         "LANCE_C_WINDOWS_MACHINE=ARM64")
 endif()
 
-install(FILES $<TARGET_FILE:lance_c_probe-static>
+install(FILES $<TARGET_FILE:lance_c-static>
     DESTINATION lib
     RENAME lance_c.lib)
-install(FILES $<TARGET_FILE:lance_c_probe-shared>
+install(FILES $<TARGET_FILE:lance_c-shared>
     DESTINATION lib
     RENAME lance_c.dll)
-install(FILES $<TARGET_LINKER_FILE:lance_c_probe-shared>
+install(FILES $<TARGET_LINKER_FILE:lance_c-shared>
     DESTINATION lib
     RENAME lance_c.dll.lib)
