@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+name: CRT static probe
+
+on:
+  push:
+    branches:
+      - xuanwo/crt-static-probe
+
+permissions:
+  contents: read
+
+jobs:
+  x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Probe shared, static /MD, static /MT
+        shell: pwsh
+        run: |
+          foreach ($consumer in @('shared', 'static_md', 'static_mt')) {
+            pwsh -File experiments/crt-static-probe/run-probe.ps1 `
+              -Consumer $consumer -Architecture x64 `
+              -Generator 'Visual Studio 17 2022'
+          }
+
+  arm64:
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Probe shared, static /MD, static /MT
+        shell: pwsh
+        run: |
+          foreach ($consumer in @('shared', 'static_md', 'static_mt')) {
+            pwsh -File experiments/crt-static-probe/run-probe.ps1 `
+              -Consumer $consumer -Architecture ARM64 `
+              -Generator 'Visual Studio 18 2026' -Toolset ClangCL
+          }
+
