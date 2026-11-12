@@ -542,10 +542,12 @@ source build until a release containing the new archive is published and the
 recipes are updated with its hash.
 
 Releases cut after the Windows package path was added also publish
-`lance-c-vX.Y.Z-x86_64-pc-windows-msvc.tar.xz`; v0.1.9 predates that artifact.
+`lance-c-vX.Y.Z-x86_64-pc-windows-msvc.tar.xz` and
+`lance-c-vX.Y.Z-aarch64-pc-windows-msvc.tar.xz`; v0.1.9 predates both.
 The archives contain headers, static and shared libraries,
-CMake package files, pkg-config metadata, and the license. The package recipes
-install only the linkage selected for that package.
+CMake package files, pkg-config metadata, and the license. Windows archives
+also contain `share/doc/lance-c/README.md`. The package recipes install only
+the linkage selected for that package.
 
 Static inspection of the published Linux shared libraries found:
 
@@ -562,10 +564,11 @@ The macOS dylib is a thin `arm64` Mach-O binary with install name
 `SystemConfiguration`, `libobjc.A.dylib`, `IOKit`, `CoreFoundation`,
 `Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`.
 
-Release builds produced by the current workflow strip the staged shared
-library and restrict its defined dynamic exports to the public `lance_*` C
-ABI. The static archive is not stripped: it keeps the symbol table required
-for static linking. Archive names and layout above are unchanged, and no
+Linux and macOS release builds produced by the current workflow strip the
+staged shared library and restrict its defined dynamic exports to the public
+`lance_*` C ABI. Windows verifies that every header-declared symbol is exported
+and currently permits additional dependency exports. The static archive is not
+stripped: it keeps the symbol table required for static linking. Archive names and layout above are unchanged, and no
 standalone shared-only artifact is added.
 
 A release-candidate x86_64 Linux build from this change measured:
@@ -632,7 +635,7 @@ target_link_libraries(myapp PRIVATE LanceC::lance_c)
 See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
 working example.
 
-### Windows (x86_64-pc-windows-msvc)
+### Windows (x86_64-pc-windows-msvc and aarch64-pc-windows-msvc)
 
 The Windows package path uses the same CMake entry point:
 
@@ -643,6 +646,18 @@ cmake --build build --config Release
 cmake --install build --prefix C:\path\to\prefix --config Release
 ```
 
+For a native ARM64 build, select the Visual Studio 2026 ARM64 platform:
+
+```powershell
+cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL `
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+cmake --install build --prefix C:\path\to\prefix --config Release
+```
+
+AWS-LC requires clang-cl for its Windows ARM64 assembly sources, so this path
+uses the Visual Studio ClangCL toolset.
+
 The install prefix contains `lib/lance_c.dll`, its import library
 `lib/lance_c.dll.lib`, the static library `lib/lance_c.lib`, and the public
 headers. `find_package(LanceC)` selects the static library by default; set
@@ -650,11 +665,16 @@ headers. `find_package(LanceC)` selects the static library by default; set
 The installed shared consumer must have `lance_c.dll` beside its executable or
 on its DLL search path.
 
-Windows CI builds this layout with Rust 1.94.0, verifies the PE32+ x64
-architecture, public `lance_*` exports and resolved runtime DLL dependencies,
-then runs static and shared C++17 consumers with `PATH` restricted to the
-Windows system directories. The tested runner is `windows-2022`. This does not
-establish `aarch64-pc-windows-msvc` or an older Windows runtime baseline.
+Windows CI builds this layout with Rust 1.94.0. The x64 job uses
+`windows-2022`. The ARM64 job uses `windows-11-arm` and asserts that the
+runner, PowerShell process, and Rust host are native ARM64. Each job verifies
+the PE32+ machine, public `lance_*` exports, and resolved runtime DLL
+dependencies, then runs static and shared C++17 consumers with `PATH`
+restricted to the Windows system directories. The ARM64 job builds both the
+package and installed consumers with the ClangCL toolset and verifies the PE
+machine of both acceptance executables before running them. The hosted Windows
+11 ARM64 baseline does not establish Windows 10 ARM64 or Windows Server ARM64
+support.
 
 See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
 for a reproducible native-14 C segment to Java-12 commit/query PoC.
@@ -1157,7 +1177,7 @@ back.
 
 ## Releasing
 
-Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds seven prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, macOS arm64 and Intel x86_64, and Windows x86_64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the restored Intel and Windows rows; its published matrix remains the five archives listed above.
+Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds eight prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, macOS arm64 and Intel x86_64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the restored Intel and Windows rows; its published matrix remains the five archives listed above.
 Before the consumer smoke test and archive upload, the Linux and macOS build rows strip the staged shared library and verify its exports. Linux rows also verify direct runtime dependencies; Windows verifies PE architecture, public exports, and DLL loading through its installed consumers.
 
 ### Recommended: cut a release via Actions UI
@@ -1174,7 +1194,7 @@ Before the consumer smoke test and archive upload, the Linux and macOS build row
    - Commits as `github-actions[bot]` with message `chore: bump version to <version>`.
    - Pushes the commit to `main` and pushes the tag.
    - Dispatches `release.yml` at the new tag's ref. (Direct tag push by `GITHUB_TOKEN` does not trigger workflows — GitHub's recursion guard — so we explicitly `gh workflow run` instead.)
-4. `release.yml` builds artifacts. Once the tag includes all rows, the [GitHub Release](https://github.com/lance-format/lance-c/releases) has `.tar.xz` artifacts for Linux x86_64/aarch64, their Debian 12 variants, macOS arm64/Intel x86_64, and Windows x86_64, plus a `SHA512SUMS` file. The v0.1.9 release remains the historical five-asset set above.
+4. `release.yml` builds artifacts. Once the tag includes all rows, the [GitHub Release](https://github.com/lance-format/lance-c/releases) has `.tar.xz` artifacts for Linux x86_64/aarch64, their Debian 12 variants, macOS arm64/Intel x86_64, and Windows x86_64/aarch64, plus a `SHA512SUMS` file. The v0.1.9 release remains the historical five-asset set above.
 5. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
    - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
    - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
