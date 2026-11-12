@@ -3765,6 +3765,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "bytes",
+ "cc",
  "chrono",
  "datafusion",
  "datafusion-substrait",

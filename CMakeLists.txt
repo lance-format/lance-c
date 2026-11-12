@@ -49,6 +49,14 @@ if(NOT LANCE_C_USE_PREBUILT)
             "${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-macos-exports.sh")
         corrosion_set_env_vars(lance_c
             "LANCE_C_MACOS_LINKER=${CMAKE_C_COMPILER}")
+    elseif(Rust_CARGO_TARGET MATCHES "x86_64-pc-windows-msvc$")
+        corrosion_set_env_vars(lance_c
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-windows-exports.cmd"
+            "LANCE_C_WINDOWS_MACHINE=X64")
+    elseif(Rust_CARGO_TARGET MATCHES "aarch64-pc-windows-msvc$")
+        corrosion_set_env_vars(lance_c
+            "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-windows-exports.cmd"
+            "LANCE_C_WINDOWS_MACHINE=ARM64")
     endif()
 endif()
 

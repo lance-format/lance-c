@@ -128,7 +128,7 @@ if ($expectedExports.Count -eq 0) {
 
 $exportText = (Invoke-Dumpbin @('/exports', $dll)) -join "`n"
 $actualExports = [regex]::Matches(
-    $exportText, '(?m)^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$') |
+    $exportText, '(?m)^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)(?:\s+=.*)?\s*$') |
     ForEach-Object { $_.Groups[1].Value } |
     Sort-Object -Unique
 if ($actualExports.Count -eq 0) {

@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     // cbindgen header generation is optional.
@@ -57,10 +57,12 @@ fn configure_shared_library_link() {
 /// rustc writes a `/DEF` file containing every reachable `no_mangle` symbol,
 /// including symbols from statically linked Rust dependencies. Windows C
 /// dependencies can also put `/EXPORT` directives in their object files (the
-/// aws-lc jitter-entropy objects do this). MSVC link.exe uses the last `/DEF`
-/// on the command line and does not add object `/EXPORT` directives when a DEF
-/// is supplied, so a later header-derived DEF leaves only the declared C ABI.
-/// This is link.exe behavior; lld-link unions those exports instead.
+/// aws-lc jitter-entropy objects do this). A DEF alone cannot suppress those
+/// directive exports when their archive member is pulled in by an ordinary
+/// reference. Instead, LIB creates an export file and matching import library
+/// from this DEF; LINK then ignores every DEF and directive export source.
+/// The Windows linker shim copies the pre-generated import library to rustc's
+/// `/IMPLIB` path and passes the export file to the real linker.
 fn write_msvc_export_definition() {
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
@@ -80,7 +82,8 @@ fn write_msvc_export_definition() {
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let definition_path = out_dir.join("lance_c.def");
-    let mut definition = String::from("LIBRARY lance_c\nEXPORTS\n");
+    let mut definition =
+        String::from("LIBRARY lance_c\n; lance-c exact public exports\nEXPORTS\n");
     for export in &exports {
         writeln!(definition, "  {export}").expect("writing a DEF entry to a String cannot fail");
     }
@@ -90,12 +93,51 @@ fn write_msvc_export_definition() {
             definition_path.display()
         )
     });
+    write_msvc_export_library(&out_dir, &definition_path);
 
-    // This is a post-link argument, after rustc's generated `/DEF`.
+    // The linker shim recognizes the marker in this DEF and supplies the
+    // matching export file generated above.
     println!(
         "cargo::rustc-cdylib-link-arg=/DEF:{}",
         definition_path.display()
     );
+}
+
+fn write_msvc_export_library(out_dir: &Path, definition_path: &Path) {
+    let target = std::env::var("TARGET").expect("TARGET is set by Cargo");
+    let machine = match target.as_str() {
+        "x86_64-pc-windows-msvc" => "X64",
+        "aarch64-pc-windows-msvc" => "ARM64",
+        _ => panic!("unsupported windows-msvc target for export generation: {target}"),
+    };
+    let import_library = out_dir.join("lance_c.dll.lib");
+    let export_file = out_dir.join("lance_c.dll.exp");
+    let tool = cc::windows_registry::find_tool(&target, "lib.exe").unwrap_or_else(|| {
+        panic!("MSVC lib.exe was not found for {target}; native Windows tools are required")
+    });
+    let output = tool
+        .to_command()
+        .arg("/NOLOGO")
+        .arg(format!("/MACHINE:{machine}"))
+        .arg(format!("/DEF:{}", definition_path.display()))
+        .arg(format!("/OUT:{}", import_library.display()))
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run MSVC lib.exe: {error}"));
+    if !output.status.success() {
+        panic!(
+            "MSVC lib.exe failed with {}: stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for artifact in [&import_library, &export_file] {
+        let metadata = fs::metadata(artifact)
+            .unwrap_or_else(|error| panic!("missing {}: {error}", artifact.display()));
+        if metadata.len() == 0 {
+            panic!("MSVC export artifact is empty: {}", artifact.display());
+        }
+    }
 }
 
 fn public_c_names(header: &str) -> BTreeSet<String> {
