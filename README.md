@@ -566,8 +566,8 @@ The macOS dylib is a thin `arm64` Mach-O binary with install name
 
 Linux and macOS release builds produced by the current workflow strip the
 staged shared library and restrict its defined dynamic exports to the public
-`lance_*` C ABI. Windows verifies that every header-declared symbol is exported
-and currently permits additional dependency exports. The static archive is not
+`lance_*` C ABI. Windows requires both the DLL and import library to expose
+exactly the header-declared symbols, with no additional dependency exports. The static archive is not
 stripped: it keeps the symbol table required for static linking. Archive names and layout above are unchanged, and no
 standalone shared-only artifact is added.
 
@@ -672,6 +672,9 @@ The DLL and archive are built with the static CRT. The DLL therefore has no
 redistributable `VCRUNTIME*`, `MSVCP*`, `MSVCR*`, `CONCRT*`, or `VCOMP*`
 direct or delay-load dependency. It still requires the stated Windows OS
 baseline and loads `lance_c.dll` from the consumer's DLL search path.
+Windows OS components such as `msvcp_win.dll`, `msvcrt.dll`, and `ucrtbase.dll`
+can still appear in the process's loaded modules; they are part of that OS
+baseline, not an additional VC Redistributable prerequisite.
 
 The static archive is a Release `/MT` archive. Its consumer must use the same
 static CRT, and the package config declares
@@ -702,6 +705,12 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 Cargo exposes that target feature to build scripts, which lets `cc` and
 AWS-LC's CMake configuration select the static CRT for native dependencies.
+
+When staging existing Windows libraries with `LANCE_C_USE_PREBUILT=ON`, also
+set `LANCE_C_CRT_STATIC=ON` for Release `/MT` inputs or `OFF` for dynamic-CRT
+inputs. This explicit declaration controls the installed package metadata;
+prebuilt mode copies the supplied libraries unchanged and cannot convert their
+CRT. Omitting the declaration in a fresh prebuilt configuration is an error.
 
 The Windows package link is restricted through a wrapper around MSVC
 `link.exe`. Overriding the linker with `lld-link` is not supported for this
@@ -1265,7 +1274,7 @@ If you need to cut a release without the workflow (e.g. local tag with extra com
    git tag v0.2.0
    git push origin v0.2.0
    ```
-5. `release.yml` fires on the tag push and builds the seven prebuilt tarballs as above.
+5. `release.yml` fires on the tag push and builds the eight prebuilt tarballs as above.
 
 A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 

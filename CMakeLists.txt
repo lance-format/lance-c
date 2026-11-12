@@ -20,12 +20,18 @@ include(GNUInstallDirs)
 option(LANCE_C_USE_PREBUILT
     "Skip cargo build and use a prebuilt liblance_c at LANCE_C_PREBUILT_DIR"
     OFF)
+if(WIN32 AND LANCE_C_USE_PREBUILT AND NOT DEFINED LANCE_C_CRT_STATIC)
+    message(FATAL_ERROR
+        "Windows prebuilt CRT must be declared with LANCE_C_CRT_STATIC=ON or OFF. "
+        "Match the input libraries: ON for Release /MT, OFF for dynamic CRT. "
+        "Prebuilt mode copies libraries unchanged; it does not select their CRT.")
+endif()
 set(_lance_c_crt_static_default OFF)
 if(WIN32 AND (MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
     set(_lance_c_crt_static_default ON)
 endif()
 option(LANCE_C_CRT_STATIC
-    "Link the Windows MSVC Rust and native dependency graph with the static CRT"
+    "Use the static MSVC CRT (in prebuilt mode, declare the input libraries' CRT)"
     ${_lance_c_crt_static_default})
 unset(_lance_c_crt_static_default)
 set(LANCE_C_PREBUILT_DIR "" CACHE PATH

@@ -49,7 +49,12 @@ function Assert-NoRedistributableRuntimeDependencies {
 
     $pattern =
         '^(?i)(VCRUNTIME|MSVCP|MSVCR|CONCRT|VCOMP)[A-Za-z0-9_]*\.dll$'
-    $unexpected = @($Dependencies | Where-Object { $_ -match $pattern })
+    # These OS components can be loaded by Windows itself. Their names overlap
+    # the VC redistributable families, but they are part of the OS baseline.
+    $systemRuntimes = @('msvcp_win.dll', 'msvcrt.dll')
+    $unexpected = @($Dependencies | Where-Object {
+        $_ -notin $systemRuntimes -and $_ -match $pattern
+    })
     if ($unexpected.Count -ne 0) {
         throw ("$Description has redistributable VC Runtime dependencies: " +
             "$($unexpected -join ', ')")

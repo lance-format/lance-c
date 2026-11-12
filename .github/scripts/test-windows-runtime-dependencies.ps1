@@ -66,6 +66,9 @@ Image has the following delay load dependencies:
     Assert-NoRedistributableRuntimeDependencies `
         -Dependencies $parsed.Direct `
         -Description 'direct dependency fixture'
+    Assert-NoRedistributableRuntimeDependencies `
+        -Dependencies @('msvcp_win.dll', 'MSVCP_WIN.DLL', 'msvcrt.dll', 'ucrtbase.dll') `
+        -Description 'Windows OS module fixture'
     $redistributableNames = @(
         'VCRUNTIME140.dll',
         'VCRUNTIME140_1.dll',
