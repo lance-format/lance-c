@@ -30,7 +30,7 @@ pub(crate) fn spawn_lance_future<F, T, S, P>(
     P: FnOnce() + Send + 'static,
 {
     RT.spawn(async move {
-        let completion_on_panic = completion;
+        let completion_on_panic = completion.clone();
         let outcome = std::panic::AssertUnwindSafe(async move {
             match future.await {
                 Ok(value) => completion.succeed(into_result(value)),

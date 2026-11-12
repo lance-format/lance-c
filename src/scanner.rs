@@ -3301,6 +3301,7 @@ unsafe fn scan_async_guarded(
     } else {
         Some(unsafe { &*scanner }.poison_flag())
     };
+    let completion_on_panic = completion.clone();
     let outcome =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| setup(scanner, completion)));
     if let Err(payload) = outcome {
@@ -3312,7 +3313,7 @@ unsafe fn scan_async_guarded(
         // entry point would abort the host, which is what this guard exists
         // to prevent.
         swallow_unwind("lance_scanner_scan_async panic report", || {
-            completion.fail(
+            completion_on_panic.fail(
                 LanceErrorCode::Panic,
                 format!("panic in FFI call: {}", panic_payload_message(&*payload)),
             );

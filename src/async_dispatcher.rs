@@ -19,12 +19,12 @@ use crate::error::{LanceErrorCode, clear_last_error, panic_payload_message, set_
 /// - `result`: operation-specific result pointer (e.g., `*mut ArrowArrayStream`)
 pub type LanceCallback = unsafe extern "C" fn(ctx: *mut c_void, status: i32, result: *mut c_void);
 
-/// A copyable async completion endpoint whose raw context is owned by the host.
+/// A cloneable async completion endpoint whose raw context is owned by the host.
 ///
 /// This centralizes the unsafe `void *` transport and status/error mapping used
 /// by spawned FFI futures. The caller must keep `callback_ctx` valid until the
 /// callback returns.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Completion {
     callback: LanceCallback,
     callback_ctx: *mut c_void,
