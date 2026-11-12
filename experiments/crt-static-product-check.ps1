@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $prefixPath = (Resolve-Path -LiteralPath $Prefix).Path
-$workPath = (Resolve-Path -LiteralPath $WorkDir).Path
+New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
 $dll = Join-Path $prefixPath 'lib\lance_c.dll'
 if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
     throw "missing staged DLL: $dll"
