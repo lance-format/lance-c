@@ -97,7 +97,7 @@ container_setup() {
         echo "protoc_path=$(command -v protoc)"
     } >>"$EVIDENCE/setup-identity.txt"
 
-    chown -R 1000:1000 /work "$EVIDENCE" /home/xuanwo
+    chown -R 1000:1000 /work "$EVIDENCE"
 }
 
 record_environment() {
