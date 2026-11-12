@@ -83,3 +83,19 @@ java \
   "${work_dir}/vector-baseline" \
   "${work_dir}/vector-metadata" \
   | tee "${work_dir}/vector-java-acceptance.log"
+
+"${work_dir}/producer" create-fts "${work_dir}/fts-dist"
+cp -a "${work_dir}/fts-dist" "${work_dir}/fts-baseline"
+"${work_dir}/producer" build-fts "${work_dir}/fts-dist" "${work_dir}/fts-metadata" \
+  | tee "${work_dir}/fts-producer.log"
+sha256sum "${work_dir}"/fts-metadata/*.pb | tee "${work_dir}/fts-metadata.sha256"
+
+java \
+  --add-opens=java.base/java.nio=ALL-UNNAMED \
+  -cp "${example_dir}/java/target/classes:$(<"${work_dir}/java-classpath.txt")" \
+  org.lance.crosssdk.CrossSdkAcceptance \
+  fts \
+  "${work_dir}/fts-dist" \
+  "${work_dir}/fts-baseline" \
+  "${work_dir}/fts-metadata" \
+  | tee "${work_dir}/fts-java-acceptance.log"
