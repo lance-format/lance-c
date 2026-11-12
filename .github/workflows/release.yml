@@ -203,6 +203,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
         with:
+          # Corrosion writes dependencies under the CMake build tree.
+          workspaces: |
+            . -> target
+            . -> build/x64/Release/cargo/build
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Record Windows runtime baseline
         shell: pwsh
