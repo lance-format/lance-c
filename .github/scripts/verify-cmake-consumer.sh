@@ -30,8 +30,19 @@ mode=$1
 arg=$2
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-work_dir=$(mktemp -d "${TMPDIR:-/tmp}/lance-c-cmake-smoke.XXXXXX")
-trap 'rm -rf "$work_dir"' EXIT
+if [ -n "${LANCE_C_CMAKE_CONSUMER_WORK_DIR:-}" ]; then
+    work_dir=$LANCE_C_CMAKE_CONSUMER_WORK_DIR
+    mkdir -p "$work_dir"
+    work_dir=$(cd "$work_dir" && pwd)
+else
+    work_dir=$(mktemp -d "${TMPDIR:-/tmp}/lance-c-cmake-smoke.XXXXXX")
+    trap 'rm -rf "$work_dir"' EXIT
+fi
+
+build_verbose=()
+if [ "${LANCE_C_CMAKE_BUILD_VERBOSE:-0}" = "1" ]; then
+    build_verbose=(--verbose)
+fi
 
 verify_corrosion_macos_linker() {
     local build_dir=$1
@@ -108,7 +119,7 @@ verify_consumer_prefix() {
             -DCMAKE_PREFIX_PATH="$install_prefix" \
             -DCMAKE_BUILD_TYPE=Release \
             -DLanceC_LINK="$linkage"
-        cmake --build "$build_dir" --parallel
+        cmake --build "$build_dir" --parallel "${build_verbose[@]}"
 
         set +e
         "$build_dir/consumer"

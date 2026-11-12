@@ -1,0 +1,529 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+name: macOS ARM64 Release Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Candidate version used in the existing archive name"
+        required: true
+        default: "0.2.0-rc.1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTUP_TOOLCHAIN: "1.94.0"
+  CC: clang
+  CXX: clang++
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+  PRODUCT_COMMIT: 62fbc0fd69d66b184643e47ce93f7f3a6525598b
+  PRODUCT_TREE: d994d6abbb46024f5411db42e8f4a5ede59225f4
+
+jobs:
+  macos-arm64-release:
+    name: macOS ARM64 Release acceptance
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build/cargo/build"
+      - name: Install protobuf
+        run: brew install protobuf
+      - name: Record host and toolchain, assert native ARM64 host
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          {
+            echo "github_workflow=$GITHUB_WORKFLOW"
+            echo "github_run_id=$GITHUB_RUN_ID"
+            echo "github_run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "github_job=$GITHUB_JOB"
+            echo "github_ref=$GITHUB_REF"
+            echo "github_sha=$GITHUB_SHA"
+            echo "runner_name=$RUNNER_NAME"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "host_date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            sw_vers
+            uname -a
+            uname -m
+            arch
+            sysctl -n hw.optional.arm64
+            sysctl -n machdep.cpu.brand_string || true
+            xcodebuild -version
+            xcode-select -p
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+            "$CC" --version
+            rustc -vV
+            cargo --version
+            rustup show active-toolchain || true
+            cmake --version
+            protoc --version
+            echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+            git status --short --branch
+          } 2>&1 | tee evidence/host-and-toolchain.txt
+
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+          test "$(arch)" = "arm64"
+          test "$(sysctl -n hw.optional.arm64)" = "1"
+          test "$MACOSX_DEPLOYMENT_TARGET" = "11.0"
+          rustc -vV > evidence/rustc-vV.txt
+          grep -Fxq 'release: 1.94.0' evidence/rustc-vV.txt
+          grep -Fxq 'host: aarch64-apple-darwin' evidence/rustc-vV.txt
+          cargo --version | grep -Eq '^cargo 1\.94\.0( |$)'
+      - name: Record product and validation identity
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test "$(git rev-parse "${PRODUCT_COMMIT}^{tree}")" = "$PRODUCT_TREE"
+          test -z "$(git status --porcelain)"
+
+          git rev-parse HEAD > evidence/validation-commit.txt
+          git rev-parse HEAD^{tree} > evidence/validation-tree.txt
+          git rev-parse "$PRODUCT_COMMIT" > evidence/product-commit.txt
+          git rev-parse "${PRODUCT_COMMIT}^{tree}" > evidence/product-tree.txt
+          git diff --name-only "$PRODUCT_COMMIT" HEAD \
+            > evidence/validation-delta-files.txt
+          git diff --stat "$PRODUCT_COMMIT" HEAD \
+            > evidence/validation-delta-stat.txt
+          git diff "$PRODUCT_COMMIT" HEAD -- \
+            .github/workflows/macos-arm64-release-acceptance.yml \
+            .github/scripts/audit-macos-release-artifacts.sh \
+            .github/scripts/verify-cmake-consumer.sh \
+            > evidence/validation-only.patch
+
+          unexpected=$(git diff --name-only "$PRODUCT_COMMIT" HEAD |
+            grep -Ev '^(\.github/workflows/macos-arm64-release-acceptance\.yml|\.github/scripts/audit-macos-release-artifacts\.sh|\.github/scripts/verify-cmake-consumer\.sh)$' ||
+            true)
+          if [ -n "$unexpected" ]; then
+            echo "validation branch contains non-validation changes:" >&2
+            printf '%s\n' "$unexpected" >&2
+            exit 1
+          fi
+
+          if ! git diff --exit-code "$PRODUCT_COMMIT" HEAD -- \
+            . \
+            ':(exclude).github/workflows/macos-arm64-release-acceptance.yml' \
+            ':(exclude).github/scripts/audit-macos-release-artifacts.sh' \
+            ':(exclude).github/scripts/verify-cmake-consumer.sh' \
+            > evidence/product-source-diff.txt; then
+            cat evidence/product-source-diff.txt
+            echo "validation branch changed product source" >&2
+            exit 1
+          fi
+
+          {
+            echo "validation_commit=$(cat evidence/validation-commit.txt)"
+            echo "validation_tree=$(cat evidence/validation-tree.txt)"
+            echo "product_commit=$(cat evidence/product-commit.txt)"
+            echo "product_tree=$(cat evidence/product-tree.txt)"
+            echo "validation_delta_files:"
+            sed 's/^/  /' evidence/validation-delta-files.txt
+          } | tee evidence/identity-summary.txt
+      - name: Configure CMake Release
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release 2>&1 |
+            tee evidence/cmake-configure.log
+          grep -Fx 'CMAKE_BUILD_TYPE:STRING=Release' build/CMakeCache.txt
+          grep -E '^CMAKE_OSX_' build/CMakeCache.txt |
+            tee evidence/cmake-osx-cache.txt || true
+      - name: Verify Corrosion selected the macOS export linker
+        run: |
+          set -euo pipefail
+          cmake --build build --target _cargo-build_lance_c -- -n \
+            > evidence/corrosion-linker-dry-run.log 2>&1
+          tr ' ' '\n' < evidence/corrosion-linker-dry-run.log |
+            grep -E '^(CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER|LANCE_C_MACOS_LINKER)=' |
+            tee evidence/corrosion-linker-selection.txt
+          grep -Fq 'limit-macos-exports.sh' \
+            evidence/corrosion-linker-selection.txt
+          grep -Fq 'LANCE_C_MACOS_LINKER=' \
+            evidence/corrosion-linker-selection.txt
+      - name: Build CMake Release
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel 2>&1 | tee evidence/cmake-build.log
+      - name: Assert nested Cargo used Rust 1.94.0 on the native ARM64 host
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee evidence/nested-cargo-rustc.txt
+          import json
+          import pathlib
+          import sys
+
+          matches = []
+          for path in pathlib.Path("build").rglob(".rustc_info.json"):
+              data = json.loads(path.read_text(encoding="utf-8"))
+              for key, value in data.get("outputs", {}).items():
+                  if not isinstance(value, dict):
+                      continue
+                  stdout = value.get("stdout", "")
+                  if (
+                      "rustc 1.94.0" in stdout
+                      and "host: aarch64-apple-darwin" in stdout
+                  ):
+                      matches.append((path, key, stdout))
+
+          if not matches:
+              print("nested Cargo did not record Rust 1.94.0 on aarch64-apple-darwin", file=sys.stderr)
+              raise SystemExit(1)
+
+          path, key, stdout = matches[0]
+          print(f"rustc-info={path}")
+          print(f"cache-key={key}")
+          print(stdout)
+          PY
+      - name: Install to staging prefix
+        run: |
+          set -euo pipefail
+          cmake --install build --prefix stage 2>&1 |
+            tee evidence/cmake-install.log
+      - name: Record installed tree before stripping
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          manifest() {
+            (
+              cd "$1"
+              find . -type f -print | sort |
+                while IFS= read -r file; do
+                  shasum -a 256 "$file"
+                done
+            )
+          }
+          manifest stage > evidence/installed-before-strip.sha256
+          shasum -a 256 \
+            stage/lib/liblance_c.a \
+            stage/lib/liblance_c.dylib \
+            stage/include/lance/lance.h \
+            stage/include/lance/lance.hpp \
+            > evidence/installed-before-strip-libraries.sha256
+          wc -l evidence/installed-before-strip.sha256
+      - name: Strip release shared library
+        run: |
+          set -euo pipefail
+          bash .github/scripts/strip-release-shared.sh stage macos 2>&1 |
+            tee evidence/strip.log
+      - name: Prove static archive is unchanged and only the dylib was stripped
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          manifest() {
+            (
+              cd "$1"
+              find . -type f -print | sort |
+                while IFS= read -r file; do
+                  shasum -a 256 "$file"
+                done
+            )
+          }
+          manifest stage > evidence/installed-after-strip.sha256
+          shasum -a 256 \
+            stage/lib/liblance_c.a \
+            stage/lib/liblance_c.dylib \
+            stage/include/lance/lance.h \
+            stage/include/lance/lance.hpp \
+            > evidence/installed-after-strip-libraries.sha256
+
+          static_before=$(awk '$2 == "./lib/liblance_c.a" {print $1}' \
+            evidence/installed-before-strip.sha256)
+          static_after=$(awk '$2 == "./lib/liblance_c.a" {print $1}' \
+            evidence/installed-after-strip.sha256)
+          dylib_before=$(awk '$2 == "./lib/liblance_c.dylib" {print $1}' \
+            evidence/installed-before-strip.sha256)
+          dylib_after=$(awk '$2 == "./lib/liblance_c.dylib" {print $1}' \
+            evidence/installed-after-strip.sha256)
+          test -n "$static_before"
+          test -n "$static_after"
+          test -n "$dylib_before"
+          test -n "$dylib_after"
+          test "$static_before" = "$static_after"
+
+          grep -v '  \./lib/liblance_c\.dylib$' \
+            evidence/installed-before-strip.sha256 \
+            > evidence/installed-before-strip-without-dylib.sha256
+          grep -v '  \./lib/liblance_c\.dylib$' \
+            evidence/installed-after-strip.sha256 \
+            > evidence/installed-after-strip-without-dylib.sha256
+          cmp evidence/installed-before-strip-without-dylib.sha256 \
+            evidence/installed-after-strip-without-dylib.sha256
+
+          {
+            echo "static_sha256_before=$static_before"
+            echo "static_sha256_after=$static_after"
+            echo "static_unchanged=yes"
+            echo "dylib_sha256_before=$dylib_before"
+            echo "dylib_sha256_after=$dylib_after"
+          } | tee evidence/strip-identity.txt
+      - name: Verify exact header-derived shared exports
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          bash .github/scripts/verify-shared-exports.sh \
+            stage/lib/liblance_c.dylib \
+            stage/include/lance/lance.h macos 2>&1 |
+            tee evidence/export-guard.log
+
+          sed '/^[[:space:]]*\*/d' stage/include/lance/lance.h |
+            grep -oE 'lance_[A-Za-z0-9_]+[[:space:]]*\(' |
+            sed 's/[[:space:]]*($//' |
+            sort -u > evidence/header-derived-exports.txt
+          nm -gU -j stage/lib/liblance_c.dylib |
+            sed 's/^_//' |
+            sort -u > evidence/dylib-defined-exports.txt
+          diff -u evidence/header-derived-exports.txt \
+            evidence/dylib-defined-exports.txt \
+            > evidence/export-set-diff.txt
+          test ! -s evidence/export-set-diff.txt
+
+          {
+            echo "header_derived_exports=$(wc -l < evidence/header-derived-exports.txt | tr -d ' ')"
+            echo "dylib_defined_exports=$(wc -l < evidence/dylib-defined-exports.txt | tr -d ' ')"
+            echo "header_exports_sha256=$(shasum -a 256 evidence/header-derived-exports.txt | awk '{print $1}')"
+            echo "dylib_exports_sha256=$(shasum -a 256 evidence/dylib-defined-exports.txt | awk '{print $1}')"
+          } | tee evidence/export-count.txt
+      - name: Verify staged macOS architecture, install name and dependencies
+        run: |
+          set -euo pipefail
+          bash .github/scripts/verify-macos-staging.sh stage arm64 2>&1 |
+            tee evidence/staging.log
+      - name: Audit static archive members and dylib metadata
+        run: |
+          set -euo pipefail
+          bash .github/scripts/audit-macos-release-artifacts.sh \
+            stage/lib/liblance_c.a \
+            stage/lib/liblance_c.dylib \
+            stage/include/lance/lance.h \
+            arm64 11.0 evidence 2>&1 |
+            tee evidence/archive-audit.log
+      - name: Verify installed headers match the product source
+        run: |
+          set -euo pipefail
+          cmp stage/include/lance/lance.h include/lance/lance.h
+          cmp stage/include/lance/lance.hpp include/lance/lance.hpp
+          shasum -a 256 include/lance/lance.h include/lance/lance.hpp \
+            > evidence/source-header-identity.sha256
+          shasum -a 256 stage/include/lance/lance.h \
+            stage/include/lance/lance.hpp \
+            > evidence/installed-header-identity.sha256
+      - name: Run installed static and shared data and ownership consumers
+        run: |
+          set -euo pipefail
+          rm -rf consumer-work
+          LANCE_C_CMAKE_CONSUMER_WORK_DIR="$PWD/consumer-work" \
+            LANCE_C_CMAKE_BUILD_VERBOSE=1 \
+            bash .github/scripts/verify-cmake-consumer.sh \
+              --from-install-prefix stage 2>&1 |
+            tee evidence/consumer-acceptance.log
+      - name: Verify linkage to installed libraries and actual run counts
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          log=evidence/consumer-acceptance.log
+
+          for linkage in static shared; do
+            binary="consumer-work/consumer-${linkage}/consumer"
+            test -x "$binary"
+            lipo -archs "$binary" | tee "evidence/consumer-${linkage}-arch.txt"
+            test "$(lipo -archs "$binary")" = "arm64"
+            file "$binary" > "evidence/consumer-${linkage}-file.txt"
+            otool -L "$binary" > "evidence/consumer-${linkage}-dependencies.txt"
+            otool -l "$binary" |
+              awk '/cmd LC_RPATH/ {getline; getline; print $2}' |
+              sort -u > "evidence/consumer-${linkage}-rpaths.txt"
+            for target in consumer acceptance; do
+              link_file="consumer-work/consumer-${linkage}/CMakeFiles/${target}.dir/link.txt"
+              test -f "$link_file"
+              cp "$link_file" "evidence/link-command-${linkage}-${target}.txt"
+            done
+          done
+
+          if grep -Fq 'liblance_c.dylib' \
+            evidence/consumer-static-dependencies.txt; then
+            echo "static consumer unexpectedly links the dylib" >&2
+            exit 1
+          fi
+          grep -Fq '@rpath/liblance_c.dylib' \
+            evidence/consumer-shared-dependencies.txt
+          grep -Fq "$PWD/stage/lib" evidence/consumer-shared-rpaths.txt
+
+          grep -F "$PWD/stage/lib" \
+            evidence/link-command-static-consumer.txt
+          grep -F "$PWD/stage/lib" \
+            evidence/link-command-shared-consumer.txt
+
+          static_dataset=$(grep -c \
+            '^Verified static consumer dataset read: rows: 512, version: 2$' \
+            "$log" || true)
+          shared_dataset=$(grep -c \
+            '^Verified shared consumer dataset read: rows: 512, version: 2$' \
+            "$log" || true)
+          acceptance=$(grep -c '^acceptance: PASS$' "$log" || true)
+          test "$static_dataset" -eq 1
+          test "$shared_dataset" -eq 1
+          test "$acceptance" -eq 2
+
+          DYLD_PRINT_LIBRARIES=1 \
+            consumer-work/consumer-shared/consumer \
+            "$PWD/test_data/v0.27.1/pq_in_schema" \
+            > evidence/shared-runtime.stdout \
+            2> evidence/shared-runtime.stderr
+          test "$(cat evidence/shared-runtime.stdout)" = "rows: 512, version: 2"
+          loaded_library_path_recorded=fallback_otool_rpath
+          if grep -F "$PWD/stage/lib/liblance_c.dylib" \
+            evidence/shared-runtime.stderr \
+            > evidence/shared-runtime-loaded-library.txt; then
+            loaded_library_path_recorded=yes
+          else
+            echo "DYLD_PRINT_LIBRARIES did not report the installed path;" \
+              "otool and the successful run provide the linkage evidence." \
+              > evidence/shared-runtime-loaded-library.txt
+          fi
+
+          {
+            echo "static_dataset_reads=$static_dataset"
+            echo "shared_dataset_reads=$shared_dataset"
+            echo "additional_shared_dyld_probe_dataset_reads=1"
+            echo "acceptance_runs=$acceptance"
+            echo "usage_only_runs=2"
+            echo "selected_data_read_runs=$((static_dataset + shared_dataset + 1))"
+            echo "selected_full_acceptance_runs=$acceptance"
+            echo "loaded_library_path_recorded=$loaded_library_path_recorded"
+          } | tee evidence/run-counts.txt
+      - name: Package archive with the existing release naming and layout
+        id: pack
+        env:
+          XZ_OPT: -T0
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          version="${{ inputs.version }}"
+          target="aarch64-apple-darwin"
+          archive="lance-c-v${version}-${target}.tar.xz"
+          mkdir -p dist
+
+          tar -C stage -cJf "dist/${archive}" .
+          (
+            cd dist
+            shasum -a 256 "$archive" > "${archive}.sha256"
+            shasum -a 512 "$archive" > "${archive}.sha512"
+          )
+          tar -tvJf "dist/${archive}" > evidence/archive-layout.txt
+          (
+            cd dist
+            shasum -a 256 -c "${archive}.sha256"
+            shasum -a 512 -c "${archive}.sha512"
+          ) 2>&1 | tee evidence/archive-checksums.txt
+          {
+            echo "archive=$archive"
+            cat "dist/${archive}.sha256"
+            cat "dist/${archive}.sha512"
+            wc -c "dist/${archive}"
+            shasum -a 256 \
+              stage/lib/liblance_c.a \
+              stage/lib/liblance_c.dylib \
+              stage/include/lance/lance.h \
+              stage/include/lance/lance.hpp
+          } | tee evidence/archive-identity.txt
+
+          mkdir -p archive-extracted
+          tar -C archive-extracted -xJf "dist/${archive}"
+          manifest() {
+            (
+              cd "$1"
+              find . -type f -print | sort |
+                while IFS= read -r file; do
+                  shasum -a 256 "$file"
+                done
+            )
+          }
+          manifest stage > evidence/installed-packaged-source.sha256
+          manifest archive-extracted > evidence/archive-extracted-manifest.sha256
+          diff -u evidence/installed-after-strip.sha256 \
+            evidence/installed-packaged-source.sha256 \
+            > evidence/packaged-stage-manifest.diff
+          test ! -s evidence/packaged-stage-manifest.diff
+          diff -u evidence/installed-packaged-source.sha256 \
+            evidence/archive-extracted-manifest.sha256 \
+            > evidence/packaged-archive-manifest.diff
+          test ! -s evidence/packaged-archive-manifest.diff
+
+          mkdir -p evidence/archive-extracted-audit
+          bash .github/scripts/audit-macos-release-artifacts.sh \
+            archive-extracted/lib/liblance_c.a \
+            archive-extracted/lib/liblance_c.dylib \
+            archive-extracted/include/lance/lance.h \
+            arm64 11.0 evidence/archive-extracted-audit 2>&1 |
+            tee evidence/archive-extracted-audit.log
+          cmp evidence/archive-members.tsv \
+            evidence/archive-extracted-audit/archive-members.tsv
+          cmp evidence/archive-audit.json \
+            evidence/archive-extracted-audit/archive-audit.json
+
+          {
+            echo "installed_tree_matches_packaged_tar=yes"
+            echo "packaged_tar_matches_exercised_stage=yes"
+            echo "archive_member_metadata_matches_extracted=yes"
+            echo "archive_sha256=$(awk '{print $1}' "dist/${archive}.sha256")"
+            echo "archive_sha512=$(awk '{print $1}' "dist/${archive}.sha512")"
+          } | tee evidence/package-verification.txt
+
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+      - name: Mark evidence complete
+        run: |
+          set -euo pipefail
+          {
+            echo "status=PASS"
+            echo "product_commit=$(cat evidence/product-commit.txt)"
+            echo "product_tree=$(cat evidence/product-tree.txt)"
+            echo "validation_commit=$(cat evidence/validation-commit.txt)"
+            echo "validation_tree=$(cat evidence/validation-tree.txt)"
+            cat evidence/export-count.txt
+            cat evidence/run-counts.txt
+            cat evidence/package-verification.txt
+            echo "macos_runtime_claim=only_the_actual_host_recorded_in_host-and-toolchain.txt"
+            echo "minos_claim=build_metadata_only"
+            echo "release_status=unpublished_candidate"
+          } | tee evidence/STATUS.txt
+          (
+            cd evidence
+            find . -type f ! -name SHA256SUMS -print | sort |
+              while IFS= read -r file; do
+                shasum -a 256 "$file"
+              done
+          ) > evidence/SHA256SUMS
+      - name: Upload retained candidate archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-macos-release-candidate-${{ github.sha }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+      - name: Upload acceptance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-macos-release-acceptance-${{ github.sha }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
