@@ -63,7 +63,7 @@ function Assert-Exports {
     $missing = @($Expected | Where-Object { $Actual -notcontains $_ })
     $extra = @($Actual | Where-Object { $Expected -notcontains $_ })
     if ($missing.Count -ne 0 -or $extra.Count -ne 0) {
-        throw "$Description mismatch: missing=[$($missing -join ', ')] extra=[$($extra -join ', ')]"
+        throw "$Description mismatch: actual=[$($Actual -join ', ')] missing=[$($missing -join ', ')] extra=[$($extra -join ', ')]"
     }
 }
 

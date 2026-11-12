@@ -40,8 +40,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.0
       - name: Build probe through Cargo linker wrapper
         shell: pwsh
+        env:
+          LANCE_C_WINDOWS_EXPORT_LOG: ${{ runner.temp }}\pr216-cargo-link.log
         run: |
-          cargo build --release `
+          cargo build -vv --release `
             --manifest-path .github/probe/cargo/Cargo.toml
       - name: Load Visual Studio tools
         shell: cmd
@@ -58,3 +60,13 @@ jobs:
           pwsh -File .github/scripts/test-pr216-cargo-linker.ps1 `
             -ManifestPath .github/probe/cargo/Cargo.toml `
             -WorkDir "$env:RUNNER_TEMP\pr216-cargo-probe"
+      - name: Upload cargo probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr216-cargo-linker-probe
+          path: |
+            .github/probe/cargo/target/release
+            ${{ runner.temp }}/pr216-cargo-probe
+            ${{ runner.temp }}/pr216-cargo-link.log
+          if-no-files-found: warn

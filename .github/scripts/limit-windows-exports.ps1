@@ -11,6 +11,14 @@ Set-StrictMode -Version Latest
 
 $ExportMarker = '; lance-c exact public exports'
 
+function Write-ExportLog {
+    param([string]$Message)
+
+    if ($env:LANCE_C_WINDOWS_EXPORT_LOG) {
+        Add-Content -LiteralPath $env:LANCE_C_WINDOWS_EXPORT_LOG -Value $Message
+    }
+}
+
 function Expand-ResponseFileArguments {
     param([string[]]$Arguments)
 
@@ -141,12 +149,16 @@ function Get-ImportLibrary {
 }
 
 $originalArguments = @($LinkerArguments)
+Write-ExportLog "original arguments: $($originalArguments -join ' | ')"
 $expandedArguments = Expand-ResponseFileArguments $originalArguments
+Write-ExportLog "expanded arguments: $($expandedArguments -join ' | ')"
 $machine = Get-Machine $expandedArguments
 $realLinker = Find-MsvcLinker $machine
 $definition = Get-MarkedDefinition $expandedArguments
+Write-ExportLog "machine=$machine linker=$realLinker definition=$definition"
 
 if (-not $definition) {
+    Write-ExportLog 'forwarding without a marked lance-c DEF'
     & $realLinker @originalArguments
     exit $LASTEXITCODE
 }
@@ -165,6 +177,7 @@ foreach ($generated in @($generatedImportLibrary, $generatedExportFile)) {
 }
 
 $importLibrary = Get-ImportLibrary $expandedArguments
+Write-ExportLog "import library=$importLibrary export file=$generatedExportFile"
 $importDirectory = Split-Path -Parent $importLibrary
 if ($importDirectory) {
     New-Item -ItemType Directory -Path $importDirectory -Force | Out-Null
@@ -177,5 +190,6 @@ if ($resolvedImportLibrary -ne $resolvedGeneratedLibrary) {
 }
 
 $linkArguments = $originalArguments + $generatedExportFile
+Write-ExportLog "final arguments: $($linkArguments -join ' | ')"
 & $realLinker @linkArguments
 exit $LASTEXITCODE
