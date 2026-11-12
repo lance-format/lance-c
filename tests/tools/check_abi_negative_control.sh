@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Validation-only negative control for issue #102.
 #
-# Mutates a temporary copy of the public header in two ways that do not change
-# any covered size/align/offset record in PR #68's probe:
+# Mutates temporary copies of the public header in two independent ways that do
+# not change any covered size/align/offset record in PR #68's probe:
 #   1. changes LANCE_ERR_PANIC from 9 to 10;
 #   2. swaps two uint64_t fields in LanceSessionCacheStats.
 #
@@ -14,11 +14,12 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-cp -R "$root/include" "$work/include"
-header="$work/include/lance/lance.h"
+cp -R "$root/include" "$work/include-discriminant"
+cp -R "$root/include" "$work/include-struct"
 
-sed -i 's/LANCE_ERR_PANIC = 9/LANCE_ERR_PANIC = 10/' "$header"
-python3 - "$header" <<'PY'
+sed -i 's/LANCE_ERR_PANIC = 9/LANCE_ERR_PANIC = 10/' \
+    "$work/include-discriminant/lance/lance.h"
+python3 - "$work/include-struct/lance/lance.h" <<'PY'
 import pathlib
 import sys
 
@@ -42,29 +43,35 @@ compile() {
 }
 
 compile "$root/tests/cpp/abi_layout.c" "$work/pr68-original" "$root/include"
-compile "$root/tests/cpp/abi_layout.c" "$work/pr68-mutated" "$work/include"
+compile "$root/tests/cpp/abi_layout.c" "$work/pr68-discriminant" "$work/include-discriminant"
+compile "$root/tests/cpp/abi_layout.c" "$work/pr68-struct" "$work/include-struct"
 compile "$root/tests/cpp/abi_layout_current.c" "$work/current-original" "$root/include"
-compile "$root/tests/cpp/abi_layout_current.c" "$work/current-mutated" "$work/include"
+compile "$root/tests/cpp/abi_layout_current.c" "$work/current-discriminant" "$work/include-discriminant"
+compile "$root/tests/cpp/abi_layout_current.c" "$work/current-struct" "$work/include-struct"
 
 "$work/pr68-original" >"$work/pr68-original.txt"
-"$work/pr68-mutated" >"$work/pr68-mutated.txt"
+"$work/pr68-discriminant" >"$work/pr68-discriminant.txt"
+"$work/pr68-struct" >"$work/pr68-struct.txt"
 "$work/current-original" >"$work/current-original.txt"
-"$work/current-mutated" >"$work/current-mutated.txt"
+"$work/current-discriminant" >"$work/current-discriminant.txt"
+"$work/current-struct" >"$work/current-struct.txt"
 
-if ! diff -q "$work/pr68-original.txt" "$work/pr68-mutated.txt" >/dev/null; then
-    echo "FAIL: PR #68 probe unexpectedly noticed a mutation" >&2
-    diff -u "$work/pr68-original.txt" "$work/pr68-mutated.txt" >&2 || true
-    exit 1
-fi
-echo "PASS: PR #68 probe output is identical under both mutations"
+for mutation in discriminant struct; do
+    if ! diff -q "$work/pr68-original.txt" "$work/pr68-$mutation.txt" >/dev/null; then
+        echo "FAIL: PR #68 probe unexpectedly noticed the $mutation mutation" >&2
+        diff -u "$work/pr68-original.txt" "$work/pr68-$mutation.txt" >&2 || true
+        exit 1
+    fi
+    echo "PASS: PR #68 probe is blind to the $mutation mutation"
+done
 
-for mutation in discriminant struct-layout; do
-    if diff -q "$work/current-original.txt" "$work/current-mutated.txt" >/dev/null; then
+for mutation in discriminant struct; do
+    if diff -q "$work/current-original.txt" "$work/current-$mutation.txt" >/dev/null; then
         echo "FAIL: current-main probe missed the $mutation mutation" >&2
         exit 1
     fi
+    echo "PASS: current-main probe detects the $mutation mutation"
+    diff -u "$work/current-original.txt" "$work/current-$mutation.txt" \
+        | sed -n '1,12p' || true
 done
-echo "PASS: current-main probe detects both mutations"
-diff -u "$work/current-original.txt" "$work/current-mutated.txt" \
-    | sed -n '1,12p;220,240p' || true
 exit 0
