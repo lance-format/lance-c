@@ -637,8 +637,8 @@ cmake --install build --prefix /your/prefix
 
 On macOS, `MACOSX_DEPLOYMENT_TARGET` must be in the environment that invokes
 the CMake build. With the pinned Corrosion 0.5.1, setting only
-`CMAKE_OSX_DEPLOYMENT_TARGET` does not propagate to Cargo build scripts. For
-example, the release workflow uses:
+`CMAKE_OSX_DEPLOYMENT_TARGET` does not propagate to Cargo build scripts. To
+set the same deployment target for CMake and Cargo:
 
 ```bash
 export MACOSX_DEPLOYMENT_TARGET=11.0
