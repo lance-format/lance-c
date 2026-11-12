@@ -217,6 +217,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
         with:
+          # Corrosion writes dependencies under the CMake build tree.
+          workspaces: |
+            . -> target
+            . -> build/${{ matrix.architecture }}/Release/cargo/build
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Assert native Windows ARM64 toolchain
         if: matrix.architecture == 'ARM64'
