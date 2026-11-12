@@ -27,7 +27,7 @@ jobs:
       # directly on the runner. A literal `image: ''` fails schema validation,
       # but an expression does not, which is what makes this pattern work.
       image: ${{ matrix.container }}
-    timeout-minutes: 90
+    timeout-minutes: ${{ matrix.timeout_minutes || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -56,14 +56,22 @@ jobs:
             os_label: linux
             container: "debian:12"
             artifact_suffix: "-debian12"
-          # x86_64-apple-darwin temporarily disabled: GitHub is deprecating
-          # macos-13 runners and jobs queue 24h+ before timing out. Restore
-          # this row once a macos-* Intel runner is reliably available again.
+          # macos-15-intel is GitHub's current standard x64 macOS runner.
+          # Keep this row native so both libraries and the consumer exercise
+          # Intel execution rather than a cross-build or arm64 translation.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            timeout_minutes: 180
+            os_label: macos
+            container: ""
+            artifact_suffix: ""
+            architecture: x86_64
           - target: aarch64-apple-darwin
             runner: macos-15
             os_label: macos
             container: ""
             artifact_suffix: ""
+            architecture: arm64
     env:
       CC: clang
       CXX: clang++
@@ -118,6 +126,18 @@ jobs:
       - name: Install protobuf (macOS)
         if: matrix.os_label == 'macos'
         run: brew install protobuf
+      - name: Record macOS host and toolchain
+        if: matrix.os_label == 'macos'
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          "$CC" --version
+          rustc -vV
+          cargo --version
+          cmake --version
+          git rev-parse HEAD
       - name: Resolve version
         id: ver
         run: |
@@ -145,7 +165,7 @@ jobs:
         run: bash .github/scripts/verify-linux-staging.sh stage ${{ matrix.target }}
       - name: Verify macOS staged libraries
         if: matrix.os_label == 'macos'
-        run: bash .github/scripts/verify-macos-staging.sh stage arm64
+        run: bash .github/scripts/verify-macos-staging.sh stage ${{ matrix.architecture }}
       - name: Smoke-test staged package with CMake consumer
         run: bash .github/scripts/verify-cmake-consumer.sh --from-install-prefix stage
       - name: Tar
@@ -197,6 +217,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
         with:
+          # Corrosion writes dependencies under the CMake build tree.
+          workspaces: |
+            . -> target
+            . -> build/${{ matrix.architecture }}/Release/cargo/build
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Assert native Windows ARM64 toolchain
         if: matrix.architecture == 'ARM64'

@@ -20,6 +20,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot 'windows-runtime-dependencies.ps1')
+. (Join-Path $PSScriptRoot 'windows-import-exports.ps1')
 
 function Invoke-Dumpbin {
     param([string[]]$Arguments)
@@ -121,8 +122,9 @@ Write-Host "==> Verifying $Architecture package with $CMakeGenerator"
 Write-Host "==> Inspecting $dll with $script:Dumpbin"
 Assert-PeImage -Path $dll -Description 'staged DLL'
 
-$headerText = ((Get-Content -LiteralPath $header) |
-    Where-Object { $_ -notmatch '^\s*\*' }) -join "`n"
+$headerSource = Get-Content -LiteralPath $header -Raw
+$headerText = [regex]::Replace($headerSource, '(?s)/\*.*?\*/', ' ')
+$headerText = [regex]::Replace($headerText, '(?m)//.*$', '')
 $expectedExports = [regex]::Matches(
     $headerText, 'lance_[A-Za-z0-9_]+(?=\s*\()') |
     ForEach-Object { $_.Value } |
@@ -133,7 +135,7 @@ if ($expectedExports.Count -eq 0) {
 
 $exportText = (Invoke-Dumpbin @('/exports', $dll)) -join "`n"
 $actualExports = [regex]::Matches(
-    $exportText, '(?m)^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$') |
+    $exportText, '(?m)^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)(?:\s+=.*)?\s*$') |
     ForEach-Object { $_.Groups[1].Value } |
     Sort-Object -Unique
 if ($actualExports.Count -eq 0) {
@@ -146,9 +148,31 @@ if ($missingExports.Count -ne 0) {
     throw "staged DLL is missing public exports:`n$($missingExports -join "`n")"
 }
 if ($extraExports.Count -ne 0) {
-    Write-Warning "staged DLL has non-header exports: $($extraExports -join ', ')"
+    throw "staged DLL has non-header exports:`n$($extraExports -join "`n")"
+}
+if ($actualExports.Count -ne $expectedExports.Count) {
+    throw "staged DLL has $($actualExports.Count) exports, expected $($expectedExports.Count)"
 }
 Write-Host "==> Verified $($expectedExports.Count) public lance_* exports ($($actualExports.Count) total exports)"
+
+$importText = (Invoke-Dumpbin @('/exports', $importLibrary)) -join "`n"
+$importExports = @(Get-WindowsImportLibraryExports -Text $importText | Sort-Object -Unique)
+if ($importExports.Count -eq 0) {
+    throw "staged import library reports no public exports:`n$importText"
+}
+
+$missingImportExports = @($expectedExports | Where-Object { $importExports -notcontains $_ })
+$extraImportExports = @($importExports | Where-Object { $expectedExports -notcontains $_ })
+if ($missingImportExports.Count -ne 0) {
+    throw "staged import library is missing public exports:`n$($missingImportExports -join "`n")"
+}
+if ($extraImportExports.Count -ne 0) {
+    throw "staged import library has non-header exports:`n$($extraImportExports -join "`n")"
+}
+if ($importExports.Count -ne $expectedExports.Count) {
+    throw "staged import library has $($importExports.Count) exports, expected $($expectedExports.Count)"
+}
+Write-Host "==> Verified $($importExports.Count) public lance_* imports"
 
 $dependentsText = (Invoke-Dumpbin @('/dependents', $dll)) -join "`n"
 $dependencies = Get-PeDependencies -DependentsText $dependentsText

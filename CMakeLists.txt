@@ -89,13 +89,23 @@ if(NOT LANCE_C_USE_PREBUILT)
         set_target_properties(lance_c-static PROPERTIES
             INTERFACE_LINK_OPTIONS "${_lance_c_static_link_options}")
     endif()
-    if(Rust_CARGO_TARGET MATCHES "apple-darwin$")
+    # FindRust stores an inferred native target only in Corrosion's directory
+    # scope. The cache entry is visible here for both inferred and explicit targets.
+    if(Rust_CARGO_TARGET_CACHED MATCHES "apple-darwin$")
         # Corrosion selects its own linker, overriding Cargo's environment.
         # Keep the dylib export policy on the actual imported build target.
         corrosion_set_linker(lance_c
             "${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-macos-exports.sh")
         corrosion_set_env_vars(lance_c
             "LANCE_C_MACOS_LINKER=${CMAKE_C_COMPILER}")
+    elseif(Rust_CARGO_TARGET_CACHED MATCHES "x86_64-pc-windows-msvc$")
+        corrosion_set_env_vars(lance_c
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-windows-exports.cmd"
+            "LANCE_C_WINDOWS_MACHINE=X64")
+    elseif(Rust_CARGO_TARGET_CACHED MATCHES "aarch64-pc-windows-msvc$")
+        corrosion_set_env_vars(lance_c
+            "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-windows-exports.cmd"
+            "LANCE_C_WINDOWS_MACHINE=ARM64")
     endif()
 endif()
 
