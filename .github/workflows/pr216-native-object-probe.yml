@@ -135,3 +135,45 @@ jobs:
           pwsh -File .github/scripts/test-windows-export-linker.ps1 `
             -Architecture ${{ matrix.architecture }} `
             -WorkDir "$env:RUNNER_TEMP\pr216 product ${{ matrix.architecture }} export linker"
+  corrosion-install:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            runner: windows-2022
+            generator: Visual Studio 17 2022
+            toolset: ""
+          - architecture: ARM64
+            runner: windows-11-arm
+            generator: Visual Studio 18 2026
+            toolset: ClangCL
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.correction_sha }}
+          path: correction
+      - name: Configure Corrosion export probe
+        shell: pwsh
+        run: >
+          cmake -S .github/probe/corrosion -B build-corrosion
+          -G "${{ matrix.generator }}"
+          -A ${{ matrix.architecture }}
+          ${{ matrix.toolset != '' && format('-T {0}', matrix.toolset) || '' }}
+          -DPROBE_CRATE_DIR="${{ github.workspace }}/.github/probe/cargo"
+          -DLANCE_C_SOURCE_DIR="${{ github.workspace }}/correction"
+      - name: Build Corrosion export probe
+        shell: pwsh
+        run: cmake --build build-corrosion --config Release --parallel 4
+      - name: Install Corrosion export probe
+        shell: pwsh
+        run: cmake --install build-corrosion --prefix stage-corrosion --config Release
+      - name: Verify installed Corrosion artifacts
+        shell: pwsh
+        run: |
+          pwsh -File .github/scripts/test-pr216-corrosion-install.ps1 `
+            -Prefix stage-corrosion -Architecture ${{ matrix.architecture }}
