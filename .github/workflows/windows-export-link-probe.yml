@@ -67,7 +67,8 @@ jobs:
           dumpbin /nologo /exports wide-then-narrow.dll >wide-then-narrow.exports.txt
           dumpbin /nologo /exports narrow-then-wide.dll >narrow-then-wide.exports.txt
           dumpbin /nologo /directives dep.obj >dep.directives.txt
-          link /? >link-options.txt
+          link /? >link-options.txt 2>&1
+          exit /b 0
           "@ | Set-Content -LiteralPath (Join-Path $work 'probe.cmd') -Encoding ascii
 
           cmd /d /c (Join-Path $work 'probe.cmd')
