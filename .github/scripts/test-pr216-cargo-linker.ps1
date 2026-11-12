@@ -68,7 +68,7 @@ function Assert-Exports {
 }
 
 $manifest = (Resolve-Path -LiteralPath $ManifestPath).Path
-$targetRoot = Join-Path (Split-Path -Parent $manifest) 'target\release'
+$targetRoot = Join-Path (Split-Path -Parent $manifest) 'target\release\deps'
 $dll = Join-Path $targetRoot 'lance_c.dll'
 $importLibrary = Join-Path $targetRoot 'lance_c.dll.lib'
 foreach ($artifact in @($dll, $importLibrary)) {
