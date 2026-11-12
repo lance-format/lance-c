@@ -676,6 +676,12 @@ machine of both acceptance executables before running them. The hosted Windows
 11 ARM64 baseline does not establish Windows 10 ARM64 or Windows Server ARM64
 support.
 
+The current Windows DLLs import `VCRUNTIME140.dll`, which the hosted images
+provide in `System32`. A system-only `PATH` does not prove that the package is
+self-contained on a machine without the Visual C++ Runtime. The distribution
+contract for that deployment is tracked in
+[#215](https://github.com/lance-format/lance-c/issues/215).
+
 See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
 for a reproducible native-14 C segment to Java-12 commit/query PoC.
 
