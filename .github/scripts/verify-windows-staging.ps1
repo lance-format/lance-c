@@ -20,6 +20,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot 'windows-runtime-dependencies.ps1')
+. (Join-Path $PSScriptRoot 'windows-import-exports.ps1')
 
 function Invoke-Dumpbin {
     param([string[]]$Arguments)
@@ -148,10 +149,7 @@ if ($actualExports.Count -ne $expectedExports.Count) {
 Write-Host "==> Verified $($expectedExports.Count) public lance_* exports ($($actualExports.Count) total exports)"
 
 $importText = (Invoke-Dumpbin @('/exports', $importLibrary)) -join "`n"
-$importExports = [regex]::Matches(
-    $importText, '(?m)^\s*(?:\d+\s+)?(lance_[A-Za-z0-9_]+)\s*$') |
-    ForEach-Object { $_.Groups[1].Value } |
-    Sort-Object -Unique
+$importExports = @(Get-WindowsImportLibraryExports -Text $importText | Sort-Object -Unique)
 if ($importExports.Count -eq 0) {
     throw "staged import library reports no public exports:`n$importText"
 }
