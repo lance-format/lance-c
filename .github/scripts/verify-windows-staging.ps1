@@ -114,8 +114,9 @@ Write-Host "==> Verifying $Architecture package with $CMakeGenerator"
 Write-Host "==> Inspecting $dll with $script:Dumpbin"
 Assert-PeImage -Path $dll -Description 'staged DLL'
 
-$headerText = ((Get-Content -LiteralPath $header) |
-    Where-Object { $_ -notmatch '^\s*\*' }) -join "`n"
+$headerSource = Get-Content -LiteralPath $header -Raw
+$headerText = [regex]::Replace($headerSource, '(?s)/\*.*?\*/', ' ')
+$headerText = [regex]::Replace($headerText, '(?m)//.*$', '')
 $expectedExports = [regex]::Matches(
     $headerText, 'lance_[A-Za-z0-9_]+(?=\s*\()') |
     ForEach-Object { $_.Value } |
