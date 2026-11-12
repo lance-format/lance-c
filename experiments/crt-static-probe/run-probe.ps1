@@ -53,10 +53,10 @@ $dumpbin = Get-ChildItem -LiteralPath (Join-Path $visualStudio 'VC\Tools\MSVC') 
     Select-Object -First 1
 if (-not $dumpbin) { throw 'dumpbin not found' }
 Write-Host "==> $Consumer executables"
-& $dumpbin.FullName /dependents $exe
+& $dumpbin /dependents $exe
 if ($Consumer -eq 'shared') {
     Write-Host '==> DLL imports'
-    & $dumpbin.FullName /dependents $dll
+    & $dumpbin /dependents $dll
 }
 
 $oldPath = $env:Path
