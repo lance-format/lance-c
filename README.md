@@ -627,11 +627,14 @@ working example.
 
 ### Windows (x86_64-pc-windows-msvc and aarch64-pc-windows-msvc)
 
-The Windows package path uses the same CMake entry point:
+The Windows CMake build links the MSVC C runtime statically by default for
+both the DLL and static archive. Release and Windows CI pass
+`-DLANCE_C_CRT_STATIC=ON` explicitly; a source build can opt into the dynamic
+CRT with `-DLANCE_C_CRT_STATIC=OFF`.
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
 cmake --build build --config Release
 cmake --install build --prefix C:\path\to\prefix --config Release
 ```
@@ -640,7 +643,7 @@ For a native ARM64 build, select the Visual Studio 2026 ARM64 platform:
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL `
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
 cmake --build build --config Release
 cmake --install build --prefix C:\path\to\prefix --config Release
 ```
@@ -655,22 +658,52 @@ headers. `find_package(LanceC)` selects the static library by default; set
 The installed shared consumer must have `lance_c.dll` beside its executable or
 on its DLL search path.
 
+The DLL and archive are built with the static CRT. The DLL therefore has no
+redistributable `VCRUNTIME*`, `MSVCP*`, `MSVCR*`, `CONCRT*`, or `VCOMP*`
+direct or delay-load dependency. It still requires the stated Windows OS
+baseline and loads `lance_c.dll` from the consumer's DLL search path.
+
+The static archive is a Release `/MT` archive. Its consumer must use the same
+static CRT, and the package config declares
+`set(LanceC_STATIC_CRT ON)` for this build. An imported library cannot
+propagate `CMAKE_MSVC_RUNTIME_LIBRARY`, so each consuming target must select it
+from that metadata:
+
+```cmake
+find_package(LanceC 0.1 REQUIRED)
+if(WIN32 AND LanceC_STATIC_CRT)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
+```
+
+Do not link a `/MD` consumer against this archive. The release archive is not
+a `/MTd` debug library, and mixing `/MTd` with it is not supported. A shared
+consumer may use either CRT; the package's acceptance example also builds the
+shared consumer with `/MT` so its own executables do not depend on a
+redistributable runtime.
+
+The CMake option does not configure a direct Cargo build. For Cargo, select
+the same Rust target feature explicitly for the Windows target:
+
+```powershell
+$env:RUSTFLAGS = '-Ctarget-feature=+crt-static'
+cargo build --release --target x86_64-pc-windows-msvc
+```
+
+Cargo exposes that target feature to build scripts, which lets `cc` and
+AWS-LC's CMake configuration select the static CRT for native dependencies.
+
 Windows CI builds this layout with Rust 1.94.0. The x64 job uses
 `windows-2022`. The ARM64 job uses `windows-11-arm` and asserts that the
 runner, PowerShell process, and Rust host are native ARM64. Each job verifies
-the PE32+ machine, public `lance_*` exports, and resolved runtime DLL
-dependencies, then runs static and shared C++17 consumers with `PATH`
-restricted to the Windows system directories. The ARM64 job builds both the
-package and installed consumers with the ClangCL toolset and verifies the PE
-machine of both acceptance executables before running them. The hosted Windows
-11 ARM64 baseline does not establish Windows 10 ARM64 or Windows Server ARM64
-support.
-
-The current Windows DLLs import `VCRUNTIME140.dll`, which the hosted images
-provide in `System32`. A system-only `PATH` does not prove that the package is
-self-contained on a machine without the Visual C++ Runtime. The distribution
-contract for that deployment is tracked in
-[#215](https://github.com/lance-format/lance-c/issues/215).
+the PE32+ machine, public `lance_*` exports, absence of redistributable CRT
+imports, static archive directives, and installed static/shared C++17
+consumers. The consumers run with `PATH` restricted to the Windows system
+directories and write their loaded-module lists; `LNK4098` and `LNK2038` are
+failures. The hosted images already contain a VC Runtime under `System32`, so
+this is import-table and loaded-module evidence on the named hosted OS, not a
+fresh-machine lab. The Windows 11 ARM64 baseline does not establish Windows 10
+ARM64 or Windows Server ARM64 support.
 
 See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
 for a reproducible native-14 C segment to Java-12 commit/query PoC.
@@ -1174,7 +1207,7 @@ back.
 ## Releasing
 
 Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds seven prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, macOS arm64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. Intel macOS consumers use the source build described above.
-Before the consumer smoke test and archive upload, the Linux and macOS rows strip the staged shared library and verify its exact public exports; Linux rows also check direct runtime dependencies. Windows rows verify all declared public exports and native consumers, while recording additional dependency exports separately.
+Before the consumer smoke test and archive upload, the Linux and macOS rows strip the staged shared library and verify its exact public exports; Linux rows also check direct runtime dependencies. Windows rows build both architectures with the static MSVC CRT, verify the DLL's direct and delay-load imports, inspect the static archive's CRT directives, and run static/shared consumers with an explicit `/MT` runtime.
 
 ### Recommended: cut a release via Actions UI
 

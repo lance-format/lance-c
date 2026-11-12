@@ -229,7 +229,7 @@ jobs:
           cmake -S . -B build -G "${{ matrix.generator }}"
           -A ${{ matrix.architecture }}
           ${{ matrix.toolset != '' && format('-T {0}', matrix.toolset) || '' }}
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
       - name: Build
         run: cmake --build build --config Release --parallel 4
       - name: Install to staging prefix

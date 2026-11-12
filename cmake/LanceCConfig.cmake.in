@@ -6,6 +6,13 @@
 set_and_check(_LANCE_C_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
 set_and_check(_LANCE_C_LIB_DIR     "@PACKAGE_CMAKE_INSTALL_LIBDIR@")
 
+# Windows packages built with LANCE_C_CRT_STATIC=ON contain Release libraries
+# linked with the static MSVC CRT. Consumers of the static archive must compile
+# and link with /MT. This is consumer metadata because CMAKE_MSVC_RUNTIME_LIBRARY
+# initializes a consuming target's property and is not propagated by imported
+# libraries.
+set(LanceC_STATIC_CRT @LanceC_STATIC_CRT@)
+
 if(WIN32)
     set(_lance_c_static "${_LANCE_C_LIB_DIR}/lance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
     set(_lance_c_shared "${_LANCE_C_LIB_DIR}/lance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")

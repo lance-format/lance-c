@@ -175,7 +175,7 @@ jobs:
       - name: Configure
         run: >
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
       - name: Build
         run: cmake --build build --config Release --parallel 4
       - name: Install to staging prefix
@@ -234,7 +234,7 @@ jobs:
       - name: Configure
         run: >
           cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
       - name: Assert ARM64 ClangCL configuration
         shell: pwsh
         run: |

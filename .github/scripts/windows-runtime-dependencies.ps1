@@ -6,6 +6,56 @@
 # not files that must exist under System32. Their availability is established
 # by running the installed native consumer on the target host.
 
+function Get-PeDependencies {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$DependentsText
+    )
+
+    $direct = [System.Collections.Generic.List[string]]::new()
+    $delay = [System.Collections.Generic.List[string]]::new()
+    $section = ''
+    foreach ($line in ($DependentsText -split "`r?`n")) {
+        if ($line -match 'Image has the following dependencies:') {
+            $section = 'direct'
+            continue
+        }
+        if ($line -match 'Image has the following delay load dependencies:') {
+            $section = 'delay'
+            continue
+        }
+        if ($section -and $line -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') {
+            $dependency = $Matches[1]
+            if ($section -eq 'direct') {
+                $direct.Add($dependency)
+            } else {
+                $delay.Add($dependency)
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Direct = @($direct | Sort-Object -Unique)
+        Delay = @($delay | Sort-Object -Unique)
+    }
+}
+
+function Assert-NoRedistributableRuntimeDependencies {
+    [CmdletBinding()]
+    param(
+        [string[]]$Dependencies,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $pattern =
+        '^(?i)(VCRUNTIME\d*|MSVCP\d*|MSVCR\d*|CONCRT\d*|VCOMP\d*)\.dll$'
+    $unexpected = @($Dependencies | Where-Object { $_ -match $pattern })
+    if ($unexpected.Count -ne 0) {
+        throw ("$Description has redistributable VC Runtime dependencies: " +
+            "$($unexpected -join ', ')")
+    }
+}
+
 function Resolve-RuntimeDependency {
     [CmdletBinding()]
     param(
