@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+#
+# Temporary issue-103 validation workflow. It mirrors the Linux release rows
+# without tag publication and pins Rust 1.94.0 for the candidate measurement.
+
+name: Linux 103 candidate matrix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CC: clang
+  CXX: clang++
+  SOURCE_COMMIT: 009d33f85cb7ac087d0c25add1161dd003ba47c8
+
+jobs:
+  linux-arm64:
+    name: Candidate (${{ matrix.target }}${{ matrix.suffix }})
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: ${{ matrix.container }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-gnu
+            suffix: ""
+            container: ""
+            cargo_jobs: 4
+          - target: aarch64-unknown-linux-gnu
+            suffix: "-debian12"
+            container: "debian:12"
+            cargo_jobs: 4
+    steps:
+      - name: Install build dependencies (container)
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            cmake \
+            curl \
+            git \
+            libprotobuf-dev \
+            perl \
+            pkg-config \
+            protobuf-compiler \
+            xz-utils \
+            zstd
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Mark workspace safe for git (container)
+        if: matrix.container != ''
+        run: git config --global --add safe.directory '*'
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Install protobuf (host)
+        if: matrix.container == ''
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Assert native ARM64 runner
+        run: |
+          test "$(uname -m)" = aarch64
+          rustc -vV
+          cargo --version
+      - name: Prepare recorded source tree
+        run: |
+          git clone --no-checkout "$GITHUB_WORKSPACE" "$RUNNER_TEMP/source"
+          git -C "$RUNNER_TEMP/source" checkout --detach "$SOURCE_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/source" rev-parse HEAD)" = \
+            "$SOURCE_COMMIT"
+      - name: Run candidate evidence
+        env:
+          CARGO_BUILD_JOBS: ${{ matrix.cargo_jobs }}
+          RUST_TEST_THREADS: "4"
+          CMAKE_BUILD_PARALLEL_LEVEL: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/work"
+          bash .github/scripts/linux103-candidate-evidence.sh \
+            --source "$RUNNER_TEMP/source" \
+            --work "$RUNNER_TEMP/work" \
+            --target "${{ matrix.target }}" \
+            --suffix "${{ matrix.suffix }}" \
+            --version "0.1.9-linux103-candidate" \
+            --expected-commit "$SOURCE_COMMIT" \
+            --validation-commit "$GITHUB_SHA"
+      - name: Upload candidate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux103-${{ matrix.target }}${{ matrix.suffix }}
+          path: ${{ runner.temp }}/work/evidence
+          if-no-files-found: error
+          retention-days: 14
