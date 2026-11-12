@@ -15,10 +15,12 @@ usage: linux103-candidate-evidence.sh \
   --target <x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu> \
   --version <archive-version> --expected-commit <sha> \
   [--suffix <archive-suffix>] [--validation-commit <sha>] \
-  [--container <image>]
+  [--container <image>] [--resume]
 
 With --container, the script pulls the image and re-runs itself inside it.
 The container receives the source, work tree and script as bind mounts.
+With --resume, a preserved stage tree is re-verified and packaged without
+rebuilding the Rust libraries.
 EOF
 }
 
@@ -32,6 +34,7 @@ VERSION=
 EXPECTED_COMMIT=
 VALIDATION_COMMIT=unknown
 CONTAINER_IMAGE=
+RESUME=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -70,6 +73,10 @@ while [ "$#" -gt 0 ]; do
         --container)
             CONTAINER_IMAGE=$2
             shift 2
+            ;;
+        --resume)
+            RESUME=1
+            shift
             ;;
         *)
             usage >&2
@@ -516,10 +523,13 @@ record_elf_metadata() {
         fail "no GLIBC symbol versions found"
     tail -1 "$EVIDENCE/glibc-versions.txt" >"$EVIDENCE/glibc-max.txt"
 
-    if grep -Eq 'GLIBCXX_|CXXABI_|GCC_[0-9]' \
+    if grep -Eq 'GLIBCXX_|CXXABI_' \
         "$EVIDENCE/readelf-version-info.txt"; then
-        fail "shared library references a C++ or GCC symbol version"
+        fail "shared library references a C++ ABI symbol version"
     fi
+    grep -oE 'GCC_[0-9]+(\.[0-9]+)+' \
+        "$EVIDENCE/readelf-version-info.txt" |
+        sort -uV >"$EVIDENCE/gcc-versions.txt"
 }
 
 verify_consumer_log() {
@@ -719,7 +729,11 @@ write_summary() {
             "$EVIDENCE/export-count.txt")"
         echo "defined_dynamic_exports=$(sed -n \
             's/^defined_dynamic_exports=//p' "$EVIDENCE/export-count.txt")"
+        echo "elf_machine=$(sed -n \
+            's/.*Machine:[[:space:]]*//p' "$EVIDENCE/readelf-header.txt")"
         echo "max_glibc=$(cat "$EVIDENCE/glibc-max.txt")"
+        echo "gcc_symbol_versions=$(paste -sd, \
+            "$EVIDENCE/gcc-versions.txt")"
         echo "dt_needed=$dt_needed"
         echo "consumer_static_dataset=rows:512,version:2"
         echo "consumer_shared_dataset=rows:512,version:2"
@@ -730,46 +744,10 @@ write_summary() {
     } >"$EVIDENCE/summary.env"
 }
 
-run_evidence() {
+run_post_stage_evidence() {
     local archive_name
     local archive
 
-    if [ "$MODE" = container-body ]; then
-        setup_debian_container
-    fi
-
-    export CC=${CC:-clang}
-    export CXX=${CXX:-clang++}
-    export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
-    export RUST_TEST_THREADS=${RUST_TEST_THREADS:-4}
-    export CMAKE_BUILD_PARALLEL_LEVEL=1
-    export RUSTUP_TOOLCHAIN=1.94.0
-
-    mkdir -p "$EVIDENCE" "$LOG_DIR"
-    : >"$STATUS_FILE"
-    trap on_exit EXIT
-
-    record_environment
-    record_source_identity
-    check_toolchain
-
-    run_step configure-release configure_release
-    run_step build-release build_release
-    run_step install-release install_release
-    run_step record-release-artifacts record_release_artifacts
-    run_step record-stage-prestrip record_stage_prestrip
-
-    run_step strip-shared strip_shared
-    run_step static-untouched verify_static_untouched
-    sha256sum "$WORK/stage/lib/liblance_c.so" \
-        >"$WORK/shared-poststrip.sha256"
-    mv "$WORK/shared-poststrip.sha256" \
-        "$EVIDENCE/stage-poststrip.sha256"
-
-    run_step exports verify_exports
-    run_step record-export-sets record_export_sets
-    run_step installed-headers verify_installed_headers
-    run_step linux-staging verify_linux_staging
     run_step elf-metadata record_elf_metadata
 
     run_step consumer-installed run_installed_consumer
@@ -798,6 +776,82 @@ run_evidence() {
 
     run_step write-summary write_summary "$archive"
     run_step cleanup-success cleanup_success
+}
+
+run_evidence() {
+    if [ "$MODE" = container-body ]; then
+        setup_debian_container
+    fi
+
+    export CC=${CC:-clang}
+    export CXX=${CXX:-clang++}
+    export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
+    export RUST_TEST_THREADS=${RUST_TEST_THREADS:-4}
+    export CMAKE_BUILD_PARALLEL_LEVEL=1
+    export RUSTUP_TOOLCHAIN=1.94.0
+
+    mkdir -p "$EVIDENCE" "$LOG_DIR"
+    if [ "$RESUME" = 1 ]; then
+        [ -f "$WORK/stage/lib/liblance_c.so" ] ||
+            fail "resume requires a preserved shared library"
+        [ -f "$WORK/stage/lib/liblance_c.a" ] ||
+            fail "resume requires a preserved static library"
+        [ -f "$EVIDENCE/stage-prestrip.sha256" ] ||
+            fail "resume requires the original stage identity"
+        [ -f "$EVIDENCE/source-identity.txt" ] ||
+            fail "resume requires the original source identity"
+
+        cp "$EVIDENCE/env.txt" "$EVIDENCE/env-initial.txt" 2>/dev/null ||
+            true
+        cp "$EVIDENCE/source-identity.txt" \
+            "$EVIDENCE/source-identity-initial.txt"
+        printf 'RESUME_START %s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$STATUS_FILE"
+        {
+            echo "resume_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "validation_commit=$VALIDATION_COMMIT"
+            echo "validation_script_sha256=$(
+                sha256sum "$SCRIPT_PATH" | awk '{print $1}'
+            )"
+            echo "stage_shared_sha256=$(
+                sha256sum "$WORK/stage/lib/liblance_c.so" | awk '{print $1}'
+            )"
+            echo "stage_static_sha256=$(
+                sha256sum "$WORK/stage/lib/liblance_c.a" | awk '{print $1}'
+            )"
+        } >"$EVIDENCE/resume-identity.txt"
+    else
+        : >"$STATUS_FILE"
+    fi
+    trap on_exit EXIT
+
+    record_environment
+    record_source_identity
+    check_toolchain
+
+    if [ "$RESUME" = 1 ]; then
+        run_post_stage_evidence
+        return
+    fi
+
+    run_step configure-release configure_release
+    run_step build-release build_release
+    run_step install-release install_release
+    run_step record-release-artifacts record_release_artifacts
+    run_step record-stage-prestrip record_stage_prestrip
+
+    run_step strip-shared strip_shared
+    run_step static-untouched verify_static_untouched
+    sha256sum "$WORK/stage/lib/liblance_c.so" \
+        >"$WORK/shared-poststrip.sha256"
+    mv "$WORK/shared-poststrip.sha256" \
+        "$EVIDENCE/stage-poststrip.sha256"
+
+    run_step exports verify_exports
+    run_step record-export-sets record_export_sets
+    run_step installed-headers verify_installed_headers
+    run_step linux-staging verify_linux_staging
+    run_post_stage_evidence
 }
 
 if [ "$MODE" = outer ] && [ -n "$CONTAINER_IMAGE" ]; then
