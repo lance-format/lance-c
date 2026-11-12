@@ -612,7 +612,7 @@ Current macOS checks and their limits are:
 | --- | --- | --- |
 | [Published v0.1.9 ARM64](https://github.com/lance-format/lance-c/releases/tag/v0.1.9) | Dylib `11.0`; static archive maximum `14.5` (416 of 3,298 members above `11.0`) | None for the published archive; the metadata split alone does not prove failure below 14.5 |
 | [#208 Intel Release candidate](https://github.com/lance-format/lance-c/pull/208) ([job](https://github.com/lance-format/lance-c/actions/runs/43137215582/job/130915319083)) | Dylib and all static archive members `<= 11.0` | macOS 15.7.9: installed static and shared dataset reads and Arrow ownership/lifetime acceptance passed. Candidate archive only, not published recipe availability |
-| [#217 ARM64 current source](https://github.com/lance-format/lance-c/pull/217) ([job](https://github.com/lance-format/lance-c/actions/runs/43167179892/job/131011816224)) | Current-source `DEBUG` artifacts; no retained Release archive | macOS 15.8.2: installed static and shared dataset reads and Arrow ownership/lifetime acceptance passed. No older-macOS run; not ARM64 Release acceptance |
+| [ARM64 current-source Release candidate at `62fbc0f`](https://github.com/lance-format/lance-c/commit/62fbc0fd69d66b184643e47ce93f7f3a6525598b) ([job](https://github.com/lance-format/lance-c/actions/runs/43181220854/job/131057410886)) | Dylib and all 3,855 static archive members: arm64, `minos 11.0` | macOS 15.8.2: installed static and shared dataset reads and Arrow, error and clone ownership acceptance passed. Candidate archive only, not published recipe availability; no older-macOS run |
 
 No numeric minimum macOS version is declared. The macOS 15.x versions above
 are exercised baselines, not a support floor; older macOS versions remain
