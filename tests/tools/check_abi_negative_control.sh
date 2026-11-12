@@ -65,4 +65,6 @@ for mutation in discriminant struct-layout; do
     fi
 done
 echo "PASS: current-main probe detects both mutations"
-diff -u "$work/current-original.txt" "$work/current-mutated.txt" | sed -n '1,12p'
+diff -u "$work/current-original.txt" "$work/current-mutated.txt" \
+    | sed -n '1,12p;220,240p' || true
+exit 0
