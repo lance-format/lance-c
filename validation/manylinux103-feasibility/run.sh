@@ -10,6 +10,7 @@ EVIDENCE=
 WORK=
 PRODUCT_COMMIT=
 VALIDATION_COMMIT=
+RESUME=0
 IMAGE=quay.io/pypa/manylinux_2_28_x86_64
 IMAGE_DIGEST=sha256:9555ba6c479fa69a2aa80ad1dc57154a60d562b19df159361d9379a02beb1e36
 CLANG_VERSION=v20.1.8.0
@@ -22,7 +23,7 @@ usage:
   run.sh --source <git-root> --root <evidence-root> --product-commit <sha>
   run.sh --container-setup --evidence <dir>
   run.sh --container-body --source <dir> --work <dir> --evidence <dir> \
-    --product-commit <sha> --validation-commit <sha>
+    --product-commit <sha> --validation-commit <sha> [--resume]
 EOF
 }
 
@@ -36,6 +37,7 @@ while [ "$#" -gt 0 ]; do
         --evidence) EVIDENCE=$2; shift 2 ;;
         --product-commit) PRODUCT_COMMIT=$2; shift 2 ;;
         --validation-commit) VALIDATION_COMMIT=$2; shift 2 ;;
+        --resume) RESUME=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -273,37 +275,95 @@ record_artifacts() {
 }
 
 record_stage_prestrip() {
+    local lib_dir
+    lib_dir=$(sed -n 's/^installed_libdir=//p' \
+        "$EVIDENCE/install-layout.txt")
     {
-        sha256sum "$WORK/stage/lib/liblance_c.a" \
-            "$WORK/stage/lib/liblance_c.so"
-        stat -c '%n %s' "$WORK/stage/lib/liblance_c.a" \
-            "$WORK/stage/lib/liblance_c.so"
+        sha256sum "$WORK/stage/$lib_dir/liblance_c.a" \
+            "$WORK/stage/$lib_dir/liblance_c.so"
+        stat -c '%n %s' "$WORK/stage/$lib_dir/liblance_c.a" \
+            "$WORK/stage/$lib_dir/liblance_c.so"
     } >"$EVIDENCE/stage-prestrip.sha256"
+}
+
+prepare_compat_stage() {
+    local stage_lib_dir
+
+    stage_lib_dir=$(find "$WORK/stage" -maxdepth 1 -type d \
+        \( -name lib -o -name lib64 \) -printf '%f\n' | sed -n '1p')
+    [ -n "$stage_lib_dir" ] || fail "installed library directory was not found"
+    COMPAT_STAGE="$WORK/stage"
+
+    {
+        echo "cmake_install_libdir=$(sed -n 's/^CMAKE_INSTALL_LIBDIR:[^=]*=//p' \
+            "$WORK/build/CMakeCache.txt" | tail -1)"
+        echo "installed_libdir=$stage_lib_dir"
+        echo "actual_prefix=$WORK/stage"
+    } >"$EVIDENCE/install-layout.txt"
+
+    if [ "$stage_lib_dir" = lib64 ]; then
+        COMPAT_STAGE="$WORK/compat-stage"
+        rm -rf "$COMPAT_STAGE"
+        mkdir -p "$COMPAT_STAGE"
+        ln -s ../stage/include "$COMPAT_STAGE/include"
+        ln -s ../stage/lib64 "$COMPAT_STAGE/lib"
+        ln -s ../stage/lib64 "$COMPAT_STAGE/lib64"
+        if [ -d "$WORK/stage/share" ]; then
+            ln -s ../stage/share "$COMPAT_STAGE/share"
+        fi
+        {
+            echo "compat_prefix=$COMPAT_STAGE"
+            echo "compat_lib_target=$(readlink -f "$COMPAT_STAGE/lib")"
+            echo "actual_static_sha256=$(sha256sum \
+                "$WORK/stage/lib64/liblance_c.a" | awk '{print $1}')"
+            echo "compat_static_sha256=$(sha256sum \
+                "$COMPAT_STAGE/lib/liblance_c.a" | awk '{print $1}')"
+            echo "actual_shared_sha256=$(sha256sum \
+                "$WORK/stage/lib64/liblance_c.so" | awk '{print $1}')"
+            echo "compat_shared_sha256=$(sha256sum \
+                "$COMPAT_STAGE/lib/liblance_c.so" | awk '{print $1}')"
+        } >>"$EVIDENCE/install-layout.txt"
+    else
+        {
+            echo "compat_prefix=$COMPAT_STAGE"
+            echo "compat_view=not-needed"
+        } >>"$EVIDENCE/install-layout.txt"
+    fi
 }
 
 strip_shared() {
     bash "$SOURCE/.github/scripts/strip-release-shared.sh" \
-        "$WORK/stage" linux
+        "$COMPAT_STAGE" linux
 }
 
 verify_static_untouched() {
-    local before after
+    local before after lib_dir
     before=$(awk '$2 ~ /liblance_c\.a$/ {print $1}' \
         "$EVIDENCE/stage-prestrip.sha256")
-    after=$(sha256sum "$WORK/stage/lib/liblance_c.a" | awk '{print $1}')
+    lib_dir=$(sed -n 's/^installed_libdir=//p' \
+        "$EVIDENCE/install-layout.txt")
+    after=$(sha256sum "$WORK/stage/$lib_dir/liblance_c.a" |
+        awk '{print $1}')
     assert_eq "$after" "$before" "static archive changed during stripping"
 }
 
 verify_exports() {
+    local lib_dir
+    lib_dir=$(sed -n 's/^installed_libdir=//p' \
+        "$EVIDENCE/install-layout.txt")
     bash "$SOURCE/.github/scripts/verify-shared-exports.sh" \
-        "$WORK/stage/lib/liblance_c.so" \
+        "$WORK/stage/$lib_dir/liblance_c.so" \
         "$WORK/stage/include/lance/lance.h" linux
 }
 
 record_export_sets() {
-    local library="$WORK/stage/lib/liblance_c.so"
+    local lib_dir
+    local library
     local header="$WORK/stage/include/lance/lance.h"
     local expected actual
+    lib_dir=$(sed -n 's/^installed_libdir=//p' \
+        "$EVIDENCE/install-layout.txt")
+    library="$WORK/stage/$lib_dir/liblance_c.so"
     expected=$(sed '/^[[:space:]]*\*/d' "$header" |
         grep -oE 'lance_[A-Za-z0-9_]+[[:space:]]*\(' |
         sed 's/[[:space:]]*($//' | sort -u)
@@ -334,12 +394,16 @@ verify_installed_headers() {
 
 verify_linux_staging() {
     bash "$SOURCE/.github/scripts/verify-linux-staging.sh" \
-        "$WORK/stage" x86_64-unknown-linux-gnu
+        "$COMPAT_STAGE" x86_64-unknown-linux-gnu
 }
 
 record_elf_metadata() {
-    local library="$WORK/stage/lib/liblance_c.so"
+    local lib_dir
+    local library
     local max_glibc
+    lib_dir=$(sed -n 's/^installed_libdir=//p' \
+        "$EVIDENCE/install-layout.txt")
+    library="$WORK/stage/$lib_dir/liblance_c.so"
 
     readelf -h "$library" >"$EVIDENCE/readelf-header.txt"
     readelf -d "$library" >"$EVIDENCE/readelf-dynamic.txt"
@@ -379,7 +443,7 @@ verify_cxx17_headers() {
 
 run_installed_consumer() {
     bash "$SOURCE/.github/scripts/verify-cmake-consumer.sh" \
-        --from-install-prefix "$WORK/stage"
+        --from-install-prefix "$COMPAT_STAGE"
 }
 
 verify_consumer_log() {
@@ -423,17 +487,27 @@ verify_source_unchanged() {
 write_summary() {
     local static_sha static_bytes shared_before shared_before_bytes
     local shared_after shared_after_bytes dt_needed export_line
+    local lib_dir install_libdir compat_prefix
 
-    static_sha=$(sha256sum "$WORK/stage/lib/liblance_c.a" | awk '{print $1}')
+    lib_dir=$(sed -n 's/^installed_libdir=//p' \
+        "$EVIDENCE/install-layout.txt")
+    install_libdir=$(sed -n 's/^cmake_install_libdir=//p' \
+        "$EVIDENCE/install-layout.txt")
+    compat_prefix=$(sed -n 's/^compat_prefix=//p' \
+        "$EVIDENCE/install-layout.txt")
+
+    static_sha=$(sha256sum "$WORK/stage/$lib_dir/liblance_c.a" |
+        awk '{print $1}')
     static_bytes=$(awk '$1 ~ /liblance_c\.a$/ {print $2}' \
         "$EVIDENCE/stage-prestrip.sha256")
     shared_before=$(awk '$2 ~ /liblance_c\.so$/ {print $1}' \
         "$EVIDENCE/stage-prestrip.sha256")
     shared_before_bytes=$(awk '$1 ~ /liblance_c\.so$/ {print $2}' \
         "$EVIDENCE/stage-prestrip.sha256")
-    shared_after=$(sha256sum "$WORK/stage/lib/liblance_c.so" |
+    shared_after=$(sha256sum "$WORK/stage/$lib_dir/liblance_c.so" |
         awk '{print $1}')
-    shared_after_bytes=$(stat -c %s "$WORK/stage/lib/liblance_c.so")
+    shared_after_bytes=$(stat -c %s \
+        "$WORK/stage/$lib_dir/liblance_c.so")
     export_line=$(grep '^Verified ' "$LOG_DIR/exports.log" | tail -1)
     dt_needed=$(sed -n \
         's/.*(NEEDED).*Shared library: \[\(.*\)\]/\1/p' \
@@ -457,6 +531,10 @@ write_summary() {
         echo "rust_test_threads=${RUST_TEST_THREADS-}"
         echo "cmake_build_parallel_level=${CMAKE_BUILD_PARALLEL_LEVEL-}"
         echo "cargo_profile_release_lto=${CARGO_PROFILE_RELEASE_LTO-unset}"
+        echo "cmake_install_libdir=$install_libdir"
+        echo "installed_libdir=$lib_dir"
+        echo "compat_prefix=$compat_prefix"
+        echo "build_reused=$RESUME"
         echo "static_sha256=$static_sha"
         echo "static_bytes=$static_bytes"
         echo "shared_unstripped_sha256=$shared_before"
@@ -504,14 +582,22 @@ container_body() {
     assert_eq "$(getconf GNU_LIBC_VERSION)" "glibc 2.28" \
         "container glibc"
 
-    run_step configure-release configure_release
-    run_step build-release build_release
-    run_step install-release install_release
+    if [ "$RESUME" = 1 ]; then
+        [ -d "$WORK/stage" ] || fail "resume requires a preserved stage"
+        [ -f "$WORK/build/CMakeCache.txt" ] ||
+            fail "resume requires a preserved CMake cache"
+    else
+        run_step configure-release configure_release
+        run_step build-release build_release
+        run_step install-release install_release
+    fi
     run_step record-artifacts record_artifacts
+    run_step install-layout prepare_compat_stage
     run_step stage-prestrip record_stage_prestrip
     run_step strip-shared strip_shared
     run_step static-untouched verify_static_untouched
-    sha256sum "$WORK/stage/lib/liblance_c.so" \
+    sha256sum "$WORK/stage/$(sed -n 's/^installed_libdir=//p' \
+        "$EVIDENCE/install-layout.txt")/liblance_c.so" \
         >"$EVIDENCE/stage-poststrip.sha256"
     run_step exports verify_exports
     run_step export-sets record_export_sets
@@ -530,6 +616,7 @@ run_outer() {
     local image_id repo_digests
     local container_name="lance103-manylinux-$(date -u +%Y%m%dT%H%M%SZ)-$$"
     local rc=0
+    local resume_args=()
 
     SOURCE=$(cd "$SOURCE" && pwd)
     ROOT=$(mkdir -p "$ROOT" && cd "$ROOT" && pwd)
@@ -542,6 +629,10 @@ run_outer() {
     LOG_DIR="$EVIDENCE/logs"
     mkdir -p "$LOG_DIR"
     VALIDATION_COMMIT=$(git -C "$SOURCE" rev-parse HEAD)
+    if [ "$RESUME" = 1 ]; then
+        [ -d "$WORK/stage" ] || fail "resume requires a preserved stage"
+        resume_args=(--resume)
+    fi
 
     [ "$(uname -m)" = x86_64 ] || fail "NieR host is not x86_64"
     command -v docker >/dev/null || fail "docker is unavailable"
@@ -642,6 +733,7 @@ run_outer() {
         --evidence /evidence \
         --product-commit "$PRODUCT_COMMIT" \
         --validation-commit "$VALIDATION_COMMIT" \
+        "${resume_args[@]}" \
         2>&1 | tee "$EVIDENCE/container-run.log"
     rc=${PIPESTATUS[0]}
     set -e
