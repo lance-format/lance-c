@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+name: Windows export link probe
+
+on:
+  push:
+    branches:
+      - xuanwo/windows-export-link-probe
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe MSVC DEF and object export directives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'windows-export-link-probe'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $env:WORK = $work
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $visualStudio = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($visualStudio)) {
+            throw 'Visual Studio C++ tools were not found'
+          }
+          $devcmd = Join-Path $visualStudio 'Common7\Tools\VsDevCmd.bat'
+
+          @'
+          __declspec(dllexport) int dependency_export(void) { return 1; }
+          int public_api(void) { return dependency_export(); }
+          '@ | Set-Content -LiteralPath (Join-Path $work 'dep.c') -Encoding ascii
+          @'
+          LIBRARY
+          EXPORTS
+            public_api
+          '@ | Set-Content -LiteralPath (Join-Path $work 'narrow.def') -Encoding ascii
+          @'
+          LIBRARY
+          EXPORTS
+            public_api
+            dependency_export
+          '@ | Set-Content -LiteralPath (Join-Path $work 'wide.def') -Encoding ascii
+
+          @"
+          @echo off
+          call "$devcmd" -no_logo -arch=x64 -host_arch=x64
+          cd /d "%WORK%"
+          cl /nologo /c dep.c
+          if errorlevel 1 exit /b 1
+          lib /nologo /out:dep.lib dep.obj
+          if errorlevel 1 exit /b 1
+          link /nologo /DLL /NOENTRY /NODEFAULTLIB /OUT:narrow.dll /DEF:narrow.def dep.lib
+          if errorlevel 1 exit /b 1
+          link /nologo /DLL /NOENTRY /NODEFAULTLIB /OUT:wide-then-narrow.dll /DEF:wide.def /DEF:narrow.def dep.lib
+          if errorlevel 1 exit /b 1
+          link /nologo /DLL /NOENTRY /NODEFAULTLIB /OUT:narrow-then-wide.dll /DEF:narrow.def /DEF:wide.def dep.lib
+          if errorlevel 1 exit /b 1
+          dumpbin /nologo /exports narrow.dll >narrow.exports.txt
+          dumpbin /nologo /exports wide-then-narrow.dll >wide-then-narrow.exports.txt
+          dumpbin /nologo /exports narrow-then-wide.dll >narrow-then-wide.exports.txt
+          dumpbin /nologo /directives dep.obj >dep.directives.txt
+          link /? >link-options.txt
+          "@ | Set-Content -LiteralPath (Join-Path $work 'probe.cmd') -Encoding ascii
+
+          cmd /d /c (Join-Path $work 'probe.cmd')
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSVC export probe failed with exit code $LASTEXITCODE"
+          }
+
+          Get-Content -LiteralPath (Join-Path $work 'dep.directives.txt')
+          Get-Content -LiteralPath (Join-Path $work 'narrow.exports.txt')
+          Get-Content -LiteralPath (Join-Path $work 'wide-then-narrow.exports.txt')
+          Get-Content -LiteralPath (Join-Path $work 'narrow-then-wide.exports.txt')
+          Get-Content -LiteralPath (Join-Path $work 'link-options.txt') |
+            Select-String -Pattern 'EXCLUDE|EXPORT|/DEF' -CaseSensitive:$false
+
+          $narrow = Get-Content -LiteralPath (Join-Path $work 'narrow.exports.txt') -Raw
+          if ($narrow -notmatch '(?m)^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+public_api\s*$') {
+            throw 'narrow DEF did not export public_api'
+          }
+          if ($narrow -notmatch '(?m)^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+dependency_export\s*$') {
+            throw 'narrow DEF unexpectedly removed the object directive export'
+          }
+
+          Copy-Item -LiteralPath $work -Destination (Join-Path $env:RUNNER_TEMP 'windows-export-link-probe-evidence') -Recurse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-export-link-probe
+          path: ${{ runner.temp }}/windows-export-link-probe-evidence
+          if-no-files-found: error
