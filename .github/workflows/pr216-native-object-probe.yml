@@ -1,0 +1,34 @@
+name: PR216 native object export probe
+
+on:
+  push:
+    branches:
+      - xuanwo/pr216-native-object-probe
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run MSVC archive-member export probe
+        shell: cmd
+        run: >
+          .github\scripts\pr216-native-object-probe.cmd
+          "%RUNNER_TEMP%\pr216-native-object-probe"
+      - name: Assert probe results
+        shell: pwsh
+        run: >
+          pwsh -File .github/scripts/test-pr216-native-object-probe.ps1
+          -WorkDir "$env:RUNNER_TEMP\pr216-native-object-probe"
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr216-native-object-probe
+          path: ${{ runner.temp }}/pr216-native-object-probe
+          if-no-files-found: warn
