@@ -666,6 +666,12 @@ machine of both acceptance executables before running them. The hosted Windows
 11 ARM64 baseline does not establish Windows 10 ARM64 or Windows Server ARM64
 support.
 
+The current Windows DLLs import `VCRUNTIME140.dll`, which the hosted images
+provide in `System32`. A system-only `PATH` does not prove that the package is
+self-contained on a machine without the Visual C++ Runtime. The distribution
+contract for that deployment is tracked in
+[#215](https://github.com/lance-format/lance-c/issues/215).
+
 See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
 for a reproducible native-14 C segment to Java-12 commit/query PoC.
 
@@ -1168,7 +1174,7 @@ back.
 ## Releasing
 
 Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds seven prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, macOS arm64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. Intel macOS consumers use the source build described above.
-Before the consumer smoke test and archive upload, the build rows strip the staged shared library, verify its exports, and verify the Linux direct runtime dependencies.
+Before the consumer smoke test and archive upload, the Linux and macOS rows strip the staged shared library and verify its exact public exports; Linux rows also check direct runtime dependencies. Windows rows verify all declared public exports and native consumers, while recording additional dependency exports separately.
 
 ### Recommended: cut a release via Actions UI
 

@@ -141,7 +141,7 @@ if ($missingExports.Count -ne 0) {
 if ($extraExports.Count -ne 0) {
     Write-Warning "staged DLL has non-header exports: $($extraExports -join ', ')"
 }
-Write-Host "==> Verified $($actualExports.Count) public lance_* exports"
+Write-Host "==> Verified $($expectedExports.Count) public lance_* exports ($($actualExports.Count) total exports)"
 
 $dependentsText = (Invoke-Dumpbin @('/dependents', $dll)) -join "`n"
 $dependencySection = ($dependentsText -split 'Image has the following dependencies:')[-1]
