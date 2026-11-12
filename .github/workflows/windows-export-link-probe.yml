@@ -66,6 +66,8 @@ jobs:
           dumpbin /nologo /exports narrow.dll >narrow.exports.txt
           dumpbin /nologo /exports wide-then-narrow.dll >wide-then-narrow.exports.txt
           dumpbin /nologo /exports narrow-then-wide.dll >narrow-then-wide.exports.txt
+          dumpbin /nologo /exports narrow.lib >narrow-import.exports.txt
+          dumpbin /nologo /symbols narrow.lib >narrow-import.symbols.txt
           dumpbin /nologo /directives dep.obj >dep.directives.txt
           link /? >link-options.txt 2>&1
           exit /b 0
@@ -80,6 +82,9 @@ jobs:
           Get-Content -LiteralPath (Join-Path $work 'narrow.exports.txt')
           Get-Content -LiteralPath (Join-Path $work 'wide-then-narrow.exports.txt')
           Get-Content -LiteralPath (Join-Path $work 'narrow-then-wide.exports.txt')
+          Get-Content -LiteralPath (Join-Path $work 'narrow-import.exports.txt')
+          Get-Content -LiteralPath (Join-Path $work 'narrow-import.symbols.txt') |
+            Select-String -Pattern '__imp_|public_api|dependency_export'
           Get-Content -LiteralPath (Join-Path $work 'link-options.txt') |
             Select-String -Pattern 'EXCLUDE|EXPORT|/DEF' -CaseSensitive:$false
 
