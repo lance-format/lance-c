@@ -193,6 +193,100 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  test-windows-arm64:
+    name: Tests (Windows ARM64)
+    runs-on: windows-11-arm
+    timeout-minutes: 150
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Assert native Windows ARM64 toolchain
+        shell: pwsh
+        run: pwsh -File .github/scripts/assert-windows-arm64-host.ps1
+      - name: Record Windows runtime baseline
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            Format-List
+          rustc --version --verbose
+          cargo --version
+          cmake --version
+      - name: Install protoc x64 build tool
+        shell: pwsh
+        run: |
+          # protoc 29.3 has no Windows ARM64 archive. This x64 executable is a
+          # code-generation tool only; the Rust and C++ build targets are native.
+          $version = '29.3'
+          $archive = "protoc-$version-win64.zip"
+          Invoke-WebRequest `
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$version/$archive" `
+            -OutFile "$env:RUNNER_TEMP\$archive"
+          Expand-Archive "$env:RUNNER_TEMP\$archive" `
+            -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
+          "$env:RUNNER_TEMP\protoc\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
+      - name: Test Windows dependency guard
+        run: pwsh -File .github/scripts/test-windows-runtime-dependencies.ps1
+      - name: Configure
+        run: >
+          cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Assert ARM64 ClangCL configuration
+        shell: pwsh
+        run: |
+          $cache = Get-Content -LiteralPath build\CMakeCache.txt
+          if ($cache -notcontains 'CMAKE_GENERATOR:INTERNAL=Visual Studio 18 2026') {
+            throw 'CMake did not select Visual Studio 18 2026'
+          }
+          if ($cache -notcontains 'CMAKE_GENERATOR_PLATFORM:INTERNAL=ARM64') {
+            throw 'CMake did not select the ARM64 platform'
+          }
+          if (-not ($cache -match '^CMAKE_GENERATOR_TOOLSET(?::[^=]+)?=ClangCL$')) {
+            throw 'CMake did not select the ClangCL toolset'
+          }
+          $compilerFiles = @(
+            Get-ChildItem -LiteralPath build\CMakeFiles -Recurse `
+              -Filter CMakeCCompiler.cmake | Select-Object -First 1
+            Get-ChildItem -LiteralPath build\CMakeFiles -Recurse `
+              -Filter CMakeCXXCompiler.cmake | Select-Object -First 1
+          )
+          if ($compilerFiles.Count -ne 2 -or $compilerFiles -contains $null) {
+            throw 'CMake did not emit both C and CXX compiler configuration files'
+          }
+          foreach ($compilerFile in $compilerFiles) {
+            $compilerConfig = Get-Content -LiteralPath $compilerFile.FullName -Raw
+            if ($compilerConfig -notmatch
+                'set\(CMAKE_C(?:XX)?_COMPILER_ID "Clang"\)') {
+              throw "CMake compiler ID is not Clang in $($compilerFile.FullName)"
+            }
+            if ($compilerConfig -notmatch
+                '(?i)set\(CMAKE_C(?:XX)?_COMPILER ".*[/\\]Llvm[/\\]Arm64[/\\]bin[/\\]clang-cl\.exe"\)') {
+              throw "CMake compiler is not the Visual Studio ARM64 clang-cl: $($compilerFile.FullName)"
+            }
+          }
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Install to staging prefix
+        run: cmake --install build --prefix stage --config Release
+      - name: Verify staged package and installed consumers
+        run: >
+          pwsh -File .github/scripts/verify-windows-staging.ps1
+          -Prefix stage -SourceRoot .
+          -WorkDir "$env:RUNNER_TEMP\lance-c-windows-arm64-acceptance"
+          -Architecture ARM64 -CMakeGenerator "Visual Studio 18 2026"
+          -CMakeToolset ClangCL
+      - name: Upload staged package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lance-c-windows-aarch64-pc-windows-msvc
+          path: stage
+          if-no-files-found: error
+          retention-days: 14
+
   rustdoc:
     name: Rustdoc
     runs-on: ubuntu-24.04
