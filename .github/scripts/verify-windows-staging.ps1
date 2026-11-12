@@ -103,9 +103,34 @@ if ($missingExports.Count -ne 0) {
     throw "staged DLL is missing public exports:`n$($missingExports -join "`n")"
 }
 if ($extraExports.Count -ne 0) {
-    Write-Warning "staged DLL has non-header exports: $($extraExports -join ', ')"
+    throw "staged DLL has non-header exports:`n$($extraExports -join "`n")"
+}
+if ($actualExports.Count -ne $expectedExports.Count) {
+    throw "staged DLL has $($actualExports.Count) exports, expected $($expectedExports.Count)"
 }
 Write-Host "==> Verified $($actualExports.Count) public lance_* exports"
+
+$importText = (Invoke-Dumpbin @('/exports', $importLibrary)) -join "`n"
+$importExports = [regex]::Matches(
+    $importText, '(?m)^\s*(?:\d+\s+)?(lance_[A-Za-z0-9_]+)\s*$') |
+    ForEach-Object { $_.Groups[1].Value } |
+    Sort-Object -Unique
+if ($importExports.Count -eq 0) {
+    throw "staged import library reports no public exports:`n$importText"
+}
+
+$missingImportExports = @($expectedExports | Where-Object { $importExports -notcontains $_ })
+$extraImportExports = @($importExports | Where-Object { $expectedExports -notcontains $_ })
+if ($missingImportExports.Count -ne 0) {
+    throw "staged import library is missing public exports:`n$($missingImportExports -join "`n")"
+}
+if ($extraImportExports.Count -ne 0) {
+    throw "staged import library has non-header exports:`n$($extraImportExports -join "`n")"
+}
+if ($importExports.Count -ne $expectedExports.Count) {
+    throw "staged import library has $($importExports.Count) exports, expected $($expectedExports.Count)"
+}
+Write-Host "==> Verified $($importExports.Count) public lance_* imports"
 
 $dependentsText = (Invoke-Dumpbin @('/dependents', $dll)) -join "`n"
 $dependencySection = ($dependentsText -split 'Image has the following dependencies:')[-1]
