@@ -107,6 +107,7 @@ $workPath = (Resolve-Path -LiteralPath $WorkDir).Path
 $fixture = Join-Path $PSScriptRoot '..\..\tests\windows\export_linker'
 Copy-Item -LiteralPath (Join-Path $fixture 'public.c') -Destination $workPath
 Copy-Item -LiteralPath (Join-Path $fixture 'dependency.c') -Destination $workPath
+Copy-Item -LiteralPath (Join-Path $fixture 'consumer.c') -Destination $workPath
 Push-Location $workPath
 try {
     Invoke-Tool cl.exe /nologo /c public.c
@@ -177,6 +178,14 @@ try {
     Assert-Exports 'fixed import library' (Get-ImportExports $fixedImport) @(
         'lance_api'
     )
+
+    # The matching import library must still support a normal shared consumer.
+    Invoke-Tool cl.exe /nologo consumer.c $fixedImport /Fe:consumer.exe
+    Copy-Item -LiteralPath $fixedDll -Destination (Join-Path $workPath 'lance_c.dll')
+    & .\consumer.exe
+    if ($LASTEXITCODE -ne 0) {
+        throw "shared consumer failed with exit code $LASTEXITCODE"
+    }
 } finally {
     Pop-Location
 }
