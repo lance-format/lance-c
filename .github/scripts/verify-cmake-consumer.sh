@@ -33,6 +33,30 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/lance-c-cmake-smoke.XXXXXX")
 trap 'rm -rf "$work_dir"' EXIT
 
+verify_corrosion_macos_linker() {
+    local build_dir=$1
+
+    if [ "$(uname -s)" != Darwin ]; then
+        return
+    fi
+
+    echo "==> Verifying Corrosion selects the macOS export linker"
+    local build_commands
+    build_commands=$(cmake --build "$build_dir" \
+        --target _cargo-build_lance_c -- -n 2>&1)
+    local linker_env
+    linker_env=$(printf '%s\n' "$build_commands" |
+        tr ' ' '\n' |
+        grep -E '^(CARGO_TARGET_[A-Z0-9_]+_LINKER|LANCE_C_MACOS_LINKER)=' || true)
+    if ! grep -Fq 'limit-macos-exports.sh' <<<"$linker_env" ||
+        ! grep -Fq 'LANCE_C_MACOS_LINKER=' <<<"$linker_env"; then
+        echo "Corrosion did not select the macOS export linker:" >&2
+        printf '%s\n' "$linker_env" >&2
+        exit 1
+    fi
+    printf '%s\n' "$linker_env"
+}
+
 verify_consumer_prefix() {
     local install_prefix=$1
 
@@ -127,6 +151,7 @@ case "$mode" in
         echo "==> Validating CMake + Corrosion configure/generate"
         cmake -S "$repo_root" -B "$work_dir/build-corrosion" \
             -DCMAKE_BUILD_TYPE=Release
+        verify_corrosion_macos_linker "$work_dir/build-corrosion"
 
         echo "==> Staging prebuilt artifacts from $target_dir and running cmake --install"
         prebuilt_dir="$work_dir/prebuilt"

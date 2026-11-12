@@ -42,7 +42,9 @@ if(NOT LANCE_C_USE_PREBUILT)
         CRATE_TYPES staticlib cdylib
         PROFILE release
     )
-    if(Rust_CARGO_TARGET MATCHES "apple-darwin$")
+    # FindRust stores an inferred native target only in Corrosion's directory
+    # scope. The cache entry is visible here for both inferred and explicit targets.
+    if(Rust_CARGO_TARGET_CACHED MATCHES "apple-darwin$")
         # Corrosion selects its own linker, overriding Cargo's environment.
         # Keep the dylib export policy on the actual imported build target.
         corrosion_set_linker(lance_c
