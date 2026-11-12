@@ -9,6 +9,7 @@ extern "C" int probe_native_crt_style();
 extern "C" char* probe_alloc_string();
 extern "C" void probe_free_string(char*);
 extern "C" char* probe_copy_string(const char*);
+extern "C" int probe_catch_panic();
 
 int main() {
     if (probe_rust_crt_style() != 1 || probe_native_crt_style() != 1) {
@@ -27,6 +28,10 @@ int main() {
         return 3;
     }
     probe_free_string(copied);
+    if (probe_catch_panic() != 1) {
+        std::cerr << "probe panic was not caught\n";
+        return 4;
+    }
     std::cout << "static probe passed\n";
     return 0;
 }

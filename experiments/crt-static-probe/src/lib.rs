@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ffi::{CStr, CString, c_char};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 unsafe extern "C" {
     static probe_native_static_crt: i32;
@@ -38,5 +39,10 @@ pub unsafe extern "C" fn probe_copy_string(value: *const c_char) -> *mut c_char 
         .to_string_lossy()
         .into_owned();
     CString::new(copied).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn probe_catch_panic() -> i32 {
+    i32::from(catch_unwind(AssertUnwindSafe(|| panic!("probe panic"))).is_err())
 }
 

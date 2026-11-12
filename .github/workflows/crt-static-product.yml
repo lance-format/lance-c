@@ -7,6 +7,12 @@ on:
   push:
     branches:
       - xuanwo/crt-static-probe
+    paths:
+      - CMakeLists.txt
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - experiments/crt-static-product-check.ps1
 
 permissions:
   contents: read

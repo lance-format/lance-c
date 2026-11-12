@@ -58,6 +58,12 @@ if ($Consumer -eq 'shared') {
     Write-Host '==> DLL imports'
     & $dumpbin /dependents $dll
 }
+$staticLib = Join-Path $build 'crt_probe.lib'
+if (Test-Path -LiteralPath $staticLib) {
+    Write-Host '==> Staticlib default-library directives'
+    & $dumpbin /directives $staticLib |
+        Select-String -Pattern 'DEFAULTLIB'
+}
 
 $oldPath = $env:Path
 try {
