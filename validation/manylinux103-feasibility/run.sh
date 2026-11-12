@@ -575,6 +575,7 @@ run_outer() {
         -e RUSTUP_HOME=/home/xuanwo/.rustup \
         -e XDG_CACHE_HOME=/home/xuanwo/.cache \
         -e XDG_CONFIG_HOME=/home/xuanwo/.config \
+        -e GIT_OPTIONAL_LOCKS=0 \
         -e PATH=/home/xuanwo/.local/share/mbx/bin:/home/xuanwo/.cargo/bin:/opt/clang/bin:/opt/rh/gcc-toolset-14/root/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         -e GIT_CONFIG_COUNT=1 \
         -e GIT_CONFIG_KEY_0=safe.directory \
@@ -629,6 +630,7 @@ run_outer() {
         -e RUSTUP_HOME=/home/xuanwo/.rustup \
         -e XDG_CACHE_HOME=/home/xuanwo/.cache \
         -e XDG_CONFIG_HOME=/home/xuanwo/.config \
+        -e GIT_OPTIONAL_LOCKS=0 \
         -e PATH=/home/xuanwo/.local/share/mbx/bin:/home/xuanwo/.cargo/bin:/opt/clang/bin:/opt/rh/gcc-toolset-14/root/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         -e GIT_CONFIG_COUNT=1 \
         -e GIT_CONFIG_KEY_0=safe.directory \
