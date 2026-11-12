@@ -68,8 +68,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
-          # Use an independent mirror while Ubuntu archive DNS is unavailable.
-          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          # Prefer an independent mirror and retain the runner mirrors as APT fallbacks.
+          printf '%s\n' \
+            $'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1' \
+            $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:2' \
+            $'https://archive.ubuntu.com/ubuntu/\tpriority:3' \
+            $'https://security.ubuntu.com/ubuntu/\tpriority:4' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Clippy
@@ -92,8 +96,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
-          # Use an independent mirror while Ubuntu archive DNS is unavailable.
-          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          # Prefer an independent mirror and retain the runner mirrors as APT fallbacks.
+          printf '%s\n' \
+            $'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1' \
+            $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:2' \
+            $'https://archive.ubuntu.com/ubuntu/\tpriority:3' \
+            $'https://security.ubuntu.com/ubuntu/\tpriority:4' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler lld
       - name: Build library artifacts
@@ -403,8 +411,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
-          # Use an independent mirror while Ubuntu archive DNS is unavailable.
-          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          # Prefer an independent mirror and retain the runner mirrors as APT fallbacks.
+          printf '%s\n' \
+            $'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1' \
+            $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:2' \
+            $'https://archive.ubuntu.com/ubuntu/\tpriority:3' \
+            $'https://security.ubuntu.com/ubuntu/\tpriority:4' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Check documentation
@@ -422,8 +434,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
-          # Use an independent mirror while Ubuntu archive DNS is unavailable.
-          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          # Prefer an independent mirror and retain the runner mirrors as APT fallbacks.
+          printf '%s\n' \
+            $'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1' \
+            $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:2' \
+            $'https://archive.ubuntu.com/ubuntu/\tpriority:3' \
+            $'https://security.ubuntu.com/ubuntu/\tpriority:4' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Check MSRV
