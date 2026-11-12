@@ -6,7 +6,7 @@ publish = false
 
 [lib]
 name = "lance_c"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "staticlib"]
 
 [build-dependencies]
 cc = "=1.2.57"
