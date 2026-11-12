@@ -263,10 +263,10 @@ def emit_rust_test(
         "use std::process::Command;",
         "",
         "macro_rules! record_enum {",
-        "    ($records:ident, $type:ty, $variant:ident, $c_name:literal) => {",
+        "    ($records:ident, $type:ty, $variant:ident, $c_type:literal, $c_name:literal) => {",
         "        $records.insert(format!(",
         '            "E|{}|{}|{}",',
-        '            stringify!($type).rsplit("::").next().unwrap(),',
+        "            $c_type,",
         "            $c_name,",
         "            <$type>::$variant as i32,",
         "        ));",
@@ -387,7 +387,7 @@ def emit_rust_test(
                     f"ambiguous Rust variants {rust_name} value {value}: {variants}"
                 )
             lines.append(
-                f'    record_enum!(rust_records, lance_c::{rust_name}, {variants[0]}, "{c_variant}");'
+                f'    record_enum!(rust_records, lance_c::{rust_name}, {variants[0]}, "{c_name}", "{c_variant}");'
             )
         lines.append("")
 
@@ -415,9 +415,11 @@ def emit_rust_test(
     lines.extend(
         [
             "",
-            "    assert_eq!(",
-            "        c_records, rust_records,",
-            '        "public C and Rust ABI layouts or discriminants diverged"',
+            "    let c_only = c_records.difference(&rust_records).collect::<Vec<_>>();",
+            "    let rust_only = rust_records.difference(&c_records).collect::<Vec<_>>();",
+            "    assert!(",
+            "        c_only.is_empty() && rust_only.is_empty(),",
+            '        "public C and Rust ABI layouts or discriminants diverged\\nC-only: {c_only:?}\\nRust-only: {rust_only:?}"',
             "    );",
             "}",
             "",
