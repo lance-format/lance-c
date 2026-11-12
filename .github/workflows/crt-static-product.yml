@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+name: CRT static product probe
+
+on:
+  push:
+    branches:
+      - xuanwo/crt-static-probe
+
+permissions:
+  contents: read
+
+jobs:
+  x64:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          $version = '29.3'
+          $archive = "protoc-$version-win64.zip"
+          Invoke-WebRequest `
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$version/$archive" `
+            -OutFile "$env:RUNNER_TEMP\$archive"
+          Expand-Archive "$env:RUNNER_TEMP\$archive" `
+            -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
+          "$env:RUNNER_TEMP\protoc\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Configure with static CRT
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel 8
+      - name: Install
+        run: cmake --install build --prefix stage --config Release
+      - name: Check DLL dependency contract
+        shell: pwsh
+        run: >
+          pwsh -File experiments/crt-static-product-check.ps1
+          -Prefix stage -WorkDir "$env:RUNNER_TEMP\lance-c-crt-check-x64"
+      - name: Run installed consumers
+        shell: pwsh
+        run: >
+          pwsh -File .github/scripts/verify-windows-staging.ps1
+          -Prefix stage -SourceRoot .
+          -WorkDir "$env:RUNNER_TEMP\lance-c-crt-product-x64"
+
+  arm64:
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Assert native Windows ARM64 toolchain
+        shell: pwsh
+        run: pwsh -File .github/scripts/assert-windows-arm64-host.ps1
+      - name: Install protoc x64 build tool
+        shell: pwsh
+        run: |
+          $version = '29.3'
+          $archive = "protoc-$version-win64.zip"
+          Invoke-WebRequest `
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$version/$archive" `
+            -OutFile "$env:RUNNER_TEMP\$archive"
+          Expand-Archive "$env:RUNNER_TEMP\$archive" `
+            -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
+          "$env:RUNNER_TEMP\protoc\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Configure with static CRT
+        run: >
+          cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL
+          -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel 8
+      - name: Install
+        run: cmake --install build --prefix stage --config Release
+      - name: Check DLL dependency contract
+        shell: pwsh
+        run: >
+          pwsh -File experiments/crt-static-product-check.ps1
+          -Prefix stage -WorkDir "$env:RUNNER_TEMP\lance-c-crt-check-arm64"
+      - name: Run installed consumers
+        shell: pwsh
+        run: >
+          pwsh -File .github/scripts/verify-windows-staging.ps1
+          -Prefix stage -SourceRoot .
+          -WorkDir "$env:RUNNER_TEMP\lance-c-crt-product-arm64"
+          -Architecture ARM64 -CMakeGenerator "Visual Studio 18 2026"
+          -CMakeToolset ClangCL
+

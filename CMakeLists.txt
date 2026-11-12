@@ -20,6 +20,9 @@ include(GNUInstallDirs)
 option(LANCE_C_USE_PREBUILT
     "Skip cargo build and use a prebuilt liblance_c at LANCE_C_PREBUILT_DIR"
     OFF)
+option(LANCE_C_CRT_STATIC
+    "Link the MSVC Rust and native dependency graph with the static CRT"
+    OFF)
 set(LANCE_C_PREBUILT_DIR "" CACHE PATH
     "Directory containing prebuilt liblance_c.{a,so,dylib} (when LANCE_C_USE_PREBUILT=ON)")
 set(LANCE_C_LINK "static" CACHE STRING
@@ -42,6 +45,22 @@ if(NOT LANCE_C_USE_PREBUILT)
         CRATE_TYPES staticlib cdylib
         PROFILE release
     )
+    if(LANCE_C_CRT_STATIC)
+        if(NOT WIN32)
+            message(FATAL_ERROR
+                "LANCE_C_CRT_STATIC is only supported on Windows")
+        endif()
+        if(NOT Rust_CARGO_TARGET_ENV STREQUAL "msvc")
+            message(FATAL_ERROR
+                "LANCE_C_CRT_STATIC is only supported for MSVC targets")
+        endif()
+        # Use the package-wide Rust flags so build-script dependencies (cc and
+        # cmake) also observe crt-static in CARGO_CFG_TARGET_FEATURE.
+        corrosion_add_target_rustflags(
+            lance_c
+            "-Ctarget-feature=+crt-static"
+        )
+    endif()
     if(Rust_CARGO_TARGET MATCHES "apple-darwin$")
         # Corrosion selects its own linker, overriding Cargo's environment.
         # Keep the dylib export policy on the actual imported build target.
