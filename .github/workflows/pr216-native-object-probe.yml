@@ -5,6 +5,10 @@ on:
     branches:
       - xuanwo/pr216-native-object-probe
   workflow_dispatch:
+    inputs:
+      correction_sha:
+        description: Correction commit to exercise
+        required: false
 
 permissions:
   contents: read
@@ -109,3 +113,25 @@ jobs:
             ${{ runner.temp }}/pr216 arm64 cargo probe
             ${{ runner.temp }}/pr216-cargo-arm64-link.log
           if-no-files-found: warn
+  product-regression:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            runner: windows-2022
+          - architecture: ARM64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.correction_sha }}
+      - name: Run product Windows export regression
+        shell: pwsh
+        run: |
+          pwsh -File .github/scripts/test-windows-export-linker.ps1 `
+            -Architecture ${{ matrix.architecture }} `
+            -WorkDir "$env:RUNNER_TEMP\pr216 product ${{ matrix.architecture }} export linker"
