@@ -18,7 +18,7 @@ printf '%s\n' \
   > "$root/apt-mirrors.txt"
 
 printf '%s\n' \
-  $'https://invalid.invalid/ubuntu/\tpriority:1' \
+  $'http://127.0.0.1:9/ubuntu/\tpriority:1' \
   $'https://mirrors.edge.kernel.org/ubuntu/\tpriority:2' \
   $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:3' \
   $'https://archive.ubuntu.com/ubuntu/\tpriority:4' \
@@ -26,7 +26,7 @@ printf '%s\n' \
   > "$root/apt-mirrors-invalid-first.txt"
 
 printf '%s\n' \
-  $'https://invalid.invalid/ubuntu/\tpriority:1' \
+  $'http://127.0.0.1:9/ubuntu/\tpriority:1' \
   > "$root/apt-mirrors-all-invalid.txt"
 
 printf '%s\n' \
