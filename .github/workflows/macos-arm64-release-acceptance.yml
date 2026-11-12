@@ -4,6 +4,9 @@
 name: macOS ARM64 Release Acceptance
 
 on:
+  push:
+    branches:
+      - xuanwo/arm64-macos-release-acceptance
   workflow_dispatch:
     inputs:
       version:
