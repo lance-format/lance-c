@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+//
+// Field-for-field subset of protos/index_old.proto at Lance commit
+// 40f15ed1b71b66950961b175829fdf17a763f108. Keep IDs, types, presence, and
+// wire semantics identical to the authoritative schema.
+
+syntax = "proto3";
+
+package lance.table;
+
+option java_package = "org.lance.crosssdk.proto";
+option java_outer_classname = "InvertedIndexDetailsProto";
+
+message InvertedIndexDetails {
+  enum DocumentGranularity {
+    ROW = 0;
+    LIST_ELEMENT = 1;
+  }
+
+  message CodeTokenizerConfig {
+    bool split_identifiers = 1;
+    optional bool split_on_numerics = 2;
+    optional bool preserve_original = 3;
+    bool index_operators = 4;
+  }
+
+  optional string base_tokenizer = 1;
+  string language = 2;
+  bool with_position = 3;
+  optional uint32 max_token_length = 4;
+  bool lower_case = 5;
+  bool stem = 6;
+  bool remove_stop_words = 7;
+  bool ascii_folding = 8;
+  uint32 min_ngram_length = 9;
+  uint32 max_ngram_length = 10;
+  bool prefix_only = 11;
+  optional uint32 block_size = 12;
+  CodeTokenizerConfig code_config = 13;
+  DocumentGranularity document_granularity = 14;
+  optional uint32 posting_format_version = 15;
+}
