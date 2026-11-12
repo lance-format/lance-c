@@ -21,13 +21,14 @@ File Type: LIBRARY
                   crc_fast_checksum
             7     lance_dataset_close
                   ?foreign@@YAHXZ
+                  Summary
 
   Summary
 
           C0 .debug$S
           14 .idata$2
 '@
-$expected = @('lance_dataset_open', 'crc_fast_checksum', 'lance_dataset_close', '?foreign@@YAHXZ')
+$expected = @('lance_dataset_open', 'crc_fast_checksum', 'lance_dataset_close', '?foreign@@YAHXZ', 'Summary')
 foreach ($text in @($fixture, ($fixture -replace '\r?\n', "`r`n"))) {
     $actual = @(Get-WindowsImportLibraryExports -Text $text)
     if (($actual -join ',') -cne ($expected -join ',')) {

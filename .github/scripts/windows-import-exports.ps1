@@ -15,7 +15,7 @@ function Get-WindowsImportLibraryExports {
             $foundTable = $true
             continue
         }
-        if ($line -match '^\s*Summary\s*$') {
+        if ($line -match '^  Summary\s*$') {
             $inTable = $false
         }
         if (-not $inTable -or [string]::IsNullOrWhiteSpace($line)) {
