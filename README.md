@@ -559,10 +559,15 @@ Static inspection of the published Linux shared libraries found:
 | aarch64 Debian 12 | `GLIBC_2.35` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` |
 
 None of the Linux libraries records GLIBCXX or CXXABI version requirements.
-The macOS dylib is a thin `arm64` Mach-O binary with install name
-`@rpath/liblance_c.dylib`, `minos 11.0`, SDK `14.5`, and dependencies on
+The published v0.1.9 macOS dylib is a thin `arm64` Mach-O binary with install
+name `@rpath/liblance_c.dylib`, `minos 11.0`, SDK `14.5`, and dependencies on
 `SystemConfiguration`, `libobjc.A.dylib`, `IOKit`, `CoreFoundation`,
-`Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`.
+`Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`. Its static archive
+is not uniform: 416 of 3,298 Mach-O members declare `minos 14.5`, above the
+dylib's `11.0`, so the archive-level maximum is `14.5`. This split prevents
+treating the dylib value as a whole-package numeric runtime floor, but does
+not by itself prove that a static consumer fails below 14.5. No runtime
+execution of this published archive was retained.
 
 Linux and macOS release builds produced by the current workflow strip the
 staged shared library and restrict its defined dynamic exports to the public
@@ -594,18 +599,24 @@ entries before the consumer and archive steps. Only glibc/toolchain SONAMEs
 `libssl` and `libcrypto` are rejected.
 
 The highest GLIBC symbol reference records a dynamic-loader requirement.
-The Mach-O `minos` field records the binary's declared deployment target.
-Runtime compatibility requires consumer verification on the intended OS.
-Static archive inspection established object architecture. The complete
+Mach-O `minos` values record each dylib's or object's declared target; they
+are build metadata, not a whole-package runtime guarantee. The complete
 binary metadata is recorded in the [artifact
 audit](https://github.com/lance-format/lance-c/blob/2c00796/validation/issue-103/RESULTS.md).
-Runtime consumer evidence covers Linux x86_64 and is recorded in the
+Runtime consumer evidence for Linux x86_64 remains recorded in the
 [issue 100 validation
 record](https://github.com/lance-format/lance-c/blob/5a29b67/validation/issue-100/RESULTS.md).
-The candidate Intel macOS row is built and executed on the hosted macOS 15
-Intel runner. Its dylib `minos` value is build metadata, not proof that macOS 11
-can run the complete static distribution; the exercised runner OS and build SDK
-are recorded in the workflow log.
+Current macOS checks and their limits are:
+
+| Build | Declared macOS metadata | Retained runtime check |
+| --- | --- | --- |
+| [Published v0.1.9 ARM64](https://github.com/lance-format/lance-c/releases/tag/v0.1.9) | Dylib `11.0`; static archive maximum `14.5` (416 of 3,298 members above `11.0`) | None for the published archive; the metadata split alone does not prove failure below 14.5 |
+| [#208 Intel Release candidate](https://github.com/lance-format/lance-c/pull/208) ([job](https://github.com/lance-format/lance-c/actions/runs/43137215582/job/130915319083)) | Dylib and all static archive members `<= 11.0` | macOS 15.7.9: installed static and shared dataset reads and Arrow ownership/lifetime acceptance passed. Candidate archive only, not published recipe availability |
+| [#217 ARM64 current source](https://github.com/lance-format/lance-c/pull/217) ([job](https://github.com/lance-format/lance-c/actions/runs/43167179892/job/131011816224)) | Current-source `DEBUG` artifacts; no retained Release archive | macOS 15.8.2: installed static and shared dataset reads and Arrow ownership/lifetime acceptance passed. No older-macOS run; not ARM64 Release acceptance |
+
+No numeric minimum macOS version is declared. The macOS 15.x versions above
+are exercised baselines, not a support floor; older macOS versions remain
+unverified, with no implied requirement to test every older release.
 
 ### From source via cargo (Rust developers)
 
@@ -623,6 +634,21 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 cmake --install build --prefix /your/prefix
 ```
+
+On macOS, `MACOSX_DEPLOYMENT_TARGET` must be in the environment that invokes
+the CMake build. With the pinned Corrosion 0.5.1, setting only
+`CMAKE_OSX_DEPLOYMENT_TARGET` does not propagate to Cargo build scripts. To
+set the same deployment target for CMake and Cargo:
+
+```bash
+export MACOSX_DEPLOYMENT_TARGET=11.0
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+cmake --build build
+cmake --install build --prefix /your/prefix
+```
+
+The value selects a build target; it is not a runtime support promise.
 
 Installs headers, both linkages, a `LanceCConfig.cmake` package config, and
 a `lance-c.pc` pkg-config file. Consumers then:
