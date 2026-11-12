@@ -66,7 +66,7 @@ args=(
     --validation-commit "$validation_commit"
 )
 if [ "$mode" = debian ]; then
-    args+=(--container debian:12)
+    args+=(--container debian:12 --suffix -debian12)
 fi
 
 bash "$branch_root/.github/scripts/linux103-candidate-evidence.sh" \
