@@ -665,6 +665,10 @@ headers. `find_package(LanceC)` selects the static library by default; set
 The installed shared consumer must have `lance_c.dll` beside its executable or
 on its DLL search path.
 
+The Windows package link is restricted through a wrapper around MSVC
+`link.exe`. Overriding the linker with `lld-link` is not supported for this
+export policy.
+
 Windows CI builds this layout with Rust 1.94.0. The x64 job uses
 `windows-2022`. The ARM64 job uses `windows-11-arm` and asserts that the
 runner, PowerShell process, and Rust host are native ARM64. Each job verifies

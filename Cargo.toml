@@ -14,6 +14,9 @@ keywords = ["lance", "ffi", "c", "cpp", "arrow"]
 categories = ["database-implementations", "external-ffi-bindings"]
 rust-version = "1.94.0"
 
+[build-dependencies]
+cc = "1"
+
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
