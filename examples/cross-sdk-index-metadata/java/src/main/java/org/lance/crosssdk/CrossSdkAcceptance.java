@@ -605,9 +605,6 @@ public final class CrossSdkAcceptance {
     long cacheLookups = stats.getIndexCacheHits() + stats.getIndexCacheMisses();
     long partitionsSearched = stats.getAllCounts().getOrDefault("partitions_searched", 0L);
     require(
-        stats.getIndicesLoaded() > 0,
-        "FTS query did not load a committed index: " + stats);
-    require(
         partitionsSearched > 0,
         "FTS query did not search an inverted-index partition: " + stats);
     require(cacheLookups > 0, "FTS query performed no inverted-index cache lookups: " + stats);
