@@ -69,7 +69,11 @@ Image has the following delay load dependencies:
     $redistributableNames = @(
         'VCRUNTIME140.dll',
         'VCRUNTIME140_1.dll',
+        'VCRUNTIME140D.dll',
         'MSVCP140.dll',
+        'MSVCP140_ATOMIC_WAIT.dll',
+        'MSVCP140_CODECVT_IDS.dll',
+        'MSVCP140D.dll',
         'MSVCR120.dll',
         'CONCRT140.dll',
         'VCOMP140.dll'

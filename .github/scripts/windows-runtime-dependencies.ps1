@@ -48,7 +48,7 @@ function Assert-NoRedistributableRuntimeDependencies {
     )
 
     $pattern =
-        '^(?i)(VCRUNTIME[0-9_]*|MSVCP[0-9_]*|MSVCR[0-9_]*|CONCRT[0-9_]*|VCOMP[0-9_]*)\.dll$'
+        '^(?i)(VCRUNTIME|MSVCP|MSVCR|CONCRT|VCOMP)[A-Za-z0-9_]*\.dll$'
     $unexpected = @($Dependencies | Where-Object { $_ -match $pattern })
     if ($unexpected.Count -ne 0) {
         throw ("$Description has redistributable VC Runtime dependencies: " +
