@@ -837,9 +837,8 @@ fn metadata_statistics_pages_and_global_buffers_match_native() {
             &format!("column {column_index} encoding"),
         );
         assert_eq!(column.page_count, native_column.pages.len());
-        for page_index in 0..column.page_count {
+        for (page_index, native_page) in native_column.pages.iter().enumerate() {
             let page = unsafe { &*column.pages.add(page_index) };
-            let native_page = &native_column.pages[page_index];
             assert_buffer_descriptors(
                 page.buffers,
                 page.buffer_count,
