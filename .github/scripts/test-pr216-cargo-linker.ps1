@@ -23,7 +23,7 @@ function Get-DllExports {
     [System.IO.File]::WriteAllText((Join-Path $WorkDir $name), $text)
     return @(
         [regex]::Matches(
-            $text, '(?m)^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)(?:\s+=.*)?$') |
+            $text, '(?m)^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)(?:\s+=.*)?\s*$') |
             ForEach-Object { $_.Groups[1].Value } |
             Sort-Object -Unique
     )
