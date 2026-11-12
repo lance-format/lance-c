@@ -290,11 +290,7 @@ function Test-InstalledConsumer {
     Write-Host "==> Verified $Linkage consumer object CRT directives"
 
     $vcxproj = Join-Path $buildDir 'acceptance.vcxproj'
-    $runtimeLibraries = [regex]::Matches(
-        (Get-Content -LiteralPath $vcxproj -Raw),
-        '<RuntimeLibrary>([^<]+)</RuntimeLibrary>') |
-        ForEach-Object { $_.Groups[1].Value } |
-        Sort-Object -Unique
+    $runtimeLibraries = @(Get-MsvcRuntimeLibraries -ProjectPath $vcxproj)
     if ($runtimeLibraries.Count -eq 0) {
         throw "$Linkage consumer does not declare MSVC_RUNTIME_LIBRARY"
     }

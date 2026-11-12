@@ -56,6 +56,22 @@ function Assert-NoRedistributableRuntimeDependencies {
     }
 }
 
+function Get-MsvcRuntimeLibraries {
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectPath
+    )
+
+    return @(
+        [regex]::Matches(
+            (Get-Content -LiteralPath $ProjectPath -Raw),
+            '<RuntimeLibrary>([^<]+)</RuntimeLibrary>') |
+            ForEach-Object { $_.Groups[1].Value } |
+            Sort-Object -Unique
+    )
+}
+
 function Resolve-RuntimeDependency {
     [CmdletBinding()]
     param(

@@ -91,6 +91,22 @@ Image has the following delay load dependencies:
         }
     }
 
+    $vcxprojFixture = Join-Path $fixture 'acceptance.vcxproj'
+    Set-Content -LiteralPath $vcxprojFixture -Value @'
+<ItemDefinitionGroup>
+  <ClCompile>
+    <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+  </ClCompile>
+</ItemDefinitionGroup>
+'@
+    $runtimeLibraries = @(
+        Get-MsvcRuntimeLibraries -ProjectPath $vcxprojFixture
+    )
+    if ($runtimeLibraries.Count -ne 1 -or
+        $runtimeLibraries[0] -ne 'MultiThreaded') {
+        throw "single MSVC runtime library was not preserved as an array"
+    }
+
     $missing = 'missing-runtime-174.dll'
     $rejected = $false
     try {

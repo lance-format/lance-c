@@ -483,9 +483,16 @@ int main(int argc, char** argv) {
         verify_clone(uri);
         verify_last_error(uri);
 #ifdef _WIN32
-        if (const char* module_report = std::getenv("LANCE_C_MODULE_REPORT");
-            module_report != nullptr && module_report[0] != '\0') {
+        char* module_report = nullptr;
+        size_t module_report_length = 0;
+        if (_dupenv_s(
+                &module_report, &module_report_length,
+                "LANCE_C_MODULE_REPORT") != 0) {
+            fail("failed to read LANCE_C_MODULE_REPORT");
+        }
+        if (module_report != nullptr) {
             write_loaded_module_report(module_report);
+            std::free(module_report);
         }
 #endif
         std::printf("acceptance: PASS\n");

@@ -12,8 +12,35 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Windows dependency guard
+        shell: pwsh
+        run: pwsh -File .github/scripts/test-windows-runtime-dependencies.ps1
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -LiteralPath .github/scripts -Filter *.ps1 |
+            ForEach-Object {
+              $tokens = $null
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                $_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+              if ($errors.Count -ne 0) {
+                Write-Host "PowerShell parse errors in $($_.FullName):"
+                $errors | Format-List
+                $failed = $true
+              }
+            }
+          if ($failed) { exit 1 }
+
   build-windows:
     name: Build (${{ matrix.target }})
+    needs: validate
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     strategy:
@@ -61,8 +88,6 @@ jobs:
           "$env:RUNNER_TEMP\protoc\bin" |
             Out-File -FilePath $env:GITHUB_PATH -Append
           & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
-      - name: Test Windows dependency guard
-        run: pwsh -File .github/scripts/test-windows-runtime-dependencies.ps1
       - name: Configure
         run: >
           cmake -S . -B build -G "${{ matrix.generator }}"
@@ -73,6 +98,13 @@ jobs:
         run: cmake --build build --config Release --parallel 4
       - name: Install to staging prefix
         run: cmake --install build --prefix stage --config Release
+      - name: Upload staged package before verification
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: windows-crt-stage-${{ matrix.architecture }}-${{ github.sha }}
+          path: stage
+          if-no-files-found: error
+          retention-days: 2
       - name: Verify staged package and installed consumers
         run: >
           pwsh -File .github/scripts/verify-windows-staging.ps1
