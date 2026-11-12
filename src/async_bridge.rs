@@ -240,4 +240,29 @@ mod tests {
         );
         unsafe { drop(Box::from_raw(ctx)) };
     }
+
+    /// Demonstrates the `Completion: Copy` type-safety gap reviewed on PR #68.
+    ///
+    /// This is not a current scanner path: `scan_async_guarded` and
+    /// `spawn_lance_future` each use one endpoint. It shows that the Copy API
+    /// permits an internal caller to complete twice, which the future
+    /// `Clone`-only API is intended to turn into a compile error.
+    #[test]
+    fn copy_endpoint_admits_two_completions() {
+        let (completion, rx, ctx) = completion();
+        completion.fail(LanceErrorCode::Internal, "first completion");
+        spawn_lance_future::<_, (), _, _>(
+            completion,
+            async { Ok(()) },
+            |_| std::ptr::null_mut(),
+            || {},
+        );
+
+        let first = receive(&rx);
+        let second = receive(&rx);
+        let mut statuses = [first.status, second.status];
+        statuses.sort_unstable();
+        assert_eq!(statuses, [-1, 0]);
+        unsafe { drop(Box::from_raw(ctx)) };
+    }
 }
