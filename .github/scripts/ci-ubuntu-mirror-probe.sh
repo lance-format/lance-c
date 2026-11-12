@@ -63,13 +63,14 @@ run_case() {
   docker run --rm \
     --volume "$root/ubuntu.sources:/etc/apt/sources.list.d/ubuntu.sources:ro" \
     --volume "$mirror_file:/etc/apt/apt-mirrors.txt:ro" \
+    --volume /etc/ssl/certs:/etc/ssl/certs:ro \
     "$image" \
     bash -euxo pipefail -c '
       cat /etc/apt/sources.list.d/ubuntu.sources
       cat /etc/apt/apt-mirrors.txt
       apt-get update
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends protobuf-compiler lld
-      dpkg-query -W -f="${Package}\t${Version}\t${Status}\n" protobuf-compiler lld
+      dpkg-query -W protobuf-compiler lld
       protoc --version
       ld.lld --version
       apt-cache policy protobuf-compiler lld
