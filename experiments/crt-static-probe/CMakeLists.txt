@@ -33,7 +33,7 @@ if(Rust_CARGO_TARGET_ENV STREQUAL "msvc")
         INTERFACE_LINK_OPTIONS)
     message(STATUS "crt_probe-static INTERFACE_LINK_OPTIONS before: ${_crt_probe_link_options}")
     list(FILTER _crt_probe_link_options
-        EXCLUDE REGEX "(?i)^/defaultlib:msvcrtd?$")
+        EXCLUDE REGEX "^/defaultlib:[mM][sS][vV][cC][rR][tT][dD]?$")
     set_target_properties(crt_probe-static PROPERTIES
         INTERFACE_LINK_OPTIONS "${_crt_probe_link_options}")
     message(STATUS "crt_probe-static INTERFACE_LINK_OPTIONS after: ${_crt_probe_link_options}")
