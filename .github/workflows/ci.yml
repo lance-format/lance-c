@@ -124,6 +124,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: brew install protobuf
+      - name: Record macOS host and toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          "$CC" --version
+          rustc -vV
+          cargo --version
+          cmake --version
+          git rev-parse HEAD
       - name: Test macOS export linker arguments
         run: python3 .github/scripts/test-macos-exports.py
       - name: Build library artifacts
@@ -134,8 +145,81 @@ jobs:
         run: cargo test
       - name: Run C/C++ compilation tests
         run: cargo test --test compile_and_run_test -- --ignored
-      - name: Verify CMake package and consumer linkage
+      - name: Verify installed package and consumer data read
         run: bash .github/scripts/verify-cmake-consumer.sh --from-target-dir target/debug
+
+  package-macos-intel:
+    name: Package (macOS Intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    env:
+      CC: clang
+      CXX: clang++
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER: ${{ github.workspace }}/.github/scripts/limit-macos-exports.sh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Corrosion writes dependencies under the CMake build tree.
+          workspaces: |
+            . -> target
+            . -> build-release/cargo/build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install dependencies
+        run: brew install protobuf
+      - name: Record macOS host and toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          "$CC" --version
+          rustc -vV
+          cargo --version
+          cmake --version
+          git rev-parse HEAD
+      - name: Test macOS export linker arguments
+        run: python3 .github/scripts/test-macos-exports.py
+      - name: Build direct Cargo libraries with export shim
+        run: cargo build --lib
+      - name: Verify direct Cargo shared-library exports
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance/lance.h macos
+      - name: Configure and build release staging tree
+        run: |
+          cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-release --parallel
+      - name: Install to staging prefix
+        run: cmake --install build-release --prefix stage
+      - name: Strip release shared library
+        run: bash .github/scripts/strip-release-shared.sh stage macos
+      - name: Verify staged shared-library exports
+        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.dylib stage/include/lance/lance.h macos
+      - name: Verify staged macOS architectures and dependencies
+        run: bash .github/scripts/verify-macos-staging.sh stage x86_64
+      - name: Verify installed package and consumer data read
+        run: bash .github/scripts/verify-cmake-consumer.sh --from-install-prefix stage
+      - name: Package candidate artifacts
+        id: pack
+        env:
+          XZ_OPT: -T0
+        run: |
+          ARCHIVE="lance-c-intel-candidate-${GITHUB_SHA}-x86_64-apple-darwin.tar.xz"
+          tar -C stage -cJf "${ARCHIVE}" .
+          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          shasum -a 512 "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          echo "archive=${ARCHIVE}" >>"$GITHUB_OUTPUT"
+      - name: Upload candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: intel-macos-candidate-${{ github.sha }}
+          path: |
+            ${{ steps.pack.outputs.archive }}
+            ${{ steps.pack.outputs.archive }}.sha256
+            ${{ steps.pack.outputs.archive }}.sha512
+          if-no-files-found: error
+          retention-days: 14
 
   test-windows:
     name: Tests (Windows x64)
@@ -148,6 +232,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
         with:
+          # Corrosion writes dependencies under the CMake build tree.
+          workspaces: |
+            . -> target
+            . -> build/x64/Release/cargo/build
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Record Windows runtime baseline
         shell: pwsh
