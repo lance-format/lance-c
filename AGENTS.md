@@ -2,8 +2,8 @@
 
 ## Structure
 Rust FFI source: `src/`
-C header (stable ABI): `include/lance.h`
-C++ RAII wrappers (header-only): `include/lance.hpp`
+C header (stable ABI): `include/lance/lance.h`
+C++ RAII wrappers (header-only): `include/lance/lance.hpp`
 Tests (Rust): `tests/c_api_test.rs`
 Tests (C/C++): `tests/cpp/`
 Historical test data: `test_data/`
@@ -19,7 +19,8 @@ test C/C++ compilation: `cargo test --test compile_and_run_test -- --ignored`
 - Opaque handles with `lance_*_open`/`lance_*_close` lifecycle.
 - Thread-local error handling via `ffi_try!` macro.
 - Arrow C Data Interface for zero-copy data exchange.
-- `panic = "abort"` in release to prevent unwinding across FFI.
+- `panic = "unwind"` is required so guarded FFI boundaries can translate
+  panics to `LANCE_ERR_PANIC`; `panic = "abort"` builds are rejected.
 
 ## Coding Standards
 

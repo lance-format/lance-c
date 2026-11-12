@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
 name: CI
 on:
   push:
@@ -7,27 +10,50 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  # Skip DWARF debug info in dev/test profiles (previously set implicitly by
+  # actions-rust-lang/setup-rust-toolchain) to cut compile/link I/O in half and
+  # keep target/debug/liblance_c.a (~2 GiB) under macOS lipo's 4 GiB limit.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  format:
-    name: Rustfmt
+  lint:
+    name: Format & License
     runs-on: ubuntu-24.04
     container: quay.io/pypa/manylinux_2_28_x86_64
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt -- --check
+      - name: Check SPDX license headers
+        run: |
+          MISSING=""
+          for f in $(find src tests include cmake examples .github/scripts -type f \( \
+            -name '*.rs' -o -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \
+            -o -name '*.cmake' -o -name 'CMakeLists.txt' -o -name '*.py' -o -name '*.sh' \
+          \)) build.rs CMakeLists.txt Cargo.toml; do
+            if ! head -5 "$f" | grep -q 'SPDX-License-Identifier'; then
+              MISSING="$MISSING $f"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "Missing SPDX license header in:$MISSING"
+            exit 1
+          fi
 
   clippy:
     name: Clippy
@@ -36,10 +62,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
           ARCH=$(uname -m)
@@ -57,9 +85,11 @@ jobs:
     env:
       CC: clang
       CXX: clang++
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Clang 20
         run: manylinux-install-clang -v 20.1.8.0
@@ -69,32 +99,300 @@ jobs:
           case "${ARCH}" in x86_64) PA="linux-x86_64" ;; aarch64) PA="linux-aarch_64" ;; esac
           curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-${PA}.zip" -o /tmp/protoc.zip
           unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' && rm /tmp/protoc.zip
+      - name: Build library artifacts
+        run: cargo build --lib
+      - name: Verify shared-library exports
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.so include/lance/lance.h linux
       - name: Run tests
         run: cargo test
       - name: Run C/C++ compilation tests
         run: cargo test --test compile_and_run_test -- --ignored
+      - name: Verify CMake package and consumer linkage
+        run: bash .github/scripts/verify-cmake-consumer.sh --from-target-dir target/debug
 
   test-macos:
     name: Tests (macOS)
-    runs-on: macos-14
-    timeout-minutes: 30
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CC: clang
+      CXX: clang++
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER: ${{ github.workspace }}/.github/scripts/limit-macos-exports.sh
     steps:
       - uses: actions/checkout@v4
-      - name: Load baseline floors
-        shell: bash
-        run: |
-          set -a
-          source .github/baseline.env
-          set +a
-          echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET" >>"$GITHUB_ENV"
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: brew install protobuf
+      - name: Record macOS host and toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          "$CC" --version
+          rustc -vV
+          cargo --version
+          cmake --version
+          git rev-parse HEAD
+      - name: Test macOS export linker arguments
+        run: python3 .github/scripts/test-macos-exports.py
+      - name: Build library artifacts
+        run: cargo build --lib
+      - name: Verify shared-library exports
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance/lance.h macos
       - name: Run tests
         run: cargo test
       - name: Run C/C++ compilation tests
         run: cargo test --test compile_and_run_test -- --ignored
+      - name: Verify installed package and consumer data read
+        run: bash .github/scripts/verify-cmake-consumer.sh --from-target-dir target/debug
+
+  package-macos-intel:
+    name: Package (macOS Intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    env:
+      CC: clang
+      CXX: clang++
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER: ${{ github.workspace }}/.github/scripts/limit-macos-exports.sh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Corrosion writes dependencies under the CMake build tree.
+          workspaces: |
+            . -> target
+            . -> build-release/cargo/build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install dependencies
+        run: brew install protobuf
+      - name: Record macOS host and toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          "$CC" --version
+          rustc -vV
+          cargo --version
+          cmake --version
+          git rev-parse HEAD
+      - name: Test macOS export linker arguments
+        run: python3 .github/scripts/test-macos-exports.py
+      - name: Build direct Cargo libraries with export shim
+        run: cargo build --lib
+      - name: Verify direct Cargo shared-library exports
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance/lance.h macos
+      - name: Configure and build release staging tree
+        run: |
+          cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-release --parallel
+      - name: Install to staging prefix
+        run: cmake --install build-release --prefix stage
+      - name: Strip release shared library
+        run: bash .github/scripts/strip-release-shared.sh stage macos
+      - name: Verify staged shared-library exports
+        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.dylib stage/include/lance/lance.h macos
+      - name: Verify staged macOS architectures and dependencies
+        run: bash .github/scripts/verify-macos-staging.sh stage x86_64
+      - name: Verify installed package and consumer data read
+        run: bash .github/scripts/verify-cmake-consumer.sh --from-install-prefix stage
+      - name: Package candidate artifacts
+        id: pack
+        env:
+          XZ_OPT: -T0
+        run: |
+          ARCHIVE="lance-c-intel-candidate-${GITHUB_SHA}-x86_64-apple-darwin.tar.xz"
+          tar -C stage -cJf "${ARCHIVE}" .
+          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          shasum -a 512 "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          echo "archive=${ARCHIVE}" >>"$GITHUB_OUTPUT"
+      - name: Upload candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: intel-macos-candidate-${{ github.sha }}
+          path: |
+            ${{ steps.pack.outputs.archive }}
+            ${{ steps.pack.outputs.archive }}.sha256
+            ${{ steps.pack.outputs.archive }}.sha512
+          if-no-files-found: error
+          retention-days: 14
+
+  test-windows:
+    name: Tests (Windows x64)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Corrosion writes dependencies under the CMake build tree.
+          workspaces: |
+            . -> target
+            . -> build/x64/Release/cargo/build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Record Windows runtime baseline
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            Format-List
+          rustc --version --verbose
+          cmake --version
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          $version = '29.3'
+          $archive = "protoc-$version-win64.zip"
+          Invoke-WebRequest `
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$version/$archive" `
+            -OutFile "$env:RUNNER_TEMP\$archive"
+          Expand-Archive "$env:RUNNER_TEMP\$archive" `
+            -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
+          "$env:RUNNER_TEMP\protoc\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
+      - name: Test Windows dependency guard
+        run: |
+          pwsh -File .github/scripts/test-windows-runtime-dependencies.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File .github/scripts/test-windows-import-exports.ps1
+      - name: Test Windows export linker
+        run: >
+          pwsh -File .github/scripts/test-windows-export-linker.ps1
+          -Architecture x64
+          -WorkDir "$env:RUNNER_TEMP\windows export linker"
+      - name: Configure
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Install to staging prefix
+        run: cmake --install build --prefix stage --config Release
+      - name: Verify staged package and installed consumers
+        run: >
+          pwsh -File .github/scripts/verify-windows-staging.ps1
+          -Prefix stage -SourceRoot .
+          -WorkDir "$env:RUNNER_TEMP\lance-c-windows-acceptance"
+      - name: Upload staged package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lance-c-windows-x86_64-pc-windows-msvc
+          path: stage
+          if-no-files-found: error
+          retention-days: 14
+
+  test-windows-arm64:
+    name: Tests (Windows ARM64)
+    runs-on: windows-11-arm
+    timeout-minutes: 150
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Assert native Windows ARM64 toolchain
+        shell: pwsh
+        run: pwsh -File .github/scripts/assert-windows-arm64-host.ps1
+      - name: Record Windows runtime baseline
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            Format-List
+          rustc --version --verbose
+          cargo --version
+          cmake --version
+      - name: Install protoc x64 build tool
+        shell: pwsh
+        run: |
+          # protoc 29.3 has no Windows ARM64 archive. This x64 executable is a
+          # code-generation tool only; the Rust and C++ build targets are native.
+          $version = '29.3'
+          $archive = "protoc-$version-win64.zip"
+          Invoke-WebRequest `
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$version/$archive" `
+            -OutFile "$env:RUNNER_TEMP\$archive"
+          Expand-Archive "$env:RUNNER_TEMP\$archive" `
+            -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
+          "$env:RUNNER_TEMP\protoc\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
+      - name: Test Windows dependency guard
+        run: |
+          pwsh -File .github/scripts/test-windows-runtime-dependencies.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File .github/scripts/test-windows-import-exports.ps1
+      - name: Test Windows export linker
+        run: >
+          pwsh -File .github/scripts/test-windows-export-linker.ps1
+          -Architecture ARM64
+          -WorkDir "$env:RUNNER_TEMP\windows arm64 export linker"
+      - name: Configure
+        run: >
+          cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Assert ARM64 ClangCL configuration
+        shell: pwsh
+        run: |
+          $cache = Get-Content -LiteralPath build\CMakeCache.txt
+          if ($cache -notcontains 'CMAKE_GENERATOR:INTERNAL=Visual Studio 18 2026') {
+            throw 'CMake did not select Visual Studio 18 2026'
+          }
+          if ($cache -notcontains 'CMAKE_GENERATOR_PLATFORM:INTERNAL=ARM64') {
+            throw 'CMake did not select the ARM64 platform'
+          }
+          if (-not ($cache -match '^CMAKE_GENERATOR_TOOLSET(?::[^=]+)?=ClangCL$')) {
+            throw 'CMake did not select the ClangCL toolset'
+          }
+          $compilerFiles = @(
+            Get-ChildItem -LiteralPath build\CMakeFiles -Recurse `
+              -Filter CMakeCCompiler.cmake | Select-Object -First 1
+            Get-ChildItem -LiteralPath build\CMakeFiles -Recurse `
+              -Filter CMakeCXXCompiler.cmake | Select-Object -First 1
+          )
+          if ($compilerFiles.Count -ne 2 -or $compilerFiles -contains $null) {
+            throw 'CMake did not emit both C and CXX compiler configuration files'
+          }
+          foreach ($compilerFile in $compilerFiles) {
+            $compilerConfig = Get-Content -LiteralPath $compilerFile.FullName -Raw
+            if ($compilerConfig -notmatch
+                'set\(CMAKE_C(?:XX)?_COMPILER_ID "Clang"\)') {
+              throw "CMake compiler ID is not Clang in $($compilerFile.FullName)"
+            }
+            if ($compilerConfig -notmatch
+                '(?i)set\(CMAKE_C(?:XX)?_COMPILER ".*[/\\]Llvm[/\\]Arm64[/\\]bin[/\\]clang-cl\.exe"\)') {
+              throw "CMake compiler is not the Visual Studio ARM64 clang-cl: $($compilerFile.FullName)"
+            }
+          }
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Install to staging prefix
+        run: cmake --install build --prefix stage --config Release
+      - name: Verify staged package and installed consumers
+        run: >
+          pwsh -File .github/scripts/verify-windows-staging.ps1
+          -Prefix stage -SourceRoot .
+          -WorkDir "$env:RUNNER_TEMP\lance-c-windows-arm64-acceptance"
+          -Architecture ARM64 -CMakeGenerator "Visual Studio 18 2026"
+          -CMakeToolset ClangCL
+      - name: Upload staged package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lance-c-windows-aarch64-pc-windows-msvc
+          path: stage
+          if-no-files-found: error
+          retention-days: 14
 
   rustdoc:
     name: Rustdoc
@@ -103,8 +401,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
           ARCH=$(uname -m)
@@ -115,16 +415,16 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
   msrv:
-    name: MSRV (1.91.0)
+    name: MSRV (1.94.0)
     runs-on: ubuntu-24.04
     container: quay.io/pypa/manylinux_2_28_x86_64
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: "1.91.0"
+      - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         run: |
           ARCH=$(uname -m)

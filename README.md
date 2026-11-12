@@ -15,10 +15,604 @@ The C/C++ binding to [Lance](https://github.com/lancedb/lance), providing native
 | GLIBC baseline | 2.28 |
 | Clang | Clang 20; Apple Clang 15 |
 | macOS | `.github/baseline.env` (`MACOSX_DEPLOYMENT_TARGET`) |
+Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/6035).
+
+### Phase 1: Core Read Path + C++ Wrappers (MVP)
+
+| Status | Component | Description |
+|--------|-----------|-------------|
+| [x] | Infrastructure | `lance-c` crate with Cargo.toml, Tokio runtime initialization |
+| [x] | Error handling | Thread-local error codes/messages for cross-FFI safety |
+| [x] | C header | `lance.h` with Arrow C Data Interface structs |
+| [x] | Dataset operations | Open/close with URI + storage options + version support |
+| [x] | Schema export | Arrow C Data Interface for zero-copy schema exchange |
+| [x] | Scanner builder | Column projection, SQL filters, limit/offset, batch size, row ID, fragment filtering |
+| [x] | ArrowArrayStream export | `lance_scanner_to_arrow_stream()` blocking API |
+| [x] | Batch iteration | `lance_scanner_next()` blocking function |
+| [x] | Poll + waker iteration | `lance_scanner_poll_next()` for async engines (Velox, Presto) |
+| [x] | Random access | Index-based row retrieval via `lance_dataset_take()` |
+| [x] | C++ wrappers | Header-only RAII library (`lance::Dataset`, `lance::Scanner`, `lance::Batch`) |
+| [x] | Builder pattern | Fluent Scanner API (`.limit().offset().batch_size().with_row_id()`) |
+
+### Phase 2: Vector Search & Indexing
+
+| Status | Component | Description |
+|--------|-----------|-------------|
+| [x] | Vector search | Nearest-neighbor via scanner with metric/k/nprobes |
+| [x] | Full-text search | FTS queries through scanner interface |
+| [x] | MinHash text search | Native MinHash LSH index and scanner similarity search with `_distance` |
+| [x] | Vector index creation | IVF_FLAT, IVF_SQ, IVF_PQ, IVF_RQ and HNSW variants, with native build options |
+| [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List, NGram, ZoneMap, BloomFilter, MinHash LSH indexes |
+| [x] | Index management | List and drop index operations |
+| [x] | Distributed index build | Share IVF/PQ/RQ models, build uncommitted fragment-scoped segments, and exchange protobuf metadata |
+| [x] | C++ wrappers | `create_vector_index[_with_options]()` and `create_scalar_index()` methods |
+
+### Phase 3: Write Path & Mutations
+
+| Status | Component | Description |
+|--------|-----------|-------------|
+| [x] | Dataset write | Create / append / overwrite from ArrowArrayStream via `lance_dataset_write()`; tunable variant `lance_dataset_write_with_params()` for file/row-group sizing, Lance format version, and stable row IDs |
+| [x] | Native transactions | Uncommitted writer transaction handles, inspection/protobuf handoff, single and append-batch publication, and dataset history reads. Additional operation constructors remain issue #112 follow-up scope |
+| [x] | Fragment writer | Batch-at-a-time fragment file writing (no commit) via `lance_write_fragments()` |
+| [x] | Delete operations | Predicate-based deletion via `lance_dataset_delete()` |
+| [x] | Update operations | Expression-based row updates via `lance_dataset_update()` |
+| [x] | Merge-insert | Upsert via configurable when-matched / when-not-matched policies with `lance_dataset_merge_insert()` |
+| [x] | Schema evolution | Add columns via SQL / all-null / `ArrowArrayStream` / callback `BatchUDF` with native checkpointing, left-join native `Dataset::merge`, drop via `lance_dataset_drop_columns()`, and rename / retype / set nullability via `lance_dataset_alter_columns()` |
+| [x] | Version management | Version details/metadata, lightweight refs, native ref checkout, tag and branch lifecycle, rollback, and numeric-version open |
+
+### Phase 4: Advanced Features
+
+| Status | Component | Description |
+|--------|-----------|-------------|
+| [x] | Fragment-level access | Fragment enumeration, ID listing, read-only metadata/schema/counts, scanner fragment filtering |
+| [x] | Compaction | Fragment consolidation via `lance_dataset_compact_files()` |
+| [x] | Dataset maintenance | Native manual cleanup/explain, dataset validation, deleted-row and small-file counts |
+| [x] | Statistics export | Per-field compressed on-disk size for query planning via `lance_dataset_calculate_data_stats()` |
+| [x] | Cloud storage | S3, GCS, Azure via storage options pass-through |
+| [x] | Package distribution | vcpkg and Conan recipe packaging |
+
+### Additional (not in RFC)
+
+| Status | Component | Description |
+|--------|-----------|-------------|
+| [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
+| [x] | Dataset metadata | Table/schema/field metadata updates plus native storage-version, stable-row-ID and field-ID inspection |
+| [x] | Config, bases and files | Config merge/replace/clear, native base-path inspection/registration, and tracked/all-file Arrow streams |
+| [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
+| [x] | Substrait aggregation | `lance_scanner_set_substrait_aggregate()` accepts a serialized Substrait `Plan`; group/measure semantics, aliases, validation, and aggregate output come from the native planner |
+| [x] | Row prefilter | `lance_scanner_set_row_addr_allowlist()` / `lance_scanner_set_row_addr_blocklist()` restrict scans, nearest-neighbor and full-text searches to (or exclude) a set of `_rowid`s before ranking |
+| [x] | Native ordering | `lance_scanner_set_order_by()` and C++ `Scanner::order_by()` sort by one or more columns with direction and NULL placement |
+| [x] | Expression projection | `lance_scanner_set_projection()` binds named SQL expressions, aliases and nested fields; `lance_scanner_disable_scoring_autoprojection()` controls automatic `_score` / `_distance` output |
+
+## Dataset metadata
+
+Table metadata is available through `lance_dataset_metadata_json()` or
+`Dataset::metadata_json()`. Updates return the complete post-commit map:
+
+```c
+const char* keys[] = {"owner", "retired", "empty"};
+const char* values[] = {"c-consumer", NULL, ""};
+const char* updated = lance_dataset_update_metadata_json(
+    dataset, keys, values, 3, LANCE_METADATA_UPDATE_MERGE);
+if (!updated) {
+    /* Check lance_last_error_code()/message. */
+}
+lance_free_string(updated);
+```
+
+```cpp
+ds.update_metadata_json({
+    {"owner", std::string("c++")},
+    {"retired", std::nullopt},
+    {"empty", std::string("")},
+}, lance::MetadataUpdateMode::Merge);
+
+ds.update_schema_metadata_json({
+    {"schema-owner", std::string("c++")},
+});
+```
+
+A NULL value removes the key. An empty string remains a real empty value.
+`LANCE_METADATA_UPDATE_REPLACE` / `MetadataUpdateMode::Replace` replaces the
+whole map; an empty update in replace mode clears it. Updates mutate the same
+dataset handle under Lance's native snapshot and commit semantics: the handle
+sees the new version, while existing dataset snapshots and scanners keep their
+prior view. Table and schema maps are independent.
+
+The exported Arrow schema is still the schema metadata read path. Use
+`lance_dataset_schema()` or `Dataset::schema()` to inspect the committed schema
+metadata; no duplicate C-side metadata cache is maintained.
+
+Field metadata uses one native batch and one commit. Each entry selects a field
+by ID or path and carries its own merge or replace mode:
+
+```cpp
+auto id = ds.resolve_field_id(lance::FieldReference::by_path("id"));
+ds.update_field_metadata({
+    {lance::FieldReference::by_id(id),
+     {{"owner", std::string("c++")}, {"empty", std::string("")}},
+     lance::MetadataUpdateMode::Merge},
+    {lance::FieldReference::by_path("profile.name"),
+     {{"nested", std::string("value")}},
+     lance::MetadataUpdateMode::Replace},
+});
+```
+
+A NULL value removes a key, an empty string remains a real value, and duplicate
+references to the same resolved field follow the native builder's
+last-update-wins behavior. Read field metadata through the Arrow schema's field
+metadata. `lance_dataset_data_storage_version()`,
+`lance_dataset_has_stable_row_ids()`, `lance_dataset_field_id_count()` /
+`lance_dataset_field_id_at()`, `lance_dataset_resolve_field_id()` and
+`lance_dataset_field_path()` expose the current native snapshot; the C++
+wrappers provide the corresponding `Dataset` methods.
+
+## Dataset configuration, bases and files
+
+`lance_dataset_update_config_json()` and `Dataset::update_config_json()` apply
+native config merge or replace semantics and return the complete resulting map:
+
+```cpp
+auto updated = ds.update_config_json({
+    {"owner", std::string("c++")},
+    {"retired", std::nullopt},
+    {"empty", std::string("")},
+    {"dup", std::string("first")},
+    {"dup", std::string("second")},
+});
+
+auto cleared =
+    ds.update_config_json({}, lance::MetadataUpdateMode::Replace);
+```
+
+A NULL or `std::nullopt` value removes a key, an empty string remains a value,
+and duplicate keys follow the native builder's last-write-wins behavior. An
+empty replace clears the map. The existing merge-only
+`lance_dataset_update_config()` and `Dataset::update_config()` entry points keep
+their original signatures.
+
+Base paths are copied from the current manifest as JSON keyed by decimal ID.
+Registration maps to native `Dataset::add_bases`, including optional transaction
+properties:
+
+```cpp
+auto registry = ds.base_paths_json();
+
+lance::AddBasesOptions options;
+options.transaction_properties =
+    std::vector<std::pair<std::string, std::string>>{{"owner", "c++"}};
+ds.add_bases({
+    lance::BasePath{0, alternate_uri, std::string("alternate"), false},
+}, options);
+```
+
+ID zero requests native allocation. `name == std::nullopt` means native `None`;
+an engaged empty string is preserved. An unset transaction-properties optional
+maps to native `None`, while an engaged empty vector maps to
+`Some(empty map)`. Native duplicate/conflict validation remains authoritative.
+
+`lance_dataset_tracked_files_stream()` and
+`lance_dataset_all_files_stream()` export the corresponding native Arrow
+streams. `Dataset::tracked_files_stream()` and `Dataset::all_files_stream()`
+return the move-only `lance::ArrowStream` owner. Tracked files follow native
+manifest walking across versions and registered bases. `all_files` lists the
+primary root only and includes untracked physical files there.
+
+```cpp
+auto tracked = ds.tracked_files_stream(
+    /*min_version=*/2,
+    [](uint64_t processed, std::optional<uint64_t> total) {
+        /* Runs on a native background task; do not block or throw. */
+    });
+auto files = ds.all_files_stream();
+```
+
+An exported stream retains what it needs after the source dataset closes. The
+stream `release` callback may return before a native progress callback finishes;
+the C++ wrapper keeps the callback capture until the native emitter releases it.
+In C, `LanceTrackedFilesProgress` transfers ownership of `callback_ctx` to the
+library, which calls its `release` exactly once, including on factory errors or
+early stream release.
+
+## Dataset maintenance
+
+Manual version cleanup and its read-only explanation bind the native
+`CleanupPolicy`, `CleanupOperation`, `Dataset::cleanup_old_versions`,
+`Dataset::validate`, `Dataset::count_deleted_rows` and
+`Dataset::num_small_files` operations:
+
+```cpp
+lance::CleanupPolicy policy;
+policy.versions = std::vector<uint64_t>{2, 3};
+policy.before_version = 5;
+
+lance::CleanupOperationOptions operation;
+operation.max_candidate_files = 100;
+
+auto preview = ds.explain_cleanup(policy, operation);
+auto removed = ds.cleanup(policy, operation);
+
+ds.validate();
+uint64_t deleted_rows = ds.count_deleted_rows();
+uint64_t small_files = ds.num_small_files(/*max_rows_per_group=*/1000);
+```
+
+Policy selectors combine with AND. A default-constructed policy inherits native
+defaults rather than the legacy writer's automatic 20-version / 14-day policy.
+`std::nullopt` versus an engaged empty vector distinguishes absent from explicit
+empty version selection, and `retain_versions` uses Lance's asynchronous native
+builder. Use `CleanupOldVersionsOptions` /
+`lance_dataset_cleanup_old_versions()` for relative-duration cleanup; Lance core
+owns the clock cutoff.
+
+Explanations copy all aggregate stats, candidate files, truncation state,
+referenced branches and warnings, so they remain valid after the dataset handle
+closes. They do not reserve files. Execution re-evaluates current references
+and storage state, protects current/tagged/branch/unverified data according to
+Lance, and reports partial deletion through `failed_deletes`; it does not roll
+back successful deletes. Historical snapshot handles do not own a storage lease.
+
+## Scanner ordering
+
+Use `lance_scanner_set_order_by()` or the fluent C++ `Scanner::order_by()` to
+apply Lance's native `Scanner::order_by` behavior:
+
+```cpp
+auto scanner = dataset.scan();
+scanner.order_by({
+    {"category", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+    {"score", LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_FIRST},
+    {"id", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+});
+```
+
+Tie ordering must be explicit when rows can compare equal; the binding does not
+add a row-id or stable-order tie-breaker. Lance validates referenced columns
+when the scan starts. With limit/offset, Lance sorts all rows before applying
+the window. With nearest or full-text search, Lance sorts the rows selected by
+the query.
+
+Pass `std::nullopt` or `lance_scanner_set_order_by(scanner, NULL, 0)` to clear
+the ordering. An explicit empty vector is the native empty ordering and has the
+same scan effect. Invalid enum values or a NULL column name are rejected without
+replacing the previous ordering. Multi-vector search is the one unsupported
+mode: `nearest_multivector()` always restores distance order for its result
+window, so combining it with a non-empty ordering fails when the scan starts
+instead of silently ignoring the ordering.
+
+## Scanner projection and scoring columns
+
+`lance_scanner_set_projection()` and the C++ `Scanner::project()` bind Lance's
+native `Scanner::project_with_transform()`:
+
+```cpp
+auto scanner = dataset.scan();
+scanner.project({
+    {"id_alias", "id"},
+    {"doubled", "id * 2"},
+    {"x", "metadata.location.x"},
+});
+```
+
+Entries preserve input order. `output_name` is the output field name and may be
+an alias; `expression` is a Lance SQL expression. The binder accepts stored
+columns, metadata columns, nested field paths and search-generated scoring
+columns. Pass `std::nullopt` or `lance_scanner_set_projection(scanner, NULL, 0)`
+to restore the unset projection and scan all dataset columns. An empty vector is
+an explicit empty projection. The arrays and strings are copied before the
+setter returns; invalid entries leave the previous projection unchanged. The
+older column-list argument to `lance_scanner_new()` keeps its escaped
+field-path behavior and is unchanged.
+
+By default, vector and full-text searches still append `_distance` or `_score`
+to an explicit projection, matching the published legacy behavior. Call
+`Scanner::disable_scoring_autoprojection()` or
+`lance_scanner_disable_scoring_autoprojection()` before starting the scan to
+include those columns only when the projection names them explicitly. The
+setting is one-way for that scanner.
+
+Multi-vector search keeps the hidden distance required for its final result
+window internally. It is removed from output when scoring autoprojection is
+disabled and the caller did not request `_distance`.
+
+## Segment-scoped array label filters
+
+Ordinary scans can use a `LabelList` index for array membership through the
+existing SQL and Substrait filter interfaces. For example, on a `List<Utf8>`
+column named `labels`:
+
+```sql
+array_contains(labels, 'red')
+array_contains(labels, 'red') AND array_contains(labels, 'blue')
+array_contains(labels, 'red') OR array_contains(labels, 'blue')
+array_has_all(labels, ['red', 'blue'])
+array_has_any(labels, ['red', 'blue'])
+```
+
+Configure `lance_scanner_set_fragment_ids` and
+`lance_scanner_set_scalar_index_segment` with the selected LabelList segment.
+Pass a SQL filter to `lance_scanner_new`, or attach a serialized Substrait
+`ExtendedExpression` with `lance_scanner_set_substrait_filter`. The Substrait
+schema must describe the list field and its element type; replacing that field
+with an unsupported-type placeholder cannot express a label predicate. Use
+Lance/DataFusion's `array_has` (the canonical name of `array_contains`),
+`array_has_all`, or `array_has_any` functions with correctly typed arguments.
+Substrait takes precedence over the primary SQL filter; use
+`lance_scanner_additional_sql_filter` when an additional condition must be ANDed
+with it.
+
+AND/OR membership expressions can reuse the same selected LabelList segment.
+Other columns remain residual filters, evaluated before LIMIT/OFFSET. This API
+selects one physical segment; it does not intersect indices on different columns.
+Incomplete segment coverage falls back to scanning the entire explicit fragment
+scope. Check `scalar_segments_searched` and `scalar_segment_fallbacks` in the
+statistics callback to distinguish index acceleration from filter execution.
+
+Bindings preserve Lance's function semantics, not the semantics of similarly
+named functions in another SQL engine. In particular, a NULL search value in
+`array_contains` does not match NULL array elements. `array_has_all` tests set
+containment, not an ordered contiguous subsequence. The pinned Lance version
+also treats an empty all-label query as true even for NULL lists. Integrators
+should initially push only non-NULL constant labels with matching element types
+and retain conditions whose semantics have not been verified in the calling engine.
+
+## Runtime BTree segment selection
+
+Ordinary segment-scoped scans can opt in to comparing BTree page costs at scan
+preparation time. Configure `lance_scanner_set_scalar_index_auto_selection(scanner,
+true)`, or call `Scanner::scalar_index_auto_selection(true)` in C++, together with
+`scalar_index_segment` and an explicit, nonempty fragment list. The selected
+segment remains the default when estimation is unavailable. The option is disabled
+by default and does not affect vector or full-text searches.
+
+The estimator reads `page_lookup.lance` min/max and NULL-count metadata for equality,
+range, bounded IN, IS NULL, and supported AND/OR expressions. Estimated work is
+matching pages times the index's configured rows per page. It can select a cheaper
+BTree segment only when its known coverage contains the entire read domain. A best
+estimate at least as large as the domain's physical row count selects a scoped
+non-indexed scan. The full filter, deletion handling, explicit fragment scope and
+LIMIT/OFFSET remain in effect on every path; estimates never remove result rows.
+
+Each preparation considers at most eight physical segments, an aggregate 8 MiB
+of lookup files, and a separate 8 MiB allowance for decoded lookup buffers. The
+decoded allowance is checked from schema and row count before materialization and
+charged for both cached and newly loaded lookups. Only fixed-width scalar lookup
+columns have a known bound with the current reader API. Variable-width keys such
+as strings/binary therefore have unknown costs: a default on such a key is kept,
+and an alternative is skipped without opening its lookup for estimation. Such
+indices remain usable through the caller's existing segment-selection path.
+
+One lookup is limited to 65,536 pages, IN predicates to 256 values, and one estimate
+to 1,000,000 page/predicate checks. Lookup batches share the Session's bounded
+metadata cache. Unknown manifest file sizes, unsupported formats, probe errors,
+or an unestimable default retain the original segment path. Bitmap and LabelList
+segments retain their existing behavior and are not cost-ranked.
+
+Statistics callbacks report `scalar_index_auto_candidates`,
+`scalar_index_auto_changed`, `scalar_index_auto_estimated_pages`,
+`scalar_index_auto_estimated_rows`, and `scalar_index_auto_full_scans`. Estimated
+rows are a page-level approximation, not an exact result count or measured latency.
+The model does not account for cache residency, projected-row width, or random
+row-fetch cost. Warm lookups avoid storage I/O but still require estimation work.
+
+## Distance-bounded vector search
+
+After configuring a single-vector nearest-neighbor query, use
+`lance_scanner_set_distance_range` or C++ `Scanner::distance_range` to restrict
+results to `lower_bound <= _distance < upper_bound`:
+
+```cpp
+const float query[] = {1.0f, 0.0f};
+auto scanner = dataset.scan();
+scanner.nearest("embedding", query, 2, 100)
+       .metric(LANCE_METRIC_L2)
+       .distance_range(std::nullopt, 0.5f);
+```
+
+This returns **at most 100** neighbors with distance below `0.5`. It is a
+range-constrained Top-K search, not an unbounded enumeration of all matches.
+For an annulus, use `.distance_range(0.2f, 0.5f)`; for a lower bound only, use
+`.distance_range(0.2f)`; `.distance_range()` clears both bounds. In C, pass
+pointers to bounds and `NULL` for an unbounded side:
+
+```c
+float upper_bound = 0.5f;
+int32_t status = lance_scanner_set_distance_range(scanner, NULL, &upper_bound);
+/* Check status and lance_last_error_* before starting the scan. */
+```
+
+Bounds are copied and must be finite. When both are set, the lower bound must
+be strictly smaller than the upper bound. Negative bounds are allowed (for
+example, Dot distances can be negative). Distances use the selected metric's
+units: L2 reports **squared Euclidean distance**, so a geometric radius `r`
+corresponds to an upper bound of `r * r`, with the boundary excluded. Index-based
+search retains Lance's approximate candidate selection; the range does not
+guarantee exhaustive recall. Use `.use_index(false)` for an exact scan, still
+subject to `k`.
+
+Set bounds after `nearest` and before starting the scan. Replacing the nearest
+query clears the bounds; an invalid range leaves the previous range unchanged.
+Multi-vector queries are not supported by this setter because their scores
+aggregate distances across subvectors.
+
+## Multi-vector search
+
+Use `lance_scanner_nearest_multivector` or the C++ `Scanner::nearest_multivector`
+method for a `List<FixedSizeList<float16|float32|float64, D>>` column:
+
+```cpp
+const float query[] = {1.0f, 0.0f, 0.0f, 1.0f};
+auto scanner = dataset.scan();
+scanner.nearest_multivector("embeddings", query, 2, 2, LANCE_DTYPE_FLOAT32, 10)
+       .metric(LANCE_METRIC_COSINE)
+       .prefilter(true);
+```
+
+The copied, row-major matrix is **one query** containing two subvectors. Results
+rank logical rows by the sum of each query subvector's minimum distance to a
+stored subvector. Empty or null outer rows do not rank. Inner vectors must be
+non-nullable; actual stored null or non-finite elements encountered during
+scoring fail the stream. Float types and dimensions must match the column.
+Cosine pairs with zero norm have undefined distance and are ignored. A row is
+excluded if any query subvector has no defined match; a zero-norm query subvector
+therefore produces no results. Column names use Lance field-path syntax,
+including nested paths such as `payload.embeddings` and backtick-quoted names.
+
+L2 is the default on every fragment. Cosine multi-vector indexes are supported
+by the pinned Lance version; incompatible metrics use exact search. Indexed
+candidates are refined against stored values (`refine_factor` defaults to 1).
+ANN candidate selection remains approximate. Limit and offset apply after
+restoring distance order, including fragment-scoped searches. Strict row batching
+is applied after that final result window, preserving full batches except the last.
+
+Queries accept at most 128 subvectors. Both `num_vectors * k` and
+`refine_factor * k` must be at most 100,000 to bound plan expansion and candidate
+allocation. The existing single-vector API and its defaults are unchanged.
+
+## Batch nearest-neighbor search
+
+Use `lance_scanner_nearest_batch` or `Scanner::nearest_batch` to search a
+`FixedSizeList<T, dimension>` column with independent query vectors:
+
+```cpp
+const float queries[] = {1.0f, 0.0f, 0.0f, 1.0f};
+auto scanner = dataset.scan();
+scanner.nearest_batch("embedding", queries, 2, 2, 10)
+       .use_index(false);
+```
+
+Here there are two queries of dimension two, each returning up to ten rows.
+The result includes the zero-based `query_index` (`int32`) and, under the legacy
+scoring default, `_distance`, alongside the requested dataset columns. A batch
+of one query still includes `query_index`. After
+`disable_scoring_autoprojection()`, `_distance` appears only when named
+explicitly in the projection. Duplicate query vectors retain distinct indices;
+queries with no matching rows produce no result rows. Result row order is not
+part of the API contract.
+
+This differs from `nearest_multivector`: that API scores one logical query
+against a `List<FixedSizeList<...>>` column and returns one ranked result set.
+Batch input requires a fixed-size vector column and rejects a dataset with a
+reserved `query_index` column. Float16, Float32, Float64, Int8, and UInt8 are accepted;
+the query element type must match the column. UInt8 uses the Hamming metric.
+Floating-point query values must be finite. Values are copied before the setter
+returns, so the caller can immediately release its input buffer.
+
+Configure the query before scanning. Successful nearest-query setters replace
+the previous query; an invalid batch request leaves it unchanged. FTS and
+nearest queries remain mutually exclusive. Distance ranges currently require a
+single-vector query; replacing it with a batch clears its bounds. All queries
+share the scanner's metric, filter, index selection, and tuning parameters.
+Existing prefilter and postfilter semantics apply; postfiltering can return
+fewer than `k` rows.
+
+The scanner's global `limit` and `offset` settings are rejected in batch mode,
+in either configuration order: they cannot represent independent result windows.
+For per-query pagination, request enough candidates with `k` and apply the window
+separately to each `query_index` in the caller.
+
+Bounds are 128 queries, 64 MiB of copied query values, and 100,000 candidates for
+`num_queries * k * refine_factor` (use 1 when refinement is unset). Explicit
+refinement must be positive. These bounds do not cap total index/payload memory;
+callers should also configure scanner resource controls. Arrow streams use the
+existing ownership and cancellation contract, including early stream release.
+
+Execution delegates to the pinned Lance scanner. Flat search can share data
+scans. Eligible IVF queries can share partition scans; HNSW, refinement, adaptive
+partition probing, and other ineligible plans use Lance's per-query fallback.
+The batch API does not guarantee shared execution or a particular speedup.
 
 ## Building
 
 There are four supported entry points; pick whichever matches your toolchain.
+Building this source tree requires Rust 1.94.0 or newer. The `from-source`
+recipes fetch the v0.1.9 tag, whose `Cargo.toml` declares
+`rust-version = "1.91.0"`. Prebuilt archives do not require a Rust toolchain.
+
+### Published prebuilt archives
+
+The v0.1.9 release publishes five archives. vcpkg and Conan currently select
+three of them:
+
+| Archive | Selected by |
+| --- | --- |
+| `lance-c-v0.1.9-x86_64-unknown-linux-gnu.tar.xz` | Not selected by the current recipes |
+| `lance-c-v0.1.9-x86_64-unknown-linux-gnu-debian12.tar.xz` | vcpkg `x64-linux`, `x64-linux-dynamic`, Conan `Linux/x86_64` |
+| `lance-c-v0.1.9-aarch64-unknown-linux-gnu.tar.xz` | vcpkg `arm64-linux`, `arm64-linux-dynamic`, Conan `Linux/armv8` |
+| `lance-c-v0.1.9-aarch64-unknown-linux-gnu-debian12.tar.xz` | Not selected by the current recipes |
+| `lance-c-v0.1.9-aarch64-apple-darwin.tar.xz` | vcpkg `arm64-osx`, `arm64-osx-dynamic`, Conan `Macos/armv8` |
+
+Intel macOS (`x86_64-apple-darwin`) uses the `from-source` path for v0.1.9.
+The release workflow now includes an Intel macOS build row for future tags.
+That row has no effect on the published v0.1.9 package set: Intel remains a
+source build until a release containing the new archive is published and the
+recipes are updated with its hash.
+
+Releases cut after the Windows package path was added also publish
+`lance-c-vX.Y.Z-x86_64-pc-windows-msvc.tar.xz` and
+`lance-c-vX.Y.Z-aarch64-pc-windows-msvc.tar.xz`; v0.1.9 predates both.
+The archives contain headers, static and shared libraries,
+CMake package files, pkg-config metadata, and the license. Windows archives
+also contain `share/doc/lance-c/README.md`. The package recipes install only
+the linkage selected for that package.
+
+Static inspection of the published Linux shared libraries found:
+
+| Archive | Highest GLIBC symbol reference | Direct dynamic dependencies |
+| --- | --- | --- |
+| x86_64 standard | `GLIBC_2.39` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` |
+| x86_64 Debian 12 | `GLIBC_2.35` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` |
+| aarch64 standard | `GLIBC_2.39` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` |
+| aarch64 Debian 12 | `GLIBC_2.35` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` |
+
+None of the Linux libraries records GLIBCXX or CXXABI version requirements.
+The macOS dylib is a thin `arm64` Mach-O binary with install name
+`@rpath/liblance_c.dylib`, `minos 11.0`, SDK `14.5`, and dependencies on
+`SystemConfiguration`, `libobjc.A.dylib`, `IOKit`, `CoreFoundation`,
+`Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`.
+
+Linux and macOS release builds produced by the current workflow strip the
+staged shared library and restrict its defined dynamic exports to the public
+`lance_*` C ABI. Windows verifies that every header-declared symbol is exported
+and currently permits additional dependency exports. The static archive is not
+stripped: it keeps the symbol table required for static linking. Archive names and layout above are unchanged, and no
+standalone shared-only artifact is added.
+
+A release-candidate x86_64 Linux build from this change measured:
+
+| Artifact | Bytes |
+| --- | --- |
+| baseline `liblance_c.so` (main `6b5c55f`) | 385,778,240 |
+| candidate `liblance_c.so` before stripping | 385,614,104 |
+| candidate `liblance_c.so` after stripping | 321,793,408 |
+| `liblance_c.a` | 1,073,016,964 |
+
+This is a candidate measurement, not a published release. The stripped
+library exported 846 `lance_*` symbols and no dependency symbols. The
+baseline shared library exported 872 symbols, including 26 `crc_fast_*`
+symbols. The static archive was byte-identical to the baseline. The
+aarch64 and macOS rows use the same policy; their sizes are produced by the
+release matrix and are not claimed by this x86_64 measurement. The v0.1.9
+table and archive labels above are historical.
+
+All Linux rows also verify the staged shared library's direct `DT_NEEDED`
+entries before the consumer and archive steps. Only glibc/toolchain SONAMEs
+(including the legacy `libpthread` and `libdl` names) are accepted;
+`libssl` and `libcrypto` are rejected.
+
+The highest GLIBC symbol reference records a dynamic-loader requirement.
+The Mach-O `minos` field records the binary's declared deployment target.
+Runtime compatibility requires consumer verification on the intended OS.
+Static archive inspection established object architecture. The complete
+binary metadata is recorded in the [artifact
+audit](https://github.com/lance-format/lance-c/blob/2c00796/validation/issue-103/RESULTS.md).
+Runtime consumer evidence covers Linux x86_64 and is recorded in the
+[issue 100 validation
+record](https://github.com/lance-format/lance-c/blob/5a29b67/validation/issue-100/RESULTS.md).
+The candidate Intel macOS row is built and executed on the hosted macOS 15
+Intel runner. Its dylib `minos` value is build metadata, not proof that macOS 11
+can run the complete static distribution; the exercised runner OS and build SDK
+are recorded in the workflow log.
 
 ### From source via cargo (Rust developers)
 
@@ -50,6 +644,60 @@ working example.
 
 Baseline values are defined once in [`.github/baseline.env`](.github/baseline.env) and loaded by CI, release workflows, and CMake.
 
+### Windows (x86_64-pc-windows-msvc and aarch64-pc-windows-msvc)
+
+The Windows package path uses the same CMake entry point:
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+cmake --install build --prefix C:\path\to\prefix --config Release
+```
+
+For a native ARM64 build, select the Visual Studio 2026 ARM64 platform:
+
+```powershell
+cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL `
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+cmake --install build --prefix C:\path\to\prefix --config Release
+```
+
+AWS-LC requires clang-cl for its Windows ARM64 assembly sources, so this path
+uses the Visual Studio ClangCL toolset.
+
+The install prefix contains `lib/lance_c.dll`, its import library
+`lib/lance_c.dll.lib`, the static library `lib/lance_c.lib`, and the public
+headers. `find_package(LanceC)` selects the static library by default; set
+`LanceC_LINK=shared` before `find_package` to link through the import library.
+The installed shared consumer must have `lance_c.dll` beside its executable or
+on its DLL search path.
+
+The Windows package link is restricted through a wrapper around MSVC
+`link.exe`. Overriding the linker with `lld-link` is not supported for this
+export policy.
+
+Windows CI builds this layout with Rust 1.94.0. The x64 job uses
+`windows-2022`. The ARM64 job uses `windows-11-arm` and asserts that the
+runner, PowerShell process, and Rust host are native ARM64. Each job verifies
+the PE32+ machine, public `lance_*` exports, and resolved runtime DLL
+dependencies, then runs static and shared C++17 consumers with `PATH`
+restricted to the Windows system directories. The ARM64 job builds both the
+package and installed consumers with the ClangCL toolset and verifies the PE
+machine of both acceptance executables before running them. The hosted Windows
+11 ARM64 baseline does not establish Windows 10 ARM64 or Windows Server ARM64
+support.
+
+The current Windows DLLs import `VCRUNTIME140.dll`, which the hosted images
+provide in `System32`. A system-only `PATH` does not prove that the package is
+self-contained on a machine without the Visual C++ Runtime. The distribution
+contract for that deployment is tracked in
+[#215](https://github.com/lance-format/lance-c/issues/215).
+
+See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
+for a reproducible native-14 C segment to Java-12 commit/query PoC.
+
 ### vcpkg
 
 ```bash
@@ -64,14 +712,20 @@ unsupported triples, opt into a source build with the `from-source` feature:
 vcpkg install 'lance-c[from-source]'  # requires Rust toolchain
 ```
 
+The prebuilt archives and vcpkg mappings are listed under [Published prebuilt
+archives](#published-prebuilt-archives). Intel macOS has no prebuilt asset in
+this release, so use `lance-c[from-source]` there. Source builds also require
+CMake and `protoc` on the build host.
+
 ### Conan
 
 ```bash
-conan install --requires=lance-c/0.1.0
+conan install --requires=lance-c/0.1.9
 ```
 
 Default path downloads prebuilts; `-o lance-c/*:from_source=True` builds
-from source via cargo.
+from source via cargo. As with vcpkg, Intel macOS must use the source path in
+this release.
 
 ### Header path
 
@@ -79,6 +733,8 @@ from source via cargo.
 #include <lance/lance.h>     // C
 #include <lance/lance.hpp>   // C++
 ```
+
+The C++ wrappers require C++17. The C header is usable from C.
 
 ## Usage
 
@@ -118,6 +774,323 @@ ds.scan()
 // consume stream...
 ```
 
+### Owned native write options
+
+`lance_native_write_options_new` copies one `LanceNativeWriteOptionsSpec` into
+an opaque `LanceNativeWriteOptions` owner. The handle maps the full representable
+native `WriteParams` surface: output shape, auto-cleanup, stable row IDs,
+`data_storage_version`, `enable_v2_manifest_paths`, session, transaction
+properties, base registration and placement, per-base storage params, external
+blob policy, blob pack-file threshold, current-format file-writer options, and
+fragment/cumulative progress callbacks. `lance_dataset_write_with_native_options`
+uses it for a committing write;
+`lance_dataset_write_uncommitted_stream_with_native_options` uses it for a
+staged write that is published through the existing transaction commit APIs.
+
+```c
+LanceWriteOptions write = {0};
+write.params.max_rows_per_file = 1;
+
+LanceNativeWriteOptionsSpec spec = {0};
+spec.write_options = &write;
+spec.has_enable_v2_manifest_paths = 1;
+spec.enable_v2_manifest_paths = false;
+spec.has_target_all_bases = 1;
+spec.target_all_bases = true;
+
+LanceNativeWriteOptions* options = lance_native_write_options_new(&spec);
+LanceDataset* out = NULL;
+if (lance_dataset_write_with_native_options(
+        "data.lance", &schema, &stream, LANCE_WRITE_CREATE, options, &out) != 0) {
+    /* read lance_last_error_* */
+}
+lance_native_write_options_close(options);
+```
+
+The C++ RAII wrapper is `lance::NativeWriteOptions` with
+`lance::NativeWriteOptionsSpec`; use `Dataset::write_with_native_options` and
+`Dataset::write_uncommitted_with_native_options`.
+
+The returned staged transaction owns only uncommitted data-file metadata. It
+does not retain the options handle, session, storage accessor or commit lock;
+pass those owners to the later commit when commit I/O needs them.
+
+Option presence is preserved. A NULL list pointer maps to native `None`; a
+non-NULL list pointer with count zero maps to `Some(empty)`. An explicit empty
+target list and all native target-base conflicts are reported by Lance core,
+not reconstructed here. `target_all_bases` resolves primary storage as ID 0
+and registered bases by ascending ID, with primary first when included.
+
+Progress callbacks receive actual native events. Fragment begin/complete
+callbacks receive a borrowed `LanceWriteFragmentProgressInfo`; the write-stats
+callback receives cumulative native `WriteStats`. Fragment callbacks may report
+an error and may run concurrently on native worker threads. Write-stats has no
+native error channel. Ownership of the progress context transfers only when
+`lance_native_write_options_new` succeeds, and the release callback runs
+exactly once when the final native owner drops. Closing the options handle does
+not invalidate already-committed datasets or returned transactions.
+
+Native trait-object hooks that cannot be represented in C remain explicit gaps:
+custom Rust object stores and store wrappers, custom commit handlers other than
+`LanceCommitLock`, and feature-gated AWS credential providers. Global
+`ObjectStoreParams` scalar fields beyond the storage accessor are also not
+exposed; per-base `ObjectStoreParams` supports the accessor, block size, S3
+credential refresh offset, constant-size upload parts, and lexical ordering.
+Native object-store resolution, validation, defaults and errors remain
+authoritative.
+
+### Native transactions
+
+`Dataset::write_uncommitted` maps to `InsertBuilder::execute_uncommitted_stream`
+and returns an owned native transaction. The stream is consumed, but data files
+remain uncommitted until the transaction is published:
+
+```cpp
+ArrowArrayStream stream = source_stream();
+lance::UncommittedWriteOptions write_options;
+write_options.write.params.max_rows_per_file = 1;
+write_options.transaction_properties =
+    std::vector<std::pair<std::string, std::string>>{{"engine", "cpp"}};
+
+auto transaction = lance::Dataset::write_uncommitted(
+    "data.lance", &stream, lance::WriteMode::Append, write_options);
+auto operation = transaction.operation();
+assert(operation.kind() == lance::OperationKind::Append);
+assert(operation.fragment_count() > 0);
+
+auto bytes = transaction.to_proto();
+auto parsed = lance::Transaction::from_proto(bytes);
+auto dataset = lance::Dataset::commit("data.lance", parsed);
+auto committed = dataset.read_transaction();
+auto version_one = dataset.read_transaction_by_version(1);
+```
+
+Fragment deletion writes native deletion files before publication. The returned
+fragment metadata is used by its scanner, so staged reads, takes and counts see
+the deletion immediately:
+
+```cpp
+auto fragment = dataset.open_fragment(dataset.fragment_ids()[0]);
+auto updated = fragment.delete_if("id = 3");  // nullopt if every row is deleted
+if (updated) {
+    auto operation = lance::Operation::make_delete(
+        {&*updated}, {}, "id = 3");
+    lance::TransactionOptions options;
+    options.tag = "fragment-delete";
+    options.transaction_properties =
+        std::vector<std::pair<std::string, std::string>>{
+            {"owner=team", "analytics"},
+            {"empty", ""},
+        };
+    auto transaction = lance::Transaction::from_operation(
+        dataset.version(), operation, options);
+    dataset = lance::Dataset::commit("data.lance", transaction);
+}
+```
+
+Deleting every row returns `std::nullopt`; put that fragment ID in
+`Operation::make_delete`'s deleted-ID list instead. An explicit
+`Scanner::fragment_ids()` replaces the staged metadata selection; a zero-length
+selection selects no fragments. The C entry points are
+`lance_fragment_delete`, `lance_operation_delete_new` and
+`lance_transaction_new`. Native commit validation and conflict handling remain
+authoritative.
+
+Append batches use native `CommitBuilder::execute_batch` and return both the
+actual merged transaction and a new dataset:
+
+```cpp
+std::vector<std::reference_wrapper<const lance::Transaction>> batch{
+    std::cref(first), std::cref(second)};
+auto result = lance::Dataset::commit_batch("data.lance", batch);
+```
+
+The C entry points are `lance_dataset_write_uncommitted_stream`,
+`lance_transaction_commit`, `lance_transaction_commit_batch`,
+`lance_dataset_read_transaction`, and
+`lance_dataset_read_transaction_by_version`. Native defaults remain omitted in
+`LanceCommitOptions`; explicit zero retries, zero retry budget, disabled timeout
+and explicit timeout values are forwarded without reinterpretation.
+
+This delivery exposes writer-generated Append and Overwrite operations plus a
+typed Delete constructor for the native fragment-delete workflow. Other typed
+Update/Merge/Restore/Clone/Rewrite/index/schema operation constructors and
+callback-based commit locks remain later issue #112 scope.
+Transaction values are independent snapshots: closing their source dataset,
+stream, or derived operation handle does not invalidate them.
+
+Native protobuf conversion is the transport contract. `Operation::Unknown`
+decodes but cannot be re-encoded or committed, empty tag/property maps normalize
+to absent, and the pinned core does not preserve Overwrite schema metadata
+through its separate protobuf field. The pinned core's CommitBuilder also does
+not apply its separate `with_transaction_properties` field in `execute` or
+`execute_batch`; this binding therefore carries properties on the uncommitted
+transaction.
+
+A failed commit performs no binding-side rollback. Data files may remain, and
+an I/O failure can leave publication uncertain. Reopen the URI to establish the
+actual version before retrying. Detached commits follow native behavior: they do
+not appear in main history, and the pinned core rejects using one to create a
+new dataset.
+
+### Share metadata and index caches
+
+Use a session to share Lance's metadata and index caches across dataset
+handles. Cache limits are bytes; zero requests zero capacity for the
+corresponding cache.
+
+```c
+LanceSession* session = lance_session_new(
+    6ULL * 1024 * 1024 * 1024,
+    1ULL * 1024 * 1024 * 1024);
+LanceDataset* ds =
+    lance_dataset_open_with_session("data.lance", NULL, 0, session);
+
+LanceSessionCacheStats stats;
+lance_session_get_cache_stats(session, &stats);
+
+lance_session_close(session);  /* ds remains valid */
+lance_dataset_close(ds);
+```
+
+```cpp
+lance::Session session(
+    6ULL * 1024 * 1024 * 1024,
+    1ULL * 1024 * 1024 * 1024);
+auto ds = lance::Dataset::open_with_session(session, "data.lance");
+auto stats = session.cache_stats();
+```
+
+Each tier can independently use the native default, an explicit capacity, a
+backend URI, or a backend kind plus options. `Default` and an explicit zero
+capacity are different choices.
+
+```c
+LanceSessionCacheSpec index = {0};
+index.kind = LANCE_SESSION_CACHE_SPEC_URI;
+index.backend_uri = "moka://?capacity=67108864";
+
+LanceSessionCacheSpec metadata = {0};
+metadata.kind = LANCE_SESSION_CACHE_SPEC_SIZE;
+metadata.size_bytes = 0; /* explicit zero capacity */
+
+LanceSession* session = lance_session_new_with_cache_specs(&index, &metadata);
+uint64_t size_bytes = 0;
+uint64_t approx_items = 0;
+lance_session_get_size_bytes(session, &size_bytes);
+lance_session_get_approx_num_items(session, &approx_items);
+```
+
+```cpp
+lance::Session session(
+    lance::SessionCacheSpec::from_uri("moka://?capacity=67108864"),
+    lance::SessionCacheSpec::with_size(0));
+auto size_bytes = session.size_bytes();
+auto approx_items = session.approx_num_items();
+```
+
+`size_bytes()` is the native deep size of live session state, not an RSS
+measurement or a configured limit. `approx_num_items()` is explicitly
+approximate and may change as cache maintenance runs.
+
+### Vector index build options
+
+`lance_dataset_create_vector_index` and
+`lance_index_segment_builder_new_vector` retain the original
+`LanceVectorIndexParams` ABI and its zero-as-default rules. IVF_RQ is value 107;
+its legacy `num_bits == 0` selects the native RQ default of 5.
+
+Use `lance_dataset_create_vector_index_with_options` and
+`lance_index_segment_builder_new_vector_with_options` when a build needs native
+presence semantics. `LanceVectorIndexOptions` distinguishes an absent value from
+an explicit zero, supports automatic or explicit IVF sizing, training/sampling
+and streaming controls, precomputed partitions/shuffle inputs, storage and
+runtime hints, PQ parameters/models, native IVF/PQ Arrow model pairs, RQ JSON,
+HNSW tuning, index file version, transpose control, and the native train flag.
+`options->has_train == false` retains the native train=true default.
+
+```c
+LanceVectorIndexOptions options = {0};
+options.index_type = LANCE_INDEX_IVF_RQ;
+options.metric = LANCE_METRIC_L2;
+options.num_partitions = (LanceOptionalU64){256, true}; /* absent: native auto */
+options.num_bits = (LanceOptionalU64){5, true};
+const char* rq_model = lance_index_build_rq_model(128, 0); /* 0 -> native 5 */
+options.rabitq_model_json = rq_model;
+int32_t status = lance_dataset_create_vector_index_with_options(
+    dataset, "embedding", "embedding_idx", &options, false);
+lance_free_string(rq_model);
+```
+
+```cpp
+lance::VectorIndexOptions options;
+options.index_type = LANCE_INDEX_IVF_RQ;
+options.num_partitions = 256;
+options.rabitq_model_json = lance::build_rq_model(128);
+dataset.create_vector_index_with_options("embedding", options);
+```
+
+String maps must contain valid UTF-8. Duplicate keys use Rust HashMap
+last-write-wins semantics. Fragment selection preserves native None versus
+Some(empty); Lance decides duplicate and missing-ID validation at build time.
+Native Arrow model pointers are borrowed synchronously and may be replaced while
+a live caller-owned equivalent remains in place. `IndexModel::adopt` transfers
+caller-produced native Arrow structs and clears the input structs, allowing
+model dtypes beyond the legacy trainer's Float32 representation.
+
+Uncommitted builders copy their dataset snapshot, strings, maps, paths, fragment
+IDs and UUIDs. The committed options entry point follows native publication:
+Lance commits first and then reloads index metadata, so an error can be returned
+after a new dataset version was published. Reopen the dataset to determine its
+current version; the binding does not claim storage rollback on such errors.
+
+### Prewarm an index synchronously
+
+Prewarm a logical index before serving queries to move cold index reads out of
+foreground query execution. The call blocks until the Rust SDK's
+`Dataset::prewarm_index` finishes for all segments with that name in the dataset
+handle's snapshot. It does not create an index or change the dataset version.
+
+```c
+LanceSession* session = lance_session_new(64 * 1024 * 1024, 16 * 1024 * 1024);
+if (!session) return -1;
+LanceDataset* ds = lance_dataset_open_with_session("data.lance", NULL, 0, session);
+if (!ds) {
+    lance_session_close(session);
+    return -1;
+}
+/* Assumes an index named embedding_idx already exists. */
+int32_t status = lance_dataset_prewarm_index(ds, "embedding_idx");
+if (status != 0) {
+    const char* message = lance_last_error_message();
+    fprintf(stderr, "%s\n", message);
+    lance_free_string(message);
+}
+lance_dataset_close(ds);
+/* Keep session alive and reuse it when opening subsequent query datasets. */
+lance_session_close(session);
+```
+
+```cpp
+lance::Session session(64 * 1024 * 1024, 16 * 1024 * 1024);
+auto ds = lance::Dataset::open_with_session(session, "data.lance");
+ds.prewarm_index("embedding_idx"); // Blocks; throws lance::Error on failure.
+```
+
+The destination is the dataset's process-local session index cache. Reusing the
+same session across handles preserves warmed entries after a dataset closes.
+Independent sessions and other processes do not share that cache. Entries remain
+evictable: success guarantees completion, not that the entire index fits in the
+cache or remains resident. Replacing an index creates new segments that must be
+warmed separately; historical handles still use their own snapshots. A failure
+can leave partially warmed entries in the cache; retrying is safe.
+
+This binding uses the SDK's index-specific prewarm behavior without additional
+options. Tests cover multi-segment IVF-Flat and B-tree indexes; other index types
+and formats follow the underlying SDK's support and error behavior. It does not
+prewarm ordinary data columns or eliminate result-row reads, and it adds no
+persistent cache, automatic refresh, or background task management.
+
 ### Open at a specific version
 
 `lance_dataset_open` takes a `version` argument — `0` means the latest, any
@@ -132,9 +1105,99 @@ LanceDataset* ds = lance_dataset_open("data.lance", NULL, 42);
 auto ds = lance::Dataset::open("data.lance", {}, /*version=*/42);
 ```
 
+Native refs can also select a version, the latest version on a branch, or a tag:
+
+```c
+LanceRef* ref = lance_ref_tag("release-2026-11");
+LanceDataset* ds = lance_dataset_checkout_ref(source, ref);
+lance_ref_close(ref);
+```
+
+```cpp
+auto ds = source.checkout(lance::Ref::tag("release-2026-11"));
+auto tags = ds.tags();
+```
+
+`lance_dataset_current_version()`, `lance_dataset_version_refs()` and
+`lance_dataset_tags()` return copied snapshots. They remain valid after the
+originating dataset handle is closed. Timestamp accessors expose native
+nanosecond precision; the existing millisecond version accessor is unchanged.
+Nanosecond accessors report an error when a timestamp does not fit i64
+nanoseconds. Snapshot creation and millisecond reads retain the native range.
+There is no C-side timestamp/asof selector.
+
+Branches use the public Lance 14.0.2 branch lifecycle:
+
+```cpp
+auto branch = source.create_branch(
+    "feature/next", lance::Ref::version(
+        std::optional<std::string>("main"), std::optional<uint64_t>(2)));
+auto checked_out = source.checkout_branch("feature/next");
+branch.replace_branch_metadata("feature/next", {{"owner", "team"}});
+auto branches = source.branches_json();
+auto contents = source.get_branch_json("feature/next");
+auto identifier = branch.branch_identifier_json();
+```
+
+`lance_dataset_branch_create()` accepts the source dataset's store params when
+its storage-options pointer is `NULL`; a non-`NULL`, empty array requests
+explicit empty object-store params. Native creation is a non-atomic shallow
+clone followed by a `BranchContents` write. If creation leaves a branch
+dataset without `BranchContents`, use `lance_dataset_branch_force_delete()` to
+remove it. Normal deletion still rejects branches referenced by a child branch
+or a tag. Reusing an existing branch name may fail in the native shallow-clone
+phase rather than reaching the `BranchContents` conflict check.
+
+Branch JSON is the selected Lance core's serde representation, not a new C
+metadata model. The list is an object keyed by branch name; each
+`BranchContents` includes `parentBranch`, `identifier.version_mapping`,
+`parentVersion`, `createAt` in Unix seconds, `manifestSize`, and `metadata`.
+Map enumeration order is unspecified. Branch metadata replacement writes the
+whole native map, so an empty map clears all entries.
+
+### Deep clone a dataset
+
+`lance_dataset_deep_clone` copies one source snapshot into a new target dataset
+using native `Dataset::deep_clone`. A `NULL` reference clones the source
+handle's current snapshot; pass a `LanceRef` to select the current head, a
+version, a tag, or a branch:
+
+```c
+LanceDataset* copy = NULL;
+if (lance_dataset_deep_clone(ds, "copy.lance", NULL, NULL, &copy) != 0) {
+    /* handle error */
+}
+
+LanceRef* ref = lance_ref_version_number(7);
+LanceDataset* at_seven = NULL;
+int32_t rc = lance_dataset_deep_clone(ds, "copy-v7.lance", ref, NULL, &at_seven);
+lance_ref_close(ref);
+```
+
+```cpp
+lance::Dataset copy = ds.deep_clone("copy.lance");
+auto ref = lance::Ref::version_number(7);
+lance::Dataset at_seven = ds.deep_clone("copy-v7.lance", &ref);
+```
+
+The target must not exist yet. The returned handle is a normal dataset whose
+version id is the cloned snapshot's version; the source handle keeps its
+snapshot and no source write lock is held during copying. The optional storage
+options accessor contributes its native `Arc` without resolving or copying
+credentials; NULL, or an accessor created with neither static options nor a
+provider, passes native `None`. For datasets with additional base paths, native
+deep clone reads them through the source dataset's object store; per-base
+distinct source credentials are not supported. Native clone commits resolve the
+target URI through the default object-store registry, so target schemes
+registered only on a custom session are rejected. A copy or commit error does
+not guarantee that the target remains unpublished; reopen the target to check
+its state. Copied objects may remain under the target path and are not rolled
+back.
+
 ## Releasing
 
-Releases are tag-driven: pushing a `v*.*.*` tag fires [`release.yml`](.github/workflows/release.yml), which builds prebuilt tarballs for `linux-{x86_64,aarch64}` and `macos-aarch64` and attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. (`macos-x86_64` is temporarily disabled — see the matrix comment in `release.yml`.)
+Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds eight prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, macOS arm64 and Intel x86_64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the restored Intel and Windows rows; its published matrix remains the five archives listed above.
+Before the consumer smoke test and archive upload, the Linux and macOS build rows strip the staged shared library and verify its exports. Linux rows also verify direct runtime dependencies; Windows verifies PE architecture, public exports, and DLL loading through its installed consumers.
 
 ### Recommended: cut a release via Actions UI
 
@@ -150,7 +1213,7 @@ Releases are tag-driven: pushing a `v*.*.*` tag fires [`release.yml`](.github/wo
    - Commits as `github-actions[bot]` with message `chore: bump version to <version>`.
    - Pushes the commit to `main` and pushes the tag.
    - Dispatches `release.yml` at the new tag's ref. (Direct tag push by `GITHUB_TOKEN` does not trigger workflows — GitHub's recursion guard — so we explicitly `gh workflow run` instead.)
-4. `release.yml` builds artifacts. ~20 minutes later the [GitHub Release](https://github.com/lance-format/lance-c/releases) has all four `.tar.xz` artifacts plus a `SHA512SUMS` file.
+4. `release.yml` builds artifacts. Once the tag includes all rows, the [GitHub Release](https://github.com/lance-format/lance-c/releases) has `.tar.xz` artifacts for Linux x86_64/aarch64, their Debian 12 variants, macOS arm64/Intel x86_64, and Windows x86_64/aarch64, plus a `SHA512SUMS` file. The v0.1.9 release remains the historical five-asset set above.
 5. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
    - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
    - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
@@ -178,7 +1241,7 @@ If you need to cut a release without the workflow (e.g. local tag with extra com
    git tag v0.2.0
    git push origin v0.2.0
    ```
-5. `release.yml` fires on the tag push and builds the four prebuilt tarballs as above.
+5. `release.yml` fires on the tag push and builds the seven prebuilt tarballs as above.
 
 A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 

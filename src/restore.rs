@@ -4,7 +4,7 @@
 //! Restore C API: move a dataset's latest back to an older version by
 //! committing a new manifest whose fragments match the chosen version.
 //!
-//! Returns a fresh `LanceDataset*` positioned at the target version; the
+//! Returns a fresh `LanceDataset*` positioned at the newly committed version; the
 //! caller's original handle is untouched and remains usable.
 
 use std::sync::{Arc, RwLock};
@@ -27,7 +27,7 @@ use crate::runtime::block_on;
 /// current latest — this guarantees the caller's stated intent ("make `version`
 /// the new latest") holds under concurrent writers without a TOCTOU race.
 ///
-/// Returns a fresh `LanceDataset*` positioned at the target version on success
+/// Returns a fresh `LanceDataset*` positioned at the newly committed version
 /// (caller closes with `lance_dataset_close`), or NULL on error. Errors include
 /// `LANCE_ERR_NOT_FOUND` for an unknown `version` and `LANCE_ERR_COMMIT_CONFLICT`
 /// for a concurrent commit race.
@@ -41,16 +41,14 @@ pub unsafe extern "C" fn lance_dataset_restore(
 
 unsafe fn restore_inner(dataset: *const LanceDataset, version: u64) -> Result<*mut LanceDataset> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     if version == 0 {
-        return Err(lance_core::Error::InvalidInput {
-            source: "version must be >= 1; 0 is reserved as the \"latest\" sentinel".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "version must be >= 1; 0 is reserved as the \"latest\" sentinel".into(),
+        ));
     }
 
     let ds = unsafe { &*dataset };

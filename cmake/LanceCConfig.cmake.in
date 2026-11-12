@@ -6,8 +6,14 @@
 set_and_check(_LANCE_C_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
 set_and_check(_LANCE_C_LIB_DIR     "@PACKAGE_CMAKE_INSTALL_LIBDIR@")
 
-set(_lance_c_static "${_LANCE_C_LIB_DIR}/liblance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
-set(_lance_c_shared "${_LANCE_C_LIB_DIR}/liblance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
+if(WIN32)
+    set(_lance_c_static "${_LANCE_C_LIB_DIR}/lance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    set(_lance_c_shared "${_LANCE_C_LIB_DIR}/lance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    set(_lance_c_import "${_LANCE_C_LIB_DIR}/lance_c.dll${CMAKE_STATIC_LIBRARY_SUFFIX}")
+else()
+    set(_lance_c_static "${_LANCE_C_LIB_DIR}/liblance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    set(_lance_c_shared "${_LANCE_C_LIB_DIR}/liblance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
+endif()
 
 # Platform link requirements (must match build-tree CMakeLists.txt).
 set(_lance_c_platform_deps "")
@@ -19,22 +25,30 @@ if(APPLE)
         "-framework SystemConfiguration")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND _lance_c_platform_deps pthread dl m)
+elseif(WIN32)
+    list(APPEND _lance_c_platform_deps
+        advapi32 bcrypt dbghelp kernel32 mswsock ntdll ole32 userenv ws2_32)
 endif()
 
 if(EXISTS "${_lance_c_static}" AND NOT TARGET LanceC::lance_c_static)
-    add_library(LanceC::lance_c_static UNKNOWN IMPORTED)
+    add_library(LanceC::lance_c_static STATIC IMPORTED)
     set_target_properties(LanceC::lance_c_static PROPERTIES
         IMPORTED_LOCATION "${_lance_c_static}"
         INTERFACE_INCLUDE_DIRECTORIES "${_LANCE_C_INCLUDE_DIR}"
         INTERFACE_LINK_LIBRARIES "${_lance_c_platform_deps}")
 endif()
 
-if(EXISTS "${_lance_c_shared}" AND NOT TARGET LanceC::lance_c_shared)
-    add_library(LanceC::lance_c_shared UNKNOWN IMPORTED)
+if(EXISTS "${_lance_c_shared}" AND (NOT WIN32 OR EXISTS "${_lance_c_import}")
+        AND NOT TARGET LanceC::lance_c_shared)
+    add_library(LanceC::lance_c_shared SHARED IMPORTED)
     set_target_properties(LanceC::lance_c_shared PROPERTIES
         IMPORTED_LOCATION "${_lance_c_shared}"
         INTERFACE_INCLUDE_DIRECTORIES "${_LANCE_C_INCLUDE_DIR}"
         INTERFACE_LINK_LIBRARIES "${_lance_c_platform_deps}")
+    if(WIN32)
+        set_target_properties(LanceC::lance_c_shared PROPERTIES
+            IMPORTED_IMPLIB "${_lance_c_import}")
+    endif()
 endif()
 
 # Resolve LanceC::lance_c alias to whichever linkage the consumer requested.

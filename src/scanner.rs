@@ -3,29 +3,63 @@
 
 //! Scanner C API: builder, sync iteration, async scan, poll-based iteration.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::pin::Pin;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow_array::Int64Array;
 use arrow_schema::SchemaRef;
-use futures::{Stream, StreamExt};
+use datafusion::physical_expr::expressions;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::{
+    ExecutionPlan, empty::EmptyExec, projection::ProjectionExec as DFProjectionExec,
+};
+use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
-use lance::dataset::scanner::DatasetRecordBatchStream;
+use lance::dataset::fragment::FileFragment;
+use lance::dataset::scanner::{
+    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
+    ExecutionSummaryCounts, MaterializationStyle, RowAddrMask, RowAddrTreeMap,
+};
+use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use lance_core::Result;
+use lance_core::datatypes::{BlobHandling, escape_field_path_for_project};
+use lance_datafusion::exec::{
+    LanceExecutionOptions, analyze_plan as analyze_execution_plan, execute_plan,
+};
 use lance_index::scalar::FullTextSearchQuery;
-use lance_io::ffi::to_ffi_arrow_array_stream;
+use lance_index::scalar::minhash_lsh::MinHashQuery;
+use lance_index::vector::ApproxMode;
 use lance_io::stream::RecordBatchStream;
+use lance_table::format::{Fragment, IndexMetadata};
 use uuid::Uuid;
 
 use crate::async_dispatcher::{self, LanceCallback};
 use crate::batch::LanceBatch;
 use crate::dataset::LanceDataset;
-use crate::error::{LanceErrorCode, clear_last_error, ffi_try, set_lance_error, set_last_error};
+use crate::error::{
+    FfiFailure, LanceErrorCode, clear_last_error, error_code_from_lance, ffi_guard_with, ffi_try,
+    panic_payload_message, set_lance_error, set_last_error, swallow_unwind,
+};
+use crate::fts_query::{
+    FtsQueryContextInner, LanceFtsQuery, LanceFtsQueryContext, PreparedFtsQuery, clone_context,
+    clone_query, parse_segment_uuids,
+};
 use crate::helpers;
 use crate::runtime::{RT, block_on};
+use crate::scalar_segment::PreparedScalarSegment;
+use crate::stream_guard::GuardedReader;
+
+const DISTANCE_COLUMN: &str = "_distance";
+/// Prefix for the binding-private column that carries the native distance
+/// through the caller's final projection. Projection expressions may rename or
+/// transform `_distance`, so the result window cannot rank on the output name.
+const MULTIVECTOR_WINDOW_DISTANCE_COLUMN: &str = "_lance_c_multivector_distance";
 
 /// Data type tag for query vectors, mirroring the C enum `LanceDataType`.
 #[repr(i32)]
@@ -38,36 +72,377 @@ pub enum LanceDataType {
     Int8 = 4,
 }
 
+/// Speed / accuracy tradeoff for approximate vector search, mirroring the C
+/// enum `LanceApproxMode`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceApproxMode {
+    Fast = 0,
+    Normal = 1,
+    Accurate = 2,
+}
+
+impl LanceApproxMode {
+    fn from_i32(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Fast),
+            1 => Ok(Self::Normal),
+            2 => Ok(Self::Accurate),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!("approx_mode must be 0 (FAST), 1 (NORMAL), or 2 (ACCURATE), got {value}")
+                    .into(),
+            )),
+        }
+    }
+
+    fn to_approx_mode(self) -> ApproxMode {
+        match self {
+            Self::Fast => ApproxMode::Fast,
+            Self::Normal => ApproxMode::Normal,
+            Self::Accurate => ApproxMode::Accurate,
+        }
+    }
+}
+
+/// Materialization style for ordinary scanner payload columns, mirroring the
+/// C enum `LanceMaterializationStyle`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceMaterializationStyle {
+    Heuristic = 0,
+    AllLate = 1,
+    AllEarly = 2,
+    AllEarlyExcept = 3,
+}
+
+impl LanceMaterializationStyle {
+    fn from_i32(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Heuristic),
+            1 => Ok(Self::AllLate),
+            2 => Ok(Self::AllEarly),
+            3 => Ok(Self::AllEarlyExcept),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "materialization_style must be 0 (HEURISTIC), 1 (ALL_LATE), 2 (ALL_EARLY), or 3 (ALL_EARLY_EXCEPT), got {value}"
+                )
+                .into(),
+            )),
+        }
+    }
+}
+
+/// Sort direction for one scanner ordering key, mirroring the C enum
+/// `LanceOrderDirection`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceOrderDirection {
+    Ascending = 0,
+    Descending = 1,
+}
+
+/// NULL placement for one scanner ordering key, mirroring the C enum
+/// `LanceNullOrder`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceNullOrder {
+    NullsLast = 0,
+    NullsFirst = 1,
+}
+
+/// One native scanner ordering key, mirroring the C struct
+/// `LanceColumnOrdering`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LanceColumnOrdering {
+    pub column_name: *const c_char,
+    pub direction: i32,
+    pub null_order: i32,
+}
+
+/// One scanner projection entry, mirroring the C struct
+/// `LanceProjectionColumn`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LanceProjectionColumn {
+    pub output_name: *const c_char,
+    pub expression: *const c_char,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionExpression {
+    output_name: String,
+    expression: String,
+}
+
+/// A scanner has exactly one projection source: the legacy column list passed
+/// to `lance_scanner_new`, an ordered SQL-expression projection, or no
+/// projection at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProjectionSelection {
+    Columns(Vec<String>),
+    Expressions(Vec<ProjectionExpression>),
+}
+
+impl ProjectionSelection {
+    fn conflicts_with_output(&self, name: &str) -> bool {
+        match self {
+            Self::Columns(columns) => columns
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case(name)),
+            Self::Expressions(columns) => columns
+                .iter()
+                .any(|column| column.output_name.eq_ignore_ascii_case(name)),
+        }
+    }
+}
+
+/// Fragment scope carried by a scanner.
+///
+/// `All` uses the dataset snapshot's default fragment set. `Ids` resolves
+/// native metadata from that snapshot. `Metadata` carries the exact native
+/// fragment values supplied by a staged fragment operation.
+#[derive(Clone, Debug)]
+enum FragmentSelection {
+    All,
+    Ids(Vec<u64>),
+    Metadata(Vec<Fragment>),
+}
+
+impl FragmentSelection {
+    fn is_restricted(&self) -> bool {
+        !matches!(self, Self::All)
+    }
+
+    fn scalar_segment_ids(&self) -> Option<Vec<u64>> {
+        match self {
+            Self::Ids(ids) if !ids.is_empty() => Some(ids.clone()),
+            Self::Metadata(fragments) if !fragments.is_empty() => {
+                Some(fragments.iter().map(|fragment| fragment.id).collect())
+            }
+            Self::All | Self::Ids(_) | Self::Metadata(_) => None,
+        }
+    }
+}
+
 /// Opaque scanner handle. Stores configuration until stream materialization.
 pub struct LanceScanner {
     dataset: Arc<Dataset>,
-    columns: Option<Vec<String>>,
+    projection: Option<ProjectionSelection>,
+    disable_scoring_autoprojection: bool,
     filter: Option<String>,
     substrait_filter: Option<Vec<u8>>,
+    substrait_aggregate: Option<Vec<u8>>,
+    additional_sql_filters: Vec<String>,
+    blob_handling: Option<BlobHandling>,
     limit: Option<i64>,
     offset: Option<i64>,
     batch_size: Option<usize>,
+    batch_size_bytes: Option<u64>,
+    strict_batch_size: Option<bool>,
+    io_buffer_size: Option<u64>,
+    batch_readahead: Option<usize>,
+    fragment_readahead: Option<usize>,
+    target_parallelism: Option<usize>,
+    scan_in_order: Option<bool>,
+    use_scalar_index: Option<bool>,
+    use_stats: Option<bool>,
     with_row_id: bool,
-    fragment_ids: Option<Vec<u64>>,
+    with_row_address: bool,
+    include_deleted_rows: bool,
+    fragment_selection: FragmentSelection,
+    // External row prefilter keyed in the dataset's `_rowid` space; combined into
+    // a single `RowAddrMask` (allowed AND NOT blocked) when the scanner is built.
+    row_addr_allowlist: Option<RowAddrTreeMap>,
+    row_addr_blocklist: Option<RowAddrTreeMap>,
     index_segments: Option<Vec<Uuid>>,
+    scalar_index_segment: Option<Uuid>,
+    scalar_index_auto_selection: bool,
     nearest: Option<NearestQuery>,
-    nprobes: Option<u32>,
+    probe: ProbeConfig,
+    approx_mode: Option<LanceApproxMode>,
+    query_parallelism: Option<i32>,
     refine_factor: Option<u32>,
     ef: Option<u32>,
     metric_override: Option<crate::index::LanceMetricType>,
     use_index: Option<bool>,
     prefilter: bool,
+    materialization_style: MaterializationStyle,
+    fast_search: bool,
+    minhash_query: Option<MinHashQuery>,
     fts_query: Option<FullTextSearchQuery>,
+    fts_context: Option<Arc<FtsQueryContextInner>>,
+    fts_index_segments: Option<Vec<Uuid>>,
+    order_by: Option<Vec<ColumnOrdering>>,
+    // Set when a panic is caught in any operation on this scanner (issue #61):
+    // once poisoned, every later `lance_scanner_*` call on this handle (except
+    // `lance_scanner_close`, which must always free memory) fails with
+    // `LANCE_ERR_PANIC`. Behind an `Arc` so the exported-stream wrapper and
+    // the spawned async task can poison the handle from outside this call
+    // frame via `poison_flag()`.
+    poisoned: Arc<AtomicBool>,
+    // Every RawWaker handed to the poll stream registers here. Close retires
+    // the registry before dropping the stream: pending callbacks are
+    // cancelled and callbacks already in progress are allowed to quiesce
+    // before the caller may destroy callback_ctx.
+    poll_wakers: PollWakerRegistry,
+    scan_statistics_callback: Option<ExecutionStatsCallback>,
+    scan_started: AtomicBool,
     // Materialized on first iteration call
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
     #[allow(dead_code)]
     schema: Option<SchemaRef>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NearestMode {
+    Single,
+    MultiVector,
+    Batch { num_queries: usize },
+}
+
+const MAX_BATCH_QUERIES: usize = 128;
+const MAX_BATCH_QUERY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BATCH_CANDIDATES: usize = 100_000;
+
+fn batch_query_value_count(dimension: usize, num_queries: usize, width: usize) -> Result<usize> {
+    // Check both products before constructing an FFI slice, including on 32-bit targets.
+    let overflow = || {
+        let message = format!(
+            "batch query byte size overflows usize: dimension={dimension}, num_queries={num_queries}, element_width={width}"
+        );
+        lance_core::Error::invalid_input_source(message.into())
+    };
+    let count = dimension.checked_mul(num_queries).ok_or_else(overflow)?;
+    let bytes = count.checked_mul(width).ok_or_else(overflow)?;
+    if bytes > MAX_BATCH_QUERY_BYTES {
+        let message = format!(
+            "batch query byte size {bytes} exceeds limit {MAX_BATCH_QUERY_BYTES}: dimension={dimension}, num_queries={num_queries}, element_width={width}"
+        );
+        return Err(lance_core::Error::invalid_input_source(message.into()));
+    }
+    Ok(count)
+}
+
+fn validate_batch_candidates(num_queries: usize, k: u32, refine_factor: Option<u32>) -> Result<()> {
+    let refine = refine_factor.unwrap_or(1) as usize;
+    if refine == 0
+        || num_queries
+            .checked_mul(k as usize)
+            .and_then(|n| n.checked_mul(refine))
+            .is_none_or(|n| n > MAX_BATCH_CANDIDATES)
+    {
+        return Err(lance_core::Error::invalid_input_source(format!(
+            "batch num_queries ({num_queries}) * k ({k}) * refine_factor ({refine}) must be in 1..={MAX_BATCH_CANDIDATES}"
+        ).into()));
+    }
+    Ok(())
+}
+
 struct NearestQuery {
+    mode: NearestMode,
     column: String,
     query: arrow_array::ArrayRef,
     k: u32,
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
+}
+
+/// Native probe intent. `nprobes` is kept separate from explicit bounds so a
+/// later `search_effort` can ignore the fixed count without discarding the
+/// caller's explicit minimum and maximum.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ProbeConfig {
+    nprobes: Option<u32>,
+    minimum: Option<u32>,
+    maximum: Option<u32>,
+    search_effort: Option<f64>,
+}
+
+impl ProbeConfig {
+    fn with_nprobes(self, nprobes: u32) -> Result<Self> {
+        if nprobes == 0 {
+            return Err(lance_core::Error::invalid_input_source(
+                "nprobes must be greater than 0, got 0".into(),
+            ));
+        }
+        Ok(Self {
+            nprobes: Some(nprobes),
+            search_effort: self.search_effort,
+            ..Self::default()
+        })
+    }
+
+    fn with_minimum(self, minimum_nprobes: u32) -> Result<Self> {
+        if minimum_nprobes == 0 {
+            return Err(lance_core::Error::invalid_input_source(
+                "minimum_nprobes must be greater than 0, got 0".into(),
+            ));
+        }
+        if let Some(maximum_nprobes) = self.maximum
+            && minimum_nprobes > maximum_nprobes
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "minimum_nprobes ({minimum_nprobes}) must not exceed maximum_nprobes ({maximum_nprobes})"
+                )
+                .into(),
+            ));
+        }
+        Ok(Self {
+            minimum: Some(minimum_nprobes),
+            ..self
+        })
+    }
+
+    fn with_maximum(self, maximum_nprobes: u32) -> Result<Self> {
+        if maximum_nprobes == 0 {
+            return Err(lance_core::Error::invalid_input_source(
+                "maximum_nprobes must be greater than 0, got 0".into(),
+            ));
+        }
+        if let Some(minimum_nprobes) = self.minimum
+            && maximum_nprobes < minimum_nprobes
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "maximum_nprobes ({maximum_nprobes}) must not be less than minimum_nprobes ({minimum_nprobes})"
+                )
+                .into(),
+            ));
+        }
+        Ok(Self {
+            maximum: Some(maximum_nprobes),
+            ..self
+        })
+    }
+
+    fn with_effort(self, effort: f64) -> Result<Self> {
+        if !effort.is_finite() || !(0.0..=1.0).contains(&effort) {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("search_effort must be finite and in [0, 1], got {effort}").into(),
+            ));
+        }
+        Ok(Self {
+            search_effort: Some(effort),
+            ..self
+        })
+    }
+
+    fn validate_for_scan(self) -> Result<()> {
+        let fixed = self.nprobes.filter(|_| self.search_effort.is_none());
+        let minimum = self.minimum.or(fixed).unwrap_or(1);
+        let maximum = self.maximum.or(fixed);
+        if let Some(maximum) = maximum
+            && minimum > maximum
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("minimum_nprobes ({minimum}) must not exceed maximum_nprobes ({maximum})")
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Poll status for `lance_scanner_poll_next`.
@@ -93,138 +468,444 @@ impl LanceScanner {
     fn new(dataset: Arc<Dataset>) -> Self {
         Self {
             dataset,
-            columns: None,
+            projection: None,
+            disable_scoring_autoprojection: false,
             filter: None,
             substrait_filter: None,
+            substrait_aggregate: None,
+            additional_sql_filters: Vec::new(),
+            blob_handling: None,
             limit: None,
             offset: None,
             batch_size: None,
+            batch_size_bytes: None,
+            strict_batch_size: None,
+            io_buffer_size: None,
+            batch_readahead: None,
+            fragment_readahead: None,
+            target_parallelism: None,
+            scan_in_order: None,
+            use_scalar_index: None,
+            use_stats: None,
             with_row_id: false,
-            fragment_ids: None,
+            with_row_address: false,
+            include_deleted_rows: false,
+            fragment_selection: FragmentSelection::All,
+            row_addr_allowlist: None,
+            row_addr_blocklist: None,
             index_segments: None,
+            scalar_index_segment: None,
+            scalar_index_auto_selection: false,
             nearest: None,
-            nprobes: None,
+            probe: ProbeConfig::default(),
+            approx_mode: None,
+            query_parallelism: None,
             refine_factor: None,
             ef: None,
             metric_override: None,
             use_index: None,
             prefilter: false,
+            materialization_style: MaterializationStyle::Heuristic,
+            fast_search: false,
+            minhash_query: None,
             fts_query: None,
+            fts_context: None,
+            fts_index_segments: None,
+            order_by: None,
+            poisoned: Arc::new(AtomicBool::new(false)),
+            poll_wakers: PollWakerRegistry::default(),
+            scan_statistics_callback: None,
+            scan_started: AtomicBool::new(false),
             stream: None,
             schema: None,
         }
     }
 
-    /// Apply fragment selection to a scanner builder if fragment_ids is set.
-    fn apply_fragment_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
-        if let Some(ids) = &self.fragment_ids {
-            let all_fragments = self.dataset.get_fragments();
-            let id_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
-            let selected: Vec<_> = all_fragments
-                .into_iter()
-                .filter(|f| id_set.contains(&(f.id() as u64)))
-                .map(|f| f.metadata().clone())
-                .collect();
-            scanner.with_fragments(selected);
+    /// Create a scanner whose initial selection is one native fragment.
+    ///
+    /// `FileFragment::scan` starts from the fragment's owned dataset snapshot
+    /// and selects that fragment's metadata over the ordinary scanner path.
+    pub(crate) fn from_fragment(fragment: &FileFragment) -> Self {
+        let mut scanner = Self::new(Arc::new(fragment.dataset().clone()));
+        scanner.fragment_selection = FragmentSelection::Metadata(vec![fragment.metadata().clone()]);
+        scanner
+    }
+
+    /// Whether a panic was caught in an earlier stateful operation on this
+    /// scanner. Checked by every `lance_scanner_*` entry point except close.
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
+    }
+
+    /// Clone of the shared poison flag, for wiring into the exported Arrow
+    /// stream wrapper and the async scan task (later steps of issue #61) so a
+    /// panic caught there marks this handle unusable for later calls.
+    pub(crate) fn poison_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.poisoned)
+    }
+
+    fn ensure_scan_not_started(&self, setting_name: &str) -> Result<()> {
+        if self.scan_started.load(Ordering::Acquire) {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("{setting_name} must be set before the scan starts").into(),
+            ));
         }
+        Ok(())
+    }
+
+    fn begin_scan(&self) {
+        self.scan_started.store(true, Ordering::Release);
+    }
+
+    /// Pick an output name for the native distance that cannot collide with a
+    /// stored field, a projected output, or wildcard expansion of the stored
+    /// schema. The name is binding-private and removed after the result window.
+    fn multi_vector_window_distance_column(&self) -> String {
+        let mut name = MULTIVECTOR_WINDOW_DISTANCE_COLUMN.to_string();
+        let mut suffix = 0usize;
+        loop {
+            let stored = self
+                .dataset
+                .schema()
+                .fields
+                .iter()
+                .any(|field| field.name.eq_ignore_ascii_case(&name));
+            let projected = self
+                .projection
+                .as_ref()
+                .is_some_and(|projection| projection.conflicts_with_output(&name));
+            if !stored && !projected {
+                return name;
+            }
+            suffix += 1;
+            name = format!("{MULTIVECTOR_WINDOW_DISTANCE_COLUMN}_{suffix}");
+        }
+    }
+
+    /// Apply the configured projection to the native scanner.
+    ///
+    /// `window_distance_column` is only used by the multi-vector adapter. It
+    /// adds the native distance as an extra output so the final result window
+    /// can rank on it even when the caller's projection renames or transforms
+    /// `_distance`.
+    fn apply_projection(
+        &self,
+        scanner: &mut lance::dataset::scanner::Scanner,
+        window_distance_column: Option<&str>,
+    ) -> Result<()> {
+        match &self.projection {
+            None => {}
+            Some(ProjectionSelection::Columns(columns)) if window_distance_column.is_none() => {
+                scanner.project(columns)?;
+            }
+            Some(ProjectionSelection::Columns(columns)) => {
+                let mut native = columns
+                    .iter()
+                    .map(|column| (column.as_str(), escape_field_path_for_project(column)))
+                    .collect::<Vec<_>>();
+                if let Some(distance_column) = window_distance_column {
+                    native.push((distance_column, DISTANCE_COLUMN.to_string()));
+                }
+                scanner.project_with_transform(&native)?;
+            }
+            Some(ProjectionSelection::Expressions(columns)) => {
+                let mut native = columns
+                    .iter()
+                    .map(|column| (column.output_name.as_str(), column.expression.as_str()))
+                    .collect::<Vec<_>>();
+                if let Some(distance_column) = window_distance_column {
+                    native.push((distance_column, DISTANCE_COLUMN));
+                }
+                scanner.project_with_transform(&native)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate an expression projection through the same native configuration
+    /// method the scan will use. Lance reports malformed expressions, duplicate
+    /// outputs, and schema-dependent expression resolution here; planning-only
+    /// errors remain materialization errors.
+    fn validate_expression_projection(&self, columns: &[ProjectionExpression]) -> Result<()> {
+        let mut scanner = self.dataset.scan();
+        let native = columns
+            .iter()
+            .map(|column| (column.output_name.as_str(), column.expression.as_str()))
+            .collect::<Vec<_>>();
+        scanner.project_with_transform(&native)?;
+        Ok(())
+    }
+
+    /// Apply the scanner's fragment selection.
+    /// For nearest queries this limits candidates before Top-K regardless of prefilter;
+    /// it is not a predicate applied to the ranked results.
+    fn apply_fragment_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
+        match &self.fragment_selection {
+            FragmentSelection::All => {}
+            FragmentSelection::Ids(ids) => {
+                let all_fragments = self.dataset.get_fragments();
+                let id_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
+                let selected: Vec<_> = all_fragments
+                    .into_iter()
+                    .filter(|f| id_set.contains(&(f.id() as u64)))
+                    .map(|f| f.metadata().clone())
+                    .collect();
+                scanner.with_fragments(selected);
+            }
+            FragmentSelection::Metadata(fragments) => {
+                scanner.with_fragments(fragments.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// The external row prefilter, combined the same way as
+    /// `RowAddrMask::from_serialized_parts`: rows in the allowlist and not in the
+    /// blocklist. `None` when neither list is set (no mask, not "select nothing").
+    fn row_addr_mask(&self) -> Option<RowAddrMask> {
+        match (&self.row_addr_allowlist, &self.row_addr_blocklist) {
+            (Some(allow), Some(block)) => {
+                Some(RowAddrMask::from_allowed(allow.clone()).also_block(block.clone()))
+            }
+            (Some(allow), None) => Some(RowAddrMask::from_allowed(allow.clone())),
+            (None, Some(block)) => Some(RowAddrMask::from_block(block.clone())),
+            (None, None) => None,
+        }
+    }
+
+    fn apply_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
+        if let Some(substrait) = &self.substrait_filter {
+            scanner.filter_substrait(substrait)?;
+        } else if let Some(sql) = &self.filter {
+            scanner.filter(sql)?;
+        }
+
+        if self.additional_sql_filters.is_empty() {
+            return Ok(());
+        }
+
+        // Let Lance resolve every SQL expression against the scanner's full
+        // filterable schema. Besides stored columns, this includes metadata
+        // columns and query-generated columns such as _distance and _score.
+        let mut combined = scanner.get_expr_filter()?;
+        for sql in &self.additional_sql_filters {
+            let mut additional_scanner = scanner.clone();
+            additional_scanner.filter(sql)?;
+            let additional = additional_scanner
+                .get_expr_filter()?
+                .expect("additional SQL filter exists");
+            combined = Some(match combined {
+                Some(existing) => existing.and(additional),
+                None => additional,
+            });
+        }
+        scanner.filter_expr(combined.expect("additional SQL filter exists"));
         Ok(())
     }
 
     /// Build the underlying Scanner and open a stream.
     fn materialize_stream(&mut self) -> Result<()> {
-        let mut scanner = self.dataset.scan();
-        if let Some(cols) = &self.columns {
-            scanner.project(cols)?;
-        }
-        // Substrait filter takes precedence over SQL filter when both are set.
-        if let Some(bytes) = &self.substrait_filter {
-            scanner.filter_substrait(bytes)?;
-        } else if let Some(filter) = &self.filter {
-            scanner.filter(filter)?;
-        }
-        if self.limit.is_some() || self.offset.is_some() {
-            scanner.limit(self.limit, self.offset)?;
-        }
-        if let Some(bs) = self.batch_size {
-            scanner.batch_size(bs);
-        }
-        if self.with_row_id {
-            scanner.with_row_id();
-        }
-        self.apply_fragment_filter(&mut scanner)?;
-        if self.index_segments.is_some() && self.nearest.is_none() {
-            return Err(lance_core::Error::InvalidInput {
-                source: "index_segments requires nearest() to be configured".into(),
-                location: snafu::location!(),
-            });
-        }
-        if let Some(n) = &self.nearest {
-            scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
-            if let Some(np) = self.nprobes {
-                scanner.nprobes(np as usize);
-            }
-            if let Some(rf) = self.refine_factor {
-                scanner.refine(rf);
-            }
-            if let Some(ef) = self.ef {
-                scanner.ef(ef as usize);
-            }
-            if let Some(m) = self.metric_override {
-                scanner.distance_metric(m.to_distance());
-            }
-            if let Some(ui) = self.use_index {
-                scanner.use_index(ui);
-            }
-            if self.prefilter {
-                scanner.prefilter(true);
-            }
-            if let Some(segments) = &self.index_segments {
-                scanner.with_index_segments(segments.clone())?;
-            }
-        }
-        if let Some(fts) = &self.fts_query {
-            scanner.full_text_search(fts.clone())?;
-        }
-        let stream = block_on(scanner.try_into_stream())?;
+        self.begin_scan();
+        let prepared_scanner = self.build_scanner()?;
+        let stream = block_on(prepared_scanner.try_into_stream())?;
         self.schema = Some(stream.schema());
         self.stream = Some(Box::pin(stream));
         Ok(())
     }
 
     /// Build a Scanner (without materializing) and return it.
-    fn build_scanner(&self) -> Result<lance::dataset::scanner::Scanner> {
+    fn build_scanner(&self) -> Result<PreparedScanner> {
+        self.build_scanner_for(ScannerOperation::Scan)
+    }
+
+    fn build_count_scanner(&self) -> Result<PreparedScanner> {
+        self.build_scanner_for(ScannerOperation::Count)
+    }
+
+    fn build_scanner_for(&self, operation: ScannerOperation) -> Result<PreparedScanner> {
         let mut scanner = self.dataset.scan();
-        if let Some(cols) = &self.columns {
-            scanner.project(cols)?;
+        // Both batch and multi-vector inputs are matrices, but only multi-vector
+        // queries may use the custom row-level scoring and global result window.
+        let multi_vector = self
+            .nearest
+            .as_ref()
+            .is_some_and(|query| query.mode == NearestMode::MultiVector);
+        let has_aggregate =
+            operation == ScannerOperation::Scan && self.substrait_aggregate.is_some();
+        if self.nearest.is_none() && self.probe.search_effort.is_some() {
+            return Err(lance_core::Error::invalid_input_source(
+                "search_effort requires nearest() to be configured".into(),
+            ));
         }
-        // Substrait filter takes precedence over SQL filter when both are set.
-        if let Some(bytes) = &self.substrait_filter {
-            scanner.filter_substrait(bytes)?;
-        } else if let Some(filter) = &self.filter {
-            scanner.filter(filter)?;
+        // The multi-vector window must rank on the native distance after the
+        // final projection. Projections can rename or transform `_distance`,
+        // so carry a binding-private copy whenever a projection is configured.
+        let private_multi_vector_distance =
+            multi_vector && self.projection.is_some() && !has_aggregate;
+        let window_distance_column =
+            private_multi_vector_distance.then(|| self.multi_vector_window_distance_column());
+        self.apply_projection(&mut scanner, window_distance_column.as_deref())?;
+        if self.disable_scoring_autoprojection && !(multi_vector && self.projection.is_none()) {
+            scanner.disable_scoring_autoprojection();
+        }
+        if let Some(handling) = &self.blob_handling {
+            scanner.blob_handling(handling.clone());
+        }
+        if operation == ScannerOperation::Scan
+            && multi_vector
+            && !has_aggregate
+            && self
+                .order_by
+                .as_ref()
+                .is_some_and(|ordering| !ordering.is_empty())
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                "order_by is not supported with nearest_multivector because its result window is always distance-ordered"
+                    .into(),
+            ));
+        }
+        scanner.order_by(self.order_by.clone())?;
+        if let Some(NearestQuery {
+            mode: NearestMode::Batch { num_queries },
+            k,
+            ..
+        }) = &self.nearest
+        {
+            validate_batch_candidates(*num_queries, *k, self.refine_factor)?;
         }
         if self.limit.is_some() || self.offset.is_some() {
             scanner.limit(self.limit, self.offset)?;
+            if multi_vector && operation == ScannerOperation::Scan && !has_aggregate {
+                // Retain Lance's window validation, but defer truncation until the final sort.
+                scanner.limit(None, None)?;
+            }
         }
         if let Some(bs) = self.batch_size {
             scanner.batch_size(bs);
         }
+        if let Some(batch_size_bytes) = self.batch_size_bytes {
+            scanner.batch_size_bytes(batch_size_bytes);
+        }
+        if let Some(strict_batch_size) = self.strict_batch_size {
+            scanner.strict_batch_size(strict_batch_size);
+        }
+        if let Some(io_buffer_size) = self.io_buffer_size {
+            scanner.io_buffer_size(io_buffer_size);
+        }
+        if let Some(batch_readahead) = self.batch_readahead {
+            scanner.batch_readahead(batch_readahead);
+        }
+        if let Some(fragment_readahead) = self.fragment_readahead {
+            scanner.fragment_readahead(fragment_readahead);
+        }
+        if let Some(target_parallelism) = self.target_parallelism {
+            scanner.target_parallelism(target_parallelism);
+        }
+        if let Some(scan_in_order) = self.scan_in_order {
+            scanner.scan_in_order(scan_in_order);
+        }
+        if let Some(use_scalar_index) = self.use_scalar_index {
+            scanner.use_scalar_index(use_scalar_index);
+        }
+        if let Some(use_stats) = self.use_stats {
+            scanner.use_stats(use_stats);
+        }
         if self.with_row_id {
             scanner.with_row_id();
         }
-        self.apply_fragment_filter(&mut scanner)?;
+        if self.with_row_address {
+            scanner.with_row_address();
+        }
+        if self.include_deleted_rows {
+            scanner.include_deleted_rows();
+        }
+        // Lance rejects nearest() when fragments are already configured and prefilter is off.
+        // Deferring with_fragments only works around that configuration-time guard: fragments
+        // still restrict indexed and flat-search inputs before Top-K. The prefilter setting
+        // controls scanner filter expressions, not this search-domain scope.
+        let apply_fragment_filter_after_nearest = self.nearest.is_some() && !self.prefilter;
+        if !apply_fragment_filter_after_nearest {
+            self.apply_fragment_filter(&mut scanner)?;
+        }
         if self.index_segments.is_some() && self.nearest.is_none() {
-            return Err(lance_core::Error::InvalidInput {
-                source: "index_segments requires nearest() to be configured".into(),
-                location: snafu::location!(),
-            });
+            return Err(lance_core::Error::invalid_input_source(
+                "index_segments requires nearest() to be configured".into(),
+            ));
+        }
+        if self.fts_index_segments.is_some() && self.fts_context.is_none() {
+            return Err(lance_core::Error::invalid_input_source(
+                "fts_index_segments requires an FTS query context".into(),
+            ));
+        }
+        if self.fts_context.is_some() && self.fragment_selection.is_restricted() {
+            return Err(lance_core::Error::invalid_input_source(
+                "fragment_ids cannot be combined with an FTS query context; split the query by FTS index segment UUID instead".into(),
+            ));
+        }
+        // A segment-scoped scalar scan installs its own row prefilter from the segment's
+        // candidates, which would replace this one.
+        let row_addr_mask = self.row_addr_mask().map(Arc::new);
+        if row_addr_mask.is_some() && self.scalar_index_segment.is_some() {
+            return Err(lance_core::Error::invalid_input_source(
+                "row address allowlist/blocklist cannot be combined with scalar_index_segment"
+                    .into(),
+            ));
+        }
+        if let Some(mask) = &row_addr_mask {
+            scanner.with_row_id_prefilter(RowAddrMask::clone(mask));
+        }
+        if self.prefilter {
+            scanner.prefilter(true);
+        }
+        if self.fast_search {
+            // Pylance applies fast_search before nearest/use_index. Preserve that order:
+            // an explicit use_index=false remains effective and lets the native planner
+            // return its indexed-only outcome rather than silently falling back.
+            scanner.fast_search();
         }
         if let Some(n) = &self.nearest {
+            self.probe.validate_for_scan()?;
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
-            if let Some(np) = self.nprobes {
-                scanner.nprobes(np as usize);
+            scanner.distance_range(n.lower_bound, n.upper_bound);
+            if let Some(nprobes) = self.probe.nprobes {
+                scanner.nprobes(nprobes as usize);
             }
-            if let Some(rf) = self.refine_factor {
+            if let Some(minimum_nprobes) = self.probe.minimum {
+                scanner.minimum_nprobes(minimum_nprobes as usize);
+            }
+            if let Some(maximum_nprobes) = self.probe.maximum {
+                scanner.maximum_nprobes(maximum_nprobes as usize);
+            }
+            if let Some(search_effort) = self.probe.search_effort {
+                scanner.search_effort(search_effort)?;
+            }
+            if let Some(approx_mode) = self.approx_mode {
+                scanner.approx_mode(approx_mode.to_approx_mode());
+            }
+            if let Some(query_parallelism) = self.query_parallelism {
+                scanner.query_parallelism(query_parallelism);
+            }
+            if multi_vector {
+                if matches!(
+                    self.metric_override,
+                    Some(crate::index::LanceMetricType::Hamming)
+                ) {
+                    return Err(lance_core::Error::invalid_input_source(
+                        "multi-vector queries support only l2, cosine, and dot metrics".into(),
+                    ));
+                }
+                let refine = self.refine_factor.unwrap_or(1);
+                if refine == 0
+                    || n.k as usize
+                        > crate::multivector::MAX_QUERY_VECTOR_CANDIDATES / refine as usize
+                {
+                    return Err(lance_core::Error::invalid_input_source(
+                        "multi-vector refined candidate count must be in 1..=100000".into(),
+                    ));
+                }
+                // Validate actual stored values and refine candidate scores before TopK.
+                scanner.refine(refine);
+            } else if let Some(rf) = self.refine_factor {
                 scanner.refine(rf);
             }
             if let Some(ef) = self.ef {
@@ -232,22 +913,774 @@ impl LanceScanner {
             }
             if let Some(m) = self.metric_override {
                 scanner.distance_metric(m.to_distance());
+            } else if multi_vector {
+                // Resolve the same default on indexed and uncovered fragments.
+                scanner.distance_metric(lance_linalg::distance::DistanceType::L2);
             }
             if let Some(ui) = self.use_index {
                 scanner.use_index(ui);
-            }
-            if self.prefilter {
-                scanner.prefilter(true);
             }
             if let Some(segments) = &self.index_segments {
                 scanner.with_index_segments(segments.clone())?;
             }
         }
+        if apply_fragment_filter_after_nearest {
+            // This delayed builder call preserves the same fragment search domain.
+            self.apply_fragment_filter(&mut scanner)?;
+        }
+        scanner.materialization_style(self.materialization_style.clone());
+        if let Some(query) = &self.minhash_query {
+            scanner.minhash_search(query.clone())?;
+        }
         if let Some(fts) = &self.fts_query {
             scanner.full_text_search(fts.clone())?;
         }
-        Ok(scanner)
+        let distributed_fts = if let Some(context) = &self.fts_context {
+            context.validate_dataset_identity(&self.dataset)?;
+            let segments = select_fts_segments(context, self.fts_index_segments.as_deref())?;
+            scanner.full_text_search(context.query.clone())?;
+            Some(PreparedFtsExecution {
+                context: Arc::clone(context),
+                segments,
+                scope_prefilter_to_fts_segments: self.prefilter
+                    && (self.filter.is_some()
+                        || self.substrait_filter.is_some()
+                        || !self.additional_sql_filters.is_empty()),
+                row_addr_mask,
+                batch_size: self.batch_size,
+                scan_statistics_callback: self.scan_statistics_callback.clone(),
+            })
+        } else {
+            None
+        };
+        self.apply_filter(&mut scanner)?;
+        let scalar_segment = if let Some(segment_uuid) = self.scalar_index_segment {
+            if self.nearest.is_some()
+                || self.minhash_query.is_some()
+                || self.fts_query.is_some()
+                || self.fts_context.is_some()
+                || self.index_segments.is_some()
+                || self.fts_index_segments.is_some()
+                || self.include_deleted_rows
+            {
+                return Err(lance_core::Error::invalid_input_source(
+                    "scalar_index_segment requires an ordinary scan of live rows; vector/MinHash/FTS queries and include_deleted_rows=true are unsupported".into(),
+                ));
+            }
+            let fragment_ids = self.fragment_selection.scalar_segment_ids()
+                .ok_or_else(|| lance_core::Error::invalid_input_source(
+                    "scalar_index_segment requires explicit nonempty fragment_ids for its read and fallback domain".into(),
+                ))?;
+            Some(PreparedScalarSegment {
+                dataset: Arc::clone(&self.dataset),
+                segment_uuid,
+                auto_selection: self.scalar_index_auto_selection,
+                fragment_ids,
+                use_scalar_index: self.use_scalar_index.unwrap_or(true),
+                callback: self.scan_statistics_callback.clone(),
+            })
+        } else {
+            None
+        };
+        if operation == ScannerOperation::Scan
+            && let Some(bytes) = &self.substrait_aggregate
+        {
+            scanner.aggregate(AggregateExpr::substrait(bytes.clone()))?;
+        }
+        if let Some(callback) = &self.scan_statistics_callback {
+            scanner.scan_stats_callback(callback.clone());
+        }
+        let multi_vector_window = (multi_vector
+            && operation == ScannerOperation::Scan
+            && !has_aggregate)
+            .then(|| MultiVectorWindow {
+                offset: self.offset.unwrap_or(0) as usize,
+                limit: self.limit.map(|n| n as usize),
+                distance_column: window_distance_column
+                    .unwrap_or_else(|| DISTANCE_COLUMN.to_string()),
+                drop_distance_column: private_multi_vector_distance
+                    || (self.projection.is_none() && self.disable_scoring_autoprojection),
+            });
+        Ok(PreparedScanner {
+            scanner,
+            distributed_fts,
+            multi_vector,
+            multi_vector_window,
+            batch_size: self.batch_size,
+            scan_statistics_callback: self.scan_statistics_callback.clone(),
+            scalar_segment,
+        })
     }
+}
+
+struct PreparedFtsExecution {
+    context: Arc<FtsQueryContextInner>,
+    segments: Vec<IndexMetadata>,
+    scope_prefilter_to_fts_segments: bool,
+    // Re-applied to the rebuilt Match/Phrase execs: they are reconstructed from the
+    // planned ones, which do not expose the external mask Lance attached to them.
+    row_addr_mask: Option<Arc<RowAddrMask>>,
+    batch_size: Option<usize>,
+    scan_statistics_callback: Option<ExecutionStatsCallback>,
+}
+
+struct PreparedScanner {
+    scanner: lance::dataset::scanner::Scanner,
+    distributed_fts: Option<PreparedFtsExecution>,
+    multi_vector: bool,
+    multi_vector_window: Option<MultiVectorWindow>,
+    batch_size: Option<usize>,
+    scan_statistics_callback: Option<ExecutionStatsCallback>,
+    scalar_segment: Option<PreparedScalarSegment>,
+}
+
+struct MultiVectorWindow {
+    offset: usize,
+    limit: Option<usize>,
+    /// Column holding the native distance before any caller projection
+    /// expression is applied.
+    distance_column: String,
+    /// Whether `distance_column` is binding-private and must not be returned.
+    drop_distance_column: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScannerOperation {
+    Scan,
+    Count,
+}
+
+struct PreparedPlan {
+    plan: Arc<dyn ExecutionPlan>,
+    batch_size: Option<usize>,
+    stats_callback: Option<ExecutionStatsCallback>,
+}
+
+impl PreparedScanner {
+    async fn create_plan(self, operation: ScannerOperation) -> Result<PreparedPlan> {
+        let PreparedScanner {
+            scanner,
+            distributed_fts,
+            multi_vector,
+            multi_vector_window,
+            batch_size,
+            scan_statistics_callback,
+            scalar_segment,
+        } = self;
+
+        if let Some(scalar_segment) = scalar_segment {
+            let configured = scalar_segment.configure(scanner).await?;
+            let mut scanner = configured.scanner;
+            if operation == ScannerOperation::Count {
+                add_count_aggregate(&mut scanner)?;
+            }
+            let plan = scanner.create_plan().await?;
+            return Ok(PreparedPlan {
+                plan,
+                batch_size,
+                stats_callback: if operation == ScannerOperation::Scan {
+                    configured.stats_callback
+                } else {
+                    None
+                },
+            });
+        }
+
+        if multi_vector {
+            let mut scanner = scanner;
+            if operation == ScannerOperation::Count {
+                add_count_aggregate(&mut scanner)?;
+            }
+            let plan = crate::multivector::rewrite(scanner.create_plan().await?)?;
+            let plan = if let Some(window) = multi_vector_window {
+                let plan = crate::multivector::apply_result_window(
+                    plan,
+                    window.offset,
+                    window.limit,
+                    &window.distance_column,
+                )?;
+                if window.drop_distance_column {
+                    drop_column_from_plan(plan, &window.distance_column)?
+                } else {
+                    plan
+                }
+            } else {
+                plan
+            };
+            return Ok(PreparedPlan {
+                plan,
+                batch_size,
+                stats_callback: if operation == ScannerOperation::Scan {
+                    scan_statistics_callback
+                } else {
+                    None
+                },
+            });
+        }
+
+        if let Some(distributed_fts) = distributed_fts {
+            let mut scanner = scanner;
+            if operation == ScannerOperation::Count {
+                add_count_aggregate(&mut scanner)?;
+            }
+            let plan = build_prepared_fts_plan(scanner, &distributed_fts).await?;
+            return Ok(PreparedPlan {
+                plan,
+                batch_size: distributed_fts.batch_size,
+                stats_callback: if operation == ScannerOperation::Scan {
+                    distributed_fts.scan_statistics_callback
+                } else {
+                    None
+                },
+            });
+        }
+
+        let mut scanner = scanner;
+        if operation == ScannerOperation::Count {
+            add_count_aggregate(&mut scanner)?;
+        }
+        Ok(PreparedPlan {
+            plan: scanner.create_plan().await?,
+            batch_size,
+            stats_callback: if operation == ScannerOperation::Scan {
+                scan_statistics_callback
+            } else {
+                None
+            },
+        })
+    }
+
+    async fn try_into_stream(self) -> Result<DatasetRecordBatchStream> {
+        let prepared = self.create_plan(ScannerOperation::Scan).await?;
+        let stream = execute_plan(
+            prepared.plan,
+            LanceExecutionOptions {
+                batch_size: prepared.batch_size,
+                execution_stats_callback: prepared.stats_callback,
+                ..Default::default()
+            },
+        )?;
+        Ok(DatasetRecordBatchStream::new(stream))
+    }
+
+    async fn schema(self) -> Result<SchemaRef> {
+        Ok(self
+            .create_plan(ScannerOperation::Scan)
+            .await?
+            .plan
+            .schema())
+    }
+
+    async fn explain_plan(self, verbose: bool) -> Result<String> {
+        let plan = self.create_plan(ScannerOperation::Scan).await?.plan;
+        Ok(format!(
+            "{}",
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(verbose)
+        ))
+    }
+
+    async fn analyze_plan(self) -> Result<String> {
+        let prepared = self.create_plan(ScannerOperation::Scan).await?;
+        analyze_execution_plan(
+            prepared.plan,
+            LanceExecutionOptions {
+                batch_size: prepared.batch_size,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn count_rows(self) -> Result<u64> {
+        let prepared = self.create_plan(ScannerOperation::Count).await?;
+        count_plan_rows(prepared.plan).await
+    }
+
+    async fn analyze_count_plan(self) -> Result<String> {
+        let prepared = self.create_plan(ScannerOperation::Count).await?;
+        analyze_execution_plan(
+            prepared.plan,
+            LanceExecutionOptions {
+                batch_size: prepared.batch_size,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+}
+
+fn add_count_aggregate(scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
+    scanner.aggregate(AggregateExpr::builder().count_star().build())?;
+    Ok(())
+}
+
+async fn count_plan_rows(plan: Arc<dyn ExecutionPlan>) -> Result<u64> {
+    let mut stream = execute_plan(plan, LanceExecutionOptions::default())?;
+    if let Some(first_batch) = stream.next().await {
+        let batch = first_batch?;
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input(
+                    "Count plan did not return an Int64Array".to_string(),
+                )
+            })?;
+        Ok(array.value(0) as u64)
+    } else {
+        Ok(0)
+    }
+}
+
+async fn build_prepared_fts_plan(
+    mut scanner: lance::dataset::scanner::Scanner,
+    distributed_fts: &PreparedFtsExecution,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let selected_fragments = selected_current_fts_fragments(
+        &distributed_fts.context.dataset,
+        &distributed_fts.segments,
+    )?;
+    let selected_segments_have_current_fragments = !selected_fragments.is_empty();
+    if distributed_fts.scope_prefilter_to_fts_segments && selected_segments_have_current_fragments {
+        // The scanner is already split by the selected FTS segment(s). Applying the same
+        // fragment scope before plan creation lets Lance restrict scalar-index segment loads
+        // for the TVF prefilter without changing unfiltered FTS scans.
+        scanner.with_fragments(selected_fragments);
+    }
+    let plan = scanner.create_plan().await?;
+    let (plan, rewritten) = rewrite_prepared_fts_plan(
+        plan,
+        &distributed_fts.segments,
+        &distributed_fts.context.prepared,
+        selected_segments_have_current_fragments,
+        distributed_fts.row_addr_mask.as_ref(),
+    )?;
+    // Fast search may eliminate every FTS source. Projection and row-fetch
+    // nodes can still wrap EmptyExec, with no query node to rewrite.
+    let empty_sources_only = rewritten.indexed_query_execs == 0
+        && rewritten.flat_match_query_execs == 0
+        && fts_plan_has_only_empty_sources(plan.as_ref());
+    if !empty_sources_only
+        && (rewritten.indexed_query_execs > 1
+            || rewritten.flat_match_query_execs > 1
+            || rewritten.indexed_query_execs + rewritten.flat_match_query_execs == 0
+            || (selected_segments_have_current_fragments && rewritten.indexed_query_execs != 1))
+    {
+        return Err(lance_core::Error::internal(format!(
+            "unexpected prepared FTS plan for selected segments with current fragment coverage {selected_segments_have_current_fragments}: rewrote {} indexed FTS query node(s) and removed {} FlatMatchQueryExec node(s)",
+            rewritten.indexed_query_execs, rewritten.flat_match_query_execs
+        )));
+    }
+    Ok(plan)
+}
+
+fn drop_column_from_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    column_name: &str,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    let projection = schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() != column_name)
+        .map(|field| {
+            Ok((
+                expressions::col(field.name(), schema.as_ref())?,
+                field.name().clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(DFProjectionExec::try_new(projection, plan)?))
+}
+
+fn fts_plan_has_only_empty_sources(plan: &dyn ExecutionPlan) -> bool {
+    let children = plan.children();
+    if children.is_empty() {
+        plan.downcast_ref::<EmptyExec>().is_some()
+    } else {
+        children
+            .into_iter()
+            .all(|child| fts_plan_has_only_empty_sources(child.as_ref()))
+    }
+}
+
+fn select_fts_segments(
+    context: &FtsQueryContextInner,
+    selected_uuids: Option<&[Uuid]>,
+) -> Result<Vec<IndexMetadata>> {
+    let Some(selected_uuids) = selected_uuids else {
+        return Ok(context.segments.clone());
+    };
+    let mut selected = Vec::with_capacity(selected_uuids.len());
+    for uuid in selected_uuids {
+        let segment = context
+            .segments
+            .iter()
+            .find(|segment| segment.uuid == *uuid)
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "FTS segment UUID {uuid} is not present in the attached query context for dataset version {}",
+                        context.dataset.version_id()
+                    )
+                    .into(),
+                )
+            })?;
+        selected.push(segment.clone());
+    }
+    if selected.is_empty() {
+        return Err(lance_core::Error::invalid_input_source(
+            "FTS segment subset must contain at least one UUID".into(),
+        ));
+    }
+    Ok(selected)
+}
+
+fn selected_current_fts_fragments(
+    dataset: &lance::Dataset,
+    segments: &[IndexMetadata],
+) -> Result<Vec<Fragment>> {
+    let mut selected_fragment_ids = std::collections::HashSet::new();
+    for segment in segments {
+        let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+            lance_core::Error::internal(format!(
+                "prepared FTS segment {} lost its validated fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        selected_fragment_ids.extend(fragment_bitmap.iter());
+    }
+
+    let mut selected_fragments = Vec::new();
+    for fragment in dataset.get_fragments() {
+        let fragment_id = u32::try_from(fragment.id()).map_err(|_| {
+            lance_core::Error::internal(format!(
+                "current fragment id {} exceeds the validated u32 FTS coverage range",
+                fragment.id()
+            ))
+        })?;
+        if selected_fragment_ids.contains(&fragment_id) {
+            selected_fragments.push(fragment.metadata().clone());
+        }
+    }
+    Ok(selected_fragments)
+}
+
+#[derive(Default)]
+struct PreparedFtsPlanRewriteCounts {
+    indexed_query_execs: usize,
+    flat_match_query_execs: usize,
+}
+
+fn rewrite_prepared_fts_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    segments: &[IndexMetadata],
+    prepared: &PreparedFtsQuery,
+    selected_segments_have_current_fragments: bool,
+    row_addr_mask: Option<&Arc<RowAddrMask>>,
+) -> Result<(Arc<dyn ExecutionPlan>, PreparedFtsPlanRewriteCounts)> {
+    // Lance's ordinary FTS planner adds a flat-search branch for fragments not
+    // covered by the logical index. A prepared INDEX_ONLY scan must omit that
+    // branch, but using Scanner::with_fragments to do so would turn an
+    // otherwise unfiltered index search into a full row-id prefilter scan.
+    if plan.downcast_ref::<FlatMatchQueryExec>().is_some() {
+        return Ok((
+            Arc::new(EmptyExec::new(plan.schema())),
+            PreparedFtsPlanRewriteCounts {
+                indexed_query_execs: 0,
+                flat_match_query_execs: 1,
+            },
+        ));
+    }
+
+    let children = plan.children();
+    let mut rewritten = PreparedFtsPlanRewriteCounts::default();
+    let rebuilt = if children.is_empty() {
+        plan
+    } else {
+        let mut new_children = Vec::with_capacity(children.len());
+        for child in children {
+            let (new_child, child_rewritten) = rewrite_prepared_fts_plan(
+                Arc::clone(child),
+                segments,
+                prepared,
+                selected_segments_have_current_fragments,
+                row_addr_mask,
+            )?;
+            new_children.push(new_child);
+            rewritten.indexed_query_execs += child_rewritten.indexed_query_execs;
+            rewritten.flat_match_query_execs += child_rewritten.flat_match_query_execs;
+        }
+        plan.with_new_children(new_children).map_err(|error| {
+            lance_core::Error::internal(format!(
+                "failed to rebuild FTS execution plan children: {error}"
+            ))
+        })?
+    };
+
+    if let Some(exec) = rebuilt.downcast_ref::<MatchQueryExec>() {
+        rewritten.indexed_query_execs += 1;
+        if !selected_segments_have_current_fragments {
+            return Ok((Arc::new(EmptyExec::new(rebuilt.schema())), rewritten));
+        }
+        let PreparedFtsQuery::Match(scorer) = prepared else {
+            return Err(lance_core::Error::internal(
+                "prepared Phrase state cannot be attached to MatchQueryExec".to_string(),
+            ));
+        };
+        let replacement = MatchQueryExec::new_with_segments(
+            Arc::clone(exec.dataset()),
+            exec.query().clone(),
+            exec.params().clone(),
+            exec.prefilter_source().clone(),
+            segments.to_vec(),
+        )?
+        .with_base_scorer(Arc::clone(scorer))
+        .with_external_mask(row_addr_mask.cloned());
+        return Ok((Arc::new(replacement), rewritten));
+    }
+    if let Some(exec) = rebuilt.downcast_ref::<PhraseQueryExec>() {
+        rewritten.indexed_query_execs += 1;
+        if !selected_segments_have_current_fragments {
+            return Ok((Arc::new(EmptyExec::new(rebuilt.schema())), rewritten));
+        }
+        let PreparedFtsQuery::Phrase(scorer) = prepared else {
+            return Err(lance_core::Error::internal(
+                "prepared Match state cannot be attached to PhraseQueryExec".to_string(),
+            ));
+        };
+        let replacement = PhraseQueryExec::new_with_segments(
+            Arc::clone(exec.dataset()),
+            exec.query().clone(),
+            exec.params().clone(),
+            exec.prefilter_source().clone(),
+            segments.to_vec(),
+        )?
+        .with_base_scorer(Arc::clone(scorer))
+        .with_external_mask(row_addr_mask.cloned());
+        return Ok((Arc::new(replacement), rewritten));
+    }
+    Ok((rebuilt, rewritten))
+}
+
+/// Type of a dynamically named scan metric.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceScanMetricKind {
+    /// Monotonically accumulated counter.
+    Count = 0,
+    /// Accumulated duration in nanoseconds.
+    TimeNanoseconds = 1,
+}
+
+/// Borrowed view of one dynamically named scan metric.
+///
+/// `name` is not NUL-terminated. Both `name` and this structure are valid only
+/// for the duration of the scan statistics callback. Metric order is unspecified.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceScanMetric {
+    pub name: *const c_char,
+    pub name_len: usize,
+    pub kind: LanceScanMetricKind,
+    pub value: u64,
+}
+
+/// Borrowed view of the execution statistics for one fully consumed scan.
+///
+/// The fixed fields are stable summary metrics. `metrics` contains additional
+/// implementation-specific counters and timings whose names are not a stable API
+/// and are intended only for diagnostics and profiles. Dynamic metrics are
+/// best-effort and may be omitted if they cannot be materialized. `metrics` is
+/// null when `metrics_len` is zero and is valid only for the callback duration.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceScanStatistics {
+    pub iops: u64,
+    pub requests: u64,
+    pub bytes_read: u64,
+    pub indices_loaded: u64,
+    pub index_partitions_loaded: u64,
+    pub index_comparisons: u64,
+    pub metrics: *const LanceScanMetric,
+    pub metrics_len: usize,
+}
+
+/// Callback invoked once for each derived scan stream that is fully consumed to EOF.
+///
+/// The callback is an FFI boundary and must return normally without unwinding
+/// or throwing an exception. It must not call back into `lance_scanner_*` with
+/// the originating scanner. From callback entry until the enclosing operation
+/// that observes EOF has returned to its caller, the callback must not directly
+/// or indirectly cause any Arrow C stream derived from the originating scanner to
+/// be called, released, moved, destroyed, or otherwise accessed. This includes
+/// signaling or scheduling another thread to act based only on callback completion:
+/// the callback returns before the enclosing stream operation does. Such interaction
+/// is reentrant and has undefined behavior. Normal access may resume only after the
+/// enclosing `get_next`, `lance_scanner_next`, or `lance_scanner_poll_next` returns.
+pub type LanceScanStatisticsCallback =
+    Option<unsafe extern "C" fn(callback_ctx: *mut c_void, statistics: *const LanceScanStatistics)>;
+
+struct SendScanStatisticsCallback {
+    callback: unsafe extern "C" fn(*mut c_void, *const LanceScanStatistics),
+    ctx: *mut c_void,
+}
+
+// SAFETY: The C API requires the callback and its context to remain valid and
+// safe to invoke until the scanner is closed, every in-flight asynchronous scan
+// has delivered its completion callback, and every derived stream has been
+// released. Concurrent derived streams may invoke the callback concurrently.
+unsafe impl Send for SendScanStatisticsCallback {}
+unsafe impl Sync for SendScanStatisticsCallback {}
+
+impl SendScanStatisticsCallback {
+    fn invoke(&self, counts: &ExecutionSummaryCounts) {
+        // Dynamic profile metrics are best-effort. Use fallible reservation so
+        // allocation failure omits them instead of aborting the embedding process.
+        let mut metrics = Vec::new();
+        if let Some(metrics_len) = counts.all_counts.len().checked_add(counts.all_times.len())
+            && metrics.try_reserve_exact(metrics_len).is_ok()
+        {
+            metrics.extend(
+                counts
+                    .all_counts
+                    .iter()
+                    .map(|(name, value)| LanceScanMetric {
+                        name: name.as_ptr().cast(),
+                        name_len: name.len(),
+                        kind: LanceScanMetricKind::Count,
+                        value: *value as u64,
+                    }),
+            );
+            metrics.extend(
+                counts
+                    .all_times
+                    .iter()
+                    .map(|(name, value)| LanceScanMetric {
+                        name: name.as_ptr().cast(),
+                        name_len: name.len(),
+                        kind: LanceScanMetricKind::TimeNanoseconds,
+                        value: *value as u64,
+                    }),
+            );
+        }
+
+        let statistics = LanceScanStatistics {
+            iops: counts.iops as u64,
+            requests: counts.requests as u64,
+            bytes_read: counts.bytes_read as u64,
+            indices_loaded: counts.indices_loaded as u64,
+            index_partitions_loaded: counts.parts_loaded as u64,
+            index_comparisons: counts.index_comparisons as u64,
+            metrics: if metrics.is_empty() {
+                ptr::null()
+            } else {
+                metrics.as_ptr()
+            },
+            metrics_len: metrics.len(),
+        };
+        unsafe { (self.callback)(self.ctx, &statistics) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Poison check shared by all `lance_scanner_*` entry points
+// ---------------------------------------------------------------------------
+
+/// Reject calls on a scanner handle that was poisoned by an earlier panic
+/// (issue #61). Applies to every `lance_scanner_*` entry point that
+/// dereferences the handle — setters included, since they are still "later
+/// calls on a poisoned handle" — EXCEPT the void close/free path, which must
+/// always be able to free memory.
+///
+/// The check runs only when the pointer is non-NULL, so a NULL handle keeps
+/// flowing into the normal NULL-argument error path (observably, the poison
+/// check sits right after the handle NULL check). A poisoned handle is
+/// unusable, so the check precedes validation of any other arguments.
+///
+/// The poison error code must be `LanceErrorCode::Panic`, which a plain
+/// `lance_core::Error` cannot express, so this sets the thread-local error
+/// and returns `$errval` directly instead of going through `ffi_try!`.
+macro_rules! scanner_poison_check {
+    ($scanner:expr, $errval:expr) => {
+        if !$scanner.is_null() && unsafe { &*$scanner }.is_poisoned() {
+            $crate::error::set_last_error(
+                $crate::error::LanceErrorCode::Panic,
+                "scanner is poisoned by an earlier panic",
+            );
+            return $errval;
+        }
+    };
+}
+
+macro_rules! scanner_ffi_try_value {
+    ($scanner:expr, $errval:expr, $body:expr $(,)?) => {{
+        let scanner_ptr = $scanner;
+        ffi_guard_with(
+            || $body,
+            |failure| {
+                if matches!(failure, FfiFailure::Panic) && !scanner_ptr.is_null() {
+                    unsafe { &*scanner_ptr }
+                        .poison_flag()
+                        .store(true, Ordering::SeqCst);
+                }
+                $errval
+            },
+        )
+    }};
+}
+
+/// Run a scanner configuration call through the common FFI guard and poison
+/// the handle if that call catches a panic. Regular Lance errors remain
+/// recoverable and do not poison the builder.
+macro_rules! scanner_ffi_try {
+    ($scanner:expr, $body:expr $(,)?) => {
+        scanner_ffi_try_value!($scanner, -1, $body)
+    };
+}
+
+/// Enable bounded runtime BTree selection for an explicitly scoped scalar segment scan.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_scalar_index_auto_selection(
+    scanner: *mut LanceScanner,
+    enabled: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, {
+        let scanner = unsafe { scanner.as_mut() }
+            .ok_or_else(|| lance_core::Error::invalid_input_source("scanner is NULL".into()))?;
+        scanner.ensure_scan_not_started("scalar_index_auto_selection")?;
+        scanner.scalar_index_auto_selection = enabled;
+        Ok(0)
+    })
+}
+
+/// Select one physical scalar index segment. NULL clears the selection.
+/// Requires explicit fragment_ids and an ordinary live-row scan. See the C header.
+/// include_deleted_rows=true is rejected when preparing the scan, even if
+/// use_scalar_index=false selects the scoped non-indexed fallback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_scalar_index_segment(
+    scanner: *mut LanceScanner,
+    segment_uuid: *const u8,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, {
+        let scanner = unsafe { scanner.as_mut() }
+            .ok_or_else(|| lance_core::Error::invalid_input_source("scanner is NULL".into()))?;
+        scanner.ensure_scan_not_started("scalar_index_segment")?;
+        let segment = if segment_uuid.is_null() {
+            None
+        } else {
+            Some(
+                Uuid::from_slice(unsafe { std::slice::from_raw_parts(segment_uuid, 16) })
+                    .map_err(|e| lance_core::Error::invalid_input_source(e.into()))?,
+            )
+        };
+        scanner.scalar_index_segment = segment;
+        Ok(0)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -276,17 +1709,16 @@ unsafe fn scanner_new_inner(
     filter: *const c_char,
 ) -> Result<*mut LanceScanner> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     let ds = unsafe { &*dataset };
     let col_names = unsafe { helpers::parse_c_string_array(columns)? };
     let filter_str = unsafe { helpers::parse_c_string(filter)? }.map(|s| s.to_string());
 
     let mut scanner = LanceScanner::new(ds.snapshot());
-    scanner.columns = col_names;
+    scanner.projection = col_names.map(ProjectionSelection::Columns);
     scanner.filter = filter_str;
     Ok(Box::into_raw(Box::new(scanner)))
 }
@@ -294,27 +1726,55 @@ unsafe fn scanner_new_inner(
 /// Set the row limit on the scanner. Returns 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_limit(scanner: *mut LanceScanner, limit: i64) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe { scanner_set_limit_inner(scanner, limit) })
+}
+
+unsafe fn scanner_set_limit_inner(scanner: *mut LanceScanner, limit: i64) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
+    if s.nearest
+        .as_ref()
+        .is_some_and(|q| matches!(q.mode, NearestMode::Batch { .. }))
+    {
+        return Err(lance_core::Error::invalid_input_source(
+            "global limit is unsupported for batch nearest; apply windows per query_index in the caller".into(),
+        ));
+    }
     s.limit = Some(limit);
-    clear_last_error();
-    0
+    Ok(0)
 }
 
 /// Set the row offset on the scanner. Returns 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_offset(scanner: *mut LanceScanner, offset: i64) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_offset_inner(scanner, offset)
+    })
+}
+
+unsafe fn scanner_set_offset_inner(scanner: *mut LanceScanner, offset: i64) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
+    if s.nearest
+        .as_ref()
+        .is_some_and(|q| matches!(q.mode, NearestMode::Batch { .. }))
+    {
+        return Err(lance_core::Error::invalid_input_source(
+            "global offset is unsupported for batch nearest; apply windows per query_index in the caller".into(),
+        ));
+    }
     s.offset = Some(offset);
-    clear_last_error();
-    0
+    Ok(0)
 }
 
 /// Set the batch size on the scanner. Returns 0.
@@ -323,14 +1783,681 @@ pub unsafe extern "C" fn lance_scanner_set_batch_size(
     scanner: *mut LanceScanner,
     batch_size: i64,
 ) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_batch_size_inner(scanner, batch_size)
+    })
+}
+
+unsafe fn scanner_set_batch_size_inner(scanner: *mut LanceScanner, batch_size: i64) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     s.batch_size = Some(batch_size as usize);
-    clear_last_error();
-    0
+    Ok(0)
+}
+
+/// Set the target output batch size in bytes. Returns 0 on success.
+///
+/// The size must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_batch_size_bytes(
+    scanner: *mut LanceScanner,
+    batch_size_bytes: u64,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_batch_size_bytes_inner(scanner, batch_size_bytes)
+    })
+}
+
+unsafe fn scanner_set_batch_size_bytes_inner(
+    scanner: *mut LanceScanner,
+    batch_size_bytes: u64,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if batch_size_bytes == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "batch_size_bytes must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("batch_size_bytes")?;
+    if scanner.strict_batch_size == Some(true) {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "strict_batch_size=true cannot be combined with batch_size_bytes={batch_size_bytes}"
+            )
+            .into(),
+        ));
+    }
+    scanner.batch_size_bytes = Some(batch_size_bytes);
+    Ok(0)
+}
+
+/// Set the scanner I/O buffer size in bytes. Returns 0 on success.
+///
+/// The size must be between 1 and [`i64::MAX`] and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_io_buffer_size(
+    scanner: *mut LanceScanner,
+    io_buffer_size_bytes: u64,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_io_buffer_size_inner(scanner, io_buffer_size_bytes)
+    })
+}
+
+unsafe fn scanner_set_io_buffer_size_inner(
+    scanner: *mut LanceScanner,
+    io_buffer_size_bytes: u64,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if io_buffer_size_bytes == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "io_buffer_size_bytes must be greater than 0, got 0".into(),
+        ));
+    }
+    if io_buffer_size_bytes > i64::MAX as u64 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "io_buffer_size_bytes must be at most {}, got {io_buffer_size_bytes}",
+                i64::MAX
+            )
+            .into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("io_buffer_size_bytes")?;
+    scanner.io_buffer_size = Some(io_buffer_size_bytes);
+    Ok(0)
+}
+
+/// Set the number of batches to decode concurrently. Returns 0 on success.
+///
+/// The value must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_batch_readahead(
+    scanner: *mut LanceScanner,
+    batch_readahead: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_batch_readahead_inner(scanner, batch_readahead)
+    })
+}
+
+unsafe fn scanner_set_batch_readahead_inner(
+    scanner: *mut LanceScanner,
+    batch_readahead: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if batch_readahead == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "batch_readahead must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("batch_readahead")?;
+    scanner.batch_readahead = Some(batch_readahead);
+    Ok(0)
+}
+
+/// Set the number of fragments to read ahead for unordered scans.
+///
+/// The value must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fragment_readahead(
+    scanner: *mut LanceScanner,
+    fragment_readahead: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fragment_readahead_inner(scanner, fragment_readahead)
+    })
+}
+
+unsafe fn scanner_set_fragment_readahead_inner(
+    scanner: *mut LanceScanner,
+    fragment_readahead: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if fragment_readahead == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "fragment_readahead must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("fragment_readahead")?;
+    scanner.fragment_readahead = Some(fragment_readahead);
+    Ok(0)
+}
+
+/// Set the target number of physical execution partitions.
+///
+/// The value must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_target_parallelism(
+    scanner: *mut LanceScanner,
+    target_parallelism: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_target_parallelism_inner(scanner, target_parallelism)
+    })
+}
+
+unsafe fn scanner_set_target_parallelism_inner(
+    scanner: *mut LanceScanner,
+    target_parallelism: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if target_parallelism == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "target_parallelism must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("target_parallelism")?;
+    scanner.target_parallelism = Some(target_parallelism);
+    Ok(0)
+}
+
+/// Configure whether scan results are returned in storage order.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_scan_in_order(
+    scanner: *mut LanceScanner,
+    scan_in_order: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_scan_in_order_inner(scanner, scan_in_order)
+    })
+}
+
+unsafe fn scanner_set_scan_in_order_inner(
+    scanner: *mut LanceScanner,
+    scan_in_order: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("scan_in_order")?;
+    scanner.scan_in_order = Some(scan_in_order);
+    Ok(0)
+}
+
+/// Configure whether scalar indices may be used to optimize filters.
+///
+/// Scalar indices are enabled by default in Lance. Must be set before the scan
+/// starts. False also disables explicit scalar segment search while preserving
+/// the configured fragment domain and snapshot validation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_use_scalar_index(
+    scanner: *mut LanceScanner,
+    use_scalar_index: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_use_scalar_index_inner(scanner, use_scalar_index)
+    })
+}
+
+unsafe fn scanner_set_use_scalar_index_inner(
+    scanner: *mut LanceScanner,
+    use_scalar_index: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("use_scalar_index")?;
+    scanner.use_scalar_index = Some(use_scalar_index);
+    Ok(0)
+}
+
+/// Configure whether output batches use the exact row-based batch size.
+///
+/// Must be set before the scan starts. Enabling this together with a
+/// byte-based batch-size limit is rejected without changing scanner state.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_strict_batch_size(
+    scanner: *mut LanceScanner,
+    strict_batch_size: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_strict_batch_size_inner(scanner, strict_batch_size)
+    })
+}
+
+unsafe fn scanner_set_strict_batch_size_inner(
+    scanner: *mut LanceScanner,
+    strict_batch_size: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("strict_batch_size")?;
+    if strict_batch_size && let Some(batch_size_bytes) = scanner.batch_size_bytes {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "strict_batch_size=true cannot be combined with batch_size_bytes={batch_size_bytes}"
+            )
+            .into(),
+        ));
+    }
+    scanner.strict_batch_size = Some(strict_batch_size);
+    Ok(0)
+}
+
+/// Configure whether file statistics may be used to optimize the scan.
+///
+/// Statistics are enabled by default. Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_use_stats(
+    scanner: *mut LanceScanner,
+    use_stats: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_use_stats_inner(scanner, use_stats)
+    })
+}
+
+unsafe fn scanner_set_use_stats_inner(scanner: *mut LanceScanner, use_stats: bool) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("use_stats")?;
+    scanner.use_stats = Some(use_stats);
+    Ok(0)
+}
+
+/// Replace the native scan ordering.
+///
+/// `orderings == NULL` clears the ordering (Rust `None`). A non-NULL array,
+/// including `len == 0`, is an explicit ordering list (Rust `Some`); Lance
+/// treats an empty list as no ordering. Every entry and its column name are
+/// copied before this call returns. Column existence is validated by Lance
+/// when the scan is materialized.
+///
+/// Must be set before the scan starts. Invalid direction or NULL-order values
+/// are rejected without changing the previous ordering.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_order_by(
+    scanner: *mut LanceScanner,
+    orderings: *const LanceColumnOrdering,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_order_by_inner(scanner, orderings, len)
+    })
+}
+
+unsafe fn scanner_set_order_by_inner(
+    scanner: *mut LanceScanner,
+    orderings: *const LanceColumnOrdering,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("order_by")?;
+    if orderings.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "orderings is NULL but len > 0".into(),
+        ));
+    }
+
+    let parsed = if orderings.is_null() {
+        None
+    } else {
+        let specs = if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(orderings, len) }
+        };
+        let mut parsed = Vec::with_capacity(specs.len());
+        for spec in specs {
+            parsed.push(unsafe { parse_column_ordering(spec)? });
+        }
+        Some(parsed)
+    };
+    scanner.order_by = parsed;
+    Ok(0)
+}
+
+unsafe fn parse_column_ordering(spec: &LanceColumnOrdering) -> Result<ColumnOrdering> {
+    let column_name = unsafe { helpers::parse_c_string(spec.column_name)? }
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source("order_by column_name must not be NULL".into())
+        })?
+        .to_owned();
+    let ascending = match spec.direction {
+        0 => true,
+        1 => false,
+        other => {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "order_by direction must be 0 (LanceOrderDirection::Ascending) or 1 (LanceOrderDirection::Descending), got {other}"
+                )
+                .into(),
+            ));
+        }
+    };
+    let nulls_first = match spec.null_order {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "order_by null_order must be 0 (LanceNullOrder::NullsLast) or 1 (LanceNullOrder::NullsFirst), got {other}"
+                )
+                .into(),
+            ));
+        }
+    };
+    Ok(ColumnOrdering {
+        ascending,
+        nulls_first,
+        column_name,
+    })
+}
+
+/// Replace the scanner projection with ordered output-name / SQL-expression pairs.
+///
+/// `columns == NULL` with `len == 0` clears the projection, returning to the
+/// native unset projection (all columns). A non-NULL array, including
+/// `len == 0`, is an explicit projection; an empty array therefore selects no
+/// output columns. Entries and both strings are copied before this call
+/// returns. An invalid entry or a projection rejected by Lance leaves the
+/// previous projection unchanged.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_projection(
+    scanner: *mut LanceScanner,
+    columns: *const LanceProjectionColumn,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_projection_inner(scanner, columns, len)
+    })
+}
+
+unsafe fn scanner_set_projection_inner(
+    scanner: *mut LanceScanner,
+    columns: *const LanceProjectionColumn,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("projection")?;
+
+    let parsed = unsafe { parse_projection_columns(columns, len)? };
+    if let Some(columns) = &parsed {
+        scanner.validate_expression_projection(columns)?;
+    }
+    scanner.projection = parsed.map(ProjectionSelection::Expressions);
+    Ok(0)
+}
+
+unsafe fn parse_projection_columns(
+    columns: *const LanceProjectionColumn,
+    len: usize,
+) -> Result<Option<Vec<ProjectionExpression>>> {
+    if columns.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "columns is NULL but len > 0".into(),
+        ));
+    }
+    if columns.is_null() {
+        return Ok(None);
+    }
+    let specs = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(columns, len) }
+    };
+    let mut parsed = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let output_name = unsafe { helpers::parse_c_string(spec.output_name)? }
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    "projection output_name must not be NULL".into(),
+                )
+            })?
+            .to_owned();
+        let expression = unsafe { helpers::parse_c_string(spec.expression)? }
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    "projection expression must not be NULL".into(),
+                )
+            })?
+            .to_owned();
+        parsed.push(ProjectionExpression {
+            output_name,
+            expression,
+        });
+    }
+    Ok(Some(parsed))
+}
+
+/// Disable automatic projection of `_score` / `_distance` for this scanner.
+///
+/// The published default remains unchanged unless this function succeeds:
+/// explicit projections still receive scoring columns automatically. Once
+/// disabled, the setting cannot be re-enabled on the same scanner; create a
+/// new scanner to restore the default. Must be called before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_disable_scoring_autoprojection(
+    scanner: *mut LanceScanner,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_disable_scoring_autoprojection_inner(scanner)
+    })
+}
+
+unsafe fn scanner_disable_scoring_autoprojection_inner(scanner: *mut LanceScanner) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("disable_scoring_autoprojection")?;
+    scanner.disable_scoring_autoprojection = true;
+    Ok(0)
+}
+
+/// Set how blob columns are materialized. `handling` is the C enum
+/// `LanceBlobHandling` as an integer: 0 descriptors for blob columns (the
+/// default), 1 bytes for every blob column, 2 descriptors for every binary
+/// column. Other values are rejected. Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_blob_handling(
+    scanner: *mut LanceScanner,
+    handling: i32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_blob_handling_inner(scanner, handling)
+    })
+}
+
+unsafe fn scanner_set_blob_handling_inner(
+    scanner: *mut LanceScanner,
+    handling: i32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("blob_handling")?;
+    let parsed = match handling {
+        0 => BlobHandling::BlobsDescriptions,
+        1 => BlobHandling::AllBinary,
+        2 => BlobHandling::AllDescriptions,
+        other => {
+            return Err(lance_core::Error::invalid_input(format!(
+                "blob_handling must be 0 (blobs as descriptions), 1 (all binary) or 2 (all descriptions); got {other}"
+            )));
+        }
+    };
+    scanner.blob_handling = Some(parsed);
+    Ok(0)
+}
+
+unsafe fn parse_c_string_array_with_count(
+    values: *const *const c_char,
+    count: usize,
+    parameter_name: &str,
+) -> Result<Vec<String>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if values.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{parameter_name} is NULL but early_except_column_count is {count}").into(),
+        ));
+    }
+    if count > isize::MAX as usize / std::mem::size_of::<*const c_char>() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "early_except_column_count {count} exceeds the maximum addressable array length"
+            )
+            .into(),
+        ));
+    }
+
+    let entries = unsafe { std::slice::from_raw_parts(values, count) };
+    let mut columns = Vec::with_capacity(count);
+    for (index, entry) in entries.iter().copied().enumerate() {
+        let column = unsafe { helpers::parse_c_string(entry)? }.ok_or_else(|| {
+            lance_core::Error::invalid_input_source(
+                format!("{parameter_name}[{index}] is NULL").into(),
+            )
+        })?;
+        columns.push(column.to_string());
+    }
+    Ok(columns)
+}
+
+/// Configure when ordinary scanner payload columns are materialized.
+///
+/// The style follows Lance's native `MaterializationStyle`. For
+/// `ALL_EARLY_EXCEPT`, `early_except_columns` contains column paths resolved by
+/// Lance's schema projection; an empty list means every column is early. The
+/// names are copied and resolved before this function returns. Native
+/// schema-projection errors are returned without changing the previous style.
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_materialization_style(
+    scanner: *mut LanceScanner,
+    style: i32,
+    early_except_columns: *const *const c_char,
+    early_except_column_count: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_materialization_style_inner(
+            scanner,
+            style,
+            early_except_columns,
+            early_except_column_count,
+        )
+    })
+}
+
+unsafe fn scanner_set_materialization_style_inner(
+    scanner: *mut LanceScanner,
+    style: i32,
+    early_except_columns: *const *const c_char,
+    early_except_column_count: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("materialization_style")?;
+    let style = LanceMaterializationStyle::from_i32(style)?;
+    if style != LanceMaterializationStyle::AllEarlyExcept && early_except_column_count != 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "early_except_column_count must be 0 for materialization_style={style:?}, got {early_except_column_count}"
+            )
+            .into(),
+        ));
+    }
+    let materialization_style = match style {
+        LanceMaterializationStyle::AllEarlyExcept => {
+            let columns = unsafe {
+                parse_c_string_array_with_count(
+                    early_except_columns,
+                    early_except_column_count,
+                    "early_except_columns",
+                )
+            }?;
+            MaterializationStyle::all_early_except(&columns, s.dataset.schema())?
+        }
+        LanceMaterializationStyle::Heuristic => MaterializationStyle::Heuristic,
+        LanceMaterializationStyle::AllLate => MaterializationStyle::AllLate,
+        LanceMaterializationStyle::AllEarly => MaterializationStyle::AllEarly,
+    };
+    s.materialization_style = materialization_style;
+    Ok(0)
 }
 
 /// Enable or disable row ID in scan output. Returns 0.
@@ -339,14 +2466,79 @@ pub unsafe extern "C" fn lance_scanner_with_row_id(
     scanner: *mut LanceScanner,
     enable: bool,
 ) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_with_row_id_inner(scanner, enable)
+    })
+}
+
+unsafe fn scanner_with_row_id_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     s.with_row_id = enable;
-    clear_last_error();
-    0
+    Ok(0)
+}
+
+/// Enable or disable the `_rowaddr` metadata column in scan output.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_with_row_address(
+    scanner: *mut LanceScanner,
+    enable: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_with_row_address_inner(scanner, enable)
+    })
+}
+
+unsafe fn scanner_with_row_address_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("with_row_address")?;
+    scanner.with_row_address = enable;
+    Ok(0)
+}
+
+/// Configure whether deleted rows still present in storage are returned.
+///
+/// Requires with_row_id=true; deleted rows have a NULL `_rowid`.
+/// Filtered scans also need use_scalar_index=false because indices may omit
+/// tombstoned rows. Incompatible with scalar_index_segment.
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_include_deleted_rows(
+    scanner: *mut LanceScanner,
+    include_deleted_rows: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_include_deleted_rows_inner(scanner, include_deleted_rows)
+    })
+}
+
+unsafe fn scanner_set_include_deleted_rows_inner(
+    scanner: *mut LanceScanner,
+    include_deleted_rows: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("include_deleted_rows")?;
+    scanner.include_deleted_rows = include_deleted_rows;
+    Ok(0)
 }
 
 /// Restrict the scan to the given fragment IDs.
@@ -359,13 +2551,26 @@ pub unsafe extern "C" fn lance_scanner_set_fragment_ids(
     ids: *const u64,
     len: usize,
 ) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fragment_ids_inner(scanner, ids, len)
+    })
+}
+
+unsafe fn scanner_set_fragment_ids_inner(
+    scanner: *mut LanceScanner,
+    ids: *const u64,
+    len: usize,
+) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     if ids.is_null() && len > 0 {
-        set_last_error(LanceErrorCode::InvalidArgument, "ids is NULL but len > 0");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "ids is NULL but len > 0".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     let id_slice = if len > 0 {
@@ -373,9 +2578,89 @@ pub unsafe extern "C" fn lance_scanner_set_fragment_ids(
     } else {
         &[]
     };
-    s.fragment_ids = Some(id_slice.to_vec());
-    clear_last_error();
-    0
+    s.fragment_selection = FragmentSelection::Ids(id_slice.to_vec());
+    Ok(0)
+}
+
+/// Restrict the scan or search to rows whose `_rowid` is in `row_ids`.
+///
+/// The ids are in the dataset's `_rowid` space: the stable row id when stable
+/// row ids are enabled, otherwise the row address. The allowlist is applied
+/// before ranking: a nearest or full-text search (including a prepared FTS
+/// query context) computes its top-k over the allowed rows only, and a plain
+/// scan reads only those rows. Combined with any filter expression (AND) and
+/// with a blocklist (allowed AND NOT blocked). `len == 0` allows no rows.
+/// Calling it again replaces the previous allowlist. Must be called before the
+/// scan starts; the ids are copied.
+///
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_row_addr_allowlist(
+    scanner: *mut LanceScanner,
+    row_ids: *const u64,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_row_addr_list_inner(scanner, row_ids, len, RowAddrList::Allow)
+    })
+}
+
+/// Exclude rows whose `_rowid` is in `row_ids` from the scan or search.
+///
+/// Same `_rowid` space, timing, and replacement semantics as
+/// `lance_scanner_set_row_addr_allowlist`. `len == 0` blocks no rows.
+///
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_row_addr_blocklist(
+    scanner: *mut LanceScanner,
+    row_ids: *const u64,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_row_addr_list_inner(scanner, row_ids, len, RowAddrList::Block)
+    })
+}
+
+enum RowAddrList {
+    Allow,
+    Block,
+}
+
+unsafe fn scanner_set_row_addr_list_inner(
+    scanner: *mut LanceScanner,
+    row_ids: *const u64,
+    len: usize,
+    list: RowAddrList,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if row_ids.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "row_ids is NULL but len > 0".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started(match list {
+        RowAddrList::Allow => "row_addr_allowlist",
+        RowAddrList::Block => "row_addr_blocklist",
+    })?;
+    let ids = if len > 0 {
+        unsafe { std::slice::from_raw_parts(row_ids, len) }
+    } else {
+        &[]
+    };
+    let tree_map: RowAddrTreeMap = ids.iter().collect();
+    match list {
+        RowAddrList::Allow => s.row_addr_allowlist = Some(tree_map),
+        RowAddrList::Block => s.row_addr_blocklist = Some(tree_map),
+    }
+    Ok(0)
 }
 
 /// Set a Substrait filter on the scanner.
@@ -403,36 +2688,374 @@ pub unsafe extern "C" fn lance_scanner_set_substrait_filter(
     bytes: *const u8,
     len: usize,
 ) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_substrait_filter_inner(scanner, bytes, len)
+    })
+}
+
+unsafe fn scanner_set_substrait_filter_inner(
+    scanner: *mut LanceScanner,
+    bytes: *const u8,
+    len: usize,
+) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     if bytes.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "bytes is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "bytes is NULL".into(),
+        ));
     }
     if len == 0 {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "Substrait filter bytes must be non-empty",
-        );
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "Substrait filter bytes must be non-empty".into(),
+        ));
     }
     let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
     let s = unsafe { &mut *scanner };
     s.substrait_filter = Some(slice.to_vec());
-    clear_last_error();
-    0
+    Ok(0)
+}
+
+/// Set a Substrait aggregate plan on the scanner.
+///
+/// `bytes` must point to a serialized Substrait `Plan` whose first relation is
+/// an `AggregateRel`, either directly or through a `RelRoot`. Field references
+/// use positions in the dataset schema. The plan is validated immediately
+/// against the dataset schema on a temporary native scanner, and the previous
+/// aggregate is retained when validation fails.
+///
+/// - `scanner`: An open `LanceScanner*`.
+/// - `bytes`: Pointer to serialized Substrait `Plan` bytes. NULL is accepted
+///   only when `len` is zero, in which case the empty byte string reaches
+///   native plan validation. The bytes are copied into the scanner.
+/// - `len`: Length of the byte buffer.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_substrait_aggregate(
+    scanner: *mut LanceScanner,
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_substrait_aggregate_inner(scanner, bytes, len)
+    })
+}
+
+unsafe fn scanner_set_substrait_aggregate_inner(
+    scanner: *mut LanceScanner,
+    bytes: *const u8,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("substrait_aggregate")?;
+    if len > isize::MAX as usize {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("substrait aggregate len {len} exceeds isize::MAX").into(),
+        ));
+    }
+    if bytes.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "bytes is NULL but len > 0".into(),
+        ));
+    }
+    let slice = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, len) }
+    };
+    let bytes = slice.to_vec();
+    let mut validation_scanner = s.dataset.scan();
+    validation_scanner.aggregate(AggregateExpr::substrait(bytes.clone()))?;
+    s.substrait_aggregate = Some(bytes);
+    Ok(0)
+}
+
+/// Add an SQL filter that is combined with the scanner's selected primary filter using AND.
+///
+/// The primary filter is the Substrait filter when one is set, otherwise it is the SQL filter
+/// passed to `lance_scanner_new`. Multiple additional SQL filters are also combined using AND.
+/// This must be called before the scan starts. The string is copied into the scanner.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_additional_sql_filter(
+    scanner: *mut LanceScanner,
+    filter: *const c_char,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_additional_sql_filter_inner(scanner, filter)
+    })
+}
+
+unsafe fn scanner_additional_sql_filter_inner(
+    scanner: *mut LanceScanner,
+    filter: *const c_char,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let filter = unsafe { helpers::parse_c_string(filter)? }
+        .ok_or_else(|| lance_core::Error::invalid_input_source("filter must not be NULL".into()))?;
+    if filter.is_empty() {
+        return Err(lance_core::Error::invalid_input_source(
+            "additional SQL filter must be non-empty".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    if scanner.scan_started.load(Ordering::Acquire) {
+        return Err(lance_core::Error::invalid_input_source(
+            "additional SQL filter must be set before the scan starts".into(),
+        ));
+    }
+    scanner.additional_sql_filters.push(filter.to_string());
+    Ok(0)
+}
+
+/// Register a callback that receives execution statistics after the scan stream
+/// is fully consumed to EOF.
+///
+/// The callback is not guaranteed to run if execution fails, the scan is
+/// cancelled, or the scanner / exported Arrow stream is released before EOF.
+/// The registration applies to every stream derived from this scanner, including
+/// streams created after an earlier callback has returned. The callback and
+/// `callback_ctx` must remain valid until the scanner is closed, every in-flight
+/// asynchronous scan has delivered its completion callback, and every derived
+/// stream has been released.
+/// Metric names and arrays passed to the callback are borrowed and must be copied
+/// if the caller needs to retain them. The callback must be thread-safe, must
+/// return normally without unwinding or throwing an exception, and must not call
+/// `lance_scanner_*` with the originating scanner. From callback entry until the
+/// enclosing operation that observes EOF has returned to its caller, the callback
+/// must not directly or indirectly cause any Arrow C stream derived from that
+/// scanner to be called, released, moved, destroyed, or otherwise accessed. This
+/// includes signaling or scheduling another thread to act based only on callback
+/// completion: the callback returns before the enclosing stream operation does.
+/// Such interaction is reentrant and has undefined behavior. Normal access may
+/// resume only after the enclosing `get_next`, `lance_scanner_next`, or
+/// `lance_scanner_poll_next` returns. Replacing the registration before scanning
+/// starts immediately releases the previous registration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_statistics_callback(
+    scanner: *mut LanceScanner,
+    callback: LanceScanStatisticsCallback,
+    callback_ctx: *mut c_void,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_statistics_callback_inner(scanner, callback, callback_ctx)
+    })
+}
+
+unsafe fn scanner_set_statistics_callback_inner(
+    scanner: *mut LanceScanner,
+    callback: LanceScanStatisticsCallback,
+    callback_ctx: *mut c_void,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let Some(callback) = callback else {
+        return Err(lance_core::Error::invalid_input_source(
+            "statistics callback is NULL".into(),
+        ));
+    };
+
+    let s = unsafe { &mut *scanner };
+    if s.scan_started.load(Ordering::Acquire) {
+        return Err(lance_core::Error::invalid_input_source(
+            "statistics callback must be registered before the scan starts".into(),
+        ));
+    }
+
+    let callback = SendScanStatisticsCallback {
+        callback,
+        ctx: callback_ctx,
+    };
+    s.scan_statistics_callback = Some(Arc::new(move |counts: &ExecutionSummaryCounts| {
+        callback.invoke(counts);
+    }));
+    Ok(0)
 }
 
 /// Close and free a scanner handle.
+///
+/// Pending poll wakers are cancelled before the stream is dropped. If a poll
+/// waker callback is already running on another thread, close waits for that
+/// callback to return, making this function the retirement boundary for its
+/// callback context. A waker callback must therefore never close or otherwise
+/// re-enter its originating scanner.
+///
+/// Best-effort (issue #61): this drops a possibly-live
+/// `DatasetRecordBatchStream`, the highest-risk `Drop` in this crate. A
+/// panic raised while dropping the handle is caught and logged rather than
+/// unwinding into the caller, and the remainder of the value may leak.
+/// Deliberately no poison check — a poisoned scanner must still be freeable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_close(scanner: *mut LanceScanner) {
     if !scanner.is_null() {
-        unsafe {
-            let _ = Box::from_raw(scanner);
-        }
+        swallow_unwind("lance_scanner_close", || unsafe {
+            let scanner = Box::from_raw(scanner);
+            scanner.poll_wakers.retire_and_wait();
+            drop(scanner);
+        });
     }
+}
+
+/// Export the configured scanner output schema without starting a scan.
+///
+/// `out` must point to an empty ArrowSchema (release callback NULL). Planning
+/// may perform read-only index metadata and candidate work required by the
+/// configured execution path, but it never advances a scanner-owned or
+/// exported stream. The scanner remains configurable after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_schema(
+    scanner: *const LanceScanner,
+    out: *mut FFI_ArrowSchema,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe { scanner_schema_inner(scanner, out) })
+}
+
+unsafe fn scanner_schema_inner(
+    scanner: *const LanceScanner,
+    out: *mut FFI_ArrowSchema,
+) -> Result<i32> {
+    if scanner.is_null() || out.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner and out must not be NULL".into(),
+        ));
+    }
+    if unsafe { &*out }.release.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out must be an empty ArrowSchema (release callback must be NULL)".into(),
+        ));
+    }
+    let scanner = unsafe { &*scanner };
+    let schema = block_on(scanner.build_scanner()?.schema())?;
+    let ffi_schema = FFI_ArrowSchema::try_from(schema.as_ref())?;
+    unsafe {
+        ptr::write_unaligned(out, ffi_schema);
+    }
+    Ok(0)
+}
+
+/// Explain the configured scanner plan without executing it.
+///
+/// `verbose` selects the native DataFusion tree formatting. The returned
+/// string is owned by the caller and must be freed with `lance_free_string()`.
+/// Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_explain_plan(
+    scanner: *const LanceScanner,
+    verbose: bool,
+) -> *const c_char {
+    scanner_poison_check!(scanner, ptr::null());
+    scanner_ffi_try_value!(scanner, ptr::null(), unsafe {
+        scanner_plan_string_inner(scanner, ScannerPlanString::Explain(verbose))
+    })
+}
+
+/// Execute and format the configured scanner plan with native runtime metrics.
+///
+/// This executes the same plan a scan from this configuration would use,
+/// including binding-required scalar-segment, multi-vector, and prepared FTS
+/// transformations. It does not consume or advance any existing stream. The
+/// returned string is owned by the caller and must be freed with
+/// `lance_free_string()`. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_analyze_plan(scanner: *const LanceScanner) -> *const c_char {
+    scanner_poison_check!(scanner, ptr::null());
+    scanner_ffi_try_value!(scanner, ptr::null(), unsafe {
+        scanner_plan_string_inner(scanner, ScannerPlanString::Analyze)
+    })
+}
+
+/// Count rows matched by the configured scanner.
+///
+/// This applies the native `COUNT(*)` aggregate to the configured scanner
+/// plan and executes that count plan. Planning rejects any configured limit,
+/// offset, or ordering with the native aggregate error. It does not count
+/// batches from a stream. Returns 0 on error; an empty match also returns 0,
+/// so check `lance_last_error_code()`. The scanner remains configurable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_count_rows(scanner: *const LanceScanner) -> u64 {
+    scanner_poison_check!(scanner, 0);
+    scanner_ffi_try_value!(scanner, 0, unsafe { scanner_count_rows_inner(scanner) })
+}
+
+unsafe fn scanner_count_rows_inner(scanner: *const LanceScanner) -> Result<u64> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &*scanner };
+    block_on(scanner.build_count_scanner()?.count_rows())
+}
+
+/// Execute and format the configured native `COUNT(*)` plan.
+///
+/// This is the plan used by `lance_scanner_count_rows`, not the ordinary scan
+/// plan. The returned string is owned by the caller and must be freed with
+/// `lance_free_string()`. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_analyze_count_plan(
+    scanner: *const LanceScanner,
+) -> *const c_char {
+    scanner_poison_check!(scanner, ptr::null());
+    scanner_ffi_try_value!(scanner, ptr::null(), unsafe {
+        scanner_plan_string_inner(scanner, ScannerPlanString::AnalyzeCount)
+    })
+}
+
+enum ScannerPlanString {
+    Explain(bool),
+    Analyze,
+    AnalyzeCount,
+}
+
+unsafe fn scanner_plan_string_inner(
+    scanner: *const LanceScanner,
+    operation: ScannerPlanString,
+) -> Result<*const c_char> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &*scanner };
+    let value = match operation {
+        ScannerPlanString::Explain(verbose) => {
+            block_on(scanner.build_scanner()?.explain_plan(verbose))?
+        }
+        ScannerPlanString::Analyze => block_on(scanner.build_scanner()?.analyze_plan())?,
+        ScannerPlanString::AnalyzeCount => {
+            block_on(scanner.build_count_scanner()?.analyze_count_plan())?
+        }
+    };
+    CString::new(value)
+        .map(|value| value.into_raw() as *const c_char)
+        .map_err(|error| {
+            lance_core::Error::internal(format!(
+                "scanner plan output contains an embedded NUL: {error}"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +3065,14 @@ pub unsafe extern "C" fn lance_scanner_close(scanner: *mut LanceScanner) {
 /// Materialize the scan as an Arrow C Data Interface `ArrowArrayStream`.
 ///
 /// This is the preferred API for simple integrations — blocks the calling thread.
-/// The scanner is consumed by this call and should not be used afterward (close it).
+/// The scanner remains valid and may be used to create additional streams.
+///
+/// The exported stream is panic-guarded (issue #61): a panic during export
+/// poisons the scanner — this call returns -1 with `LANCE_ERR_PANIC`, and
+/// every later call on the handle fails the same way — while a panic during
+/// later consumer-driven `get_next` calls surfaces as a stream error
+/// (nonzero `get_next` + `get_last_error`, then end-of-stream) instead of
+/// unwinding out of the Arrow C callbacks and aborting the host process.
 ///
 /// Returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
@@ -450,23 +3080,62 @@ pub unsafe extern "C" fn lance_scanner_to_arrow_stream(
     scanner: *mut LanceScanner,
     out: *mut FFI_ArrowArrayStream,
 ) -> i32 {
-    ffi_try!(unsafe { scanner_to_arrow_stream_inner(scanner, out) }, neg)
-}
-
-unsafe fn scanner_to_arrow_stream_inner(
-    scanner: *mut LanceScanner,
-    out: *mut FFI_ArrowArrayStream,
-) -> Result<i32> {
-    if scanner.is_null() || out.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "scanner and out must not be NULL".into(),
-            location: snafu::location!(),
-        });
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner must not be NULL");
+        return -1;
+    }
+    scanner_poison_check!(scanner, -1);
+    if out.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "out must not be NULL");
+        return -1;
     }
     let s = unsafe { &*scanner };
+    let poisoned = s.poison_flag();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match unsafe { scanner_to_arrow_stream_inner(s, out) } {
+            Ok(rc) => {
+                clear_last_error();
+                rc
+            }
+            Err(err) => {
+                set_lance_error(&err);
+                -1
+            }
+        }
+    })) {
+        Ok(rc) => rc,
+        Err(payload) => {
+            poisoned.store(true, Ordering::SeqCst);
+            set_last_error(
+                LanceErrorCode::Panic,
+                format!("panic in FFI call: {}", panic_payload_message(&*payload)),
+            );
+            -1
+        }
+    }
+}
+
+/// Export logic, split out so `lance_scanner_to_arrow_stream` can wrap the
+/// whole thing in `catch_unwind` and poison the handle on panic. The stream
+/// is exported through a [`GuardedReader`] so panics during the consumer's
+/// later `get_next` calls — including a `Handle::block_on` panic on a
+/// consumer thread that is driving a Tokio runtime — convert to a terminal
+/// stream
+/// error (and poison the handle) instead of unwinding across the Arrow C
+/// callbacks, and cleanup panics on the `release` path are contained.
+///
+/// # Safety
+/// `out` must be a valid, writable pointer (checked by the caller).
+unsafe fn scanner_to_arrow_stream_inner(
+    s: &LanceScanner,
+    out: *mut FFI_ArrowArrayStream,
+) -> Result<i32> {
+    s.begin_scan();
     let built_scanner = s.build_scanner()?;
     let stream = block_on(built_scanner.try_into_stream())?;
-    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone())?;
+    let schema = stream.schema();
+    let reader = GuardedReader::new(stream, schema, RT.handle().clone(), s.poison_flag());
+    let ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
     unsafe {
         ptr::write_unaligned(out, ffi_stream);
     }
@@ -485,20 +3154,51 @@ unsafe fn scanner_to_arrow_stream_inner(
 /// - `-1` — error (check `lance_last_error_*`), `*out` is NULL.
 ///
 /// The caller must free each returned batch with `lance_batch_free()`.
+///
+/// A panic in the stream logic poisons the scanner: this call returns -1 with
+/// `LANCE_ERR_PANIC`, and every later call on the handle fails the same way.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_next(
     scanner: *mut LanceScanner,
     out: *mut *mut LanceBatch,
 ) -> i32 {
-    if scanner.is_null() || out.is_null() {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "scanner and out must not be NULL",
-        );
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut() };
+    }
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner must not be NULL");
+        return -1;
+    }
+    scanner_poison_check!(scanner, -1);
+    if out.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "out must not be NULL");
         return -1;
     }
     let s = unsafe { &mut *scanner };
+    let poisoned = s.poison_flag();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        scanner_next_inner(s, out)
+    })) {
+        Ok(rc) => rc,
+        Err(payload) => {
+            poisoned.store(true, Ordering::SeqCst);
+            set_last_error(
+                LanceErrorCode::Panic,
+                format!("panic in FFI call: {}", panic_payload_message(&*payload)),
+            );
+            unsafe { *out = ptr::null_mut() };
+            -1
+        }
+    }
+}
 
+/// Blocking next-batch logic, split out so `lance_scanner_next` can wrap the
+/// whole thing in `catch_unwind` and poison the handle on panic. Error and
+/// end-of-stream semantics (0/1/-1 plus thread-local error) are unchanged.
+///
+/// # Safety
+/// `out` must be a valid, writable pointer (checked by the caller).
+unsafe fn scanner_next_inner(s: &mut LanceScanner, out: *mut *mut LanceBatch) -> i32 {
     // Lazily materialize the stream on first call.
     if s.stream.is_none()
         && let Err(err) = s.materialize_stream()
@@ -537,30 +3237,155 @@ pub unsafe extern "C" fn lance_scanner_next(
 /// Start an async scan. The callback is invoked on a dedicated dispatcher thread
 /// when the ArrowArrayStream is ready.
 ///
-/// - `callback`: Called with `(ctx, 0, *mut ArrowArrayStream)` on success,
-///   or `(ctx, -1, NULL)` on error (check `lance_last_error_*`).
+/// - `callback`: Must not be NULL. Called with
+///   `(ctx, 0, *mut ArrowArrayStream)` on success or `(ctx, -1, NULL)` on
+///   error. The successful result is a Rust-allocated outer stream container
+///   and must eventually be passed to [`lance_scanner_async_stream_free`]. On
+///   error, the dispatcher installs the error on the callback thread's TLS
+///   first, so `lance_last_error_*` called from inside the callback observes
+///   the failure.
 /// - `callback_ctx`: Opaque pointer passed back to the callback.
 ///
 /// The scanner configuration is captured at call time. The scanner handle
 /// can be closed immediately after this call.
+///
+/// With a non-NULL callback, the promised contract is exactly one completion,
+/// even on panic. Completions normally run on the dispatcher thread; if that
+/// thread cannot be created or its channel has failed, delivery falls back to
+/// the thread producing the completion rather than dropping it.
+/// A panic anywhere in call-time setup (validation, scanner building,
+/// runtime access, task spawn) is caught by the entry guard below and still
+/// reported through the callback: `(ctx, -1, NULL)` with `LANCE_ERR_PANIC`,
+/// and the scanner is poisoned. A panic inside the spawned task is caught by
+/// the task's own `catch_unwind().await` and reported the same way — the
+/// caller never hangs waiting for a completion that would otherwise die as
+/// an unobserved task `JoinError` or an unwinding abort.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_scan_async(
+    scanner: *const LanceScanner,
+    callback: Option<LanceCallback>,
+    callback_ctx: *mut c_void,
+) {
+    let Some(callback) = callback else {
+        set_last_error(LanceErrorCode::InvalidArgument, "callback must not be NULL");
+        return;
+    };
+    unsafe {
+        scan_async_guarded(scanner, callback, callback_ctx, |s, cb, ctx| {
+            scan_async_setup(s, cb, ctx)
+        });
+    }
+}
+
+/// Entry guard for `lance_scanner_scan_async` (issue #61): catches a panic
+/// anywhere in call-time setup so it cannot unwind out of the non-unwinding
+/// public entry point, then poisons the handle (when one was passed) and
+/// dispatches exactly one `LANCE_ERR_PANIC` completion. The setup closure is
+/// injectable so tests can exercise this guard without a production fault
+/// hook.
+///
+/// # Safety
+/// `scanner` must be NULL or a valid scanner handle; `callback` and
+/// `callback_ctx` follow the same contract as `lance_scanner_scan_async`.
+unsafe fn scan_async_guarded(
+    scanner: *const LanceScanner,
+    callback: LanceCallback,
+    callback_ctx: *mut c_void,
+    setup: impl FnOnce(*const LanceScanner, LanceCallback, *mut c_void),
+) {
+    // Capture the poison flag BEFORE setup runs: a panic during setup must
+    // still be able to poison the handle it never finished configuring.
+    let poison_flag = if scanner.is_null() {
+        None
+    } else {
+        Some(unsafe { &*scanner }.poison_flag())
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        setup(scanner, callback, callback_ctx)
+    }));
+    if let Err(payload) = outcome {
+        if let Some(flag) = poison_flag {
+            flag.store(true, Ordering::SeqCst);
+        }
+        // Best-effort: if even reporting panics (e.g. the dispatcher thread
+        // never started), swallow — a second panic unwinding out of this
+        // entry point would abort the host, which is what this guard exists
+        // to prevent.
+        swallow_unwind("lance_scanner_scan_async panic report", || {
+            async_dispatcher::dispatch_callback(
+                callback,
+                callback_ctx,
+                -1,
+                ptr::null_mut(),
+                Some((
+                    LanceErrorCode::Panic,
+                    format!("panic in FFI call: {}", panic_payload_message(&*payload)),
+                )),
+            );
+        });
+    }
+}
+
+/// Call-time setup plus task spawn for `lance_scanner_scan_async`, split out
+/// so the entry guard can wrap the whole thing in `catch_unwind`. Every
+/// handled failure delivers the `-1` callback itself; an escaped panic is
+/// the entry guard's job.
+///
+/// # Safety
+/// `scanner` must be NULL or a valid scanner handle (checked first).
+unsafe fn scan_async_setup(
     scanner: *const LanceScanner,
     callback: LanceCallback,
     callback_ctx: *mut c_void,
 ) {
+    // Validation-time failures happen before scan_async returns, so they keep
+    // setting the caller thread's TLS AND carry the error inside the dispatch
+    // message for the callback thread to observe (issue #61).
     if scanner.is_null() {
         set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        async_dispatcher::dispatch_callback(callback, callback_ctx, -1, ptr::null_mut());
+        async_dispatcher::dispatch_callback(
+            callback,
+            callback_ctx,
+            -1,
+            ptr::null_mut(),
+            Some((LanceErrorCode::InvalidArgument, "scanner is NULL".into())),
+        );
         return;
     }
 
     let s = unsafe { &*scanner };
+    if s.is_poisoned() {
+        // Hand-rolled poison check (the shared macro cannot dispatch the
+        // error callback this void entry point reports through).
+        set_last_error(
+            LanceErrorCode::Panic,
+            "scanner is poisoned by an earlier panic",
+        );
+        async_dispatcher::dispatch_callback(
+            callback,
+            callback_ctx,
+            -1,
+            ptr::null_mut(),
+            Some((
+                LanceErrorCode::Panic,
+                "scanner is poisoned by an earlier panic".into(),
+            )),
+        );
+        return;
+    }
+
+    s.begin_scan();
     let built_scanner = match s.build_scanner() {
         Ok(sc) => sc,
         Err(err) => {
             set_lance_error(&err);
-            async_dispatcher::dispatch_callback(callback, callback_ctx, -1, ptr::null_mut());
+            async_dispatcher::dispatch_callback(
+                callback,
+                callback_ctx,
+                -1,
+                ptr::null_mut(),
+                Some((error_code_from_lance(&err), err.to_string())),
+            );
             return;
         }
     };
@@ -569,6 +3394,7 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
 
     // Wrap non-Send raw pointers for the async task.
     // Safety: The C caller guarantees callback_ctx remains valid until callback fires.
+    #[derive(Clone, Copy)]
     struct SendCallback {
         callback: LanceCallback,
         ctx: *mut c_void,
@@ -576,8 +3402,13 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
     unsafe impl Send for SendCallback {}
 
     impl SendCallback {
-        fn dispatch(&self, status: i32, result: *mut c_void) {
-            async_dispatcher::dispatch_callback(self.callback, self.ctx, status, result);
+        fn dispatch(
+            &self,
+            status: i32,
+            result: *mut c_void,
+            error: Option<(LanceErrorCode, String)>,
+        ) {
+            async_dispatcher::dispatch_callback(self.callback, self.ctx, status, result, error);
         }
     }
 
@@ -586,25 +3417,80 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
         ctx: callback_ctx,
     };
 
+    // Shared poison flag moved into the task: the GuardedReader below flips
+    // it if a panic is caught during the consumer's later `get_next` calls.
+    let poisoned = s.poison_flag();
+
     RT.spawn(async move {
-        let result = built_scanner.try_into_stream().await;
-        match result {
-            Ok(stream) => match to_ffi_arrow_array_stream(stream, handle) {
-                Ok(ffi_stream) => {
+        // Copies kept outside the inner future (which consumes the originals)
+        // so the panic arm below can still poison the handle and report.
+        let poisoned_on_panic = Arc::clone(&poisoned);
+        let send_cb_on_panic = send_cb;
+        // The whole task body runs under catch_unwind (issue #61): a panic
+        // here would otherwise die as an unobserved JoinError — the callback
+        // would never fire and the C caller would hang forever waiting for a
+        // completion that never arrives.
+        let outcome = std::panic::AssertUnwindSafe(async move {
+            let result = built_scanner.try_into_stream().await;
+            match result {
+                Ok(stream) => {
+                    // Guard the exported stream at the reader level (issue
+                    // #61): a mid-iteration panic — including a
+                    // `Handle::block_on` panic on a consumer thread driving a
+                    // Tokio runtime — becomes one terminal error item per
+                    // the Arrow C stream error contract instead of unwinding
+                    // out of arrow-rs's `get_next`, and cleanup panics on the
+                    // `release` path are contained.
+                    let schema = stream.schema();
+                    let reader = GuardedReader::new(stream, schema, handle, poisoned);
+                    let ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
                     let ptr = Box::into_raw(Box::new(ffi_stream));
-                    send_cb.dispatch(0, ptr as *mut c_void);
+                    send_cb.dispatch(0, ptr as *mut c_void, None);
                 }
                 Err(err) => {
-                    set_lance_error(&err);
-                    send_cb.dispatch(-1, std::ptr::null_mut());
+                    // Runs on a Tokio worker AFTER scan_async returned:
+                    // setting this thread's TLS would be invisible to
+                    // everyone, so the error rides inside the dispatch
+                    // message and the dispatcher installs it on the
+                    // callback thread instead (issue #61).
+                    send_cb.dispatch(
+                        -1,
+                        std::ptr::null_mut(),
+                        Some((error_code_from_lance(&err), err.to_string())),
+                    );
                 }
-            },
-            Err(err) => {
-                set_lance_error(&err);
-                send_cb.dispatch(-1, std::ptr::null_mut());
             }
+        })
+        .catch_unwind()
+        .await;
+        if let Err(payload) = outcome {
+            poisoned_on_panic.store(true, Ordering::SeqCst);
+            send_cb_on_panic.dispatch(
+                -1,
+                std::ptr::null_mut(),
+                Some((
+                    LanceErrorCode::Panic,
+                    format!("panic in FFI call: {}", panic_payload_message(&*payload)),
+                )),
+            );
         }
     });
+}
+
+/// Release the heap-allocated Arrow stream container returned through a
+/// successful [`lance_scanner_scan_async`] callback.
+///
+/// The Arrow stream's own `release` callback is invoked first when it is still
+/// present, then the outer Rust allocation is freed. Passing NULL is a no-op.
+/// This function must not be used for stack-allocated streams returned by
+/// [`lance_scanner_to_arrow_stream`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_async_stream_free(stream: *mut FFI_ArrowArrayStream) {
+    if !stream.is_null() {
+        swallow_unwind("lance_scanner_async_stream_free", || unsafe {
+            drop(Box::from_raw(stream));
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -614,28 +3500,74 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
 /// Poll for the next batch without blocking.
 ///
 /// - If data is already buffered, returns `LANCE_POLL_READY` immediately.
-/// - If I/O is needed, returns `LANCE_POLL_PENDING` and schedules the waker callback.
+/// - If I/O is needed, returns `LANCE_POLL_PENDING` and schedules the non-NULL
+///   waker callback.
 ///   The caller should yield the thread and re-poll after the waker fires.
 /// - The waker is single-use: it fires at most once per poll call that returns PENDING.
+///   Its context must remain valid until the callback returns or
+///   `lance_scanner_close` returns. Close cancels callbacks that have not
+///   entered and waits for callbacks already in progress.
 ///
 /// The stream is lazily materialized on the first poll call (which will typically
 /// return PENDING while the stream opens).
+///
+/// A panic in the poll logic poisons the scanner: this call returns
+/// `LANCE_POLL_ERROR` with `LANCE_ERR_PANIC`, and every later call on the
+/// handle fails the same way.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_poll_next(
     scanner: *mut LanceScanner,
+    waker: Option<LanceWaker>,
+    waker_ctx: *mut c_void,
+    out: *mut *mut LanceBatch,
+) -> LancePollStatus {
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut() };
+    }
+    if scanner.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "scanner must not be NULL");
+        return LancePollStatus::Error;
+    }
+    scanner_poison_check!(scanner, LancePollStatus::Error);
+    if out.is_null() {
+        set_last_error(LanceErrorCode::InvalidArgument, "out must not be NULL");
+        return LancePollStatus::Error;
+    }
+    let Some(waker) = waker else {
+        set_last_error(LanceErrorCode::InvalidArgument, "waker must not be NULL");
+        return LancePollStatus::Error;
+    };
+    let s = unsafe { &mut *scanner };
+    let poisoned = s.poison_flag();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        scanner_poll_next_inner(s, waker, waker_ctx, out)
+    })) {
+        Ok(status) => status,
+        Err(payload) => {
+            poisoned.store(true, Ordering::SeqCst);
+            set_last_error(
+                LanceErrorCode::Panic,
+                format!("panic in FFI call: {}", panic_payload_message(&*payload)),
+            );
+            unsafe { *out = ptr::null_mut() };
+            LancePollStatus::Error
+        }
+    }
+}
+
+/// Poll logic, split out so `lance_scanner_poll_next` can wrap the whole
+/// thing in `catch_unwind` and poison the handle on panic. Ready/Pending/
+/// Finished/Error mapping and thread-local error semantics are unchanged.
+///
+/// # Safety
+/// `out` must be a valid, writable pointer (checked by the caller);
+/// `waker_ctx` must satisfy the `LanceWaker` contract.
+unsafe fn scanner_poll_next_inner(
+    s: &mut LanceScanner,
     waker: LanceWaker,
     waker_ctx: *mut c_void,
     out: *mut *mut LanceBatch,
 ) -> LancePollStatus {
-    if scanner.is_null() || out.is_null() {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "scanner and out must not be NULL",
-        );
-        return LancePollStatus::Error;
-    }
-    let s = unsafe { &mut *scanner };
-
     // Lazily materialize the stream.
     if s.stream.is_none()
         && let Err(err) = s.materialize_stream()
@@ -645,12 +3577,12 @@ pub unsafe extern "C" fn lance_scanner_poll_next(
         return LancePollStatus::Error;
     }
 
-    let stream = s.stream.as_mut().unwrap();
-
     // Construct a std::task::Waker from the C function pointer.
-    let raw_waker = make_raw_waker(waker, waker_ctx);
+    let raw_waker = make_raw_waker(&s.poll_wakers, waker, waker_ctx);
     let waker_obj = unsafe { Waker::from_raw(raw_waker) };
     let mut cx = Context::from_waker(&waker_obj);
+
+    let stream = s.stream.as_mut().unwrap();
 
     // Enter the Tokio runtime context so internal I/O futures can access
     // the reactor. Without this, polling from a non-Tokio thread panics.
@@ -689,44 +3621,164 @@ pub unsafe extern "C" fn lance_scanner_poll_next(
 struct CWakerContext {
     waker_fn: LanceWaker,
     ctx: *mut c_void,
+    state: Mutex<CWakerState>,
+    quiesced: Condvar,
+}
+
+#[derive(Default)]
+struct CWakerState {
+    fired: bool,
+    cancelled: bool,
+    active: bool,
+}
+
+#[derive(Default)]
+struct PollWakerRegistry {
+    state: Mutex<PollWakerRegistryState>,
+}
+
+#[derive(Default)]
+struct PollWakerRegistryState {
+    retired: bool,
+    registrations: Vec<Weak<CWakerContext>>,
 }
 
 // C function pointers + void* are Send by convention for FFI.
 unsafe impl Send for CWakerContext {}
 unsafe impl Sync for CWakerContext {}
 
-fn make_raw_waker(waker_fn: LanceWaker, ctx: *mut c_void) -> RawWaker {
-    let data = Box::into_raw(Box::new(CWakerContext { waker_fn, ctx })) as *const ();
+fn make_raw_waker(
+    registry: &PollWakerRegistry,
+    waker_fn: LanceWaker,
+    ctx: *mut c_void,
+) -> RawWaker {
+    let context = Arc::new(CWakerContext {
+        waker_fn,
+        ctx,
+        state: Mutex::new(CWakerState::default()),
+        quiesced: Condvar::new(),
+    });
+    registry.register(&context);
+    let data = Arc::into_raw(context) as *const ();
 
     const VTABLE: RawWakerVTable = RawWakerVTable::new(
         // clone
         |data| {
-            let orig = unsafe { &*(data as *const CWakerContext) };
-            let cloned = Box::new(CWakerContext {
-                waker_fn: orig.waker_fn,
-                ctx: orig.ctx,
-            });
-            RawWaker::new(Box::into_raw(cloned) as *const (), &VTABLE)
+            unsafe { Arc::<CWakerContext>::increment_strong_count(data.cast()) };
+            RawWaker::new(data, &VTABLE)
         },
         // wake (consumes)
         |data| {
-            let ctx = unsafe { Box::from_raw(data as *mut CWakerContext) };
-            unsafe { (ctx.waker_fn)(ctx.ctx) };
+            let ctx = unsafe { Arc::from_raw(data as *const CWakerContext) };
+            ctx.wake_once();
         },
         // wake_by_ref
         |data| {
             let ctx = unsafe { &*(data as *const CWakerContext) };
-            unsafe { (ctx.waker_fn)(ctx.ctx) };
+            ctx.wake_once();
         },
         // drop
         |data| {
             unsafe {
-                let _ = Box::from_raw(data as *mut CWakerContext);
+                drop(Arc::from_raw(data as *const CWakerContext));
             };
         },
     );
 
     RawWaker::new(data, &VTABLE)
+}
+
+impl CWakerContext {
+    fn wake_once(&self) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.cancelled || state.fired {
+                return;
+            }
+            state.fired = true;
+            state.active = true;
+        }
+
+        unsafe { (self.waker_fn)(self.ctx) };
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active = false;
+        self.quiesced.notify_all();
+    }
+
+    fn cancel(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancelled = true;
+    }
+
+    fn wait_until_quiescent(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.active {
+            state = self
+                .quiesced
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+impl PollWakerRegistry {
+    fn register(&self, registration: &Arc<CWakerContext>) {
+        let retired = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .registrations
+                .retain(|candidate| candidate.strong_count() > 0);
+            if state.retired {
+                true
+            } else {
+                state.registrations.push(Arc::downgrade(registration));
+                false
+            }
+        };
+        if retired {
+            registration.cancel();
+        }
+    }
+
+    fn retire_and_wait(&self) {
+        let registrations = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.retired = true;
+            state
+                .registrations
+                .drain(..)
+                .filter_map(|registration| registration.upgrade())
+                .collect::<Vec<_>>()
+        };
+
+        // Cancel every registration before waiting for any one callback, so
+        // no later registration can enter while close is quiescing an earlier
+        // one.
+        for registration in &registrations {
+            registration.cancel();
+        }
+        for registration in registrations {
+            registration.wait_until_quiescent();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -737,28 +3789,312 @@ macro_rules! scanner_set_u32 {
     ($name:ident, $field:ident) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(scanner: *mut LanceScanner, value: u32) -> i32 {
-            if scanner.is_null() {
-                set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-                return -1;
-            }
-            unsafe {
-                (*scanner).$field = Some(value);
-            }
-            crate::error::clear_last_error();
-            0
+            scanner_poison_check!(scanner, -1);
+            scanner_ffi_try!(
+                scanner,
+                (|| -> Result<i32> {
+                    if scanner.is_null() {
+                        return Err(lance_core::Error::invalid_input_source(
+                            "scanner is NULL".into(),
+                        ));
+                    }
+                    unsafe {
+                        (*scanner).$field = Some(value);
+                    }
+                    Ok(0)
+                })()
+            )
         }
     };
 }
 
-scanner_set_u32!(lance_scanner_set_nprobes, nprobes);
-scanner_set_u32!(lance_scanner_set_refine_factor, refine_factor);
+/// Configure refinement without exceeding a batch query's candidate budget.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_refine_factor(
+    scanner: *mut LanceScanner,
+    value: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(
+        scanner,
+        (|| -> Result<i32> {
+            let s = unsafe { scanner.as_mut() }
+                .ok_or_else(|| lance_core::Error::invalid_input_source("scanner is NULL".into()))?;
+            if let Some(NearestQuery {
+                mode: NearestMode::Batch { num_queries },
+                k,
+                ..
+            }) = &s.nearest
+            {
+                s.ensure_scan_not_started("refine_factor")?;
+                validate_batch_candidates(*num_queries, *k, Some(value))?;
+            }
+            s.refine_factor = Some(value);
+            Ok(0)
+        })()
+    )
+}
 scanner_set_u32!(lance_scanner_set_ef, ef);
+
+/// Set inclusive lower and exclusive upper distance bounds on a single-vector query.
+///
+/// NULL bounds are unbounded. Values are copied and must be finite, with lower < upper
+/// when both are present. Call after nearest and before scanning; k still caps results.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_distance_range(
+    scanner: *mut LanceScanner,
+    lower_bound: *const f32,
+    upper_bound: *const f32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_distance_range_inner(scanner, lower_bound, upper_bound)
+    })
+}
+
+unsafe fn scanner_set_distance_range_inner(
+    scanner: *mut LanceScanner,
+    lower_bound: *const f32,
+    upper_bound: *const f32,
+) -> Result<i32> {
+    let invalid = |message: String| lance_core::Error::invalid_input_source(message.into());
+    if scanner.is_null() {
+        return Err(invalid("scanner is NULL".into()));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("distance_range")?;
+    let nearest = scanner
+        .nearest
+        .as_mut()
+        .ok_or_else(|| invalid("distance_range requires nearest() to be configured".into()))?;
+    // Range bounds are currently a single-query contract. Both batch and
+    // multi-vector queries use matrices, so check the explicit mode.
+    if nearest.mode != NearestMode::Single {
+        return Err(invalid(
+            "distance_range requires a single-vector nearest query".into(),
+        ));
+    }
+    let lower_bound = unsafe { lower_bound.as_ref() }.copied();
+    let upper_bound = unsafe { upper_bound.as_ref() }.copied();
+    for (name, bound) in [("lower_bound", lower_bound), ("upper_bound", upper_bound)] {
+        if let Some(value) = bound
+            && !value.is_finite()
+        {
+            return Err(invalid(format!("{name} must be finite, got {value}")));
+        }
+    }
+    if let (Some(lower), Some(upper)) = (lower_bound, upper_bound)
+        && lower >= upper
+    {
+        return Err(invalid(format!(
+            "lower_bound ({lower}) must be less than upper_bound ({upper})"
+        )));
+    }
+    nearest.lower_bound = lower_bound;
+    nearest.upper_bound = upper_bound;
+    Ok(0)
+}
+
+/// Set both vector-index partition-search bounds to the same value.
+///
+/// This replaces any values previously configured through
+/// `minimum_nprobes` or `maximum_nprobes`. The value must be greater than zero
+/// and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_nprobes(
+    scanner: *mut LanceScanner,
+    nprobes: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_nprobes_inner(scanner, nprobes)
+    })
+}
+
+unsafe fn scanner_set_nprobes_inner(scanner: *mut LanceScanner, nprobes: u32) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("nprobes")?;
+    let next = scanner.probe.with_nprobes(nprobes)?;
+    scanner.probe = next;
+    Ok(0)
+}
+
+/// Set the minimum number of vector-index partitions to search.
+///
+/// The value must be greater than zero and no greater than an explicit
+/// `maximum_nprobes`. A conflict with only a fixed `nprobes` count is reported
+/// when the nearest scan is prepared.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_minimum_nprobes(
+    scanner: *mut LanceScanner,
+    minimum_nprobes: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_minimum_nprobes_inner(scanner, minimum_nprobes)
+    })
+}
+
+unsafe fn scanner_set_minimum_nprobes_inner(
+    scanner: *mut LanceScanner,
+    minimum_nprobes: u32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("minimum_nprobes")?;
+    let next = scanner.probe.with_minimum(minimum_nprobes)?;
+    scanner.probe = next;
+    Ok(0)
+}
+
+/// Set the maximum number of vector-index partitions to search.
+///
+/// The value must be greater than zero and no less than an explicit
+/// `minimum_nprobes`. A conflict with only a fixed `nprobes` count is reported
+/// when the nearest scan is prepared.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_maximum_nprobes(
+    scanner: *mut LanceScanner,
+    maximum_nprobes: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_maximum_nprobes_inner(scanner, maximum_nprobes)
+    })
+}
+
+unsafe fn scanner_set_maximum_nprobes_inner(
+    scanner: *mut LanceScanner,
+    maximum_nprobes: u32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("maximum_nprobes")?;
+    let next = scanner.probe.with_maximum(maximum_nprobes)?;
+    scanner.probe = next;
+    Ok(0)
+}
+
+/// Set the native continuous IVF search effort.
+///
+/// The value must be finite and in `[0, 1]`. Any explicit effort, including
+/// `0.5`, ignores a previously configured fixed nprobes count while preserving
+/// explicit minimum and maximum probe bounds, regardless of setter order.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_search_effort(
+    scanner: *mut LanceScanner,
+    effort: f64,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_search_effort_inner(scanner, effort)
+    })
+}
+
+unsafe fn scanner_set_search_effort_inner(scanner: *mut LanceScanner, effort: f64) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("search_effort")?;
+    scanner.probe = scanner.probe.with_effort(effort)?;
+    Ok(0)
+}
+
+/// Configure the speed / accuracy tradeoff for approximate vector search.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_approx_mode(
+    scanner: *mut LanceScanner,
+    approx_mode: i32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_approx_mode_inner(scanner, approx_mode)
+    })
+}
+
+unsafe fn scanner_set_approx_mode_inner(
+    scanner: *mut LanceScanner,
+    approx_mode: i32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let approx_mode = LanceApproxMode::from_i32(approx_mode)?;
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("approx_mode")?;
+    scanner.approx_mode = Some(approx_mode);
+    Ok(0)
+}
+
+/// Set vector index partition-search concurrency for each query.
+///
+/// `-1` uses the CPU pool size, `0` selects Lance's automatic policy, and
+/// positive values request that many workers. Values below `-1` are invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_query_parallelism(
+    scanner: *mut LanceScanner,
+    query_parallelism: i32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_query_parallelism_inner(scanner, query_parallelism)
+    })
+}
+
+unsafe fn scanner_set_query_parallelism_inner(
+    scanner: *mut LanceScanner,
+    query_parallelism: i32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if query_parallelism < -1 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("query_parallelism must be -1, 0, or greater than 0, got {query_parallelism}")
+                .into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("query_parallelism")?;
+    scanner.query_parallelism = Some(query_parallelism);
+    Ok(0)
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_metric(scanner: *mut LanceScanner, metric: i32) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_metric_inner(scanner, metric)
+    })
+}
+
+unsafe fn scanner_set_metric_inner(scanner: *mut LanceScanner, metric: i32) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     let m = match metric {
         0 => crate::index::LanceMetricType::L2,
@@ -766,18 +4102,15 @@ pub unsafe extern "C" fn lance_scanner_set_metric(scanner: *mut LanceScanner, me
         2 => crate::index::LanceMetricType::Dot,
         3 => crate::index::LanceMetricType::Hamming,
         _ => {
-            set_last_error(
-                LanceErrorCode::InvalidArgument,
-                format!("invalid metric: {}", metric),
-            );
-            return -1;
+            return Err(lance_core::Error::invalid_input_source(
+                format!("invalid metric: {}", metric).into(),
+            ));
         }
     };
     unsafe {
         (*scanner).metric_override = Some(m);
     }
-    crate::error::clear_last_error();
-    0
+    Ok(0)
 }
 
 #[unsafe(no_mangle)]
@@ -785,15 +4118,56 @@ pub unsafe extern "C" fn lance_scanner_set_use_index(
     scanner: *mut LanceScanner,
     enable: bool,
 ) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_use_index_inner(scanner, enable)
+    })
+}
+
+unsafe fn scanner_set_use_index_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     unsafe {
         (*scanner).use_index = Some(enable);
     }
-    crate::error::clear_last_error();
-    0
+    Ok(0)
+}
+
+/// Configure native indexed-only fast search.
+///
+/// This weak-consistency mode applies to vector queries, scalar-indexed filters
+/// and full-text search. Index-backed paths can omit unindexed data. Ordinary
+/// scans and non-indexable expressions follow native planning.
+///
+/// Lance's native `fast_search()` is applied before the nearest query and
+/// explicit `use_index` setting. For vector queries, unindexed fragments are
+/// omitted and the result is empty without a usable index, including when
+/// `use_index=false`. Disabling restores the default native behavior.
+/// Disabled by default. Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fast_search(
+    scanner: *mut LanceScanner,
+    enable: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fast_search_inner(scanner, enable)
+    })
+}
+
+unsafe fn scanner_set_fast_search_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("fast_search")?;
+    s.fast_search = enable;
+    Ok(0)
 }
 
 #[unsafe(no_mangle)]
@@ -801,15 +4175,22 @@ pub unsafe extern "C" fn lance_scanner_set_prefilter(
     scanner: *mut LanceScanner,
     enable: bool,
 ) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_prefilter_inner(scanner, enable)
+    })
+}
+
+unsafe fn scanner_set_prefilter_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     unsafe {
         (*scanner).prefilter = enable;
     }
-    crate::error::clear_last_error();
-    0
+    Ok(0)
 }
 
 /// Restrict the next `nearest()` query to a specific subset of vector index segments.
@@ -829,16 +4210,26 @@ pub unsafe extern "C" fn lance_scanner_set_index_segments(
     segment_uuids: *const u8,
     len: usize,
 ) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_index_segments_inner(scanner, segment_uuids, len)
+    })
+}
+
+unsafe fn scanner_set_index_segments_inner(
+    scanner: *mut LanceScanner,
+    segment_uuids: *const u8,
+    len: usize,
+) -> Result<i32> {
     if scanner.is_null() {
-        set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
     }
     if segment_uuids.is_null() && len > 0 {
-        set_last_error(
-            LanceErrorCode::InvalidArgument,
-            "segment_uuids is NULL but len > 0",
-        );
-        return -1;
+        return Err(lance_core::Error::invalid_input_source(
+            "segment_uuids is NULL but len > 0".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
     if len == 0 {
@@ -854,8 +4245,7 @@ pub unsafe extern "C" fn lance_scanner_set_index_segments(
         }
         s.index_segments = Some(uuids);
     }
-    crate::error::clear_last_error();
-    0
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -880,10 +4270,10 @@ pub unsafe extern "C" fn lance_scanner_nearest(
     element_type: i32,
     k: u32,
 ) -> i32 {
-    ffi_try!(
-        unsafe { scanner_nearest_inner(scanner, column, query_data, query_len, element_type, k) },
-        neg
-    )
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_nearest_inner(scanner, column, query_data, query_len, element_type, k)
+    },)
 }
 
 unsafe fn scanner_nearest_inner(
@@ -895,40 +4285,211 @@ unsafe fn scanner_nearest_inner(
     k: u32,
 ) -> Result<i32> {
     if scanner.is_null() || column.is_null() || query_data.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "scanner, column, and query_data must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner, column, and query_data must not be NULL".into(),
+        ));
     }
     if k == 0 {
-        return Err(lance_core::Error::InvalidInput {
-            source: "k must be > 0".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "k must be > 0".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
-    if s.fts_query.is_some() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "cannot call nearest after full_text_search; they are mutually exclusive"
-                .into(),
-            location: snafu::location!(),
-        });
+    if s.fts_query.is_some() || s.fts_context.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot call nearest after full_text_search or attaching an FTS query context; they are mutually exclusive".into(),
+        ));
     }
     let column_str = unsafe { helpers::parse_c_string(column)? }.unwrap();
 
-    let dtype = match element_type {
-        0 => LanceDataType::Float32,
-        1 => LanceDataType::Float16,
-        2 => LanceDataType::Float64,
-        3 => LanceDataType::UInt8,
-        4 => LanceDataType::Int8,
+    let query = unsafe { decode_query_values(query_data, query_len, element_type)? };
+
+    s.nearest = Some(NearestQuery {
+        mode: NearestMode::Single,
+        column: column_str.to_string(),
+        query,
+        k,
+        lower_bound: None,
+        upper_bound: None,
+    });
+    Ok(0)
+}
+
+/// Set independent nearest-neighbor queries copied from a row-major matrix.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_nearest_batch(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_queries: usize,
+    element_type: i32,
+    k: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        nearest_batch_inner(
+            scanner,
+            column,
+            query_data,
+            dimension,
+            num_queries,
+            element_type,
+            k,
+        )
+    })
+}
+
+unsafe fn nearest_batch_inner(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_queries: usize,
+    element_type: i32,
+    k: u32,
+) -> Result<i32> {
+    use arrow_array::{Array, Float16Array, Float32Array, Float64Array};
+    use arrow_schema::{DataType, Field};
+    let invalid = |message: String| lance_core::Error::invalid_input_source(message.into());
+    if scanner.is_null() || column.is_null() || query_data.is_null() {
+        return Err(invalid(
+            "scanner, column, and query_data must not be NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("nearest_batch")?;
+    if dimension == 0 || dimension > i32::MAX as usize || k == 0 {
+        return Err(invalid(format!(
+            "dimension ({dimension}) and k ({k}) must be positive; dimension must fit int32"
+        )));
+    }
+    if num_queries == 0 || num_queries > MAX_BATCH_QUERIES {
+        return Err(invalid(format!(
+            "num_queries ({num_queries}) must be in 1..={MAX_BATCH_QUERIES}"
+        )));
+    }
+    if s.fts_query.is_some() || s.fts_context.is_some() {
+        return Err(invalid(
+            "batch nearest and full-text search are mutually exclusive".into(),
+        ));
+    }
+    if s.limit.is_some() || s.offset.is_some() {
+        return Err(invalid("batch nearest does not support global limit/offset; apply windows per query_index in the caller".into()));
+    }
+    validate_batch_candidates(num_queries, k, s.refine_factor)?;
+    let (data_type, width) = match element_type {
+        0 => (DataType::Float32, 4),
+        1 => (DataType::Float16, 2),
+        2 => (DataType::Float64, 8),
+        3 => (DataType::UInt8, 1),
+        4 => (DataType::Int8, 1),
         _ => {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!("invalid element_type: {}", element_type).into(),
-                location: snafu::location!(),
-            });
+            return Err(invalid(format!(
+                "batch element_type ({element_type}) must be float16, float32, float64, uint8, or int8"
+            )));
         }
     };
+    let count = batch_query_value_count(dimension, num_queries, width)?;
+    let column = unsafe { helpers::parse_c_string(column)? }.unwrap();
+    if s.dataset.schema().field("query_index").is_some() {
+        return Err(invalid(
+            "batch nearest reserves the dataset column name query_index".into(),
+        ));
+    }
+    let field = s
+        .dataset
+        .schema()
+        .field(column)
+        .ok_or_else(|| invalid(format!("batch vector column {column:?} does not exist")))?;
+    match field.data_type() {
+        DataType::FixedSizeList(element, dim)
+            if dim == dimension as i32 && *element.data_type() == data_type => {}
+        actual => {
+            return Err(invalid(format!(
+                "batch column {column:?} must be FixedSizeList<{data_type}, {dimension}>, got {actual}"
+            )));
+        }
+    }
+    let values = unsafe { decode_query_values(query_data, count, element_type)? };
+    let finite = match values.data_type() {
+        DataType::Float16 => values
+            .as_any()
+            .downcast_ref::<Float16Array>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_some_and(|v| v.is_finite())),
+        DataType::Float32 => values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_some_and(f32::is_finite)),
+        DataType::Float64 => values
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_some_and(f64::is_finite)),
+        DataType::UInt8 | DataType::Int8 => true,
+        actual => {
+            // A future decoder type must return an input error instead of poisoning the scanner.
+            return Err(invalid(format!(
+                "unsupported batch query data type {actual} for element_type={element_type}"
+            )));
+        }
+    };
+    if !finite {
+        return Err(invalid(
+            "batch query values must be finite and non-null".into(),
+        ));
+    }
+    // Keep the matrix shape even for one query: Lance uses it to emit query_index.
+    let query = arrow_array::FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", data_type, false)),
+        dimension as i32,
+        values,
+        None,
+    )?;
+    s.nearest = Some(NearestQuery {
+        mode: NearestMode::Batch { num_queries },
+        column: column.to_string(),
+        query: Arc::new(query),
+        k,
+        lower_bound: None,
+        upper_bound: None,
+    });
+    Ok(0)
+}
+
+unsafe fn decode_query_values(
+    query_data: *const c_void,
+    query_len: usize,
+    element_type: i32,
+) -> Result<arrow_array::ArrayRef> {
+    let (dtype, alignment) = match element_type {
+        0 => (LanceDataType::Float32, std::mem::align_of::<f32>()),
+        1 => (LanceDataType::Float16, std::mem::align_of::<half::f16>()),
+        2 => (LanceDataType::Float64, std::mem::align_of::<f64>()),
+        3 => (LanceDataType::UInt8, std::mem::align_of::<u8>()),
+        4 => (LanceDataType::Int8, std::mem::align_of::<i8>()),
+        _ => {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("invalid element_type: {}", element_type).into(),
+            ));
+        }
+    };
+
+    // from_raw_parts requires alignment even when the caller supplies raw bytes.
+    // Validate here so single, multi-vector, and batch queries share the same guard.
+    if !(query_data as usize).is_multiple_of(alignment) {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "query_data must be aligned to {alignment} bytes for element_type={element_type}"
+            )
+            .into(),
+        ));
+    }
 
     let query: arrow_array::ArrayRef = match dtype {
         LanceDataType::Float32 => {
@@ -955,10 +4516,116 @@ unsafe fn scanner_nearest_inner(
         }
     };
 
+    Ok(query)
+}
+
+/// Set one multi-vector query, supplied as a row-major matrix of floating-point values.
+/// The caller must supply dimension * num_vectors aligned elements matching the column type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_nearest_multivector(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_vectors: usize,
+    element_type: i32,
+    k: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        nearest_multivector_inner(
+            scanner,
+            column,
+            query_data,
+            dimension,
+            num_vectors,
+            element_type,
+            k,
+        )
+    },)
+}
+
+unsafe fn nearest_multivector_inner(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_vectors: usize,
+    element_type: i32,
+    k: u32,
+) -> Result<i32> {
+    use arrow_schema::{DataType, Field};
+    let invalid = |message: &str| lance_core::Error::invalid_input_source(message.into());
+    if scanner.is_null() || column.is_null() || query_data.is_null() {
+        return Err(invalid("scanner, column, and query_data must not be NULL"));
+    }
+    if dimension == 0 || dimension > i32::MAX as usize || num_vectors == 0 || k == 0 {
+        return Err(invalid(
+            "dimension, num_vectors, and k must be positive; dimension must fit int32",
+        ));
+    }
+    if num_vectors > crate::multivector::MAX_QUERY_VECTORS
+        || num_vectors > crate::multivector::MAX_QUERY_VECTOR_CANDIDATES / k as usize
+    {
+        return Err(invalid(
+            "multi-vector query exceeds 128 subvectors or 100000 subvector-candidates",
+        ));
+    }
+    let (data_type, width) = match element_type {
+        0 => (DataType::Float32, 4),
+        1 => (DataType::Float16, 2),
+        2 => (DataType::Float64, 8),
+        _ => {
+            return Err(invalid(
+                "multi-vector queries require float16, float32, or float64",
+            ));
+        }
+    };
+    let count = dimension
+        .checked_mul(num_vectors)
+        .filter(|count| *count <= isize::MAX as usize / width)
+        .ok_or_else(|| invalid("query matrix byte size overflows"))?;
+    let s = unsafe { &mut *scanner };
+    if s.fts_query.is_some() || s.fts_context.is_some() {
+        return Err(invalid(
+            "nearest and full-text search are mutually exclusive",
+        ));
+    }
+    let column = unsafe { helpers::parse_c_string(column)? }.unwrap();
+    let field = s
+        .dataset
+        .schema()
+        .field(column)
+        .ok_or_else(|| invalid("multi-vector column does not exist"))?;
+    match field.data_type() {
+        DataType::List(child) if !child.is_nullable() => match child.data_type() {
+            DataType::FixedSizeList(element, dim)
+                if *dim == dimension as i32 && *element.data_type() == data_type => {}
+            _ => return Err(invalid("multi-vector dimension/type mismatch")),
+        },
+        _ => {
+            return Err(invalid(
+                "multi-vector column must be List of non-nullable FixedSizeList",
+            ));
+        }
+    }
+    // A primitive array is interpreted as one vector by Lance. Preserve matrix shape even
+    // for a single subvector. Lance does not preserve element nullability in its schema.
+    let values = unsafe { decode_query_values(query_data, count, element_type)? };
+    crate::multivector::validate_query(values.as_ref())?;
+    let query = arrow_array::FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", data_type, false)),
+        dimension as i32,
+        values,
+        None,
+    )?;
     s.nearest = Some(NearestQuery {
-        column: column_str.to_string(),
-        query,
+        mode: NearestMode::MultiVector,
+        column: column.to_string(),
+        query: Arc::new(query),
         k,
+        lower_bound: None,
+        upper_bound: None,
     });
     Ok(0)
 }
@@ -966,6 +4633,53 @@ unsafe fn scanner_nearest_inner(
 // ---------------------------------------------------------------------------
 // Full-text search (Phase 2)
 // ---------------------------------------------------------------------------
+
+/// Set a native MinHash LSH text-similarity query on the scanner.
+///
+/// The column and text are copied. A valid earlier query remains attached when
+/// validation fails. The column must be non-empty; an empty text is accepted by
+/// native Lance and produces no matching signatures. The scan must have an
+/// explicit limit before planning; the native scanner limit controls the number
+/// of result rows. Native planning adds `_distance`, equal to one minus the
+/// estimated Jaccard similarity.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_minhash_query(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    text: *const c_char,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_minhash_query_inner(scanner, column, text)
+    })
+}
+
+unsafe fn scanner_set_minhash_query_inner(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    text: *const c_char,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner must not be NULL".into(),
+        ));
+    }
+    let column = unsafe { helpers::parse_c_string(column)? }.ok_or_else(|| {
+        lance_core::Error::invalid_input_source("MinHash column must not be NULL".into())
+    })?;
+    let text = unsafe { helpers::parse_c_string(text)? }.ok_or_else(|| {
+        lance_core::Error::invalid_input_source("MinHash text must not be NULL".into())
+    })?;
+    let query = MinHashQuery::new(text.to_string(), column.to_string());
+    let scanner = unsafe { &mut *scanner };
+    // Reuse the public native builder for its validation phase without
+    // disturbing this scanner's existing query state.
+    scanner.dataset.scan().minhash_search(query.clone())?;
+    scanner.minhash_query = Some(query);
+    Ok(0)
+}
 
 /// Set a BM25 full-text search query on the scanner.
 ///
@@ -985,10 +4699,10 @@ pub unsafe extern "C" fn lance_scanner_full_text_search(
     columns: *const *const c_char,
     max_fuzzy_distance: u32,
 ) -> i32 {
-    ffi_try!(
-        unsafe { fts_inner(scanner, query, columns, max_fuzzy_distance) },
-        neg
-    )
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        fts_inner(scanner, query, columns, max_fuzzy_distance)
+    },)
 }
 
 unsafe fn fts_inner(
@@ -998,20 +4712,22 @@ unsafe fn fts_inner(
     max_fuzzy_distance: u32,
 ) -> Result<i32> {
     if scanner.is_null() || query.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "scanner and query must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner and query must not be NULL".into(),
+        ));
     }
     let s = unsafe { &mut *scanner };
 
     // Mutual exclusion with vector search.
     if s.nearest.is_some() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "cannot call full_text_search after nearest; they are mutually exclusive"
-                .into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot call full_text_search after nearest; they are mutually exclusive".into(),
+        ));
+    }
+    if s.fts_context.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot call full_text_search after attaching an FTS query context; the context already owns the query".into(),
+        ));
     }
 
     let query_str = unsafe { helpers::parse_c_string(query)? }
@@ -1033,4 +4749,1222 @@ unsafe fn fts_inner(
 
     s.fts_query = Some(fts);
     Ok(0)
+}
+
+/// Attach an immutable typed full-text query tree to this scanner.
+///
+/// The scanner snapshots the query value, so the query handle and every source
+/// child handle may be closed after this function returns successfully.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`). This is
+/// mutually exclusive with nearest search and prepared FTS query contexts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fts_query(
+    scanner: *mut LanceScanner,
+    query: *const LanceFtsQuery,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fts_query_inner(scanner, query)
+    })
+}
+
+unsafe fn scanner_set_fts_query_inner(
+    scanner: *mut LanceScanner,
+    query: *const LanceFtsQuery,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner must not be NULL".into(),
+        ));
+    }
+    let query = unsafe { clone_query(query)? };
+    let scanner = unsafe { &mut *scanner };
+    if scanner.nearest.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot attach a typed FTS query after nearest; they are mutually exclusive".into(),
+        ));
+    }
+    if scanner.fts_context.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot attach a typed FTS query after an FTS query context; the context already owns the query"
+                .into(),
+        ));
+    }
+    scanner.fts_query = Some(FullTextSearchQuery::new_query(query));
+    Ok(0)
+}
+
+/// Attach an immutable, process-local FTS query context to this scanner.
+/// The scanner clones the context's shared ownership; the caller may close
+/// the public context handle after this function returns successfully.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fts_query_context(
+    scanner: *mut LanceScanner,
+    context: *const LanceFtsQueryContext,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fts_query_context_inner(scanner, context)
+    })
+}
+
+unsafe fn scanner_set_fts_query_context_inner(
+    scanner: *mut LanceScanner,
+    context: *const LanceFtsQueryContext,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner must not be NULL".into(),
+        ));
+    }
+    let context = unsafe { clone_context(context)? };
+    let scanner = unsafe { &mut *scanner };
+    if scanner.nearest.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot attach an FTS query context after nearest; they are mutually exclusive".into(),
+        ));
+    }
+    if scanner.fts_query.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot attach an FTS query context after full_text_search; the context already owns the query"
+                .into(),
+        ));
+    }
+    context.validate_dataset_identity(&scanner.dataset)?;
+    scanner.fts_context = Some(context);
+    Ok(0)
+}
+
+/// Restrict a context-backed FTS scan to a subset of segment UUIDs.
+/// Passing `len == 0` clears the restriction so all context segments are used.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fts_index_segments(
+    scanner: *mut LanceScanner,
+    segment_uuids: *const u8,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fts_index_segments_inner(scanner, segment_uuids, len)
+    })
+}
+
+unsafe fn scanner_set_fts_index_segments_inner(
+    scanner: *mut LanceScanner,
+    segment_uuids: *const u8,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner must not be NULL".into(),
+        ));
+    }
+    let segments = if len == 0 {
+        None
+    } else {
+        Some(parse_segment_uuids(segment_uuids, len)?)
+    };
+    unsafe { &mut *scanner }.fts_index_segments = segments;
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataset::{lance_dataset_close, lance_dataset_open};
+    use crate::error::{lance_last_error_code, lance_last_error_message};
+    use crate::fts_query::{
+        LanceFtsCoverageMode, LanceFtsMatchOperator, lance_dataset_prepare_fts_match_query,
+        lance_fts_query_context_close,
+    };
+    use std::ffi::{CStr, CString};
+    use std::sync::atomic::{AtomicI32, AtomicUsize};
+    use std::sync::{Barrier, mpsc};
+    use std::time::Duration;
+
+    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance::index::DatasetIndexExt;
+    use lance::io::exec::PreFilterSource;
+    use lance_index::{IndexType, scalar::InvertedIndexParams};
+
+    #[test]
+    fn batch_query_sizes_distinguish_overflow_from_byte_limit() {
+        for (dimension, num_queries, width) in [(usize::MAX, 2, 1), (usize::MAX / 2 + 1, 1, 2)] {
+            let error = batch_query_value_count(dimension, num_queries, width)
+                .unwrap_err()
+                .to_string();
+            for detail in [
+                "overflows usize".to_string(),
+                format!("dimension={dimension}"),
+                format!("num_queries={num_queries}"),
+                format!("element_width={width}"),
+            ] {
+                assert!(error.contains(&detail), "{error} lacks {detail}");
+            }
+        }
+        assert_eq!(
+            batch_query_value_count(MAX_BATCH_QUERY_BYTES / 8, 1, 8).unwrap(),
+            MAX_BATCH_QUERY_BYTES / 8
+        );
+        let error = batch_query_value_count(MAX_BATCH_QUERY_BYTES / 8 + 1, 1, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds limit"), "{error}");
+        assert!(!error.contains("overflows"), "{error}");
+    }
+
+    #[test]
+    fn query_decoder_rejects_unaligned_typed_buffers() {
+        let storage = [0u64; 4];
+        let unaligned = unsafe { storage.as_ptr().cast::<u8>().add(1) }.cast();
+        for element_type in [0, 1, 2] {
+            let error = unsafe { decode_query_values(unaligned, 2, element_type) }
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("query_data must be aligned"), "{error}");
+        }
+    }
+
+    #[test]
+    fn batch_matrix_does_not_enter_multivector_scoring() {
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+        use futures::TryStreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().join("batch.lance");
+        let element = Arc::new(Field::new("item", DataType::Float32, false));
+        let vectors = FixedSizeListArray::try_new(
+            element.clone(),
+            2,
+            Arc::new(Float32Array::from(vec![0., 0., 1., 0., 4., 0., 5., 0.])),
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("embedding", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        block_on(Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri.to_str().unwrap(),
+            None,
+        ))
+        .unwrap();
+        let (dataset, scanner) = open_dataset_and_scanner(uri.to_str().unwrap());
+        unsafe {
+            (*scanner).nearest = Some(NearestQuery {
+                mode: NearestMode::Batch { num_queries: 2 },
+                column: "embedding".to_string(),
+                query: Arc::new(
+                    FixedSizeListArray::try_new(
+                        element,
+                        2,
+                        Arc::new(Float32Array::from(vec![0., 0., 4., 0.])),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                k: 2,
+                lower_bound: None,
+                upper_bound: None,
+            });
+            (*scanner).use_index = Some(false);
+            let result = block_on(async {
+                (*scanner)
+                    .build_scanner()?
+                    .try_into_stream()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await
+            });
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+            let batches =
+                result.expect("independent batch queries must not use multivector scoring");
+            let mut rows = Vec::new();
+            for batch in batches {
+                let queries = batch
+                    .column_by_name("query_index")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let distances = batch
+                    .column_by_name("_distance")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    rows.push((queries.value(row), ids.value(row), distances.value(row)));
+                }
+            }
+            rows.sort_by_key(|row| (row.0, row.1));
+            assert_eq!(rows, vec![(0, 0, 0.), (0, 1, 1.), (1, 2, 0.), (1, 3, 1.)]);
+        }
+    }
+
+    /// Write a 3-row dataset to a tempdir, returning (tempdir, uri).
+    fn create_test_dataset() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().join("scanner_ds").to_str().unwrap().to_string();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        block_on(Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        ))
+        .unwrap();
+        (tmp, uri)
+    }
+
+    /// Open a dataset + unconfigured scanner through the public entry points.
+    fn open_dataset_and_scanner(uri: &str) -> (*mut LanceDataset, *mut LanceScanner) {
+        let c_uri = CString::new(uri).unwrap();
+        let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+        assert!(!dataset.is_null(), "lance_dataset_open failed");
+        let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+        assert!(!scanner.is_null(), "lance_scanner_new failed");
+        (dataset, scanner)
+    }
+
+    fn poison(scanner: *mut LanceScanner) {
+        unsafe { &*scanner }
+            .poison_flag()
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn prepared_fts_plan_shape(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize, usize) {
+        let mut match_query_execs = 0;
+        let mut flat_match_query_execs = 0;
+        let mut filtered_row_id_prefilters = 0;
+        if let Some(exec) = plan.downcast_ref::<MatchQueryExec>() {
+            match_query_execs += 1;
+            if matches!(exec.prefilter_source(), PreFilterSource::FilteredRowIds(_)) {
+                filtered_row_id_prefilters += 1;
+            }
+        }
+        if plan.downcast_ref::<FlatMatchQueryExec>().is_some() {
+            flat_match_query_execs += 1;
+        }
+        for child in plan.children() {
+            let (child_match, child_flat, child_filtered) =
+                prepared_fts_plan_shape(&Arc::clone(child));
+            match_query_execs += child_match;
+            flat_match_query_execs += child_flat;
+            filtered_row_id_prefilters += child_filtered;
+        }
+        (
+            match_query_execs,
+            flat_match_query_execs,
+            filtered_row_id_prefilters,
+        )
+    }
+
+    #[test]
+    fn nprobes_setters_share_one_validated_range() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let assert_range = |minimum, maximum| {
+            assert_eq!(
+                unsafe { &*scanner }.probe,
+                ProbeConfig {
+                    minimum,
+                    maximum,
+                    ..ProbeConfig::default()
+                }
+            );
+        };
+
+        assert_range(None, None);
+        assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 2) }, 0);
+        assert_range(Some(2), None);
+        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 5) }, 0);
+        assert_range(Some(2), Some(5));
+
+        // The combined setter replaces both bounds.
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 4) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig::default().with_nprobes(4).unwrap()
+        );
+
+        // A fixed count and an explicit minimum can be staged before the
+        // explicit maximum. Their no-effort conflict is checked when the
+        // nearest scan is prepared, not while the range is still incomplete.
+        assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 5) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig {
+                nprobes: Some(4),
+                minimum: Some(5),
+                maximum: None,
+                search_effort: None,
+            }
+        );
+        assert!(unsafe { &*scanner }.probe.validate_for_scan().is_err());
+
+        // An explicit maximum completes the range without changing the
+        // staged minimum.
+        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 6) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig {
+                nprobes: Some(4),
+                minimum: Some(5),
+                maximum: Some(6),
+                search_effort: None,
+            }
+        );
+        unsafe { &*scanner }.probe.validate_for_scan().unwrap();
+
+        // A later combined call deterministically replaces the widened range.
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 3) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig::default().with_nprobes(3).unwrap()
+        );
+        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 2) }, 0);
+        assert!(unsafe { &*scanner }.probe.validate_for_scan().is_err());
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 0) }, -1);
+
+        // The combined setter clears explicit bounds but never discards an
+        // effort supplied before it.
+        assert_eq!(unsafe { lance_scanner_set_search_effort(scanner, 0.5) }, 0);
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 2) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig {
+                nprobes: Some(2),
+                search_effort: Some(0.5),
+                ..ProbeConfig::default()
+            }
+        );
+        unsafe { &*scanner }.probe.validate_for_scan().unwrap();
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn prepared_fts_index_only_plan_does_not_scan_indexed_fragment_row_ids() {
+        let (_tmp, uri) = create_test_dataset();
+        block_on(async {
+            let mut dataset = Dataset::open(&uri).await.unwrap();
+            dataset
+                .create_index(
+                    &["name"],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![4])),
+                    Arc::new(StringArray::from(vec!["a"])),
+                ],
+            )
+            .unwrap();
+            dataset
+                .append(
+                    arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+                    None,
+                )
+                .await
+                .unwrap();
+        });
+
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let column = CString::new("name").unwrap();
+        let query = CString::new("a").unwrap();
+        let context = unsafe {
+            lance_dataset_prepare_fts_match_query(
+                dataset,
+                column.as_ptr(),
+                query.as_ptr(),
+                LanceFtsMatchOperator::Or as i32,
+                0,
+                LanceFtsCoverageMode::IndexOnly as i32,
+            )
+        };
+        assert!(!context.is_null());
+        assert_eq!(
+            unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+            0
+        );
+
+        let prepared = unsafe { &*scanner }.build_scanner().unwrap();
+        let distributed = prepared.distributed_fts.as_ref().unwrap();
+        let segments = distributed.segments.clone();
+        let plan = block_on(prepared.scanner.create_plan()).unwrap();
+        assert_eq!(
+            prepared_fts_plan_shape(&plan),
+            (1, 1, 0),
+            "an unfiltered prepared FTS plan must not materialize selected fragment row IDs"
+        );
+
+        let has_current_fragments =
+            !selected_current_fts_fragments(&distributed.context.dataset, &segments)
+                .unwrap()
+                .is_empty();
+        let (rewritten, counts) = rewrite_prepared_fts_plan(
+            plan,
+            &segments,
+            &distributed.context.prepared,
+            has_current_fragments,
+            None,
+        )
+        .unwrap();
+        assert_eq!(counts.indexed_query_execs, 1);
+        assert_eq!(counts.flat_match_query_execs, 1);
+        assert_eq!(prepared_fts_plan_shape(&rewritten), (1, 0, 0));
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_fts_query_context_close(context);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    /// Assert the pending thread-local error is `Panic` carrying the poison
+    /// message; consumes it so the next assertion starts from a clean slate.
+    fn assert_poison_error_pending() {
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+        let msg_ptr = lance_last_error_message();
+        assert!(!msg_ptr.is_null(), "poison error must carry a message");
+        let msg = unsafe { CStr::from_ptr(msg_ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::error::lance_free_string(msg_ptr) };
+        assert!(
+            msg.contains("poisoned by an earlier panic"),
+            "unexpected message: {msg}"
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+    }
+
+    unsafe extern "C" fn noop_waker(_ctx: *mut c_void) {}
+
+    #[test]
+    fn null_async_callback_is_rejected_without_poisoning_scanner() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+
+        unsafe { lance_scanner_scan_async(scanner, None, ptr::null_mut()) };
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let msg_ptr = lance_last_error_message();
+        assert!(!msg_ptr.is_null());
+        let msg = unsafe { CStr::from_ptr(msg_ptr) }.to_string_lossy();
+        assert!(msg.contains("callback must not be NULL"), "got: {msg}");
+        unsafe { crate::error::lance_free_string(msg_ptr) };
+        assert!(!unsafe { &*scanner }.is_poisoned());
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn set_blob_handling_stores_the_matching_upstream_variant() {
+        // A scan cannot tell AllDescriptions from BlobsDescriptions on lance
+        // v11, so check the stored variant directly.
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+
+        assert_eq!(
+            unsafe { &*scanner }.blob_handling,
+            None,
+            "blob handling should be unset until the setter is called"
+        );
+
+        for (handling, expected) in [
+            (0, BlobHandling::BlobsDescriptions),
+            (1, BlobHandling::AllBinary),
+            (2, BlobHandling::AllDescriptions),
+        ] {
+            assert_eq!(
+                unsafe { lance_scanner_set_blob_handling(scanner, handling) },
+                0
+            );
+            assert_eq!(
+                unsafe { &*scanner }.blob_handling,
+                Some(expected),
+                "blob handling {handling} stored the wrong variant"
+            );
+        }
+
+        // A rejected value leaves the last accepted mode in place.
+        assert_eq!(unsafe { lance_scanner_set_blob_handling(scanner, 3) }, -1);
+        assert_eq!(
+            unsafe { &*scanner }.blob_handling,
+            Some(BlobHandling::AllDescriptions)
+        );
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn scanner_materialization_and_fast_search_setters_preserve_state_on_errors() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let name = CString::new("name").unwrap();
+        let missing = CString::new("missing").unwrap();
+        let name_id = unsafe { (*dataset).snapshot() }
+            .schema()
+            .field("name")
+            .unwrap()
+            .id as u32;
+
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::Heuristic
+        ));
+        assert!(!unsafe { &*scanner }.fast_search);
+
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    [name.as_ptr()].as_ptr(),
+                    1,
+                )
+            },
+            0
+        );
+        match &unsafe { &*scanner }.materialization_style {
+            MaterializationStyle::AllEarlyExcept(ids) => assert_eq!(ids, &vec![name_id]),
+            _ => panic!("unexpected materialization style"),
+        }
+
+        let empty: [*const c_char; 0] = [];
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    empty.as_ptr(),
+                    0,
+                )
+            },
+            0
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllEarlyExcept(ids) if ids.is_empty()
+        ));
+
+        // Invalid names, NULL entries, non-EXCEPT column lists, and unknown enum
+        // tags are rejected without replacing the accepted empty exception list.
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    [missing.as_ptr()].as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    [ptr::null()].as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllLate as i32,
+                    [name.as_ptr()].as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { lance_scanner_set_materialization_style(scanner, 99, ptr::null(), 0) },
+            -1
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllEarlyExcept(ids) if ids.is_empty()
+        ));
+
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllLate as i32,
+                    ptr::null(),
+                    0,
+                )
+            },
+            0
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllLate
+        ));
+
+        assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, true) }, 0);
+        assert!(unsafe { &*scanner }.fast_search);
+        assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, false) }, 0);
+        assert!(!unsafe { &*scanner }.fast_search);
+
+        let mut batch = ptr::null_mut();
+        assert_eq!(unsafe { lance_scanner_next(scanner, &mut batch) }, 0);
+        assert!(!batch.is_null());
+        unsafe { crate::batch::lance_batch_free(batch) };
+        assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, true) }, -1);
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarly as i32,
+                    ptr::null(),
+                    0,
+                )
+            },
+            -1
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllLate
+        ));
+        assert!(!unsafe { &*scanner }.fast_search);
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn null_poll_waker_is_rejected_and_clears_out() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let mut batch = std::ptr::NonNull::<LanceBatch>::dangling().as_ptr();
+
+        let status = unsafe { lance_scanner_poll_next(scanner, None, ptr::null_mut(), &mut batch) };
+        assert_eq!(status, LancePollStatus::Error);
+        assert!(batch.is_null());
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert!(!unsafe { &*scanner }.is_poisoned());
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn raw_waker_clones_share_one_shot_gate() {
+        static WAKES: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn count_wake(_ctx: *mut c_void) {
+            WAKES.fetch_add(1, Ordering::SeqCst);
+        }
+
+        WAKES.store(0, Ordering::SeqCst);
+        let registry = PollWakerRegistry::default();
+        let waker =
+            unsafe { Waker::from_raw(make_raw_waker(&registry, count_wake, ptr::null_mut())) };
+        let cloned = waker.clone();
+        waker.wake_by_ref();
+        cloned.wake_by_ref();
+        drop(cloned);
+        drop(waker);
+        assert_eq!(WAKES.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn scanner_close_cancels_a_retained_poll_waker() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let calls = Box::into_raw(Box::new(AtomicUsize::new(0)));
+
+        unsafe extern "C" fn count_wake(ctx: *mut c_void) {
+            let calls = unsafe { &*(ctx.cast::<AtomicUsize>()) };
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        // Model a future retaining the RawWaker clone returned from a PENDING
+        // poll. Closing the scanner is the documented retirement boundary, so
+        // waking that retained clone afterwards must not touch callback_ctx.
+        let waker = unsafe {
+            Waker::from_raw(make_raw_waker(
+                &(*scanner).poll_wakers,
+                count_wake,
+                calls.cast(),
+            ))
+        };
+        unsafe { lance_scanner_close(scanner) };
+        waker.wake();
+
+        let calls = unsafe { Box::from_raw(calls) };
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a retained RawWaker invoked callback_ctx after scanner close"
+        );
+        unsafe { lance_dataset_close(dataset) };
+    }
+
+    struct BlockingWakeProbe {
+        calls: AtomicUsize,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    unsafe extern "C" fn blocking_waker(ctx: *mut c_void) {
+        let probe = unsafe { &*(ctx.cast::<BlockingWakeProbe>()) };
+        probe.calls.fetch_add(1, Ordering::SeqCst);
+        probe.entered.wait();
+        probe.release.wait();
+    }
+
+    #[test]
+    fn scanner_close_waits_for_an_active_poll_waker() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let probe = Box::into_raw(Box::new(BlockingWakeProbe {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        let waker = unsafe {
+            Waker::from_raw(make_raw_waker(
+                &(*scanner).poll_wakers,
+                blocking_waker,
+                probe.cast(),
+            ))
+        };
+
+        let wake_thread = std::thread::spawn(move || waker.wake());
+        entered.wait();
+
+        let close_started = Arc::new(Barrier::new(2));
+        let close_started_in_thread = Arc::clone(&close_started);
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let scanner_address = scanner as usize;
+        let close_thread = std::thread::spawn(move || {
+            close_started_in_thread.wait();
+            unsafe { lance_scanner_close(scanner_address as *mut LanceScanner) };
+            closed_tx.send(()).unwrap();
+        });
+        close_started.wait();
+
+        let closed_while_callback_was_active =
+            closed_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        release.wait();
+        wake_thread.join().unwrap();
+        close_thread.join().unwrap();
+
+        let probe = unsafe { Box::from_raw(probe) };
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !closed_while_callback_was_active,
+            "scanner close returned before an active poll waker callback completed"
+        );
+        unsafe { lance_dataset_close(dataset) };
+    }
+
+    fn panicking_setter_body() -> Result<i32> {
+        panic!("simulated panic in scanner setter")
+    }
+
+    unsafe fn panicking_scanner_setter(scanner: *mut LanceScanner) -> i32 {
+        scanner_poison_check!(scanner, -1);
+        scanner_ffi_try!(scanner, panicking_setter_body())
+    }
+
+    #[test]
+    fn scanner_setter_panic_poisons_handle() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+
+        let rc = unsafe { panicking_scanner_setter(scanner) };
+        assert_eq!(rc, -1);
+        assert!(unsafe { &*scanner }.is_poisoned());
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Panic);
+        let msg_ptr = lance_last_error_message();
+        assert!(!msg_ptr.is_null());
+        let msg = unsafe { CStr::from_ptr(msg_ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::error::lance_free_string(msg_ptr) };
+        assert!(
+            msg.contains("simulated panic in scanner setter"),
+            "got: {msg}"
+        );
+
+        // The original panic message is reported once; later calls use the
+        // stable poison error and never touch scanner state again.
+        let rc = unsafe { lance_scanner_set_limit(scanner, 10) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn poisoned_scanner_rejects_setters_with_panic_code() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        poison(scanner);
+
+        // Representative setters across the hand-written and macro-generated
+        // families: each must return -1 with LANCE_ERR_PANIC.
+        let rc = unsafe { lance_scanner_set_limit(scanner, 10) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        let rc = unsafe { lance_scanner_set_nprobes(scanner, 4) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        let rc = unsafe { lance_scanner_set_prefilter(scanner, true) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        let rc = unsafe { lance_scanner_set_projection(scanner, ptr::null(), 0) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        let rc = unsafe { lance_scanner_disable_scoring_autoprojection(scanner) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        let rc = unsafe { lance_scanner_set_substrait_aggregate(scanner, ptr::null(), 0) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        // to_arrow_stream also dereferences the handle: same rejection.
+        let mut ffi_stream = FFI_ArrowArrayStream::empty();
+        let rc = unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        // Close must still free a poisoned handle (no poison check there).
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn poisoned_scanner_rejects_planning_and_count_with_panic_code() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        poison(scanner);
+
+        let mut schema = FFI_ArrowSchema::empty();
+        assert_eq!(unsafe { lance_scanner_schema(scanner, &mut schema) }, -1);
+        assert_poison_error_pending();
+
+        assert!(unsafe { lance_scanner_explain_plan(scanner, false) }.is_null());
+        assert_poison_error_pending();
+        assert!(unsafe { lance_scanner_analyze_plan(scanner) }.is_null());
+        assert_poison_error_pending();
+        assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
+        assert_poison_error_pending();
+        assert!(unsafe { lance_scanner_analyze_count_plan(scanner) }.is_null());
+        assert_poison_error_pending();
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn poisoned_scanner_next_returns_panic_code() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        poison(scanner);
+
+        let mut batch = std::ptr::NonNull::<LanceBatch>::dangling().as_ptr();
+        let rc = unsafe { lance_scanner_next(scanner, &mut batch) };
+        assert_eq!(rc, -1);
+        assert!(batch.is_null(), "error path must leave *out NULL");
+        assert_poison_error_pending();
+
+        // Poison has precedence over validation of secondary arguments.
+        let rc = unsafe { lance_scanner_next(scanner, ptr::null_mut()) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn poisoned_scanner_poll_next_returns_error_status() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        poison(scanner);
+
+        let mut batch = std::ptr::NonNull::<LanceBatch>::dangling().as_ptr();
+        let status = unsafe {
+            lance_scanner_poll_next(scanner, Some(noop_waker), ptr::null_mut(), &mut batch)
+        };
+        assert_eq!(status, LancePollStatus::Error);
+        assert!(batch.is_null(), "error path must leave *out NULL");
+        assert_poison_error_pending();
+
+        let status = unsafe {
+            lance_scanner_poll_next(scanner, Some(noop_waker), ptr::null_mut(), ptr::null_mut())
+        };
+        assert_eq!(status, LancePollStatus::Error);
+        assert_poison_error_pending();
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    static CALLBACK_STATUS: AtomicI32 = AtomicI32::new(i32::MIN);
+    static CALLBACK_RESULT_WAS_NULL: AtomicBool = AtomicBool::new(false);
+    static CALLBACK_ERROR_CODE: AtomicI32 = AtomicI32::new(i32::MIN);
+    static CALLBACK_ERROR_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    unsafe extern "C" fn record_status(_ctx: *mut c_void, status: i32, result: *mut c_void) {
+        CALLBACK_RESULT_WAS_NULL.store(result.is_null(), Ordering::SeqCst);
+        // The dispatcher installs the error on this (callback) thread's TLS
+        // before invoking us; record it exactly as a C consumer reads it:
+        // code first, then the (consuming) message read.
+        CALLBACK_ERROR_CODE.store(lance_last_error_code() as i32, Ordering::SeqCst);
+        let msg_ptr = lance_last_error_message();
+        let message = if msg_ptr.is_null() {
+            None
+        } else {
+            let msg = unsafe { CStr::from_ptr(msg_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { crate::error::lance_free_string(msg_ptr) };
+            Some(msg)
+        };
+        *CALLBACK_ERROR_MESSAGE.lock().unwrap() = message;
+        // Published last: a reader that observes `status` also observes the
+        // error fields written above (SeqCst total order).
+        CALLBACK_STATUS.store(status, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn poisoned_scanner_scan_async_dispatches_error_callback() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        poison(scanner);
+
+        unsafe { lance_scanner_scan_async(scanner, Some(record_status), ptr::null_mut()) };
+        // The poison error is also visible on the calling thread.
+        assert_poison_error_pending();
+
+        // The void entry point reports through the callback on the dispatcher
+        // thread; wait for delivery.
+        let mut waited_ms = 0;
+        while CALLBACK_STATUS.load(Ordering::SeqCst) == i32::MIN && waited_ms < 5000 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited_ms += 10;
+        }
+        assert_eq!(CALLBACK_STATUS.load(Ordering::SeqCst), -1);
+        assert!(CALLBACK_RESULT_WAS_NULL.load(Ordering::SeqCst));
+        // The callback thread's TLS must carry the poison error too (issue
+        // #61): validation-time failures set the caller thread's TLS AND ride
+        // inside the dispatch message, which the dispatcher installs before
+        // invoking the callback.
+        assert_eq!(
+            CALLBACK_ERROR_CODE.load(Ordering::SeqCst),
+            LanceErrorCode::Panic as i32
+        );
+        let callback_msg = CALLBACK_ERROR_MESSAGE
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("callback-thread TLS must carry the poison message");
+        assert!(
+            callback_msg.contains("poisoned by an earlier panic"),
+            "unexpected callback-thread message: {callback_msg}"
+        );
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn fresh_scanner_is_not_poisoned() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+
+        let rc = unsafe { lance_scanner_set_limit(scanner, 10) };
+        assert_eq!(rc, 0);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+
+        // Smoke-test the newly guarded iteration path end to end.
+        let mut batches = 0;
+        let mut batch: *mut LanceBatch = ptr::null_mut();
+        loop {
+            let rc = unsafe { lance_scanner_next(scanner, &mut batch) };
+            assert!(rc >= 0, "lance_scanner_next failed with {rc}");
+            if rc == 1 {
+                break;
+            }
+            assert!(!batch.is_null());
+            batches += 1;
+            unsafe { crate::lance_batch_free(batch) };
+            batch = ptr::null_mut();
+        }
+        assert!(batches > 0, "dataset must yield at least one batch");
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    /// What the probe callback observed on the dispatcher thread: the
+    /// completion status plus the error the dispatcher installed on TLS.
+    #[derive(Debug)]
+    struct SetupPanicObservation {
+        status: i32,
+        code: LanceErrorCode,
+        message: Option<String>,
+    }
+
+    unsafe extern "C" fn record_setup_panic(ctx: *mut c_void, status: i32, _result: *mut c_void) {
+        let tx = unsafe { &*(ctx as *const std::sync::mpsc::Sender<SetupPanicObservation>) };
+        let code = lance_last_error_code();
+        let msg_ptr = lance_last_error_message();
+        let message = if msg_ptr.is_null() {
+            None
+        } else {
+            let msg = unsafe { CStr::from_ptr(msg_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { crate::error::lance_free_string(msg_ptr) };
+            Some(msg)
+        };
+        let _ = tx.send(SetupPanicObservation {
+            status,
+            code,
+            message,
+        });
+    }
+
+    /// Regression for the review finding that the spawned task's
+    /// `catch_unwind().await` started too late: a panic in *call-time setup*
+    /// (validation, `build_scanner`, runtime access, `RT.spawn`) used to
+    /// unwind out of the non-unwinding entry point and abort the host
+    /// without delivering the promised callback. The entry guard must poison
+    /// the handle and dispatch exactly one `LANCE_ERR_PANIC` completion
+    /// instead. The setup closure is injected so no production fault hook is
+    /// needed. (The panic hook prints to stderr; expected noise.)
+    #[test]
+    fn scan_async_setup_panic_poisons_and_dispatches_exactly_one_completion() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+
+        let (tx, rx) = std::sync::mpsc::channel::<SetupPanicObservation>();
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+
+        unsafe {
+            scan_async_guarded(scanner, record_setup_panic, ctx, |_, _, _| {
+                panic!("injected setup panic")
+            });
+        }
+
+        assert!(
+            unsafe { &*scanner }.is_poisoned(),
+            "a setup panic must poison the scanner handle"
+        );
+
+        let obs = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the entry guard must still deliver the callback");
+        assert_eq!(obs.status, -1);
+        assert_eq!(obs.code, LanceErrorCode::Panic);
+        assert!(
+            obs.message
+                .as_deref()
+                .expect("panic completion must carry a message")
+                .contains("injected setup panic"),
+            "panic payload must reach the callback, got: {:?}",
+            obs.message
+        );
+
+        // The contract is exactly ONE completion: no duplicate may follow.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a setup panic must dispatch exactly one callback completion"
+        );
+
+        unsafe {
+            drop(Box::from_raw(
+                ctx as *mut std::sync::mpsc::Sender<SetupPanicObservation>,
+            ));
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
 }

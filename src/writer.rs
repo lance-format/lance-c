@@ -15,16 +15,24 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::record_batch::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
+use chrono::TimeDelta;
 use lance::Dataset;
-use lance::dataset::{WriteMode as LanceWriteModeUpstream, WriteParams};
+use lance::dataset::{AutoCleanupParams, WriteMode as LanceWriteModeUpstream, WriteParams};
+use lance::session::Session;
 use lance_core::Result;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 
+use lance_table::io::commit::CommitHandler;
+
+use crate::commit_lock::{LanceCommitLock, commit_handler_from_ffi};
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
+use crate::native_write_options::LanceNativeWriteOptions;
 use crate::runtime::block_on;
+use crate::session::LanceSession;
+use crate::storage_options::{LanceStorageOptionsAccessor, storage_options_accessor_from_ffi};
 
 /// Write mode for `lance_dataset_write`.
 ///
@@ -50,18 +58,17 @@ pub enum LanceWriteMode {
 impl LanceWriteMode {
     /// Validate a raw FFI integer into a `LanceWriteMode`. Out-of-range
     /// values become `InvalidInput`.
-    fn from_raw(raw: i32) -> Result<Self> {
+    pub(crate) fn from_raw(raw: i32) -> Result<Self> {
         match raw {
             0 => Ok(Self::Create),
             1 => Ok(Self::Append),
             2 => Ok(Self::Overwrite),
-            other => Err(lance_core::Error::InvalidInput {
-                source: format!(
+            other => Err(lance_core::Error::invalid_input_source(
+                format!(
                     "invalid write mode {other}; expected 0 (create), 1 (append), or 2 (overwrite)"
                 )
                 .into(),
-                location: snafu::location!(),
-            }),
+            )),
         }
     }
 }
@@ -106,6 +113,52 @@ pub struct LanceWriteParams {
     pub enable_stable_row_ids: bool,
 }
 
+/// Native automatic-cleanup parameters for `lance_dataset_write_with_options`.
+///
+/// `interval` is the number of committed versions between cleanup runs; `0`
+/// is a valid native value that considers cleanup on every commit.
+///
+/// `older_than_seconds` and `older_than_nanos` together express the native
+/// `chrono::TimeDelta` retention window as
+/// `older_than_seconds + older_than_nanos / 1_000_000_000`. Both fields carry
+/// the sign, and the nanosecond component preserves the native precision.
+/// `older_than_nanos` must be in `[-999_999_999, 999_999_999]`, and the
+/// combined value must fit in `chrono::TimeDelta` (about +/-292 million
+/// years). Negative durations are forwarded to Lance, which rejects them when
+/// it builds the write transaction because the persisted config uses
+/// `std::time::Duration`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceAutoCleanupParams {
+    /// Number of committed versions between cleanup runs. `0` is valid.
+    pub interval: u64,
+    /// Whole-second component of the retention window.
+    pub older_than_seconds: i64,
+    /// Signed subsecond component of the retention window, in nanoseconds.
+    pub older_than_nanos: i32,
+}
+
+/// Native write options for `lance_dataset_write_with_options`.
+///
+/// Zero-initialize this struct to select `WriteParams::default()`:
+/// `auto_cleanup = None` and `skip_auto_cleanup = false`. The embedded
+/// `params` keeps the zero-means-upstream-default mapping documented on
+/// `LanceWriteParams`.
+///
+/// A NULL `auto_cleanup` selects native `None`; a non-NULL pointer selects
+/// `Some`, including an explicit `interval = 0` or a zero-length retention
+/// window. `skip_auto_cleanup` affects only the current commit and never
+/// changes persisted configuration.
+#[repr(C)]
+pub struct LanceWriteOptions {
+    /// Output-shape overrides. Zero-initialize to inherit upstream defaults.
+    pub params: LanceWriteParams,
+    /// Native `WriteParams::auto_cleanup`; NULL means `None`.
+    pub auto_cleanup: *const LanceAutoCleanupParams,
+    /// Native `WriteParams::skip_auto_cleanup`.
+    pub skip_auto_cleanup: bool,
+}
+
 /// Write an Arrow record batch stream to a Lance dataset at `uri`, committing a manifest.
 ///
 /// - `uri`: Dataset URI (`file://`, `s3://`, `memory://`, ...). Must not be NULL or empty.
@@ -121,6 +174,9 @@ pub struct LanceWriteParams {
 ///   `*out_dataset` is untouched — do not read or free it.
 ///
 /// Equivalent to `lance_dataset_write_with_params(..., params = NULL, ...)`.
+/// This legacy entry point records the documented 20-version / 14-day
+/// auto-cleanup policy. Use `lance_dataset_write_with_options` for native
+/// `WriteParams` defaults.
 ///
 /// Returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
@@ -132,21 +188,41 @@ pub unsafe extern "C" fn lance_dataset_write(
     storage_opts: *const *const c_char,
     out_dataset: *mut *mut LanceDataset,
 ) -> i32 {
-    unsafe {
-        lance_dataset_write_with_params(
-            uri,
-            schema,
-            stream,
-            mode,
-            std::ptr::null(),
-            storage_opts,
-            out_dataset,
-        )
-    }
+    // Wrap the shared inner fn directly rather than forwarding to the
+    // `lance_dataset_write_with_params` extern: both extern "C" frames must
+    // carry their own panic guard, and a guard around the forwarding call
+    // would clear the thread-local error the inner guard just set (its
+    // `-1` return looks like `Ok(-1)` to an outer guard).
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options: std::ptr::null(),
+                    legacy_auto_cleanup: true,
+                    storage_options_accessor: std::ptr::null(),
+                    session: None,
+                    commit_handler: None,
+                    native_options: std::ptr::null(),
+                },
+                storage_opts,
+                out_dataset,
+            )
+        },
+        neg
+    )
 }
 
 /// Same as `lance_dataset_write` but takes a `LanceWriteParams` for tuning the
 /// output shape. Pass `params = NULL` to use upstream defaults.
+///
+/// This legacy entry point records the documented 20-version / 14-day
+/// auto-cleanup policy. Use `lance_dataset_write_with_options` for native
+/// `WriteParams` defaults.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_dataset_write_with_params(
     uri: *const c_char,
@@ -159,10 +235,385 @@ pub unsafe extern "C" fn lance_dataset_write_with_params(
 ) -> i32 {
     ffi_try!(
         unsafe {
-            write_dataset_inner(uri, schema, stream, mode, params, storage_opts, out_dataset)
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params,
+                    options: std::ptr::null(),
+                    legacy_auto_cleanup: true,
+                    storage_options_accessor: std::ptr::null(),
+                    session: None,
+                    commit_handler: None,
+                    native_options: std::ptr::null(),
+                },
+                storage_opts,
+                out_dataset,
+            )
         },
         neg
     )
+}
+
+/// Same as `lance_dataset_write` but selects native `WriteParams` defaults
+/// and optional auto-cleanup settings. Pass `options = NULL` to use a
+/// zero-initialized `LanceWriteOptions`, which is equivalent to
+/// `WriteParams::default()`: `auto_cleanup = None`, `skip_auto_cleanup =
+/// false`.
+///
+/// On an existing dataset, `auto_cleanup` is written only by CREATE;
+/// APPEND and OVERWRITE leave the persisted policy unchanged. An explicit
+/// `auto_cleanup = None` on an existing manifest therefore does not delete
+/// stored cleanup configuration.
+///
+/// The stream is consumed on every return path except a NULL `stream`.
+/// `out_dataset` follows the same contract as `lance_dataset_write`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_write_with_options(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    options: *const LanceWriteOptions,
+    storage_opts: *const *const c_char,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options,
+                    legacy_auto_cleanup: false,
+                    storage_options_accessor: std::ptr::null(),
+                    session: None,
+                    commit_handler: None,
+                    native_options: std::ptr::null(),
+                },
+                storage_opts,
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Write with a native storage-options accessor and the legacy 20/14
+/// auto-cleanup policy.
+///
+/// `storage_options_accessor` may be NULL for native defaults. Static storage
+/// options belong in the accessor's initial options, so no `storage_opts`
+/// parameter is accepted here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_write_with_accessor(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options: std::ptr::null(),
+                    legacy_auto_cleanup: true,
+                    storage_options_accessor,
+                    session: None,
+                    commit_handler: None,
+                    native_options: std::ptr::null(),
+                },
+                std::ptr::null(),
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Write with native `LanceWriteParams` and a storage-options accessor.
+///
+/// `params` may be NULL for native defaults. `storage_options_accessor` may be
+/// NULL for native defaults. This entry point keeps the legacy 20/14
+/// auto-cleanup policy, matching `lance_dataset_write_with_params`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_dataset_write_with_params_and_accessor(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    params: *const LanceWriteParams,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params,
+                    options: std::ptr::null(),
+                    legacy_auto_cleanup: true,
+                    storage_options_accessor,
+                    session: None,
+                    commit_handler: None,
+                    native_options: std::ptr::null(),
+                },
+                std::ptr::null(),
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Write with native `LanceWriteOptions` and a storage-options accessor.
+///
+/// `options` may be NULL for a zero-initialized `LanceWriteOptions`, which
+/// selects native `WriteParams::default()`. `storage_options_accessor` may be
+/// NULL for native defaults.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_dataset_write_with_options_and_accessor(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    options: *const LanceWriteOptions,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options,
+                    legacy_auto_cleanup: false,
+                    storage_options_accessor,
+                    session: None,
+                    commit_handler: None,
+                    native_options: std::ptr::null(),
+                },
+                std::ptr::null(),
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Same as `lance_dataset_write_with_options` but composes with an optional
+/// dynamic storage-options accessor and a foreign commit lock.
+///
+/// A non-NULL `storage_accessor` forwards its native `Arc` owner directly; a
+/// NULL handle, or an accessor without an inner owner, selects native `None`.
+/// A non-NULL `commit_lock` replaces the URI-derived handler with the foreign
+/// handler; NULL keeps the native default. Both owners are retained by the
+/// committed dataset after this call returns. `session` is optional.
+///
+/// `out_dataset` follows `lance_dataset_write_with_options`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_dataset_write_with_options_with_commit_lock(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    options: *const LanceWriteOptions,
+    storage_accessor: *const LanceStorageOptionsAccessor,
+    session: *const LanceSession,
+    commit_lock: *const LanceCommitLock,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            let session = if session.is_null() {
+                None
+            } else {
+                Some((*session).inner.clone())
+            };
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options,
+                    legacy_auto_cleanup: false,
+                    storage_options_accessor: storage_accessor,
+                    session,
+                    commit_handler: commit_handler_from_ffi(commit_lock),
+                    native_options: std::ptr::null(),
+                },
+                std::ptr::null(),
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Write with an owned native-backed options handle.
+///
+/// A NULL `options` selects native `WriteParams::default()`. The handle
+/// supplies every native write option, including the session, storage
+/// accessor, commit lock, base placement, blob policy, file-writer options and
+/// progress callbacks. The stream is consumed on every return path except a
+/// NULL `stream`. Output semantics match `lance_dataset_write`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_write_with_native_options(
+    uri: *const c_char,
+    schema: *const FFI_ArrowSchema,
+    stream: *mut FFI_ArrowArrayStream,
+    mode: i32,
+    options: *const LanceNativeWriteOptions,
+    out_dataset: *mut *mut LanceDataset,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            write_dataset_inner(
+                uri,
+                schema,
+                stream,
+                mode,
+                WriteSettings {
+                    params: std::ptr::null(),
+                    options: std::ptr::null(),
+                    legacy_auto_cleanup: false,
+                    storage_options_accessor: std::ptr::null(),
+                    session: None,
+                    commit_handler: None,
+                    native_options: options,
+                },
+                std::ptr::null(),
+                out_dataset,
+            )
+        },
+        neg
+    )
+}
+
+/// Internal selection between the legacy write entry points and the native
+/// options entry point. Raw pointers stay valid for the synchronous FFI call.
+struct WriteSettings {
+    params: *const LanceWriteParams,
+    options: *const LanceWriteOptions,
+    legacy_auto_cleanup: bool,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
+    session: Option<Arc<Session>>,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
+    native_options: *const LanceNativeWriteOptions,
+}
+
+/// Build native `WriteParams` from the writer option representations.
+///
+/// This is shared by the committing writer entry points and the uncommitted
+/// transaction entry point so their option/default conversion cannot drift.
+/// The C pointers are borrowed only for this synchronous call.
+pub(crate) unsafe fn write_params_from_ffi(
+    mode: LanceWriteMode,
+    params: *const LanceWriteParams,
+    options: *const LanceWriteOptions,
+    legacy_auto_cleanup: bool,
+    storage_opts: *const *const c_char,
+    storage_options_accessor: *const LanceStorageOptionsAccessor,
+    session: Option<Arc<Session>>,
+) -> Result<WriteParams> {
+    // SAFETY: `storage_opts` is either NULL or a NULL-terminated array of
+    // C-string pointers per the FFI contract.
+    let opts = unsafe { helpers::parse_storage_options(storage_opts)? };
+    let accessor = unsafe { storage_options_accessor_from_ffi(storage_options_accessor)? };
+    if accessor.is_some() && !opts.is_empty() {
+        return Err(lance_core::Error::invalid_input_source(
+            "storage_opts must be NULL when a storage options accessor is provided".into(),
+        ));
+    }
+    let store_params = if let Some(accessor) = accessor {
+        Some(ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..ObjectStoreParams::default()
+        })
+    } else {
+        (!opts.is_empty()).then(|| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                opts,
+            ))),
+            ..ObjectStoreParams::default()
+        })
+    };
+    let mut write_params = WriteParams {
+        mode: mode.into(),
+        store_params,
+        session,
+        ..WriteParams::default()
+    };
+
+    if !options.is_null() {
+        unsafe { apply_write_options(&mut write_params, options)? };
+    } else if !params.is_null() {
+        // SAFETY: a non-NULL `params` points to a valid `LanceWriteParams` for
+        // the duration of this call.
+        unsafe { apply_write_params(&mut write_params, &*params)? };
+    }
+
+    if legacy_auto_cleanup {
+        // Lance 9.1 changed the upstream default to `auto_cleanup: None`.
+        // The long-standing C entry points still expose the pre-9.1 policy
+        // (every 20 versions, older than 14 days) so datasets created through
+        // them keep their reclamation path. Pin the values explicitly rather
+        // than via `AutoCleanupParams::default()`, so a future upstream
+        // default change cannot silently shift C-visible behavior.
+        write_params.auto_cleanup = Some(legacy_auto_cleanup_params());
+    }
+
+    Ok(write_params)
+}
+
+/// Apply the shared `LanceWriteOptions` representation onto native params.
+///
+/// The C pointers are borrowed only for this synchronous conversion. The same
+/// mapping is used by the legacy entry points and by the owned native options
+/// handle.
+pub(crate) unsafe fn apply_write_options(
+    target: &mut WriteParams,
+    options: *const LanceWriteOptions,
+) -> Result<()> {
+    if options.is_null() {
+        return Ok(());
+    }
+    // SAFETY: a non-NULL `options` points to a valid `LanceWriteOptions` for
+    // the duration of this call. The borrow ends before any await.
+    let options = unsafe { &*options };
+    unsafe { apply_write_params(target, &options.params)? };
+    if !options.auto_cleanup.is_null() {
+        // SAFETY: the caller guarantees a non-NULL `auto_cleanup` points to a
+        // valid `LanceAutoCleanupParams` for this call.
+        target.auto_cleanup = Some(unsafe { auto_cleanup_from_ffi(&*options.auto_cleanup)? });
+    }
+    target.skip_auto_cleanup = options.skip_auto_cleanup;
+    Ok(())
 }
 
 unsafe fn write_dataset_inner(
@@ -170,7 +621,7 @@ unsafe fn write_dataset_inner(
     schema: *const FFI_ArrowSchema,
     stream: *mut FFI_ArrowArrayStream,
     mode: i32,
-    params: *const LanceWriteParams,
+    settings: WriteSettings,
     storage_opts: *const *const c_char,
     out_dataset: *mut *mut LanceDataset,
 ) -> Result<i32> {
@@ -180,10 +631,9 @@ unsafe fn write_dataset_inner(
     // uri/schema NULL checks ahead of `from_raw` would leak the stream on
     // those paths and break the documented "consumed on every return" contract.
     if stream.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "stream must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "stream must not be NULL".into(),
+        ));
     }
 
     // SAFETY: `stream` is non-NULL (checked above) and the caller guarantees
@@ -191,24 +641,18 @@ unsafe fn write_dataset_inner(
     // owned by them. `from_raw` performs a `ptr::replace` that transfers
     // ownership into the returned reader, zeroing the caller's release
     // callback so it cannot be released twice.
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream) }.map_err(|e| {
-        lance_core::Error::InvalidInput {
-            source: e.to_string().into(),
-            location: snafu::location!(),
-        }
-    })?;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream) }
+        .map_err(|e| lance_core::Error::invalid_input_source(e.to_string().into()))?;
 
     if uri.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "uri must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "uri must not be NULL".into(),
+        ));
     }
     if schema.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "schema must not be NULL".into(),
-            location: snafu::location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "schema must not be NULL".into(),
+        ));
     }
 
     // Validate the mode at the boundary — storing an out-of-range tag as a
@@ -222,55 +666,46 @@ unsafe fn write_dataset_inner(
     // which `block_on` enforces by completing before this function returns.
     let uri_str = unsafe { helpers::parse_c_string(uri)? }
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| lance_core::Error::InvalidInput {
-            // NULL is rejected above; only the empty case reaches here.
-            source: "uri must not be empty".into(),
-            location: snafu::location!(),
-        })?;
+        // NULL is rejected above; only the empty case reaches here.
+        .ok_or_else(|| lance_core::Error::invalid_input("uri must not be empty"))?;
 
     // SAFETY: `schema` is non-NULL (checked above) and the caller guarantees
     // it points to a properly-initialized `FFI_ArrowSchema` valid for the
     // duration of this call. `try_from(&FFI_ArrowSchema)` reads by shared
     // reference and does not move out of or release the schema.
     let expected_schema = ArrowSchema::try_from(unsafe { &*schema }).map_err(|e| {
-        lance_core::Error::InvalidInput {
-            source: format!("invalid schema: {e}").into(),
-            location: snafu::location!(),
-        }
+        lance_core::Error::invalid_input_source(format!("invalid schema: {e}").into())
     })?;
 
-    // SAFETY: `storage_opts` is either NULL or a NULL-terminated array of
-    // C-string pointers per the FFI contract; `parse_storage_options` returns
-    // an empty map for NULL.
-    let opts = unsafe { helpers::parse_storage_options(storage_opts)? };
+    let mut write_params = if settings.native_options.is_null() {
+        let mut params = unsafe {
+            write_params_from_ffi(
+                mode,
+                settings.params,
+                settings.options,
+                settings.legacy_auto_cleanup,
+                storage_opts,
+                settings.storage_options_accessor,
+                settings.session,
+            )?
+        };
+        params.commit_handler = settings.commit_handler;
+        params
+    } else {
+        // SAFETY: the caller guarantees a non-NULL native-options pointer is
+        // valid for this synchronous call. `params_clone` copies every native
+        // owner the write needs.
+        unsafe { &*settings.native_options }.params_clone()
+    };
+    write_params.mode = mode.into();
 
     // Fail fast: compare the stream schema against the caller-provided schema.
     let stream_schema = reader.schema();
     if stream_schema.fields() != expected_schema.fields() {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!(
+        return Err(lance_core::Error::invalid_input_source(format!(
                 "stream schema does not match the provided schema.\n  expected: {expected_schema}\n  got:      {stream_schema}"
             )
-            .into(),
-            location: snafu::location!(),
-        });
-    }
-
-    let store_params = (!opts.is_empty()).then(|| ObjectStoreParams {
-        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(opts))),
-        ..ObjectStoreParams::default()
-    });
-    let mut write_params = WriteParams {
-        mode: mode.into(),
-        store_params,
-        ..WriteParams::default()
-    };
-    if !params.is_null() {
-        // SAFETY: `params` is non-NULL (checked above) and the caller
-        // guarantees it points to a properly-initialized `LanceWriteParams`
-        // valid for the duration of this call. We borrow by shared reference
-        // and only read; the borrow is consumed before any await point.
-        unsafe { apply_write_params(&mut write_params, &*params)? };
+            .into()));
     }
 
     let dataset = block_on(Dataset::write(reader, uri_str, Some(write_params)))?;
@@ -291,6 +726,55 @@ unsafe fn write_dataset_inner(
     Ok(0)
 }
 
+/// The documented legacy lance-c cleanup policy.
+fn legacy_auto_cleanup_params() -> AutoCleanupParams {
+    AutoCleanupParams {
+        interval: 20,
+        older_than: TimeDelta::days(14),
+    }
+}
+
+/// Convert the C representation into native `AutoCleanupParams`.
+///
+/// The nanosecond component must be already normalized to the native
+/// `TimeDelta` subsecond range. Out-of-range values and durations outside
+/// `chrono::TimeDelta` are rejected with context instead of being clamped.
+fn auto_cleanup_from_ffi(raw: &LanceAutoCleanupParams) -> Result<AutoCleanupParams> {
+    let interval = u64_to_usize(raw.interval, "auto_cleanup.interval")?;
+    let older_than =
+        helpers::time_delta_from_ffi(raw.older_than_seconds, raw.older_than_nanos, "auto_cleanup")?;
+
+    Ok(AutoCleanupParams {
+        interval,
+        older_than,
+    })
+}
+
+/// Parse a nullable native Lance file-version string.
+pub(crate) unsafe fn parse_storage_version(
+    ptr: *const c_char,
+    field: &str,
+) -> Result<Option<LanceFileVersion>> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: the caller guarantees a non-NULL `ptr` is a NUL-terminated
+    // string valid for the duration of the outer FFI call.
+    let value = unsafe { helpers::parse_c_string(ptr)? }
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source(
+                format!("{field} must not be an empty string").into(),
+            )
+        })?;
+    let version = LanceFileVersion::from_str(value).map_err(|error| {
+        lance_core::Error::invalid_input_source(
+            format!("invalid {field} {value:?}: {error}").into(),
+        )
+    })?;
+    Ok(Some(version))
+}
+
 /// Apply caller-provided overrides onto an `lance::WriteParams`. Zero / NULL
 /// fields are no-ops so upstream defaults flow through.
 unsafe fn apply_write_params(target: &mut WriteParams, params: &LanceWriteParams) -> Result<()> {
@@ -304,28 +788,8 @@ unsafe fn apply_write_params(target: &mut WriteParams, params: &LanceWriteParams
         target.max_bytes_per_file = u64_to_usize(params.max_bytes_per_file, "max_bytes_per_file")?;
     }
     if !params.data_storage_version.is_null() {
-        // SAFETY: `data_storage_version` is non-NULL (checked above) and the
-        // `apply_write_params` caller (`unsafe fn` contract) guarantees it
-        // points to a NUL-terminated C string valid for the duration of the
-        // outer FFI call. `parse_c_string` reads by shared reference and the
-        // returned borrow is consumed before this function returns.
-        //
-        // `parse_c_string` returns `None` only for NULL input, which the
-        // outer check already ruled out. `.filter` lets an empty C string
-        // also fail presence, producing the clearer message below instead
-        // of relying on `FromStr`'s generic "unknown version" path.
-        let s = unsafe { helpers::parse_c_string(params.data_storage_version)? }
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| lance_core::Error::InvalidInput {
-                source: "data_storage_version must not be an empty string".into(),
-                location: snafu::location!(),
-            })?;
-        let version =
-            LanceFileVersion::from_str(s).map_err(|e| lance_core::Error::InvalidInput {
-                source: format!("invalid data_storage_version {s:?}: {e}").into(),
-                location: snafu::location!(),
-            })?;
-        target.data_storage_version = Some(version);
+        target.data_storage_version =
+            unsafe { parse_storage_version(params.data_storage_version, "data_storage_version")? };
     }
     target.enable_stable_row_ids = params.enable_stable_row_ids;
     Ok(())
@@ -335,8 +799,9 @@ unsafe fn apply_write_params(target: &mut WriteParams, params: &LanceWriteParams
 /// Realistic write tunings fit in `usize` on every supported target, but a
 /// silent `as` cast would wrap on a 32-bit host.
 fn u64_to_usize(v: u64, field: &'static str) -> Result<usize> {
-    usize::try_from(v).map_err(|_| lance_core::Error::InvalidInput {
-        source: format!("{field}={v} exceeds usize::MAX on this target").into(),
-        location: snafu::location!(),
+    usize::try_from(v).map_err(|_| {
+        lance_core::Error::invalid_input_source(
+            format!("{field}={v} exceeds usize::MAX on this target").into(),
+        )
     })
 }

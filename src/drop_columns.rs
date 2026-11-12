@@ -11,7 +11,6 @@
 use std::ffi::c_char;
 
 use lance_core::Result;
-use snafu::location;
 
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
@@ -53,22 +52,19 @@ unsafe fn drop_columns_inner(
     num_columns: usize,
 ) -> Result<i32> {
     if dataset.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "dataset must not be NULL".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset must not be NULL".into(),
+        ));
     }
     if columns.is_null() {
-        return Err(lance_core::Error::InvalidInput {
-            source: "columns must not be NULL".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "columns must not be NULL".into(),
+        ));
     }
     if num_columns == 0 {
-        return Err(lance_core::Error::InvalidInput {
-            source: "num_columns must be > 0".into(),
-            location: location!(),
-        });
+        return Err(lance_core::Error::invalid_input_source(
+            "num_columns must be > 0".into(),
+        ));
     }
 
     // Materialize the column names up front so any per-index validation
@@ -83,9 +79,10 @@ unsafe fn drop_columns_inner(
         // NUL-terminated C string the caller keeps alive for this call.
         let name = unsafe { helpers::parse_c_string(entry)? }
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| lance_core::Error::InvalidInput {
-                source: format!("columns[{i}] must not be NULL or empty").into(),
-                location: location!(),
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!("columns[{i}] must not be NULL or empty").into(),
+                )
             })?;
         names.push(name.to_string());
     }

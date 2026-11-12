@@ -68,6 +68,24 @@ if(NOT LANCE_C_USE_PREBUILT)
     if(APPLE)
         corrosion_set_env_vars(lance_c "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
     endif()
+    # FindRust stores an inferred native target only in Corrosion's directory
+    # scope. The cache entry is visible here for both inferred and explicit targets.
+    if(Rust_CARGO_TARGET_CACHED MATCHES "apple-darwin$")
+        # Corrosion selects its own linker, overriding Cargo's environment.
+        # Keep the dylib export policy on the actual imported build target.
+        corrosion_set_linker(lance_c
+            "${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-macos-exports.sh")
+        corrosion_set_env_vars(lance_c
+            "LANCE_C_MACOS_LINKER=${CMAKE_C_COMPILER}")
+    elseif(Rust_CARGO_TARGET_CACHED MATCHES "x86_64-pc-windows-msvc$")
+        corrosion_set_env_vars(lance_c
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-windows-exports.cmd"
+            "LANCE_C_WINDOWS_MACHINE=X64")
+    elseif(Rust_CARGO_TARGET_CACHED MATCHES "aarch64-pc-windows-msvc$")
+        corrosion_set_env_vars(lance_c
+            "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=${CMAKE_CURRENT_LIST_DIR}/.github/scripts/limit-windows-exports.cmd"
+            "LANCE_C_WINDOWS_MACHINE=ARM64")
+    endif()
 endif()
 
 # Imported targets and install rules are added in subsequent tasks.
@@ -79,8 +97,14 @@ endif()
 # path keeps a separate hand-written config template.
 
 if(LANCE_C_USE_PREBUILT)
-    set(_lance_c_static_real "${LANCE_C_PREBUILT_DIR}/lib/liblance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
-    set(_lance_c_shared_real "${LANCE_C_PREBUILT_DIR}/lib/liblance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    if(WIN32)
+        set(_lance_c_static_real "${LANCE_C_PREBUILT_DIR}/lib/lance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
+        set(_lance_c_shared_real "${LANCE_C_PREBUILT_DIR}/lib/lance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
+        set(_lance_c_import_real "${LANCE_C_PREBUILT_DIR}/lib/lance_c.dll${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    else()
+        set(_lance_c_static_real "${LANCE_C_PREBUILT_DIR}/lib/liblance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
+        set(_lance_c_shared_real "${LANCE_C_PREBUILT_DIR}/lib/liblance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    endif()
     set(_lance_c_include_dirs "${LANCE_C_PREBUILT_DIR}/include")
 else()
     # Corrosion replaces hyphens with underscores in target names (since Rust
@@ -103,6 +127,9 @@ if(APPLE)
         "-framework SystemConfiguration")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(LanceC_platform_deps INTERFACE pthread dl m)
+elseif(WIN32)
+    target_link_libraries(LanceC_platform_deps INTERFACE
+        advapi32 bcrypt dbghelp kernel32 mswsock ntdll ole32 userenv ws2_32)
 endif()
 
 # Public namespaced targets for build-tree (add_subdirectory) consumers.
@@ -136,15 +163,55 @@ install(DIRECTORY include/lance
 # EXECUTABLE targets, so use vanilla install(FILES) with TARGET_FILE generator
 # expressions that resolve to the .a / .dylib / .so paths cargo emits.
 if(NOT LANCE_C_USE_PREBUILT)
-    install(FILES $<TARGET_FILE:lance_c-static>
-        DESTINATION ${CMAKE_INSTALL_LIBDIR})
-    install(FILES $<TARGET_FILE:lance_c-shared>
-        DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    if(WIN32)
+        # Rust emits `lance_c.dll` plus `lance_c.dll.lib` for a cdylib on
+        # windows-msvc. Rename the import library explicitly so the installed
+        # package config does not depend on rustc's artifact suffix.
+        install(FILES $<TARGET_FILE:lance_c-static>
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RENAME lance_c${CMAKE_STATIC_LIBRARY_SUFFIX})
+        install(FILES $<TARGET_FILE:lance_c-shared>
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RENAME lance_c${CMAKE_SHARED_LIBRARY_SUFFIX})
+        install(FILES $<TARGET_LINKER_FILE:lance_c-shared>
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RENAME lance_c.dll${CMAKE_STATIC_LIBRARY_SUFFIX})
+    else()
+        install(FILES $<TARGET_FILE:lance_c-static>
+            DESTINATION ${CMAKE_INSTALL_LIBDIR})
+        install(FILES $<TARGET_FILE:lance_c-shared>
+            DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    endif()
+else()
+    if(WIN32)
+        install(FILES "${_lance_c_static_real}"
+            OPTIONAL
+            DESTINATION ${CMAKE_INSTALL_LIBDIR})
+        install(FILES "${_lance_c_shared_real}"
+            OPTIONAL
+            DESTINATION ${CMAKE_INSTALL_LIBDIR})
+        install(FILES "${_lance_c_import_real}"
+            OPTIONAL
+            DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    else()
+        install(FILES "${_lance_c_static_real}"
+            OPTIONAL
+            DESTINATION ${CMAKE_INSTALL_LIBDIR})
+        install(FILES "${_lance_c_shared_real}"
+            OPTIONAL
+            DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    endif()
 endif()
 
 # License.
 install(FILES LICENSE
     DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/lance-c)
+
+# Windows archives are distributed as standalone SDK bundles.
+if(WIN32)
+    install(FILES README.md
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/lance-c)
+endif()
 
 # Generate LanceCConfig.cmake from the template.
 configure_package_config_file(
