@@ -91,8 +91,8 @@ container_setup() {
     rm -f "$zip"
 
     {
-        echo "clang=$($tools/clang --version | head -1)"
-        echo "clangxx=$($tools/clang++ --version | head -1)"
+        echo "clang=$($tools/clang --version | awk 'NR == 1')"
+        echo "clangxx=$($tools/clang++ --version | awk 'NR == 1')"
         echo "protoc=$(protoc --version)"
         echo "protoc_path=$(command -v protoc)"
     } >>"$EVIDENCE/setup-identity.txt"
@@ -114,7 +114,7 @@ record_environment() {
         echo "almalinux_release=$(cat /etc/almalinux-release 2>/dev/null || true)"
         echo "libc=$(getconf GNU_LIBC_VERSION)"
         echo "ldd_begin"
-        ldd --version | head -2
+        ldd --version | sed -n '1,2p'
         echo "ldd_end"
         echo "memory_begin"
         free -h
@@ -131,19 +131,19 @@ record_environment() {
         echo "cargo_path=$(command -v cargo)"
         rustc -vV
         echo "cargo=$(cargo --version)"
-        echo "clang=$($CC --version | head -1)"
-        echo "clangxx=$($CXX --version | head -1)"
-        echo "gcc=$(gcc --version | head -1)"
-        echo "gxx=$(g++ --version | head -1)"
-        echo "cmake=$(cmake --version | head -1)"
-        echo "make=$(make --version | head -1)"
+        echo "clang=$($CC --version | awk 'NR == 1')"
+        echo "clangxx=$($CXX --version | awk 'NR == 1')"
+        echo "gcc=$(gcc --version | awk 'NR == 1')"
+        echo "gxx=$(g++ --version | awk 'NR == 1')"
+        echo "cmake=$(cmake --version | awk 'NR == 1')"
+        echo "make=$(make --version | awk 'NR == 1')"
         echo "protoc=$(protoc --version)"
         echo "git=$(git --version)"
         echo "python=$(python3 --version)"
-        echo "readelf=$(readelf --version | head -1)"
-        echo "nm=$(nm --version | head -1)"
-        echo "strip=$(strip --version | head -1)"
-        echo "mbx=$(mbx --version 2>&1 | head -1)"
+        echo "readelf=$(readelf --version | awk 'NR == 1')"
+        echo "nm=$(nm --version | awk 'NR == 1')"
+        echo "strip=$(strip --version | awk 'NR == 1')"
+        echo "mbx=$(mbx --version 2>&1 | awk 'NR == 1')"
         echo "mbx_doctor_begin"
         mbx doctor
         echo "mbx_doctor_end"
@@ -450,8 +450,8 @@ write_summary() {
         echo "rustc=$(rustc -V)"
         echo "cargo=$(cargo --version)"
         echo "rustup_toolchain=${RUSTUP_TOOLCHAIN-}"
-        echo "clang=$($CC --version | head -1)"
-        echo "cmake=$(cmake --version | head -1)"
+        echo "clang=$($CC --version | awk 'NR == 1')"
+        echo "cmake=$(cmake --version | awk 'NR == 1')"
         echo "protoc=$(protoc --version)"
         echo "cargo_build_jobs=${CARGO_BUILD_JOBS-}"
         echo "rust_test_threads=${RUST_TEST_THREADS-}"
@@ -623,7 +623,7 @@ run_outer() {
     printf 'PASS container-setup\n' >>"$EVIDENCE/orchestration-status.txt"
 
     set +e
-    docker exec -u 1000 \
+    docker exec --user 1000:1000 \
         -e HOME=/home/xuanwo \
         -e CARGO_HOME=/home/xuanwo/.cargo \
         -e RUSTUP_HOME=/home/xuanwo/.rustup \
