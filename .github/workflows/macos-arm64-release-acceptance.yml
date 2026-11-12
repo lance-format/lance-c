@@ -4,9 +4,6 @@
 name: macOS ARM64 Release Acceptance
 
 on:
-  push:
-    branches:
-      - xuanwo/arm64-macos-release-acceptance
   workflow_dispatch:
     inputs:
       version:
@@ -29,6 +26,7 @@ env:
   CC: clang
   CXX: clang++
   MACOSX_DEPLOYMENT_TARGET: "11.0"
+  DEFAULT_CANDIDATE_VERSION: "0.2.0-rc.1"
   PRODUCT_COMMIT: 62fbc0fd69d66b184643e47ce93f7f3a6525598b
   PRODUCT_TREE: d994d6abbb46024f5411db42e8f4a5ede59225f4
 
@@ -419,6 +417,10 @@ jobs:
           set -euo pipefail
           export LC_ALL=C
           version="${{ inputs.version }}"
+          if [ -z "$version" ]; then
+            version="$DEFAULT_CANDIDATE_VERSION"
+          fi
+          test -n "$version"
           target="aarch64-apple-darwin"
           archive="lance-c-v${version}-${target}.tar.xz"
           mkdir -p dist
