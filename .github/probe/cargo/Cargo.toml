@@ -1,0 +1,12 @@
+[package]
+name = "lance-c-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "lance_c"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+cc = "1"
