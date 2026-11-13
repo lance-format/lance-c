@@ -389,8 +389,10 @@ configure_release() {
 
 verify_configure_toolchain() {
     local log="$LOG_DIR/configure-release.log"
-    grep -Fq "$CLANG_VERSION_TEXT" "$log" ||
-        fail "CMake did not select Clang 20.1.8"
+    grep -Fq 'The C compiler identification is Clang 20.1.8' "$log" ||
+        fail "CMake did not select Clang 20.1.8 for C"
+    grep -Fq 'The CXX compiler identification is Clang 20.1.8' "$log" ||
+        fail "CMake did not select Clang 20.1.8 for C++"
     grep -Fq 'Rust Toolchain: 1.94.0-aarch64-unknown-linux-gnu' "$log" ||
         fail "CMake did not select Rust 1.94.0 for aarch64"
     grep -Fq 'Rust Target: aarch64-unknown-linux-gnu' "$log" ||
