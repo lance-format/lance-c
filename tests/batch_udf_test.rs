@@ -1934,7 +1934,6 @@ fn seed_partial_batch_checkpoint(
     declared: Arc<Schema>,
     ffi_schema: &FFI_ArrowSchema,
     store: &Arc<StoreState>,
-    mapper: &Arc<MapperState>,
 ) -> (u32, usize) {
     *store.failure.lock().unwrap() = Some(Failure {
         method: StoreMethod::InsertFragment,
@@ -1942,12 +1941,13 @@ fn seed_partial_batch_checkpoint(
         code: LanceErrorCode::IoError as i32,
         message: "interrupted before the fragment checkpoint".to_owned(),
     });
-    let (_, _, context) = make_context_with_store(declared, MapperMode::Constant(5), store.clone());
+    let (seed_mapper, _, context) =
+        make_context_with_store(declared, MapperMode::Constant(5), store.clone());
     assert_eq!(
         run_batch_udf_v2(dataset, ffi_schema, &context, None, None),
         -1
     );
-    assert_eq!(mapper.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(seed_mapper.calls.load(Ordering::SeqCst), 2);
     assert!(store.inserted_fragments.lock().unwrap().is_empty());
     let cached = store.v2_batches.lock().unwrap();
     assert_eq!(cached.len(), 1);
@@ -1967,9 +1967,9 @@ fn test_batch_udf_schema_aware_checkpoint_replays_cached_batch() {
     let declared = output_schema();
     let ffi_schema = schema_to_ffi(&declared);
 
-    let (mapper, store, _) = make_context(declared.clone(), MapperMode::Constant(5));
+    let (_, store, _) = make_context(declared.clone(), MapperMode::Constant(5));
     let (fragment_id, batch_index) =
-        seed_partial_batch_checkpoint(dataset, declared.clone(), &ffi_schema, &store, &mapper);
+        seed_partial_batch_checkpoint(dataset, declared.clone(), &ffi_schema, &store);
     assert_eq!(batch_index, 0);
     assert_eq!(unsafe { lance_dataset_version(dataset) }, baseline);
 
@@ -2027,8 +2027,8 @@ fn test_batch_udf_schema_aware_checkpoint_rejects_incompatible_context() {
     let declared = output_schema();
     let ffi_schema = schema_to_ffi(&declared);
 
-    let (mapper, store, _) = make_context(declared.clone(), MapperMode::Constant(5));
-    seed_partial_batch_checkpoint(dataset, declared.clone(), &ffi_schema, &store, &mapper);
+    let (_, store, _) = make_context(declared.clone(), MapperMode::Constant(5));
+    seed_partial_batch_checkpoint(dataset, declared.clone(), &ffi_schema, &store);
 
     // Changing read columns changes the native checkpoint context, so the cached
     // batch must be rejected instead of silently replayed.
