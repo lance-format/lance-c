@@ -1,0 +1,328 @@
+diff --git a/rust/lance/src/dataset.rs b/rust/lance/src/dataset.rs
+index 6d18cdb8c..a3614606d 100644
+--- a/rust/lance/src/dataset.rs
++++ b/rust/lance/src/dataset.rs
+@@ -545,6 +545,31 @@ impl Dataset {
+         }
+     }
+ 
++    /// Check out the greatest retained version committed strictly before `cutoff`.
++    ///
++    /// Only versions in the current branch's retained history are considered. A
++    /// version removed by cleanup cannot be recovered, so a cutoff may have no
++    /// match even when it falls after an earlier commit timestamp.
++    pub async fn checkout_before(&self, cutoff: DateTime<Utc>) -> Result<Self> {
++        let version = self
++            .versions()
++            .await?
++            .into_iter()
++            .filter(|version| version.timestamp < cutoff)
++            .max_by_key(|version| version.version)
++            .ok_or_else(|| {
++                Error::invalid_input(format!(
++                    "no retained version of branch '{}' was committed strictly before {}. \
++                     The retained history may not reach back to the cutoff, or earlier \
++                     versions may have been cleaned up.",
++                    refs::normalize_branch(self.manifest.branch.as_deref()),
++                    cutoff
++                ))
++            })?;
++
++        self.checkout_version(version.version).await
++    }
++
+     pub fn tags(&self) -> Tags<'_> {
+         self.refs.tags()
+     }
+diff --git a/rust/lance/src/dataset/tests/dataset_versioning.rs b/rust/lance/src/dataset/tests/dataset_versioning.rs
+index e97f9c90c..5898fa067 100644
+--- a/rust/lance/src/dataset/tests/dataset_versioning.rs
++++ b/rust/lance/src/dataset/tests/dataset_versioning.rs
+@@ -16,9 +16,10 @@ use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
+ use arrow_array::RecordBatch;
+ use arrow_array::RecordBatchReader;
+ use arrow_array::cast::AsArray;
+-use arrow_array::types::UInt64Type;
++use arrow_array::types::{UInt32Type, UInt64Type};
+ use arrow_array::{RecordBatchIterator, UInt32Array, types::Int32Type};
+ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
++use chrono::{DateTime, Utc};
+ use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
+ use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+ use lance_file::version::LanceFileVersion;
+@@ -26,6 +27,7 @@ use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+ use mock_instant::thread_local::MockClock;
+ use tokio::sync::Barrier;
+ 
++use crate::dataset::cleanup::CleanupPolicyBuilder;
+ use crate::dataset::refs::branch_contents_path;
+ use crate::utils::test::copy_test_data_to_tmp;
+ use futures::TryStreamExt;
+@@ -1598,3 +1600,267 @@ async fn test_branch() {
+         .unwrap();
+     assert!(branches.is_empty());
+ }
++
++fn checkout_before_time(seconds: i64, nanos: u32) -> DateTime<Utc> {
++    DateTime::from_timestamp(seconds, nanos).unwrap()
++}
++
++fn set_commit_time(seconds: u64, nanos: u32) {
++    MockClock::set_system_time(std::time::Duration::new(seconds, nanos));
++}
++
++async fn write_checkout_version(
++    uri: &str,
++    values: std::ops::Range<u32>,
++    mode: WriteMode,
++) -> Dataset {
++    let batch = u32_batch(values);
++    Dataset::write(
++        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
++        uri,
++        Some(WriteParams {
++            max_rows_per_file: 2,
++            max_rows_per_group: 2,
++            mode,
++            ..Default::default()
++        }),
++    )
++    .await
++    .unwrap()
++}
++
++async fn scan_i_values(dataset: &Dataset) -> Vec<u32> {
++    let batch = dataset.scan().try_into_batch().await.unwrap();
++    batch["i"].as_primitive::<UInt32Type>().values().to_vec()
++}
++
++#[tokio::test]
++async fn checkout_before_selects_greatest_eligible_version() {
++    let test_uri = TempStrDir::default();
++    set_commit_time(10, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 0..5, WriteMode::Create).await;
++    set_commit_time(30, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 5..10, WriteMode::Append).await;
++    set_commit_time(20, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 10..15, WriteMode::Append).await;
++
++    assert_eq!(dataset.version_id(), 3);
++    assert_eq!(scan_i_values(&dataset).await, (0..15).collect::<Vec<_>>());
++    assert!(dataset.get_fragments().len() > 1);
++
++    // The earliest retained commit is excluded by the strict comparison.
++    let err = dataset
++        .checkout_before(checkout_before_time(10, 0))
++        .await
++        .unwrap_err();
++    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
++
++    // Version 3 has the same timestamp as the cutoff, so version 1 is the
++    // greatest eligible version; version 2 was committed later.
++    let selected = dataset
++        .checkout_before(checkout_before_time(20, 0))
++        .await
++        .unwrap();
++    assert_eq!(selected.version_id(), 1);
++    assert_eq!(scan_i_values(&selected).await, vec![0, 1, 2, 3, 4]);
++    assert!(selected.get_fragments().len() > 1);
++
++    // Version 3 is eligible at 25s even though version 2 has a newer timestamp.
++    let selected = dataset
++        .checkout_before(checkout_before_time(25, 0))
++        .await
++        .unwrap();
++    assert_eq!(selected.version_id(), 3);
++    assert_eq!(scan_i_values(&selected).await, (0..15).collect::<Vec<_>>());
++
++    // All versions are eligible at 31s; the greatest numeric version wins.
++    let selected = dataset
++        .checkout_before(checkout_before_time(31, 0))
++        .await
++        .unwrap();
++    assert_eq!(selected.version_id(), 3);
++    assert_eq!(scan_i_values(&selected).await, (0..15).collect::<Vec<_>>());
++
++    assert_eq!(dataset.version_id(), 3);
++    assert_eq!(scan_i_values(&dataset).await, (0..15).collect::<Vec<_>>());
++}
++
++#[tokio::test]
++async fn checkout_before_strict_nanosecond_boundary_and_equal_timestamps() {
++    let test_uri = TempStrDir::default();
++    set_commit_time(10, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    set_commit_time(10, 1);
++    let dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    set_commit_time(10, 1);
++    let dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
++
++    assert_eq!(dataset.version_id(), 3);
++
++    // Versions 2 and 3 share a timestamp exactly equal to the cutoff, so the
++    // strict comparison excludes both and leaves version 1.
++    let selected = dataset
++        .checkout_before(checkout_before_time(10, 1))
++        .await
++        .unwrap();
++    assert_eq!(selected.version_id(), 1);
++    assert_eq!(scan_i_values(&selected).await, vec![0, 1, 2]);
++
++    // One nanosecond later both tied versions are eligible; the greater
++    // numeric version wins.
++    let selected = dataset
++        .checkout_before(checkout_before_time(10, 2))
++        .await
++        .unwrap();
++    assert_eq!(selected.version_id(), 3);
++    assert_eq!(scan_i_values(&selected).await, (0..9).collect::<Vec<_>>());
++}
++
++#[tokio::test]
++async fn checkout_before_no_match_reports_branch_and_retained_history() {
++    let test_uri = TempStrDir::default();
++    set_commit_time(10, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++
++    let cutoff = checkout_before_time(10, 0);
++    let err = dataset.checkout_before(cutoff).await.unwrap_err();
++    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
++
++    let message = err.to_string();
++    assert!(message.contains("no retained version"), "{message}");
++    assert!(message.contains("'main'"), "{message}");
++    assert!(message.contains(&cutoff.to_string()), "{message}");
++    assert!(message.contains("cleaned up"), "{message}");
++}
++
++#[tokio::test]
++async fn checkout_before_ignores_removed_history() {
++    let test_uri = TempStrDir::default();
++    set_commit_time(10, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    set_commit_time(30, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    set_commit_time(20, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
++    set_commit_time(40, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 9..12, WriteMode::Append).await;
++    assert_eq!(dataset.version_id(), 4);
++
++    let policy = CleanupPolicyBuilder::default()
++        .versions(vec![3])
++        .unwrap()
++        .build();
++    let removed = dataset.cleanup(policy).execute().await.unwrap();
++    assert_eq!(removed.old_versions, 1);
++    assert_eq!(
++        dataset
++            .version_refs()
++            .await
++            .unwrap()
++            .iter()
++            .map(|version| version.version)
++            .collect::<Vec<_>>(),
++        vec![1, 2, 4]
++    );
++
++    // Version 3 was committed at 20s and would have been selected at 25s, but
++    // cleanup removed it. Only retained version 1 remains eligible.
++    let selected = dataset
++        .checkout_before(checkout_before_time(25, 0))
++        .await
++        .unwrap();
++    assert_eq!(selected.version_id(), 1);
++    assert_eq!(scan_i_values(&selected).await, vec![0, 1, 2]);
++}
++
++#[tokio::test]
++async fn checkout_before_old_handle_does_not_cap_history() {
++    let test_uri = TempStrDir::default();
++    set_commit_time(10, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    set_commit_time(20, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    set_commit_time(30, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
++
++    let old = dataset.checkout_version(1).await.unwrap();
++    assert_eq!(old.version_id(), 1);
++
++    let selected = old
++        .checkout_before(checkout_before_time(35, 0))
++        .await
++        .unwrap();
++    assert_eq!(selected.version_id(), 3);
++    assert_eq!(scan_i_values(&selected).await, (0..9).collect::<Vec<_>>());
++
++    assert_eq!(old.version_id(), 1);
++    assert_eq!(dataset.version_id(), 3);
++}
++
++#[tokio::test]
++async fn checkout_before_limits_history_to_the_current_branch() {
++    let test_uri = TempStrDir::default();
++    set_commit_time(10, 0);
++    let mut main = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    set_commit_time(30, 0);
++    main = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++
++    let mut dev = main.create_branch("dev", 2, None).await.unwrap();
++    set_commit_time(20, 0);
++    dev = write_checkout_version(dev.uri(), 100..103, WriteMode::Append).await;
++    assert_eq!(dev.version_id(), 3);
++
++    // Main retains versions 1 (10s) and 2 (30s), so only version 1 is eligible.
++    let selected = main
++        .checkout_before(checkout_before_time(25, 0))
++        .await
++        .unwrap();
++    assert_eq!(selected.version_id(), 1);
++    assert_eq!(selected.manifest.branch, None);
++    assert_eq!(scan_i_values(&selected).await, vec![0, 1, 2]);
++
++    // The branch's own version 3 (20s) is eligible even though its parent
++    // version 2 has a later timestamp.
++    let selected = dev
++        .checkout_before(checkout_before_time(25, 0))
++        .await
++        .unwrap();
++    assert_eq!(selected.version_id(), 3);
++    assert_eq!(selected.manifest.branch.as_deref(), Some("dev"));
++    let mut values = scan_i_values(&selected).await;
++    values.sort_unstable();
++    assert_eq!(values, vec![0, 1, 2, 3, 4, 5, 100, 101, 102]);
++}
++
++#[tokio::test]
++async fn checkout_before_propagates_manifest_read_failure() {
++    let test_uri = TempStrDir::default();
++    set_commit_time(10, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    set_commit_time(20, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    set_commit_time(30, 0);
++    let dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
++
++    let locations = dataset
++        .commit_handler
++        .list_manifest_locations(&dataset.base, dataset.object_store.as_ref(), false)
++        .try_collect::<Vec<_>>()
++        .await
++        .unwrap();
++    let location = locations
++        .iter()
++        .find(|location| location.version == 2)
++        .unwrap();
++    dataset
++        .object_store
++        .delete(&location.path)
++        .await
++        .unwrap();
++
++    let err = dataset
++        .checkout_before(checkout_before_time(35, 0))
++        .await
++        .unwrap_err();
++    assert!(matches!(err, Error::NotFound { .. }), "{err}");
++}
