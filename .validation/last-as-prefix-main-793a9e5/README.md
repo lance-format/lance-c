@@ -12,12 +12,12 @@ pin, C API, ABI, or error contract. No C API surface is added or modified.
 
 | Artifact | SHA256 |
 | --- | --- |
-| `native-last-as-prefix-main-793a9e5.patch` (this candidate) | `8622122db07fa4f1daf44d33222745e6a07b24c87d767167e279b452ba1d45b9` |
+| `native-last-as-prefix-main-793a9e5.patch` (this candidate) | `077703e17d694d6efa0ffe67922653ee2784629004f2f31f13db524cdd9d4470` |
 | `../last-as-prefix/native-last-as-prefix.patch` (pinned, unchanged) | `18bad6fe2ae452dc7bd91e5243385eccb9a749413b63f8be8533afab45ae720e` |
 
 - Candidate base tree: `b71237fa79dd9c94da47752e026430bd93ce7243`
   (identical to `793a9e5^{tree}`).
-- Candidate patch: 16 files, +871/−146.
+- Candidate patch: 17 files, +913/−150.
 - Pinned oracle `../last-as-prefix/fts_last_as_prefix.rs` is intentionally not
   copied into the patch; it remains the pinned experiment's test.
 
@@ -74,7 +74,7 @@ When enabled for a `Match` leaf:
 | `mem_wal/.../scanner/builder.rs` | same file | Explicit `not_supported` rejection plus a unit test. |
 | (not in pinned patch) `mem_wal/index/fts.rs` | same file | Residual exact-leaf guards now reject any vocabulary-expanding leaf, including `last_as_prefix`, instead of only fuzzy leaves. |
 
-`git diff --check` is clean. All 16 changed native files pass direct rustfmt
+`git diff --check` is clean. All 17 changed native files pass direct rustfmt
 from the upstream-declared Rust 1.98.1 toolchain, with edition 2024 and
 `skip_children=true`; this does not claim a whole-workspace Cargo fmt run.
 Focused native execution is recorded below.
@@ -197,3 +197,30 @@ Retained evidence on NieR: `/home/xuanwo/Code/validation/`
 `lance-native-prefix-main-793a9e5-evidence/` (run1-index, run2-lance-lib,
 run4-dataset, run5-dataset-rerun, run6-budget-correction). The coordinator
 retained and read the failure and corrected raw logs.
+
+
+## Direct flat-filter correction (2026-11-13)
+
+Kimi source review found that direct `FlatMatchFilterExec` execution could
+silently perform exact matching when only `FtsSearchParams.last_as_prefix`
+was true. The execution guard now checks both the query's expansion request
+and the params flag before opening its input. The existing fuzzy error
+assertion was updated for the expanded rejection message.
+
+On NieR Rust1.98.1 with `--locked`, the new three-case regression first ran
+against the unfixed source: query-only and both-flags cases passed, while
+params-only returned an exact match and failed as intended (2 passed,
+1 failed, exit101). The corrected source then passed all16 `flat_filter_binding`
+cases, including query-only/params-only/both, direct and reconstructed plans,
+fuzzy rejection, exact matching, aliases, resolved documents, input validation
+and tokenizer selection (exit0). This is executed direct-path coverage rather
+than relying only on planner rejection.
+
+Final native tree: `27c52e47c9cc559b6af1dcbadba8fa20f00ca8a9`.
+The native source/index matched before and after the run. Evidence is retained
+in NieR `lance-native-prefix-main-793a9e5-evidence/run7-flat-filter-red` and
+`run8-flat-filter-green`, with coordinator copies. These16 cases supplement
+the applicable14 index, two other lance-lib and three dataset cases above;
+those earlier runs were not repeated. The pinned-core Rust1.94 nine-case
+oracle remains separate. No whole-workspace, C API, upstream publication,
+or product-pin acceptance is implied.
