@@ -823,9 +823,15 @@ extracted_consumer() {
     assert_eq "$rc" "0" "$linkage consumer dataset exit code"
     assert_eq "$dataset_output" "rows: 512, version: 2" \
         "$linkage consumer dataset output"
+    printf 'Verified %s consumer dataset read: %s\n' \
+        "$linkage" "$dataset_output" >>"$combined"
 
     printf '==> extracted %s acceptance check\n' "$linkage" >>"$combined"
+    set +e
     "${ld_env[@]}" "$acceptance" "file://$acceptance_path" >>"$combined" 2>&1
+    rc=$?
+    set -e
+    assert_eq "$rc" "0" "$linkage acceptance exit code"
 
     "${ld_env[@]}" ldd "$exe" \
         >"$EVIDENCE/consumer-${linkage}-ldd.txt" 2>&1 || true
