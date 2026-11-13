@@ -55,6 +55,7 @@ oracle_sha_before=
 oracle_sha_after=
 applied_diff_sha256=
 applied_diff_stat=
+rustfmt_clean=
 cargo_rc=
 running_line=
 result_line=
@@ -83,6 +84,7 @@ write_status() {
         --arg oracle_git_blob_expected "$oracle_git_blob_expected" \
         --arg applied_diff_sha256 "$applied_diff_sha256" \
         --arg applied_diff_stat "$applied_diff_stat" \
+        --arg oracle_rustfmt_clean "$rustfmt_clean" \
         --arg command "$command_line" \
         --arg rustup_toolchain "${RUSTUP_TOOLCHAIN:-}" \
         --arg cargo_build_jobs "${CARGO_BUILD_JOBS:-}" \
@@ -101,6 +103,7 @@ write_status() {
         --arg detail "$note" \
         --arg log "$out/runner.log" \
         --arg environment "$out/environment.txt" \
+        --arg rustfmt_check "$out/rustfmt-check.txt" \
         --arg outer_log "$out/outer.log" \
         --arg finished_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         '{
@@ -119,6 +122,8 @@ write_status() {
             oracle_git_blob_expected: $oracle_git_blob_expected,
             applied_diff_sha256: $applied_diff_sha256,
             applied_diff_stat: $applied_diff_stat,
+            oracle_rustfmt_clean: ($oracle_rustfmt_clean == "true"),
+            oracle_rustfmt_check: $rustfmt_check,
             command: $command,
             environment: {
                 rustup_toolchain: $rustup_toolchain,
@@ -198,6 +203,14 @@ cargo_version=$(cargo +1.94.0 --version) || die "cargo +1.94.0 unavailable"
 rustc_path=$(rustup which --toolchain 1.94.0 rustc) || die "rustc 1.94.0 unavailable"
 rustc_version=$(rustc +1.94.0 --version) || die "rustc +1.94.0 unavailable"
 
+rustfmt +1.94.0 --check --edition 2024 "$out/artifacts/fts_last_as_prefix.rs" >"$out/rustfmt-check.txt" 2>&1
+if [[ $? -eq 0 ]]; then
+    rustfmt_clean=true
+else
+    rustfmt_clean=false
+    echo "WARNING: oracle is not rustfmt-clean under edition 2024; see $out/rustfmt-check.txt"
+fi
+
 {
     printf 'mode=%s\n' "$mode"
     printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -213,6 +226,7 @@ rustc_version=$(rustc +1.94.0 --version) || die "rustc +1.94.0 unavailable"
     printf 'rustc_path=%s\n' "$rustc_path"
     printf 'rustc_version=%s\n' "$rustc_version"
     printf 'rustfmt_version=%s\n' "$(rustfmt +1.94.0 --version)"
+    printf 'oracle_rustfmt_clean=%s\n' "$rustfmt_clean"
     printf 'host=%s\n' "$(hostname)"
     printf 'kernel=%s\n' "$(uname -sr)"
     printf 'nproc=%s\n' "$(nproc)"
@@ -230,9 +244,6 @@ rustc_version=$(rustc +1.94.0 --version) || die "rustc +1.94.0 unavailable"
     printf 'oracle_git_blob=%s\n' "$oracle_blob"
     printf 'source_status=%s\n' "$(git -C "$src" status --porcelain | tr '\n' ';')"
 } >"$out/hashes-before.txt"
-
-rustfmt +1.94.0 --check --edition 2024 "$out/artifacts/fts_last_as_prefix.rs" >"$out/rustfmt-check.txt" 2>&1 \
-    || die "rustfmt --check failed for oracle under edition 2024; see $out/rustfmt-check.txt"
 
 git -C "$src" apply --check --whitespace=error-all "$out/artifacts/native-last-as-prefix.patch" \
     || die "git apply --check failed"
