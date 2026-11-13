@@ -273,6 +273,13 @@ unsafe impl Send for FfiCheckpointStore {}
 unsafe impl Sync for FfiCheckpointStore {}
 
 impl UDFCheckpointStore for FfiCheckpointStore {
+    // A batch hit returns an owned ArrowArray, so the batch is rebuilt from the
+    // declared output schema: the callback has nowhere to return the schema
+    // metadata native writes. Since Lance 15.0.0-beta.20 native binds a cached
+    // batch to a `lance:udf_checkpoint_context` marker stored in that metadata,
+    // so a batch hit restored by a foreign store is rejected as incompatible
+    // instead of being used. Fragment checkpoints are unaffected: their
+    // fragment JSON carries the marker verbatim.
     fn get_batch(&self, info: &BatchInfo) -> Result<Option<RecordBatch>> {
         let info = LanceUDFBatchInfo {
             fragment_id: info.fragment_id,

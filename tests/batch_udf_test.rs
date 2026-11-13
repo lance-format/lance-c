@@ -53,6 +53,26 @@ fn open(uri: &str) -> *mut LanceDataset {
     dataset
 }
 
+fn open_version(uri: &str, version: u64) -> *mut LanceDataset {
+    let uri = c_string(uri);
+    let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), version) };
+    assert!(
+        !dataset.is_null(),
+        "dataset open at version {version} failed: {:?}",
+        take_error()
+    );
+    dataset
+}
+
+/// Clear the observations of one checkpoint-store run without dropping the
+/// values the store already owns.
+fn reset_store(store: &StoreState) {
+    store.events.lock().unwrap().clear();
+    store.calls.lock().unwrap().clear();
+    store.inserted_batches.lock().unwrap().clear();
+    store.inserted_fragments.lock().unwrap().clear();
+}
+
 fn scan_batches(dataset: *const LanceDataset) -> Vec<RecordBatch> {
     let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
     assert!(!scanner.is_null(), "scanner creation failed");
@@ -1278,6 +1298,97 @@ fn test_batch_udf_checkpoint_hits_skip_mapper_and_batches() {
     let tmp = tempfile::tempdir().unwrap();
     let uri = fixture_uri(&tmp, "hits");
     create_batch_udf_dataset(&uri, false);
+
+    let declared = output_schema();
+    let ffi_schema = schema_to_ffi(&declared);
+    let dataset = open(&uri);
+    let original_version = unsafe { lance_dataset_version(dataset) };
+    let (mapper, store, context) = make_context(declared.clone(), MapperMode::Constant(5));
+    assert_eq!(
+        run_batch_udf(dataset, &ffi_schema, &context, None, None, true),
+        0,
+        "checkpoint seeding call failed: {:?}",
+        take_error()
+    );
+    assert_eq!(mapper.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(store.inserted_fragments.lock().unwrap().len(), 2);
+    unsafe { lance_dataset_close(dataset) };
+
+    // Replay the same add_columns request against the original snapshot. The
+    // checkpoint store now holds the fragment JSON native wrote during the
+    // seeding run, including the native checkpoint-context marker, so the
+    // fragment hit must skip the mapper for that fragment.
+    let replay = open_version(&uri, original_version);
+    reset_store(&store);
+    let replay_mapper = Arc::new(MapperState {
+        output_schema: declared.clone(),
+        mode: MapperMode::Constant(7),
+        calls: AtomicUsize::new(0),
+        events: Mutex::new(Vec::new()),
+        string_releases: Arc::new(AtomicUsize::new(0)),
+        partial_releases: Arc::new(AtomicUsize::new(0)),
+    });
+    let replay_context = CallbackContext {
+        mapper: replay_mapper.clone(),
+        store: store.clone(),
+        independent_reads: None,
+    };
+    assert_eq!(
+        run_batch_udf(replay, &ffi_schema, &replay_context, None, None, true),
+        0,
+        "checkpoint hit call failed: {:?}",
+        take_error()
+    );
+    assert_eq!(
+        replay_mapper.calls.load(Ordering::SeqCst),
+        1,
+        "the fragment checkpoint hit must skip the mapper for its fragment"
+    );
+    assert_eq!(
+        store.inserted_fragments.lock().unwrap().len(),
+        1,
+        "a fragment hit skips insert_fragment; only the replayed fragment is stored"
+    );
+    assert!(
+        store.inserted_batches.lock().unwrap().is_empty(),
+        "the checkpointed fragment must not re-insert batches"
+    );
+
+    let events = store.events.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("get_fragment:"))
+    );
+    assert_eq!(events.iter().filter(|event| *event == "mapper").count(), 1);
+
+    let values = derive_map(replay, "derived");
+    for (id, value) in values {
+        if id < 4 {
+            assert_eq!(
+                value,
+                Some(5),
+                "the fragment hit must reuse the checkpointed column value"
+            );
+        } else {
+            assert_eq!(value, Some(7), "the replayed fragment must run the mapper");
+        }
+    }
+    unsafe { lance_dataset_close(replay) };
+}
+
+/// Native Beta20 binds every checkpoint entry to a checkpoint-context marker:
+/// fragment JSON and cached batch schemas must carry the marker native wrote.
+/// The public C checkpoint callbacks return an owned ArrowArray for a batch
+/// hit, so the adapter rebuilds that batch from the declared output schema and
+/// cannot carry the marker back. A marker-less entry is therefore rejected by
+/// native validation instead of being treated as a checkpoint hit; fragment
+/// checkpoints still round-trip because their JSON carries the marker.
+#[test]
+fn test_batch_udf_checkpoint_without_native_context_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = fixture_uri(&tmp, "context-rejection");
+    create_batch_udf_dataset(&uri, false);
     let native = lance_c::runtime::block_on(Dataset::open(&uri)).unwrap();
     let fragments = native.get_fragments();
     assert_eq!(fragments.len(), 2);
@@ -1287,61 +1398,45 @@ fn test_batch_udf_checkpoint_hits_skip_mapper_and_batches() {
     let declared = output_schema();
     let ffi_schema = schema_to_ffi(&declared);
     let dataset = open(&uri);
+    let version = unsafe { lance_dataset_version(dataset) };
     let (mapper, store, context) = make_context(declared.clone(), MapperMode::Constant(5));
     store.fragment_hits.lock().unwrap().insert(
         fragment_a.id as u32,
         serde_json::to_string(&fragment_a).unwrap(),
     );
+    assert_eq!(
+        run_batch_udf(dataset, &ffi_schema, &context, None, None, true),
+        -1
+    );
+    let (code, message) = take_error();
+    assert_eq!(code, LanceErrorCode::InvalidArgument);
+    assert!(
+        message.contains("incompatible with this add_columns invocation"),
+        "unexpected marker rejection message: {message}"
+    );
+    assert_eq!(mapper.calls.load(Ordering::SeqCst), 0);
+
+    store.fragment_hits.lock().unwrap().clear();
     store.batch_hits.lock().unwrap().insert(
         (fragment_b_id, 0),
         RecordBatch::try_new(declared, vec![Arc::new(Int64Array::from(vec![9; 4]))]).unwrap(),
     );
-
     assert_eq!(
         run_batch_udf(dataset, &ffi_schema, &context, None, None, true),
-        0,
-        "checkpoint hit call failed: {:?}",
-        take_error()
+        -1
     );
+    let (code, message) = take_error();
+    assert_eq!(code, LanceErrorCode::InvalidArgument);
+    assert!(
+        message.contains("incompatible with this add_columns invocation"),
+        "unexpected batch marker rejection message: {message}"
+    );
+    assert_eq!(mapper.calls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        mapper.calls.load(Ordering::SeqCst),
-        0,
-        "fragment and batch hits must skip the mapper"
+        unsafe { lance_dataset_version(dataset) },
+        version,
+        "a rejected checkpoint must not commit"
     );
-    assert!(
-        store.inserted_batches.lock().unwrap().is_empty(),
-        "batch hit must skip insert_batch"
-    );
-    assert_eq!(
-        store.inserted_fragments.lock().unwrap().len(),
-        1,
-        "fragment hit skips insert_fragment; only the batch-hit fragment is stored"
-    );
-
-    let values = derive_map(dataset, "derived");
-    for (id, value) in values {
-        if id < 4 {
-            assert_eq!(
-                value, None,
-                "fragment hit reused the supplied native Fragment metadata"
-            );
-        } else {
-            assert_eq!(value, Some(9), "batch hit supplied the output batch");
-        }
-    }
-
-    let events = store.events.lock().unwrap().clone();
-    assert!(
-        events
-            .iter()
-            .any(|event| event.starts_with("get_fragment:"))
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event == &format!("get_batch:{fragment_b_id}:0"))
-    );
-    assert_eq!(events.iter().filter(|event| *event == "mapper").count(), 0);
     unsafe { lance_dataset_close(dataset) };
 }
 
