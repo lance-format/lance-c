@@ -3365,7 +3365,7 @@ fn released_blob_v2_raw_file_reads_descriptor_children_through_c_api() {
 
     // The decoded footer schema must be exactly what the native raw reader sees.
     let native = native_reader(uri);
-    let native_schema: Schema = native.file_schema.as_ref().into();
+    let native_schema: Schema = native_metadata(uri).file_schema.as_ref().into();
     assert_eq!(schema, native_schema);
 
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
