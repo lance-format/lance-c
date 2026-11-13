@@ -66,11 +66,12 @@ fn open_version(uri: &str, version: u64) -> *mut LanceDataset {
 
 /// Clear the observations of one checkpoint-store run without dropping the
 /// values the store already owns.
+/// Clear per-run bookkeeping while keeping durable checkpoint payloads, so a
+/// replay observes the batches and fragments an earlier run stored.
 fn reset_store(store: &StoreState) {
     store.events.lock().unwrap().clear();
     store.calls.lock().unwrap().clear();
     store.inserted_batches.lock().unwrap().clear();
-    store.v2_batches.lock().unwrap().clear();
     store.inserted_fragments.lock().unwrap().clear();
 }
 
