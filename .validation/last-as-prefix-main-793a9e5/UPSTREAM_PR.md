@@ -50,8 +50,10 @@ resource-test allocation tracker. The FTS change classifies excessive
 automaton construction as `InvalidInput` with guidance; the candidate preserves
 it. The other deltas do not alter the focused prefix paths. Accepted execution
 at the old base is retained as such; current-main source applicability is not
-relabeled as a second execution. Focused execution of the newly added upstream
-error cases is recorded separately when complete.
+relabeled as a second execution. Both newly added upstream excessive-fuzziness error cases (ASCII/Unicode)
+passed on the current patched tree using Rust1.98.1 and --locked, exit0,
+3889 filtered out. Pre/post tree and source diffs were unchanged. This
+supplements the earlier prefix evidence; it does not relabel the older runs.
 
 A bounded open-PR search for `last_as_prefix` returned no matches on2026-11-13.
 This is not a claim that no unlinked or differently named work exists.
