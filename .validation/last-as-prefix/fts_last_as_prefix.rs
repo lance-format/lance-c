@@ -238,14 +238,15 @@ async fn prefix_matches_last_token_only() {
         .await),
         Vec::<i32>::new()
     );
-    // The other order expands `alpe`, so documents with alpenglow match.
+    // The other order expands `alpe`, but the earlier `alp` stays exact and is
+    // not a term in rows 0 or 7, so nothing matches both positions.
     assert_eq!(
         ids(&run(
             &ds,
             match_node("text", "alp alpe", true).with_operator(Operator::And)
         )
         .await),
-        vec![0, 7]
+        Vec::<i32>::new()
     );
 }
 
