@@ -18,7 +18,7 @@ if [[ $mode != red && $mode != green ]]; then
     exit 64
 fi
 
-artifact_repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+artifact_repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 src=${PREFIX_COMPAT_SRC:-$HOME/Code/validation/lance-native-prefix-40f15ed-public-expansion-compat}
 ev_root=${PREFIX_COMPAT_EV:-$HOME/Code/validation/lance-prefix-public-expansion-compat-evidence}
 out=$ev_root/$mode
