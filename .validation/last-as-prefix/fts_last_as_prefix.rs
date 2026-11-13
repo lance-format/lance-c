@@ -6,6 +6,12 @@
 //! This test is deliberately isolated from the regular lance test suite: it
 //! exercises the proposed native contract on a patched checkout and is not
 //! part of the candidate upstream patch.
+//!
+//! Corpus (ids 0..9): "alpha alpenglow", "alphabet soup", "alpha beta",
+//! "alphanumeric values", "alpine climbing", "beta gamma", "the alpha",
+//! "ALPHA ALPENGLOW", "alpha alp!", "alpha   ". With the simple tokenizer and
+//! lower-casing, the vocabulary sorted lexicographically is
+//! alp < alpenglow < alpha < alphabet < alphanumeric < alpine.
 
 use std::sync::Arc;
 
@@ -161,9 +167,27 @@ const ROWS: &[&str] = &[
 async fn exact_match_remains_unchanged() {
     let (_dir, ds) = write_rows(ROWS).await;
 
-    // `alp` is a prefix, not a term: exact matching must not invent it.
+    // `alp` is a real term in row 8, but it is not a prefix: exact matching
+    // must not expand it to alpha, alphabet, alpenglow, or alpine.
     assert_eq!(
         ids(&run(&ds, match_node("text", "alpha alp", false)).await),
+        vec![0, 2, 6, 7, 8, 9]
+    );
+    assert_eq!(
+        ids(&run(
+            &ds,
+            match_node("text", "alpha alp", false).with_operator(Operator::And)
+        )
+        .await),
+        vec![8]
+    );
+    // `alpe` is not a term, so an exact AND leaf matches nothing.
+    assert_eq!(
+        ids(&run(
+            &ds,
+            match_node("text", "alpha alpe", false).with_operator(Operator::And)
+        )
+        .await),
         Vec::<i32>::new()
     );
     assert_eq!(
@@ -194,13 +218,34 @@ async fn prefix_matches_last_token_only() {
         ids(&run(&ds, match_node("text", "alp", true)).await),
         vec![0, 1, 2, 3, 4, 6, 7, 8, 9]
     );
+    // `alpe` expands to alpenglow (rows 0 and 7), and the earlier `alpha`
+    // remains exact.
     assert_eq!(
         ids(&run(
             &ds,
-            match_node("text", "alpha alp", true).with_operator(Operator::And)
+            match_node("text", "alpha alpe", true).with_operator(Operator::And)
         )
         .await),
-        vec![0, 7, 8]
+        vec![0, 7]
+    );
+    // Only the final token expands: as the earlier token, `alpe` matches
+    // nothing.
+    assert_eq!(
+        ids(&run(
+            &ds,
+            match_node("text", "alpe alp", true).with_operator(Operator::And)
+        )
+        .await),
+        Vec::<i32>::new()
+    );
+    // The other order expands `alpe`, so documents with alpenglow match.
+    assert_eq!(
+        ids(&run(
+            &ds,
+            match_node("text", "alp alpe", true).with_operator(Operator::And)
+        )
+        .await),
+        vec![0, 7]
     );
 }
 
@@ -215,25 +260,22 @@ async fn boolean_composition_with_prefix() {
         ),
         (
             Occur::Must,
-            FtsQuery::Match(match_node("text", "alp", true)),
+            FtsQuery::Match(match_node("text", "alpe", true)),
         ),
     ]);
-    assert_eq!(ids(&run_boolean(&ds, must).await), vec![0, 7, 8]);
+    assert_eq!(ids(&run_boolean(&ds, must).await), vec![0, 7]);
 
     let should = BooleanQuery::new([
         (
             Occur::Should,
-            FtsQuery::Match(match_node("text", "alp", true)),
+            FtsQuery::Match(match_node("text", "alpe", true)),
         ),
         (
             Occur::Should,
             FtsQuery::Match(match_node("text", "beta", false)),
         ),
     ]);
-    assert_eq!(
-        ids(&run_boolean(&ds, should).await),
-        (0..=9).collect::<Vec<_>>()
-    );
+    assert_eq!(ids(&run_boolean(&ds, should).await), vec![0, 2, 5, 7]);
 }
 
 #[tokio::test]
@@ -315,7 +357,7 @@ async fn serde_default_is_backwards_compatible() {
 
     let new: MatchQuery = serde_json::from_value(serde_json::json!({
         "column": "text",
-        "terms": "alpha alp",
+        "terms": "alpha alpe",
         "last_as_prefix": true,
     }))
     .unwrap();
