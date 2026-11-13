@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Historical transaction-file readback across the core-15 migration.
 //!
 //! The fixture is produced by a Lance 14.0.2 `lance-c` build
