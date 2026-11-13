@@ -5508,24 +5508,17 @@ static std::vector<int32_t> cpp_scan_ids(lance::Dataset& dataset) {
     return ids;
 }
 
-static std::string cpp_root_base_path(lance::Dataset& dataset) {
+static std::string cpp_clone_base_path(lance::Dataset& dataset) {
     const std::string json = dataset.base_paths_json();
-    const auto root = json.find("\"is_dataset_root\":true");
-    if (root == std::string::npos) {
-        throw std::runtime_error("base_paths_json has no dataset root");
-    }
     const std::string marker = "\"path\":\"";
-    auto start = json.find(marker, root);
+    auto start = json.find(marker);
     if (start == std::string::npos) {
-        start = json.rfind(marker, root);
-    }
-    if (start == std::string::npos) {
-        throw std::runtime_error("base_paths_json root has no path");
+        throw std::runtime_error("base_paths_json has no base path");
     }
     start += marker.size();
     const auto end = json.find('"', start);
     if (end == std::string::npos) {
-        throw std::runtime_error("base_paths_json root path is unterminated");
+        throw std::runtime_error("base_paths_json base path is unterminated");
     }
     return json.substr(start, end - start);
 }
@@ -5561,7 +5554,6 @@ static void test_dataset_shallow_clone_base_store_params(
         source_version = source.version();
         source_ids = cpp_scan_ids(source);
         assert(!source_ids.empty());
-        source_base = cpp_root_base_path(source);
 
         // The target accepts the static options (shared-memory ignores them),
         // while the clone keeps the source's valid params for the local base.
@@ -5569,6 +5561,7 @@ static void test_dataset_shallow_clone_base_store_params(
             target, nullptr, &invalid_target_accessor));
         assert(cloned->version() == source_version);
         assert(cpp_scan_ids(*cloned) == source_ids);
+        source_base = cpp_clone_base_path(*cloned);
     }
 
     // The returned handle retains runtime base params after the source closes.

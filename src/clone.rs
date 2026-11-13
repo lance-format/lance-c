@@ -547,7 +547,11 @@ mod tests {
         try_c_rows(dataset).unwrap_or_else(|error| panic!("{error}"))
     }
 
-    fn root_base_path(dataset: *const LanceDataset) -> String {
+    /// Return the only base path recorded by a cross-store shallow clone.
+    ///
+    /// A plain source dataset has no explicit base paths; the clone manifest
+    /// adds one for the shared source location.
+    fn only_base_path(dataset: *const LanceDataset) -> String {
         let json_ptr = unsafe { crate::base_paths::lance_dataset_base_paths_json(dataset) };
         assert!(!json_ptr.is_null(), "{}", last_error());
         let json = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
@@ -556,12 +560,9 @@ mod tests {
             .to_string();
         unsafe { lance_free_string(json_ptr) };
         let value: serde_json::Value = serde_json::from_str(&json).expect("base paths JSON");
-        value
-            .as_object()
-            .expect("base paths object")
-            .values()
-            .find(|base| base["is_dataset_root"] == true)
-            .expect("dataset root base")["path"]
+        let bases = value.as_object().expect("base paths object");
+        assert_eq!(bases.len(), 1, "expected one clone base path: {json}");
+        bases.values().next().expect("base path entry")["path"]
             .as_str()
             .expect("base path string")
             .to_string()
@@ -627,7 +628,6 @@ mod tests {
         let source = open_with_base(&src_uri, &source_options, &session, std::ptr::null());
         assert!(!source.is_null(), "{}", last_error());
         let source_version = unsafe { lance_dataset_version(source) };
-        let source_base = root_base_path(source);
 
         let dst_c = c_string(&dst_uri);
         let mut cloned: *mut LanceDataset = std::ptr::null_mut();
@@ -652,6 +652,7 @@ mod tests {
             "shallow clone must keep the native snapshot version"
         );
         assert_eq!(c_rows(cloned), SHALLOW_ROWS);
+        let source_base = only_base_path(cloned);
 
         // The returned handle retains the source base params. It reads shared
         // source files after the source handle is closed.
@@ -781,8 +782,11 @@ mod tests {
             0,
             "shallow clone must not copy data files"
         );
-        let clone_base = root_base_path(cloned);
-        assert_eq!(clone_base, root_base_path(source));
+        let clone_base = only_base_path(cloned);
+        assert!(
+            clone_base.ends_with("source.lance"),
+            "clone base must point at the shared source, got {clone_base}"
+        );
 
         // The source handle and its data are unchanged.
         assert_eq!(c_rows(source), SHALLOW_ROWS);
