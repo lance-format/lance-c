@@ -51588,7 +51588,6 @@ fn test_native_update_operation_value_matches_native_struct() {
     use lance::dataset::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
     use lance_table::format::Fragment;
     use lance_table::format::key_existence::{FilterType, KeyExistenceFilter};
-    use lance_table::format::pb;
     use lance_table::system_index::mem_wal::CompactedSsTable;
     use roaring::RoaringBitmap;
 
