@@ -68,6 +68,15 @@ use substrait_aggregate::{
 
 /// Helper: create a test dataset in a temp directory and return its path.
 fn create_test_dataset() -> (tempfile::TempDir, String) {
+    create_test_dataset_inner(false)
+}
+
+/// Helper: create the same small dataset with stable row ids.
+fn create_test_dataset_with_stable_row_ids() -> (tempfile::TempDir, String) {
+    create_test_dataset_inner(true)
+}
+
+fn create_test_dataset_inner(enable_stable_row_ids: bool) -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().join("test_ds").to_str().unwrap().to_string();
 
@@ -87,12 +96,16 @@ fn create_test_dataset() -> (tempfile::TempDir, String) {
     )
     .unwrap();
 
+    let params = enable_stable_row_ids.then(|| WriteParams {
+        enable_stable_row_ids: true,
+        ..Default::default()
+    });
     // Use lance-c's internal runtime to write the dataset.
     lance_c::runtime::block_on(async {
         Dataset::write(
             arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
             &uri,
-            None,
+            params,
         )
         .await
         .unwrap();
@@ -10982,14 +10995,20 @@ fn create_create_index_dataset() -> (tempfile::TempDir, String) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("score", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
     ]));
     let ids = (0..18).collect::<Vec<_>>();
     let scores = ids.iter().map(|id| id * 10).collect::<Vec<_>>();
+    let names = ids
+        .iter()
+        .map(|id| format!("name-{id}"))
+        .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(Int32Array::from(ids)),
             Arc::new(Int32Array::from(scores)),
+            Arc::new(StringArray::from(names)),
         ],
     )
     .unwrap();
@@ -12099,25 +12118,28 @@ fn test_create_index_native_validation_stays_in_core() {
             None,
         )
     };
-    let bitmap = unsafe {
+    let inverted = unsafe {
         build_scalar_segment_via_c(
             dataset,
-            "id",
+            "name",
             "mixed_domain_idx",
-            LanceScalarIndexType::Bitmap,
-            "",
+            LanceScalarIndexType::Inverted,
+            r#"{"base_tokenizer":"simple","language":"English"}"#,
             &[2, 3],
             Some([0x22; 16]),
         )
     };
     let btree_value = inspect_index_metadata_via_c(btree);
-    let bitmap_value = inspect_index_metadata_via_c(bitmap);
+    let inverted_value = inspect_index_metadata_via_c(inverted);
     assert_eq!(btree_value.index_type, LanceScalarIndexType::BTree as i32);
-    assert_eq!(bitmap_value.index_type, LanceScalarIndexType::Bitmap as i32);
+    assert_eq!(
+        inverted_value.index_type,
+        LanceScalarIndexType::Inverted as i32
+    );
 
     let entries = [
         btree as *const LanceIndexSegmentMetadata,
-        bitmap as *const LanceIndexSegmentMetadata,
+        inverted as *const LanceIndexSegmentMetadata,
     ];
     let operation = unsafe {
         lance_operation_create_index_new(entries.as_ptr(), entries.len(), ptr::null(), 0)
@@ -12128,7 +12150,7 @@ fn test_create_index_native_validation_stays_in_core() {
     unsafe {
         lance_operation_close(operation);
         lance_index_segment_metadata_free(btree);
-        lance_index_segment_metadata_free(bitmap);
+        lance_index_segment_metadata_free(inverted);
         lance_dataset_close(dataset);
     }
 
@@ -25707,7 +25729,9 @@ fn test_prepare_fts_query_index_only_allows_unindexed_fragment() {
     let mut stream = FFI_ArrowArrayStream::empty();
     assert_eq!(
         unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
-        0
+        0,
+        "{}",
+        take_last_error_message()
     );
     let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream).unwrap() };
     let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
@@ -25808,9 +25832,19 @@ fn test_prepared_fts_index_only_empty_segment_returns_empty_shard() {
             let explain = take_scanner_string(unsafe { lance_scanner_explain_plan(scanner, true) });
             assert!(!explain.is_empty());
             assert!(explain.contains("EmptyExec"), "{explain}");
-            assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
+            assert_eq!(
+                unsafe { lance_scanner_count_rows(scanner) },
+                0,
+                "{}",
+                take_last_error_message()
+            );
             assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
-            assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
+            assert_eq!(
+                unsafe { lance_scanner_count_rows(scanner) },
+                0,
+                "{}",
+                take_last_error_message()
+            );
             let analyze_count =
                 take_scanner_string(unsafe { lance_scanner_analyze_count_plan(scanner) });
             assert!(analyze_count.contains("AggregateExec"), "{analyze_count}");
@@ -30084,7 +30118,7 @@ fn test_scanner_additional_sql_filters_are_anded_with_substrait() {
 
 #[test]
 fn test_scanner_additional_sql_filter_preserves_metadata_primary_filter() {
-    let (_tmp, uri) = create_test_dataset();
+    let (_tmp, uri) = create_test_dataset_with_stable_row_ids();
     let c_uri = c_str(&uri);
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
     assert!(!ds.is_null());
@@ -39279,12 +39313,14 @@ fn test_scalar_segment_metadata_residuals_fall_back_within_scope() {
             // of both the stored schema and the output projection.
             let (_tmp, uri, uuids) =
                 create_scalar_segment_fixture_with_options(kind, stable, None, &[&[0, 1]]);
-            for residual in [
-                "_rowid > 0",
-                "_rowaddr > 0",
-                "_row_created_at_version IS NOT NULL",
-                "_row_last_updated_at_version IS NOT NULL",
-            ] {
+            let mut residuals = vec!["_rowid > 0", "_rowaddr > 0"];
+            if stable {
+                // v15 tracks row versions only for datasets with stable row ids;
+                // the hidden version columns reject datasets without them.
+                residuals.push("_row_created_at_version IS NOT NULL");
+                residuals.push("_row_last_updated_at_version IS NOT NULL");
+            }
+            for residual in residuals {
                 let filter = format!("key >= 0 AND {residual}");
                 for (fragments, expected) in [
                     (vec![0], vec![1, 2, 3]),
@@ -47131,7 +47167,14 @@ fn test_memwal_plan_stream_rejects_unexportable_schema() {
     }
     assert_eq!(rc, -1);
     assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
-    assert!(take_last_error_message().contains("panic exporting Arrow schema"));
+    let message = take_last_error_message();
+    // Arrow 59 reports an invalid field name as a typed C Data Interface error
+    // instead of panicking with NulError. The rejection still happens before
+    // any callback is exposed.
+    assert!(
+        message.contains("Null byte at position 5 not allowed in name"),
+        "{message}"
+    );
     assert!(stream.release.is_none());
     assert!(stream.get_schema.is_none());
     assert!(stream.get_next.is_none());
@@ -50040,18 +50083,17 @@ fn test_native_operation_typed_four_variants_representation() {
         take_last_error_message()
     );
     assert!(!native_schema.is_null());
-    // Native Overwrite assigns fresh field IDs at commit: the Arrow-provided
-    // `lance:field_id` metadata is provisional and the committed dataset uses
-    // the native identity assigned by the writer.
-    assert_eq!(native_schema_field_id_for_test(native_schema, "id"), 0);
-    assert_eq!(native_schema_field_id_for_test(native_schema, "payload"), 1);
+    // Native Overwrite in v15 preserves the Arrow-provided `lance:field_id`
+    // metadata instead of assigning fresh consecutive ids at commit.
+    assert_eq!(native_schema_field_id_for_test(native_schema, "id"), 7);
+    assert_eq!(native_schema_field_id_for_test(native_schema, "payload"), 3);
     assert_eq!(
         native_schema_field_id_for_test(native_schema, "payload.tag"),
-        2
+        11
     );
     assert_eq!(
         native_schema_field_id_for_test(native_schema, "payload.score"),
-        3
+        4
     );
     let arrow_schema = native_schema_arrow(native_schema);
     assert_eq!(arrow_schema.field(1).metadata()["owner"], "typed-op-tests");
@@ -50216,7 +50258,7 @@ fn test_native_operation_typed_four_variants_representation() {
     );
     assert_eq!(
         native_schema_field_id_for_test(overwrite_schema, "payload.tag"),
-        2
+        11
     );
     let mut shared_schema = ptr::null_mut();
     assert_eq!(
@@ -50227,7 +50269,7 @@ fn test_native_operation_typed_four_variants_representation() {
     );
     assert_eq!(
         native_schema_field_id_for_test(shared_schema, "payload.score"),
-        3
+        4
     );
 
     let mut has_config = false;
@@ -54540,8 +54582,24 @@ fn test_native_update_mem_wal_state_publishes_flushed_generation() {
     );
     unsafe { lance_mem_wal_shard_snapshot_free(newer_snapshot) };
     let compacted_values = [newer_compacted];
+    let dir_id = lance_c::runtime::block_on(async {
+        use lance::dataset::mem_wal::DatasetMemWalExt;
+
+        let native = Dataset::open(&uri).await.unwrap();
+        native
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .dir_id
+    });
+    let dir_id = c_str(&dir_id);
     let operation = unsafe {
-        lance_operation_update_mem_wal_state_new(compacted_values.as_ptr(), compacted_values.len())
+        lance_operation_update_mem_wal_state_new_with_dir_id(
+            compacted_values.as_ptr(),
+            compacted_values.len(),
+            dir_id.as_ptr(),
+        )
     };
     assert!(!operation.is_null(), "{}", take_last_error_message());
     let transaction = unsafe { lance_transaction_new(version_before, operation, ptr::null()) };
