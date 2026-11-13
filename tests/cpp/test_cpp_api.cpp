@@ -3933,7 +3933,6 @@ static void test_merge_and_batch_udf(const std::string& dst_uri) {
     std::atomic<int> v2_batch_hits{0};
     std::atomic<int> v2_insert_fragment_calls{0};
     std::atomic<bool> v2_interrupt_once{true};
-    std::atomic<bool> v2_saw_context_marker{false};
 
     lance::UDFCheckpointStoreV2 store_v2;
     store_v2.get_batch = [&](const lance::BatchUDFInfo& info, ArrowArray& out,
@@ -3950,10 +3949,6 @@ static void test_merge_and_batch_udf(const std::string& dst_uri) {
     };
     store_v2.insert_batch = [&](const lance::BatchUDFInfo& info, ArrowArray& batch,
                                 ArrowSchema& batch_schema) {
-        if (batch_schema.metadata != nullptr &&
-            std::strstr(batch_schema.metadata, "lance:udf_checkpoint_context") != nullptr) {
-            v2_saw_context_marker.store(true);
-        }
         v2_batches[{info.fragment_id, info.batch_index}] =
             StoredV2Batch{batch, batch_schema};
         batch.release = nullptr;
@@ -3992,15 +3987,16 @@ static void test_merge_and_batch_udf(const std::string& dst_uri) {
     assert(v2_seed_failed);
     assert(ds.version() == v2_version);
     assert(!v2_batches.empty());
-    assert(v2_saw_context_marker.load());
 
     const int v2_seed_mapper_calls = v2_mapper_calls.load();
     auto resume = make_udf_v2();
     ds.add_columns_batch_udf(resume, std::vector<std::string>{});
     assert(ds.version() > v2_version);
     assert(v2_insert_fragment_calls.load() > 0);
+    // The stored schema carries native's checkpoint marker, so the resume must
+    // restore the cached batch instead of mapping it again.
     assert(v2_batch_hits.load() > 0);
-    assert(v2_mapper_calls.load() <= v2_seed_mapper_calls);
+    assert(v2_mapper_calls.load() == v2_seed_mapper_calls);
 
     PASS();
 }
