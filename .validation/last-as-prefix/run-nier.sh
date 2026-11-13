@@ -35,7 +35,7 @@ log="$artifacts/oracle.log"
 set +e
 (
     cd "$src"
-    mbx cargo test -p lance --test fts_last_as_prefix -- --test-threads=4
+    cargo test -p lance --test fts_last_as_prefix -- --test-threads=4
 ) 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}
 set -e
