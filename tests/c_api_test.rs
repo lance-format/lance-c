@@ -52209,7 +52209,8 @@ fn test_native_operation_mem_wal_directory_state_view() {
         );
         assert!(!view.is_null());
         assert_eq!(unsafe { CStr::from_ptr(view) }.to_str().unwrap(), expected);
-        let Operation::UpdateMemWalState { dir_id, .. } = decoded_native_operation(operation) else {
+        let Operation::UpdateMemWalState { dir_id, .. } = decoded_native_operation(operation)
+        else {
             panic!("expected an UpdateMemWalState operation");
         };
         assert_eq!(dir_id, expected);
