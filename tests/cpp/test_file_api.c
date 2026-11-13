@@ -343,6 +343,10 @@ static int verify_released_blob_v2_raw_file(const char *base_dir) {
     ArrowArrayStream stream = {0};
     ArrowArray batch = {0};
     int32_t ids[3] = {0};
+    int blob_a_valid[3] = {0, 0, 0};
+    int blob_b_valid[3] = {0, 0, 0};
+    int payload_valid[3] = {0, 0, 0};
+    int64_t blob_a_size[3] = {-1, -1, -1};
     int rows = 0;
     if (ok) ok = lance_file_reader_read_all(reader, 2, 2, &stream) == 0;
     if (ok) {
@@ -354,62 +358,52 @@ static int verify_released_blob_v2_raw_file(const char *base_dir) {
     }
     while (ok && stream.get_next(&stream, &batch) == 0) {
         if (!batch.release) break;
-        ok = batch.n_children == 4;
-        if (ok) {
-            const ArrowArray *id = batch.children[0];
-            const int32_t *values = (const int32_t *)id->buffers[1];
-            for (int64_t row = 0; row < batch.length && rows + row < 3; row++) {
-                ids[rows + row] = values[row];
-            }
+        if (batch.n_children != 4) {
+            ok = 0;
+            break;
         }
-        if (ok && rows == 0) {
-            const ArrowArray *blob_a = batch.children[1];
-            const ArrowArray *blob_b = batch.children[2];
-            const ArrowArray *payload = batch.children[3]->children[0];
-            int blob_a_valid = struct_is_valid(blob_a, 0) && !struct_is_valid(blob_a, 1) &&
-                               struct_is_valid(blob_a, 2);
-            int blob_b_valid = struct_is_valid(blob_b, 0) && struct_is_valid(blob_b, 1) &&
-                               !struct_is_valid(blob_b, 2);
-            int payload_valid = struct_is_valid(payload, 0) && !struct_is_valid(payload, 1) &&
-                                struct_is_valid(payload, 2);
-            int empty_size = descriptor_size_at(blob_a, 2) == 0;
-            ok = blob_a_valid && blob_b_valid && payload_valid && empty_size;
-            if (!ok) {
-                fprintf(stderr,
-                        "BLOB null and empty rows mismatch: "
-                        "blob_a=%d blob_b=%d payload=%d empty_size=%d "
-                        "a_valid=%d%d%d b_valid=%d%d%d p_valid=%d%d%d sizes=%lld,%lld,%lld "
-                        "n_children=%lld\n",
-                        blob_a_valid, blob_b_valid, payload_valid, empty_size,
-                        struct_is_valid(blob_a, 0), struct_is_valid(blob_a, 1),
-                        struct_is_valid(blob_a, 2), struct_is_valid(blob_b, 0),
-                        struct_is_valid(blob_b, 1), struct_is_valid(blob_b, 2),
-                        struct_is_valid(payload, 0), struct_is_valid(payload, 1),
-                        struct_is_valid(payload, 2), (long long)descriptor_size_at(blob_a, 0),
-                        (long long)descriptor_size_at(blob_a, 1),
-                        (long long)descriptor_size_at(blob_a, 2),
-                        (long long)blob_a->n_children);
-                fprintf(stderr,
-                        "detail: lengths a=%lld b=%lld p=%lld offsets=%lld,%lld,%lld "
-                        "n_buffers=%lld,%lld,%lld validity=%02x,%02x,%02x "
-                        "size_valid=%d,%d,%d size_null=%p\n",
-                        (long long)blob_a->length, (long long)blob_b->length,
-                        (long long)payload->length, (long long)blob_a->offset,
-                        (long long)blob_b->offset, (long long)payload->offset,
-                        (long long)blob_a->n_buffers, (long long)blob_b->n_buffers,
-                        (long long)payload->n_buffers,
-                        blob_a->buffers[0] ? ((const unsigned char *)blob_a->buffers[0])[0] : 0xff,
-                        blob_b->buffers[0] ? ((const unsigned char *)blob_b->buffers[0])[0] : 0xff,
-                        payload->buffers[0] ? ((const unsigned char *)payload->buffers[0])[0] : 0xff,
-                        struct_is_valid(blob_a->children[2], 0),
-                        struct_is_valid(blob_a->children[2], 1),
-                        struct_is_valid(blob_a->children[2], 2),
-                        blob_a->children[2]->buffers[0]);
+        const ArrowArray *id = batch.children[0];
+        const int32_t *values = (const int32_t *)id->buffers[1];
+        const ArrowArray *blob_a = batch.children[1];
+        const ArrowArray *blob_b = batch.children[2];
+        const ArrowArray *payload = batch.children[3]->children[0];
+        for (int64_t row = 0; row < batch.length; row++) {
+            int index = rows + (int)row;
+            if (index >= 3) {
+                ok = 0;
+                break;
+            }
+            ids[index] = values[row];
+            blob_a_valid[index] = struct_is_valid(blob_a, row);
+            blob_b_valid[index] = struct_is_valid(blob_b, row);
+            payload_valid[index] = struct_is_valid(payload, row);
+            if (blob_a_valid[index]) {
+                blob_a_size[index] = descriptor_size_at(blob_a, row);
             }
         }
         rows += (int)batch.length;
         batch.release(&batch);
         memset(&batch, 0, sizeof(batch));
+    }
+    if (batch.release) {
+        batch.release(&batch);
+        memset(&batch, 0, sizeof(batch));
+    }
+    ok = ok && rows == 3 && ids[0] == 10 && ids[1] == 20 && ids[2] == 30;
+    if (ok) {
+        ok = blob_a_valid[0] && !blob_a_valid[1] && blob_a_valid[2] &&
+             blob_b_valid[0] && blob_b_valid[1] && !blob_b_valid[2] &&
+             payload_valid[0] && !payload_valid[1] && payload_valid[2] &&
+             blob_a_size[0] == 5 && blob_a_size[2] == 0;
+        if (!ok) {
+            fprintf(stderr,
+                    "BLOB null and empty rows mismatch: "
+                    "a_valid=%d%d%d b_valid=%d%d%d p_valid=%d%d%d sizes=%lld,%lld\n",
+                    blob_a_valid[0], blob_a_valid[1], blob_a_valid[2],
+                    blob_b_valid[0], blob_b_valid[1], blob_b_valid[2],
+                    payload_valid[0], payload_valid[1], payload_valid[2],
+                    (long long)blob_a_size[0], (long long)blob_a_size[2]);
+        }
     }
     ok = ok && rows == 3 && ids[0] == 10 && ids[1] == 20 && ids[2] == 30;
     if (!ok) fprintf(stderr, "BLOB default readback failed\n");

@@ -192,32 +192,43 @@ bool verify_released_blob_v2_stream(lance::ArrowStream &stream) {
 
     static const int32_t expected_ids[] = {10, 20, 30};
     int rows = 0;
+    bool blob_a_valid[3] = {false, false, false};
+    bool blob_b_valid[3] = {false, false, false};
+    bool payload_valid[3] = {false, false, false};
+    int64_t blob_a_size[3] = {-1, -1, -1};
     while (true) {
         ArrowArray batch{};
         if (stream->get_next(stream.get(), &batch) != 0) return false;
         if (!batch.release) break;
-        if (batch.n_children != 4) return false;
+        if (batch.n_children != 4) {
+            batch.release(&batch);
+            return false;
+        }
         const auto *ids =
             static_cast<const int32_t *>(batch.children[0]->buffers[1]);
+        const ArrowArray &blob_a = *batch.children[1];
+        const ArrowArray &blob_b = *batch.children[2];
+        const ArrowArray &payload = *batch.children[3]->children[0];
         for (int64_t row = 0; row < batch.length; row++) {
-            if (rows + row >= 3 || ids[row] != expected_ids[rows + row]) {
+            const int index = rows + static_cast<int>(row);
+            if (index >= 3 || ids[row] != expected_ids[index]) {
+                batch.release(&batch);
                 return false;
             }
-        }
-        if (rows == 0) {
-            const ArrowArray &blob_a = *batch.children[1];
-            const ArrowArray &payload = *batch.children[3]->children[0];
-            if (!struct_is_valid(blob_a, 0) || struct_is_valid(blob_a, 1) ||
-                !struct_is_valid(blob_a, 2) ||
-                descriptor_size_at(blob_a, 2) != 0 ||
-                struct_is_valid(payload, 1) || !struct_is_valid(payload, 2)) {
-                return false;
+            blob_a_valid[index] = struct_is_valid(blob_a, row);
+            blob_b_valid[index] = struct_is_valid(blob_b, row);
+            payload_valid[index] = struct_is_valid(payload, row);
+            if (blob_a_valid[index]) {
+                blob_a_size[index] = descriptor_size_at(blob_a, row);
             }
         }
         rows += static_cast<int>(batch.length);
         batch.release(&batch);
     }
-    return rows == 3;
+    return rows == 3 && blob_a_valid[0] && !blob_a_valid[1] &&
+           blob_a_valid[2] && blob_b_valid[0] && blob_b_valid[1] &&
+           !blob_b_valid[2] && payload_valid[0] && !payload_valid[1] &&
+           payload_valid[2] && blob_a_size[0] == 5 && blob_a_size[2] == 0;
 }
 
 bool verify_stream(
