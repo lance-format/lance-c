@@ -9,8 +9,8 @@ SRC=${SRC:?set SRC to the exact source checkout}
 EV=${EV:?set EV to the evidence directory}
 MODE=${1:-green}
 
-BASE_COMMIT=d1c0c36ebf11f3fc042bdc7faf9edafd192c6736
-BASE_TREE=474a86230949a0736805ff1e0d9c2545a69b2be5
+BASE_COMMIT=${BASE_COMMIT:?set BASE_COMMIT to the exact source commit}
+BASE_TREE=${BASE_TREE:?set BASE_TREE to the exact source tree}
 
 export RUSTUP_TOOLCHAIN=1.94.0
 export CARGO_BUILD_JOBS=8
