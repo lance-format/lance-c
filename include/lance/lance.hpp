@@ -2097,6 +2097,13 @@ public:
     static Operation make_update_mem_wal_state(
         const std::vector<CompactedSsTable>& compacted_sstables);
 
+    /// Construct an UpdateMemWalState operation for a specific MemWAL
+    /// directory. Pass an empty `dir_id` for a legacy MemWAL. Native commit
+    /// rejects a stale or removed identifier with LANCE_ERR_STALE_MEM_WAL.
+    static Operation make_update_mem_wal_state_with_dir_id(
+        const std::vector<CompactedSsTable>& compacted_sstables,
+        const std::string& dir_id);
+
     // Update inspection. Inspecting a different operation kind throws
     // LANCE_ERR_NOT_SUPPORTED; every getter below reports native fields
     // unchanged.
@@ -2219,6 +2226,10 @@ public:
     /// but empty value is preserved.
     std::optional<UpdatedFragmentOffsets> updated_fragment_offsets() const;
 
+    /// MemWAL directory identifier named by an Update operation, or nullopt
+    /// for native None. An engaged empty string denotes a legacy MemWAL.
+    std::optional<std::string> update_mem_wal_dir_id() const;
+
     /// Number of groups in a Rewrite operation.
     uint64_t rewrite_group_count() const {
         uint64_t count = 0;
@@ -2264,6 +2275,10 @@ public:
     /// Copy one flushed generation marker by position.
     CompactedSsTable update_mem_wal_state_compacted_sstable_at(
         size_t index) const;
+
+    /// MemWAL directory identifier named by an UpdateMemWalState operation.
+    /// An empty string denotes the legacy `_mem_wal` directory.
+    std::string update_mem_wal_state_dir_id() const;
 
     const LanceOperation* c_handle() const { return handle_.get(); }
 };
@@ -6219,7 +6234,9 @@ struct CompactedSsTable {
 /// applied: an engaged empty vector means the caller supplied no entries.
 /// `update_mode == std::nullopt`, a null `inserted_rows_filter` and a null
 /// `updated_fragment_offsets` map to native `None`, which is distinct from
-/// empty populated values.
+/// empty populated values. `mem_wal_dir_id == std::nullopt` maps to native
+/// `None`; an engaged value (including an empty string) is required by Lance
+/// 15 when compaction progress is present.
 struct UpdateOperationSpec {
     std::vector<uint64_t> removed_fragment_ids;
     std::vector<const Fragment*> updated_fragments;
@@ -6230,6 +6247,7 @@ struct UpdateOperationSpec {
     std::optional<UpdateMode> update_mode;
     std::optional<KeyExistenceFilter> inserted_rows_filter;
     std::optional<UpdatedFragmentOffsets> updated_fragment_offsets;
+    std::optional<std::string> mem_wal_dir_id;
 };
 
 /// One SSTable referenced by a shard snapshot.
@@ -6662,24 +6680,30 @@ class MemWalIndexDetails {
     std::vector<std::string> maintained_;
     std::vector<ShardingSpec> specs_;
     std::map<std::string, std::string> defaults_;
+    std::string dir_id_;
 
 public:
     MemWalIndexDetails(uint32_t num_shards,
                        bool maintain_all,
                        std::vector<std::string> maintained,
                        std::vector<ShardingSpec> specs,
-                       std::map<std::string, std::string> defaults)
+                       std::map<std::string, std::string> defaults,
+                       std::string dir_id = {})
         : num_shards_(num_shards),
           maintain_all_(maintain_all),
           maintained_(std::move(maintained)),
           specs_(std::move(specs)),
-          defaults_(std::move(defaults)) {}
+          defaults_(std::move(defaults)),
+          dir_id_(std::move(dir_id)) {}
 
     MemWalIndexDetails(MemWalIndexDetails&&) noexcept = default;
     MemWalIndexDetails& operator=(MemWalIndexDetails&&) noexcept = default;
     MemWalIndexDetails(const MemWalIndexDetails&) = delete;
     MemWalIndexDetails& operator=(const MemWalIndexDetails&) = delete;
 
+    /// Directory identifier of this MemWAL. Empty denotes the legacy
+    /// `_mem_wal` directory.
+    const std::string& dir_id() const { return dir_id_; }
     uint32_t num_shards() const { return num_shards_; }
     bool maintain_all_indexes() const { return maintain_all_; }
     const std::vector<std::string>& maintained_indexes() const { return maintained_; }
@@ -13861,9 +13885,11 @@ inline std::optional<MemWalIndexDetails> Dataset::mem_wal_index_details() const 
         lance_mem_wal_index_details_num_shards(details.get());
     const int32_t maintain_all =
         lance_mem_wal_index_details_maintain_all_indexes(details.get());
+    const char* dir_id = lance_mem_wal_index_details_dir_id(details.get());
+    if (!dir_id) check_error();
     return MemWalIndexDetails(num_shards, maintain_all != 0,
                               std::move(maintained), std::move(specs),
-                              std::move(defaults));
+                              std::move(defaults), std::string(dir_id));
 }
 
 inline ShardWriter Dataset::mem_wal_writer(
@@ -14259,6 +14285,43 @@ Operation::updated_fragment_offsets() const {
     return UpdatedFragmentOffsets(offsets);
 }
 
+inline std::optional<std::string> Operation::update_mem_wal_dir_id() const {
+    bool present = false;
+    const char* dir_id = nullptr;
+    if (lance_operation_update_mem_wal_dir_id(handle_.get(), &present,
+                                               &dir_id) != 0) {
+        check_error();
+    }
+    if (!present) {
+        if (dir_id) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "Update MemWAL dir_id reported absent with a non-null "
+                        "string");
+        }
+        return std::nullopt;
+    }
+    if (!dir_id) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "Update MemWAL dir_id reported present with a null "
+                    "string");
+    }
+    return std::string(dir_id);
+}
+
+inline std::string Operation::update_mem_wal_state_dir_id() const {
+    const char* dir_id = nullptr;
+    if (lance_operation_update_mem_wal_state_dir_id(handle_.get(), &dir_id) !=
+        0) {
+        check_error();
+    }
+    if (!dir_id) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "UpdateMemWalState dir_id reported present with a null "
+                    "string");
+    }
+    return std::string(dir_id);
+}
+
 inline RewriteGroup Operation::rewrite_group_at(size_t index) const {
     LanceRewriteGroup* group = nullptr;
     if (lance_operation_rewrite_group_at(handle_.get(), index, &group) != 0) {
@@ -14359,7 +14422,10 @@ inline Operation Operation::make_update(const UpdateOperationSpec& spec) {
             ? spec.updated_fragment_offsets->c_handle()
             : nullptr;
 
-    auto* raw = lance_operation_update_new(&options);
+    auto* raw = spec.mem_wal_dir_id
+                   ? lance_operation_update_new_with_mem_wal_dir_id(
+                         &options, spec.mem_wal_dir_id->c_str())
+                   : lance_operation_update_new(&options);
     if (!raw) check_error();
     return Operation(raw);
 }
@@ -14393,6 +14459,20 @@ inline Operation Operation::make_update_mem_wal_state(
     }
     auto* operation = lance_operation_update_mem_wal_state_new(
         raw.empty() ? nullptr : raw.data(), raw.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline Operation Operation::make_update_mem_wal_state_with_dir_id(
+    const std::vector<CompactedSsTable>& compacted_sstables,
+    const std::string& dir_id) {
+    std::vector<::LanceCompactedSsTable> raw;
+    raw.reserve(compacted_sstables.size());
+    for (const auto& sstable : compacted_sstables) {
+        raw.push_back(sstable.to_c());
+    }
+    auto* operation = lance_operation_update_mem_wal_state_new_with_dir_id(
+        raw.empty() ? nullptr : raw.data(), raw.size(), dir_id.c_str());
     if (!operation) check_error();
     return Operation(operation);
 }

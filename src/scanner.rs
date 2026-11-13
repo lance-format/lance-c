@@ -18,6 +18,7 @@ use datafusion::physical_expr::expressions;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{
     ExecutionPlan, empty::EmptyExec, projection::ProjectionExec as DFProjectionExec,
+    replace_children_if_necessary,
 };
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
@@ -1412,7 +1413,7 @@ fn rewrite_prepared_fts_plan(
             rewritten.indexed_query_execs += child_rewritten.indexed_query_execs;
             rewritten.flat_match_query_execs += child_rewritten.flat_match_query_execs;
         }
-        plan.with_new_children(new_children).map_err(|error| {
+        replace_children_if_necessary(plan, new_children).map_err(|error| {
             lance_core::Error::internal(format!(
                 "failed to rebuild FTS execution plan children: {error}"
             ))

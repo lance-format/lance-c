@@ -9885,6 +9885,21 @@ LanceOperation* lance_operation_update_new(
 );
 
 /**
+ * Construct an Update operation that names its MemWAL directory.
+ *
+ * Identical to `lance_operation_update_new()` except that `mem_wal_dir_id`
+ * maps to native `Some(...)`; NULL maps to `None`. Since Lance 15 native code
+ * requires the identifier when `compacted_sstables` carries compaction
+ * progress, and later rejects a stale or removed identifier at commit.
+ *
+ * @return the new operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_new_with_mem_wal_dir_id(
+    const LanceUpdateOperationOptions* options,
+    const char* mem_wal_dir_id
+);
+
+/**
  * Read the number of removed fragment IDs in an Update operation.
  *
  * @return 0 on success, -1 on error or a different operation kind.
@@ -10056,6 +10071,22 @@ int32_t lance_operation_update_updated_fragment_offsets(
     const LanceOperation* operation,
     bool* out_present,
     LanceUpdatedFragmentOffsets** out_offsets
+);
+
+/**
+ * Borrow the MemWAL directory identifier named by an Update operation.
+ *
+ * Writes `*out_present = false` and a NULL string when the native field is
+ * `None`. An empty string is a present identifier for a legacy MemWAL.
+ * `*out_dir_id` remains valid until the operation is closed. Both outputs are
+ * written only on success.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_mem_wal_dir_id(
+    const LanceOperation* operation,
+    bool* out_present,
+    const char** out_dir_id
 );
 
 /**
@@ -10362,6 +10393,21 @@ LanceOperation* lance_operation_update_mem_wal_state_new(
 );
 
 /**
+ * Construct an UpdateMemWalState operation for a specific MemWAL directory.
+ *
+ * `dir_id` is required and must be valid UTF-8. Pass an empty string for a
+ * legacy MemWAL created before directory identifiers existed. Native commit
+ * rejects a stale or removed identifier with `LANCE_ERR_STALE_MEM_WAL`.
+ *
+ * @return the new operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_mem_wal_state_new_with_dir_id(
+    const LanceCompactedSsTable* compacted_sstables,
+    size_t compacted_sstable_count,
+    const char* dir_id
+);
+
+/**
  * Read the number of compacted SSTables in an UpdateMemWalState operation.
  *
  * @return 0 on success, -1 on error or a different operation kind.
@@ -10380,6 +10426,19 @@ int32_t lance_operation_update_mem_wal_state_compacted_sstable_at(
     const LanceOperation* operation,
     size_t index,
     LanceCompactedSsTable* out_sstable
+);
+
+/**
+ * Borrow the MemWAL directory identifier of an UpdateMemWalState operation.
+ *
+ * An empty string denotes the legacy `_mem_wal` directory. The string remains
+ * valid until the operation is closed.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_mem_wal_state_dir_id(
+    const LanceOperation* operation,
+    const char** out_dir_id
 );
 
 /**
@@ -12222,6 +12281,16 @@ int32_t lance_mem_wal_index_details(
 
 /** Free an index-details handle. Safe to call with NULL. */
 void lance_mem_wal_index_details_free(LanceMemWalIndexDetails* details);
+
+/**
+ * Borrow the MemWAL directory identifier recorded in the index details.
+ *
+ * An empty string denotes the legacy `_mem_wal` directory. The string remains
+ * valid until the details handle is freed.
+ */
+const char* lance_mem_wal_index_details_dir_id(
+    const LanceMemWalIndexDetails* details
+);
 
 /** Number of shards recorded for the MemWAL index. */
 uint32_t lance_mem_wal_index_details_num_shards(

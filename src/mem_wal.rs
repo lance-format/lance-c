@@ -39,7 +39,8 @@ use lance::dataset::mem_wal::scanner::{
     LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr,
 };
-use lance::dataset::mem_wal::write::{SharedWriteStats, WriteStatsSnapshot};
+use lance::dataset::mem_wal::write::WriteStatsSnapshot;
+use lance::dataset::mem_wal::write::stats::SharedWriteStats;
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, ShardWriterConfig,
     arrow_schema_with_field_ids, evaluate_sharding_spec,
@@ -398,6 +399,7 @@ fn snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -> Shar
 pub struct LanceMemWalIndexDetails {
     num_shards: u32,
     maintain_all: bool,
+    dir_id: CString,
     maintained: Vec<CString>,
     specs: Vec<ShardingSpec>,
     defaults: Vec<(CString, CString)>,
@@ -430,6 +432,7 @@ impl LanceMemWalIndexDetails {
         Ok(Self {
             num_shards: details.num_shards,
             maintain_all: details.maintain_all_indexes,
+            dir_id: cstring(&details.dir_id, "MemWAL dir_id")?,
             maintained,
             specs: details.sharding_specs,
             defaults,
@@ -594,6 +597,17 @@ pub unsafe extern "C" fn lance_mem_wal_index_details_num_shards(
     details: *const LanceMemWalIndexDetails,
 ) -> u32 {
     ffi_try!(Ok(details_ref(details)?.num_shards), 0)
+}
+
+/// Borrow the MemWAL state directory identifier.
+///
+/// An empty string denotes the legacy `_mem_wal` directory. The value remains
+/// valid until the details handle is freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_mem_wal_index_details_dir_id(
+    details: *const LanceMemWalIndexDetails,
+) -> *const c_char {
+    ffi_try!(Ok(details_ref(details)?.dir_id.as_ptr()), null)
 }
 
 #[unsafe(no_mangle)]
