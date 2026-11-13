@@ -1,6 +1,6 @@
 # Native `last_as_prefix` candidate for upstream main 793a9e5
 
-Source-only candidate that ports the pinned native experiment (Lance 14.0.2,
+Validation candidate that ports the pinned native experiment (Lance 14.0.2,
 `40f15ed1b71b66950961b175829fdf17a763f108`) to exact upstream main
 `793a9e5156556ef315062f051779ee47de32d5ad`.
 
@@ -77,7 +77,7 @@ When enabled for a `Match` leaf:
 `git diff --check` is clean. All 16 changed native files pass direct rustfmt
 from the upstream-declared Rust 1.98.1 toolchain, with edition 2024 and
 `skip_children=true`; this does not claim a whole-workspace Cargo fmt run.
-The candidate has not yet been compiled or executed.
+Focused native execution is recorded below.
 
 ## Tests added
 
@@ -132,9 +132,9 @@ Flat execution:
 - Static review of every changed hunk, remaining `fuzziness == Some(0)` /
   `uses_fuzzy_expansion` call sites, match struct literals, and test helpers.
 
-Not run, per the source-only constraint: `cargo check`, `cargo test`, Clippy,
-CMake, benchmarks, and any runtime execution. The separate pinned Rust 1.94
-MSRV job was not touched.
+Not run in this acceptance: a whole-workspace check/test matrix, Clippy,
+CMake or benchmarks. Focused native tests are recorded below. The separate
+pinned Rust 1.94 MSRV acceptance remains independent.
 
 ## Unresolved concerns
 
@@ -166,15 +166,15 @@ MSRV job was not touched.
 7. **Certification**: the old eight-case pinned oracle does not certify JSON
    query execution, default-analyzer edge cases, or multi-segment behavior by
    itself. New tests cover cross-fragment merging and serde/parser defaults,
-   but none of them were executed in this source-only task.
+   and the focused execution below now covers those added dataset cases.
 
 ## Validation toolchain boundary
 
 Upstream declares Rust 1.98.1 in `rust-toolchain.toml` and a minimum of 1.95.0.
 Any execution of this upstream candidate must identify that toolchain and must
 not be called lance-c Rust 1.94 acceptance. The selected lance-c core pin and
-its Rust 1.94 contract remain unchanged. Native-current execution is pending;
-the previously accepted pinned-native nine-case oracle is separate evidence.
+its Rust 1.94 contract remain unchanged. The native-current execution below uses 1.98.1; the previously accepted
+pinned-native nine-case oracle is separate evidence.
 
 ## Dataset budget correction (2026-11-13)
 
@@ -184,5 +184,16 @@ its vocabulary. Shared expansion selects actual vocabulary keys, so `alpha`
 uses the first slot and `alpenglow` uses the second. The corrected test checks
 that cap 1 cannot satisfy both AND positions and cap 2 returns row 0. No
 production selector changed. The prior 14 index and two lance-lib results
-remain applicable; the corrected dataset case awaits its focused recheck.
-Earlier source-only statements describe the original preparation stage.
+remain applicable. NieR re-executed the corrected dataset case with
+`--features slow_tests --test integration_tests --
+query::inverted::test_inverted_last_as_prefix_expands_only_highest_position
+--exact --test-threads=4`: one passed, 171 filtered out, exit 0 on Rust 1.98.1
+with `--locked`. The other two dataset cases already passed against identical
+production source and are reused. Post-test tree verification and working-tree
+comparison found no source drift. Together this supports 14 index, two
+lance-lib, and three dataset cases, not a repeated whole-suite run.
+
+Retained evidence on NieR: `/home/xuanwo/Code/validation/`
+`lance-native-prefix-main-793a9e5-evidence/` (run1-index, run2-lance-lib,
+run4-dataset, run5-dataset-rerun, run6-budget-correction). The coordinator
+retained and read the failure and corrected raw logs.
