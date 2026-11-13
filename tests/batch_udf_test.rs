@@ -1947,7 +1947,8 @@ fn seed_partial_batch_checkpoint(
         run_batch_udf_v2(dataset, ffi_schema, &context, None, None),
         -1
     );
-    assert_eq!(seed_mapper.calls.load(Ordering::SeqCst), 2);
+    // Only the first fragment is mapped before the fragment checkpoint fails.
+    assert_eq!(seed_mapper.calls.load(Ordering::SeqCst), 1);
     assert!(store.inserted_fragments.lock().unwrap().is_empty());
     let cached = store.v2_batches.lock().unwrap();
     assert_eq!(cached.len(), 1);
