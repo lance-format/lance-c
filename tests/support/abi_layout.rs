@@ -2000,32 +2000,6 @@ fn field_names(body: &[String]) -> Vec<String> {
         if declaration.is_empty() {
             continue;
         }
-        // A function-pointer declarator looks like `(*name)`. Parameter
-        // names such as `struct Foo* self` are nested one parenthesis deeper,
-        // so only inspect `*` tokens at the declarator's own depth.
-        let mut depth = 0usize;
-        let mut is_function_pointer = false;
-        for (index, token) in declaration.iter().enumerate() {
-            match token.as_str() {
-                "(" => depth += 1,
-                ")" => depth = depth.saturating_sub(1),
-                "*" if depth == 1 => {
-                    if declaration
-                        .get(index + 1)
-                        .is_some_and(|name| is_ident(name))
-                        && declaration.get(index + 2).map(String::as_str) == Some(")")
-                    {
-                        fields.push(declaration[index + 1].clone());
-                        is_function_pointer = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if is_function_pointer {
-            continue;
-        }
-
         let mut depth = 0usize;
         let mut start = 0;
         for (index, token) in declaration.iter().enumerate() {
@@ -2033,15 +2007,53 @@ fn field_names(body: &[String]) -> Vec<String> {
                 "(" | "[" | "{" => depth += 1,
                 ")" | "]" | "}" => depth = depth.saturating_sub(1),
                 "," if depth == 0 => {
-                    fields.push(declarator_name(&declaration[start..index]));
+                    fields.push(field_name(&declaration[start..index]));
                     start = index + 1;
                 }
                 _ => {}
             }
         }
-        fields.push(declarator_name(&declaration[start..]));
+        fields.push(field_name(&declaration[start..]));
     }
     fields
+}
+
+/// A function-pointer declarator wraps its name in parentheses, for example
+/// `void (*release)(struct Foo* self)`. Only the first top-level group is the
+/// declarator; parameter names such as `self` are outside it.
+fn parenthesized_group(declaration: &[String]) -> Option<&[String]> {
+    let mut depth = 0usize;
+    let mut start = None;
+    for (index, token) in declaration.iter().enumerate() {
+        match token.as_str() {
+            "(" => {
+                if depth == 0 && start.is_none() {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            ")" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0
+                    && let Some(start) = start
+                {
+                    return Some(&declaration[start + 1..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn field_name(declaration: &[String]) -> String {
+    if let Some(group) = parenthesized_group(declaration)
+        && group.iter().any(|token| token == "*")
+        && let Some(name) = group.iter().rev().find(|token| is_ident(token))
+    {
+        return (*name).clone();
+    }
+    declarator_name(declaration)
 }
 
 fn declarator_name(declaration: &[String]) -> String {
