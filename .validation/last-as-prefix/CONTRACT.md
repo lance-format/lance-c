@@ -156,28 +156,45 @@ entry point works without new symbols.
 ## Validation
 
 Oracle: `fts_last_as_prefix.rs`, a one-off integration test against the patched
-checkout (not part of the candidate patch). Corpus is four small row datasets and
-one list-element dataset with fixed ids; the index uses the simple tokenizer with
+checkout (not part of the candidate patch). Corpus is one 10-row dataset with
+fixed ids (`alpha alpenglow`, `alphabet soup`, `alpha beta`, ...) and one
+list-element dataset. The index uses the simple tokenizer with
 `lower_case=true`, stemming/stop-words/folding/max-length disabled so the
 analyzer does not hide the token-selection rule.
 
 Covered:
 
-- exact behavior unchanged (`alpha alp` exact = empty; `alpha beta` AND = id 2);
-- fuzzy regression (`alpa`, fuzziness 1);
-- prefix OR and AND, Boolean must/should composition;
+- exact behavior unchanged: `alpha alp` OR = ids [0,2,6,7,8,9] because `alp` is
+  a real term in row 8; `alpha alp` AND = [8]; `alpha alpe` AND = empty;
+  `alpha beta` AND = [2];
+- fuzzy regression (`alpa`, fuzziness 1) = [0,2,6,7,8,9];
+- prefix OR and AND; only the last token expands (`alpha alpe` AND = [0,7],
+  `alpe alp` AND = empty, `alp alpe` AND = empty because the earlier `alp` is
+  exact);
+- Boolean must/should composition ([0,7] and [0,2,5,7]);
 - shared budget and deterministic truncation (`max_expansions` 0/2/3/5),
   including the earlier exact token consuming budget;
 - trailing punctuation/whitespace and empty analysis;
 - serde absent/false compatibility and execution of a serde-parsed query;
-- boost scaling of the leaf score;
-- list-element boundary (`al` + `pha` does not match `alp`).
+- boost scaling of the leaf score (2x within 1e-5);
+- list-element boundary (`al` + `pha` does not match `alp`; prefix = [0,1,3],
+  exact = [3]).
 
-Expected results are asserted as concrete ids; see the test file. Command:
+Command and result on NieR (32-core Linux, mbx-managed cargo shim), against a
+disposable `cp -a` copy of the pinned cargo checkout at
+`40f15ed1b71b66950961b175829fdf17a763f108`:
 
 ```bash
-cargo test -p lance --test fts_last_as_prefix
+cargo test -p lance --test fts_last_as_prefix -- --test-threads=4
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
 ```
+
+The whole patched `lance` integration-test crate compiled before the run. Two
+earlier oracle revisions failed only because their expectations were wrong
+(`alpha` itself starts with `alp`; OR unions the leaves), not because of the
+implementation; the final assertions above were re-run from scratch. Patch
+revision validated: sha256
+`3cdaf8373790c5e952585ab85288c9719859cfce2ad06645d3904e0821ab6d4a`.
 
 Limitations: no JSON-column oracle, no default-analyzer (stemming/stop-word)
 oracle, no multi-segment partition-split oracle, no full lance-c suite, and no
