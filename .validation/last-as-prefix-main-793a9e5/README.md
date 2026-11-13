@@ -17,7 +17,7 @@ pin, C API, ABI, or error contract. No C API surface is added or modified.
 
 - Candidate base tree: `b71237fa79dd9c94da47752e026430bd93ce7243`
   (identical to `793a9e5^{tree}`).
-- Candidate patch: 16 files, +761/−142.
+- Candidate patch: 16 files, +871/−146.
 - Pinned oracle `../last-as-prefix/fts_last_as_prefix.rs` is intentionally not
   copied into the patch; it remains the pinned experiment's test.
 
@@ -66,7 +66,7 @@ When enabled for a `Match` leaf:
 | Pinned `PrefixAutomaton` / `ExpansionAutomaton` | `inverted.rs` | Replaced the bespoke two-enum automaton with `fst::automaton::Str::new(token).starts_with()`. Same language: terms whose UTF-8 bytes begin with the analyzed token; empty prefix matches all. Removes impossible fuzzy/prefix state combinations. |
 | `inverted/index/partition.rs` | same file | Partition-level `expand_fuzzy` applies prefix only at the highest position; collector renamed `collect_expansion_candidates_with_automaton<A: fst::Automaton>`. |
 | `inverted/index/search.rs` | same file | `expand_fuzzy_tokens` delegates to the shared selector; both scoring guards use the predicate; injected-scorer error mentions fuzzy or prefix. |
-| `inverted/parser.rs` | same file | JSON key `last_as_prefix` defaults to `false`. Omission defaults to `false`; provided non-boolean values, including `null`, return `InvalidInput` with the field and value, matching serde's boolean field contract. |
+| `inverted/parser.rs` | same file | JSON key `last_as_prefix`: omission defaults to `false`; provided non-boolean values, including `null`, return `InvalidInput` with the field and value, matching serde's boolean field contract. |
 | `inverted/compound.rs` `effective_params` | same file | Propagates `last_as_prefix` into each leaf's effective params. |
 | `dataset/scanner.rs` residual/postfilter gates | `dataset/scanner/fts.rs` | Main split scanner FTS planning into a module; residual compound gating uses `!uses_vocabulary_expansion()` for `Match` and `MultiMatch`. |
 | `io/exec/fts.rs` gates | `io/exec/fts/{matches,match_query,compound,flat_match,corpus}.rs` | Main split the old file; predicate renamed `compound_query_uses_vocabulary_expansion`, scorer-only guard, post-filter rejection, and Match exec effective params all use the predicate. |
