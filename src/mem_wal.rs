@@ -324,6 +324,18 @@ fn get_pk_columns(dataset: &Dataset) -> lance_core::Result<Vec<String>> {
     Ok(fields.iter().map(|field| field.name.clone()).collect())
 }
 
+/// Directory identifier of the dataset's MemWAL layout.
+///
+/// An empty string is the legacy `_mem_wal` layout. Native scanners and
+/// planners default to that legacy value, so every binding constructor must
+/// pass the dataset's actual identifier or reads resolve against the wrong
+/// directory.
+fn mem_wal_dir_id(dataset: &Dataset) -> lance_core::Result<String> {
+    Ok(block_on(dataset.mem_wal_index_details())?
+        .map(|details| details.dir_id)
+        .unwrap_or_default())
+}
+
 fn write_ffi_schema(out: *mut FFI_ArrowSchema, schema: &ArrowSchema) -> lance_core::Result<()> {
     if out.is_null() {
         return Err(invalid("out must not be NULL"));
@@ -1763,6 +1775,7 @@ unsafe fn writer_lsm_scanner_inner(
         combined,
         get_pk_columns(&writer.dataset)?,
     )
+    .with_mem_wal_dir_id(live.config().dir_id.clone())
     .with_in_memory_memtables(writer.shard_id, refs);
     unsafe { *out = Box::into_raw(Box::new(LanceLsmScanner::new(scanner))) };
     Ok(0)
@@ -1866,7 +1879,9 @@ pub unsafe extern "C" fn lance_lsm_scanner_from_snapshots(
             let snapshots = snapshots_from_c(snapshots, num_snapshots)?;
             let snapshot = dataset.snapshot();
             let pk_columns = get_pk_columns(&snapshot)?;
-            let scanner = LsmScanner::new(snapshot, snapshots, pk_columns);
+            let dir_id = mem_wal_dir_id(&snapshot)?;
+            let scanner =
+                LsmScanner::new(snapshot, snapshots, pk_columns).with_mem_wal_dir_id(dir_id);
             *out = Box::into_raw(Box::new(LanceLsmScanner::new(scanner)));
             Ok(0)
         },
@@ -2112,7 +2127,9 @@ pub unsafe extern "C" fn lance_lsm_point_lookup_planner_new(
             };
             let base_schema = Arc::new(ArrowSchema::from(native.schema()));
             let identity_schema = Arc::new(arrow_schema_with_field_ids(native.schema()));
-            let collector = LsmDataSourceCollector::new(native.clone(), snapshots);
+            let dir_id = mem_wal_dir_id(&native)?;
+            let collector =
+                LsmDataSourceCollector::new(native.clone(), snapshots).with_mem_wal_dir_id(dir_id);
             let planner =
                 LsmPointLookupPlanner::new(collector, pk_columns.clone(), base_schema.clone())?
                     .with_identity_schema(identity_schema);
@@ -2344,7 +2361,8 @@ unsafe fn vector_planner_new_inner(
         Some(filter) => Some(parse_filter_expr(base_schema.as_ref(), &filter)?),
         None => None,
     };
-    let collector = LsmDataSourceCollector::new(native.clone(), snapshots);
+    let collector = LsmDataSourceCollector::new(native.clone(), snapshots)
+        .with_mem_wal_dir_id(mem_wal_dir_id(&native)?);
     let planner = LsmVectorSearchPlanner::new(
         collector,
         pk_columns,
