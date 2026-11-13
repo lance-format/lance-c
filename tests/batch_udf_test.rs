@@ -1304,22 +1304,45 @@ fn test_batch_udf_checkpoint_hits_skip_mapper_and_batches() {
     let dataset = open(&uri);
     let original_version = unsafe { lance_dataset_version(dataset) };
     let (mapper, store, context) = make_context(declared.clone(), MapperMode::Constant(5));
+
+    // A failure after the first fragment checkpoint leaves the dataset at its
+    // original version and keeps the fragment JSON native wrote, which is the
+    // resume state the checkpoint protocol is built for.
+    *store.failure.lock().unwrap() = Some(Failure {
+        method: StoreMethod::InsertFragment,
+        call_index: 1,
+        code: LanceErrorCode::IoError as i32,
+        message: "interrupted after the first fragment checkpoint".into(),
+    });
     assert_eq!(
         run_batch_udf(dataset, &ffi_schema, &context, None, None, true),
-        0,
-        "checkpoint seeding call failed: {:?}",
-        take_error()
+        -1
     );
-    assert_eq!(mapper.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(store.inserted_fragments.lock().unwrap().len(), 2);
+    let (code, message) = take_error();
+    assert_eq!(code, LanceErrorCode::IoError);
+    assert!(
+        message.contains("interrupted after the first fragment checkpoint"),
+        "unexpected seeding failure: {message}"
+    );
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, original_version);
+    assert_eq!(mapper.calls.load(Ordering::SeqCst), 1);
+
+    // A durable store returns the native fragment JSON verbatim, marker included.
+    let checkpointed: Vec<(u64, String)> = store.inserted_fragments.lock().unwrap().clone();
+    assert_eq!(checkpointed.len(), 1);
+    for (fragment_id, json) in checkpointed {
+        store
+            .fragment_hits
+            .lock()
+            .unwrap()
+            .insert(fragment_id as u32, json);
+    }
     unsafe { lance_dataset_close(dataset) };
 
-    // Replay the same add_columns request against the original snapshot. The
-    // checkpoint store now holds the fragment JSON native wrote during the
-    // seeding run, including the native checkpoint-context marker, so the
-    // fragment hit must skip the mapper for that fragment.
+    // Resume the same add_columns request against the original snapshot.
     let replay = open_version(&uri, original_version);
     reset_store(&store);
+    *store.failure.lock().unwrap() = None;
     let replay_mapper = Arc::new(MapperState {
         output_schema: declared.clone(),
         mode: MapperMode::Constant(7),
@@ -1348,10 +1371,6 @@ fn test_batch_udf_checkpoint_hits_skip_mapper_and_batches() {
         store.inserted_fragments.lock().unwrap().len(),
         1,
         "a fragment hit skips insert_fragment; only the replayed fragment is stored"
-    );
-    assert!(
-        store.inserted_batches.lock().unwrap().is_empty(),
-        "the checkpointed fragment must not re-insert batches"
     );
 
     let events = store.events.lock().unwrap().clone();
@@ -1417,10 +1436,19 @@ fn test_batch_udf_checkpoint_without_native_context_is_rejected() {
     assert_eq!(mapper.calls.load(Ordering::SeqCst), 0);
 
     store.fragment_hits.lock().unwrap().clear();
-    store.batch_hits.lock().unwrap().insert(
-        (fragment_b_id, 0),
-        RecordBatch::try_new(declared, vec![Arc::new(Int64Array::from(vec![9; 4]))]).unwrap(),
-    );
+    // A batch entry restored through the C callbacks carries no schema
+    // metadata, so native rejects it instead of using it as a hit even when
+    // every fragment has an entry and the mapper would never run.
+    for fragment_id in [fragment_a.id as u32, fragment_b_id] {
+        store.batch_hits.lock().unwrap().insert(
+            (fragment_id, 0),
+            RecordBatch::try_new(
+                declared.clone(),
+                vec![Arc::new(Int64Array::from(vec![9; 4]))],
+            )
+            .unwrap(),
+        );
+    }
     assert_eq!(
         run_batch_udf(dataset, &ffi_schema, &context, None, None, true),
         -1
