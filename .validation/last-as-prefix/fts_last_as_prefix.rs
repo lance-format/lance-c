@@ -200,7 +200,12 @@ async fn public_exact_vocabulary_expansion_filters_and_caps_tokens() {
     }
     let missing = collect_query_tokens("zzzzmissing", &mut tokenizer);
     let params = FtsSearchParams::default().with_fuzziness(Some(0));
-    assert!(index.expand_fuzzy_tokens(&missing, &params).unwrap().is_empty());
+    assert!(
+        index
+            .expand_fuzzy_tokens(&missing, &params)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
