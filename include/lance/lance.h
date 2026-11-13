@@ -2322,6 +2322,25 @@ typedef int32_t (*LanceUDFCheckpointGetBatch)(
 );
 
 /**
+ * Retrieve a checkpointed output batch together with its schema.
+ *
+ * Return 1 with both `output` and `output_schema` initialized to owned Arrow C
+ * Data values, 0 with both slots left zero-initialized, or -1 with `error`
+ * initialized. The schema is authoritative: native stores a checkpoint context
+ * marker in its metadata, so the callback must retain and return the exact
+ * schema received through `LanceUDFCheckpointInsertBatch`. Rebuilding a batch
+ * from the declared output schema drops that metadata and native rejects the
+ * hit as incompatible.
+ */
+typedef int32_t (*LanceUDFCheckpointGetBatchV2)(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* info,
+    struct ArrowArray* output,
+    struct ArrowSchema* output_schema,
+    LanceCallbackError* error
+);
+
+/**
  * Retain a checkpoint batch.
  *
  * `batch` and `batch_schema` are owned, movable Arrow C Data Interface values.
@@ -2395,6 +2414,34 @@ typedef struct LanceBatchUDF {
 } LanceBatchUDF;
 
 /**
+ * Schema-aware foreign UDFCheckpointStore adapter.
+ *
+ * Same contract as `LanceUDFCheckpointStore`, but `get_batch` returns the batch
+ * schema alongside the batch. Insert and fragment callbacks are shared with the
+ * original struct. All four callbacks are required when engaged.
+ */
+typedef struct LanceUDFCheckpointStoreV2 {
+    LanceUDFCheckpointGetBatchV2 get_batch;
+    LanceUDFCheckpointInsertBatch insert_batch;
+    LanceUDFCheckpointGetFragment get_fragment;
+    LanceUDFCheckpointInsertFragment insert_fragment;
+    void* callback_ctx;
+} LanceUDFCheckpointStoreV2;
+
+/**
+ * Schema-aware foreign BatchUDF declaration.
+ *
+ * `output_schema` is the complete schema of every mapper output batch and is
+ * borrowed for this call. `checkpoint_store` may be NULL.
+ */
+typedef struct LanceBatchUDFV2 {
+    LanceBatchUDFMapper mapper;
+    void* mapper_ctx;
+    const struct ArrowSchema* output_schema;
+    const LanceUDFCheckpointStoreV2* checkpoint_store;
+} LanceBatchUDFV2;
+
+/**
  * Add columns through native `NewColumnTransform::BatchUDF`.
  *
  * `read_columns` NULL maps to native None. A non-NULL NULL-terminated array
@@ -2413,6 +2460,24 @@ typedef struct LanceBatchUDF {
 int32_t lance_dataset_add_columns_batch_udf(
     LanceDataset* dataset,
     const LanceBatchUDF* udf,
+    const char* const* read_columns,
+    const uint32_t* batch_size
+);
+
+/**
+ * Add columns through a schema-aware native `NewColumnTransform::BatchUDF`.
+ *
+ * Identical to `lance_dataset_add_columns_batch_udf` except that batch
+ * checkpoints are restored from an owned ArrowArray plus the schema that
+ * carries native schema metadata. Use this entry when replaying cached batches;
+ * the original entry remains ABI-stable and honestly rejects markerless batch
+ * hits through native validation.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_add_columns_batch_udf_v2(
+    LanceDataset* dataset,
+    const LanceBatchUDFV2* udf,
     const char* const* read_columns,
     const uint32_t* batch_size
 );
@@ -3856,6 +3921,27 @@ int32_t lance_fragment_add_columns_stream(
 int32_t lance_fragment_add_columns_batch_udf(
     const LanceFragment* fragment,
     const LanceBatchUDF* udf,
+    const char* const* read_columns,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add columns through a schema-aware borrowed BatchUDF declaration.
+ *
+ * Identical to `lance_fragment_add_columns_batch_udf` except that batch
+ * checkpoints are restored from an owned ArrowArray plus the schema that
+ * carries native schema metadata. The original entry remains ABI-stable and
+ * honestly rejects markerless batch hits through native validation.
+ *
+ * Both outputs are success-only. The output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_batch_udf_v2(
+    const LanceFragment* fragment,
+    const LanceBatchUDFV2* udf,
     const char* const* read_columns,
     const uint32_t* batch_size,
     LanceFragment** out_fragment,

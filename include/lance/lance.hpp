@@ -2543,6 +2543,38 @@ struct BatchUDF {
     std::optional<UDFCheckpointStore> checkpoint_store;
 };
 
+/// Schema-aware checkpoint lookup. A hit must return both an owned array and
+/// the exact schema received by `insert_batch`, because native binds a cached
+/// batch to a context marker stored in that schema's metadata. Returns true on
+/// a hit, false on a miss, and throws on error.
+using BatchUDFGetBatchV2 = std::function<bool(
+    const BatchUDFInfo&,
+    ArrowArray&,
+    ArrowSchema&)>;
+
+/// Schema-aware native UDF checkpoint store. Insert and fragment callbacks are
+/// shared with `UDFCheckpointStore`; only the batch lookup differs. All four
+/// callbacks are required when the store is engaged.
+struct UDFCheckpointStoreV2 {
+    BatchUDFGetBatchV2 get_batch;
+
+    std::function<void(
+        const BatchUDFInfo&,
+        ArrowArray&,
+        ArrowSchema&)> insert_batch;
+
+    std::function<std::optional<std::string>(uint32_t)> get_fragment;
+
+    std::function<void(uint64_t, const std::string&)> insert_fragment;
+};
+
+/// Schema-aware native BatchUDF declaration.
+struct BatchUDFV2 {
+    BatchUDFMapper mapper;
+    const ArrowSchema* output_schema = nullptr;
+    std::optional<UDFCheckpointStoreV2> checkpoint_store;
+};
+
 namespace callback_detail {
 
 inline void release_owned_string(LanceOwnedString* value) noexcept {
@@ -2578,14 +2610,29 @@ inline void release_array_after_exception(ArrowArray* value) noexcept {
     }
 }
 
+inline void release_schema_after_exception(ArrowSchema* value) noexcept {
+    if (value != nullptr && value->release != nullptr) {
+        value->release(value);
+    }
+}
+
 struct MapperContext {
     const BatchUDF* udf;
+};
+
+struct MapperContextV2 {
+    const BatchUDFV2* udf;
 };
 
 struct CheckpointContext {
     const UDFCheckpointStore* store;
 };
 
+struct CheckpointContextV2 {
+    const UDFCheckpointStoreV2* store;
+};
+
+template <typename Context>
 inline int32_t mapper_trampoline(
     void* callback_ctx,
     const ArrowArray* input,
@@ -2635,6 +2682,35 @@ inline int32_t get_batch_trampoline(
     }
 }
 
+inline int32_t get_batch_v2_trampoline(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* raw_info,
+    ArrowArray* output,
+    ArrowSchema* output_schema,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<CheckpointContextV2*>(callback_ctx);
+        BatchUDFInfo info{raw_info->fragment_id, raw_info->batch_index};
+        return context->store->get_batch(info, *output, *output_schema) ? 1 : 0;
+    } catch (const lance::Error& exception) {
+        release_array_after_exception(output);
+        release_schema_after_exception(output_schema);
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        release_array_after_exception(output);
+        release_schema_after_exception(output_schema);
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        release_array_after_exception(output);
+        release_schema_after_exception(output_schema);
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+template <typename Context>
 inline int32_t insert_batch_trampoline(
     void* callback_ctx,
     const LanceUDFBatchInfo* raw_info,
@@ -2658,6 +2734,7 @@ inline int32_t insert_batch_trampoline(
     }
 }
 
+template <typename Context>
 inline int32_t get_fragment_trampoline(
     void* callback_ctx,
     uint32_t fragment_id,
@@ -2691,6 +2768,7 @@ inline int32_t get_fragment_trampoline(
     }
 }
 
+template <typename Context>
 inline int32_t insert_fragment_trampoline(
     void* callback_ctx,
     uint64_t fragment_id,
@@ -2728,6 +2806,10 @@ struct BatchUDFCall {
     CheckpointContext checkpoint_context{};
     LanceUDFCheckpointStore raw_store{};
     LanceBatchUDF raw{};
+    MapperContextV2 mapper_context_v2{};
+    CheckpointContextV2 checkpoint_context_v2{};
+    LanceUDFCheckpointStoreV2 raw_store_v2{};
+    LanceBatchUDFV2 raw_v2{};
 
     BatchUDFCall(const BatchUDF& udf,
                  std::optional<std::vector<std::string>> columns,
@@ -2754,18 +2836,70 @@ struct BatchUDFCall {
             }
             checkpoint_context.store = store;
             raw_store.get_batch = &get_batch_trampoline;
-            raw_store.insert_batch = &insert_batch_trampoline;
-            raw_store.get_fragment = &get_fragment_trampoline;
-            raw_store.insert_fragment = &insert_fragment_trampoline;
+            raw_store.insert_batch = &insert_batch_trampoline<CheckpointContext>;
+            raw_store.get_fragment = &get_fragment_trampoline<CheckpointContext>;
+            raw_store.insert_fragment =
+                &insert_fragment_trampoline<CheckpointContext>;
             raw_store.callback_ctx = &checkpoint_context;
         }
 
         mapper_context.udf = &udf;
-        raw.mapper = &mapper_trampoline;
+        raw.mapper = &mapper_trampoline<MapperContext>;
         raw.mapper_ctx = &mapper_context;
         raw.output_schema = udf.output_schema;
         raw.checkpoint_store = store == nullptr ? nullptr : &raw_store;
 
+        prepare_arguments(batch_size);
+    }
+
+    BatchUDFCall(const BatchUDFV2& udf,
+                 std::optional<std::vector<std::string>> columns,
+                 std::optional<uint32_t> batch_size)
+        : read_columns(std::move(columns)) {
+        if (!udf.mapper) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT, "BatchUDF mapper must not be empty");
+        }
+        if (udf.output_schema == nullptr) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "BatchUDF output_schema must not be null");
+        }
+
+        const UDFCheckpointStoreV2* store = nullptr;
+        if (udf.checkpoint_store) {
+            store = &*udf.checkpoint_store;
+            if (!store->get_batch || !store->insert_batch ||
+                !store->get_fragment || !store->insert_fragment) {
+                throw Error(
+                    LANCE_ERR_INVALID_ARGUMENT,
+                    "UDFCheckpointStoreV2 must provide all four callbacks");
+            }
+            checkpoint_context_v2.store = store;
+            raw_store_v2.get_batch = &get_batch_v2_trampoline;
+            raw_store_v2.insert_batch = &insert_batch_trampoline<CheckpointContextV2>;
+            raw_store_v2.get_fragment = &get_fragment_trampoline<CheckpointContextV2>;
+            raw_store_v2.insert_fragment =
+                &insert_fragment_trampoline<CheckpointContextV2>;
+            raw_store_v2.callback_ctx = &checkpoint_context_v2;
+        }
+
+        mapper_context_v2.udf = &udf;
+        raw_v2.mapper = &mapper_trampoline<MapperContextV2>;
+        raw_v2.mapper_ctx = &mapper_context_v2;
+        raw_v2.output_schema = udf.output_schema;
+        raw_v2.checkpoint_store = store == nullptr ? nullptr : &raw_store_v2;
+
+        prepare_arguments(batch_size);
+    }
+
+    BatchUDFCall(const BatchUDFCall&) = delete;
+    BatchUDFCall& operator=(const BatchUDFCall&) = delete;
+    BatchUDFCall(BatchUDFCall&&) = delete;
+    BatchUDFCall& operator=(BatchUDFCall&&) = delete;
+
+private:
+    void prepare_arguments(std::optional<uint32_t> batch_size) {
         if (read_columns) {
             read_column_ptrs.reserve(read_columns->size() + 1);
             for (const auto& column : *read_columns) {
@@ -2779,11 +2913,6 @@ struct BatchUDFCall {
             batch_size_ptr = &batch_size_value;
         }
     }
-
-    BatchUDFCall(const BatchUDFCall&) = delete;
-    BatchUDFCall& operator=(const BatchUDFCall&) = delete;
-    BatchUDFCall(BatchUDFCall&&) = delete;
-    BatchUDFCall& operator=(BatchUDFCall&&) = delete;
 };
 
 }  // namespace callback_detail
@@ -4509,6 +4638,12 @@ public:
         std::optional<std::vector<std::string>> read_columns = std::nullopt,
         std::optional<uint32_t> batch_size = std::nullopt) const;
 
+    /// Add columns through the shared schema-aware BatchUDF adapter.
+    std::pair<Fragment, LanceSchema> add_columns_batch_udf(
+        const BatchUDFV2& udf,
+        std::optional<std::vector<std::string>> read_columns = std::nullopt,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
     /// Merge a consumed right-hand Arrow stream into this bound fragment.
     std::pair<Fragment, LanceSchema> merge_columns(
         ArrowArrayStream* stream,
@@ -4889,6 +5024,23 @@ inline std::pair<Fragment, LanceSchema> Fragment::add_columns_batch_udf(
     ::LanceSchema* out_schema = nullptr;
     if (lance_fragment_add_columns_batch_udf(
             handle_.get(), &call.raw, call.read_columns_ptr,
+            call.batch_size_ptr, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_batch_udf(
+    const BatchUDFV2& udf,
+    std::optional<std::vector<std::string>> read_columns,
+    std::optional<uint32_t> batch_size) const {
+    callback_detail::BatchUDFCall call(
+        udf, std::move(read_columns), batch_size);
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_batch_udf_v2(
+            handle_.get(), &call.raw_v2, call.read_columns_ptr,
             call.batch_size_ptr, &out_fragment, &out_schema) != 0) {
         check_error();
     }
@@ -9354,6 +9506,23 @@ public:
 
         if (lance_dataset_add_columns_batch_udf(
                 handle_.get(), &call.raw, call.read_columns_ptr,
+                call.batch_size_ptr) != 0) {
+            check_error();
+        }
+    }
+
+    /// Add columns through the schema-aware shared BatchUDF adapter. Batch
+    /// checkpoints are restored from the batch schema, preserving the native
+    /// context marker; the array-only overload keeps its original behavior.
+    void add_columns_batch_udf(
+        const BatchUDFV2& udf,
+        std::optional<std::vector<std::string>> read_columns = std::nullopt,
+        std::optional<uint32_t> batch_size = std::nullopt) {
+        callback_detail::BatchUDFCall call(
+            udf, std::move(read_columns), batch_size);
+
+        if (lance_dataset_add_columns_batch_udf_v2(
+                handle_.get(), &call.raw_v2, call.read_columns_ptr,
                 call.batch_size_ptr) != 0) {
             check_error();
         }

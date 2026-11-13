@@ -436,6 +436,25 @@ fn manifest() -> AbiManifest {
     );
     abi_struct!(
         manifest,
+        LanceUDFCheckpointStoreV2 {
+            get_batch,
+            insert_batch,
+            get_fragment,
+            insert_fragment,
+            callback_ctx,
+        }
+    );
+    abi_struct!(
+        manifest,
+        LanceBatchUDFV2 {
+            mapper,
+            mapper_ctx,
+            output_schema,
+            checkpoint_store,
+        }
+    );
+    abi_struct!(
+        manifest,
         LanceCommitLockCallbacks {
             lock,
             release,

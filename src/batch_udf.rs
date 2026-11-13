@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Fields, Schema};
 use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
 use lance_core::{Error, Result};
 use lance_table::format::Fragment;
@@ -81,11 +81,37 @@ pub type LanceUDFCheckpointInsertFragment = unsafe extern "C" fn(
     error: *mut LanceCallbackError,
 ) -> i32;
 
+/// Retrieve a checkpointed output batch together with the schema that carries
+/// native schema metadata. Returns 1 on hit, 0 on miss, -1 on error.
+pub type LanceUDFCheckpointGetBatchV2 = unsafe extern "C" fn(
+    callback_ctx: *mut c_void,
+    info: *const LanceUDFBatchInfo,
+    output: *mut FFI_ArrowArray,
+    output_schema: *mut FFI_ArrowSchema,
+    error: *mut LanceCallbackError,
+) -> i32;
+
 /// Foreign implementation of every native `UDFCheckpointStore` method.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LanceUDFCheckpointStore {
     pub get_batch: Option<LanceUDFCheckpointGetBatch>,
+    pub insert_batch: Option<LanceUDFCheckpointInsertBatch>,
+    pub get_fragment: Option<LanceUDFCheckpointGetFragment>,
+    pub insert_fragment: Option<LanceUDFCheckpointInsertFragment>,
+    pub callback_ctx: *mut c_void,
+}
+
+/// Foreign checkpoint store whose batch lookup returns the batch schema.
+///
+/// Native binds a cached batch to a marker stored in the batch schema
+/// metadata, so a hit must return both an owned ArrowArray and its owned
+/// ArrowSchema. Keeping this as a separate table preserves the original
+/// `LanceUDFCheckpointStore` ABI and behavior.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LanceUDFCheckpointStoreV2 {
+    pub get_batch: Option<LanceUDFCheckpointGetBatchV2>,
     pub insert_batch: Option<LanceUDFCheckpointInsertBatch>,
     pub get_fragment: Option<LanceUDFCheckpointGetFragment>,
     pub insert_fragment: Option<LanceUDFCheckpointInsertFragment>,
@@ -105,6 +131,19 @@ pub struct LanceBatchUDF {
     pub checkpoint_store: *const LanceUDFCheckpointStore,
 }
 
+/// Foreign BatchUDF declaration with schema-aware batch checkpoints.
+#[repr(C)]
+pub struct LanceBatchUDFV2 {
+    /// Required mapper callback.
+    pub mapper: Option<LanceBatchUDFMapper>,
+    /// Call-scoped mapper context.
+    pub mapper_ctx: *mut c_void,
+    /// Complete native output RecordBatch schema, borrowed for this call.
+    pub output_schema: *const FFI_ArrowSchema,
+    /// Optional pointer to all four V2 checkpoint callbacks.
+    pub checkpoint_store: *const LanceUDFCheckpointStoreV2,
+}
+
 /// Build the native BatchUDF transform from the borrowed C declaration.
 ///
 /// This owns the callback adapters and declared output schema for the complete
@@ -119,35 +158,126 @@ pub(crate) unsafe fn batch_udf_transform(udf: *const LanceBatchUDF) -> Result<Ne
     // LanceBatchUDF for the duration of this call. The output schema is read
     // only through this borrow and is never released by the binding.
     let udf = unsafe { &*udf };
-    let mapper_callback = udf
-        .mapper
-        .ok_or_else(|| Error::invalid_input_source("udf.mapper must not be NULL".into()))?;
-    let output_schema =
-        unsafe { helpers::import_arrow_schema(udf.output_schema, "udf.output_schema")? };
-
-    let result_checkpoint = if udf.checkpoint_store.is_null() {
+    let store = if udf.checkpoint_store.is_null() {
         None
     } else {
         // SAFETY: the pointer is either NULL or caller-owned for this call.
-        let store = unsafe { *udf.checkpoint_store };
-        if store.get_batch.is_none()
-            || store.insert_batch.is_none()
-            || store.get_fragment.is_none()
-            || store.insert_fragment.is_none()
-        {
-            return Err(Error::invalid_input_source(
-                "checkpoint_store must provide all four callbacks".into(),
-            ));
-        }
-        Some(Arc::new(FfiCheckpointStore {
+        Some(CheckpointStoreTable::V1(unsafe { *udf.checkpoint_store }))
+    };
+    unsafe {
+        build_batch_udf_transform(
+            udf.mapper,
+            udf.mapper_ctx,
+            udf.output_schema,
             store,
-            output_schema: output_schema.clone(),
-        }) as Arc<dyn UDFCheckpointStore>)
+            "udf.output_schema",
+        )
+    }
+}
+
+/// Build the native transform from a schema-aware C declaration.
+pub(crate) unsafe fn batch_udf_transform_v2(
+    udf: *const LanceBatchUDFV2,
+) -> Result<NewColumnTransform> {
+    if udf.is_null() {
+        return Err(Error::invalid_input_source("udf must not be NULL".into()));
+    }
+
+    // SAFETY: same contract as `batch_udf_transform`.
+    let udf = unsafe { &*udf };
+    let store = if udf.checkpoint_store.is_null() {
+        None
+    } else {
+        // SAFETY: the pointer is either NULL or caller-owned for this call.
+        Some(CheckpointStoreTable::V2(unsafe { *udf.checkpoint_store }))
+    };
+    unsafe {
+        build_batch_udf_transform(
+            udf.mapper,
+            udf.mapper_ctx,
+            udf.output_schema,
+            store,
+            "udf.output_schema",
+        )
+    }
+}
+
+/// Foreign checkpoint callback table, either ABI revision.
+#[derive(Clone, Copy)]
+enum CheckpointStoreTable {
+    V1(LanceUDFCheckpointStore),
+    V2(LanceUDFCheckpointStoreV2),
+}
+
+impl CheckpointStoreTable {
+    fn get_batch_v2(&self) -> Option<LanceUDFCheckpointGetBatchV2> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(store) => store.get_batch,
+        }
+    }
+
+    /// The shared insert/get-fragment callbacks and, for V1, the array-only
+    /// batch lookup. A V2 table never exposes an array-only get_batch.
+    fn shared_callbacks(&self) -> LanceUDFCheckpointStore {
+        match self {
+            Self::V1(store) => *store,
+            Self::V2(store) => LanceUDFCheckpointStore {
+                get_batch: None,
+                insert_batch: store.insert_batch,
+                get_fragment: store.get_fragment,
+                insert_fragment: store.insert_fragment,
+                callback_ctx: store.callback_ctx,
+            },
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        let callbacks = self.shared_callbacks();
+        let batch_lookup = match self {
+            Self::V1(_) => callbacks.get_batch.is_some(),
+            Self::V2(_) => self.get_batch_v2().is_some(),
+        };
+        batch_lookup
+            && callbacks.insert_batch.is_some()
+            && callbacks.get_fragment.is_some()
+            && callbacks.insert_fragment.is_some()
+    }
+}
+
+unsafe fn build_batch_udf_transform(
+    mapper_callback: Option<LanceBatchUDFMapper>,
+    mapper_ctx: *mut c_void,
+    output_schema_ptr: *const FFI_ArrowSchema,
+    store: Option<CheckpointStoreTable>,
+    output_schema_context: &str,
+) -> Result<NewColumnTransform> {
+    let mapper_callback = mapper_callback
+        .ok_or_else(|| Error::invalid_input_source("udf.mapper must not be NULL".into()))?;
+    let output_schema =
+        unsafe { helpers::import_arrow_schema(output_schema_ptr, output_schema_context)? };
+
+    let result_checkpoint = match store {
+        None => None,
+        Some(store) => {
+            if !store.is_complete() {
+                return Err(Error::invalid_input_source(
+                    "checkpoint_store must provide get_batch, insert_batch, get_fragment and \
+                     insert_fragment callbacks"
+                        .into(),
+                ));
+            }
+            Some(Arc::new(FfiCheckpointStore {
+                callbacks: store.shared_callbacks(),
+                get_batch_v2: store.get_batch_v2(),
+                output_schema: output_schema.clone(),
+            }) as Arc<dyn UDFCheckpointStore>)
+        }
     };
 
     let mapper = FfiBatchUdfMapper {
         callback: mapper_callback,
-        callback_ctx: udf.mapper_ctx,
+        callback_ctx: mapper_ctx,
         output_schema: output_schema.clone(),
     };
     let mapper = Box::new(move |batch: &RecordBatch| {
@@ -176,14 +306,40 @@ pub unsafe extern "C" fn lance_dataset_add_columns_batch_udf(
     batch_size: *const u32,
 ) -> i32 {
     ffi_try!(
-        unsafe { add_columns_batch_udf_inner(dataset, udf, read_columns, batch_size) },
+        unsafe {
+            let transform = batch_udf_transform(udf)?;
+            add_columns_batch_udf_inner(dataset, transform, read_columns, batch_size)
+        },
+        neg
+    )
+}
+
+/// Add columns through a borrowed schema-aware BatchUDF declaration.
+///
+/// Identical to `lance_dataset_add_columns_batch_udf` except that batch
+/// checkpoints are restored from an owned ArrowArray plus the schema that
+/// carries native schema metadata. Use this entry for cache replay; the
+/// original array-only entry keeps its ABI and honest native-rejection
+/// behavior for markerless batch hits.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_add_columns_batch_udf_v2(
+    dataset: *mut LanceDataset,
+    udf: *const LanceBatchUDFV2,
+    read_columns: *const *const c_char,
+    batch_size: *const u32,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            let transform = batch_udf_transform_v2(udf)?;
+            add_columns_batch_udf_inner(dataset, transform, read_columns, batch_size)
+        },
         neg
     )
 }
 
 unsafe fn add_columns_batch_udf_inner(
     dataset: *mut LanceDataset,
-    udf: *const LanceBatchUDF,
+    transform: NewColumnTransform,
     read_columns: *const *const c_char,
     batch_size: *const u32,
 ) -> Result<i32> {
@@ -192,7 +348,6 @@ unsafe fn add_columns_batch_udf_inner(
             "dataset must not be NULL".into(),
         ));
     }
-    let transform = unsafe { batch_udf_transform(udf)? };
     let read_columns = unsafe { helpers::parse_c_string_array(read_columns)? };
     let batch_size = if batch_size.is_null() {
         None
@@ -262,7 +417,8 @@ impl FfiBatchUdfMapper {
 }
 
 struct FfiCheckpointStore {
-    store: LanceUDFCheckpointStore,
+    callbacks: LanceUDFCheckpointStore,
+    get_batch_v2: Option<LanceUDFCheckpointGetBatchV2>,
     output_schema: Arc<Schema>,
 }
 
@@ -273,27 +429,71 @@ unsafe impl Send for FfiCheckpointStore {}
 unsafe impl Sync for FfiCheckpointStore {}
 
 impl UDFCheckpointStore for FfiCheckpointStore {
-    // A batch hit returns an owned ArrowArray, so the batch is rebuilt from the
-    // declared output schema: the callback has nowhere to return the schema
-    // metadata native writes. Since Lance 15.0.0-beta.20 native binds a cached
-    // batch to a `lance:udf_checkpoint_context` marker stored in that metadata,
-    // so a batch hit restored by a foreign store is rejected as incompatible
-    // instead of being used. Fragment checkpoints are unaffected: their
-    // fragment JSON carries the marker verbatim.
+    // The V1 callback returns only an owned ArrowArray, so the batch has to be
+    // rebuilt from the declared output schema and the schema metadata native
+    // writes (`lance:udf_checkpoint_context`) cannot round-trip. Since Lance
+    // 15.0.0-beta.20 native binds a cached batch to that marker, a V1 batch hit
+    // is rejected as incompatible. Use `LanceUDFCheckpointStoreV2` to replay
+    // batch checkpoints; fragment checkpoints are unaffected because their
+    // Fragment JSON carries the marker verbatim.
     fn get_batch(&self, info: &BatchInfo) -> Result<Option<RecordBatch>> {
         let info = LanceUDFBatchInfo {
             fragment_id: info.fragment_id,
             batch_index: info.batch_index,
         };
+
+        if let Some(callback_v2) = self.get_batch_v2 {
+            let mut output = FFI_ArrowArray::empty();
+            let mut schema = FFI_ArrowSchema::empty();
+            let mut error = LanceCallbackError::empty();
+            // SAFETY: the callback table and context are valid for this call.
+            let status = tokio::task::block_in_place(|| unsafe {
+                callback_v2(
+                    self.callbacks.callback_ctx,
+                    &info,
+                    &mut output,
+                    &mut schema,
+                    &mut error,
+                )
+            });
+            return match status {
+                0 => {
+                    unsafe { release_array_slot(&mut output) };
+                    unsafe { release_schema_slot(&mut schema) };
+                    unsafe { release_message_only(&mut error) };
+                    Ok(None)
+                }
+                1 => {
+                    let batch = unsafe {
+                        import_checkpoint_batch(
+                            &mut output,
+                            &mut schema,
+                            &self.output_schema,
+                            "checkpoint get_batch",
+                        )
+                    };
+                    unsafe { release_message_only(&mut error) };
+                    batch.map(Some)
+                }
+                _ => {
+                    let native =
+                        unsafe { callback_error(&mut error, status, "checkpoint get_batch") };
+                    unsafe { release_array_slot(&mut output) };
+                    unsafe { release_schema_slot(&mut schema) };
+                    Err(native)
+                }
+            };
+        }
+
         let mut output = FFI_ArrowArray::empty();
         let mut error = LanceCallbackError::empty();
         let callback = self
-            .store
+            .callbacks
             .get_batch
             .expect("validated checkpoint get_batch callback");
         // SAFETY: the callback table and context are valid for this call.
         let status = tokio::task::block_in_place(|| unsafe {
-            callback(self.store.callback_ctx, &info, &mut output, &mut error)
+            callback(self.callbacks.callback_ctx, &info, &mut output, &mut error)
         });
         match status {
             0 => {
@@ -440,19 +640,11 @@ fn export_batch(batch: &RecordBatch) -> Result<(FFI_ArrowArray, FFI_ArrowSchema)
     Ok((array, schema))
 }
 
-unsafe fn import_output_batch(
-    output: *mut FFI_ArrowArray,
-    schema: &Arc<Schema>,
+unsafe fn validate_struct_array_geometry(
+    array: &FFI_ArrowArray,
+    field_count: usize,
     context: &str,
-) -> Result<RecordBatch> {
-    if output.is_null() {
-        return Err(Error::invalid_input_source(
-            format!("{context} output must not be NULL").into(),
-        ));
-    }
-
-    // SAFETY: the slot is caller-owned and initialized.
-    let array = unsafe { &*output };
+) -> Result<()> {
     if array.is_released() {
         return Err(Error::invalid_input_source(
             format!("{context} did not return an owned ArrowArray").into(),
@@ -474,12 +666,11 @@ unsafe fn import_output_batch(
             .into(),
         ));
     }
-    if array.n_children != schema.fields().len() as i64 {
+    if array.n_children != field_count as i64 {
         return Err(Error::invalid_input_source(
             format!(
                 "{context} returned {} struct children but the declared schema has {} fields",
-                array.n_children,
-                schema.fields().len()
+                array.n_children, field_count
             )
             .into(),
         ));
@@ -513,6 +704,23 @@ unsafe fn import_output_batch(
             format!("{context} returned null_count > 0 without a validity buffer").into(),
         ));
     }
+    Ok(())
+}
+
+unsafe fn import_output_batch(
+    output: *mut FFI_ArrowArray,
+    schema: &Arc<Schema>,
+    context: &str,
+) -> Result<RecordBatch> {
+    if output.is_null() {
+        return Err(Error::invalid_input_source(
+            format!("{context} output must not be NULL").into(),
+        ));
+    }
+
+    // SAFETY: the slot is caller-owned and initialized.
+    let array = unsafe { &*output };
+    unsafe { validate_struct_array_geometry(array, schema.fields().len(), context)? };
 
     // Claim the slot exactly once even if Arrow later rejects the payload.
     let array = unsafe { FFI_ArrowArray::from_raw(output) };
@@ -534,6 +742,101 @@ unsafe fn import_output_batch(
         }
         RecordBatch::try_new_with_options(
             schema.clone(),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(row_count)),
+        )
+        .map_err(|error| {
+            Error::invalid_input_source(
+                format!("{context} returned an invalid RecordBatch: {error}").into(),
+            )
+        })
+    }));
+
+    match imported {
+        Ok(result) => result,
+        Err(payload) => Err(Error::invalid_input_source(
+            format!(
+                "{context} triggered an Arrow import panic: {}",
+                panic_payload_message(&*payload)
+            )
+            .into(),
+        )),
+    }
+}
+
+fn field_summary(fields: &Fields) -> String {
+    fields
+        .iter()
+        .map(|field| format!("{}: {:?}", field.name(), field.data_type()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Import a schema-aware checkpoint hit.
+///
+/// The returned schema is authoritative for schema metadata: native binds a
+/// cached batch to `lance:udf_checkpoint_context`, so the batch must be rebuilt
+/// from the returned schema rather than the declared output schema. Both slots
+/// are claimed exactly once, including on every error path.
+unsafe fn import_checkpoint_batch(
+    output: *mut FFI_ArrowArray,
+    output_schema: *mut FFI_ArrowSchema,
+    declared: &Arc<Schema>,
+    context: &str,
+) -> Result<RecordBatch> {
+    if output.is_null() || output_schema.is_null() {
+        return Err(Error::invalid_input_source(
+            format!("{context} must return both an ArrowArray and an ArrowSchema").into(),
+        ));
+    }
+
+    // Claim both slots exactly once so dropping them releases whatever the
+    // callback returned, even when a later check rejects the payload.
+    let array = unsafe { FFI_ArrowArray::from_raw(output) };
+    let exported = unsafe { FFI_ArrowSchema::from_raw(output_schema) };
+    if exported.is_released() {
+        return Err(Error::invalid_input_source(
+            format!("{context} did not return an owned ArrowSchema").into(),
+        ));
+    }
+    unsafe { validate_struct_array_geometry(&array, declared.fields().len(), context)? };
+
+    let declared = declared.clone();
+    let imported = catch_unwind(AssertUnwindSafe(move || {
+        let returned = Schema::try_from(&exported).map_err(|error| {
+            Error::invalid_input_source(
+                format!("{context} returned an invalid ArrowSchema: {error}").into(),
+            )
+        })?;
+        if returned.fields() != declared.fields() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "{context} returned a schema that does not match the declared output \
+                     schema: returned [{}], declared [{}]",
+                    field_summary(returned.fields()),
+                    field_summary(declared.fields())
+                )
+                .into(),
+            ));
+        }
+        let fields = returned.fields().clone();
+        let data = unsafe { from_ffi_and_data_type(array, DataType::Struct(fields)) }.map_err(
+            |error| {
+                Error::invalid_input_source(
+                    format!("{context} returned invalid Arrow C data: {error}").into(),
+                )
+            },
+        )?;
+        let row_count = data.len();
+        let struct_array = StructArray::from(data);
+        let (_, columns, nulls) = struct_array.into_parts();
+        if nulls.as_ref().is_some_and(|nulls| nulls.null_count() != 0) {
+            return Err(Error::invalid_input_source(
+                format!("{context} returned a nullable top-level struct").into(),
+            ));
+        }
+        RecordBatch::try_new_with_options(
+            Arc::new(returned),
             columns,
             &RecordBatchOptions::new().with_row_count(Some(row_count)),
         )
