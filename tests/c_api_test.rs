@@ -52137,6 +52137,104 @@ fn decoded_native_operation(
 }
 
 #[test]
+fn test_native_operation_mem_wal_directory_update_view() {
+    use lance::dataset::transaction::Operation;
+
+    let options = update_options_default();
+    for expected in [None, Some(""), Some("update-directory")] {
+        let input = expected.map(|value| CString::new(value).unwrap());
+        let operation = unsafe {
+            lance_operation_update_new_with_mem_wal_dir_id(
+                &options,
+                input.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
+            )
+        };
+        assert!(!operation.is_null(), "{}", take_last_error_message());
+        drop(input);
+
+        let mut present = expected.is_none();
+        let mut view = std::ptr::dangling();
+        assert_eq!(
+            unsafe { lance_operation_update_mem_wal_dir_id(operation, &mut present, &mut view) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert_eq!(present, expected.is_some());
+        match expected {
+            Some(value) => {
+                assert!(!view.is_null());
+                assert_eq!(unsafe { CStr::from_ptr(view) }.to_str().unwrap(), value);
+            }
+            None => assert!(view.is_null()),
+        }
+        let Operation::Update { mem_wal_dir_id, .. } = decoded_native_operation(operation) else {
+            panic!("expected an Update operation");
+        };
+        assert_eq!(mem_wal_dir_id.as_deref(), expected);
+        unsafe { lance_operation_close(operation) };
+    }
+
+    let legacy = unsafe { lance_operation_update_new(&options) };
+    assert!(!legacy.is_null(), "{}", take_last_error_message());
+    let mut present = true;
+    let mut view = std::ptr::dangling();
+    assert_eq!(
+        unsafe { lance_operation_update_mem_wal_dir_id(legacy, &mut present, &mut view) },
+        0
+    );
+    assert!(!present);
+    assert!(view.is_null());
+    unsafe { lance_operation_close(legacy) };
+}
+
+#[test]
+fn test_native_operation_mem_wal_directory_state_view() {
+    use lance::dataset::transaction::Operation;
+
+    for expected in ["", "state-directory"] {
+        let input = CString::new(expected).unwrap();
+        let operation = unsafe {
+            lance_operation_update_mem_wal_state_new_with_dir_id(ptr::null(), 0, input.as_ptr())
+        };
+        assert!(!operation.is_null(), "{}", take_last_error_message());
+        drop(input);
+
+        let mut view = ptr::null();
+        assert_eq!(
+            unsafe { lance_operation_update_mem_wal_state_dir_id(operation, &mut view) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        assert!(!view.is_null());
+        assert_eq!(unsafe { CStr::from_ptr(view) }.to_str().unwrap(), expected);
+        let Operation::UpdateMemWalState { dir_id, .. } = decoded_native_operation(operation) else {
+            panic!("expected an UpdateMemWalState operation");
+        };
+        assert_eq!(dir_id, expected);
+        unsafe { lance_operation_close(operation) };
+    }
+
+    let legacy = unsafe { lance_operation_update_mem_wal_state_new(ptr::null(), 0) };
+    assert!(!legacy.is_null(), "{}", take_last_error_message());
+    let mut view = ptr::null();
+    assert_eq!(
+        unsafe { lance_operation_update_mem_wal_state_dir_id(legacy, &mut view) },
+        0
+    );
+    assert!(!view.is_null());
+    assert_eq!(unsafe { CStr::from_ptr(view) }.to_bytes(), b"");
+    unsafe { lance_operation_close(legacy) };
+
+    let invalid = unsafe {
+        lance_operation_update_mem_wal_state_new_with_dir_id(ptr::null(), 0, ptr::null())
+    };
+    assert!(invalid.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+}
+
+#[test]
 fn test_native_update_operation_defaults_and_validation() {
     use lance::dataset::transaction::{Operation, UpdateMode};
 
