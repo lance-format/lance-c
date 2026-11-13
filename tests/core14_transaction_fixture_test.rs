@@ -83,7 +83,7 @@ unsafe fn count_rows(dataset: *const LanceDataset, filter: Option<&CStr>) -> u64
         }
     };
     assert_eq!(
-        unsafe { lance_last_error_code() },
+        lance_last_error_code(),
         LanceErrorCode::Ok,
         "count rows: {}",
         last_error()
@@ -199,9 +199,9 @@ fn core14_attached_and_detached_transactions_read_back() {
         lance_transaction_close(current);
 
         // The persisted data files must remain readable through the C API.
-        assert_eq!(unsafe { count_rows(dataset, None) }, 2);
+        assert_eq!(count_rows(dataset, None), 2);
         let id_one = CString::new("id = 1").unwrap();
-        assert_eq!(unsafe { count_rows(dataset, Some(&id_one)) }, 1);
+        assert_eq!(count_rows(dataset, Some(&id_one)), 1);
 
         let mut by_version = std::ptr::null_mut();
         assert_eq!(
@@ -236,9 +236,9 @@ fn core14_attached_and_detached_transactions_read_back() {
         lance_transaction_close(detached_transaction);
 
         // The detached manifest appends two rows to the attached version.
-        assert_eq!(unsafe { count_rows(detached, None) }, 4);
+        assert_eq!(count_rows(detached, None), 4);
         let id_two = CString::new("id = 2").unwrap();
-        assert_eq!(unsafe { count_rows(detached, Some(&id_two)) }, 2);
+        assert_eq!(count_rows(detached, Some(&id_two)), 2);
         lance_dataset_close(detached);
     }
 }
