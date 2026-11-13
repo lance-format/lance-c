@@ -35,7 +35,7 @@ index 6d18cdb8c..a3614606d 100644
          self.refs.tags()
      }
 diff --git a/rust/lance/src/dataset/tests/dataset_versioning.rs b/rust/lance/src/dataset/tests/dataset_versioning.rs
-index e97f9c90c..08b0e108c 100644
+index e97f9c90c..b6e962a0c 100644
 --- a/rust/lance/src/dataset/tests/dataset_versioning.rs
 +++ b/rust/lance/src/dataset/tests/dataset_versioning.rs
 @@ -16,9 +16,10 @@ use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
@@ -50,7 +50,7 @@ index e97f9c90c..08b0e108c 100644
  use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
  use lance_datagen::{BatchCount, RowCount, array, gen_batch};
  use lance_file::version::LanceFileVersion;
-@@ -26,6 +27,7 @@ use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+@@ -26,10 +27,12 @@ use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
  use mock_instant::thread_local::MockClock;
  use tokio::sync::Barrier;
  
@@ -58,7 +58,12 @@ index e97f9c90c..08b0e108c 100644
  use crate::dataset::refs::branch_contents_path;
  use crate::utils::test::copy_test_data_to_tmp;
  use futures::TryStreamExt;
-@@ -1598,3 +1600,284 @@ async fn test_branch() {
+ use lance_core::Error;
++use object_store::ObjectStoreExt;
+ use object_store::path::Path;
+ use rstest::rstest;
+ use std::cmp::Ordering;
+@@ -1598,3 +1601,284 @@ async fn test_branch() {
          .unwrap();
      assert!(branches.is_empty());
  }

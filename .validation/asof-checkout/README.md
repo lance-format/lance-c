@@ -10,7 +10,7 @@ or Python code.
 - Repository: `lance-format/lance`
 - Commit: `40f15ed1b71b66950961b175829fdf17a763f108` (Lance 14.0.2)
 - Patch: `native-checkout-before.patch`
-- Patch SHA-256: `06292bd11676c72369a6dcd59d33ce6e7c81ed8dc32107a2919047916e4490e5`
+- Patch SHA-256: `aeacfdd647e992aaf72ab7a5064e9521f0439863faed5114de657c9f5316b854`
 - Files changed:
   - `rust/lance/src/dataset.rs`
   - `rust/lance/src/dataset/tests/dataset_versioning.rs`
