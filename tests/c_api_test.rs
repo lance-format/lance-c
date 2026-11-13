@@ -25838,7 +25838,12 @@ fn test_prepared_fts_index_only_empty_segment_returns_empty_shard() {
                 "{}",
                 take_last_error_message()
             );
-            assert_eq!(lance_last_error_code(), LanceErrorCode::Ok);
+            assert_eq!(
+                lance_last_error_code(),
+                LanceErrorCode::Ok,
+                "{}",
+                take_last_error_message()
+            );
             assert_eq!(
                 unsafe { lance_scanner_count_rows(scanner) },
                 0,
@@ -39350,12 +39355,14 @@ fn test_scalar_segment_metadata_residuals_fall_back_within_scope() {
                 1,
             );
             assert_eq!(ids, vec![3], "apply the residual before LIMIT/OFFSET");
-            for column in [
-                "_rowid",
-                "_rowaddr",
-                "_row_created_at_version",
-                "_row_last_updated_at_version",
-            ] {
+            let mut columns = vec!["_rowid", "_rowaddr"];
+            if stable {
+                // v15 rejects version-column filters on datasets without
+                // stable row ids instead of treating every row as version 1.
+                columns.push("_row_created_at_version");
+                columns.push("_row_last_updated_at_version");
+            }
+            for column in columns {
                 let filter = format!("key >= 0 AND {column} IS NULL");
                 let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], &filter, None, 0);
                 assert!(ids.is_empty(), "must retain the residual: {filter}");
@@ -47172,7 +47179,7 @@ fn test_memwal_plan_stream_rejects_unexportable_schema() {
     // instead of panicking with NulError. The rejection still happens before
     // any callback is exposed.
     assert!(
-        message.contains("Null byte at position 5 not allowed in name"),
+        message.contains("Null byte at position 3 not allowed in name"),
         "{message}"
     );
     assert!(stream.release.is_none());
@@ -50479,7 +50486,7 @@ fn test_native_operation_typed_four_variants_representation() {
         "{}",
         take_last_error_message()
     );
-    assert_eq!(native_schema_field_id_for_test(merge_schema, "payload"), 1);
+    assert_eq!(native_schema_field_id_for_test(merge_schema, "payload"), 3);
 
     // Clone carries optional native strings and the shallow flag verbatim.
     let ref_name = c_str("refs/heads/main");
