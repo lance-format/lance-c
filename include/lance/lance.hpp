@@ -2099,7 +2099,7 @@ public:
 
     /// Construct an UpdateMemWalState operation for a specific MemWAL
     /// directory. Pass an empty `dir_id` for a legacy MemWAL. Native commit
-    /// rejects a stale or removed identifier with LANCE_ERR_STALE_MEM_WAL.
+    /// rejects a stale or removed identifier.
     static Operation make_update_mem_wal_state_with_dir_id(
         const std::vector<CompactedSsTable>& compacted_sstables,
         const std::string& dir_id);

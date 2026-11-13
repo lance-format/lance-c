@@ -10397,7 +10397,7 @@ LanceOperation* lance_operation_update_mem_wal_state_new(
  *
  * `dir_id` is required and must be valid UTF-8. Pass an empty string for a
  * legacy MemWAL created before directory identifiers existed. Native commit
- * rejects a stale or removed identifier with `LANCE_ERR_STALE_MEM_WAL`.
+ * rejects a stale or removed identifier.
  *
  * @return the new operation, or NULL on error.
  */

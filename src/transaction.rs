@@ -5817,9 +5817,9 @@ pub unsafe extern "C" fn lance_operation_update_mem_wal_dir_id(
                 Some(_) => match operation.mem_wal_dir_id.as_ref() {
                     Some(Ok(value)) => value.as_ptr(),
                     Some(Err(_)) | None => {
-                        return Err(lance_core::Error::internal(
-                            "Update mem_wal_dir_id contains an embedded NUL byte".into(),
-                        ));
+                        return Err(lance_core::Error::internal(String::from(
+                            "Update mem_wal_dir_id contains an embedded NUL byte",
+                        )));
                     }
                 },
             };
@@ -5868,7 +5868,7 @@ pub unsafe extern "C" fn lance_operation_update_mem_wal_state_new(
 ///
 /// `dir_id` is required; pass an empty string for a legacy MemWAL created
 /// before directory identifiers existed. Native commit rejects a stale or
-/// removed identifier with `LANCE_ERR_STALE_MEM_WAL`.
+/// removed identifier.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_operation_update_mem_wal_state_new_with_dir_id(
     compacted_sstables: *const LanceCompactedSsTable,
@@ -5922,9 +5922,9 @@ pub unsafe extern "C" fn lance_operation_update_mem_wal_state_dir_id(
             let value = match operation.mem_wal_dir_id.as_ref() {
                 Some(Ok(value)) => value.as_ptr(),
                 Some(Err(_)) | None => {
-                    return Err(lance_core::Error::internal(
-                        "UpdateMemWalState dir_id contains an embedded NUL byte".into(),
-                    ));
+                    return Err(lance_core::Error::internal(String::from(
+                        "UpdateMemWalState dir_id contains an embedded NUL byte",
+                    )));
                 }
             };
             unsafe { ptr::write(out_dir_id, value) };

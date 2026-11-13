@@ -250,7 +250,7 @@ where
     }
     let dimension = vectors.value_length() as usize;
     let distance = metric
-        .try_func::<T>()
+        .try_func::<<T as ArrowPrimitiveType>::Native>()
         .map_err(|error| invalid(format!("unsupported distance metric: {error}")))?;
     // Subtracting each small distance from 1 rounds it away before TopK. Sum minima
     // directly, using f64 only for the accumulator; the base kernels and output remain f32.
