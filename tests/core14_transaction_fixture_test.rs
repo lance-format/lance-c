@@ -115,14 +115,14 @@ unsafe fn assert_transaction(
         "{}",
         last_error()
     );
-    let mut kind = LANCE_OPERATION_UNKNOWN;
+    let mut kind = LanceOperationKind::Unknown;
     assert_eq!(
         unsafe { lance_operation_kind(operation, &mut kind) },
         0,
         "{}",
         last_error()
     );
-    assert_eq!(kind, LANCE_OPERATION_APPEND);
+    assert_eq!(kind, LanceOperationKind::Append);
     let mut fragments = 0_u64;
     assert_eq!(
         unsafe { lance_operation_append_fragment_count(operation, &mut fragments) },
