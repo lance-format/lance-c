@@ -2218,7 +2218,9 @@ int32_t lance_dataset_merge_insert(
  * The source field named by `right_on` is the join key and is not appended.
  * Every other top-level RHS field must be new to the dataset. Native owns key
  * matching, duplicate and NULL semantics, schema compatibility, field IDs,
- * physical writes, and commit conflicts.
+ * physical writes, and commit conflicts. The pinned native implementation
+ * rejects duplicate right-side join keys, including duplicate NULL keys,
+ * with LANCE_ERR_INVALID_ARGUMENT.
  *
  * The non-NULL `source` stream is consumed on every return path, including
  * invalid dataset/key arguments and native failures. After this call the
@@ -2641,6 +2643,11 @@ int32_t lance_compaction_options_v2_set_materialize_deletions_threshold(
     LanceCompactionOptionsV2* options,
     float value
 );
+/**
+ * Store an optional thread-count override. `has_value = false` selects the
+ * native default. An explicit zero is stored by this setter but rejected
+ * with LANCE_ERR_INVALID_ARGUMENT when native compaction executes.
+ */
 int32_t lance_compaction_options_v2_set_num_threads(
     LanceCompactionOptionsV2* options,
     bool has_value,
@@ -12018,6 +12025,10 @@ void lance_transaction_array_free(
  * an Arrow C stream owned by the caller (release it exactly once); it stays
  * valid after the delta and dataset handles close. On error the stream slot
  * is left unchanged.
+ *
+ * Native row-change streams require stable row IDs at both nonzero endpoints;
+ * version 0 denotes the empty snapshot. Missing stable row IDs produce
+ * LANCE_ERR_INVALID_ARGUMENT when requesting the stream.
  *
  * Returns 0 on success, -1 on error.
  */

@@ -5408,6 +5408,8 @@ public:
         return *this;
     }
 
+    /// Store the override; nullopt selects the native default. Native
+    /// compaction rejects an explicit zero when executed, not in this setter.
     CompactionOptions& set_num_threads(std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_num_threads(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
@@ -9038,6 +9040,8 @@ public:
 
     /// One-shot native `Dataset::merge` left join with distinct keys.
     ///
+    /// Duplicate right-side join keys, including duplicate nulls, are rejected
+    /// by native with LANCE_ERR_INVALID_ARGUMENT.
     /// Empty key strings are forwarded to native validation. Throws
     /// lance::Error on failure.
     void merge(
@@ -10227,6 +10231,9 @@ public:
 /// Native version-diff handle. Reusable: `list_transactions` and every
 /// `get_*` stream may be called repeatedly and in any order; each returned
 /// stream owns its state after this (and the dataset) handle closes.
+/// Row-change and deleted-ID streams require stable row IDs at both nonzero
+/// endpoints; version 0 is the empty snapshot. Native rejection surfaces as
+/// lance::Error with LANCE_ERR_INVALID_ARGUMENT when requesting a stream.
 class DatasetDelta {
     Handle<LanceDatasetDelta, lance_dataset_delta_close> handle_;
 
