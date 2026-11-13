@@ -420,7 +420,12 @@ async fn scalar_success_control_has_only_load_data_checkpoints() {
     );
     assert_eq!(metadata.uuid, uuid);
     assert_eq!(metadata.name, "id_btree");
-    assert!(!metadata.files.is_empty());
+    let files = metadata
+        .files
+        .as_ref()
+        .expect("committed scalar metadata must list its index files");
+    assert!(!files.is_empty());
+    assert!(files.iter().all(|file| file.size_bytes > 0));
 
     let (after, indices) = dataset_state(&uri).await;
     let tree = index_tree(&uri);
@@ -633,7 +638,12 @@ async fn vector_success_control_publishes_after_all_checkpoints() {
         other => panic!("build must end with merge_partitions complete, got {other:?}"),
     }
     assert_eq!(metadata.uuid, uuid);
-    assert!(!metadata.files.is_empty());
+    let files = metadata
+        .files
+        .as_ref()
+        .expect("committed vector metadata must list its index files");
+    assert!(!files.is_empty());
+    assert!(files.iter().all(|file| file.size_bytes > 0));
 
     let (after, indices) = dataset_state(&uri).await;
     let tree = index_tree(&uri);
