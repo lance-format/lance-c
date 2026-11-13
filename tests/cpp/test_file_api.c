@@ -440,19 +440,44 @@ static int verify_released_blob_v2_raw_file(const char *base_dir) {
             }
             if (ok) {
                 int projected_rows = 0;
+                int blob_b_valid[3] = {0, 0, 0};
+                int payload_valid[3] = {0, 0, 0};
+                int64_t blob_b_size[3] = {-1, -1, -1};
                 ArrowArray projected_batch = {0};
                 while (projected_stream.get_next(&projected_stream,
                                                  &projected_batch) == 0) {
                     if (!projected_batch.release) break;
-                    ok = projected_batch.n_children == 2 &&
-                         struct_is_valid(projected_batch.children[0], 2) &&
-                         descriptor_size_at(projected_batch.children[0], 2) == 0;
+                    if (projected_batch.n_children != 2) {
+                        ok = 0;
+                        break;
+                    }
+                    const ArrowArray *blob_b = projected_batch.children[0];
+                    const ArrowArray *payload =
+                        projected_batch.children[1]->children[0];
+                    for (int64_t row = 0; row < projected_batch.length; row++) {
+                        int index = projected_rows + (int)row;
+                        if (index >= 3) {
+                            ok = 0;
+                            break;
+                        }
+                        blob_b_valid[index] = struct_is_valid(blob_b, row);
+                        payload_valid[index] = struct_is_valid(payload, row);
+                        if (blob_b_valid[index]) {
+                            blob_b_size[index] = descriptor_size_at(blob_b, row);
+                        }
+                    }
                     projected_rows += (int)projected_batch.length;
                     projected_batch.release(&projected_batch);
                     memset(&projected_batch, 0, sizeof(projected_batch));
-                    if (!ok) break;
                 }
-                ok = ok && projected_rows == 3;
+                if (projected_batch.release) {
+                    projected_batch.release(&projected_batch);
+                    memset(&projected_batch, 0, sizeof(projected_batch));
+                }
+                ok = ok && projected_rows == 3 && blob_b_valid[0] &&
+                     blob_b_valid[1] && !blob_b_valid[2] &&
+                     blob_b_size[0] == 3 && blob_b_size[1] == 5 &&
+                     payload_valid[0] && !payload_valid[1] && payload_valid[2];
             }
             if (!ok) fprintf(stderr, "BLOB projection readback failed\n");
             if (projected_stream.release) {
