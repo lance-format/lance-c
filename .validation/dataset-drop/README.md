@@ -59,3 +59,17 @@ These tests exercise native local and in-memory backends. They do not certify
 cloud-provider IAM, eventual consistency, concurrent writers, shallow clone
 reference protection, or namespace deregistration. Existing validator
 manifest-format coverage remains in the native module.
+
+## Accepted candidate evidence (2026-11-13)
+
+NieR executed artifact `d8643bd4fa92cc61ad5776161eb093d1b66ee3e2` on
+Rust/Cargo 1.94.0 using the runner above and `--locked`: all five integration
+tests passed, zero ignored/filtered, exit 0. The runner also exited 0;
+pre/post native staged diffs were byte-identical and the patched tree matched
+`identity.json`. The raw log and source snapshots are retained at
+`/home/xuanwo/Code/validation/lance-native-drop-113-40f15ed/evidence` on NieR
+and in the coordinator's `dataset113-native-acceptance/evidence` record.
+SWE-2 independently reviewed the exact artifact and immutable native objects
+without compiling and found no material source defects. This accepts the
+bounded native candidate and tests; it does not publish upstream changes,
+add a C API, migrate the core, or complete issue #113's remaining scope.
