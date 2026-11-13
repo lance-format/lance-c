@@ -8079,7 +8079,7 @@ fn test_robotics_e2e_write_then_finalize() {
     use lance_file::reader::{CachedFileMetadata, FileReader as LanceFileReader};
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
     use lance_io::utils::CachedFileSize;
-    use lance_table::format::{DataFile, Fragment};
+    use lance_table::format::{DataFile, Fragment, pb_actions};
 
     // ── Step 1: "C++ edge device" writes fragment data files ──
 
@@ -11323,12 +11323,16 @@ fn test_index_metadata_clone_with_fragment_ids_and_encode() {
             IndexFile {
                 path: "index.idx".to_string(),
                 size_bytes: 101,
+                file_metadata_size_bytes: None,
             },
             IndexFile {
                 path: "metadata.idx".to_string(),
                 size_bytes: 202,
+                file_metadata_size_bytes: None,
             },
         ]),
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let encoded_source = pb::IndexMetadata::from(&native).encode_to_vec();
     let mut source = ptr::null_mut();
@@ -50688,8 +50692,8 @@ fn test_native_operation_typed_four_variants_representation() {
         let mut field_metadata_updates = HashMap::new();
         field_metadata_updates.insert(
             7,
-            pb::transaction::UpdateMap {
-                update_entries: vec![pb::transaction::UpdateMapEntry {
+            pb_actions::UpdateMap {
+                update_entries: vec![pb_actions::UpdateMapEntry {
                     key: "nul\0key".to_string(),
                     value: Some("nul\0value".to_string()),
                 }],
@@ -50705,13 +50709,13 @@ fn test_native_operation_typed_four_variants_representation() {
                 pb::transaction::UpdateConfig {
                     config_updates: None,
                     table_metadata_updates: None,
-                    schema_metadata_updates: Some(pb::transaction::UpdateMap {
+                    schema_metadata_updates: Some(pb_actions::UpdateMap {
                         update_entries: vec![
-                            pb::transaction::UpdateMapEntry {
+                            pb_actions::UpdateMapEntry {
                                 key: "nul\0history".to_string(),
                                 value: Some("kept".to_string()),
                             },
-                            pb::transaction::UpdateMapEntry {
+                            pb_actions::UpdateMapEntry {
                                 key: "plain".to_string(),
                                 value: Some("nul\0value".to_string()),
                             },
@@ -51658,10 +51662,10 @@ fn test_native_update_operation_value_matches_native_struct() {
     }];
 
     // Exact-set filter built from explicit protobuf, including a duplicate key.
-    let pb_filter = pb::transaction::KeyExistenceFilter {
+    let pb_filter = pb_actions::KeyExistenceFilter {
         field_ids: vec![0, 3],
-        data: Some(pb::transaction::key_existence_filter::Data::Exact(
-            pb::transaction::ExactKeySetFilter {
+        data: Some(pb_actions::key_existence_filter::Data::Exact(
+            pb_actions::ExactKeySetFilter {
                 key_hashes: vec![9, 4, 9],
             },
         )),
@@ -52092,6 +52096,7 @@ fn test_native_update_operation_value_matches_native_struct() {
             2,
             RoaringBitmap::from_iter([1u32, 5]),
         )]))),
+        mem_wal_dir_id: None,
     };
     assert_eq!(decoded, expected);
     assert_eq!(updated_json.len(), 2);
@@ -52217,6 +52222,7 @@ fn test_native_update_operation_defaults_and_validation() {
             update_mode: Some(UpdateMode::RewriteRows),
             inserted_rows_filter: None,
             updated_fragment_offsets: None,
+            mem_wal_dir_id: None,
         }
     );
 
@@ -52479,10 +52485,10 @@ fn test_native_update_offsets_and_key_existence_filter_values() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 
     // Bloom decode uses the native defaults for absent sizes.
-    let pb_bloom = pb::transaction::KeyExistenceFilter {
+    let pb_bloom = pb_actions::KeyExistenceFilter {
         field_ids: vec![1],
-        data: Some(pb::transaction::key_existence_filter::Data::Bloom(
-            pb::transaction::BloomFilter {
+        data: Some(pb_actions::key_existence_filter::Data::Bloom(
+            pb_actions::BloomFilter {
                 bitmap: vec![1, 2, 3],
                 num_bits: 64,
                 number_of_items: 0,
@@ -52580,10 +52586,10 @@ fn test_native_update_offsets_and_key_existence_filter_values() {
     assert_eq!(kind, LanceKeyExistenceFilterKind::Bloom);
 
     // A zero-length bitmap yields a NULL buffer, not a dangling pointer.
-    let pb_zero_bitmap = pb::transaction::KeyExistenceFilter {
+    let pb_zero_bitmap = pb_actions::KeyExistenceFilter {
         field_ids: vec![],
-        data: Some(pb::transaction::key_existence_filter::Data::Bloom(
-            pb::transaction::BloomFilter {
+        data: Some(pb_actions::key_existence_filter::Data::Bloom(
+            pb_actions::BloomFilter {
                 bitmap: vec![],
                 num_bits: 0,
                 number_of_items: 1,
@@ -52628,10 +52634,10 @@ fn test_native_update_offsets_and_key_existence_filter_values() {
     // Exact-set getters reject bloom filters; the bloom getter rejects exact
     // sets; NULL handles are rejected everywhere.
     let exact_keys = {
-        let pb_exact = pb::transaction::KeyExistenceFilter {
+        let pb_exact = pb_actions::KeyExistenceFilter {
             field_ids: vec![0, 3],
-            data: Some(pb::transaction::key_existence_filter::Data::Exact(
-                pb::transaction::ExactKeySetFilter {
+            data: Some(pb_actions::key_existence_filter::Data::Exact(
+                pb_actions::ExactKeySetFilter {
                     key_hashes: vec![9, 4],
                 },
             )),
@@ -52724,6 +52730,7 @@ fn test_native_update_offsets_and_key_existence_filter_values() {
             update_mode: Some(UpdateMode::RewriteRows),
             inserted_rows_filter: None,
             updated_fragment_offsets: None,
+            mem_wal_dir_id: None,
         }
     );
 
@@ -52765,6 +52772,7 @@ fn test_native_update_offsets_and_key_existence_filter_values() {
                 5,
                 RoaringBitmap::from_iter([1u32, 3]),
             )]))),
+            mem_wal_dir_id: None,
         }
     );
 
@@ -53435,10 +53443,12 @@ fn test_native_rewrite_and_update_mem_wal_state_values() {
                         lance_table::format::IndexFile {
                             path: "index/part-a.idx".to_string(),
                             size_bytes: 100,
+                            file_metadata_size_bytes: None,
                         },
                         lance_table::format::IndexFile {
                             path: "index/part-b.idx".to_string(),
                             size_bytes: 200,
+                            file_metadata_size_bytes: None,
                         },
                     ]),
                 },
@@ -53682,6 +53692,7 @@ fn test_native_rewrite_and_update_mem_wal_state_values() {
                 CompactedSsTable::new(uuid::Uuid::from_bytes(shard_a), 7),
                 CompactedSsTable::new(uuid::Uuid::from_bytes(shard_b), 8),
             ],
+            dir_id: String::new(),
         }
     );
 
@@ -53699,6 +53710,7 @@ fn test_native_rewrite_and_update_mem_wal_state_values() {
         decoded_native_operation(empty_state),
         Operation::UpdateMemWalState {
             compacted_sstables: vec![],
+            dir_id: String::new(),
         }
     );
     let rejected = unsafe { lance_operation_update_mem_wal_state_new(ptr::null(), 1) };
