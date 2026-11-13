@@ -4390,8 +4390,23 @@ pub unsafe extern "C" fn lance_key_existence_filter_to_proto(
 pub unsafe extern "C" fn lance_operation_update_new(
     options: *const LanceUpdateOperationOptions,
 ) -> *mut LanceOperation {
+    unsafe { lance_operation_update_new_with_mem_wal_dir_id(options, ptr::null()) }
+}
+
+/// Construct an Update operation that names its MemWAL directory.
+///
+/// Identical to `lance_operation_update_new()` except that `mem_wal_dir_id`
+/// maps to native `Some(...)`; NULL maps to `None`. Native code requires the
+/// identifier when `compacted_sstables` carries compaction progress.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_new_with_mem_wal_dir_id(
+    options: *const LanceUpdateOperationOptions,
+    mem_wal_dir_id: *const c_char,
+) -> *mut LanceOperation {
     ffi_try!(
         (|| -> Result<*mut LanceOperation> {
+            let mem_wal_dir_id =
+                unsafe { helpers::parse_c_string(mem_wal_dir_id)? }.map(str::to_string);
             if options.is_null() {
                 return Err(lance_core::Error::invalid_input_source(
                     "options must not be NULL".into(),
@@ -4471,42 +4486,9 @@ pub unsafe extern "C" fn lance_operation_update_new(
                     update_mode,
                     inserted_rows_filter,
                     updated_fragment_offsets,
-                    mem_wal_dir_id: None,
+                    mem_wal_dir_id,
                 },
             ))))
-        })(),
-        null
-    )
-}
-
-/// Construct an Update operation that names its MemWAL directory.
-///
-/// Identical to `lance_operation_update_new()` except that `mem_wal_dir_id`
-/// maps to native `Some(...)`; NULL maps to `None`. Native code requires the
-/// identifier when `compacted_sstables` carries compaction progress.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lance_operation_update_new_with_mem_wal_dir_id(
-    options: *const LanceUpdateOperationOptions,
-    mem_wal_dir_id: *const c_char,
-) -> *mut LanceOperation {
-    ffi_try!(
-        (|| -> Result<*mut LanceOperation> {
-            let mem_wal_dir_id =
-                unsafe { helpers::parse_c_string(mem_wal_dir_id)? }.map(str::to_string);
-            let operation = unsafe { lance_operation_update_new(options) };
-            if operation.is_null() {
-                return Ok(ptr::null_mut());
-            }
-            let handle = unsafe { &mut *operation };
-            let Operation::Update {
-                mem_wal_dir_id: slot,
-                ..
-            } = &mut handle.inner
-            else {
-                unreachable!("lance_operation_update_new always returns an Update");
-            };
-            *slot = mem_wal_dir_id;
-            Ok(operation)
         })(),
         null
     )
@@ -5845,23 +5827,13 @@ pub unsafe extern "C" fn lance_operation_update_mem_wal_state_new(
     compacted_sstables: *const LanceCompactedSsTable,
     compacted_sstable_count: usize,
 ) -> *mut LanceOperation {
-    ffi_try!(
-        (|| -> Result<*mut LanceOperation> {
-            let compacted_sstables = unsafe {
-                crate::mem_wal::parse_compacted_sstables(
-                    compacted_sstables,
-                    compacted_sstable_count,
-                )?
-            };
-            Ok(Box::into_raw(Box::new(LanceOperation::from_native(
-                Operation::UpdateMemWalState {
-                    compacted_sstables,
-                    dir_id: String::new(),
-                },
-            ))))
-        })(),
-        null
-    )
+    unsafe {
+        lance_operation_update_mem_wal_state_new_with_dir_id(
+            compacted_sstables,
+            compacted_sstable_count,
+            c"".as_ptr(),
+        )
+    }
 }
 
 /// Construct an UpdateMemWalState operation for a specific MemWAL directory.
@@ -5878,23 +5850,18 @@ pub unsafe extern "C" fn lance_operation_update_mem_wal_state_new_with_dir_id(
     ffi_try!(
         (|| -> Result<*mut LanceOperation> {
             let dir_id = required_c_string(dir_id, "dir_id")?.to_string();
-            let operation = unsafe {
-                lance_operation_update_mem_wal_state_new(
+            let compacted_sstables = unsafe {
+                crate::mem_wal::parse_compacted_sstables(
                     compacted_sstables,
                     compacted_sstable_count,
-                )
+                )?
             };
-            if operation.is_null() {
-                return Ok(ptr::null_mut());
-            }
-            let handle = unsafe { &mut *operation };
-            let Operation::UpdateMemWalState { dir_id: slot, .. } = &mut handle.inner else {
-                unreachable!(
-                    "lance_operation_update_mem_wal_state_new always returns an UpdateMemWalState"
-                );
-            };
-            *slot = dir_id;
-            Ok(operation)
+            Ok(Box::into_raw(Box::new(LanceOperation::from_native(
+                Operation::UpdateMemWalState {
+                    compacted_sstables,
+                    dir_id,
+                },
+            ))))
         })(),
         null
     )
