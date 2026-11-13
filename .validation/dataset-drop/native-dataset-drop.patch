@@ -1,0 +1,302 @@
+diff --git a/rust/lance/src/dataset.rs b/rust/lance/src/dataset.rs
+index 6d18cdb8c93821740b961982f04455d96ba459ac..40c185b366f42f315f73cd5820e412b59e5aba89 100644
+--- a/rust/lance/src/dataset.rs
++++ b/rust/lance/src/dataset.rs
+@@ -4503,6 +4503,35 @@ impl Projectable for Dataset {
+ /// `lance-namespace-impls` depends on this crate, not the other way around.
+ const NAMESPACE_TABLE_MARKERS: &[&str] = &[".lance-reserved", ".lance-deregistered"];
+
++/// Delete a dataset root and every object beneath it.
++///
++/// The caller resolves the URI and storage options into `object_store` and
++/// `base`. The same store and path are used for both validation and deletion.
++/// [`validate_dataset_root_for_drop`] must accept the root before deletion
++/// starts. Unmanaged files inside an accepted root are also deleted; objects
++/// outside it, including external base paths, are not traversed.
++///
++/// `ignore_not_found` suppresses only a native [`Error::NotFound`] returned by
++/// deletion. Validation errors and other deletion errors are propagated. A
++/// backend that treats deletion of an absent prefix as success retains that
++/// behavior even when `ignore_not_found` is false.
++///
++/// Validation and deletion are not atomic with concurrent writes, and a
++/// failed deletion may have removed some objects. This does not protect data
++/// referenced by shallow clones, invalidate open handles, or deregister a
++/// table from a namespace.
++pub async fn drop_dataset(
++    object_store: &ObjectStore,
++    base: &Path,
++    ignore_not_found: bool,
++) -> Result<()> {
++    validate_dataset_root_for_drop(object_store, base).await?;
++    match object_store.remove_dir_all(base.clone()).await {
++        Err(Error::NotFound { .. }) if ignore_not_found => Ok(()),
++        result => result,
++    }
++}
++
+ /// Check that `base` is a Lance dataset root before deleting it recursively.
+ ///
+ /// Dropping a dataset removes whatever the caller pointed at, so a mistyped or
+diff --git a/rust/lance/tests/dataset_drop.rs b/rust/lance/tests/dataset_drop.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a082f61667fa4636c48b891e75a23cd0bdd0c8c9
+--- /dev/null
++++ b/rust/lance/tests/dataset_drop.rs
+@@ -0,0 +1,256 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++use std::sync::Arc;
++
++use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
++use arrow_schema::{DataType, Field, Schema};
++use async_trait::async_trait;
++use futures::{StreamExt, TryStreamExt, stream::BoxStream};
++use lance::dataset::{WriteMode, WriteParams, drop_dataset};
++use lance::{Dataset, Error};
++use lance_io::object_store::ObjectStore;
++use object_store::path::Path;
++use object_store::{
++    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
++    ObjectStore as Backend, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
++};
++
++async fn write_rows(uri: &str, mode: WriteMode) -> Dataset {
++    let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
++    let batch =
++        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
++    Dataset::write(
++        RecordBatchIterator::new(vec![Ok(batch)], schema),
++        uri,
++        Some(WriteParams {
++            mode,
++            ..Default::default()
++        }),
++    )
++    .await
++    .unwrap()
++}
++
++#[tokio::test]
++async fn drop_dataset_removes_all_versions_and_unmanaged_files_only_under_root() {
++    let dir = tempfile::tempdir().unwrap();
++    let root = dir.path().join("table.lance");
++    let uri = root.to_str().unwrap();
++    write_rows(uri, WriteMode::Create).await;
++    let dataset = write_rows(uri, WriteMode::Append).await;
++    assert_eq!(dataset.get_fragments().len(), 2);
++    std::fs::write(root.join("notes.txt"), b"inside").unwrap();
++    let sibling = dir.path().join("table.lance-other");
++    std::fs::create_dir(&sibling).unwrap();
++    std::fs::write(sibling.join("keep.txt"), b"outside").unwrap();
++    let (store, base) = ObjectStore::from_uri(uri).await.unwrap();
++    drop_dataset(&store, &base, false).await.unwrap();
++    assert!(!root.exists());
++    assert!(Dataset::open(uri).await.is_err());
++    assert_eq!(std::fs::read(sibling.join("keep.txt")).unwrap(), b"outside");
++}
++
++#[tokio::test]
++async fn drop_dataset_rejects_invalid_roots_without_deleting_even_when_ignoring_missing() {
++    for kind in ["data_only", "corrupt_manifest", "warehouse"] {
++        let dir = tempfile::tempdir().unwrap();
++        let root = dir.path();
++        match kind {
++            "data_only" => {
++                std::fs::create_dir(root.join("data")).unwrap();
++                std::fs::write(root.join("data/0.lance"), b"uncommitted").unwrap();
++            }
++            "corrupt_manifest" => {
++                std::fs::create_dir(root.join("_versions")).unwrap();
++                std::fs::write(root.join("_versions/1.manifest"), b"corrupt").unwrap();
++            }
++            _ => {
++                write_rows(
++                    root.join("child.lance").to_str().unwrap(),
++                    WriteMode::Create,
++                )
++                .await;
++            }
++        }
++        std::fs::write(root.join("keep.txt"), b"untouched").unwrap();
++        let (store, base) = ObjectStore::from_uri(root.to_str().unwrap()).await.unwrap();
++        let before = store
++            .list(Some(base.clone()))
++            .try_collect::<Vec<_>>()
++            .await
++            .unwrap();
++        let err = drop_dataset(&store, &base, true).await.unwrap_err();
++        assert!(matches!(err, Error::InvalidInput { .. }), "{kind}: {err}");
++        let after = store
++            .list(Some(base))
++            .try_collect::<Vec<_>>()
++            .await
++            .unwrap();
++        assert_eq!(before, after, "{kind}: refused drop changed objects");
++        assert_eq!(std::fs::read(root.join("keep.txt")).unwrap(), b"untouched");
++        if kind == "warehouse" {
++            assert_eq!(
++                Dataset::open(root.join("child.lance").to_str().unwrap())
++                    .await
++                    .unwrap()
++                    .count_rows(None)
++                    .await
++                    .unwrap(),
++                2
++            );
++        }
++    }
++}
++
++#[tokio::test]
++async fn drop_dataset_accepts_namespace_markers() {
++    for marker in [".lance-reserved", ".lance-deregistered"] {
++        let parent = tempfile::tempdir().unwrap();
++        let root = parent.path().join("table");
++        std::fs::create_dir(&root).unwrap();
++        std::fs::write(root.join(marker), b"reserved table").unwrap();
++        let (store, base) = ObjectStore::from_uri(root.to_str().unwrap()).await.unwrap();
++        drop_dataset(&store, &base, false).await.unwrap();
++        assert!(!root.exists());
++    }
++}
++
++#[tokio::test]
++async fn drop_dataset_preserves_backend_missing_and_empty_behavior() {
++    let parent = tempfile::tempdir().unwrap();
++    let root = parent.path().join("missing");
++    let (store, base) = ObjectStore::from_uri(root.to_str().unwrap()).await.unwrap();
++    assert!(matches!(
++        drop_dataset(&store, &base, false).await,
++        Err(Error::NotFound { .. })
++    ));
++    drop_dataset(&store, &base, true).await.unwrap();
++    std::fs::create_dir(&root).unwrap();
++    drop_dataset(&store, &base, false).await.unwrap();
++    assert!(!root.exists());
++
++    let store = native_memory_store(Arc::new(object_store::memory::InMemory::new()));
++    // Object stores need not report an error for deletion of an absent prefix.
++    drop_dataset(&store, &Path::from("missing"), false)
++        .await
++        .unwrap();
++}
++
++fn native_memory_store(inner: Arc<dyn Backend>) -> ObjectStore {
++    ObjectStore::new(
++        inner,
++        url::Url::parse("memory://drop-test").unwrap(),
++        None,
++        None,
++        false,
++        true,
++        1,
++        0,
++        None,
++    )
++}
++
++#[derive(Debug)]
++struct FailAfterFirstDelete(Arc<dyn Backend>);
++
++impl std::fmt::Display for FailAfterFirstDelete {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "FailAfterFirstDelete")
++    }
++}
++
++#[async_trait]
++impl Backend for FailAfterFirstDelete {
++    async fn put_opts(
++        &self,
++        p: &Path,
++        v: PutPayload,
++        o: PutOptions,
++    ) -> object_store::Result<PutResult> {
++        self.0.put_opts(p, v, o).await
++    }
++    async fn put_multipart_opts(
++        &self,
++        p: &Path,
++        o: PutMultipartOptions,
++    ) -> object_store::Result<Box<dyn MultipartUpload>> {
++        self.0.put_multipart_opts(p, o).await
++    }
++    async fn get_opts(&self, p: &Path, o: GetOptions) -> object_store::Result<GetResult> {
++        self.0.get_opts(p, o).await
++    }
++    fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
++        self.0.list(p)
++    }
++    async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
++        self.0.list_with_delimiter(p).await
++    }
++    async fn copy_opts(&self, a: &Path, b: &Path, o: CopyOptions) -> object_store::Result<()> {
++        self.0.copy_opts(a, b, o).await
++    }
++    fn delete_stream(
++        &self,
++        paths: BoxStream<'static, object_store::Result<Path>>,
++    ) -> BoxStream<'static, object_store::Result<Path>> {
++        let inner = self.0.clone();
++        paths
++            .enumerate()
++            .then(move |(i, path)| {
++                let inner = inner.clone();
++                async move {
++                    let path = path?;
++                    if i > 0 {
++                        return Err(object_store::Error::Generic {
++                            store: "drop-test",
++                            source: std::io::Error::other("injected delete failure").into(),
++                        });
++                    }
++                    inner.delete(&path).await?;
++                    Ok(path)
++                }
++            })
++            .boxed()
++    }
++}
++
++#[tokio::test]
++async fn drop_dataset_propagates_partial_delete_failure_with_ignore_not_found() {
++    let inner = Arc::new(object_store::memory::InMemory::new());
++    for p in [
++        "table/.lance-reserved",
++        "table/a",
++        "table/b",
++        "table-other/keep",
++    ] {
++        inner
++            .put(&Path::from(p), b"value".to_vec().into())
++            .await
++            .unwrap();
++    }
++    let store = native_memory_store(Arc::new(FailAfterFirstDelete(inner.clone())));
++    let err = drop_dataset(&store, &Path::from("table"), true)
++        .await
++        .unwrap_err();
++    assert!(err.to_string().contains("injected delete failure"), "{err}");
++    assert_eq!(
++        inner
++            .list(Some(&Path::from("table")))
++            .try_collect::<Vec<_>>()
++            .await
++            .unwrap()
++            .len(),
++        2
++    );
++    assert_eq!(
++        inner
++            .get(&Path::from("table-other/keep"))
++            .await
++            .unwrap()
++            .bytes()
++            .await
++            .unwrap()
++            .as_ref(),
++        b"value"
++    );
++}
