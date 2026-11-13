@@ -235,6 +235,42 @@ fn boundaries(events: &[ProbeEvent]) -> Vec<String> {
     events.iter().map(ProbeEvent::boundary).collect()
 }
 
+/// Collapse runs of repeat progress callbacks for the same stage. K-means
+/// reports one `train_ivf` progress event per iteration and the iteration
+/// count depends on scheduling, so boundary assertions use runs while progress
+/// counts and values are asserted separately.
+fn boundary_runs(events: &[ProbeEvent]) -> Vec<String> {
+    let mut runs: Vec<String> = Vec::new();
+    for event in events {
+        let boundary = event.boundary();
+        if boundary.starts_with("progress:") && runs.last().is_some_and(|last| last == &boundary) {
+            continue;
+        }
+        runs.push(boundary);
+    }
+    runs
+}
+
+fn stage_start_total(events: &[ProbeEvent], stage: &str) -> Option<Option<u64>> {
+    events.iter().find_map(|event| match event {
+        ProbeEvent::Start {
+            stage: recorded,
+            total,
+            ..
+        } if recorded == stage => Some(*total),
+        _ => None,
+    })
+}
+
+fn stage_progress_count(events: &[ProbeEvent], stage: &str) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(event, ProbeEvent::Progress { stage: recorded, .. } if recorded == stage)
+        })
+        .count()
+}
+
 async fn multi_fragment_dataset() -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp
@@ -320,7 +356,7 @@ fn index_tree(uri: &str) -> Vec<(String, u64)> {
                     .unwrap()
                     .to_string_lossy()
                     .to_string();
-                out.push((format!("_indices/{relative}"), metadata.len()));
+                out.push((relative, metadata.len()));
             }
         }
     }
@@ -468,7 +504,7 @@ async fn vector_shuffle_error_after_work_prevents_commit() {
     let observed = boundaries(&events);
     eprintln!("vector_shuffle_error_after_work_prevents_commit: events={observed:?}");
     assert_eq!(
-        observed,
+        boundary_runs(&events),
         vec![
             "start:train_ivf",
             "progress:train_ivf",
@@ -480,6 +516,10 @@ async fn vector_shuffle_error_after_work_prevents_commit() {
         ],
         "failure must land on the first shuffle progress callback"
     );
+    assert!(
+        stage_progress_count(&events, "train_ivf") >= 1,
+        "training iterations must have been reported before the shuffle failure"
+    );
     match events.last().unwrap() {
         ProbeEvent::Progress { stage, completed } => {
             assert_eq!(stage, "shuffle");
@@ -490,13 +530,11 @@ async fn vector_shuffle_error_after_work_prevents_commit() {
         }
         other => panic!("last event must be shuffle progress, got {other:?}"),
     }
-    match &events[5] {
-        ProbeEvent::Start { stage, total, .. } => {
-            assert_eq!(stage, "shuffle");
-            assert_eq!(*total, Some(TOTAL_ROWS));
-        }
-        other => panic!("expected shuffle stage start, got {other:?}"),
-    }
+    assert_eq!(
+        stage_start_total(&events, "shuffle"),
+        Some(Some(TOTAL_ROWS)),
+        "shuffle stage must report its real row total"
+    );
 
     let (after, indices) = dataset_state(&uri).await;
     let tree = index_tree(&uri);
@@ -541,7 +579,7 @@ async fn vector_merge_error_after_partition_work_leaves_only_unreferenced_sideca
     let observed = boundaries(&events);
     eprintln!("vector_merge_error_after_partition_work: events={observed:?}");
     assert_eq!(
-        observed,
+        boundary_runs(&events),
         vec![
             "start:train_ivf",
             "progress:train_ivf",
@@ -607,7 +645,7 @@ async fn vector_success_control_publishes_after_all_checkpoints() {
     let observed = boundaries(&events);
     eprintln!("vector_success_control: events={observed:?}");
     assert_eq!(
-        observed,
+        boundary_runs(&events),
         vec![
             "start:train_ivf",
             "progress:train_ivf",
