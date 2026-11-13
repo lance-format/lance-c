@@ -56030,25 +56030,25 @@ fn shallow_clone_across_separate_local_directories_reuse_source_data_through_c_a
     /// publish metadata only, so its own directory tree has no such files while
     /// the source directory does.
     fn data_files(dataset_uri: &str) -> Vec<String> {
-        fn walk(dir: &std::path::Path, files: &mut Vec<String>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
+        fn walk(entries: std::fs::ReadDir, files: &mut Vec<String>) {
             for entry in entries {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    walk(&path, files);
-                } else if path
-                    .parent()
-                    .map(|parent| parent.ends_with("data"))
-                    .unwrap_or(false)
-                {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(std::fs::read_dir(&path).unwrap(), files);
+                } else {
                     files.push(path.display().to_string());
                 }
             }
         }
+        let data_dir = std::path::Path::new(dataset_uri).join("data");
+        let entries = match std::fs::read_dir(&data_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) => panic!("cannot inspect {}: {error}", data_dir.display()),
+        };
         let mut files = Vec::new();
-        walk(std::path::Path::new(dataset_uri), &mut files);
+        walk(entries, &mut files);
         files.sort();
         files
     }
@@ -56153,10 +56153,6 @@ fn shallow_clone_across_separate_local_directories_reuse_source_data_through_c_a
         LanceWriteMode::Append,
         ptr::null(),
     );
-    let v1_data_files: Vec<String> = data_file_references(source_v1)
-        .into_iter()
-        .map(|(path, _)| path)
-        .collect();
     let source_v2 = commit_native_transaction(&source_uri, appended, ptr::null());
     assert_eq!(unsafe { lance_dataset_version(source_v2) }, 2);
     unsafe { lance_dataset_close(source_v2) };
