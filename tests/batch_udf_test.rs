@@ -70,7 +70,6 @@ fn reset_store(store: &StoreState) {
     store.events.lock().unwrap().clear();
     store.calls.lock().unwrap().clear();
     store.inserted_batches.lock().unwrap().clear();
-    store.v2_batches.lock().unwrap().clear();
     store.inserted_fragments.lock().unwrap().clear();
 }
 
@@ -2015,6 +2014,101 @@ fn test_batch_udf_schema_aware_checkpoint_replays_cached_batch() {
     );
     assert_eq!(unsafe { lance_dataset_version(dataset) }, baseline + 1);
     unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_fragment_batch_udf_schema_aware_checkpoint_replays_cached_batch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = fixture_uri(&tmp, "v2-fragment-replay");
+    create_batch_udf_dataset(&uri, false);
+    let dataset = open(&uri);
+    let baseline = unsafe { lance_dataset_version(dataset) };
+    let declared = output_schema();
+    let ffi_schema = schema_to_ffi(&declared);
+    let (_, store, _) = make_context(declared.clone(), MapperMode::Constant(5));
+    let (fragment_id, batch_index) =
+        seed_partial_batch_checkpoint(dataset, declared.clone(), &ffi_schema, &store);
+    assert_eq!(batch_index, 0);
+
+    reset_store(&store);
+    *store.failure.lock().unwrap() = None;
+    assert!(
+        store
+            .v2_batches
+            .lock()
+            .unwrap()
+            .contains_key(&(fragment_id, batch_index))
+    );
+    let fragment = unsafe { lance_dataset_open_fragment(dataset, u64::from(fragment_id)) };
+    assert!(
+        !fragment.is_null(),
+        "fragment open failed: {:?}",
+        take_error()
+    );
+    let original_files = unsafe { lance_fragment_data_file_count(fragment) };
+    let (mapper, _, context) =
+        make_context_with_store(declared, MapperMode::Constant(7), store.clone());
+    let raw_store = checkpoint_store_v2(&context);
+    let udf = LanceBatchUDFV2 {
+        mapper: Some(mapper_callback),
+        mapper_ctx: (&context as *const CallbackContext).cast_mut().cast(),
+        output_schema: &ffi_schema,
+        checkpoint_store: &raw_store,
+    };
+    let mut updated = ptr::null_mut();
+    let mut schema = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_fragment_add_columns_batch_udf_v2(
+                fragment,
+                &udf,
+                ptr::null(),
+                ptr::null(),
+                &mut updated,
+                &mut schema,
+            )
+        },
+        0,
+        "fragment checkpoint replay failed: {:?}",
+        take_error()
+    );
+    assert!(!updated.is_null());
+    assert!(!schema.is_null());
+    assert_eq!(mapper.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.inserted_fragments.lock().unwrap().len(), 1);
+    assert!(
+        store
+            .events
+            .lock()
+            .unwrap()
+            .contains(&format!("get_batch:{fragment_id}:{batch_index}"))
+    );
+    assert_eq!(
+        unsafe { lance_fragment_data_file_count(fragment) },
+        original_files
+    );
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, baseline);
+    assert!(exported_schema(dataset).field_with_name("derived").is_err());
+
+    // Staged metadata and schema remain independently owned after both the
+    // input fragment and its dataset are closed; this call does not publish.
+    unsafe {
+        lance_fragment_close(fragment);
+        lance_dataset_close(dataset);
+    }
+    assert_eq!(unsafe { lance_fragment_id(updated) }, u64::from(fragment_id));
+    assert!(unsafe { lance_fragment_data_file_count(updated) } > original_files);
+    let mut arrow_schema = FFI_ArrowSchema::empty();
+    assert_eq!(unsafe { lance_schema_to_arrow(schema, &mut arrow_schema) }, 0);
+    let exported = Schema::try_from(&arrow_schema).unwrap();
+    assert_eq!(
+        exported.field_with_name("derived").unwrap().data_type(),
+        &DataType::Int64
+    );
+    unsafe {
+        lance_schema_close(schema);
+        lance_fragment_close(updated);
+    }
 }
 
 #[test]
