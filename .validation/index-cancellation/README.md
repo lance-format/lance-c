@@ -43,6 +43,7 @@ pin, public C API, C headers, error numbers, or `ProgressCallbackGate`.
 7. `vector_success_control_publishes_after_all_checkpoints`
 8. `fm_trained_multi_segment_cancellation_before_publication` (plus success control)
 9. `fm_untrained_multi_segment_cancellation_before_publication` (plus success control)
+10. `vector_merge_cancellation_stops_before_completion_and_publication`
 
 All use three fragments / 96 rows and deterministic callback triggers, not
 sleeps. Cancellation cases reopen the dataset and assert unchanged version and
@@ -78,3 +79,10 @@ The runner records `run.log`, `applied.patch`, `changed-production-files.txt`,
   additional checkpoints. Checks at the create/multi-segment level cover the
   publication route.
 - No universal backend quiescence is claimed.
+- Vector cancellation during merge progress is exercised through the real
+  builder and checked against reopened manifest state. Partition-planning and
+  individual partition-work checkpoints remain source-reviewed only; this test
+  does not identify which of the subsequent checkpoints first observes the token.
+- The cancellation classifier recognizes the direct `Error::External` returned
+  by these native build paths. Recognition through an additional caller-created
+  `Error::Shared` wrapper is not currently provided.

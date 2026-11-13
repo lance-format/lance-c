@@ -535,6 +535,39 @@ async fn committed_last_completion_window_does_not_publish() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vector_merge_cancellation_stops_before_completion_and_publication() {
+    let (_tmp, uri) = scalar_dataset().await;
+    let before = dataset_state(&uri).await;
+    let mut dataset = Dataset::open(&uri).await.unwrap();
+    let (_token, observer, progress) = cancellable(Trigger::CancelAtProgress {
+        stage: "merge_partitions".to_string(),
+        min_completed: 1,
+    });
+
+    let err = dataset
+        .create_index_builder(
+            &["embedding"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(NUM_PARTITIONS, MetricType::L2),
+        )
+        .name("embedding_ivf".to_string())
+        .progress(progress)
+        .await
+        .unwrap_err();
+
+    assert_typed_cancellation(&err);
+    assert_eq!(observer.progress_values("merge_partitions"), vec![1]);
+    assert!(
+        !observer
+            .events()
+            .iter()
+            .any(|event| event.is_complete("merge_partitions")),
+        "cancellation during merge must stop before reporting completion"
+    );
+    assert_eq!(dataset_state(&uri).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn observer_error_is_not_reclassified_as_cancellation() {
     let (_tmp, uri) = scalar_dataset().await;
     let before = dataset_state(&uri).await;

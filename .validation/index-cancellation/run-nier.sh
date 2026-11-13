@@ -59,7 +59,7 @@ rustfmt +1.94.0 --edition 2024 --check \
 
 # Focused compilation and execution: this target only.
 cd "$LANCE_SRC"
-cargo +1.94.0 test --locked -p lance --test e4_native_cancellation -j 8 -- --test-threads=4
+cargo +1.94.0 test --locked -p lance --test e4_native_cancellation -j 8 -- "$@" --test-threads=4
 
 # A locked run must leave the native source and fixture exactly as supplied.
 git diff --binary > "$EVIDENCE_DIR/after-test.patch"
