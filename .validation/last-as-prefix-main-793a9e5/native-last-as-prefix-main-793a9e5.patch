@@ -1079,6 +1079,61 @@ index 47d5eda2a..8bf19ab82 100644
      #[rstest::rstest]
      #[case::default(InvertedIndexParams::default(), "alpha", "beta")]
      #[case::ngram(InvertedIndexParams::default()
+diff --git a/rust/lance/src/io/exec/fts/flat_match/tests/filter_binding.rs b/rust/lance/src/io/exec/fts/flat_match/tests/filter_binding.rs
+index 7356fde1d..47dcc9e9c 100644
+--- a/rust/lance/src/io/exec/fts/flat_match/tests/filter_binding.rs
++++ b/rust/lance/src/io/exec/fts/flat_match/tests/filter_binding.rs
+@@ -299,7 +299,7 @@ async fn flat_filter_binding_keeps_fuzzy_rejection(#[case] fuzziness: Option<u32
+     assert!(
+         error
+             .to_string()
+-            .contains("Fuzzy MatchQuery is not supported"),
++            .contains("Fuzzy or prefix MatchQuery is not supported"),
+         "{error}"
+     );
+     assert_eq!(
+@@ -308,6 +308,41 @@ async fn flat_filter_binding_keeps_fuzzy_rejection(#[case] fuzziness: Option<u32
+     );
+ }
+
++#[rstest]
++#[case::query_only(true, false)]
++#[case::params_only(false, true)]
++#[case::both(true, true)]
++#[tokio::test]
++async fn flat_filter_binding_rejects_last_as_prefix(
++    #[case] query_prefix: bool,
++    #[case] params_prefix: bool,
++) {
++    let batch = record_batch!(
++        ("id", Int32, [0, 1]),
++        ("text", Utf8, ["alpha beta", "alpha betamax"])
++    )
++    .unwrap();
++    let native = FlatMatchFilterExec::new(
++        input(&batch),
++        dataset(batch.clone()).await,
++        query("text", Some(DocumentGranularity::Row)).with_last_as_prefix(query_prefix),
++        FtsSearchParams::default().with_last_as_prefix(params_prefix),
++    );
++    for exec in [restore(&native, input(&batch)), native] {
++        let error = rows(Arc::new(exec)).await.unwrap_err();
++        assert!(
++            matches!(error, DataFusionError::NotImplemented(_)),
++            "{error}"
++        );
++        assert!(
++            error
++                .to_string()
++                .contains("Fuzzy or prefix MatchQuery is not supported"),
++            "{error}"
++        );
++    }
++}
++
+ #[tokio::test]
+ async fn flat_filter_binding_keeps_empty_explicit_segments() {
+     let batch = record_batch!(("id", Int32, [0]), ("text", Utf8, ["alpha beta"])).unwrap();
 diff --git a/rust/lance/src/io/exec/fts/match_query.rs b/rust/lance/src/io/exec/fts/match_query.rs
 index 756dde56e..f7ab95dc6 100644
 --- a/rust/lance/src/io/exec/fts/match_query.rs
