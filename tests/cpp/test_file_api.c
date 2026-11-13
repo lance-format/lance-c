@@ -389,6 +389,22 @@ static int verify_released_blob_v2_raw_file(const char *base_dir) {
                         (long long)descriptor_size_at(blob_a, 1),
                         (long long)descriptor_size_at(blob_a, 2),
                         (long long)blob_a->n_children);
+                fprintf(stderr,
+                        "detail: lengths a=%lld b=%lld p=%lld offsets=%lld,%lld,%lld "
+                        "n_buffers=%lld,%lld,%lld validity=%02x,%02x,%02x "
+                        "size_valid=%d,%d,%d size_null=%p\n",
+                        (long long)blob_a->length, (long long)blob_b->length,
+                        (long long)payload->length, (long long)blob_a->offset,
+                        (long long)blob_b->offset, (long long)payload->offset,
+                        (long long)blob_a->n_buffers, (long long)blob_b->n_buffers,
+                        (long long)payload->n_buffers,
+                        blob_a->buffers[0] ? ((const unsigned char *)blob_a->buffers[0])[0] : 0xff,
+                        blob_b->buffers[0] ? ((const unsigned char *)blob_b->buffers[0])[0] : 0xff,
+                        payload->buffers[0] ? ((const unsigned char *)payload->buffers[0])[0] : 0xff,
+                        struct_is_valid(blob_a->children[2], 0),
+                        struct_is_valid(blob_a->children[2], 1),
+                        struct_is_valid(blob_a->children[2], 2),
+                        blob_a->children[2]->buffers[0]);
             }
         }
         rows += (int)batch.length;
