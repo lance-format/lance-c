@@ -8,6 +8,10 @@
 # fts_last_as_prefix.rs, transported through Git.
 set -euo pipefail
 
+export RUSTUP_TOOLCHAIN=1.94.0
+export CARGO_BUILD_JOBS=8
+export RUST_TEST_THREADS=4
+
 src=${1:?lance source copy}
 artifacts=${2:?artifact dir}
 status=${3:?status file}
@@ -32,10 +36,20 @@ fi
 cp "$test_file" "$src/rust/lance/tests/fts_last_as_prefix.rs"
 
 log="$artifacts/oracle.log"
+metadata="$artifacts/oracle-environment.txt"
+{
+    printf 'source_head=%s\n' "$head"
+    printf 'RUSTUP_TOOLCHAIN=%s\n' "$RUSTUP_TOOLCHAIN"
+    printf 'CARGO_BUILD_JOBS=%s\n' "$CARGO_BUILD_JOBS"
+    printf 'RUST_TEST_THREADS=%s\n' "$RUST_TEST_THREADS"
+    cargo +1.94.0 --version
+    rustc +1.94.0 --version
+    sha256sum "$patch_file" "$test_file"
+} >"$metadata"
 set +e
 (
     cd "$src"
-    cargo test -p lance --test fts_last_as_prefix -- --test-threads=4
+    cargo +1.94.0 test --locked -p lance --test fts_last_as_prefix -- --test-threads=4
 ) 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}
 set -e
