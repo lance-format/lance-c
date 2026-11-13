@@ -278,7 +278,7 @@ case "$MODE" in
         ;;
     controls)
         run_controls
-        write_status PASS "negative-controls"
+        write_status PASS ""
         log_line "CONTROLS PASS $(date -Is)"
         ;;
     *)
