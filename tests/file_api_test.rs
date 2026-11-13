@@ -3348,7 +3348,7 @@ fn released_blob_v2_raw_file_reads_descriptor_children_through_c_api() {
         unsafe { lance_file_reader_get_metadata(reader, &mut metadata) },
         0
     );
-    let mut info = std::mem::zeroed::<LanceFileMetadataInfo>();
+    let mut info = unsafe { std::mem::zeroed::<LanceFileMetadataInfo>() };
     assert_eq!(
         unsafe { lance_file_metadata_get_info(metadata, &mut info) },
         0
@@ -3365,9 +3365,8 @@ fn released_blob_v2_raw_file_reads_descriptor_children_through_c_api() {
 
     // The decoded footer schema must be exactly what the native raw reader sees.
     let native = native_reader(uri);
-    let native_schema = native.schema();
-    assert_eq!(schema.fields(), native_schema.fields());
-    assert_eq!(schema.metadata(), native_schema.metadata());
+    let native_schema: Schema = native.file_schema.as_ref().into();
+    assert_eq!(schema, native_schema);
 
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(names, ["id", "blob_a", "blob_b", "info"]);
@@ -3491,7 +3490,7 @@ fn released_blob_v2_raw_file_reader_handles_survive_close() {
     unsafe { lance_file_reader_close(reader) };
 
     // Metadata and statistics are owned snapshots and stay usable.
-    let mut info = std::mem::zeroed::<LanceFileMetadataInfo>();
+    let mut info = unsafe { std::mem::zeroed::<LanceFileMetadataInfo>() };
     assert_eq!(
         unsafe { lance_file_metadata_get_info(metadata, &mut info) },
         0,

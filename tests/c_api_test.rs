@@ -55987,12 +55987,19 @@ fn test_fragment_create_preserves_native_schema_identity() {
 
 /// Shallow clones are published through the public Clone operation and the
 /// ordinary transaction commit. The source and target live in separate local
-/// store roots, so this pins that the returned handle reads source fragments
-/// through the cloned manifest's base path, that a later source append stays
-/// invisible to the pinned clone, that a reopened target still reads the shared
-/// data, and that a chained shallow clone keeps the original base path.
+/// directories served by the default local object store; a genuinely distinct
+/// `ObjectStore` instance, a remote store, or an explicit source base-store
+/// parameter is not expressible through the public C surface, so that boundary
+/// is documented rather than simulated.
+///
+/// The assertions pin the native reference semantics instead of trusting
+/// fragment ID equality alone: the clone records the source directory as its
+/// base path, the target directory holds metadata only (no copied data files),
+/// the returned handle reads the shared source data, a later source append
+/// stays invisible to the pinned clone, a reopened target still reads it, and a
+/// chained shallow clone keeps the original base path.
 #[test]
-fn shallow_clone_across_separate_local_stores_shares_source_data_through_c_api() {
+fn shallow_clone_across_separate_local_directories_reuse_source_data_through_c_api() {
     fn scan_ids(dataset: *const LanceDataset) -> Vec<i32> {
         let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
         assert!(!scanner.is_null(), "{}", take_last_error_message());
@@ -56017,6 +56024,92 @@ fn shallow_clone_across_separate_local_stores_shares_source_data_through_c_api()
         let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
         unsafe { lance_free_string(raw) };
         json
+    }
+
+    /// Data files are written under `<dataset>/data`. A shallow clone must
+    /// publish metadata only, so its own directory tree has no such files while
+    /// the source directory does.
+    fn data_files(dataset_uri: &str) -> Vec<String> {
+        fn walk(dir: &std::path::Path, files: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path
+                    .parent()
+                    .map(|parent| parent.ends_with("data"))
+                    .unwrap_or(false)
+                {
+                    files.push(path.display().to_string());
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(std::path::Path::new(dataset_uri), &mut files);
+        files.sort();
+        files
+    }
+
+    /// Base id to recorded base path. A shallow clone must route its fragment
+    /// data files through these entries instead of copying the files.
+    fn base_paths(json: &str) -> std::collections::HashMap<u32, String> {
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        parsed
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(id, entry)| {
+                (
+                    id.parse::<u32>().unwrap(),
+                    entry["path"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn data_file_references(dataset: *const LanceDataset) -> Vec<(String, Option<u32>)> {
+        let fragment_count = unsafe { lance_dataset_fragment_count(dataset) } as usize;
+        let mut fragment_ids = vec![0u64; fragment_count];
+        assert_eq!(
+            unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let mut references = Vec::new();
+        for fragment_id in fragment_ids {
+            let fragment = unsafe { lance_dataset_open_fragment(dataset, fragment_id) };
+            assert!(!fragment.is_null(), "{}", take_last_error_message());
+            let file_count = unsafe { lance_fragment_data_file_count(fragment) } as usize;
+            for index in 0..file_count {
+                let mut file: *mut LanceDataFile = ptr::null_mut();
+                assert_eq!(
+                    unsafe { lance_fragment_data_file_at(fragment, index, &mut file) },
+                    0,
+                    "{}",
+                    take_last_error_message()
+                );
+                let path = unsafe { CStr::from_ptr(lance_data_file_path(file)) }
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let mut has_base_id = false;
+                let mut base_id = 0u32;
+                assert_eq!(
+                    unsafe { lance_data_file_base_id(file, &mut has_base_id, &mut base_id) },
+                    0,
+                    "{}",
+                    take_last_error_message()
+                );
+                references.push((path, has_base_id.then_some(base_id)));
+                unsafe { lance_data_file_close(file) };
+            }
+            unsafe { lance_fragment_close(fragment) };
+        }
+        references
     }
 
     fn commit_shallow_clone(target_uri: &str, source_uri: &str, version: u64) -> *mut LanceDataset {
@@ -56047,6 +56140,10 @@ fn shallow_clone_across_separate_local_stores_shares_source_data_through_c_api()
     );
     let source_v1 = commit_native_transaction(&source_uri, created, ptr::null());
     let v1_fragments = native_typed_fragment_ids(source_v1);
+    let v1_data_files: Vec<String> = data_file_references(source_v1)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
     assert_eq!(unsafe { lance_dataset_version(source_v1) }, 1);
     unsafe { lance_dataset_close(source_v1) };
 
@@ -56056,9 +56153,17 @@ fn shallow_clone_across_separate_local_stores_shares_source_data_through_c_api()
         LanceWriteMode::Append,
         ptr::null(),
     );
+    let v1_data_files: Vec<String> = data_file_references(source_v1)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
     let source_v2 = commit_native_transaction(&source_uri, appended, ptr::null());
     assert_eq!(unsafe { lance_dataset_version(source_v2) }, 2);
     unsafe { lance_dataset_close(source_v2) };
+    assert!(
+        data_files(&source_uri).len() >= 2,
+        "source directory must hold the fragment data files"
+    );
 
     // 1. Publish a shallow clone at source version 1 into a different store root.
     let clone_uri = format!("{base}/clone_target/target.lance");
@@ -56073,12 +56178,33 @@ fn shallow_clone_across_separate_local_stores_shares_source_data_through_c_api()
     assert_eq!(
         native_typed_fragment_ids(cloned),
         v1_fragments,
-        "shallow clone shares the source fragments instead of copying them"
+        "shallow clone references the source fragment ids"
     );
-    let cloned_base_paths = base_paths_json(cloned);
+    let cloned_base_paths = base_paths(&base_paths_json(cloned));
+    let cloned_references = data_file_references(cloned);
+    assert_eq!(
+        cloned_references.len(),
+        v1_data_files.len(),
+        "clone must keep one reference per source data file"
+    );
+    for ((path, base_id), expected_path) in cloned_references.iter().zip(&v1_data_files) {
+        assert_eq!(
+            path, expected_path,
+            "clone must reuse the source data file path"
+        );
+        let base_id = base_id.expect("shallow clone data file must carry a base id");
+        let base_path = cloned_base_paths
+            .get(&base_id)
+            .unwrap_or_else(|| panic!("base id {base_id} is not declared: {cloned_base_paths:?}"));
+        assert!(
+            base_path.ends_with("clone_source/source.lance"),
+            "clone data file must resolve through the source directory, got {base_path}"
+        );
+    }
+    let copied_data_files = data_files(&clone_uri);
     assert!(
-        cloned_base_paths.contains(&source_uri),
-        "cloned manifest must record the source base path: {cloned_base_paths}"
+        copied_data_files.is_empty(),
+        "shallow clone must publish metadata only, found copied data files: {copied_data_files:?}"
     );
     unsafe { lance_dataset_close(cloned) };
 
@@ -56094,10 +56220,24 @@ fn shallow_clone_across_separate_local_stores_shares_source_data_through_c_api()
     let chained = commit_shallow_clone(&chain_uri, &clone_uri, 1);
     assert_eq!(unsafe { lance_dataset_version(chained) }, 1);
     assert_eq!(scan_ids(chained), vec![1, 2, 3]);
-    let chained_base_paths = base_paths_json(chained);
+    let chained_base_paths = base_paths(&base_paths_json(chained));
+    let chained_references = data_file_references(chained);
+    assert_eq!(chained_references.len(), v1_data_files.len());
+    for ((path, base_id), expected_path) in chained_references.iter().zip(&v1_data_files) {
+        assert_eq!(path, expected_path);
+        let base_id = base_id.expect("chained clone data file must carry a base id");
+        let base_path = chained_base_paths
+            .get(&base_id)
+            .unwrap_or_else(|| panic!("base id {base_id} is not declared: {chained_base_paths:?}"));
+        assert!(
+            base_path.ends_with("clone_source/source.lance"),
+            "chained clone must inherit the original source base path, got {base_path}"
+        );
+    }
+    let chained_data_files = data_files(&chain_uri);
     assert!(
-        chained_base_paths.contains(&source_uri),
-        "chained clone must inherit the original base path: {chained_base_paths}"
+        chained_data_files.is_empty(),
+        "chained shallow clone must publish metadata only, found copied data files: {chained_data_files:?}"
     );
     unsafe { lance_dataset_close(chained) };
 
