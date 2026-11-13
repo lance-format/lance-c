@@ -518,7 +518,7 @@ The batch API does not guarantee shared execution or a particular speedup.
 ## Building
 
 There are four supported entry points; pick whichever matches your toolchain.
-Building this source tree requires Rust 1.94.0 or newer. The `from-source`
+Building this source tree requires Rust 1.95.0 or newer. The `from-source`
 recipes fetch the v0.1.9 tag, whose `Cargo.toml` declares
 `rust-version = "1.91.0"`. Prebuilt archives do not require a Rust toolchain.
 
@@ -742,7 +742,7 @@ The Windows package link is restricted through a wrapper around MSVC
 `link.exe`. Overriding the linker with `lld-link` is not supported for this
 export policy.
 
-Windows CI builds this layout with Rust 1.94.0. The x64 job uses
+Windows CI builds this layout with Rust 1.95.0. The x64 job uses
 `windows-2022`. The ARM64 job uses `windows-11-arm` and asserts that the
 runner, PowerShell process, and Rust host are native ARM64. Each job verifies
 the PE32+ machine, public `lance_*` exports, absence of redistributable CRT

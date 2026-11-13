@@ -25,6 +25,7 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -3906,6 +3907,96 @@ static void test_merge_and_batch_udf(const std::string& dst_uri) {
     ds.schema(&schema_after_udf);
     assert(schema_after_udf.n_children == fields_before + 3);
     schema_after_udf.release(&schema_after_udf);
+
+    // Schema-aware checkpoint replay: the first call stores one batch
+    // checkpoint and throws before persisting the fragment checkpoint; the
+    // second call must restore that batch from its array plus native schema and
+    // skip the mapper for it.
+    ArrowSchema udf_v2_column{};
+    ArrowSchema* udf_v2_children[1] = {&udf_v2_column};
+    udf_v2_column.format = "l";
+    udf_v2_column.name = "c_udf_cpp_v2";
+    udf_v2_column.flags = ARROW_FLAG_NULLABLE;
+    udf_v2_column.release = test_noop_schema_release;
+    ArrowSchema udf_v2_schema{};
+    udf_v2_schema.format = "+s";
+    udf_v2_schema.n_children = 1;
+    udf_v2_schema.children = udf_v2_children;
+    udf_v2_schema.release = test_noop_schema_release;
+
+    struct StoredV2Batch {
+        ArrowArray array{};
+        ArrowSchema schema{};
+    };
+    std::map<std::pair<uint32_t, std::size_t>, StoredV2Batch> v2_batches;
+    std::atomic<int> v2_mapper_calls{0};
+    std::atomic<int> v2_batch_hits{0};
+    std::atomic<int> v2_insert_fragment_calls{0};
+    std::atomic<bool> v2_interrupt_once{true};
+
+    lance::UDFCheckpointStoreV2 store_v2;
+    store_v2.get_batch = [&](const lance::BatchUDFInfo& info, ArrowArray& out,
+                             ArrowSchema& out_schema) {
+        auto entry = v2_batches.find({info.fragment_id, info.batch_index});
+        if (entry == v2_batches.end()) {
+            return false;
+        }
+        out = entry->second.array;
+        out_schema = entry->second.schema;
+        v2_batches.erase(entry);
+        v2_batch_hits.fetch_add(1);
+        return true;
+    };
+    store_v2.insert_batch = [&](const lance::BatchUDFInfo& info, ArrowArray& batch,
+                                ArrowSchema& batch_schema) {
+        v2_batches[{info.fragment_id, info.batch_index}] =
+            StoredV2Batch{batch, batch_schema};
+        batch.release = nullptr;
+        batch_schema.release = nullptr;
+    };
+    store_v2.get_fragment = [](uint32_t) -> std::optional<std::string> {
+        return std::nullopt;
+    };
+    store_v2.insert_fragment = [&](uint64_t, const std::string&) {
+        if (v2_interrupt_once.exchange(false)) {
+            throw std::runtime_error("interrupted before the fragment checkpoint");
+        }
+        v2_insert_fragment_calls.fetch_add(1);
+    };
+
+    auto make_udf_v2 = [&]() {
+        lance::BatchUDFV2 udf_v2;
+        udf_v2.output_schema = &udf_v2_schema;
+        udf_v2.mapper = [&](const ArrowArray& input, const ArrowSchema&, ArrowArray& out) {
+            v2_mapper_calls.fetch_add(1);
+            auto* batch = new CppInt64Batch(input.length, 13000);
+            out = batch->top;
+        };
+        udf_v2.checkpoint_store = store_v2;
+        return udf_v2;
+    };
+
+    const uint64_t v2_version = ds.version();
+    bool v2_seed_failed = false;
+    try {
+        auto seed = make_udf_v2();
+        ds.add_columns_batch_udf(seed, std::vector<std::string>{});
+    } catch (const lance::Error&) {
+        v2_seed_failed = true;
+    }
+    assert(v2_seed_failed);
+    assert(ds.version() == v2_version);
+    assert(!v2_batches.empty());
+
+    const int v2_seed_mapper_calls = v2_mapper_calls.load();
+    auto resume = make_udf_v2();
+    ds.add_columns_batch_udf(resume, std::vector<std::string>{});
+    assert(ds.version() > v2_version);
+    assert(v2_insert_fragment_calls.load() > 0);
+    // The stored schema carries native's checkpoint marker, so the resume must
+    // restore the cached batch instead of mapping it again.
+    assert(v2_batch_hits.load() > 0);
+    assert(v2_mapper_calls.load() == v2_seed_mapper_calls);
 
     PASS();
 }

@@ -39,7 +39,8 @@ use lance::dataset::mem_wal::scanner::{
     LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr,
 };
-use lance::dataset::mem_wal::write::{SharedWriteStats, WriteStatsSnapshot};
+use lance::dataset::mem_wal::write::WriteStatsSnapshot;
+use lance::dataset::mem_wal::write::stats::SharedWriteStats;
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, ShardWriterConfig,
     arrow_schema_with_field_ids, evaluate_sharding_spec,
@@ -323,6 +324,18 @@ fn get_pk_columns(dataset: &Dataset) -> lance_core::Result<Vec<String>> {
     Ok(fields.iter().map(|field| field.name.clone()).collect())
 }
 
+/// Directory identifier of the dataset's MemWAL layout.
+///
+/// An empty string is the legacy `_mem_wal` layout. Native scanners and
+/// planners default to that legacy value, so every binding constructor must
+/// pass the dataset's actual identifier or reads resolve against the wrong
+/// directory.
+fn mem_wal_dir_id(dataset: &Dataset) -> lance_core::Result<String> {
+    Ok(block_on(dataset.mem_wal_index_details())?
+        .map(|details| details.dir_id)
+        .unwrap_or_default())
+}
+
 fn write_ffi_schema(out: *mut FFI_ArrowSchema, schema: &ArrowSchema) -> lance_core::Result<()> {
     if out.is_null() {
         return Err(invalid("out must not be NULL"));
@@ -398,6 +411,7 @@ fn snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -> Shar
 pub struct LanceMemWalIndexDetails {
     num_shards: u32,
     maintain_all: bool,
+    dir_id: CString,
     maintained: Vec<CString>,
     specs: Vec<ShardingSpec>,
     defaults: Vec<(CString, CString)>,
@@ -430,6 +444,7 @@ impl LanceMemWalIndexDetails {
         Ok(Self {
             num_shards: details.num_shards,
             maintain_all: details.maintain_all_indexes,
+            dir_id: cstring(&details.dir_id, "MemWAL dir_id")?,
             maintained,
             specs: details.sharding_specs,
             defaults,
@@ -594,6 +609,17 @@ pub unsafe extern "C" fn lance_mem_wal_index_details_num_shards(
     details: *const LanceMemWalIndexDetails,
 ) -> u32 {
     ffi_try!(Ok(details_ref(details)?.num_shards), 0)
+}
+
+/// Borrow the MemWAL state directory identifier.
+///
+/// An empty string denotes the legacy `_mem_wal` directory. The value remains
+/// valid until the details handle is freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_mem_wal_index_details_dir_id(
+    details: *const LanceMemWalIndexDetails,
+) -> *const c_char {
+    ffi_try!(Ok(details_ref(details)?.dir_id.as_ptr()), null)
 }
 
 #[unsafe(no_mangle)]
@@ -1749,6 +1775,7 @@ unsafe fn writer_lsm_scanner_inner(
         combined,
         get_pk_columns(&writer.dataset)?,
     )
+    .with_mem_wal_dir_id(live.config().dir_id.clone())
     .with_in_memory_memtables(writer.shard_id, refs);
     unsafe { *out = Box::into_raw(Box::new(LanceLsmScanner::new(scanner))) };
     Ok(0)
@@ -1852,7 +1879,9 @@ pub unsafe extern "C" fn lance_lsm_scanner_from_snapshots(
             let snapshots = snapshots_from_c(snapshots, num_snapshots)?;
             let snapshot = dataset.snapshot();
             let pk_columns = get_pk_columns(&snapshot)?;
-            let scanner = LsmScanner::new(snapshot, snapshots, pk_columns);
+            let dir_id = mem_wal_dir_id(&snapshot)?;
+            let scanner =
+                LsmScanner::new(snapshot, snapshots, pk_columns).with_mem_wal_dir_id(dir_id);
             *out = Box::into_raw(Box::new(LanceLsmScanner::new(scanner)));
             Ok(0)
         },
@@ -2098,7 +2127,9 @@ pub unsafe extern "C" fn lance_lsm_point_lookup_planner_new(
             };
             let base_schema = Arc::new(ArrowSchema::from(native.schema()));
             let identity_schema = Arc::new(arrow_schema_with_field_ids(native.schema()));
-            let collector = LsmDataSourceCollector::new(native.clone(), snapshots);
+            let dir_id = mem_wal_dir_id(&native)?;
+            let collector =
+                LsmDataSourceCollector::new(native.clone(), snapshots).with_mem_wal_dir_id(dir_id);
             let planner =
                 LsmPointLookupPlanner::new(collector, pk_columns.clone(), base_schema.clone())?
                     .with_identity_schema(identity_schema);
@@ -2330,7 +2361,8 @@ unsafe fn vector_planner_new_inner(
         Some(filter) => Some(parse_filter_expr(base_schema.as_ref(), &filter)?),
         None => None,
     };
-    let collector = LsmDataSourceCollector::new(native.clone(), snapshots);
+    let collector = LsmDataSourceCollector::new(native.clone(), snapshots)
+        .with_mem_wal_dir_id(mem_wal_dir_id(&native)?);
     let planner = LsmVectorSearchPlanner::new(
         collector,
         pk_columns,

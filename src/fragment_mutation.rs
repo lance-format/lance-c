@@ -21,7 +21,9 @@ use lance_file::version::ConcreteFileVersion;
 use lance_table::format::Fragment;
 
 use crate::add_columns::{LanceSqlColumn, parse_sql_columns};
-use crate::batch_udf::{LanceBatchUDF, batch_udf_transform};
+use crate::batch_udf::{
+    LanceBatchUDF, LanceBatchUDFV2, batch_udf_transform, batch_udf_transform_v2,
+};
 use crate::error::{ffi_try, swallow_unwind};
 use crate::fragment::{LanceFragment, fragment_ref};
 use crate::helpers;
@@ -246,9 +248,41 @@ pub unsafe extern "C" fn lance_fragment_add_columns_batch_udf(
 ) -> i32 {
     ffi_try!(
         unsafe {
+            let transform = batch_udf_transform(udf)?;
             fragment_add_columns_batch_udf_inner(
                 fragment,
-                udf,
+                transform,
+                read_columns,
+                batch_size,
+                out_fragment,
+                out_schema,
+            )
+        },
+        neg
+    )
+}
+
+/// Add columns through a borrowed schema-aware BatchUDF declaration.
+///
+/// Identical to `lance_fragment_add_columns_batch_udf` except that batch
+/// checkpoints are restored from an owned ArrowArray plus the schema that
+/// carries native schema metadata. The original array-only entry keeps its ABI
+/// and native rejection of markerless batch hits.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_fragment_add_columns_batch_udf_v2(
+    fragment: *const LanceFragment,
+    udf: *const LanceBatchUDFV2,
+    read_columns: *const *const c_char,
+    batch_size: *const u32,
+    out_fragment: *mut *mut LanceFragment,
+    out_schema: *mut *mut LanceSchema,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            let transform = batch_udf_transform_v2(udf)?;
+            fragment_add_columns_batch_udf_inner(
+                fragment,
+                transform,
                 read_columns,
                 batch_size,
                 out_fragment,
@@ -261,7 +295,7 @@ pub unsafe extern "C" fn lance_fragment_add_columns_batch_udf(
 
 unsafe fn fragment_add_columns_batch_udf_inner(
     fragment: *const LanceFragment,
-    udf: *const LanceBatchUDF,
+    transform: NewColumnTransform,
     read_columns: *const *const c_char,
     batch_size: *const u32,
     out_fragment: *mut *mut LanceFragment,
@@ -269,7 +303,6 @@ unsafe fn fragment_add_columns_batch_udf_inner(
 ) -> Result<i32> {
     let fragment = unsafe { fragment_ref(fragment) }?;
     require_fragment_schema_outputs(out_fragment, out_schema)?;
-    let transform = unsafe { batch_udf_transform(udf)? };
     let read_columns = unsafe { helpers::parse_c_string_array(read_columns)? };
     let (updated, schema) = block_on(fragment.bound()?.add_columns(
         transform,

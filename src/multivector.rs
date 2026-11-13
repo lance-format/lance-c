@@ -12,11 +12,13 @@ use arrow_array::{
     RecordBatch, UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-    stream::RecordBatchStreamAdapter,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
+    InputDistributionRequirements, PhysicalExpr, PlanProperties, ReplaceChildrenOptions,
+    SendableRecordBatchStream, replace_children_if_necessary, stream::RecordBatchStreamAdapter,
 };
 use futures::{StreamExt, TryStreamExt, stream};
 use lance::io::exec::KNNVectorDistanceExec;
@@ -41,7 +43,7 @@ pub(crate) fn rewrite(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionP
     let plan = if children.is_empty() {
         plan
     } else {
-        plan.with_new_children(children)?
+        replace_children_if_necessary(plan, children)?
     };
     let mode = if let Some(exact) = plan.downcast_ref::<KNNVectorDistanceExec>() {
         if exact.is_batch {
@@ -90,7 +92,7 @@ pub(crate) fn apply_result_window(
         // outside the window, preserving its resolved batch size, including defaults.
         let input =
             apply_result_window(plan.children()[0].clone(), offset, limit, distance_column)?;
-        return plan.with_new_children(vec![input]);
+        return replace_children_if_necessary(plan, vec![input]);
     }
     let sort = PhysicalSortExpr {
         expr: expressions::col(distance_column, plan.schema().as_ref())?,
@@ -140,17 +142,34 @@ impl ExecutionPlan for MultiVectorScoreExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.original.children()
     }
-    fn required_input_distribution(&self) -> Vec<datafusion::physical_expr::Distribution> {
-        self.original.required_input_distribution()
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        self.original.apply_expressions(f)
     }
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        self.original.input_distribution_requirements()
+    }
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            original: self.original.clone().replace_children(children, options)?,
+            mode: self.mode.clone(),
+        }))
+    }
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self {
-            original: self.original.clone().with_new_children(children)?,
-            mode: self.mode.clone(),
-        }))
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
     fn execute(
         &self,
@@ -230,7 +249,9 @@ where
         ));
     }
     let dimension = vectors.value_length() as usize;
-    let distance = metric.func();
+    let distance = metric
+        .try_func::<<T as ArrowPrimitiveType>::Native>()
+        .map_err(|error| invalid(format!("unsupported distance metric: {error}")))?;
     // Subtracting each small distance from 1 rounds it away before TopK. Sum minima
     // directly, using f64 only for the accumulator; the base kernels and output remain f32.
     let mut score = 0.0f64;

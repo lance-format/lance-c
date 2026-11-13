@@ -923,7 +923,10 @@ mod tests {
                 "guarded_in_memory_rejects_nul_schema_before_callback_exposure",
                 CHILD,
             );
-            assert!(stderr.contains("NulError"));
+            assert!(
+                !stderr.contains("panicked"),
+                "NUL schema preflight must reject without panicking:\n{stderr}"
+            );
             return;
         }
 
@@ -939,8 +942,13 @@ mod tests {
 
         let result = guarded_ffi_stream_from_reader(reader);
         let error = result.expect_err("invalid schema must fail before export");
+        // Arrow 59 reports NUL field names as a C Data interface error instead
+        // of panicking inside `FFI_ArrowSchema::try_from`. The rejection still
+        // happens during preflight, before any callback is exposed.
         assert!(
-            error.to_string().contains("panic exporting Arrow schema"),
+            error
+                .to_string()
+                .contains("Null byte at position 5 not allowed in name"),
             "got: {error}"
         );
     }

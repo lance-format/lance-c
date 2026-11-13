@@ -1650,6 +1650,18 @@ fn test_native_data_overlay_consumers() {
 fn test_raw_file_native_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
     let base = tempfile::tempdir().unwrap();
+    // The raw-file consumers read the released 14.0.2 Blob v2 fixture from the
+    // scratch directory they already receive as argv[1].
+    let fixture_dir = base.path().join("blob_v2_raw_reader");
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    std::fs::write(
+        fixture_dir.join("blob_v2_raw.lance"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/v14.0.2/blob_v2_raw_reader/blob_v2_raw.lance"
+        )),
+    )
+    .unwrap();
     let base_path = base.path().to_str().unwrap();
     let build_dir = tempfile::tempdir().unwrap();
     let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

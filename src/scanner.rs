@@ -18,6 +18,7 @@ use datafusion::physical_expr::expressions;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{
     ExecutionPlan, empty::EmptyExec, projection::ProjectionExec as DFProjectionExec,
+    replace_children_if_necessary,
 };
 use futures::{FutureExt, Stream, StreamExt};
 use lance::Dataset;
@@ -26,7 +27,9 @@ use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
     ExecutionSummaryCounts, MaterializationStyle, RowAddrMask, RowAddrTreeMap,
 };
-use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
+use lance::io::exec::fts::{
+    FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorerExec,
+};
 use lance_core::Result;
 use lance_core::datatypes::{BlobHandling, escape_field_path_for_project};
 use lance_datafusion::exec::{
@@ -1380,6 +1383,27 @@ fn rewrite_prepared_fts_plan(
     selected_segments_have_current_fragments: bool,
     row_addr_mask: Option<&Arc<RowAddrMask>>,
 ) -> Result<(Arc<dyn ExecutionPlan>, PreparedFtsPlanRewriteCounts)> {
+    // A prepared scan always replaces the flat branch with EmptyExec, so the
+    // v15 corpus owner has no producer left to coordinate with. Drop the owner
+    // and keep the rebuilt indexed leaf, which already carries the prepared
+    // corpus-wide scorer.
+    if plan.downcast_ref::<SharedFtsScorerExec>().is_some() {
+        let children = plan.children();
+        let [input] = children.as_slice() else {
+            return Err(lance_core::Error::internal(format!(
+                "prepared FTS corpus owner must have exactly one input, got {}",
+                children.len()
+            )));
+        };
+        return rewrite_prepared_fts_plan(
+            Arc::clone(input),
+            segments,
+            prepared,
+            selected_segments_have_current_fragments,
+            row_addr_mask,
+        );
+    }
+
     // Lance's ordinary FTS planner adds a flat-search branch for fragments not
     // covered by the logical index. A prepared INDEX_ONLY scan must omit that
     // branch, but using Scanner::with_fragments to do so would turn an
@@ -1412,7 +1436,7 @@ fn rewrite_prepared_fts_plan(
             rewritten.indexed_query_execs += child_rewritten.indexed_query_execs;
             rewritten.flat_match_query_execs += child_rewritten.flat_match_query_execs;
         }
-        plan.with_new_children(new_children).map_err(|error| {
+        replace_children_if_necessary(plan, new_children).map_err(|error| {
             lance_core::Error::internal(format!(
                 "failed to rebuild FTS execution plan children: {error}"
             ))

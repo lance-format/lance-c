@@ -456,11 +456,27 @@ static void test_reversed_and_unsupported(const char *history_uri,
     ASSERT(message != NULL && strstr(message, "stable row ids") != NULL,
            "native stable-row-id error surfaces");
     lance_free_string(message);
-    /* Row-change streams stay available on the same delta, but they filter on
-     * row-version lineage, which a write without stable row ids does not
-     * record, so a plain dataset reports no changes. */
-    stream = inserted_rows(delta);
-    assert_i32_set("plain inserted", &stream, NULL, 0);
+    /* v15 requires stable row ids for every row-change stream, not only for
+     * deleted ids, so inserted/updated/upserted all reject this dataset. */
+    const char *row_change_errors[] = {
+        "plain inserted rejects missing stable row ids",
+        "plain updated rejects missing stable row ids",
+        "plain upserted rejects missing stable row ids",
+    };
+    for (int kind = 0; kind < 3; kind++) {
+        memset(&stream, 0, sizeof(stream));
+        int32_t rc = kind == 0   ? lance_dataset_delta_get_inserted_rows(delta, &stream)
+                     : kind == 1 ? lance_dataset_delta_get_updated_rows(delta, &stream)
+                                 : lance_dataset_delta_get_upserted_rows(delta, &stream);
+        ASSERT(rc != 0, row_change_errors[kind]);
+        ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+               "missing stable row ids is invalid input");
+        const char *row_change_message = lance_last_error_message();
+        ASSERT(row_change_message != NULL &&
+                   strstr(row_change_message, "stable row ids") != NULL,
+               "native stable-row-id error surfaces for row changes");
+        lance_free_string(row_change_message);
+    }
     lance_dataset_delta_close(delta);
     lance_dataset_close(dataset);
 }
