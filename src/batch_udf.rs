@@ -524,7 +524,7 @@ impl UDFCheckpointStore for FfiCheckpointStore {
         let (mut array, mut schema) = export_batch(&batch)?;
         let mut error = LanceCallbackError::empty();
         let callback = self
-            .store
+            .callbacks
             .insert_batch
             .expect("validated checkpoint insert_batch callback");
         // SAFETY: both Arrow values are initialized owned payloads. The
@@ -533,7 +533,7 @@ impl UDFCheckpointStore for FfiCheckpointStore {
         // after the callback returns on every path.
         let status = tokio::task::block_in_place(|| unsafe {
             callback(
-                self.store.callback_ctx,
+                self.callbacks.callback_ctx,
                 &info,
                 &mut array,
                 &mut schema,
@@ -555,13 +555,13 @@ impl UDFCheckpointStore for FfiCheckpointStore {
         let mut out_json = LanceOwnedString::empty();
         let mut error = LanceCallbackError::empty();
         let callback = self
-            .store
+            .callbacks
             .get_fragment
             .expect("validated checkpoint get_fragment callback");
         // SAFETY: the callback table and context are valid for this call.
         let status = tokio::task::block_in_place(|| unsafe {
             callback(
-                self.store.callback_ctx,
+                self.callbacks.callback_ctx,
                 fragment_id,
                 &mut out_json,
                 &mut error,
@@ -608,13 +608,13 @@ impl UDFCheckpointStore for FfiCheckpointStore {
         })?;
         let mut error = LanceCallbackError::empty();
         let callback = self
-            .store
+            .callbacks
             .insert_fragment
             .expect("validated checkpoint insert_fragment callback");
         // SAFETY: `json` remains alive and is borrowed for the callback only.
         let status = tokio::task::block_in_place(|| unsafe {
             callback(
-                self.store.callback_ctx,
+                self.callbacks.callback_ctx,
                 fragment_id,
                 json.as_ptr(),
                 &mut error,
@@ -794,7 +794,9 @@ unsafe fn import_checkpoint_batch(
     // callback returned, even when a later check rejects the payload.
     let array = unsafe { FFI_ArrowArray::from_raw(output) };
     let exported = unsafe { FFI_ArrowSchema::from_raw(output_schema) };
-    if exported.is_released() {
+    // `FFI_ArrowSchema` has no `is_released` helper; an empty slot leaves the
+    // release callback cleared, which also means it owns nothing to drop.
+    if exported.release.is_none() {
         return Err(Error::invalid_input_source(
             format!("{context} did not return an owned ArrowSchema").into(),
         ));
