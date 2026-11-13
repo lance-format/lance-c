@@ -75,12 +75,30 @@ unsafe fn property(transaction: *const LanceTransaction, wanted: &str) -> String
     panic!("missing transaction property {wanted}");
 }
 
+unsafe fn count_rows(dataset: *const LanceDataset, filter: Option<&CStr>) -> u64 {
+    let rows = unsafe {
+        match filter {
+            Some(filter) => lance_dataset_count_rows_filtered(dataset, filter.as_ptr()),
+            None => lance_dataset_count_rows(dataset),
+        }
+    };
+    assert_eq!(
+        unsafe { lance_last_error_code() },
+        LanceErrorCode::Ok,
+        "count rows: {}",
+        last_error()
+    );
+    rows
+}
+
 unsafe fn assert_transaction(
     transaction: *const LanceTransaction,
     read_version: u64,
     uuid: &str,
     tag: &str,
     stage: &str,
+    expected_kind: LanceOperationKind,
+    expected_append_fragments: Option<u64>,
 ) {
     assert!(!transaction.is_null());
     let mut actual_read_version = u64::MAX;
@@ -122,15 +140,17 @@ unsafe fn assert_transaction(
         "{}",
         last_error()
     );
-    assert_eq!(kind, LanceOperationKind::Append);
-    let mut fragments = 0_u64;
-    assert_eq!(
-        unsafe { lance_operation_append_fragment_count(operation, &mut fragments) },
-        0,
-        "{}",
-        last_error()
-    );
-    assert_eq!(fragments, 1);
+    assert_eq!(kind, expected_kind);
+    if let Some(expected_fragments) = expected_append_fragments {
+        let mut fragments = 0_u64;
+        assert_eq!(
+            unsafe { lance_operation_append_fragment_count(operation, &mut fragments) },
+            0,
+            "{}",
+            last_error()
+        );
+        assert_eq!(fragments, expected_fragments);
+    }
     unsafe { lance_operation_close(operation) };
 }
 
@@ -164,9 +184,24 @@ fn core14_attached_and_detached_transactions_read_back() {
 
     unsafe {
         let dataset = open(&uri, 0);
+        // The attached transaction is created with `LANCE_WRITE_CREATE`, so the
+        // persisted native operation is `Overwrite`, not `Append`.
         let current = read_transaction(dataset);
-        assert_transaction(current, 0, ATTACHED_UUID, "core14-attached", "attached");
+        assert_transaction(
+            current,
+            0,
+            ATTACHED_UUID,
+            "core14-attached",
+            "attached",
+            LanceOperationKind::Overwrite,
+            None,
+        );
         lance_transaction_close(current);
+
+        // The persisted data files must remain readable through the C API.
+        assert_eq!(unsafe { count_rows(dataset, None) }, 2);
+        let id_one = CString::new("id = 1").unwrap();
+        assert_eq!(unsafe { count_rows(dataset, Some(&id_one)) }, 1);
 
         let mut by_version = std::ptr::null_mut();
         assert_eq!(
@@ -175,7 +210,15 @@ fn core14_attached_and_detached_transactions_read_back() {
             "{}",
             last_error()
         );
-        assert_transaction(by_version, 0, ATTACHED_UUID, "core14-attached", "attached");
+        assert_transaction(
+            by_version,
+            0,
+            ATTACHED_UUID,
+            "core14-attached",
+            "attached",
+            LanceOperationKind::Overwrite,
+            None,
+        );
         lance_transaction_close(by_version);
         lance_dataset_close(dataset);
 
@@ -187,8 +230,15 @@ fn core14_attached_and_detached_transactions_read_back() {
             DETACHED_UUID,
             "core14-detached",
             "detached",
+            LanceOperationKind::Append,
+            Some(1),
         );
         lance_transaction_close(detached_transaction);
+
+        // The detached manifest appends two rows to the attached version.
+        assert_eq!(unsafe { count_rows(detached, None) }, 4);
+        let id_two = CString::new("id = 2").unwrap();
+        assert_eq!(unsafe { count_rows(detached, Some(&id_two)) }, 2);
         lance_dataset_close(detached);
     }
 }
