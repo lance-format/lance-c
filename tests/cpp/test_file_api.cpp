@@ -647,31 +647,23 @@ int main(int argc, char **argv) {
             std::vector<std::string>{"blob_b", "info.payload"};
         auto projected = blob_session.open_reader(
             "blob_v2_raw_reader/blob_v2_raw.lance", blob_projection);
-        const auto projected_metadata = projected.metadata();
-        const auto projected_schema = projected_metadata.schema();
-        CHECK(projected_schema.get()->n_children == 2,
-              "released Blob v2 projected fields");
-        CHECK(std::strcmp(projected_schema.get()->children[0]->name,
-                          "blob_b") == 0,
-              "released Blob v2 projected top-level field");
-        CHECK(std::strcmp(projected_schema.get()->children[1]->name, "info") ==
-                      0 &&
-                  projected_schema.get()->children[1]->n_children == 1,
-              "released Blob v2 projected nested field");
-        CHECK(blob_descriptor_schema(
-                  projected_schema.get()->children[1]->children[0],
-                  "projected info.payload"),
-              "released Blob v2 projected descriptor");
         auto projected_stream = projected.read_all(3, 2);
         projected.reset();
-        ArrowSchema stream_schema{};
-        const bool projected_shape =
+        ArrowSchema projected_schema{};
+        const bool projected_ok =
             projected_stream->get_schema(projected_stream.get(),
-                                         &stream_schema) == 0 &&
-            std::strcmp(stream_schema.format, "+s") == 0 &&
-            stream_schema.n_children == 2;
-        if (stream_schema.release) stream_schema.release(&stream_schema);
-        CHECK(projected_shape, "released Blob v2 projected stream schema");
+                                         &projected_schema) == 0 &&
+            std::strcmp(projected_schema.format, "+s") == 0 &&
+            projected_schema.n_children == 2 &&
+            std::strcmp(projected_schema.children[0]->name, "blob_b") == 0 &&
+            std::strcmp(projected_schema.children[1]->name, "info") == 0 &&
+            projected_schema.children[1]->n_children == 1 &&
+            std::strcmp(projected_schema.children[1]->children[0]->name,
+                        "payload") == 0 &&
+            blob_descriptor_schema(projected_schema.children[1]->children[0],
+                                   "projected info.payload");
+        if (projected_schema.release) projected_schema.release(&projected_schema);
+        CHECK(projected_ok, "released Blob v2 projected stream schema");
     }
 
     return failures == 0 ? 0 : 1;
