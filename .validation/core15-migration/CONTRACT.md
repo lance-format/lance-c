@@ -1,8 +1,12 @@
-# Official core 15 migration candidate
+# Official core 15 migration and beta20 adoption
 
-The user authorized an isolated candidate and acceptance on 2026-11-13.
-This contract does not authorize merging the migration, publishing upstream
-Lance, changing downstream Go modules, or lifting the whole-PR #149 hold.
+The user initially authorized an isolated candidate and acceptance on
+2026-11-13. A later explicit instruction authorizes updating that accepted
+candidate to official beta20 and proceeding through the existing lance-c
+ready-PR and merge workflow after acceptance. This supersedes the earlier
+preparation-only restriction and pending beta19 adoption discussion.
+It does not authorize publishing upstream Lance or lance-c packages,
+changing downstream Go modules, or lifting the whole-PR #149 hold.
 Do not edit, rebase, comment on, merge, or cherry-pick #149. PRs #50/#68
 remain author-owned. No native fork or backport is part of this work.
 
@@ -11,12 +15,16 @@ remain author-owned. No native fork or backport is part of this work.
 - Product source: current main `07df7bdf87d633c744ed15b9b62b1abb3a60418f`.
 - Existing native: Lance 14.0.2 at
   `40f15ed1b71b66950961b175829fdf17a763f108`; current MSRV 1.94.
-- Authorized official candidate: `v15.0.0-beta.19`, immutable commit
-  `98f84091db531775ab03fa7edb3d34c86937fbf5`; proposed MSRV 1.95.
+- Accepted starting candidate: `ec058b4817c043c9d5d65f2d73baa506438e4688`,
+  with beta19 runtime artifacts retained at C source `c8e07c0`.
+- Authorized official target: `v15.0.0-beta.20`, immutable commit
+  `86fff5f40f299a2ff6abb0c10210451f27e605eb`; MSRV 1.95.
+- Previous candidate pin: `98f84091db531775ab03fa7edb3d34c86937fbf5`.
+  Preserve the accepted beta19 evidence under its original identities.
 - The upstream-declared build toolchain 1.98.1 is distinct from its stated
   minimum 1.95. Passing on 1.98.1 must not be labeled 1.95 acceptance.
 
-Prepare a normal separate lance-c candidate branch from these product inputs.
+Continue the existing isolated lance-c candidate from these product inputs.
 Update related native dependency revisions coherently, make only necessary
 lockfile changes, and adapt the existing thin wrappers to the changed native
 APIs, including TransactionV2 and lance-geo where required. Preserve public
@@ -31,6 +39,30 @@ relaxing expectations or building C-only semantics. A native incompatibility
 may prevent acceptance even when compilation succeeds.
 
 ## Acceptance
+
+For beta20, inspect the actual beta19-to-beta20 dependency changes rather
+than assuming that the release contains only the two blocker fixes. Reuse
+unchanged evidence and fixtures; justify any broader integration selection
+by the changed reader, encoding, dataset, index or dependency surfaces.
+
+Required incremental behavior:
+
+- Exercise the released 14.0.2 Blob fixture through native raw-reader and
+  existing public C/C++ raw-reader entry points. Check default and explicit
+  projection, descriptors, null and empty values, and ownership across
+  multiple Blob columns. Do not substitute a dataset scanner for raw-reader
+  acceptance or infer a language binding pass from a native-only result.
+- Exercise shallow clone with separate source and target stores, reading
+  shared data through the returned handle, publication at the target,
+  reopening with explicit source parameters, and chained-clone lifetimes.
+  Use only capabilities actually exposed by the current binding. If a
+  required storage option is not exposed, record that boundary precisely;
+  do not add a C-only mechanism or claim an unexecuted public path passed.
+- Preserve the real core14 attached/detached transaction fixture and public
+  C readback. No arbitrary cross-core transaction wire guarantee is added.
+- Namespace refresh has only offline real-I/O evidence upstream. Do not
+  claim real cloud credentials, Python/Java publication, or platform-wide
+  acceptance. A fresh process still needs explicit source parameters.
 
 Use existing project verification paths on NieR with Git-transferred source,
 mbx default build/cache storage, bounded jobs (8) and test threads (4).
@@ -54,10 +86,11 @@ If Rust1.95 fails, diagnose the exact dependency/compiler requirement and
 retain the failure; do not substitute another toolchain for the promised
 acceptance or silently raise the proposed minimum. Continue independent
 source preparation where possible. Keep normal commits and push the candidate
-within lance-c; no amend/rebase/reset/force-push. Do not create or merge a PR
-for this restricted migration without coordinator acceptance and the separate
-adoption decision. Return a concrete diff, actual evidence, compatibility
-findings and remaining gates to the coordinator.
+within lance-c; no amend/rebase/reset/force-push. The coordinator owns ready-PR
+creation and merge after independent source review, execution acceptance and
+normal hosted CI. No further adoption permission is needed for this beta20
+update. Return concrete source and artifact identities, actual evidence,
+compatibility findings and actionable remaining gaps to the coordinator.
 
 ## Downstream routing
 
