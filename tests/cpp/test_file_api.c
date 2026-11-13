@@ -303,9 +303,8 @@ static int verify_released_blob_v2_raw_file(const char *base_dir) {
     char path[4096];
     snprintf(path, sizeof(path), "%s/blob_v2_raw_reader/blob_v2_raw.lance",
              base_dir);
-    LanceFileReader *reader = NULL;
-    if (lance_file_reader_open(path, NULL, NULL, NULL, NULL, &reader) != 0 ||
-        reader == NULL) {
+    LanceFileReader *reader = lance_file_reader_open(path, NULL, NULL, NULL, NULL);
+    if (reader == NULL) {
         fprintf(stderr, "BLOB open failed\n");
         return 0;
     }
@@ -390,9 +389,8 @@ static int verify_released_blob_v2_raw_file(const char *base_dir) {
         read_options.columns = columns;
         read_options.column_count = 2;
         LanceFileReader *projected = NULL;
-        ok = lance_file_reader_open(path, NULL, &read_options, NULL, NULL,
-                                    &projected) == 0 &&
-             projected != NULL;
+        projected = lance_file_reader_open(path, NULL, &read_options, NULL, NULL);
+        ok = projected != NULL;
         if (ok) {
             ArrowArrayStream projected_stream = {0};
             ok = lance_file_reader_read_all(projected, 3, 2,
