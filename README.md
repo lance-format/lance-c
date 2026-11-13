@@ -623,7 +623,7 @@ unverified, with no implied requirement to test every older release.
 
 ### Linux baseline for future packages
 
-The GLIBC maxima above describe the five published `v0.1.9` archives; they are
+The GLIBC maxima above describe the four published Linux `v0.1.9` archives; they are
 not the baseline for future Linux packages. For future tags, the generic
 `x86_64` and `aarch64` archives target **glibc 2.28** (`manylinux_2_28`).
 This is a packaging decision, not a change to any downloadable asset:
@@ -638,8 +638,9 @@ This is a packaging decision, not a change to any downloadable asset:
   for every glibc 2.28 distribution, and no glibc 2.28 archive has been
   published.
 - The workflow change that would produce these archives is author-maintained
-  in [#50](https://github.com/lance-format/lance-c/pull/50). Until that
-  contribution is integrated, the recipes keep selecting the `v0.1.9`
+  in [#50](https://github.com/lance-format/lance-c/pull/50). Until packages built
+  with this baseline are published and the recipe hashes are updated, the
+  recipes keep selecting the `v0.1.9`
   archives listed above: `x64-linux`, `x64-linux-dynamic` and
   `Linux/x86_64` use the Debian 12 x86_64 archive, while `arm64-linux`,
   `arm64-linux-dynamic` and `Linux/armv8` use the standard aarch64 archive
@@ -693,9 +694,10 @@ working example.
 
 ### Windows (x86_64-pc-windows-msvc and aarch64-pc-windows-msvc)
 
-`v0.1.9` published no Windows archive. Windows packaging is an accepted
-release candidate: the next tag publishes both archives, and no current vcpkg
-or Conan mapping selects them.
+`v0.1.9` published no Windows archive. The current release workflow is
+configured to build both Windows archives for future tags, with candidate
+consumer validation already accepted. No current vcpkg or Conan mapping
+selects these archives.
 
 The Windows CMake build links the MSVC C runtime statically by default for
 both the DLL and static archive. Release and Windows CI pass
