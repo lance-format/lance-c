@@ -413,10 +413,18 @@ void test_delta_errors(const std::string& history_uri,
     auto plain_delta = build_versions(plain, 1, 2);
     auto message = error_message_of([&] { plain_delta.get_deleted_row_ids(); });
     CHECK(message.find("stable row ids") != std::string::npos);
-    auto plain_inserted = plain_delta.get_inserted_rows();
-    // Row changes filter on row-version lineage, which a write without stable
-    // row ids does not record, so a plain dataset reports no changes.
-    CHECK(sorted(read_i32(plain_inserted, 0)).empty());
+    // v15 requires stable row ids for every row-change stream, not only for
+    // deleted ids, so the C++ wrapper surfaces the same native rejection.
+    for (const auto& get_rows : {
+             [&] { plain_delta.get_inserted_rows(); },
+             [&] { plain_delta.get_updated_rows(); },
+             [&] { plain_delta.get_upserted_rows(); },
+         }) {
+        CHECK(error_code_of(get_rows) == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    const auto plain_inserted_message =
+        error_message_of([&] { plain_delta.get_inserted_rows(); });
+    CHECK(plain_inserted_message.find("stable row ids") != std::string::npos);
 }
 
 } // namespace
