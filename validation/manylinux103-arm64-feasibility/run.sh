@@ -981,7 +981,8 @@ record_archive_audit() {
         fail "static archive contains an absolute or parent-relative member name"
     fi
     {
-        echo "archive_member_count=$member_count"
+        echo "archive_entry_count=$(wc -l <"$EVIDENCE/archive-members.txt")"
+        echo "archive_static_member_count=$member_count"
         echo "archive_machine_count=$machine_count"
         echo "archive_member_architecture=aarch64"
         echo "archive_static_sha256=$(sha256sum "$a" | awk '{print $1}')"
@@ -1021,26 +1022,27 @@ verify_source_unchanged() {
 write_summary() {
     local static_sha static_bytes shared_before shared_after
     local shared_before_bytes shared_after_bytes archive archive_sha256
-    local archive_sha512 archive_bytes member_count exports dt_needed
+    local archive_sha512 archive_bytes archive_entries static_members
+    local exports dt_needed
     local max_glibc static_glibc shared_glibc
 
     static_sha=$(awk '$2 ~ /liblance_c\.a$/ {print $1}' \
         "$EVIDENCE/stage-prestrip.sha256")
-    static_bytes=$(awk '$2 ~ /liblance_c\.a$/ {print $2}' \
-        "$EVIDENCE/stage-poststrip.sha256")
+    static_bytes=$(stat -c %s "$WORK/extracted/lib/liblance_c.a")
     shared_before=$(awk '$2 ~ /liblance_c\.so$/ {print $1}' \
         "$EVIDENCE/stage-prestrip.sha256")
-    shared_before_bytes=$(awk '$2 ~ /liblance_c\.so$/ {print $2}' \
+    shared_before_bytes=$(awk '$1 ~ /liblance_c\.so$/ {print $2}' \
         "$EVIDENCE/stage-prestrip.sha256")
     shared_after=$(awk '$2 ~ /liblance_c\.so$/ {print $1}' \
         "$EVIDENCE/stage-poststrip.sha256")
-    shared_after_bytes=$(awk '$2 ~ /liblance_c\.so$/ {print $2}' \
-        "$EVIDENCE/stage-poststrip.sha256")
+    shared_after_bytes=$(stat -c %s "$WORK/extracted/lib/liblance_c.so")
     archive=$(sed -n 's/^archive=//p' "$EVIDENCE/archive-identity.txt")
     archive_sha256=$(awk '{print $1}' "$archive.sha256")
     archive_sha512=$(awk '{print $1}' "$archive.sha512")
     archive_bytes=$(stat -c %s "$archive")
-    member_count=$(sed -n 's/^archive_member_count=//p' \
+    archive_entries=$(sed -n 's/^archive_member_count=//p' \
+        "$EVIDENCE/archive-identity.txt")
+    static_members=$(sed -n 's/^archive_static_member_count=//p' \
         "$EVIDENCE/archive-audit.txt")
     exports=$(grep '^Verified ' "$LOG_DIR/exports.log" | tail -1)
     dt_needed=$(paste -sd, "$EVIDENCE/extracted-dt-needed.txt")
@@ -1112,7 +1114,8 @@ write_summary() {
         echo "archive_sha256=$archive_sha256"
         echo "archive_sha512=$archive_sha512"
         echo "archive_bytes=$archive_bytes"
-        echo "archive_member_count=$member_count"
+        echo "archive_entry_count=$archive_entries"
+        echo "archive_static_member_count=$static_members"
         echo "archive_member_architecture=aarch64"
         echo "extracted_prefix=$WORK/extracted"
         echo "original_prefix_state=unavailable"
