@@ -589,9 +589,9 @@ async fn vector_shuffle_error_after_work_prevents_commit() {
 
 // Scenario 4: an uncommitted vector build fails at the last
 // `merge_partitions` progress callback, after one partition has already been
-// written into the final index writer. No manifest publication may happen. The
-// writer stages its output in a temp file next to the target; native drop-based
-// cleanup must remove it, leaving no unreferenced sidecar behind.
+// written into the final index writers. No manifest publication may happen. The
+// writers stage their output in temp files next to the targets; native
+// drop-based cleanup must remove them, leaving no unreferenced sidecar behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vector_merge_error_after_partition_work_leaves_only_unreferenced_sidecar() {
     let (_tmp, uri) = multi_fragment_dataset().await;
@@ -652,12 +652,14 @@ async fn vector_merge_error_after_partition_work_leaves_only_unreferenced_sideca
     eprintln!("vector_merge_error_after_partition_work: during_failure={during_failure:?}");
     assert_eq!(
         during_failure.len(),
-        1,
-        "the final index writer must have staged exactly one temp file when the callback failed"
+        2,
+        "the final index and auxiliary writers must have staged one temp file each when the callback failed"
     );
     assert!(
-        during_failure[0].0.starts_with(".tmp"),
-        "staged file must be the writer temp file, got {during_failure:?}"
+        during_failure
+            .iter()
+            .all(|(name, _)| name.starts_with(".tmp")),
+        "staged files must be the writer temp files, got {during_failure:?}"
     );
 
     let (after, indices) = dataset_state(&uri).await;
