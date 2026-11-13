@@ -35,7 +35,7 @@ index 6d18cdb8c..a3614606d 100644
          self.refs.tags()
      }
 diff --git a/rust/lance/src/dataset/tests/dataset_versioning.rs b/rust/lance/src/dataset/tests/dataset_versioning.rs
-index e97f9c90c..5898fa067 100644
+index e97f9c90c..f4ef02ab6 100644
 --- a/rust/lance/src/dataset/tests/dataset_versioning.rs
 +++ b/rust/lance/src/dataset/tests/dataset_versioning.rs
 @@ -16,9 +16,10 @@ use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
@@ -58,7 +58,7 @@ index e97f9c90c..5898fa067 100644
  use crate::dataset::refs::branch_contents_path;
  use crate::utils::test::copy_test_data_to_tmp;
  use futures::TryStreamExt;
-@@ -1598,3 +1600,267 @@ async fn test_branch() {
+@@ -1598,3 +1600,263 @@ async fn test_branch() {
          .unwrap();
      assert!(branches.is_empty());
  }
@@ -314,11 +314,7 @@ index e97f9c90c..5898fa067 100644
 +        .iter()
 +        .find(|location| location.version == 2)
 +        .unwrap();
-+    dataset
-+        .object_store
-+        .delete(&location.path)
-+        .await
-+        .unwrap();
++    dataset.object_store.delete(&location.path).await.unwrap();
 +
 +    let err = dataset
 +        .checkout_before(checkout_before_time(35, 0))
