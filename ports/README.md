@@ -20,7 +20,8 @@ release SHA512 only after that asset is published.
 
 The `x64-linux` and `x64-linux-dynamic` mappings select the Debian 12 x86_64
 archive so the default prebuilt keeps the lower Debian 12 libc floor. The
-`arm64-linux` mapping remains on the standard release archive until its exact
-libc floor is verified.
+`arm64-linux` mapping still selects the standard release archive; static
+inspection of the `v0.1.9` aarch64 shared library records `GLIBC_2.39` there
+and `GLIBC_2.35` in the Debian 12 archive.
 
 After each release, the contents are mirrored into `microsoft/vcpkg` via PR.

@@ -524,8 +524,11 @@ recipes fetch the v0.1.9 tag, whose `Cargo.toml` declares
 
 ### Published prebuilt archives
 
-The v0.1.9 release publishes five archives. vcpkg and Conan currently select
-three of them:
+This subsection describes the five `v0.1.9` archives. Candidate results appear
+only where they are labelled as such, and none of them is part of a release.
+vcpkg and Conan select three of the five archives. The Linux baseline for
+future packages is separate; see [Linux baseline for future
+packages](#linux-baseline-for-future-packages).
 
 | Archive | Selected by |
 | --- | --- |
@@ -618,6 +621,33 @@ No numeric minimum macOS version is declared. The macOS 15.x versions above
 are exercised baselines, not a support floor; older macOS versions remain
 unverified, with no implied requirement to test every older release.
 
+### Linux baseline for future packages
+
+The GLIBC maxima above describe the five published `v0.1.9` archives; they are
+not the baseline for future Linux packages. For future tags, the generic
+`x86_64` and `aarch64` archives target **glibc 2.28** (`manylinux_2_28`).
+This is a packaging decision, not a change to any downloadable asset:
+
+- Keep the Debian 12 variants, whose `v0.1.9` shared libraries reference
+  `GLIBC_2.35`, as separate archives next to the generic ones.
+- Keep the physical `lib/` install layout, with no `lib64` and no
+  compatibility symlinks, and keep the C++17 consumer requirement.
+- Runtime evidence is limited to the glibc 2.28 containers that were executed
+  (AlmaLinux 8.10) on `x86_64` and native `aarch64`, with installed and
+  archive-extracted static/shared C++17 dataset consumers. It is not a promise
+  for every glibc 2.28 distribution, and no glibc 2.28 archive has been
+  published.
+- The workflow change that would produce these archives is author-maintained
+  in [#50](https://github.com/lance-format/lance-c/pull/50). Until that
+  contribution is integrated, the recipes keep selecting the `v0.1.9`
+  archives listed above: `x64-linux`, `x64-linux-dynamic` and
+  `Linux/x86_64` use the Debian 12 x86_64 archive, while `arm64-linux`,
+  `arm64-linux-dynamic` and `Linux/armv8` use the standard aarch64 archive
+  (`GLIBC_2.39`).
+
+A source build is unaffected by this baseline; it links against the build
+host's libc.
+
 ### From source via cargo (Rust developers)
 
 ```bash
@@ -662,6 +692,10 @@ See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
 working example.
 
 ### Windows (x86_64-pc-windows-msvc and aarch64-pc-windows-msvc)
+
+`v0.1.9` published no Windows archive. Windows packaging is an accepted
+release candidate: the next tag publishes both archives, and no current vcpkg
+or Conan mapping selects them.
 
 The Windows CMake build links the MSVC C runtime statically by default for
 both the DLL and static archive. Release and Windows CI pass
