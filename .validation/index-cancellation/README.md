@@ -7,7 +7,7 @@ pin, public C API, C headers, error numbers, or `ProgressCallbackGate`.
 ## Contents
 
 - `CONTRACT.md` — accepted scope and acceptance boundaries.
-- `native-cancellation.patch` — production-only patch (5 files).
+- `native-cancellation.patch` — native patch (6 files, including the existing tokio-util lock dependency edge).
 - `e4_native_cancellation.rs` — focused native test copied into
   `rust/lance/tests/` by the runner.
 - `run-nier.sh` — verifies the base, applies the patch, proves the exact
@@ -32,7 +32,7 @@ pin, public C API, C headers, error numbers, or `ProgressCallbackGate`.
 
 ## Tests
 
-`cargo test -p lance --test e4_native_cancellation -- --test-threads=4`
+`cargo test --locked -p lance --test e4_native_cancellation -- --test-threads=4`
 
 1. `pre_cancelled_startup_returns_typed_cancellation_without_work`
 2. `btree_page_build_cancellation_stops_long_stage`

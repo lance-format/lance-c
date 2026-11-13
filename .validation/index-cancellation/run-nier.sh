@@ -44,7 +44,7 @@ applied_patch_id="$(git patch-id --stable < "$EVIDENCE_DIR/applied.patch" | awk 
 test "$patch_id" = "$applied_patch_id"
 git -C "$LANCE_SRC" apply --reverse --check "$PATCH"
 git -C "$LANCE_SRC" diff --name-only | sort | tee "$EVIDENCE_DIR/changed-production-files.txt"
-test "$(git -C "$LANCE_SRC" diff --name-only | wc -l)" -eq 5
+test "$(git -C "$LANCE_SRC" diff --name-only | wc -l)" -eq 6
 
 cp "$TEST" "$LANCE_SRC/rust/lance/tests/e4_native_cancellation.rs"
 git -C "$LANCE_SRC" status --porcelain -uall | sort | tee "$EVIDENCE_DIR/status.txt"
@@ -59,6 +59,11 @@ rustfmt +1.94.0 --edition 2024 --check \
 
 # Focused compilation and execution: this target only.
 cd "$LANCE_SRC"
-cargo +1.94.0 test -p lance --test e4_native_cancellation -j 8 -- --test-threads=4
+cargo +1.94.0 test --locked -p lance --test e4_native_cancellation -j 8 -- --test-threads=4
+
+# A locked run must leave the native source and fixture exactly as supplied.
+git diff --binary > "$EVIDENCE_DIR/after-test.patch"
+cmp "$EVIDENCE_DIR/applied.patch" "$EVIDENCE_DIR/after-test.patch"
+cmp "$TEST" "$LANCE_SRC/rust/lance/tests/e4_native_cancellation.rs"
 
 date -u +finished_utc=%Y-%m-%dT%H:%M:%SZ

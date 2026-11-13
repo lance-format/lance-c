@@ -1,3 +1,14 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4965,6 +4965,7 @@
+  "tempfile",
+  "test-log",
+  "tokio",
++ "tokio-util",
+  "tracing",
+  "twox-hash",
+  "uuid",
 diff --git a/rust/lance-index/Cargo.toml b/rust/lance-index/Cargo.toml
 index c5ecd22bf..22eae5b82 100644
 --- a/rust/lance-index/Cargo.toml
