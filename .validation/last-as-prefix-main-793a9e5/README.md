@@ -12,7 +12,7 @@ pin, C API, ABI, or error contract. No C API surface is added or modified.
 
 | Artifact | SHA256 |
 | --- | --- |
-| `native-last-as-prefix-main-793a9e5.patch` (this candidate) | `d8a83ca950256de6e5909658a73d94972dfe1a293a65432297e15f3686acebb3` |
+| `native-last-as-prefix-main-793a9e5.patch` (this candidate) | `3d49b06c9cd42b21ec3f56c854ae8cc4c5705b87bc95bf5c9d944bc1298f5e18` |
 | `../last-as-prefix/native-last-as-prefix.patch` (pinned, unchanged) | `18bad6fe2ae452dc7bd91e5243385eccb9a749413b63f8be8533afab45ae720e` |
 
 - Candidate base tree: `b71237fa79dd9c94da47752e026430bd93ce7243`
@@ -66,7 +66,7 @@ When enabled for a `Match` leaf:
 | Pinned `PrefixAutomaton` / `ExpansionAutomaton` | `inverted.rs` | Replaced the bespoke two-enum automaton with `fst::automaton::Str::new(token).starts_with()`. Same language: terms whose UTF-8 bytes begin with the analyzed token; empty prefix matches all. Removes impossible fuzzy/prefix state combinations. |
 | `inverted/index/partition.rs` | same file | Partition-level `expand_fuzzy` applies prefix only at the highest position; collector renamed `collect_expansion_candidates_with_automaton<A: fst::Automaton>`. |
 | `inverted/index/search.rs` | same file | `expand_fuzzy_tokens` delegates to the shared selector; both scoring guards use the predicate; injected-scorer error mentions fuzzy or prefix. |
-| `inverted/parser.rs` | same file | JSON key `last_as_prefix` defaults to `false`. Non-boolean values fall back to `false`, matching the file's existing lenient `boost` handling and the "no new validation errors" constraint. |
+| `inverted/parser.rs` | same file | JSON key `last_as_prefix` defaults to `false`. Omission defaults to `false`; provided non-boolean values, including `null`, return `InvalidInput` with the field and value, matching serde's boolean field contract. |
 | `inverted/compound.rs` `effective_params` | same file | Propagates `last_as_prefix` into each leaf's effective params. |
 | `dataset/scanner.rs` residual/postfilter gates | `dataset/scanner/fts.rs` | Main split scanner FTS planning into a module; residual compound gating uses `!uses_vocabulary_expansion()` for `Match` and `MultiMatch`. |
 | `io/exec/fts.rs` gates | `io/exec/fts/{matches,match_query,compound,flat_match,corpus}.rs` | Main split the old file; predicate renamed `compound_query_uses_vocabulary_expansion`, scorer-only guard, post-filter rejection, and Match exec effective params all use the predicate. |
@@ -74,11 +74,10 @@ When enabled for a `Match` leaf:
 | `mem_wal/.../scanner/builder.rs` | same file | Explicit `not_supported` rejection plus a unit test. |
 | (not in pinned patch) `mem_wal/index/fts.rs` | same file | Residual exact-leaf guards now reject any vocabulary-expanding leaf, including `last_as_prefix`, instead of only fuzzy leaves. |
 
-`git diff --check` is clean. All added lines over 100 columns are string
-literals or were wrapped; rustfmt 1.9.0-stable `--check` reports only
-pre-existing import-order differences caused by the local toolchain differing
-from the repository's pinned 1.98.1. Formatting was adjusted manually for the
-added code; `cargo fmt` was not run.
+`git diff --check` is clean. All 16 changed native files pass direct rustfmt
+from the upstream-declared Rust 1.98.1 toolchain, with edition 2024 and
+`skip_children=true`; this does not claim a whole-workspace Cargo fmt run.
+The candidate has not yet been compiled or executed.
 
 ## Tests added
 
@@ -98,24 +97,36 @@ Dataset-level (`rust/lance/tests/query/inverted.rs`):
   budget 2/3, trailing punctuation, empty analysis, boost score).
 - `test_inverted_last_as_prefix_respects_list_element_boundaries`.
 - `test_inverted_last_as_prefix_merges_fragments_before_truncation`
-  (append, `optimize_indices(append)`, cross-fragment merge before budget
-  truncation).
+  (reject all-unindexed and partially-indexed prefix queries, retain the flat
+  exact-match control, then optimize/append and check merged-vocabulary caps).
 
 Serde/parser:
 
 - `test_match_query_serde` and `test_fts_search_params_last_as_prefix_serde_default`.
-- `test_from_json_match` updated plus `test_from_json_match_last_as_prefix_defaults_false`.
+- `test_from_json_match` updated plus `test_from_json_match_last_as_prefix_defaults_false`
+  and `test_from_json_match_last_as_prefix_rejects_non_boolean`, including direct
+  serde rejection of the same malformed values.
 
 MemWAL:
 
 - `local_fts_query_maps_leaf_shapes_and_rejects_the_rest` covers `not_supported`
   for `last_as_prefix`.
 
+Flat execution:
+
+- `test_flat_match_query_rejects_last_as_prefix` calls the public physical
+  execution boundary with the flag supplied through either the query or the
+  search params, and asserts the native `NotSupported` source.
+- The common scanner flat-planning path rejects the flag before reading data;
+  its callers include unindexed/partial scans and forced flat paths. The direct
+  execution guard also protects callers that bypass that planner. Separate
+  overlay/vector-rerank runtime cases are not claimed.
+
 ## Verification performed
 
 - `git apply --check` on a pristine `793a9e5` working tree: passes.
 - Applying the patch to that pristine tree produces tree
-  `bcd8ff722cd5015605c229bcf44d787574f68039`, identical to the local staged
+  `4768d1e3756467a2a017f279aeff3f00da4b0df5`, identical to the local staged
   tree of the candidate.
 - `git diff --check`: clean.
 - Static review of every changed hunk, remaining `fuzziness == Some(0)` /
@@ -127,13 +138,12 @@ MSRV job was not touched.
 
 ## Unresolved concerns
 
-1. **Unindexed/flat fallback**: `FlatMatchQueryExec` has no vocabulary
-   expansion, so a prefix query over unindexed fragments (or an all-unindexed
-   dataset) silently matches the final token exactly. The pinned candidate had
-   the same gap. This candidate does not add an unrequested planner rejection;
-   MemWAL is rejected explicitly, and residual/corpus/post-filter paths are
-   gated. Upstream should decide whether the flat path should reject or
-   implement expansion.
+1. **Indexed execution boundary**: last-token prefix requires an indexed FTS
+   execution path. Flat Match planning/execution returns `NotSupported` instead
+   of silently substituting exact matching, including no-index and partial
+   coverage. Forced flat paths such as overlay scans or vector reranking can
+   also be unsupported even when some or all rows have index coverage. Full
+   flat prefix scoring is not implemented by this candidate.
 2. **Explicit fuzziness uses the simple analyzer**: with `fuzziness > 0`,
    `tokenizer_for_match_query` keeps the existing legacy behavior of using a
    simple analyzer instead of the index analyzer (upstream issue #9656). Prefix
@@ -149,10 +159,19 @@ MSRV job was not touched.
    design.
 5. **Planner refactor risk**: upstream PR #11018 (row-address domain for the
    inverted index) touches the same area and will require a rebase.
-6. **JSON leniency**: a non-boolean `last_as_prefix` value is treated as
-   `false` rather than rejected, consistent with the no-new-validation-errors
-   constraint but looser than strict typed parsing.
+6. **JSON types**: omission defaults to false; true/false are accepted.
+   Every provided non-boolean value, including null, is rejected. This aligns
+   the new custom-parser field with its serde boolean contract; it does not
+   change parsing of existing fields.
 7. **Certification**: the old eight-case pinned oracle does not certify JSON
    query execution, default-analyzer edge cases, or multi-segment behavior by
    itself. New tests cover cross-fragment merging and serde/parser defaults,
    but none of them were executed in this source-only task.
+
+## Validation toolchain boundary
+
+Upstream declares Rust 1.98.1 in `rust-toolchain.toml` and a minimum of 1.95.0.
+Any execution of this upstream candidate must identify that toolchain and must
+not be called lance-c Rust 1.94 acceptance. The selected lance-c core pin and
+its Rust 1.94 contract remain unchanged. Native-current execution is pending;
+the previously accepted pinned-native nine-case oracle is separate evidence.

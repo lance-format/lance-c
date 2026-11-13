@@ -1,22 +1,22 @@
 diff --git a/rust/lance-index/src/scalar/inverted.rs b/rust/lance-index/src/scalar/inverted.rs
-index 046a39f45..3f2ab7a9e 100644
+index 046a39f45..667a3577f 100644
 --- a/rust/lance-index/src/scalar/inverted.rs
 +++ b/rust/lance-index/src/scalar/inverted.rs
-@@ -23,6 +23,7 @@ pub mod tokenizer;
+@@ -22,6 +22,7 @@ mod scorer;
+ pub mod tokenizer;
  mod wand;
- 
- use futures::{StreamExt, TryStreamExt, stream};
+
 +use fst::Automaton;
+ use futures::{StreamExt, TryStreamExt, stream};
  use lance_index_core::remapping::BatchRowIdRemapper;
  use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
- use std::sync::{Arc, LazyLock};
 @@ -50,7 +51,7 @@ pub use lance_tokenizer::Language;
  pub use scorer::{CombinedFieldsBM25Scorer, MemBM25Scorer, Scorer};
  pub use tokenizer::*;
- 
+
 -use crate::scalar::inverted::query::{FtsSearchParams, Tokens, uses_fuzzy_expansion};
 +use crate::scalar::inverted::query::{FtsSearchParams, Tokens};
- 
+
  /// Canonical token vocabulary and BM25 statistics for one indexed query leaf.
  ///
 @@ -157,10 +158,31 @@ pub(crate) fn final_query_tokens(
@@ -30,7 +30,7 @@ index 046a39f45..3f2ab7a9e 100644
 +    let indices = indices.iter().map(Arc::as_ref).collect::<Vec<_>>();
 +    expand_query_tokens(&indices, query_tokens, params)
 +}
- 
+
 +/// Expand one Match leaf's analyzed tokens against the selected segments.
 +///
 +/// Groups are visited in ascending position order and every retained source
@@ -125,7 +125,7 @@ index 6261a8613..3739db1d4 100644
 +++ b/rust/lance-index/src/scalar/inverted/index/partition.rs
 @@ -976,6 +976,9 @@ impl InvertedPartition {
      }
- 
+
      pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
 +        let last_position = (0..tokens.len())
 +            .map(|token_idx| tokens.position(token_idx))
@@ -160,7 +160,7 @@ index 6261a8613..3739db1d4 100644
 @@ -1012,14 +1028,14 @@ impl InvertedPartition {
          )
      }
- 
+
 -    /// Collect up to `limit` fuzzy candidates for one query token from this
 +    /// Collect up to `limit` candidates for one query token from this
      /// partition's token FST, in key (lexicographic) order. Callers merge
@@ -181,14 +181,14 @@ index 9aeb51134..3ca5128ee 100644
 @@ -1,7 +1,6 @@
  // SPDX-License-Identifier: Apache-2.0
  // SPDX-FileCopyrightText: Copyright The Lance Authors
- 
+
 -use super::partition::FuzzyAutomaton;
  use super::*;
- 
+
  const LANCE_FTS_REUSE_PREPARED_SCORER_ENV: &str = "LANCE_FTS_REUSE_PREPARED_SCORER";
 @@ -51,16 +50,18 @@ fn select_impact_scorer(
  }
- 
+
  impl InvertedIndex {
 -    /// Add this segment's lexicographically smallest fuzzy candidates for one
 +    /// Add this segment's lexicographically smallest candidates for one
@@ -229,7 +229,7 @@ index 9aeb51134..3ca5128ee 100644
 @@ -411,68 +412,20 @@ impl InvertedIndex {
          Ok(dfs.into_iter().sum())
      }
- 
+
 -    /// Expand fuzzy query tokens against all partitions in this segment.
 +    /// Expand query tokens against all partitions in this segment.
      ///
@@ -305,7 +305,7 @@ index 9aeb51134..3ca5128ee 100644
 -        .with_term_groups(expanded_groups))
 +        crate::scalar::inverted::expand_query_tokens(&[self], tokens, params)
      }
- 
+
      /// Search documents that match the query and return row ids sorted by BM25 score.
 @@ -578,16 +531,16 @@ impl InvertedIndex {
          base_scorer: Option<&MemBM25Scorer>,
@@ -334,7 +334,7 @@ index 280152cb0..c0dddd025 100644
 @@ -762,6 +762,194 @@ async fn test_fuzzy_expansion_cap_applies_to_whole_query(
      }
  }
- 
+
 +/// One partition whose vocabulary is `alp*` plus `beta`. Used to pin the
 +/// `last_as_prefix` rewrite without a dataset: group 0 is an earlier analyzed
 +/// position, group 1 the highest one.
@@ -528,26 +528,31 @@ index 280152cb0..c0dddd025 100644
  async fn write_variant_partition(
 @@ -1648,7 +1836,7 @@ async fn test_fuzzy_candidate_merge_stays_bounded_across_partitions() {
      let automaton = FuzzyAutomaton::new("alphx", &DocType::Text, &params).unwrap();
- 
+
      index
 -        .collect_fuzzy_candidates_with_automaton(&automaton, limit, &mut candidates)
 +        .collect_expansion_candidates_with_automaton(&automaton, limit, &mut candidates)
          .unwrap();
- 
+
      assert!(candidates.len() <= limit);
 diff --git a/rust/lance-index/src/scalar/inverted/parser.rs b/rust/lance-index/src/scalar/inverted/parser.rs
-index 0ee49753d..7b259ca5f 100644
+index 0ee49753d..fc035086d 100644
 --- a/rust/lance-index/src/scalar/inverted/parser.rs
 +++ b/rust/lance-index/src/scalar/inverted/parser.rs
-@@ -51,6 +51,7 @@ impl JsonParser for MatchQuery {
+@@ -51,6 +51,12 @@ impl JsonParser for MatchQuery {
              parse_bounded_u64(&value["prefix_length"], "prefix_length", u32::MAX as u64)?
                  .map(|v| v as u32)
                  .unwrap_or(0);
-+        let last_as_prefix = value["last_as_prefix"].as_bool().unwrap_or(false);
++        let last_as_prefix = match value.get("last_as_prefix") {
++            None => false,
++            Some(value) => value.as_bool().ok_or_else(|| {
++                Error::invalid_input(format!("last_as_prefix must be a boolean, got {value}"))
++            })?,
++        };
          let document_granularity = parse_document_granularity(value)?;
- 
+
          Ok(Self {
-@@ -61,6 +62,7 @@ impl JsonParser for MatchQuery {
+@@ -61,6 +67,7 @@ impl JsonParser for MatchQuery {
              max_expansions,
              operator,
              prefix_length,
@@ -555,7 +560,7 @@ index 0ee49753d..7b259ca5f 100644
              document_granularity,
          })
      }
-@@ -283,7 +285,8 @@ mod tests {
+@@ -283,7 +290,8 @@ mod tests {
                  "fuzziness": 1,
                  "max_expansions": 10,
                  "operator": "and",
@@ -565,7 +570,7 @@ index 0ee49753d..7b259ca5f 100644
              }
          }
          "#;
-@@ -296,11 +299,29 @@ mod tests {
+@@ -296,11 +304,48 @@ mod tests {
              max_expansions: 10,
              operator: Operator::And,
              prefix_length: 2,
@@ -574,7 +579,7 @@ index 0ee49753d..7b259ca5f 100644
          });
          assert_eq!(fts_query, expected_query);
      }
- 
+
 +    #[test]
 +    fn test_from_json_match_last_as_prefix_defaults_false() {
 +        let without_field = r#"{ "match": { "terms": "hello" } }"#;
@@ -592,6 +597,25 @@ index 0ee49753d..7b259ca5f 100644
 +        assert!(query.last_as_prefix);
 +    }
 +
++    #[test]
++    fn test_from_json_match_last_as_prefix_rejects_non_boolean() {
++        for value in [
++            Value::Null,
++            serde_json::json!("true"),
++            serde_json::json!(1),
++            serde_json::json!({}),
++            serde_json::json!([]),
++        ] {
++            let leaf = serde_json::json!({ "terms": "hello", "last_as_prefix": value });
++            let json = serde_json::json!({ "match": leaf }).to_string();
++            let error = from_json(&json).unwrap_err();
++            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
++            assert!(error.to_string().contains("last_as_prefix"), "{error}");
++            assert!(error.to_string().contains(&value.to_string()), "{error}");
++            assert!(serde_json::from_value::<MatchQuery>(leaf).is_err());
++        }
++    }
++
      #[test]
      fn test_from_json_match_invalid_fuzziness_rejected() {
          // Present-but-invalid fuzziness must be rejected instead of silently
@@ -602,7 +626,7 @@ index 8f8d0dff9..e3c185fcf 100644
 @@ -19,6 +19,18 @@ pub fn uses_fuzzy_expansion(fuzziness: Option<u32>) -> bool {
      fuzziness != Some(0)
  }
- 
+
 +/// Return whether a Match leaf needs the indexed vocabulary.
 +///
 +/// Fuzzy matching expands every query token to its nearest indexed terms.
@@ -640,7 +664,7 @@ index 8f8d0dff9..e3c185fcf 100644
 +    #[serde(default)]
 +    pub last_as_prefix: bool,
  }
- 
+
  impl FtsSearchParams {
 @@ -83,6 +102,7 @@ impl FtsSearchParams {
              max_expansions: 50,
@@ -649,7 +673,7 @@ index 8f8d0dff9..e3c185fcf 100644
 +            last_as_prefix: false,
          }
      }
- 
+
 @@ -115,6 +135,16 @@ impl FtsSearchParams {
          self.prefix_length = prefix_length;
          self
@@ -665,12 +689,12 @@ index 8f8d0dff9..e3c185fcf 100644
 +        uses_vocabulary_expansion(self.fuzziness, self.last_as_prefix)
 +    }
  }
- 
+
  impl Default for FtsSearchParams {
 @@ -377,6 +407,15 @@ pub struct MatchQuery {
      #[serde(default)]
      pub prefix_length: u32,
- 
+
 +    /// Match the analyzed token at the highest position as a prefix of the
 +    /// indexed vocabulary.
 +    ///
@@ -694,7 +718,7 @@ index 8f8d0dff9..e3c185fcf 100644
 @@ -439,6 +479,16 @@ impl MatchQuery {
          self
      }
- 
+
 +    pub fn with_last_as_prefix(mut self, last_as_prefix: bool) -> Self {
 +        self.last_as_prefix = last_as_prefix;
 +        self
@@ -715,14 +739,14 @@ index 8f8d0dff9..e3c185fcf 100644
 +            "last_as_prefix": false,
          });
          assert_eq!(serialized, expected);
- 
+
 @@ -1609,8 +1660,17 @@ mod tests {
          assert_eq!(query.max_expansions, 50);
          assert_eq!(query.operator, Operator::Or);
          assert_eq!(query.prefix_length, 0);
 +        assert!(!query.last_as_prefix);
          assert_eq!(query.document_granularity, None);
- 
+
 +        let query = query.with_last_as_prefix(true);
 +        let serialized = serde_json::to_value(&query).unwrap();
 +        assert_eq!(serialized["last_as_prefix"], true);
@@ -737,7 +761,7 @@ index 8f8d0dff9..e3c185fcf 100644
 @@ -1624,6 +1684,25 @@ mod tests {
          );
      }
- 
+
 +    #[test]
 +    fn test_fts_search_params_last_as_prefix_serde_default() {
 +        use super::*;
@@ -797,10 +821,10 @@ index 97eef1211..551e24414 100644
                      let st = index.state.load_full();
                      let tokens = index.analyze_for_search(&query.terms);
 diff --git a/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs b/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs
-index 7f6e2bb6b..25877bc71 100644
+index 7f6e2bb6b..0124409f9 100644
 --- a/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs
 +++ b/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs
-@@ -450,22 +450,32 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
+@@ -450,22 +450,30 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
          }
      }
      Ok(match query {
@@ -818,10 +842,8 @@ index 7f6e2bb6b..25877bc71 100644
 +            bind(
 +                match m.fuzziness {
 +                    // `Some(0)` is an exact match in the index model.
-+                    Some(0) => {
-+                        FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
-+                            .with_boost(m.boost)
-+                    }
++                    Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
++                        .with_boost(m.boost),
 +                    fuzziness => FtsQueryExpr::fuzzy_with_options(
 +                        m.terms.clone(),
 +                        fuzziness,
@@ -848,10 +870,10 @@ index 7f6e2bb6b..25877bc71 100644
          IndexFtsQuery::Phrase(p) => bind(
              FtsQueryExpr::phrase_with_slop(p.terms.clone(), p.slop),
              p.column.as_ref(),
-@@ -2147,6 +2157,17 @@ mod tests {
+@@ -2147,6 +2155,17 @@ mod tests {
              "fuzzy AND maps to a conjunctive Fuzzy leaf"
          );
- 
+
 +        // Prefix expansion is a segment-index feature: refusing it keeps the
 +        // in-memory index from silently running an exact match instead.
 +        let prefix = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
@@ -867,11 +889,11 @@ index 7f6e2bb6b..25877bc71 100644
          let phrase = FullTextSearchQuery::new_query(IndexFtsQuery::Phrase(
              PhraseQuery::new("quick fox".to_string()).with_column(Some("text".to_string())),
 diff --git a/rust/lance/src/dataset/scanner/fts.rs b/rust/lance/src/dataset/scanner/fts.rs
-index f627d4722..648175111 100644
+index f627d4722..fc38bd47e 100644
 --- a/rust/lance/src/dataset/scanner/fts.rs
 +++ b/rust/lance/src/dataset/scanner/fts.rs
 @@ -210,7 +210,7 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
- 
+
  fn supports_indexed_stats_residual_compound(query: &FtsQuery) -> bool {
      match query {
 -        FtsQuery::Match(query) => query.fuzziness == Some(0),
@@ -897,12 +919,24 @@ index f627d4722..648175111 100644
                  (None, query.clone(), params.clone())
              }
              FtsQuery::Phrase(query)
+@@ -2231,6 +2231,11 @@ impl Scanner {
+         filter: FlatMatchFilter<'_>,
+         shared_scorer: Option<Arc<SharedFtsScorer>>,
+     ) -> Result<Arc<dyn ExecutionPlan>> {
++        if query.last_as_prefix || params.last_as_prefix {
++            return Err(Error::not_supported(
++                "last_as_prefix requires fully indexed FTS coverage; flat Match execution is unsupported",
++            ));
++        }
+         let unfiltered = ExprFilterPlan::default();
+         let (filter_plan, candidate_filter) = match filter {
+             FlatMatchFilter::BeforeScoring(filter_plan) => (filter_plan, None),
 diff --git a/rust/lance/src/io/exec/fts/compound.rs b/rust/lance/src/io/exec/fts/compound.rs
-index 2f20652fd..b525e68e8 100644
+index 2f20652fd..869525d7d 100644
 --- a/rust/lance/src/io/exec/fts/compound.rs
 +++ b/rust/lance/src/io/exec/fts/compound.rs
 @@ -54,8 +54,8 @@ use uuid::Uuid;
- 
+
  use super::match_query::MatchQueryExec;
  use super::matches::{
 -    PreparedMatch, compound_leaf_columns, compound_query_uses_fuzzy_expansion, count_fts_leaves,
@@ -926,9 +960,15 @@ index 2f20652fd..b525e68e8 100644
                  segment_selection
                      .covers_all_committed(&dataset, column, DocumentGranularity::Row, &segments)
                      .await?
-@@ -1149,7 +1149,7 @@ impl ExecutionPlan for CompoundQueryExec {
+@@ -1147,9 +1147,12 @@ impl ExecutionPlan for CompoundQueryExec {
+                 (true, _) => None,
+                 (false, scorer) => scorer,
              };
-             if base_scorer.is_some() && scorer_only_fuzzy && !scorer_override_covers_all {
+-            if base_scorer.is_some() && scorer_only_fuzzy && !scorer_override_covers_all {
++            if base_scorer.is_some()
++                && scorer_only_vocabulary_expansion
++                && !scorer_override_covers_all
++            {
                  return Err(DataFusionError::Execution(
 -                    "fuzzy CompoundQueryExec cannot use a scorer-only override over a segment subset; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_match"
 +                    "fuzzy or prefix CompoundQueryExec cannot use a scorer-only override over a segment subset; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_match"
@@ -949,7 +989,7 @@ index 3d91c67df..5f2b1ee83 100644
                  || producer.document_granularity() != consumer.document_granularity()
                  || producer.params().phrase_slop != consumer.params().phrase_slop
 diff --git a/rust/lance/src/io/exec/fts/flat_match.rs b/rust/lance/src/io/exec/fts/flat_match.rs
-index 47d5eda2a..d585a78d5 100644
+index 47d5eda2a..8bf19ab82 100644
 --- a/rust/lance/src/io/exec/fts/flat_match.rs
 +++ b/rust/lance/src/io/exec/fts/flat_match.rs
 @@ -38,7 +38,6 @@ use lance_index::scalar::inverted::builder::document_input;
@@ -974,28 +1014,95 @@ index 47d5eda2a..d585a78d5 100644
              )));
          }
          let document_granularity = resolved_field
+@@ -1001,6 +1000,11 @@ impl ExecutionPlan for FlatMatchQueryExec {
+         partition: usize,
+         context: Arc<datafusion::execution::TaskContext>,
+     ) -> DataFusionResult<SendableRecordBatchStream> {
++        if self.query.last_as_prefix || self.params.last_as_prefix {
++            return Err(DataFusionError::External(Box::new(Error::not_supported(
++                "last_as_prefix requires fully indexed FTS coverage; flat Match execution is unsupported",
++            ))));
++        }
+         let query = self.query.clone();
+         let tokenized_query = self.tokenized_query.clone();
+         let ds = self.dataset.clone();
+@@ -1196,6 +1200,52 @@ mod tests {
+     use lance_index::scalar::inverted::{InvertedIndex, Language};
+     use lance_index::{IndexCriteria, IndexType};
+
++    #[tokio::test]
++    async fn test_flat_match_query_rejects_last_as_prefix() {
++        let dataset = lance_datagen::gen_batch()
++            .col(
++                "text",
++                lance_datagen::array::cycle_utf8_literals(&["alpha", "alpenglow"]),
++            )
++            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(2))
++            .await
++            .unwrap();
++        let dataset = Arc::new(dataset);
++        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
++            "text",
++            DataType::Utf8,
++            false,
++        )]));
++        let input = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(schema));
++        let context = datafusion::prelude::SessionContext::new().task_ctx();
++        for (query_prefix, params_prefix) in [(true, false), (false, true)] {
++            let query = MatchQuery::new("alp".to_string())
++                .with_column(Some("text".to_string()))
++                .with_last_as_prefix(query_prefix);
++            let params = FtsSearchParams::default().with_last_as_prefix(params_prefix);
++            let exec = FlatMatchQueryExec::new_with_document_granularity(
++                dataset.clone(),
++                query,
++                params,
++                input.clone(),
++                DocumentGranularity::Row,
++                "text".to_string(),
++            );
++            let error = match exec.execute(0, context.clone()) {
++                Ok(_) => panic!("direct flat prefix execution must be rejected"),
++                Err(error) => error,
++            };
++            assert!(error.to_string().contains("last_as_prefix"), "{error}");
++            let DataFusionError::External(source) = error else {
++                panic!("expected native NotSupported error");
++            };
++            assert!(matches!(
++                source.downcast_ref::<Error>(),
++                Some(Error::NotSupported { .. })
++            ));
++        }
++    }
++
+     #[rstest::rstest]
+     #[case::default(InvertedIndexParams::default(), "alpha", "beta")]
+     #[case::ngram(InvertedIndexParams::default()
 diff --git a/rust/lance/src/io/exec/fts/match_query.rs b/rust/lance/src/io/exec/fts/match_query.rs
-index 756dde56e..100cc71cf 100644
+index 756dde56e..f7ab95dc6 100644
 --- a/rust/lance/src/io/exec/fts/match_query.rs
 +++ b/rust/lance/src/io/exec/fts/match_query.rs
-@@ -25,7 +25,7 @@ use crate::io::exec::PreFilterSource;
+@@ -24,9 +24,7 @@ use crate::Dataset;
+ use crate::io::exec::PreFilterSource;
  use crate::io::exec::utils::{PreFilterMasks, build_prefilter};
  use lance_index::prefilter::PreFilter;
- use lance_index::scalar::inverted::query::{
+-use lance_index::scalar::inverted::query::{
 -    FtsSearchParams, MatchQuery, try_collect_query_tokens, uses_fuzzy_expansion,
-+    FtsSearchParams, MatchQuery, try_collect_query_tokens,
- };
+-};
++use lance_index::scalar::inverted::query::{FtsSearchParams, MatchQuery, try_collect_query_tokens};
  use lance_index::scalar::inverted::{
      DocumentGranularity, MemBM25Scorer, PreparedBm25Query, fts_schema,
-@@ -151,6 +151,7 @@ impl MatchQueryExec {
+ };
+@@ -151,6 +149,7 @@ impl MatchQueryExec {
              .with_fuzziness(query.fuzziness)
              .with_max_expansions(query.max_expansions)
              .with_prefix_length(query.prefix_length)
 +            .with_last_as_prefix(query.last_as_prefix)
      }
- 
+
      pub fn new(
-@@ -606,10 +607,10 @@ impl ExecutionPlan for MatchQueryExec {
+@@ -606,10 +605,10 @@ impl ExecutionPlan for MatchQueryExec {
                      &metrics.segment_bind_duration,
                  )
                  .await?;
@@ -1009,6 +1116,18 @@ index 756dde56e..100cc71cf 100644
                  segment_selection
                      .covers_all_committed(&ds, &column, document_granularity, &segments)
                      .await?
+@@ -667,7 +666,10 @@ impl ExecutionPlan for MatchQueryExec {
+                     (None, Some(shared_scorer)) => Some(shared_scorer.wait().await?),
+                     (None, None) => None,
+                 };
+-                if base_scorer.is_some() && scorer_only_fuzzy && !scorer_override_covers_all {
++                if base_scorer.is_some()
++                    && scorer_only_vocabulary_expansion
++                    && !scorer_override_covers_all
++                {
+                     return Err(DataFusionError::Execution(
+                         "fuzzy MatchQuery cannot use a scorer-only override; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_query"
+                             .to_string(),
 diff --git a/rust/lance/src/io/exec/fts/matches.rs b/rust/lance/src/io/exec/fts/matches.rs
 index b36fc9c3d..404dd137d 100644
 --- a/rust/lance/src/io/exec/fts/matches.rs
@@ -1027,7 +1146,7 @@ index b36fc9c3d..404dd137d 100644
 @@ -245,24 +243,24 @@ pub(super) fn compound_leaf_columns(query: &FtsQuery) -> Result<Vec<&str>> {
      Ok(columns)
  }
- 
+
 -pub(super) fn compound_query_uses_fuzzy_expansion(query: &FtsQuery) -> bool {
 +pub(super) fn compound_query_uses_vocabulary_expansion(query: &FtsQuery) -> bool {
      match query {
@@ -1057,13 +1176,13 @@ index b36fc9c3d..404dd137d 100644
      }
  }
 diff --git a/rust/lance/tests/query/inverted.rs b/rust/lance/tests/query/inverted.rs
-index 31261bd67..a781ae4f6 100644
+index 31261bd67..a25ef4f96 100644
 --- a/rust/lance/tests/query/inverted.rs
 +++ b/rust/lance/tests/query/inverted.rs
-@@ -1292,6 +1292,307 @@ async fn test_element_document_fts_vector_prefilter_deduplicates_parent_rows() {
+@@ -1292,6 +1292,331 @@ async fn test_element_document_fts_vector_prefilter_deduplicates_parent_rows() {
      assert!(result.column_by_name("_doc_index").is_none());
  }
- 
+
 +fn scanned_ids(batch: &RecordBatch) -> Vec<i32> {
 +    batch["id"]
 +        .as_primitive::<arrow_array::types::Int32Type>()
@@ -1298,6 +1417,22 @@ index 31261bd67..a781ae4f6 100644
 +
 +#[tokio::test]
 +async fn test_inverted_last_as_prefix_merges_fragments_before_truncation() {
++    async fn assert_prefix_needs_full_coverage(dataset: &Dataset) {
++        let query = FullTextSearchQuery::new_query(FtsQuery::Match(
++            MatchQuery::new("alp".to_string())
++                .with_column(Some("text".to_string()))
++                .with_last_as_prefix(true),
++        ));
++        let mut scanner = dataset.scan();
++        scanner.full_text_search(query).unwrap();
++        let error = scanner.try_into_batch().await.unwrap_err();
++        assert!(
++            matches!(error, lance_core::Error::NotSupported { .. }),
++            "{error}"
++        );
++        assert!(error.to_string().contains("last_as_prefix"), "{error}");
++    }
++
 +    let first = RecordBatch::try_from_iter(vec![
 +        ("id", Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef),
 +        (
@@ -1323,6 +1458,13 @@ index 31261bd67..a781ae4f6 100644
 +    )
 +    .await
 +    .unwrap();
++    assert_prefix_needs_full_coverage(&ds).await;
++    let exact = FullTextSearchQuery::new_query(FtsQuery::Match(
++        MatchQuery::new("alpha".to_string())
++            .with_column(Some("text".to_string()))
++            .with_last_as_prefix(false),
++    ));
++    assert_eq!(scanned_ids(&run_fts(&ds, exact, None).await), vec![0]);
 +    ds.create_index(
 +        &["text"],
 +        IndexType::Inverted,
@@ -1339,8 +1481,9 @@ index 31261bd67..a781ae4f6 100644
 +    .await
 +    .unwrap();
 +    assert_eq!(ds.fragments().len(), 2);
-+    // The appended fragment must be indexed; the flat fallback has no
-+    // vocabulary expansion and would otherwise match `alp` exactly.
++    assert_prefix_needs_full_coverage(&ds).await;
++    // Once every fragment is indexed, selection merges their vocabularies
++    // before applying the shared budget.
 +    ds.optimize_indices(&OptimizeOptions::append())
 +        .await
 +        .unwrap();
