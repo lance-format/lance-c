@@ -1,5 +1,24 @@
 # AGENTS.md
 
+## Design Principles
+
+- This project provides C/C++ bindings for Lance. New product capabilities must
+  originate in the Lance Rust project; binding or parity work must not initiate
+  native feature development, including local native patches or prototypes.
+- Before adding an API, identify the public Rust entry point in the selected
+  Lance revision and its behavior, defaults, validation and error semantics.
+  If that capability is missing, record the upstream prerequisite and leave it
+  outside binding implementation until Lance provides it.
+- Use pylance to discover capabilities, not to define new core behavior.
+  Python-side orchestration does not establish a public Rust capability, and
+  implementing the same policy in C/C++ is not a substitute for one.
+- Keep binding responsibilities to foreign-language representation, ownership,
+  lifetimes, FFI input validation and error conversion. Delegate domain logic
+  and operation semantics to Rust rather than adding binding-specific policy.
+- Validate observable C/C++ behavior against the selected Rust implementation.
+  A successful experiment with a patched core does not establish support in
+  the project's selected dependency.
+
 ## Structure
 Rust FFI source: `src/`
 C header (stable ABI): `include/lance/lance.h`
