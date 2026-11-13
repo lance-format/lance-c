@@ -1414,17 +1414,17 @@ fn test_delta_deleted_ids_require_stable_row_ids() {
         (
             DeltaStream::Inserted,
             lance_dataset_delta_get_inserted_rows
-                as unsafe extern "C" fn(*mut LanceDatasetDelta, *mut FFI_ArrowArrayStream) -> i32,
+                as unsafe extern "C" fn(*const LanceDatasetDelta, *mut FFI_ArrowArrayStream) -> i32,
         ),
         (
             DeltaStream::Updated,
             lance_dataset_delta_get_updated_rows
-                as unsafe extern "C" fn(*mut LanceDatasetDelta, *mut FFI_ArrowArrayStream) -> i32,
+                as unsafe extern "C" fn(*const LanceDatasetDelta, *mut FFI_ArrowArrayStream) -> i32,
         ),
         (
             DeltaStream::Upserted,
             lance_dataset_delta_get_upserted_rows
-                as unsafe extern "C" fn(*mut LanceDatasetDelta, *mut FFI_ArrowArrayStream) -> i32,
+                as unsafe extern "C" fn(*const LanceDatasetDelta, *mut FFI_ArrowArrayStream) -> i32,
         ),
     ] {
         let mut stream = FFI_ArrowArrayStream::empty();
