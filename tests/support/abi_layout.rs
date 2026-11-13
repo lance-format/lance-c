@@ -2000,11 +2000,26 @@ fn field_names(body: &[String]) -> Vec<String> {
         if declaration.is_empty() {
             continue;
         }
+        // A function-pointer declarator looks like `(*name)`. Parameter
+        // names such as `struct Foo* self` are nested one parenthesis deeper,
+        // so only inspect `*` tokens at the declarator's own depth.
+        let mut depth = 0usize;
         let mut is_function_pointer = false;
-        for window in declaration.windows(3) {
-            if window[0] == "*" && is_ident(&window[1]) && window[2] == ")" {
-                fields.push(window[1].clone());
-                is_function_pointer = true;
+        for (index, token) in declaration.iter().enumerate() {
+            match token.as_str() {
+                "(" => depth += 1,
+                ")" => depth = depth.saturating_sub(1),
+                "*" if depth == 1 => {
+                    if declaration
+                        .get(index + 1)
+                        .is_some_and(|name| is_ident(name))
+                        && declaration.get(index + 2).map(String::as_str) == Some(")")
+                    {
+                        fields.push(declaration[index + 1].clone());
+                        is_function_pointer = true;
+                    }
+                }
+                _ => {}
             }
         }
         if is_function_pointer {
@@ -2049,7 +2064,7 @@ fn header_scanner_recognizes_public_declarations() {
         typedef enum Tag { A = 1, B = 2 } ExampleEnum;
         typedef struct Forward Forward;
         typedef struct { int value; } ExampleStruct;
-        struct ExampleArrow { void (*release)(struct ExampleArrow*); };
+        struct ExampleArrow { void (*release)(struct ExampleArrow* self); };
         typedef struct Defined Defined;
         typedef struct Defined { int x; } Defined;
     "#;
@@ -2067,7 +2082,10 @@ fn header_scanner_recognizes_public_declarations() {
         inventory.structs.get("Defined"),
         Some(&vec!["x".to_owned()])
     );
-    assert!(inventory.plain_structs.contains_key("ExampleArrow"));
+    assert_eq!(
+        inventory.plain_structs.get("ExampleArrow"),
+        Some(&vec!["release".to_owned()])
+    );
     assert!(inventory.opaque.contains("Forward"));
     assert!(inventory.opaque.contains("Defined"));
 }
