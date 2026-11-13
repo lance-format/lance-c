@@ -22,9 +22,12 @@ use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, String
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::scanner::ColumnOrdering;
-use lance::index::DatasetIndexExt;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_index::IndexType;
-use lance_index::scalar::inverted::query::{BooleanQuery, FtsQuery, MatchQuery, Occur, Operator};
+use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::scalar::inverted::query::{
+    BooleanQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator, collect_query_tokens,
+};
 use lance_index::scalar::inverted::{DocumentGranularity, Language};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use tempfile::TempDir;
@@ -162,6 +165,43 @@ const ROWS: &[&str] = &[
     "alpha alp!",
     "alpha   ",
 ];
+
+#[tokio::test]
+async fn public_exact_vocabulary_expansion_filters_and_caps_tokens() {
+    let (_dir, ds) = write_rows(ROWS).await;
+    let metadata = ds.load_indices().await.unwrap();
+    assert_eq!(metadata.len(), 1);
+    let index = ds
+        .open_scalar_index("text", &metadata[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let index = index
+        .as_any()
+        .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+        .unwrap();
+    let mut tokenizer = index.tokenizer();
+    let tokens = collect_query_tokens("zzzzmissing alpha beta", &mut tokenizer);
+
+    // Direct vocabulary expansion filters missing terms and observes the cap
+    // even in exact mode. Posting lookups would hide a regression here.
+    for (cap, expected) in [
+        (8, &[("alpha", 1), ("beta", 2)][..]),
+        (1, &[("alpha", 1)][..]),
+        (0, &[][..]),
+    ] {
+        let params = FtsSearchParams::default()
+            .with_fuzziness(Some(0))
+            .with_max_expansions(cap);
+        let expanded = index.expand_fuzzy_tokens(&tokens, &params).unwrap();
+        let actual: Vec<_> = (0..expanded.len())
+            .map(|i| (expanded.get_token(i), expanded.position(i)))
+            .collect();
+        assert_eq!(actual.as_slice(), expected, "exact vocabulary cap={cap}");
+    }
+    let missing = collect_query_tokens("zzzzmissing", &mut tokenizer);
+    let params = FtsSearchParams::default().with_fuzziness(Some(0));
+    assert!(index.expand_fuzzy_tokens(&missing, &params).unwrap().is_empty());
+}
 
 #[tokio::test]
 async fn exact_match_remains_unchanged() {
