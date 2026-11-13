@@ -12,7 +12,7 @@ pin, C API, ABI, or error contract. No C API surface is added or modified.
 
 | Artifact | SHA256 |
 | --- | --- |
-| `native-last-as-prefix-main-793a9e5.patch` (this candidate) | `0eb2ee32c25dcff542117dfb911ea4a678ba43b8008a427339ce3ba23641c583` |
+| `native-last-as-prefix-main-793a9e5.patch` (this candidate) | `8622122db07fa4f1daf44d33222745e6a07b24c87d767167e279b452ba1d45b9` |
 | `../last-as-prefix/native-last-as-prefix.patch` (pinned, unchanged) | `18bad6fe2ae452dc7bd91e5243385eccb9a749413b63f8be8533afab45ae720e` |
 
 - Candidate base tree: `b71237fa79dd9c94da47752e026430bd93ce7243`
