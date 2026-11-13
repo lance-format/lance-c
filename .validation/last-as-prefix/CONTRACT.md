@@ -1,8 +1,10 @@
 # Native last-token prefix matching for `MatchQuery`
 
-Status: candidate native contract + candidate implementation diff, validated on a
-patched Lance 14.0.2 checkout. Not upstreamed. No lance-c public C API change is
-included. Upstream publication requires separate authorization.
+Status: candidate native contract and implementation against Lance 14.0.2, not
+upstreamed. The original eight-case oracle ran with Rust 1.98.1; its separate
+Rust 1.94.0 recheck remains in progress. The compatibility revision and additional
+public-method regression below have not yet run. No lance-c public C API change
+is included. Upstream publication requires separate authorization.
 
 ## Problem
 
@@ -24,8 +26,10 @@ therefore has to own the operation.
 ## Verified sources at the pin
 
 Pinned revision: `40f15ed1b71b66950961b175829fdf17a763f108` (Lance 14.0.2).
-The same gap exists at `15.0.0-beta.16` (`03b7ff329e656636c581f1e3547048101990bc1f`)
-and on upstream `main` as of 2026-11-13; no open upstream PR implements it.
+This exact revision is the implementation authority for the candidate. A query
+representation inspection or a search of open PR titles does not establish
+complete absence of an upstream implementation. Applicability to an exact
+current upstream revision must be checked before proposing publication.
 
 Relevant source (`rust/lance-index/src/scalar/inverted/`):
 
@@ -102,9 +106,13 @@ so every token-scoring stage uses one predicate.
    several expansions of the final position are alternatives for that position.
    `BooleanQuery`, `BoostQuery`, `MultiMatchQuery`, and `CombinedFieldsQuery`
    compose the leaf unchanged. Boost multiplies the leaf BM25 score.
-10. **Disabled compatibility.** With `last_as_prefix = false`, the early return
-    in `final_query_tokens` makes the code path identical to the pin. Missing
-    `last_as_prefix` in serde input means `false`.
+10. **Disabled compatibility.** With `last_as_prefix = false`, ordinary exact
+    query planning retains its no-expansion shortcut. The existing public
+    `InvertedIndex::expand_fuzzy_tokens` is an explicit vocabulary-selection
+    call: even with `fuzziness = Some(0)`, it must discard terms absent from the
+    vocabulary, retain positions, and apply `max_expansions`. It calls the same
+    selection algorithm directly, without taking the query-planning shortcut.
+    Missing `last_as_prefix` in serde input means `false`.
 11. **Memory index.** `mem_wal` FTS has its own query expression and does not
     implement prefix expansion. `to_local_expr` rejects the flag with
     `not_supported` instead of silently degrading to fuzzy matching. Native
@@ -114,18 +122,22 @@ so every token-scoring stage uses one predicate.
 
 ## Candidate implementation
 
-Patch: `native-last-as-prefix.patch` (11 files, +282/-118 against the pin).
+Patch: `native-last-as-prefix.patch` (11 files, +292/-119 against the pin).
+Current SHA-256: `18bad6fe2ae452dc7bd91e5243385eccb9a749413b63f8be8533afab45ae720e`.
 
 - `query.rs`: fields, builders, `uses_vocabulary_expansion`.
 - `index/partition.rs`: `PrefixAutomaton` over the whole analyzed token and an
   `ExpansionAutomaton` enum; renamed the generic candidate collector to
   `collect_expansion_candidates_with_automaton`.
-- `inverted.rs`: `final_query_tokens` accepts `&[&InvertedIndex]`, treats prefix
-  as vocabulary expansion, selects the maximum position, and chooses the prefix
-  automaton there; `prepare_bm25_query` uses the same predicate.
-- `index/search.rs`: `expand_fuzzy_tokens` delegates to `final_query_tokens`
-  (removes a duplicated implementation); both scoring entry points use the new
-  predicate; injected-scorer error text covers both expansion kinds.
+- `inverted.rs`: `final_query_tokens` accepts `&[&InvertedIndex]` and retains
+  the query-mode shortcut. A private `expand_query_tokens` owns the shared
+  vocabulary-selection algorithm: highest-position prefix expansion, fuzzy
+  expansion at earlier positions, and the common budget. `prepare_bm25_query`
+  uses the same mode predicate.
+- `index/search.rs`: public `expand_fuzzy_tokens` calls `expand_query_tokens`
+  unconditionally, preserving explicit exact-mode vocabulary selection without
+  duplicating its algorithm. Both scoring entry points use the new predicate;
+  injected-scorer error text covers both expansion kinds.
 - `compound.rs`, `fts.rs`: propagate the flag into effective search params.
 - `fts.rs`, `scanner.rs`: exclude prefix leaves from "no expansion" shortcuts
   (compound scorer shortcuts, committed-index stats residual compound,
@@ -138,20 +150,17 @@ The patch was generated with `git diff` from the checkout root and applies with
 
 ## C surface mapping (proposal only, not part of this task)
 
-The existing `LanceFtsMatchOptions` is a `#[repr(C)]` by-value struct, so adding a
-field is an ABI break. Two viable mappings:
+The existing `LanceFtsMatchOptions` is a `#[repr(C)]` by-value struct; adding a
+field would break its layout. That does not require a second options hierarchy.
+The existing `LanceFtsQuery` is an immutable owned typed value. An additive
+constructor returning a new query with the native Match flag can preserve both
+the old layout and immutable-value semantics, and map directly to the consuming
+native builder. A mutating setter would contradict the current query contract.
 
-1. Versioned struct: add `LanceFtsMatchOptionsV2` (or a `size`/`version` header)
-   plus `lance_fts_match_options_v2_set_last_as_prefix`, and keep V1 unchanged.
-2. Opaque options handle: introduce an owned options object with a
-   `lance_fts_match_options_set_last_as_prefix` setter, then pass the handle to
-   the existing constructor path.
-
-Recommendation: option 1 with the smallest new surface; both map to
-`MatchQuery::with_last_as_prefix` and require the new field to flow through
-`effective_params`. Wait for the parent's decision because this changes the
-public C surface. JSON parsing already accepts `last_as_prefix`, so the C JSON
-entry point works without new symbols.
+No C mapping is implemented here. It depends on an accepted native operation in
+the selected core revision and needs real C/C++ ownership tests. The candidate's
+native JSON parser accepts the flag, but the currently pinned parser does not;
+this is not a claim of current lance-c support.
 
 ## Validation
 
@@ -180,9 +189,9 @@ Covered:
 - list-element boundary (`al` + `pha` does not match `alp`; prefix = [0,1,3],
   exact = [3]).
 
-Command and result on NieR (32-core Linux, mbx-managed cargo shim), against a
-disposable `cp -a` copy of the pinned cargo checkout at
-`40f15ed1b71b66950961b175829fdf17a763f108`:
+Original command and result on NieR (32-core Linux, mbx-managed cargo shim),
+against a disposable source copy at the pinned revision. Its retained
+`.rustc_info.json` identifies Rust 1.98.1, so this is not Rust 1.94.0 evidence:
 
 ```bash
 cargo test -p lance --test fts_last_as_prefix -- --test-threads=4
@@ -200,14 +209,20 @@ Limitations: no JSON-column oracle, no default-analyzer (stemming/stop-word)
 oracle, no multi-segment partition-split oracle, no full lance-c suite, and no
 C surface test. Those are deliberate scope limits for this design step.
 
-## Remaining decision
+## Compatibility regression and remaining delivery work
 
-The only material semantic choice is whether `max_expansions` should also count
-exact/fuzzy terms at earlier positions when `last_as_prefix` is on. The candidate
-keeps the existing fuzzy rule (shared final-vocabulary budget), because
-`max_expansions` is already documented as one shared leaf budget and a separate
-prefix budget would add a second, query-kind-specific limit.
+The ninth oracle calls public `expand_fuzzy_tokens` on the same persisted index
+with exact-mode tokens `zzzzmissing alpha beta`. Hardcoded expected terms and
+positions verify missing-term filtering and budgets 8, 1 and 0; a missing-only
+query must produce no tokens. It checks the returned vocabulary directly,
+because a later posting lookup would hide the difference. The previous candidate
+would return the original tokens before any dictionary lookup. The added test
+is not yet executed and must fail against that candidate before validating the
+repair. The original eight cases remain unchanged.
 
-Before a C feature is deliverable: upstream acceptance and pin upgrade (parent
-owned), plus a versioned C options surface and C/C++ tests. Until then, lance-c
-cannot expose this via the existing ABI without breaking it.
+Keep the existing shared per-leaf expansion budget; no independent prefix budget
+is required by this proposal. Finish bounded native validation and exact-current-
+upstream applicability, then prepare the native change and its durable tests for
+review. Upstream publication and a lance-c core-pin migration remain separately
+authorized actions. Only after the native prerequisite is available should an
+additive immutable C query mapping and C/C++ consumer coverage be delivered.
