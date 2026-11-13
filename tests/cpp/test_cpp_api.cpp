@@ -4594,6 +4594,81 @@ static std::vector<int32_t> scan_filtered_ids(
     return ids;
 }
 
+static std::vector<int32_t> scan_rtree_ids(
+    const std::string& uri,
+    const std::string& filter,
+    bool use_scalar_index,
+    ScanStatisticsCapture& captured) {
+    auto ds = lance::Dataset::open(uri);
+    auto scanner = ds.scan({"id", "geometry"}, filter);
+    captured = ScanStatisticsCapture{};
+    scanner.use_scalar_index(use_scalar_index)
+        .statistics_callback(capture_scan_statistics, &captured);
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    auto ids = collect_ordering_ids(stream);
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+static void test_rtree_scalar_index(const std::string& uri) {
+    TEST(test_rtree_scalar_index);
+    assert(LANCE_SCALAR_RTREE == 9);
+
+    auto ds = lance::Dataset::open(uri);
+    assert(ds.fragment_count() == 3);
+    ds.create_scalar_index(
+        "geometry", LANCE_SCALAR_RTREE, "cpp_geometry_rtree");
+    assert(ds.index_count() == 1);
+    assert(ds.index_segment_count("cpp_geometry_rtree") == 1);
+
+    auto json = ds.list_indices_json();
+    assert(json.find("\"name\":\"cpp_geometry_rtree\"") != std::string::npos);
+    assert(json.find("\"type\":\"RTree\"") != std::string::npos);
+    assert(json.find("\"columns\":[\"geometry\"]") != std::string::npos);
+    json = ds.index_segments_json();
+    assert(json.find("\"name\":\"cpp_geometry_rtree\"") != std::string::npos);
+    assert(json.find("\"type\":\"RTree\"") != std::string::npos);
+    assert(json.find("\"fragment_ids\":[0,1,2]") != std::string::npos);
+
+    const auto point_filter =
+        "ST_Intersects(geometry, ST_GeomFromText('POINT (0 10)'))";
+    const auto recheck_filter =
+        "ST_Intersects(geometry, ST_GeomFromText('LINESTRING (25 25, 26 26)'))";
+    for (const auto& [filter, expected] :
+         std::vector<std::pair<std::string, std::vector<int32_t>>>{
+             {point_filter, {101, 114}},
+             {recheck_filter, {106}},
+             {"ST_Intersects(geometry, ST_GeomFromText('POINT (0 0)'))",
+              {100}},
+             {"geometry IS NULL", {103, 108}},
+         }) {
+        ScanStatisticsCapture stats;
+        assert(scan_rtree_ids(uri, filter, true, stats) == expected);
+        assert(stats.calls == 1);
+        assert(stats.indices_loaded > 0);
+        ScanStatisticsCapture unindexed_stats;
+        assert(scan_rtree_ids(uri, filter, false, unindexed_stats) == expected);
+        assert(unindexed_stats.indices_loaded == 0);
+    }
+
+    ds.prewarm_index("cpp_geometry_rtree");
+    auto reopened = lance::Dataset::open(uri);
+    reopened.create_scalar_index(
+        "geometry", LANCE_SCALAR_RTREE, "cpp_geometry_rtree",
+        R"({"page_size":8})", true);
+    assert(reopened.index_count() == 1);
+    ScanStatisticsCapture stats;
+    assert((scan_rtree_ids(uri, point_filter, true, stats) ==
+            std::vector<int32_t>{101, 114}));
+    assert(stats.indices_loaded > 0);
+    reopened.drop_index("cpp_geometry_rtree");
+    assert(reopened.index_count() == 0);
+
+    PASS();
+}
+
 static void test_native_scalar_indexes(const std::string& uri) {
     TEST(test_native_scalar_indexes);
 
@@ -5474,11 +5549,12 @@ static void test_dataset_deep_clone(const std::string& feature_uri) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 12) {
+    if (argc < 13) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
                 "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri> "
-                "<aggregate_plan_path> <config_base_uri> <alternate_base_uri>\n",
+                "<rtree_geometry_uri> <aggregate_plan_path> <config_base_uri> "
+                "<alternate_base_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -5491,9 +5567,10 @@ int main(int argc, char** argv) {
     std::string fragment_uri(argv[6]);
     std::string fragment_read_uri(argv[7]);
     std::string cleanup_uri(argv[8]);
-    std::string aggregate_plan_path(argv[9]);
-    std::string config_base_uri(argv[10]);
-    std::string alternate_base_uri(argv[11]);
+    std::string rtree_geometry_uri(argv[9]);
+    std::string aggregate_plan_path(argv[10]);
+    std::string config_base_uri(argv[11]);
+    std::string alternate_base_uri(argv[12]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -5528,6 +5605,7 @@ int main(int argc, char** argv) {
     test_index_lifecycle(uri);
     test_native_scalar_indexes(uri);
     test_index_list_json_escaping(uri);
+    test_rtree_scalar_index(rtree_geometry_uri);
     test_minhash_lsh(uri);
     test_batch_nearest(uri);
     test_scanner_materialization_fast_search(uri);
