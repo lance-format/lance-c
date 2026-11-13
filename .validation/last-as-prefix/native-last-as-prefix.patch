@@ -1,0 +1,747 @@
+diff --git a/rust/lance-index/src/scalar/inverted.rs b/rust/lance-index/src/scalar/inverted.rs
+index 364b8df32..8893ca4bd 100644
+--- a/rust/lance-index/src/scalar/inverted.rs
++++ b/rust/lance-index/src/scalar/inverted.rs
+@@ -48,7 +48,7 @@ pub use lance_tokenizer::Language;
+ pub use scorer::{CombinedFieldsBM25Scorer, MemBM25Scorer, Scorer};
+ pub use tokenizer::*;
+ 
+-use crate::scalar::inverted::query::{FtsSearchParams, Tokens, uses_fuzzy_expansion};
++use crate::scalar::inverted::query::{FtsSearchParams, Tokens};
+ 
+ /// Canonical token vocabulary and BM25 statistics for one indexed query leaf.
+ ///
+@@ -116,14 +116,22 @@ impl PreparedBm25Query {
+ }
+ 
+ pub(crate) fn final_query_tokens(
+-    indices: &[Arc<InvertedIndex>],
++    indices: &[&InvertedIndex],
+     query_tokens: &Tokens,
+     params: &FtsSearchParams,
+ ) -> Result<Tokens> {
+-    if !uses_fuzzy_expansion(params.fuzziness) {
++    if !params.uses_vocabulary_expansion() {
+         return Ok(query_tokens.clone());
+     }
+ 
++    // The token at the highest position is the one the caller is still
++    // typing. Positions are not necessarily in source order (the jieba
++    // tokenizer can emit them out of order), so select by value instead of
++    // by the last token in the stream.
++    let last_position = (0..query_tokens.len())
++        .map(|token_idx| query_tokens.position(token_idx))
++        .max();
++
+     let initial_capacity = query_tokens.len().min(params.max_expansions);
+     let mut expanded_tokens = Vec::with_capacity(initial_capacity);
+     let mut expanded_positions = Vec::with_capacity(initial_capacity);
+@@ -149,9 +157,17 @@ pub(crate) fn final_query_tokens(
+             // One source token has one canonical automaton across every
+             // selected segment. Drop it after this source term so peak DFA
+             // memory is independent of the number of query terms.
+-            let automaton = FuzzyAutomaton::new(source_term, query_tokens.token_type(), params)?;
++            let automaton = if params.last_as_prefix && Some(position) == last_position {
++                ExpansionAutomaton::Prefix(PrefixAutomaton::new(source_term))
++            } else {
++                ExpansionAutomaton::Fuzzy(FuzzyAutomaton::new(
++                    source_term,
++                    query_tokens.token_type(),
++                    params,
++                )?)
++            };
+             for index in indices {
+-                index.collect_fuzzy_candidates_with_automaton(
++                index.collect_expansion_candidates_with_automaton(
+                     &automaton,
+                     remaining,
+                     &mut candidates,
+@@ -324,8 +340,9 @@ pub async fn prepare_bm25_query(
+     let first_index = indices.first().ok_or_else(|| {
+         lance_core::Error::invalid_input("FTS index requires at least one segment")
+     })?;
+-    let (tokens, has_all_query_positions) = if uses_fuzzy_expansion(params.fuzziness) {
+-        let tokens = Arc::new(final_query_tokens(indices, &query_tokens, params)?);
++    let (tokens, has_all_query_positions) = if params.uses_vocabulary_expansion() {
++        let index_refs = indices.iter().map(Arc::as_ref).collect::<Vec<_>>();
++        let tokens = Arc::new(final_query_tokens(&index_refs, &query_tokens, params)?);
+         let has_all_query_positions = has_all_query_positions(&query_tokens, tokens.as_ref());
+         (tokens, has_all_query_positions)
+     } else {
+diff --git a/rust/lance-index/src/scalar/inverted/compound.rs b/rust/lance-index/src/scalar/inverted/compound.rs
+index 91443868d..6a3b8c486 100644
+--- a/rust/lance-index/src/scalar/inverted/compound.rs
++++ b/rust/lance-index/src/scalar/inverted/compound.rs
+@@ -3741,7 +3741,8 @@ impl LeafQuery {
+                 .with_phrase_slop(None)
+                 .with_fuzziness(query.fuzziness)
+                 .with_max_expansions(query.max_expansions)
+-                .with_prefix_length(query.prefix_length),
++                .with_prefix_length(query.prefix_length)
++                .with_last_as_prefix(query.last_as_prefix),
+             Self::Phrase(query) => params
+                 .clone()
+                 .with_limit(None)
+diff --git a/rust/lance-index/src/scalar/inverted/cross_column.rs b/rust/lance-index/src/scalar/inverted/cross_column.rs
+index 7e6b11361..0d560bb0e 100644
+--- a/rust/lance-index/src/scalar/inverted/cross_column.rs
++++ b/rust/lance-index/src/scalar/inverted/cross_column.rs
+@@ -547,7 +547,8 @@ async fn prepare_column_leaves(
+     for (leaf_ordinal, leaf) in leaf_queries {
+         let effective_params = leaf.effective_params(params);
+         let tokens = tokenize_leaf(first_index, leaf, &effective_params)?;
+-        let final_tokens = Arc::new(final_query_tokens(indices, &tokens, &effective_params)?);
++        let index_refs = indices.iter().map(Arc::as_ref).collect::<Vec<_>>();
++        let final_tokens = Arc::new(final_query_tokens(&index_refs, &tokens, &effective_params)?);
+         for token in final_tokens.as_ref() {
+             if seen_terms.insert(token.clone()) {
+                 union_terms.push(token.clone());
+diff --git a/rust/lance-index/src/scalar/inverted/index/partition.rs b/rust/lance-index/src/scalar/inverted/index/partition.rs
+index 43869af81..2bbbe6390 100644
+--- a/rust/lance-index/src/scalar/inverted/index/partition.rs
++++ b/rust/lance-index/src/scalar/inverted/index/partition.rs
+@@ -279,6 +279,127 @@ impl Automaton for FuzzyAutomaton {
+     }
+ }
+ 
++/// Matches vocabulary terms that start with the query token.
++///
++/// The whole analyzed token is the prefix. JSON vocabulary terms have the form
++/// `path,type,value`, so matching the token verbatim keeps the path and type
++/// exact and only lets the value grow, just like [`FuzzyAutomaton`] does for
++/// fuzzy matching.
++pub(in crate::scalar::inverted) struct PrefixAutomaton {
++    prefix: Vec<u8>,
++}
++
++impl PrefixAutomaton {
++    pub(in crate::scalar::inverted) fn new(token: &str) -> Self {
++        Self {
++            prefix: token.as_bytes().to_vec(),
++        }
++    }
++}
++
++impl Automaton for PrefixAutomaton {
++    /// Number of bytes of `prefix` consumed so far. `None` means the term
++    /// already diverged, and `Some(prefix.len())` means every further byte is
++    /// part of a matching term.
++    type State = Option<usize>;
++
++    #[inline]
++    fn start(&self) -> Self::State {
++        Some(0)
++    }
++
++    #[inline]
++    fn is_match(&self, state: &Self::State) -> bool {
++        *state == Some(self.prefix.len())
++    }
++
++    #[inline]
++    fn can_match(&self, state: &Self::State) -> bool {
++        state.is_some()
++    }
++
++    #[inline]
++    fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
++        state.and_then(|position| {
++            if position == self.prefix.len() {
++                Some(position)
++            } else if self.prefix[position] == byte {
++                Some(position + 1)
++            } else {
++                None
++            }
++        })
++    }
++}
++
++/// Vocabulary expansion mode for one source token.
++pub(in crate::scalar::inverted) enum ExpansionAutomaton {
++    Fuzzy(FuzzyAutomaton),
++    Prefix(PrefixAutomaton),
++}
++
++pub(in crate::scalar::inverted) enum ExpansionAutomatonState {
++    Fuzzy(FuzzyAutomatonState),
++    Prefix(Option<usize>),
++}
++
++impl Automaton for ExpansionAutomaton {
++    type State = ExpansionAutomatonState;
++
++    #[inline]
++    fn start(&self) -> Self::State {
++        match self {
++            Self::Fuzzy(automaton) => ExpansionAutomatonState::Fuzzy(automaton.start()),
++            Self::Prefix(automaton) => ExpansionAutomatonState::Prefix(automaton.start()),
++        }
++    }
++
++    #[inline]
++    fn is_match(&self, state: &Self::State) -> bool {
++        match (self, state) {
++            (Self::Fuzzy(automaton), ExpansionAutomatonState::Fuzzy(state)) => {
++                automaton.is_match(state)
++            }
++            (Self::Prefix(automaton), ExpansionAutomatonState::Prefix(state)) => {
++                automaton.is_match(state)
++            }
++            _ => false,
++        }
++    }
++
++    #[inline]
++    fn can_match(&self, state: &Self::State) -> bool {
++        match (self, state) {
++            (Self::Fuzzy(automaton), ExpansionAutomatonState::Fuzzy(state)) => {
++                automaton.can_match(state)
++            }
++            (Self::Prefix(automaton), ExpansionAutomatonState::Prefix(state)) => {
++                automaton.can_match(state)
++            }
++            _ => false,
++        }
++    }
++
++    #[inline]
++    fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
++        match (self, state) {
++            (Self::Fuzzy(automaton), ExpansionAutomatonState::Fuzzy(state)) => {
++                ExpansionAutomatonState::Fuzzy(automaton.accept(state, byte))
++            }
++            (Self::Prefix(automaton), ExpansionAutomatonState::Prefix(state)) => {
++                ExpansionAutomatonState::Prefix(automaton.accept(state, byte))
++            }
++            (Self::Fuzzy(_), _) => {
++                ExpansionAutomatonState::Fuzzy(FuzzyAutomatonState::Ascii(AsciiFuzzyState {
++                    levenshtein: None,
++                    exact_prefix_bytes_matched: None,
++                }))
++            }
++            (Self::Prefix(_), _) => ExpansionAutomatonState::Prefix(None),
++        }
++    }
++}
++
+ impl UnicodeLevenshteinBuilder {
+     fn empty_transitions() -> ByteTransitions {
+         Box::new([None; 256])
+@@ -974,6 +1095,9 @@ impl InvertedPartition {
+         let mut new_positions = Vec::with_capacity(new_tokens.capacity());
+         let mut seen = HashSet::new();
+         let mut seen_source_terms = HashSet::new();
++        let last_position = (0..tokens.len())
++            .map(|token_idx| tokens.position(token_idx))
++            .max();
+         for token_idx in 0..tokens.len() {
+             let remaining = params.max_expansions.saturating_sub(new_tokens.len());
+             if remaining == 0 {
+@@ -985,8 +1109,16 @@ impl InvertedPartition {
+                 continue;
+             }
+             let mut candidates = BTreeSet::new();
+-            let automaton = FuzzyAutomaton::new(token, tokens.token_type(), params)?;
+-            self.collect_fuzzy_candidates_with_automaton(&automaton, remaining, &mut candidates)?;
++            let automaton = if params.last_as_prefix && Some(position) == last_position {
++                ExpansionAutomaton::Prefix(PrefixAutomaton::new(token))
++            } else {
++                ExpansionAutomaton::Fuzzy(FuzzyAutomaton::new(token, tokens.token_type(), params)?)
++            };
++            self.collect_expansion_candidates_with_automaton(
++                &automaton,
++                remaining,
++                &mut candidates,
++            )?;
+             for candidate in candidates {
+                 if new_tokens.len() >= params.max_expansions {
+                     break;
+@@ -1011,7 +1143,7 @@ impl InvertedPartition {
+     /// lossless for that selection because any term among the merged
+     /// lexicographically-smallest `limit` is also among its own partition's
+     /// smallest `limit`.
+-    pub(super) fn collect_fuzzy_candidates_with_automaton<A: Automaton>(
++    pub(super) fn collect_expansion_candidates_with_automaton<A: Automaton>(
+         &self,
+         automaton: &A,
+         limit: usize,
+diff --git a/rust/lance-index/src/scalar/inverted/index/search.rs b/rust/lance-index/src/scalar/inverted/index/search.rs
+index f7eb0a227..27b506ce6 100644
+--- a/rust/lance-index/src/scalar/inverted/index/search.rs
++++ b/rust/lance-index/src/scalar/inverted/index/search.rs
+@@ -1,8 +1,8 @@
+ // SPDX-License-Identifier: Apache-2.0
+ // SPDX-FileCopyrightText: Copyright The Lance Authors
+ 
+-use super::partition::FuzzyAutomaton;
+ use super::*;
++use crate::scalar::inverted::final_query_tokens;
+ 
+ const LANCE_FTS_REUSE_PREPARED_SCORER_ENV: &str = "LANCE_FTS_REUSE_PREPARED_SCORER";
+ 
+@@ -51,16 +51,21 @@ fn select_impact_scorer(
+ }
+ 
+ impl InvertedIndex {
+-    /// Add this segment's lexicographically smallest fuzzy candidates for one
+-    /// compiled query-token automaton to a caller-owned cross-segment merge
+-    /// set.
++    /// Add this segment's lexicographically smallest vocabulary candidates for
++    /// one compiled query-token automaton to a caller-owned cross-segment
++    /// merge set.
++    ///
++    /// The automaton may describe fuzzy matching or last-token prefix
++    /// matching; both use the same deterministic budgeted selection.
+     ///
+     /// The set is trimmed after every partition merge, so it always contains
+     /// at most `limit` terms. Dropping the current largest term is lossless:
+     /// no later merge can make it one of the globally smallest `limit` terms.
+-    pub(in crate::scalar::inverted) fn collect_fuzzy_candidates_with_automaton(
++    pub(in crate::scalar::inverted) fn collect_expansion_candidates_with_automaton<
++        A: fst::Automaton,
++    >(
+         &self,
+-        automaton: &FuzzyAutomaton,
++        automaton: &A,
+         limit: usize,
+         candidates: &mut BTreeSet<String>,
+     ) -> Result<()> {
+@@ -71,7 +76,7 @@ impl InvertedIndex {
+             candidates.pop_last();
+         }
+         for partition in &self.partitions {
+-            partition.collect_fuzzy_candidates_with_automaton(automaton, limit, candidates)?;
++            partition.collect_expansion_candidates_with_automaton(automaton, limit, candidates)?;
+             while candidates.len() > limit {
+                 candidates.pop_last();
+             }
+@@ -92,7 +97,7 @@ impl InvertedIndex {
+         params: &FtsSearchParams,
+         metrics: Option<&dyn MetricsCollector>,
+     ) -> Result<MemBM25Scorer> {
+-        if uses_fuzzy_expansion(params.fuzziness) {
++        if params.uses_vocabulary_expansion() {
+             let expanded = self.expand_fuzzy_tokens(query_tokens, params)?;
+             self.bm25_scorer_for_final_tokens(&expanded, metrics).await
+         } else {
+@@ -411,64 +416,13 @@ impl InvertedIndex {
+         Ok(dfs.into_iter().sum())
+     }
+ 
+-    /// Expand fuzzy query tokens against all partitions in this segment.
++    /// Resolve query tokens against this segment's vocabulary.
+     ///
++    /// Fuzzy matching and last-token prefix matching both expand tokens here.
+     /// `params.max_expansions` caps the whole query's expansion, not any
+-    /// single partition's: source terms at the same query position and their
+-    /// per-partition candidates merge into one lexicographically ordered set,
+-    /// and the remaining budget takes a prefix of it. The selected terms are
+-    /// a pure function of the segment's vocabulary, so changing source-token
+-    /// order or splitting the same corpus into more partitions cannot change
+-    /// which terms a fuzzy query matches.
++    /// single partition's; see [`final_query_tokens`] for the selection rule.
+     pub fn expand_fuzzy_tokens(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
+-        let initial_capacity = tokens.len().min(params.max_expansions);
+-        let mut expanded_tokens = Vec::with_capacity(initial_capacity);
+-        let mut expanded_positions = Vec::with_capacity(initial_capacity);
+-        let mut seen = HashSet::new();
+-        let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
+-        for token_idx in 0..tokens.len() {
+-            source_terms_by_position
+-                .entry(tokens.position(token_idx))
+-                .or_default()
+-                .push(tokens.get_token(token_idx));
+-        }
+-        for (position, source_terms) in source_terms_by_position {
+-            let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
+-            if remaining == 0 {
+-                break;
+-            }
+-            // Each partition contributes at most its `remaining`
+-            // lexicographically smallest candidates, so the global
+-            // lex-smallest `remaining` selection below is unaffected by the
+-            // per-partition truncation.
+-            let mut candidates = BTreeSet::new();
+-            let mut seen_source_terms = HashSet::new();
+-            for source_term in source_terms {
+-                if !seen_source_terms.insert(source_term) {
+-                    continue;
+-                }
+-                let automaton = FuzzyAutomaton::new(source_term, tokens.token_type(), params)?;
+-                self.collect_fuzzy_candidates_with_automaton(
+-                    &automaton,
+-                    remaining,
+-                    &mut candidates,
+-                )?;
+-            }
+-            for candidate in candidates {
+-                if expanded_tokens.len() >= params.max_expansions {
+-                    break;
+-                }
+-                if seen.insert((candidate.clone(), position)) {
+-                    expanded_tokens.push(candidate);
+-                    expanded_positions.push(position);
+-                }
+-            }
+-        }
+-        Ok(Tokens::with_positions(
+-            expanded_tokens,
+-            expanded_positions,
+-            tokens.token_type().clone(),
+-        ))
++        final_query_tokens(&[self], tokens, params)
+     }
+ 
+     /// Search documents that match the query and return row ids sorted by BM25 score.
+@@ -574,16 +528,16 @@ impl InvertedIndex {
+         base_scorer: Option<&MemBM25Scorer>,
+         initial_score_floor: Option<f32>,
+     ) -> Result<Vec<ScoredDoc>> {
+-        if base_scorer.is_some() && uses_fuzzy_expansion(params.fuzziness) {
++        if base_scorer.is_some() && params.uses_vocabulary_expansion() {
+             return Err(Error::invalid_input(
+-                "fuzzy BM25 search cannot use an injected scorer without its prepared vocabulary; use bm25_search_prepared or bm25_search_prepared_documents",
++                "BM25 search that needs vocabulary expansion cannot use an injected scorer without its prepared vocabulary; use bm25_search_prepared or bm25_search_prepared_documents",
+             ));
+         }
+         // Fuzzy expansion runs once here, with the global `max_expansions`
+         // budget, instead of once per partition: partitions receive the
+         // final token list, so the matched terms cannot depend on how the
+         // corpus happens to be partitioned.
+-        let tokens = if uses_fuzzy_expansion(params.fuzziness) {
++        let tokens = if params.uses_vocabulary_expansion() {
+             let expanded = Arc::new(self.expand_fuzzy_tokens(tokens.as_ref(), params.as_ref())?);
+             if operator == Operator::And || params.phrase_slop.is_some() {
+                 // AND/phrase semantics require every original token position
+diff --git a/rust/lance-index/src/scalar/inverted/index/tests/query.rs b/rust/lance-index/src/scalar/inverted/index/tests/query.rs
+index f8ab93218..48396e070 100644
+--- a/rust/lance-index/src/scalar/inverted/index/tests/query.rs
++++ b/rust/lance-index/src/scalar/inverted/index/tests/query.rs
+@@ -1362,7 +1362,7 @@ async fn test_fuzzy_candidate_merge_stays_bounded_across_partitions() {
+     let automaton = FuzzyAutomaton::new("alphx", &DocType::Text, &params).unwrap();
+ 
+     index
+-        .collect_fuzzy_candidates_with_automaton(&automaton, limit, &mut candidates)
++        .collect_expansion_candidates_with_automaton(&automaton, limit, &mut candidates)
+         .unwrap();
+ 
+     assert!(candidates.len() <= limit);
+diff --git a/rust/lance-index/src/scalar/inverted/parser.rs b/rust/lance-index/src/scalar/inverted/parser.rs
+index 8993522b5..9ad71519f 100644
+--- a/rust/lance-index/src/scalar/inverted/parser.rs
++++ b/rust/lance-index/src/scalar/inverted/parser.rs
+@@ -44,6 +44,7 @@ impl JsonParser for MatchQuery {
+             .as_u64()
+             .map(|v| v as u32)
+             .unwrap_or(0);
++        let last_as_prefix = value["last_as_prefix"].as_bool().unwrap_or(false);
+         let document_granularity = parse_document_granularity(value)?;
+ 
+         Ok(Self {
+@@ -54,6 +55,7 @@ impl JsonParser for MatchQuery {
+             max_expansions,
+             operator,
+             prefix_length,
++            last_as_prefix,
+             document_granularity,
+         })
+     }
+@@ -265,6 +267,7 @@ mod tests {
+             max_expansions: 10,
+             operator: Operator::And,
+             prefix_length: 2,
++            last_as_prefix: false,
+             document_granularity: None,
+         });
+         assert_eq!(fts_query, expected_query);
+diff --git a/rust/lance-index/src/scalar/inverted/query.rs b/rust/lance-index/src/scalar/inverted/query.rs
+index d6c813c69..fc4aa799d 100644
+--- a/rust/lance-index/src/scalar/inverted/query.rs
++++ b/rust/lance-index/src/scalar/inverted/query.rs
+@@ -64,14 +64,24 @@ pub struct FtsSearchParams {
+     pub limit: Option<usize>,
+     pub wand_factor: f32,
+     pub fuzziness: Option<u32>,
+-    /// Final fuzzy vocabulary budget for one Match leaf across all selected
+-    /// segments and partitions.
++    /// Final vocabulary budget for one Match leaf across all selected
++    /// segments and partitions. It bounds fuzzy expansions and, when
++    /// `last_as_prefix` is set, the prefix expansions of the final token.
+     pub max_expansions: usize,
+     // None means not a phrase query
+     // Some(n) means a phrase query with slop n
+     pub phrase_slop: Option<u32>,
+     /// The number of beginning characters being unchanged for fuzzy matching.
++    /// Applies to fuzzy expansion only; the final token is a literal prefix
++    /// match when `last_as_prefix` is set.
+     pub prefix_length: u32,
++    /// Whether the final analyzed token is matched as a vocabulary prefix.
++    ///
++    /// This is the same setting as [`MatchQuery::last_as_prefix`], carried in
++    /// the search parameters so tokenization, scorer preparation and posting
++    /// lookup share one predicate.
++    #[serde(default)]
++    pub last_as_prefix: bool,
+ }
+ 
+ impl FtsSearchParams {
+@@ -83,6 +93,7 @@ impl FtsSearchParams {
+             max_expansions: 50,
+             phrase_slop: None,
+             prefix_length: 0,
++            last_as_prefix: false,
+         }
+     }
+ 
+@@ -115,6 +126,18 @@ impl FtsSearchParams {
+         self.prefix_length = prefix_length;
+         self
+     }
++
++    pub fn with_last_as_prefix(mut self, last_as_prefix: bool) -> Self {
++        self.last_as_prefix = last_as_prefix;
++        self
++    }
++
++    /// Whether this search has to resolve query tokens to indexed vocabulary
++    /// terms. Both fuzzy matching and last-token prefix matching do; an exact
++    /// Match can look up its tokens directly.
++    pub fn uses_vocabulary_expansion(&self) -> bool {
++        uses_fuzzy_expansion(self.fuzziness) || self.last_as_prefix
++    }
+ }
+ 
+ impl Default for FtsSearchParams {
+@@ -373,10 +396,28 @@ pub struct MatchQuery {
+     pub operator: Operator,
+ 
+     /// The number of beginning characters being unchanged for fuzzy matching.
+-    /// Default to 0.
++    /// Default to 0. This only affects fuzzy expansion: when
++    /// `last_as_prefix` is set, the final token is matched as a literal
++    /// prefix and this field does not apply to it.
+     #[serde(default)]
+     pub prefix_length: u32,
+ 
++    /// Match the last analyzed token as a prefix instead of a whole term.
++    ///
++    /// The token is selected after the index tokenizer has run, so
++    /// lower-casing, stemming, stop-word removal and JSON path/type handling
++    /// are already applied. Only the token at the highest position is
++    /// expanded; earlier tokens keep their normal exact or fuzzy semantics.
++    /// The expansion shares `max_expansions` with fuzzy expansions from the
++    /// same leaf, and candidates are selected in lexicographic order, so the
++    /// surviving vocabulary does not depend on source token order or on how
++    /// the index is partitioned.
++    ///
++    /// This is not fuzzy matching: `fuzziness` and `prefix_length` apply only
++    /// to the tokens before the final one.
++    #[serde(default)]
++    pub last_as_prefix: bool,
++
+     /// The requested logical document unit.
+     ///
+     /// When absent, query planning uses the granularity stored by the unique
+@@ -397,6 +438,7 @@ impl MatchQuery {
+             max_expansions: 50,
+             operator: Operator::Or,
+             prefix_length: 0,
++            last_as_prefix: false,
+             document_granularity: None,
+         }
+     }
+@@ -439,6 +481,11 @@ impl MatchQuery {
+         self
+     }
+ 
++    pub fn with_last_as_prefix(mut self, last_as_prefix: bool) -> Self {
++        self.last_as_prefix = last_as_prefix;
++        self
++    }
++
+     pub fn with_document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
+         self.document_granularity = Some(document_granularity);
+         self
+diff --git a/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs b/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs
+index 552b4d85a..51f9557b5 100644
+--- a/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs
++++ b/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs
+@@ -449,22 +449,30 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
+         }
+     }
+     Ok(match query {
+-        IndexFtsQuery::Match(m) => bind(
+-            match m.fuzziness {
+-                // `Some(0)` is an exact match in the index model.
+-                Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
++        IndexFtsQuery::Match(m) => {
++            if m.last_as_prefix {
++                return Err(Error::not_supported(format!(
++                    "last_as_prefix is not supported by the in-memory FTS index: column={:?}, terms={:?}",
++                    m.column, m.terms
++                )));
++            }
++            bind(
++                match m.fuzziness {
++                    // `Some(0)` is an exact match in the index model.
++                    Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
++                        .with_boost(m.boost),
++                    fuzziness => FtsQueryExpr::fuzzy_with_options(
++                        m.terms.clone(),
++                        fuzziness,
++                        m.prefix_length,
++                        m.max_expansions,
++                    )
++                    .with_operator(m.operator)
+                     .with_boost(m.boost),
+-                fuzziness => FtsQueryExpr::fuzzy_with_options(
+-                    m.terms.clone(),
+-                    fuzziness,
+-                    m.prefix_length,
+-                    m.max_expansions,
+-                )
+-                .with_operator(m.operator)
+-                .with_boost(m.boost),
+-            },
+-            m.column.as_ref(),
+-        ),
++                },
++                m.column.as_ref(),
++            )
++        }
+         IndexFtsQuery::Phrase(p) => bind(
+             FtsQueryExpr::phrase_with_slop(p.terms.clone(), p.slop),
+             p.column.as_ref(),
+diff --git a/rust/lance/src/dataset/scanner.rs b/rust/lance/src/dataset/scanner.rs
+index 99812e8c0..531d1d41a 100644
+--- a/rust/lance/src/dataset/scanner.rs
++++ b/rust/lance/src/dataset/scanner.rs
+@@ -307,7 +307,7 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
+ 
+ fn supports_indexed_stats_residual_compound(query: &FtsQuery) -> bool {
+     match query {
+-        FtsQuery::Match(query) => query.fuzziness == Some(0),
++        FtsQuery::Match(query) => query.fuzziness == Some(0) && !query.last_as_prefix,
+         // MemWAL phrase matching currently collapses tokenizer position gaps.
+         // Keep phrase queries on the established fallback until it can retain
+         // those gaps exactly (notably when stop words are configured).
+@@ -319,7 +319,7 @@ fn supports_indexed_stats_residual_compound(query: &FtsQuery) -> bool {
+         FtsQuery::MultiMatch(query) => query
+             .match_queries
+             .iter()
+-            .all(|query| query.fuzziness == Some(0)),
++            .all(|query| query.fuzziness == Some(0) && !query.last_as_prefix),
+         FtsQuery::Boolean(query) => query
+             .should
+             .iter()
+diff --git a/rust/lance/src/io/exec/fts.rs b/rust/lance/src/io/exec/fts.rs
+index 4b09d997c..2d99a1595 100644
+--- a/rust/lance/src/io/exec/fts.rs
++++ b/rust/lance/src/io/exec/fts.rs
+@@ -655,25 +655,25 @@ fn compound_leaf_columns(query: &FtsQuery) -> Result<Vec<&str>> {
+     Ok(columns)
+ }
+ 
+-fn compound_query_uses_fuzzy_expansion(query: &FtsQuery) -> bool {
++fn compound_query_uses_vocabulary_expansion(query: &FtsQuery) -> bool {
+     match query {
+-        FtsQuery::Match(query) => uses_fuzzy_expansion(query.fuzziness),
++        FtsQuery::Match(query) => uses_fuzzy_expansion(query.fuzziness) || query.last_as_prefix,
+         // combined_fields matches terms exactly; it has no fuzziness setting.
+         FtsQuery::Phrase(_) | FtsQuery::CombinedFields(_) => false,
+         FtsQuery::Boost(query) => {
+-            compound_query_uses_fuzzy_expansion(&query.positive)
+-                || compound_query_uses_fuzzy_expansion(&query.negative)
++            compound_query_uses_vocabulary_expansion(&query.positive)
++                || compound_query_uses_vocabulary_expansion(&query.negative)
+         }
+         FtsQuery::MultiMatch(query) => query
+             .match_queries
+             .iter()
+-            .any(|query| uses_fuzzy_expansion(query.fuzziness)),
++            .any(|query| uses_fuzzy_expansion(query.fuzziness) || query.last_as_prefix),
+         FtsQuery::Boolean(query) => query
+             .should
+             .iter()
+             .chain(&query.must)
+             .chain(&query.must_not)
+-            .any(compound_query_uses_fuzzy_expansion),
++            .any(compound_query_uses_vocabulary_expansion),
+     }
+ }
+ 
+@@ -1588,10 +1588,10 @@ impl ExecutionPlan for CompoundQueryExec {
+                     "CompoundQueryExec prepared vocabulary requires a root Match query".to_string(),
+                 ));
+             }
+-            let scorer_only_fuzzy = preset_prepared_match.is_none()
+-                && compound_query_uses_fuzzy_expansion(&query)
++            let scorer_only_expansion = preset_prepared_match.is_none()
++                && compound_query_uses_vocabulary_expansion(&query)
+                 && preset_base_scorer.is_some();
+-            let scorer_override_covers_all = if scorer_only_fuzzy {
++            let scorer_override_covers_all = if scorer_only_expansion {
+                 segment_selection
+                     .covers_all_committed(&dataset, column, DocumentGranularity::Row, &segments)
+                     .await?
+@@ -1644,9 +1644,9 @@ impl ExecutionPlan for CompoundQueryExec {
+                 (true, _) => None,
+                 (false, scorer) => scorer,
+             };
+-            if base_scorer.is_some() && scorer_only_fuzzy && !scorer_override_covers_all {
++            if base_scorer.is_some() && scorer_only_expansion && !scorer_override_covers_all {
+                 return Err(DataFusionError::Execution(
+-                    "fuzzy CompoundQueryExec cannot use a scorer-only override over a segment subset; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_match"
++                    "CompoundQueryExec cannot use a scorer-only override over a segment subset when the query needs vocabulary expansion; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_match"
+                     .to_string(),
+                 ));
+             }
+@@ -2777,6 +2777,7 @@ impl MatchQueryExec {
+             .with_fuzziness(query.fuzziness)
+             .with_max_expansions(query.max_expansions)
+             .with_prefix_length(query.prefix_length)
++            .with_last_as_prefix(query.last_as_prefix)
+     }
+ 
+     pub fn new(
+@@ -3139,10 +3140,10 @@ impl ExecutionPlan for MatchQueryExec {
+                     &metrics.segment_bind_duration,
+                 )
+                 .await?;
+-            let scorer_only_fuzzy = preset_prepared_query.is_none()
+-                && uses_fuzzy_expansion(params.fuzziness)
++            let scorer_only_expansion = preset_prepared_query.is_none()
++                && params.uses_vocabulary_expansion()
+                 && (preset_base_scorer.is_some() || shared_scorer.is_some());
+-            let scorer_override_covers_all = if scorer_only_fuzzy {
++            let scorer_override_covers_all = if scorer_only_expansion {
+                 segment_selection
+                     .covers_all_committed(&ds, &column, document_granularity, &segments)
+                     .await?
+@@ -3198,9 +3199,9 @@ impl ExecutionPlan for MatchQueryExec {
+                     (None, Some(shared_scorer)) => Some(shared_scorer.wait().await?),
+                     (None, None) => None,
+                 };
+-                if base_scorer.is_some() && scorer_only_fuzzy && !scorer_override_covers_all {
++                if base_scorer.is_some() && scorer_only_expansion && !scorer_override_covers_all {
+                     return Err(DataFusionError::Execution(
+-                        "fuzzy MatchQuery cannot use a scorer-only override; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_query"
++                        "MatchQuery cannot use a scorer-only override when it needs vocabulary expansion; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_query"
+                             .to_string(),
+                     ));
+                 }
+@@ -3999,10 +4000,10 @@ impl FlatMatchFilterExec {
+                 "column not set for MatchQuery {}",
+                 query.terms
+             )))?;
+-        if uses_fuzzy_expansion(query.fuzziness) {
++        if uses_fuzzy_expansion(query.fuzziness) || query.last_as_prefix {
+             return Err(DataFusionError::NotImplemented(format!(
+-                "Fuzzy MatchQuery is not supported when FTS is used as a post-filter: column={}, fuzziness={:?}",
+-                column, query.fuzziness
++                "MatchQuery that needs vocabulary expansion is not supported when FTS is used as a post-filter: column={}, fuzziness={:?}, last_as_prefix={}",
++                column, query.fuzziness, query.last_as_prefix
+             )));
+         }
+         let document_granularity = resolved_field
