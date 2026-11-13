@@ -1894,18 +1894,7 @@ fn tokenize(source: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut chars = source.char_indices().peekable();
     while let Some((start, ch)) = chars.next() {
-        if ch.is_ascii_alphabetic() || ch == '_' {
-            let mut end = start + ch.len_utf8();
-            while let Some(&(next, next_ch)) = chars.peek() {
-                if next_ch.is_ascii_alphanumeric() || next_ch == '_' {
-                    end = next + next_ch.len_utf8();
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            tokens.push(source[start..end].to_owned());
-        } else if ch.is_ascii_digit() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
             let mut end = start + ch.len_utf8();
             while let Some(&(next, next_ch)) = chars.peek() {
                 if next_ch.is_ascii_alphanumeric() || next_ch == '_' {
@@ -1976,11 +1965,9 @@ fn enumerator_names(body: &[String]) -> Vec<String> {
             }
             _ => {}
         }
-        if expect_name && depth == 0 {
-            if is_ident(token) {
-                names.push(token.clone());
-                expect_name = false;
-            }
+        if expect_name && depth == 0 && is_ident(token) {
+            names.push(token.clone());
+            expect_name = false;
         }
     }
     names
